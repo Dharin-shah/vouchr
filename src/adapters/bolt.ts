@@ -154,6 +154,32 @@ export class ConnectContext {
   }
 
   /**
+   * Refuse channel-owned (shared) credentials on channel classes where membership doesn't mean
+   * "this workspace's own members" (invariant 6). Fails CLOSED: if we can't read the class, deny.
+   * Externally-shared/Slack-Connect is the security-critical case — a shared cred there would leak
+   * cross-org. Error messages name the reason and never carry tokens.
+   */
+  private async assertChannelEligible(): Promise<void> {
+    let info: any;
+    try {
+      info = await this.client.conversations.info({ channel: this.channel! });
+    } catch {
+      throw new Error('Could not verify the channel type; channel credentials are refused.');
+    }
+    const ch = info?.channel;
+    if (!ch) throw new Error('Could not verify the channel type; channel credentials are refused.');
+    if (ch.is_ext_shared || ch.is_shared || ch.is_pending_ext_shared) {
+      throw new Error('Channel credentials are not allowed in externally shared channels.');
+    }
+    if (ch.is_im || ch.is_mpim) {
+      throw new Error('Channel credentials are not allowed in DMs or group DMs.');
+    }
+    if (ch.is_archived) {
+      throw new Error('Channel credentials are not allowed in archived channels.');
+    }
+  }
+
+  /**
    * Store a raw static key as the channel's shared credential for `providerId`. Admin-only,
    * audited, refused on a `'per-user'`-locked channel (invariant 7). The secret never enters
    * the audit meta, the return value, or any error string (invariant 8 / T7). Prefer
@@ -163,6 +189,7 @@ export class ConnectContext {
     this.registry.get(providerId); // validate provider exists before anything else
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
+    await this.assertChannelEligible();
     if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
       throw new Error(`Channel is set to per-user for "${providerId}"; static keys are not allowed.`);
     }
@@ -185,6 +212,7 @@ export class ConnectContext {
     this.registry.get(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
+    await this.assertChannelEligible();
     if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
       throw new Error(`Channel is set to per-user for "${providerId}"; shared references are not allowed.`);
     }
@@ -202,6 +230,7 @@ export class ConnectContext {
     this.registry.get(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
+    await this.assertChannelEligible();
     if (mode === 'per-user') await this.vault.delete(owner, providerId);
     await cfg.setMode(owner.teamId, channel, providerId, mode);
     await this.audit.record('config', this.identity, providerId, { owner: 'channel', channel, mode });
@@ -221,7 +250,10 @@ export class ConnectContext {
     if (!(await this.vault.get(owner, providerId))) {
       throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
     }
-    // Note: channel-class restriction (ext-shared/archived/DM — invariant 6) is future work.
+    // Defense in depth: re-verify class at use time (a channel can change class after config).
+    // ponytail: one conversations.info per use (Slack Tier-3 ~50/min); cache the class with a short
+    // TTL if a hot channel throttles. Correctness first — a channel turned Slack-Connect must stop now.
+    await this.assertChannelEligible();
     return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight);
   }
 

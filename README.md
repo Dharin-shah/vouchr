@@ -136,6 +136,33 @@ const linear = defineProvider({
 For a non-OAuth API, set `credential: 'key'` and how to attach it
 (`inject: (h, key) => h.set('x-api-key', key)`); the user pastes their key into a private modal.
 
+## Production notes
+
+A few things an adopter hits in practice:
+
+- **Single workspace / single bot token.** The bot and the post-OAuth confirmation
+  DM both use one `SLACK_BOT_TOKEN`; there's no `InstallationStore`. Credentials are
+  stored keyed by `team_id` (so the store would isolate across workspaces), but the
+  embedded Bolt surface assumes a single workspace / single bot install — org-wide,
+  multi-workspace distribution is not supported.
+- **`ConsentRequiredError` is control flow, not an error.** When a user hasn't
+  connected, `connect()` posts the Connect prompt and throws `ConsentRequiredError`.
+  Catch it and stop the turn — don't log it as a failure:
+  ```ts
+  import { ConsentRequiredError } from 'vouchr';
+  // inside your handler:
+  try {
+    const gh = await context.vouchr.connect('github');
+    // ...use gh...
+  } catch (e) {
+    if (e instanceof ConsentRequiredError) return; // prompt was shown; wait for the user
+    throw e;
+  }
+  ```
+- **Storage at rest.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
+  rest of each row — and the SQLite file as a whole — is not. Keep the DB
+  access-controlled and the key in a secret manager; see [SECURITY.md](./SECURITY.md).
+
 ## Status
 
 Pre-1.0. The embedded Bolt surface is built and tested (SQLite + Postgres); not yet run in

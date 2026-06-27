@@ -37,3 +37,7 @@ Vouchr is self-hosted; some of the security posture is yours to own:
   specific secrets it resolves).
 - Keep the credential store (SQLite file or Postgres) encrypted at rest and access-controlled
   at the infrastructure layer.
+- Understand the admin gate's trust boundary: channel-credential configuration is gated on
+  Slack **workspace** admin/owner status (`users.info` `is_admin`/`is_owner`), which is
+  workspace-wide, not channel-membership-scoped. By design, a workspace admin can configure a
+  shared credential for a channel they are not a member of.

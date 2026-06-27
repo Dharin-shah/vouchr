@@ -19,11 +19,20 @@ const provider = defineProvider({
   egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
 });
 
-async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN') {
+// `convo` shapes the mocked conversations.info: a class object (default normal), or a thrower.
+async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN', convo: any = {}) {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const client = { users: { info: async () => ({ user: { is_admin: isAdmin } }) } } as any;
+  const client = {
+    users: { info: async () => ({ user: { is_admin: isAdmin } }) },
+    conversations: {
+      info: async () => {
+        if (convo === 'throw') throw new Error('channel_not_found');
+        return { channel: { id: 'C_FIN', is_channel: true, ...convo } };
+      },
+    },
+  } as any;
   const c = new ConnectContext(
     ID, channel, client, new ProviderRegistry([provider]), vault, audit,
     new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db),
@@ -107,4 +116,39 @@ test('connectChannel: handle on shared cred, refuses per-user and unconfigured',
 test('no channel in context → refuse', async () => {
   const { c } = await ctx(true, null);
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /No channel/);
+});
+
+// T2 invariant 6: shared creds are refused on channel classes whose membership ≠ workspace members.
+test('T2 channel-class restriction: disallowed classes refuse config (invariant 6)', async () => {
+  const cases: Array<[any, RegExp]> = [
+    [{ is_ext_shared: true }, /externally shared/],
+    [{ is_shared: true }, /externally shared/],
+    [{ is_pending_ext_shared: true }, /externally shared/],
+    [{ is_im: true }, /DMs/],
+    [{ is_mpim: true }, /DMs/],
+    [{ is_archived: true }, /archived/],
+  ];
+  for (const [convo, reason] of cases) {
+    const { c, vault } = await ctx(true, 'C_FIN', convo);
+    await assert.rejects(() => c.setChannelSecret('mcp', SECRET), reason);
+    await assert.rejects(
+      () => c.referenceChannelSecret('mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:x' }),
+      reason,
+    );
+    await assert.rejects(() => c.setChannelMode('mcp', 'shared'), reason);
+    assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null); // nothing stored
+  }
+});
+
+// T2 fail-closed: if we can't read the channel class, deny.
+test('T2 channel-class restriction: fails closed when conversations.info throws', async () => {
+  const { c } = await ctx(true, 'C_FIN', 'throw');
+  await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /verify the channel type/);
+});
+
+// T2 normal channel is allowed (the happy path keeps working).
+test('T2 channel-class restriction: a normal channel is allowed', async () => {
+  const { c, vault } = await ctx(true, 'C_FIN', { is_channel: true });
+  await c.setChannelSecret('mcp', SECRET);
+  assert.equal((await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
 });

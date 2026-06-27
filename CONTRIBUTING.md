@@ -37,3 +37,14 @@ Don't open a public issue for vulnerabilities. See `SECURITY.md` if present, oth
 contact the maintainers privately.
 
 By contributing you agree your contributions are licensed under Apache-2.0.
+
+## Releasing
+
+Pre-1.0 and private: the package is **not published to npm**, so there is no publish step.
+Releases are just tags. To cut one:
+
+1. Bump `version` in `package.json` (SemVer; pre-1.0 minors may carry breaking changes).
+2. Add a `## [x.y.z]` heading to `CHANGELOG.md` describing the changes.
+3. Confirm `npm run typecheck` and `npm test` are green, including the Postgres path
+   (`npm run pg:up` then `npm test`).
+4. Tag the release: `git tag vX.Y.Z`.
