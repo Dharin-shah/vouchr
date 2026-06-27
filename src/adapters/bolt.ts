@@ -1,7 +1,7 @@
 import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb } from '../core/db';
-import { loadMasterKey } from '../core/crypto';
+import { loadMasterKey, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit } from '../core/audit';
@@ -59,6 +59,12 @@ export interface VouchrOptions {
   ttl?: TtlPolicy;
   /** External secret-manager resolvers, keyed by source id (e.g. { 'aws-sm': resolveArn }). */
   resolvers?: Resolvers;
+  /**
+   * Optional KMS-style envelope encryption for at-rest secrets. When supplied, new writes wrap a
+   * fresh per-secret data key with your KMS key (KEK); when omitted, at-rest crypto behaves exactly
+   * as before (direct master-key encryption). Either way, existing rows still decrypt.
+   */
+  envelope?: EnvelopeProvider;
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -300,7 +306,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
   const key = loadMasterKey();
   const registry = new ProviderRegistry(opts.providers);
-  const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL);
+  const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
   const audit = new Audit(db);
   const consent = new Consent(db);
   const channelConfig = new ChannelConfig(db);

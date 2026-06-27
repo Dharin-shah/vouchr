@@ -14,5 +14,6 @@ export { DbInstallationStore } from './core/installationStore';
 export type { Installation, InstallationQuery, InstallationStore } from '@slack/bolt';
 export type { ChannelMode } from './core/channelConfig';
 export type { TtlPolicy } from './core/vault';
+export type { EnvelopeProvider } from './core/crypto';
 // Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);
 // registerOffboarding() wires the user_change handler. No standalone re-exports — one obvious way.

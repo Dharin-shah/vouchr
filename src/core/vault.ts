@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
-import { encrypt, decrypt } from './crypto';
+import { seal, open, type EnvelopeProvider } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
 export interface StoredToken {
@@ -46,6 +46,10 @@ export class Vault {
     private db: Db,
     private key: Buffer,
     private ttl: TtlPolicy = {},
+    // Optional KMS envelope binding. When supplied, NEW writes use envelope encryption (scheme
+    // 0x01); when absent, NEW writes use the legacy direct-to-master format (current behavior).
+    // Reads dispatch on the stored format regardless, so either mode reads existing rows.
+    private envelope?: EnvelopeProvider,
   ) {}
 
   private isExpired(createdAt: number, lastUsedAt: number, now = Date.now()): boolean {
@@ -64,8 +68,8 @@ export class Vault {
     if (this.isExpired(row.created_at, row.last_used_at ?? row.created_at)) return null;
     return {
       source: row.source,
-      accessToken: row.access_token_enc ? decrypt(toBuffer(row.access_token_enc), this.key) : null,
-      refreshToken: row.refresh_token_enc ? decrypt(toBuffer(row.refresh_token_enc), this.key) : null,
+      accessToken: row.access_token_enc ? await open(toBuffer(row.access_token_enc), this.key, this.envelope) : null,
+      refreshToken: row.refresh_token_enc ? await open(toBuffer(row.refresh_token_enc), this.key, this.envelope) : null,
       secretRef: row.secret_ref,
       scopes: row.scopes,
       expiresAt: row.expires_at,
@@ -76,6 +80,8 @@ export class Vault {
   /** Store a vaulted credential (Vouchr encrypts and owns refresh). */
   async upsert(owner: Owner, provider: string, t: StoredToken): Promise<void> {
     const now = Date.now();
+    const accessEnc = await seal(t.accessToken, this.key, this.envelope);
+    const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
     await this.db.run(
       `INSERT INTO connection
          (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
@@ -90,8 +96,7 @@ export class Vault {
          created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
       [
         randomUUID(), null, owner.teamId, owner.kind, owner.id, provider,
-        encrypt(t.accessToken, this.key),
-        t.refreshToken ? encrypt(t.refreshToken, this.key) : null,
+        accessEnc, refreshEnc,
         t.scopes, t.expiresAt, t.externalAccount, now, now, now,
       ],
     );
@@ -137,12 +142,13 @@ export class Vault {
     provider: string,
     t: Pick<StoredToken, 'accessToken' | 'refreshToken' | 'scopes' | 'expiresAt'>,
   ): Promise<void> {
+    const accessEnc = await seal(t.accessToken, this.key, this.envelope);
+    const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
     await this.db.run(
       `UPDATE connection SET access_token_enc=?, refresh_token_enc=?, scopes=?, expires_at=?, updated_at=?
        WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND source='vault'`,
       [
-        encrypt(t.accessToken, this.key),
-        t.refreshToken ? encrypt(t.refreshToken, this.key) : null,
+        accessEnc, refreshEnc,
         t.scopes, t.expiresAt, Date.now(),
         owner.teamId, owner.kind, owner.id, provider,
       ],
