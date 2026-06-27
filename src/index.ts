@@ -11,5 +11,5 @@ export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';
 export type { ChannelMode } from './core/channelConfig';
 export type { TtlPolicy } from './core/vault';
-export { offboardUser } from './core/offboard';
-export { sweepExpired } from './core/sweep';
+// Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);
+// registerOffboarding() wires the user_change handler. No standalone re-exports — one obvious way.

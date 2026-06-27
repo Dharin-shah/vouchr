@@ -1,0 +1,36 @@
+# Slack app manifest for the Vouchr demo. Create an app from this at
+# https://api.slack.com/apps → Create New App → From a manifest.
+# Replace YOUR_PUBLIC_URL with your public origin (e.g. an ngrok URL). With an
+# ExpressReceiver, events, interactivity, and the slash command all post to /slack/events.
+display_information:
+  name: Vouchr
+  description: Connect your accounts so agents can act on your behalf, without seeing your tokens.
+features:
+  bot_user:
+    display_name: vouchr
+    always_online: true
+  slash_commands:
+    - command: /vouchr
+      url: https://YOUR_PUBLIC_URL/slack/events
+      description: Manage your connected accounts
+      usage_hint: status | disconnect <provider> | configure <provider>
+      should_escape: false
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read   # receive @-mentions
+      - chat:write          # post Connect prompts / confirmation DMs
+      - commands            # the /vouchr slash command
+      - users:read          # admin gate for channel creds + offboarding (user_change)
+settings:
+  event_subscriptions:
+    request_url: https://YOUR_PUBLIC_URL/slack/events
+    bot_events:
+      - app_mention
+      - user_change         # auto-revoke a deactivated user's connections
+  interactivity:
+    is_enabled: true        # REQUIRED for the Connect button + key/configure modals
+    request_url: https://YOUR_PUBLIC_URL/slack/events
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false

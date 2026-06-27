@@ -67,10 +67,10 @@ export class Consent {
 
   /** Look up and consume (single-use) a consent request. Returns null if absent/expired. */
   async consume(state: string): Promise<ConsentRow | null> {
-    const row = (await this.db.get(`SELECT * FROM consent_request WHERE state=?`, [state])) as any;
+    // Atomic single-use: DELETE ... RETURNING so two concurrent callbacks can't both pass the
+    // check (a get-then-delete has a TOCTOU window on multi-instance Postgres). Both engines support it.
+    const row = (await this.db.get(`DELETE FROM consent_request WHERE state=? RETURNING *`, [state])) as any;
     if (!row) return null;
-    // Single-use: delete regardless of validity.
-    await this.db.run(`DELETE FROM consent_request WHERE state=?`, [state]);
     if (Date.now() - row.created_at > STATE_TTL_MS) return null;
     return {
       state: row.state,

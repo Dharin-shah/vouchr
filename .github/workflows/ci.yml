@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: vouchr
+          POSTGRES_PASSWORD: vouchr
+          POSTGRES_DB: vouchr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U vouchr"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      # Exercises the real Postgres backend (the suite skips PG if this is unreachable).
+      VOUCHR_TEST_PG_URL: postgres://vouchr:vouchr@localhost:5432/vouchr
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test

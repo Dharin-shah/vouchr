@@ -32,10 +32,6 @@ export function resolveIdentity(args: {
   return { enterpriseId, teamId, userId };
 }
 
-export function idKey(i: SlackIdentity): string {
-  return `${i.enterpriseId ?? '-'}/${i.teamId}/${i.userId}`;
-}
-
 /**
  * Whether `userId` is a Slack workspace admin/owner — the gate for channel-credential
  * config (invariant 7). Fail-closed: any API error or missing flag → not admin.

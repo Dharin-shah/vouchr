@@ -7,10 +7,10 @@ const receiver = new ExpressReceiver({
 });
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 
-// 3. An agent action that needs to act AS the user on GitHub.
+// 2. An agent action that needs to act AS the user on GitHub.
 app.event('app_mention', async ({ context, event, client }) => {
   try {
-    const gh = await (context as any).vouchr.connect('github');
+    const gh = await context.vouchr.connect('github');
     // The token is injected at the HTTP boundary — this code never sees it.
     const res = await gh.fetch('https://api.github.com/user');
     const me: any = await res.json();
@@ -26,7 +26,7 @@ app.event('app_mention', async ({ context, event, client }) => {
 });
 
 (async () => {
-  // 2. Vouchr: one provider (GitHub), public callback origin (e.g. an ngrok URL).
+  // 3. Vouchr: one provider (GitHub), public callback origin (e.g. an ngrok URL).
   //    Defaults to SQLite (VOUCHR_DB); set VOUCHR_DATABASE_URL for Postgres.
   const vouchr = await createVouchr({
     providers: [github()],

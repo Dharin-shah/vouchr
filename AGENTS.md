@@ -58,7 +58,7 @@ logic in `core/` unless it is genuinely Bolt-specific.
 
 ## Dev setup
 
-Requires Node ≥ 18 (developed on Node 22; see `.nvmrc`).
+Requires Node ≥ 20.6 (developed on Node 22; see `.nvmrc`).
 
 ```bash
 nvm use            # or: nvm install 22

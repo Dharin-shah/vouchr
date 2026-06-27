@@ -18,6 +18,8 @@ export type Resolvers = Record<string, (ref: string) => Promise<string>>;
  *  - `acting` — the human who triggered this request (audit attribution), even when a
  *    shared channel credential is used. A shared cred never launders away who acted.
  */
+const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
+
 export class ConnectionHandle {
   constructor(
     private provider: Provider,
@@ -26,6 +28,9 @@ export class ConnectionHandle {
     private vault: Vault,
     private audit: Audit,
     private resolvers: Resolvers = {},
+    // Shared across handles so concurrent fetches for the same owner+provider refresh once.
+    // Default = per-instance (no cross-request dedup) — fine for direct construction in tests.
+    private inflight: Map<string, Promise<string | null>> = new Map(),
   ) {}
 
   async account(): Promise<string | null> {
@@ -39,6 +44,11 @@ export class ConnectionHandle {
       throw new Error(
         `Egress blocked: "${url.hostname}" is not in the allowlist for provider "${this.provider.id}"`,
       );
+    }
+    // The caller (and the LLM) controls this URL. Require https so the bearer is never sent in
+    // cleartext (it goes out before any http→https redirect). Loopback is exempt for local dev.
+    if (url.protocol !== 'https:' && !LOOPBACK.has(url.hostname)) {
+      throw new Error(`Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
 
     const cred = await this.vault.get(this.owner, this.provider.id);
@@ -63,11 +73,12 @@ export class ConnectionHandle {
     }
 
     // Mark the connection used (resets its idle TTL) and audit AS THE ACTING HUMAN — never the secret.
-    await this.vault.touch(this.owner, this.provider.id);
-    await this.audit.record('inject', this.acting, this.provider.id, {
-      host: url.hostname,
-      status: res.status,
-    });
+    // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
+    // failed fetch (the caller might retry a non-idempotent request).
+    await this.vault.touch(this.owner, this.provider.id).catch(() => undefined);
+    await this.audit
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, status: res.status })
+      .catch(() => undefined);
     return res;
   }
 
@@ -93,7 +104,22 @@ export class ConnectionHandle {
     return cred.accessToken;
   }
 
+  // Single-flight: concurrent fetches for the same owner+provider share one refresh. Without this,
+  // rotating-refresh-token providers (the second refresh sees a consumed token) brick the connection.
   private async refreshAndStore(): Promise<string | null> {
+    const key = `${this.owner.teamId}:${this.owner.kind}:${this.owner.id}:${this.provider.id}`;
+    const existing = this.inflight.get(key);
+    if (existing) return existing;
+    const p = this.doRefresh();
+    this.inflight.set(key, p);
+    try {
+      return await p;
+    } finally {
+      this.inflight.delete(key);
+    }
+  }
+
+  private async doRefresh(): Promise<string | null> {
     const stored = await this.vault.get(this.owner, this.provider.id);
     if (!stored?.refreshToken) return null;
     const refreshed = await refreshToken(this.provider, stored.refreshToken);

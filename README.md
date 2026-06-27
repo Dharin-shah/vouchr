@@ -54,7 +54,9 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
 app.use(vouchr.middleware);
 vouchr.mountRoutes(receiver.router);   // the OAuth callback
-vouchr.registerCommands(app);          // /vouchr status | disconnect | configure
+vouchr.registerCommands(app);          // /vouchr status | disconnect | configure (+ the modals)
+vouchr.registerOffboarding(app);       // revoke a user's connections when Slack deactivates them
+setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 
 app.event('app_mention', async ({ context, event, say }) => {
   // If the user hasn't connected GitHub, this posts a "Connect" button to them and stops.
@@ -83,15 +85,27 @@ app.event('app_mention', async ({ context, event, say }) => {
 
 ## Setup
 
-Requires Node ≥ 18 (developed on 22).
+Requires Node ≥ 20.6 (developed on 22; `--env-file` needs 20.6).
 
 ```bash
 npm install
 cp .env.example .env     # set VOUCHR_MASTER_KEY (openssl rand -base64 32), Slack + provider creds
 npm test                 # unit + integration, fully offline
+npm run pg:up && npm test # optional: also exercise the Postgres backend (throwaway Docker PG)
 ```
 
-To run the live demo you need a Slack app, a GitHub OAuth app (callback
+### Slack app
+
+Create an app from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)
+(api.slack.com/apps → From a manifest), replacing `YOUR_PUBLIC_URL`. It sets the bot scopes
+(`app_mentions:read`, `chat:write`, `commands`, `users:read`), the `app_mention` + `user_change`
+events, **Interactivity** (required for the Connect button and the key/configure modals), and the
+`/vouchr` slash command. `vouchr.registerCommands(app)` is what wires those modals and the command,
+so it's mandatory if you use a `credential: 'key'` provider or channel config.
+
+### Run the demo
+
+You need the Slack app above, a GitHub OAuth app (callback
 `$PUBLIC_URL/vouchr/oauth/callback`), and a public URL (`ngrok http 3000`):
 
 ```bash
@@ -99,6 +113,8 @@ npm run example:github   # then @-mention the bot in a channel
 ```
 
 For Postgres instead of SQLite, set `VOUCHR_DATABASE_URL` (or `databaseUrl` in `createVouchr`).
+Note the SQLite file itself isn't encrypted at rest, only the token columns are; keep it
+access-controlled (see [SECURITY.md](./SECURITY.md)).
 
 ## Providers
 

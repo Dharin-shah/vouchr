@@ -67,6 +67,8 @@ export class ConnectContext {
     private redirectUri: string,
     private resolvers: Resolvers = {},
     private channelConfig?: ChannelConfig,
+    // Shared single-flight refresh map (see ConnectionHandle). One per createVouchr instance.
+    private inflight: Map<string, Promise<string | null>> = new Map(),
   ) {}
 
   /**
@@ -84,7 +86,7 @@ export class ConnectContext {
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
       return new ConnectionHandle(
-        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers,
+        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight,
       );
     }
 
@@ -220,7 +222,7 @@ export class ConnectContext {
       throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
     }
     // Note: channel-class restriction (ext-shared/archived/DM — invariant 6) is future work.
-    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers);
+    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight);
   }
 
   /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
@@ -268,6 +270,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
   const confirmClient = botToken ? new WebClient(botToken) : null;
+  const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
 
   /** Bolt global middleware: attach `context.vouchr` for each request with a user. */
   const middleware = async (args: any): Promise<void> => {
@@ -287,6 +290,7 @@ export async function createVouchr(opts: VouchrOptions) {
         redirectUri,
         resolvers,
         channelConfig,
+        inflight,
       );
     }
     await args.next();
@@ -297,32 +301,37 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Mount the OAuth callback on the receiver's Express router. */
   function mountRoutes(router: any): void {
     router.get(callbackPath, async (req: any, res: any) => {
-      const { code, state, error } = req.query;
-      const result = await handleOAuthCallback(
-        callbackDeps,
-        code == null ? undefined : String(code),
-        state == null ? undefined : String(state),
-        error == null ? undefined : String(error),
-      );
-      if (!result.ok) return res.status(result.status).send(result.error);
+      try {
+        const { code, state, error } = req.query;
+        const result = await handleOAuthCallback(
+          callbackDeps,
+          code == null ? undefined : String(code),
+          state == null ? undefined : String(state),
+          error == null ? undefined : String(error),
+        );
+        if (!result.ok) return res.status(result.status).send(result.error);
 
-      // Best-effort nudge back into Slack.
-      if (confirmClient) {
-        await confirmClient.chat
-          .postMessage({
-            channel: result.identity.userId,
-            text: `✅ ${result.provider} connected${result.account ? ` as ${result.account}` : ''}.`,
-          })
-          .catch(() => undefined);
+        // Best-effort nudge back into Slack.
+        if (confirmClient) {
+          await confirmClient.chat
+            .postMessage({
+              channel: result.identity.userId,
+              text: `✅ ${result.provider} connected${result.account ? ` as ${result.account}` : ''}.`,
+            })
+            .catch(() => undefined);
+        }
+        res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account));
+      } catch {
+        // Express doesn't catch async rejections; an unhandled one here hangs the browser.
+        res.status(500).send('Connection failed. Please try again.');
       }
-      res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account));
     });
   }
 
   /** Build a per-request ConnectContext bound to a specific channel (for the modal submit). */
   function contextFor(identity: SlackIdentity, channel: string | null, client: WebClient): ConnectContext {
     return new ConnectContext(
-      identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers, channelConfig,
+      identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers, channelConfig, inflight,
     );
   }
 
@@ -370,38 +379,46 @@ export async function createVouchr(opts: VouchrOptions) {
       return respond(`Your connected accounts:\n${lines}\n\nDisconnect with \`/vouchr disconnect <provider>\`.`);
     });
 
-    // Modal submit: store the channel credential. The typed value lives only in this view's
-    // state — never echoed, posted, logged, or put in audit meta (invariant 8 / T7).
-    app.view(CONFIGURE_CALLBACK, async ({ ack, body, view, client }: any) => {
+    // Modal submit (channel-shared OR per-user). One handler so both paths stay leak-safe and both
+    // await the write — the typed value lives only in this view's state, never echoed, posted, logged,
+    // or put in audit meta (invariant 8 / T7).
+    const handleSecretSubmit = async ({ ack, body, view, client }: any, kind: 'channel' | 'user') => {
       const identity = resolveIdentity({ body });
       let channel = '';
       let provider = '';
       try {
-        ({ channel, provider } = JSON.parse(view.private_metadata));
+        ({ channel = '', provider } = JSON.parse(view.private_metadata));
       } catch {
         return ack({ response_action: 'errors', errors: { ref: 'Malformed request — please reopen the modal.' } });
       }
-      const ref = view.state.values.ref?.v?.value?.trim() || '';
-      const raw = view.state.values.raw?.v?.value || '';
+      const ref = view.state?.values?.ref?.v?.value?.trim() || '';
+      const raw = view.state?.values?.raw?.v?.value || '';
       if (!identity) return ack({ response_action: 'errors', errors: { ref: 'Could not resolve your Slack identity.' } });
       if ((ref && raw) || (!ref && !raw)) {
         return ack({ response_action: 'errors', errors: { raw: 'Provide exactly one: a reference or a key.' } });
       }
-      const ctx = contextFor(identity, channel, client);
+      const ctx = contextFor(identity, kind === 'channel' ? channel : null, client);
       try {
-        if (ref) await ctx.referenceChannelSecret(provider, { source: refSource(ref), secretRef: ref });
-        else await ctx.setChannelSecret(provider, raw);
+        if (kind === 'channel') {
+          if (ref) await ctx.referenceChannelSecret(provider, { source: refSource(ref), secretRef: ref });
+          else await ctx.setChannelSecret(provider, raw);
+        } else {
+          if (ref) await ctx.referenceUserSecret(provider, { source: refSource(ref), secretRef: ref });
+          else await ctx.setUserSecret(provider, raw);
+        }
       } catch (e) {
-        const field = ref ? 'ref' : 'raw';
         // The error never contains the secret (we never interpolate it); surface it inline.
-        return ack({ response_action: 'errors', errors: { [field]: (e as Error).message } });
+        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: (e as Error).message } });
       }
       await ack();
       // Private confirmation DM — no secret, just the fact it was set.
-      await client.chat
-        .postMessage({ channel: identity.userId, text: `✅ Saved the *${provider}* credential for <#${channel}>.` })
-        .catch(() => undefined);
-    });
+      const text = kind === 'channel'
+        ? `✅ Saved the *${provider}* credential for <#${channel}>.`
+        : `✅ Your *${provider}* credential is set. Ask me again and I'll use it.`;
+      await client.chat.postMessage({ channel: identity.userId, text }).catch(() => undefined);
+    };
+    app.view(CONFIGURE_CALLBACK, (a: any) => handleSecretSubmit(a, 'channel'));
+    app.view(USER_KEY_CALLBACK, (a: any) => handleSecretSubmit(a, 'user'));
 
     // Per-user key setup: ephemeral button → private modal (self-service, not admin-gated).
     app.action(SETUP_KEY_ACTION, async ({ ack, body, client }: any) => {
@@ -409,35 +426,6 @@ export async function createVouchr(opts: VouchrOptions) {
       const provider = body.actions?.[0]?.value;
       if (!provider || !body.trigger_id) return;
       await client.views.open({ trigger_id: body.trigger_id, view: userKeyModal(provider) });
-    });
-
-    // Modal submit: store the user's OWN credential. Same leak-safe handling as the channel one.
-    app.view(USER_KEY_CALLBACK, async ({ ack, body, view, client }: any) => {
-      const identity = resolveIdentity({ body });
-      let provider = '';
-      try {
-        ({ provider } = JSON.parse(view.private_metadata));
-      } catch {
-        return ack({ response_action: 'errors', errors: { ref: 'Malformed request — please reopen.' } });
-      }
-      const ref = view.state.values.ref?.v?.value?.trim() || '';
-      const raw = view.state.values.raw?.v?.value || '';
-      if (!identity) return ack({ response_action: 'errors', errors: { ref: 'Could not resolve your Slack identity.' } });
-      if ((ref && raw) || (!ref && !raw)) {
-        return ack({ response_action: 'errors', errors: { raw: 'Provide exactly one: a reference or a key.' } });
-      }
-      const ctx = contextFor(identity, null, client);
-      try {
-        if (ref) ctx.referenceUserSecret(provider, { source: refSource(ref), secretRef: ref });
-        else ctx.setUserSecret(provider, raw);
-      } catch (e) {
-        const field = ref ? 'ref' : 'raw';
-        return ack({ response_action: 'errors', errors: { [field]: (e as Error).message } });
-      }
-      await ack();
-      await client.chat
-        .postMessage({ channel: identity.userId, text: `✅ Your *${provider}* credential is set. Ask me again and I'll use it.` })
-        .catch(() => undefined);
     });
   }
 
@@ -488,4 +476,11 @@ export async function createVouchr(opts: VouchrOptions) {
     audit,
     db,
   };
+}
+
+// Type `context.vouchr` for consumers so handlers can call it without `as any`.
+declare module '@slack/bolt' {
+  interface Context {
+    vouchr: ConnectContext;
+  }
 }

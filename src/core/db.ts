@@ -102,13 +102,23 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
   const url = opts.databaseUrl ?? process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
   if (url && /^postgres(ql)?:\/\//.test(url)) {
     types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
-    const db = new PgDb(new Pool({ connectionString: url }));
+    const pool = new Pool({
+      connectionString: url,
+      connectionTimeoutMillis: 5_000,
+      idleTimeoutMillis: 30_000,
+      statement_timeout: 10_000, // fail a request fast instead of hanging the Bolt handler
+    });
+    // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
+    // throws and kills the whole process; swallow it — pg reconnects on the next query.
+    pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
+    const db = new PgDb(pool);
     await db.exec(schema('BYTEA', 'BIGINT'));
     return db;
   }
 
   const raw = new BetterSqlite3(opts.dbPath ?? process.env.VOUCHR_DB ?? 'vouchr.db');
   raw.pragma('journal_mode = WAL');
+  raw.pragma('busy_timeout = 5000'); // wait, don't instantly SQLITE_BUSY, on a concurrent writer
   migrateSqlite(raw);
   return new SqliteDb(raw);
 }
