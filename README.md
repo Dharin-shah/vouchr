@@ -2,9 +2,9 @@
 
 **Let a Slack agent act on a user's behalf against third-party APIs — without the user's token ever touching your agent code, the LLM, or the chat.**
 
-Vouchr is the channel-scoped credential and tool plane for Slack agents: your code holds
-capability handles, secrets are injected at the egress boundary, and each channel gets its own
-tool manifest of enabled providers.
+Vouchr gives Slack agents a channel-scoped credential and tool plane: each channel sees only the
+tools and service credentials it's authorized for, and credentials are injected at the egress
+boundary so the secret never reaches the agent or the chat.
 
 A Slack agent often needs to *do things as the user*: open a GitHub issue as them, read their
 calendar, call an internal API with their access. That means storing per-user tokens, running a
