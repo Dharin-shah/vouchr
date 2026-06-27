@@ -7,7 +7,7 @@ import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit } from '../core/audit';
 import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
-import { resolveIdentity, isSlackAdmin, type SlackIdentity } from '../core/identity';
+import { resolveIdentity, isSlackAdmin, isChannelMember, type SlackIdentity } from '../core/identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo } from '../core/channelConfig';
@@ -74,6 +74,21 @@ export interface VouchrOptions {
    * never tokens, references, or user/team ids.
    */
   onEvent?: EventSink;
+  /**
+   * Custom admin check for channel-credential config (governance). When set, `requireAdmin` uses
+   * it INSTEAD of the built-in Slack is_admin/is_owner gate — e.g. to defer to your own RBAC or an
+   * allow-list. When omitted, the gate is exactly as before (`isSlackAdmin`). The default-deny +
+   * audit-on-denial behavior is identical regardless of which check runs. Fail closed yourself:
+   * a thrown override is treated as "not admin".
+   */
+  isAdmin?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
+  /**
+   * When true, using a SHARED channel credential (`connectChannel`) requires the ACTING user to be
+   * a member of the channel; a non-member (or a membership check we can't verify) is refused
+   * fail-closed and audited 'denied' with reason 'not-member'. Default false — membership is not
+   * checked, behaving exactly as before.
+   */
+  requireChannelMembership?: boolean;
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -98,6 +113,10 @@ export class ConnectContext {
     private sink: EventSink = () => {},
     // The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed.
     private providerIds: string[] = [],
+    // Governance: custom admin check (overrides isSlackAdmin). Undefined = built-in Slack gate.
+    private adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>,
+    // Governance: when true, connectChannel requires the acting user to be a channel member.
+    private requireMembership: boolean = false,
   ) {}
 
   /** Fire the sink, swallowing any error — a bad sink must never break a request. */
@@ -186,7 +205,11 @@ export class ConnectContext {
 
   /** Default-deny admin gate for config mutations (invariant 7). Audits the denial. */
   private async requireAdmin(providerId: string): Promise<void> {
-    if (!(await isSlackAdmin(this.client, this.identity.userId))) {
+    // A custom check overrides the built-in Slack gate; a thrown override fails closed (not admin).
+    const ok = this.adminCheck
+      ? await this.adminCheck(this.client, this.identity.userId, this.identity.teamId).catch(() => false)
+      : await isSlackAdmin(this.client, this.identity.userId);
+    if (!ok) {
       await this.audit.record('denied', this.identity, providerId, {
         reason: 'not-admin',
         owner: 'channel',
@@ -303,6 +326,12 @@ export class ConnectContext {
     }
     if (!(await this.vault.get(owner, providerId))) {
       throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
+    }
+    // Governance (opt-in): a shared cred is only usable by an actual channel member. Fail-closed —
+    // isChannelMember returns false on any error, so an unverifiable membership refuses the cred.
+    if (this.requireMembership && !(await isChannelMember(this.client, channel, this.identity.userId))) {
+      await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'not-member' });
+      throw new Error(`You must be a member of this channel to use its shared "${providerId}" credential.`);
     }
     // Defense in depth: re-verify class at use time (a channel can change class after config).
     // ponytail: one conversations.info per use (Slack Tier-3 ~50/min); cache the class with a short
@@ -432,6 +461,8 @@ export async function createVouchr(opts: VouchrOptions) {
         inflight,
         sink,
         providerIds,
+        opts.isAdmin,
+        opts.requireChannelMembership ?? false,
       );
     }
     await args.next();
@@ -476,6 +507,7 @@ export async function createVouchr(opts: VouchrOptions) {
     return new ConnectContext(
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, sink, providerIds,
+      opts.isAdmin, opts.requireChannelMembership ?? false,
     );
   }
 

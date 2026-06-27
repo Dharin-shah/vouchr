@@ -47,3 +47,32 @@ export async function isSlackAdmin(
     return false;
   }
 }
+
+/**
+ * Whether `userId` is a member of `channel` — the gate for using a SHARED channel credential when
+ * `requireChannelMembership` is on. Fail-closed: any API error (or a member list we can't read)
+ * → not a member, so a non-member can never borrow the channel's cred. Pages conversations.members
+ * (Slack returns at most 1000/page) until the user is seen or the cursor runs out; a missing/empty
+ * page is treated as "not found", not "allow".
+ */
+export async function isChannelMember(
+  client: {
+    conversations: {
+      members: (a: { channel: string; cursor?: string; limit?: number }) => Promise<any>;
+    };
+  },
+  channel: string,
+  userId: string,
+): Promise<boolean> {
+  try {
+    let cursor: string | undefined;
+    do {
+      const res = await client.conversations.members({ channel, cursor, limit: 1000 });
+      if (Array.isArray(res?.members) && res.members.includes(userId)) return true;
+      cursor = res?.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+    return false;
+  } catch {
+    return false;
+  }
+}

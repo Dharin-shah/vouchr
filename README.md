@@ -2,11 +2,18 @@
 
 **Let a Slack agent act on a user's behalf against third-party APIs — without the user's token ever touching your agent code, the LLM, or the chat.**
 
+Vouchr is the channel-scoped credential and tool plane for Slack agents: your code holds
+capability handles, secrets are injected at the egress boundary, and each channel gets its own
+tool manifest of enabled providers.
+
 A Slack agent often needs to *do things as the user*: open a GitHub issue as them, read their
 calendar, call an internal API with their access. That means storing per-user tokens, running a
 "connect your account" flow, and using those tokens without leaking them. Vouchr is that piece,
 as a drop-in for [Slack Bolt](https://slack.dev/bolt-js) — self-hosted, so tokens stay on your
 infra.
+
+**Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [THREAT-MODEL.md](./THREAT-MODEL.md) ·
+[SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md) · [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 The user connects once via an in-Slack button. Vouchr stores the token encrypted, keyed to their
 Slack identity, and injects it only at the outbound HTTP call — your code gets a `fetch` handle,
@@ -77,6 +84,9 @@ app.event('app_mention', async ({ context, event, say }) => {
   per-provider host allowlist.
 - **Per-user by default**, with **per-channel shared credentials** for service accounts an admin
   configures (e.g. one API key the whole `#support` channel's agents use).
+- **Channel tool plane** — admins scope which providers a channel may use via
+  `/vouchr tools | enable | disable`; `connect()` and shared creds refuse a disabled provider, and
+  `toolManifest()` returns the channel-filtered list for building per-channel agent toolsets.
 - **Bring your own secret manager** — point a credential at an AWS Secrets Manager ARN (or any
   resolver); Vouchr stores the reference, not the secret, so rotation stays where it lives.
 - **Encrypted store** — SQLite by default, Postgres for stateless/multi-instance deploys.
