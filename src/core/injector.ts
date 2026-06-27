@@ -82,6 +82,27 @@ export class ConnectionHandle {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(`Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
+    // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
+    // never reaches the vault — the secret is read strictly after every egress check passes.
+    if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => url.pathname.startsWith(p))) {
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      throw new Error(
+        `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`,
+      );
+    }
+    if (this.provider.egressMethods) {
+      const method = (init.method ?? 'GET').toUpperCase();
+      if (!this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
+        this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+        throw new Error(
+          `Egress blocked: method "${method}" is not allowed for provider "${this.provider.id}"`,
+        );
+      }
+    }
+    if (this.provider.egressValidate && !this.provider.egressValidate(url, init)) {
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      throw new Error(`Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
+    }
 
     const cred = await this.vault.get(this.owner, this.provider.id);
     if (!cred) throw new Error(`No connection for provider "${this.provider.id}"`);

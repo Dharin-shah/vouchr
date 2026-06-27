@@ -85,6 +85,14 @@ function schema(blob: string, int: string): string {
       PRIMARY KEY (team_id, channel, provider)
     );
 
+    CREATE TABLE IF NOT EXISTS channel_tool (
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      enabled ${int} NOT NULL,
+      PRIMARY KEY (team_id, channel, provider)
+    );
+
     CREATE TABLE IF NOT EXISTS audit (
       id TEXT PRIMARY KEY,
       team_id TEXT NOT NULL,

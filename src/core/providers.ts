@@ -17,6 +17,17 @@ export interface Provider {
   /** Hostnames this provider's tokens may be sent to (injection boundary). */
   egressAllow: string[];
   /**
+   * OPTIONAL finer egress controls, layered on top of `egressAllow`. All additive: a provider
+   * with only `egressAllow` behaves exactly as before. Each is checked AFTER the hostname + https
+   * checks and BEFORE the secret is read; any failure denies the request.
+   */
+  /** Allowed URL path prefixes (e.g. ['/repos/', '/user']). If set, the request path must start with one. */
+  egressPaths?: string[];
+  /** Allowed HTTP methods (e.g. ['GET','POST']). If set, the request method (case-insensitive) must be in the set. */
+  egressMethods?: string[];
+  /** Per-provider escape-hatch validator. If set and it returns false, the request is denied. */
+  egressValidate?: (url: URL, init: RequestInit) => boolean;
+  /**
    * How the secret is attached to the outbound request. Mutate `headers` in place.
    * Default (unset): `Authorization: Bearer <secret>`. Use for non-Bearer APIs/MCPs,
    * e.g. `(h, s) => h.set('x-api-key', s)`.
@@ -57,6 +68,10 @@ export interface ProviderConfig {
   clientId?: string;
   clientSecret?: string;
   scopes?: string[];
+  /** Optional finer egress controls (see Provider). Built-ins ignore these unless wired explicitly. */
+  egressPaths?: string[];
+  egressMethods?: string[];
+  egressValidate?: (url: URL, init: RequestInit) => boolean;
 }
 
 export function defineProvider(spec: Provider): Provider {

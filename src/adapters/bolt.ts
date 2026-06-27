@@ -11,6 +11,7 @@ import { resolveIdentity, isSlackAdmin, type SlackIdentity } from '../core/ident
 import { userOwner, channelOwner } from '../core/owner';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo } from '../core/channelConfig';
+import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser } from '../core/offboard';
 import { revokeToken } from '../core/tokens';
@@ -89,10 +90,14 @@ export class ConnectContext {
     private redirectUri: string,
     private resolvers: Resolvers = {},
     private channelConfig?: ChannelConfig,
+    // Per-channel tool manifest (which providers an agent may use here). Threaded like channelConfig.
+    private channelTools?: ChannelTools,
     // Shared single-flight refresh map (see ConnectionHandle). One per createVouchr instance.
     private inflight: Map<string, Promise<string | null>> = new Map(),
     // No-secret observability hook. Default no-op (zero behavior change when unset).
     private sink: EventSink = () => {},
+    // The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed.
+    private providerIds: string[] = [],
   ) {}
 
   /** Fire the sink, swallowing any error — a bad sink must never break a request. */
@@ -116,6 +121,14 @@ export class ConnectContext {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
       throw new Error(`Policy denies "${providerId}" in this channel.`);
+    }
+
+    // Channel tool manifest: refuse a provider not enabled for this channel (backward-compat rule
+    // in ChannelTools — an unconfigured channel allows all). A null channel keeps current behavior.
+    if (this.channel && this.channelTools &&
+        !(await this.channelTools.isEnabled(this.identity.teamId, this.channel, providerId))) {
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
+      throw new Error(`"${providerId}" is not enabled in this channel.`);
     }
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
@@ -280,6 +293,11 @@ export class ConnectContext {
       this.emit({ type: 'policy_denied', provider: providerId });
       throw new Error(`Policy denies "${providerId}" in this channel.`);
     }
+    // Same tool-manifest gate as connect(): a disabled provider is unusable here, shared cred or not.
+    if (this.channelTools && !(await this.channelTools.isEnabled(owner.teamId, channel, providerId))) {
+      await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'tool-disabled' });
+      throw new Error(`"${providerId}" is not enabled in this channel.`);
+    }
     if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
       throw new Error(`Channel "${channel}" uses per-user credentials for "${providerId}"; use connect() instead.`);
     }
@@ -291,6 +309,26 @@ export class ConnectContext {
     // TTL if a hot channel throttles. Correctness first — a channel turned Slack-Connect must stop now.
     await this.assertChannelEligible();
     return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink);
+  }
+
+  /**
+   * The channel-filtered tool manifest an agent / MCP gateway asks for before planning: every
+   * registered provider with whether it's enabled in THIS channel (backward-compat rule applies)
+   * and the channel's credential mode for it. With no channel (a DM-less context) every provider
+   * is reported enabled with a null mode — no channel restriction, matching connect().
+   */
+  async toolManifest(): Promise<ToolManifestEntry[]> {
+    const out: ToolManifestEntry[] = [];
+    for (const provider of this.providerIds) {
+      const enabled = this.channel && this.channelTools
+        ? await this.channelTools.isEnabled(this.identity.teamId, this.channel, provider)
+        : true;
+      const mode = this.channel && this.channelConfig
+        ? await this.channelConfig.getMode(this.identity.teamId, this.channel, provider)
+        : null;
+      out.push({ provider, mode, enabled });
+    }
+    return out;
   }
 
   /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
@@ -332,6 +370,8 @@ export async function createVouchr(opts: VouchrOptions) {
   const audit = new Audit(db);
   const consent = new Consent(db);
   const channelConfig = new ChannelConfig(db);
+  const channelTools = new ChannelTools(db);
+  const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
   const policy = opts.policy ?? new Policy();
   const resolvers = opts.resolvers ?? {};
   const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
@@ -388,8 +428,10 @@ export async function createVouchr(opts: VouchrOptions) {
         redirectUri,
         resolvers,
         channelConfig,
+        channelTools,
         inflight,
         sink,
+        providerIds,
       );
     }
     await args.next();
@@ -432,7 +474,8 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Build a per-request ConnectContext bound to a specific channel (for the modal submit). */
   function contextFor(identity: SlackIdentity, channel: string | null, client: WebClient): ConnectContext {
     return new ConnectContext(
-      identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers, channelConfig, inflight, sink,
+      identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
+      channelConfig, channelTools, inflight, sink, providerIds,
     );
   }
 
@@ -451,7 +494,48 @@ export async function createVouchr(opts: VouchrOptions) {
       const identity = resolveIdentity({ body: command });
       if (!identity) return respond('Could not resolve your Slack identity.');
 
-      const [sub, arg] = String(command.text ?? '').trim().split(/\s+/);
+      const [sub, arg, arg2] = String(command.text ?? '').trim().split(/\s+/);
+
+      // List the channel's tool manifest (which providers an agent may use here + their mode).
+      if (sub === 'tools') {
+        if (!command.channel_id) return respond('Run `/vouchr tools` from inside a channel.');
+        const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
+        if (!manifest.length) return respond('No providers are registered.');
+        const lines = manifest
+          .map((m) => `• *${m.provider}* — ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}`)
+          .join('\n');
+        return respond(`Tools for <#${command.channel_id}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`);
+      }
+
+      // Enable/disable a provider in this channel. Admin-gated (default-deny) + audited as 'config'.
+      if (sub === 'enable' || sub === 'disable') {
+        if (!arg) return respond(`Usage: \`/vouchr ${sub} <provider>\``);
+        if (!command.channel_id) return respond(`Run \`/vouchr ${sub}\` from inside the channel you want to configure.`);
+        if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
+        if (!(await isSlackAdmin(client, identity.userId))) {
+          await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
+          return respond('Only a workspace admin can change channel tools.');
+        }
+        const on = sub === 'enable';
+        await channelTools.setEnabled(identity.teamId, command.channel_id, arg, on);
+        await audit.record('config', identity, arg, { owner: 'channel', channel: command.channel_id, tool: on ? 'enabled' : 'disabled' });
+        return respond(`${on ? 'Enabled' : 'Disabled'} *${arg}* in <#${command.channel_id}>.`);
+      }
+
+      // Shortcut for the existing per-channel credential mode (admin-gated + audited in setChannelMode).
+      if (sub === 'mode') {
+        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user')) {
+          return respond('Usage: `/vouchr mode <provider> <shared|per-user>`');
+        }
+        if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');
+        try {
+          await contextFor(identity, command.channel_id, client).setChannelMode(arg, arg2);
+        } catch (e) {
+          return respond((e as Error).message); // never carries a secret
+        }
+        return respond(`Set *${arg}* to *${arg2}* in <#${command.channel_id}>.`);
+      }
+
       if (sub === 'configure') {
         if (!arg) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');

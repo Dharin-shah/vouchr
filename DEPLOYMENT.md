@@ -180,3 +180,88 @@ yours. Don't go live until each holds.
 
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as
 having run this in production — Vouchr has not yet been run in production. Treat this list as the gap.
+
+## Key rotation
+
+How rotation works depends on which at-rest mode you run (`src/core/crypto.ts`).
+
+### Direct master-key mode (default)
+
+Token columns are encrypted *directly* under `VOUCHR_MASTER_KEY` (legacy format, no
+version byte). The same key encrypts and decrypts every vaulted row, so:
+
+- **Rotating `VOUCHR_MASTER_KEY` makes every existing encrypted row undecryptable.**
+  `open()` will fail the GCM tag check and throw; `vault.get()` then breaks for those
+  connections. A key change here is only safe if every row is re-encrypted under the
+  new key.
+- **There is no built-in re-encryption tool yet.** Re-encrypting means, for each
+  vaulted `connection` row (and each `installation` row), decrypting
+  `access_token_enc` / `refresh_token_enc` (and `bot_token` / `data`) under the old
+  key and re-sealing under the new one. External-reference rows (`source != 'vault'`)
+  hold no ciphertext and are unaffected. Until such a tool exists, plan a maintenance
+  window and write a one-off migration, or take the simpler path: have users
+  reconnect (a reconnect re-vaults under the current key via `upsert`).
+- **Compromise response in this mode** is therefore disruptive: rotate the key, and
+  either re-encrypt or force reconnect. Revoke the affected provider tokens upstream
+  regardless — a leaked master key means the ciphertext may already be decrypted.
+
+For any deployment where you expect to rotate, **prefer envelope mode** below.
+
+### Envelope mode (KMS-wrapped data keys) — recommended for rotatable deploys
+
+With an `EnvelopeProvider`, each secret has its own data key (DEK) wrapped by your
+external key-encryption key (KEK) in KMS/Vault. Scheme `0x01` rows store the *wrapped*
+DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`).
+
+- **Rotate the KEK in KMS, not the rows.** AWS KMS (and equivalents) version the key
+  under a stable key id / alias: rotation creates a new backing key while the old
+  versions stay available for decrypt. Existing `0x01` rows keep decrypting because
+  KMS still unwraps their DEKs — **no row re-encryption needed.** New writes are
+  wrapped under the new KEK version automatically.
+- **What rotation requires** is only that the KEK (every version any stored DEK was
+  wrapped under) remains available to `unwrapDataKey`. Do not disable or schedule
+  deletion of an old KEK version while rows wrapped under it still exist.
+- **`VOUCHR_MASTER_KEY` in envelope mode** still encrypts any *legacy* rows written
+  before you enabled envelope (reads dispatch on format). Don't drop it until those
+  rows are gone (re-vaulted via reconnect or a future re-encryption pass).
+
+## Backup and restore
+
+The credential store and the key that protects it must be backed up **separately**.
+
+### What to back up, and the cardinal rule
+
+- **Direct mode:** the DB (SQLite file or Postgres dump) holds only ciphertext for
+  token columns; the master key (`VOUCHR_MASTER_KEY`) is what makes it readable.
+  Back up the key separately, in your secret manager — **never alongside the DB
+  backup.** A backup that contains both the ciphertext and the key is a single point
+  of compromise that leaks everything; a DB backup without the key is useless to an
+  attacker (and useless to you for restore — hence "separately", not "not at all").
+- **Envelope mode:** token DEKs are wrapped by the KMS KEK, so a DB backup is inert
+  without KMS access. Back up nothing key-related yourself — just ensure the KEK
+  (and every version any backed-up row was wrapped under) is retained in KMS for the
+  life of the backup. Treat scheduled KEK deletion as a backup-invalidating event.
+- **External-reference rows** contain no secret at all (only an ARN-style `secret_ref`);
+  the secret lives in the external manager and is backed up there, on its own policy.
+- **Never commit `VOUCHR_MASTER_KEY`** (or any key) to source control or bake it into
+  an image. Keep it in a secret manager; the DB backup goes to encrypted, access-
+  controlled storage.
+
+### Backing up
+
+- **SQLite:** stop writers or use SQLite's online backup / `VACUUM INTO` to get a
+  consistent copy (the DB runs in WAL mode — copying the bare `.db` file mid-write can
+  miss the `-wal`/`-shm` sidecars). Store the copy encrypted at rest.
+- **Postgres:** `pg_dump` (or your managed-DB snapshot mechanism) on its own schedule.
+
+### Restoring
+
+1. Restore the DB (SQLite file in place, or `pg_restore` / snapshot).
+2. Make the key available to the *same* process: set `VOUCHR_MASTER_KEY` to the exact
+   key the rows were sealed under (direct mode), or grant the restored process KMS
+   access to the KEK that wraps their DEKs (envelope mode). A wrong/missing key fails
+   closed — decrypt throws, it does not silently return garbage.
+3. External-reference rows need their resolver IAM/role intact for the restored
+   environment; the secrets themselves are restored on the external manager's policy.
+4. Verify: a `connect()` + `handle.fetch()` against one connection per mode confirms
+   decrypt works end to end before you cut traffic over.
