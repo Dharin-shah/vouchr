@@ -1,0 +1,5 @@
+# Gitleaks config — inherit the full built-in ruleset, no custom rules needed.
+# ponytail: defaults cover us; add [[rules]] / [allowlist] only when a real
+# false-positive or repo-specific secret pattern shows up.
+[extend]
+useDefault = true

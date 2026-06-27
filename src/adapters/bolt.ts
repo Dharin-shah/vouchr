@@ -9,7 +9,7 @@ import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
 import { resolveIdentity, isSlackAdmin, type SlackIdentity } from '../core/identity';
 import { userOwner, channelOwner } from '../core/owner';
-import { ConnectionHandle, type Resolvers } from '../core/injector';
+import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo } from '../core/channelConfig';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser } from '../core/offboard';
@@ -66,6 +66,13 @@ export interface VouchrOptions {
    * as before (direct master-key encryption). Either way, existing rows still decrypt.
    */
   envelope?: EnvelopeProvider;
+  /**
+   * Optional structured, NO-SECRET event hook for metrics/logs. Called fire-and-forget at key
+   * points (inject, refresh, egress deny, connect, revoke, sweep). A throwing sink never affects
+   * behavior. Events carry only non-secret fields (provider id, host, status, counts, booleans) —
+   * never tokens, references, or user/team ids.
+   */
+  onEvent?: EventSink;
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -84,7 +91,18 @@ export class ConnectContext {
     private channelConfig?: ChannelConfig,
     // Shared single-flight refresh map (see ConnectionHandle). One per createVouchr instance.
     private inflight: Map<string, Promise<string | null>> = new Map(),
+    // No-secret observability hook. Default no-op (zero behavior change when unset).
+    private sink: EventSink = () => {},
   ) {}
+
+  /** Fire the sink, swallowing any error — a bad sink must never break a request. */
+  private emit(e: VouchrEvent): void {
+    try {
+      this.sink(e);
+    } catch {
+      // ignore: observability is best-effort, never fatal
+    }
+  }
 
   /**
    * Return a leak-safe handle for the user's connection to `providerId`.
@@ -96,18 +114,20 @@ export class ConnectContext {
 
     if (!this.policy.check(providerId, this.channel)) {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
+      this.emit({ type: 'policy_denied', provider: providerId });
       throw new Error(`Policy denies "${providerId}" in this channel.`);
     }
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
       return new ConnectionHandle(
-        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight,
+        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink,
       );
     }
 
     // Key providers have no OAuth — post a self-service "set up your key" prompt instead.
     if (provider.credential === 'key') {
       await this.postKeySetupPrompt(providerId);
+      this.emit({ type: 'connect_prompted', provider: providerId });
       throw new ConsentRequiredError(providerId);
     }
 
@@ -118,6 +138,7 @@ export class ConnectContext {
       this.channel,
     );
     await this.postConnectPrompt(providerId, authorizeUrl);
+    this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId);
   }
 
@@ -256,6 +277,7 @@ export class ConnectContext {
     // Same provider/channel policy gate as connect() — a deny applies to shared channel creds too.
     if (!this.policy.check(providerId, this.channel)) {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
+      this.emit({ type: 'policy_denied', provider: providerId });
       throw new Error(`Policy denies "${providerId}" in this channel.`);
     }
     if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
@@ -268,7 +290,7 @@ export class ConnectContext {
     // ponytail: one conversations.info per use (Slack Tier-3 ~50/min); cache the class with a short
     // TTL if a hot channel throttles. Correctness first — a channel turned Slack-Connect must stop now.
     await this.assertChannelEligible();
-    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight);
+    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink);
   }
 
   /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
@@ -317,6 +339,16 @@ export async function createVouchr(opts: VouchrOptions) {
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
+  const sink: EventSink = opts.onEvent ?? (() => {});
+  // Safe emit for the createVouchr-level paths (OAuth callback, disconnect) that aren't inside a
+  // ConnectContext/ConnectionHandle. A throwing sink must never break a request.
+  const emit = (e: VouchrEvent): void => {
+    try {
+      sink(e);
+    } catch {
+      // ignore: observability is best-effort, never fatal
+    }
+  };
 
   /**
    * The WebClient used to post the post-OAuth confirmation DM. With an installationStore,
@@ -357,6 +389,7 @@ export async function createVouchr(opts: VouchrOptions) {
         resolvers,
         channelConfig,
         inflight,
+        sink,
       );
     }
     await args.next();
@@ -376,6 +409,7 @@ export async function createVouchr(opts: VouchrOptions) {
           error == null ? undefined : String(error),
         );
         if (!result.ok) return res.status(result.status).send(result.error);
+        emit({ type: 'connected', provider: result.provider });
 
         // Best-effort nudge back into Slack, from the connecting user's own workspace.
         const client = await confirmClientFor(result.identity);
@@ -398,7 +432,7 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Build a per-request ConnectContext bound to a specific channel (for the modal submit). */
   function contextFor(identity: SlackIdentity, channel: string | null, client: WebClient): ConnectContext {
     return new ConnectContext(
-      identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers, channelConfig, inflight,
+      identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers, channelConfig, inflight, sink,
     );
   }
 
@@ -442,6 +476,7 @@ export async function createVouchr(opts: VouchrOptions) {
           ok = false;
         }
         await audit.record('revoke', identity, arg, { ok }); // never the token
+        emit({ type: 'revoked', provider: arg, ok });
         return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
       }
 
@@ -536,7 +571,7 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /** Delete every connection past its TTL + clear stale consent. Run on a timer. */
   function sweep(): Promise<number> {
-    return sweepExpired(vault, audit, consent);
+    return sweepExpired(vault, audit, consent, sink);
   }
 
   return {

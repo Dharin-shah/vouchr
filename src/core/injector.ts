@@ -9,6 +9,25 @@ import { refreshToken } from './tokens';
 export type Resolvers = Record<string, (ref: string) => Promise<string>>;
 
 /**
+ * A structured, NO-SECRET observability event. Operators wire a single `EventSink` to feed
+ * metrics/logs. Fields are non-secret only — provider id, host, status, counts, booleans.
+ * NEVER carries tokens, secretRef values, user/team ids, or any user content.
+ */
+export type VouchrEvent =
+  | { type: 'injected'; provider: string; host: string; status: number; ownerKind: 'user' | 'channel' }
+  | { type: 'refreshed'; provider: string }
+  | { type: 'egress_denied'; provider: string; host: string }
+  | { type: 'resolver_failed'; provider: string; source: string }
+  | { type: 'connect_prompted'; provider: string }
+  | { type: 'connected'; provider: string }
+  | { type: 'policy_denied'; provider: string }
+  | { type: 'revoked'; provider: string; ok: boolean }
+  | { type: 'expired'; count: number };
+
+/** Fire-and-forget event sink. Sync; a throwing sink must never affect request behavior. */
+export type EventSink = (e: VouchrEvent) => void;
+
+/**
  * A handle to a connection. The caller (and any LLM) gets this object, NEVER the
  * secret. The credential is attached to the outbound request inside `fetch`, after
  * the egress allowlist check.
@@ -31,7 +50,18 @@ export class ConnectionHandle {
     // Shared across handles so concurrent fetches for the same owner+provider refresh once.
     // Default = per-instance (no cross-request dedup) — fine for direct construction in tests.
     private inflight: Map<string, Promise<string | null>> = new Map(),
+    // No-secret observability hook. Default no-op (zero behavior change when unset).
+    private sink: EventSink = () => {},
   ) {}
+
+  /** Fire the sink, swallowing any error — a bad sink must never break a request. */
+  private emit(e: VouchrEvent): void {
+    try {
+      this.sink(e);
+    } catch {
+      // ignore: observability is best-effort, never fatal
+    }
+  }
 
   async account(): Promise<string | null> {
     return (await this.vault.get(this.owner, this.provider.id))?.externalAccount ?? null;
@@ -41,6 +71,7 @@ export class ConnectionHandle {
     const url = new URL(input);
     // Egress allowlist first — before any secret is even read.
     if (!this.provider.egressAllow.includes(url.hostname)) {
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(
         `Egress blocked: "${url.hostname}" is not in the allowlist for provider "${this.provider.id}"`,
       );
@@ -48,6 +79,7 @@ export class ConnectionHandle {
     // The caller (and the LLM) controls this URL. Require https so the bearer is never sent in
     // cleartext (it goes out before any http→https redirect). Loopback is exempt for local dev.
     if (url.protocol !== 'https:' && !LOOPBACK.has(url.hostname)) {
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(`Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
 
@@ -79,6 +111,8 @@ export class ConnectionHandle {
     await this.audit
       .record('inject', this.acting, this.provider.id, { host: url.hostname, status: res.status })
       .catch(() => undefined);
+    // No-secret observability: provider/host/status/ownerKind only — never the token or the actor.
+    this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind });
     return res;
   }
 
@@ -91,7 +125,12 @@ export class ConnectionHandle {
     if (!cred.secretRef) {
       throw new Error(`Referenced connection for "${this.provider.id}" has no secret_ref`);
     }
-    return resolver(cred.secretRef);
+    try {
+      return await resolver(cred.secretRef);
+    } catch (e) {
+      this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
+      throw e;
+    }
   }
 
   private async vaultToken(cred: StoredCredential): Promise<string> {
@@ -131,6 +170,7 @@ export class ConnectionHandle {
       expiresAt: refreshed.expiresAt,
     });
     await this.audit.record('refresh', this.acting, this.provider.id, {});
+    this.emit({ type: 'refreshed', provider: this.provider.id });
     return refreshed.accessToken;
   }
 }

@@ -1,0 +1,27 @@
+# Release stub — intentionally DISABLED.
+#
+# Signed releases / SLSA provenance are out of scope for now: they require
+# signing keys / publish credentials this repo does not have. When that lands,
+# add the trigger and steps below and supply the needed secrets.
+#
+# name: Release
+#
+# on:
+#   push:
+#     tags: ['v*']
+#
+# permissions:
+#   contents: write
+#   id-token: write   # for OIDC-based provenance / keyless signing
+#
+# jobs:
+#   release:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+#       - uses: actions/setup-node@v4
+#         with:
+#           node-version: 22
+#           cache: npm
+#       - run: npm ci
+#       # - build, sign (cosign), generate provenance, publish...

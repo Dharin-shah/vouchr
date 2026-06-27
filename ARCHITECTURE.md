@@ -1,0 +1,167 @@
+# Vouchr Architecture
+
+Vouchr is a self-hosted Slack credential broker built on a single idea: the agent
+receives a **capability handle**, never a secret. A user connects an account once via
+an in-Slack button; Vouchr stores the token encrypted, keyed to the Slack identity (or
+to a channel, for shared service accounts), and injects it **only at the outbound HTTP
+boundary**, after an egress-allowlist check — so the token never reaches the agent code,
+the LLM, the chat transcript, logs, or the audit table. Credentials are owner-scoped
+(per-user by default, per-channel when an admin configures it) and isolated per Slack
+tenant.
+
+## Component / data flow
+
+```mermaid
+flowchart LR
+    user["Slack user"]
+
+    subgraph adapter["src/adapters (Slack-specific)"]
+        mw["Bolt middleware\n→ context.vouchr"]
+        cb["OAuth callback route\n(mountRoutes)"]
+        cmd["/vouchr command\n+ modals (registerCommands)"]
+        instore["DbInstallationStore"]
+    end
+
+    subgraph core["src/core (transport-agnostic)"]
+        cc["ConnectContext\n(connect / connectChannel)"]
+        consent["Consent\n(state + PKCE)"]
+        oauth["handleOAuthCallback\n+ tokens (exchange/refresh/revoke)"]
+        vault["Vault\n(owner-keyed store)"]
+        handle["ConnectionHandle\n(egress check + inject)"]
+        crypto["crypto\n(AES-GCM / envelope)"]
+        audit["Audit\n(redacting)"]
+    end
+
+    db[("SQLite / Postgres")]
+    prov["Provider API"]
+    kms["KMS / secret manager"]
+
+    user -->|verified event| mw --> cc
+    cc -->|"connect phase:\nno credential yet"| consent --> user
+    user -->|authorize in browser| cb --> oauth --> vault
+    cc -->|"use phase:\ncredential exists"| handle
+    handle -->|token injected| prov
+    vault <--> crypto <--> db
+    crypto <--> kms
+    handle --> vault
+    handle --> audit --> db
+    cmd --> cc
+    instore --> db
+```
+
+Two phases:
+
+- **Connect phase** (first time). `context.vouchr.connect('github')` finds no stored
+  credential, so the adapter posts an ephemeral Block Kit "Connect" button (only the
+  user sees it), records a single-use OAuth `state` + PKCE verifier, and throws
+  `ConsentRequiredError` — control flow, not an error. The browser OAuth returns to the
+  callback route, which consumes the state, exchanges the code, and vaults the encrypted
+  token. Key providers instead get a private modal where the user pastes a key or an
+  external reference.
+- **Use phase** (every call after). `connect()` finds the stored credential and returns
+  a `ConnectionHandle`. `handle.fetch(url)` checks the egress allowlist, reads the
+  secret, injects it, calls the provider, refreshes on 401 if needed, and records an
+  `inject` audit entry attributed to the acting human.
+
+## Core / adapter boundary
+
+The security logic lives in `src/core/`, which is **transport-agnostic** — it imports
+nothing from `@slack/*` or `src/adapters/`. The Bolt adapter (`src/adapters/bolt.ts`)
+is a thin consumer: it resolves identity and channel from verified Slack events, fetches
+Slack-side facts (admin status, channel class), and delegates every security decision to
+core.
+
+This boundary is enforced by `test/architecture.test.ts`, which scans every file in
+`src/core/` and fails if any imports `@slack/*` or `../adapters/`. The same test asserts
+the channel-eligibility rule (`channelIneligibleReason`) lives in core.
+
+Why it matters: the boundary is what lets a future **sidecar + thin clients** (other
+languages) reuse the identical core — and its security rules — instead of
+re-implementing them. The eligibility classification, owner keying, egress check, and
+crypto are all decided in one place; an adapter only supplies inputs (e.g.
+`conversations.info` output is passed to `channelIneligibleReason`, which fails closed on
+`null`).
+
+## Storage schema
+
+One store, two backends — SQLite (embedded, zero-config default) or Postgres (stateless
+/ multi-instance) — behind a minimal async `Db` seam (`src/core/db.ts`, `?`
+placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
+
+| Table | Purpose | Key |
+| --- | --- | --- |
+| `connection` | Credentials (vaulted or external-reference) | UNIQUE `(team_id, owner_kind, owner_id, provider)` |
+| `consent_request` | In-flight OAuth `state` + PKCE verifier | PK `state` |
+| `channel_config` | Per-channel mode (`shared` / `per-user`) | PK `(team_id, channel, provider)` |
+| `audit` | Append-only action log | PK `id` |
+| `installation` | Encrypted Slack install (bot/user tokens) for multi-workspace | PK rowKey `(enterprise, team)` |
+
+The **owner key `(team_id, owner_kind, owner_id, provider)`** is the heart of the model:
+every vault read/write is scoped by it, and the UNIQUE constraint enforces one credential
+per principal+provider. `owner_kind` is `user` or `channel`; `team_id` is always the
+authenticated user's, never derived from a channel id (`src/core/owner.ts`). This is the
+tenant- and owner-isolation boundary.
+
+Token columns (`access_token_enc`, `refresh_token_enc`) and the installation
+`bot_token`/`data` are encrypted; the rest of each row is plaintext (see
+[SECURITY.md](./SECURITY.md) for at-rest caveats). A `source` of `vault` means Vouchr
+holds the encrypted secret; any other `source` means the row stores a non-secret
+`secret_ref` resolved just-in-time.
+
+## Provider model
+
+A `Provider` is **declarative OAuth2** (`src/core/providers.ts`): `authorizeUrl`,
+`tokenUrl`, `scopesDefault`, a `refresh` strategy (`rotating` / `static` / `none`),
+`pkce`, and an `egressAllow` host list. Built-ins: `github()`, `google()`, `gitlab()`,
+`notion()`; most custom providers are ~10 lines via `defineProvider`. Knobs cover
+real-world divergence without special-casing: `tokenAuth: 'basic'` and
+`bodyFormat: 'json'` (Notion), `authorizeParams` (Google's `access_type=offline`),
+`inject` (non-Bearer attach, e.g. `x-api-key`).
+
+- **Key providers** (`credential: 'key'`) carry no OAuth client; the user pastes a static
+  key or an external reference into a private modal.
+- **Revoke** is declarative (RFC 7009 `revokeUrl` + optional `revokeAuth: 'body'`) with a
+  `revoke` function escape hatch for non-standard endpoints (GitHub's DELETE + Basic
+  auth). Honest no-op when a provider has no documented endpoint (Notion).
+- **Envelope encryption** is optional (`EnvelopeProvider`, `src/core/crypto.ts`): a fresh
+  per-secret data key encrypts the secret and is wrapped by an external KEK (KMS/Vault).
+  Without it, secrets are encrypted directly under the master key (legacy format, no
+  version byte). Reads dispatch on the stored format, so both modes read existing rows.
+- **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
+  an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
+  non-secret ref and resolves it JIT at injection time — never persisted, cached, or
+  logged. Rotation stays where the secret lives.
+
+## Lifecycle
+
+```
+consent → callback → vault → inject → refresh → TTL/sweep → offboard/revoke
+```
+
+1. **Consent** (`src/core/consent.ts`). `begin()` mints a single-use `state` (32 random
+   bytes) + PKCE verifier, persists the consent row, and builds the provider authorize
+   URL.
+2. **Callback** (`src/core/oauthCallback.ts`). `consume()` atomically deletes the state
+   (`DELETE ... RETURNING`, single-use, 10-min TTL), the code is exchanged for tokens,
+   an optional `accountProbe` fetches a human-readable label, and the token is vaulted.
+3. **Vault** (`src/core/vault.ts`). `upsert` stores a vaulted credential (resets
+   `created_at`); `reference` stores an external-ref credential; both are owner-keyed.
+4. **Inject** (`src/core/injector.ts`). `handle.fetch()` enforces egress allowlist +
+   HTTPS, reads/resolves the secret, attaches it (`redirect: 'manual'`), touches the idle
+   timer, and audits as the acting human.
+5. **Refresh.** On a 401 (or near-expiry) for a vaulted OAuth credential, a single-flight
+   refresh (`inflight` map dedups concurrent refreshes of a rotating token) updates the
+   tokens via `updateTokens` — which leaves `created_at` intact, so refresh cannot defer
+   the max-age TTL.
+6. **TTL / sweep** (`src/core/sweep.ts`, `vault.ts`). `get()` returns `null` for an
+   expired connection (lazy expiry); a periodic `sweepExpired()` deletes idle/aged rows
+   (default idle 7d / max-age 30d) and clears stale consent. Filtering happens in SQL.
+7. **Offboard / revoke** (`src/core/offboard.ts`, `src/core/tokens.ts`). On Slack
+   deactivation (or `/vouchr disconnect`, or a SCIM hook), the local credential is deleted
+   first (the security-meaningful action), pending consent is purged, and an upstream
+   revoke is attempted best-effort. Channel/shared credentials are intentionally left for
+   an admin to review.
+
+See [SECURITY.md](./SECURITY.md) for the security model and limits, and
+[THREAT-MODEL.md](./THREAT-MODEL.md) for trust boundaries, the attacker model, and the
+enforced invariants.
