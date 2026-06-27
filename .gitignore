@@ -10,4 +10,5 @@ dist/
 # Internal notes, design docs, and strategy. Kept local, not part of the public repo.
 HANDOVER.md
 DESIGN.md
+ASSESSMENT.md
 docs/
