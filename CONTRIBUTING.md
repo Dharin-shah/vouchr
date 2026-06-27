@@ -11,7 +11,7 @@ setup, and testing expectations.
 ## Quick start
 
 ```bash
-nvm use            # Node ≥ 18 (developed on 22)
+nvm use            # Node ≥ 20.6 (developed on 22)
 npm install
 npm run typecheck  # must be clean
 npm test           # unit + integration, fully offline

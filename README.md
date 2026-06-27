@@ -140,11 +140,11 @@ For a non-OAuth API, set `credential: 'key'` and how to attach it
 
 A few things an adopter hits in practice:
 
-- **Single workspace / single bot token.** The bot and the post-OAuth confirmation
-  DM both use one `SLACK_BOT_TOKEN`; there's no `InstallationStore`. Credentials are
-  stored keyed by `team_id` (so the store would isolate across workspaces), but the
-  embedded Bolt surface assumes a single workspace / single bot install — org-wide,
-  multi-workspace distribution is not supported.
+- **Workspaces / bot tokens.** A single-workspace app just sets `SLACK_BOT_TOKEN`. For an app
+  installed to many workspaces or org-wide, pass a `DbInstallationStore` to both Bolt's OAuth
+  `installationStore` and `createVouchr({ installationStore })` — the post-OAuth confirmation DM is
+  then sent with the connecting user's own workspace token (resolved per enterprise and team).
+  Credentials are isolated by `team_id` either way.
 - **`ConsentRequiredError` is control flow, not an error.** When a user hasn't
   connected, `connect()` posts the Connect prompt and throws `ConsentRequiredError`.
   Catch it and stop the turn — don't log it as a failure:

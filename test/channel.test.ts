@@ -20,7 +20,7 @@ const provider = defineProvider({
 });
 
 // `convo` shapes the mocked conversations.info: a class object (default normal), or a thrower.
-async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN', convo: any = {}) {
+async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN', convo: any = {}, policy = new Policy()) {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -35,7 +35,7 @@ async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN', convo: an
   } as any;
   const c = new ConnectContext(
     ID, channel, client, new ProviderRegistry([provider]), vault, audit,
-    new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db),
+    new Consent(db), policy, 'http://x', {}, new ChannelConfig(db),
   );
   return { c, db, vault, audit };
 }
@@ -110,6 +110,15 @@ test('connectChannel: handle on shared cred, refuses per-user and unconfigured',
   await ok.c.setChannelMode('mcp', 'per-user');
   assert.equal(await ok.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
   await assert.rejects(async () => ok.c.connectChannel('mcp'), /per-user/);
+});
+
+// Policy denial applies to shared channel creds, not just per-user connect().
+test('connectChannel: refused + audited when policy denies the provider in this channel', async () => {
+  const deny = new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } });
+  const ok = await ctx(true, 'C_FIN', {}, deny);
+  await ok.c.setChannelSecret('mcp', SECRET); // config is admin-gated, not policy-gated
+  await assert.rejects(async () => ok.c.connectChannel('mcp'), /Policy denies/);
+  assert.ok((await auditRows(ok.db)).some((r) => r.action === 'denied'));
 });
 
 // A null channel (e.g. a DM-less context) cannot configure a channel credential.

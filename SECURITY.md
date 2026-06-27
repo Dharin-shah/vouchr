@@ -27,6 +27,28 @@ Of particular interest:
 - **OAuth flow** — `state` reuse/fixation, PKCE downgrade, or open-redirect / egress-allowlist
   bypass at the injection boundary.
 
+## What Vouchr does not protect against
+
+Vouchr is a credential *boundary*, not a complete authorization system. Know its limits:
+
+- **It is not fine-grained authorization.** The egress allowlist restricts which *hosts* a token
+  may be sent to, not which paths, methods, or provider-side scopes. A GitHub handle can call any
+  GitHub API the underlying token permits. Constrain the token's own scopes at the provider.
+- **Provider responses flow back to your agent.** Vouchr keeps the *token* from the agent/LLM, but
+  the response body is returned to your handler. If that data is sensitive, your code (and prompt)
+  must decide what reaches the model or the Slack reply.
+- **Raw keys typed into a Slack modal pass through Slack.** The value is in the modal submission
+  payload. Vouchr never echoes, logs, or stores it unsafely, but an external secret reference (an
+  ARN resolved just in time) avoids putting the secret in Slack at all — prefer it.
+- **Disconnect/offboard is local.** Removing a connection deletes Vouchr's stored credential; it
+  does not revoke the token upstream at the provider. Revoke there too if that matters.
+- **Audit metadata is caller-supplied.** Vouchr's own code keeps secrets out of `audit.meta`
+  (and tests enforce it), but a custom provider/`accountProbe` or caller could put sensitive data
+  in metadata. Don't.
+- **The SQLite file is not wholly encrypted at rest.** Token columns are encrypted; the rest of the
+  row and the file are not. Use disk/database encryption and access control at the infra layer
+  (envelope encryption via an `EnvelopeProvider` raises the bar on the token columns).
+
 ## Operator responsibilities
 
 Vouchr is self-hosted; some of the security posture is yours to own:

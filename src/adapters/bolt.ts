@@ -252,6 +252,11 @@ export class ConnectContext {
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
     const provider = this.registry.get(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
+    // Same provider/channel policy gate as connect() — a deny applies to shared channel creds too.
+    if (!this.policy.check(providerId, this.channel)) {
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
+      throw new Error(`Policy denies "${providerId}" in this channel.`);
+    }
     if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
       throw new Error(`Channel "${channel}" uses per-user credentials for "${providerId}"; use connect() instead.`);
     }
