@@ -1,4 +1,4 @@
-#!/usr/bin/env -S node --import tsx
+#!/usr/bin/env node
 /**
  * vouchr — operator CLI for self-hosted deployments.
  *

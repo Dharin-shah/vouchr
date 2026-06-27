@@ -1,9 +1,8 @@
 name: Release
 
-# Manual-only placeholder so this file is a VALID workflow (never auto-runs, never red-X's the
-# repo). Signed releases / SLSA provenance are out of scope until there are publish credentials
-# and signing keys. When that lands, switch the trigger to `on: push: tags: ['v*']`, add
-# `permissions: { contents: write, id-token: write }`, and the build/sign/publish steps.
+# Manual-only until publish credentials and signing keys exist. When that lands,
+# switch the trigger to version tags, add contents/id-token permissions, and wire
+# the build/sign/publish steps.
 on:
   workflow_dispatch:
 

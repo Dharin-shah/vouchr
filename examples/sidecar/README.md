@@ -9,8 +9,8 @@ This works because the Vouchr core is **transport-agnostic** (enforced by
 `test/architecture.test.ts`): the core has no knowledge of Slack or Bolt. The Bolt adapter is one
 front-end; this sidecar is another. Both drive the same `ConnectionHandle` over the same vault DB.
 
-> This is a **reference implementation**, not a hardened product. It is intentionally placed under
-> `examples/` so it is typechecked against the real `src/` exports for free. See
+> This is a **minimal reference implementation**. It is intentionally placed under
+> `examples/` so it is typechecked against the real `src/` exports. See
 > [What a production sidecar adds](#what-a-production-sidecar-would-add).
 
 ## Why proxy instead of returning the token

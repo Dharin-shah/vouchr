@@ -76,7 +76,7 @@ class HttpError extends Error {
  * Register the built-in providers whose OAuth client env is configured. Built-ins throw at
  * construction if clientId/clientSecret are missing, so we skip the unconfigured ones rather than
  * crash at startup — the sidecar only needs the providers it'll actually serve.
- * ponytail: built-ins only; add custom defineProvider() calls here if you run your own providers.
+ * Built-ins only; add custom defineProvider() calls here if you run your own providers.
  */
 function buildRegistry(): ProviderRegistry {
   const providers: Provider[] = [];

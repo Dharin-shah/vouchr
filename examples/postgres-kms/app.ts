@@ -11,8 +11,8 @@ import { loadMasterKey } from '../../src/core/crypto';
  * Envelope encryption with AWS KMS. Each stored secret gets a fresh data key (DEK)
  * that Vouchr wraps with your KMS key (the KEK) and stores alongside the ciphertext.
  *
- * This is a STUB so the example typechecks WITHOUT pulling in @aws-sdk/client-kms.
- * Replace the two bodies with the real calls (sketched in the comment) before use.
+ * This template typechecks WITHOUT pulling in @aws-sdk/client-kms.
+ * Replace the two bodies with the real calls (sketched below) before use.
  *
  *   import { KMSClient, EncryptCommand, DecryptCommand } from '@aws-sdk/client-kms';
  *   const kms = new KMSClient({});                 // region/creds from the default chain
@@ -33,10 +33,10 @@ import { loadMasterKey } from '../../src/core/crypto';
  */
 const kmsEnvelope: EnvelopeProvider = {
   async wrapDataKey(_dek) {
-    throw new Error('TODO: configure KMS — implement wrapDataKey (EncryptCommand)');
+    throw new Error('KMS envelope provider is not configured: implement wrapDataKey with EncryptCommand.');
   },
   async unwrapDataKey(_wrapped) {
-    throw new Error('TODO: configure KMS — implement unwrapDataKey (DecryptCommand)');
+    throw new Error('KMS envelope provider is not configured: implement unwrapDataKey with DecryptCommand.');
   },
 };
 

@@ -8,8 +8,8 @@ All notable changes to this project are documented here. This project adheres to
 The 0.1.0 line is the first production-intended release. Everything below is on `main` and
 green in CI (typecheck + full suite incl. a real Postgres backend). It is **not declared
 production until an independent security review / pen test is completed** — the one gate that
-can't be self-served. (An early `v0.1.0` git tag points at a pre-feature snapshot and will be
-re-cut at the production release.)
+can't be self-served. There is intentionally no `v0.1.0` git tag yet; cut it after external
+validation passes.
 
 ### Core capability
 
@@ -58,12 +58,12 @@ re-cut at the production release.)
 - CI: typecheck + tests (with Postgres) and a security workflow (npm audit, gitleaks, CycloneDX
   SBOM) + dependabot. Property/fuzz tests for egress, redaction, policy, state, and URL building.
 - Docs: README, SECURITY.md, THREAT-MODEL.md, ARCHITECTURE.md, SECURITY-WHITEPAPER.md, DEPLOYMENT.md
-  (incl. key-rotation and backup/restore runbooks), plus runnable examples
-  (bolt-github, google-user, internal-api-key, aws-secrets-manager, postgres-kms, mcp-gateway, sidecar, scim).
+  (incl. key-rotation and backup/restore runbooks), plus examples for Bolt, Google, internal API keys,
+  AWS Secrets Manager, MCP gateway, sidecar, SCIM, and a Postgres+KMS production template.
 - Node ≥ 20.6.
 
 ### Deferred (intentionally out of 0.1.0)
 
 - Intent/session narrowing (enterprise; egress path/method limits provide a baseline today).
-- Signed releases / provenance (needs publish infrastructure; disabled `release.yml` stub in place).
+- Signed releases / provenance (needs publish infrastructure; `release.yml` is manual-only for now).
 - External security review / pen test — the production gate.

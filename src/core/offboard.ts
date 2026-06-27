@@ -99,9 +99,9 @@ export async function offboardUserEverywhere(
     try {
       summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason) });
     } catch {
-      // ponytail: non-fatal per team; local deletes were already attempted inside offboardUser.
-      // Record the team with no providers rather than aborting the whole sweep. Never surface the error
-      // (it could carry connection detail) — secrets stay out of logs/returns.
+      // Non-fatal per team; local deletes were already attempted inside offboardUser. Record the
+      // team with no providers rather than aborting the whole sweep. Never surface the error (it
+      // could carry connection detail) — secrets stay out of logs/returns.
       summary.push({ teamId, providers: [] });
     }
   }

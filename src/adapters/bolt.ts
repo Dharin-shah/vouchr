@@ -334,8 +334,8 @@ export class ConnectContext {
       throw new Error(`You must be a member of this channel to use its shared "${providerId}" credential.`);
     }
     // Defense in depth: re-verify class at use time (a channel can change class after config).
-    // ponytail: one conversations.info per use (Slack Tier-3 ~50/min); cache the class with a short
-    // TTL if a hot channel throttles. Correctness first — a channel turned Slack-Connect must stop now.
+    // This is one conversations.info per use; cache the class with a short TTL if a hot channel
+    // throttles. Correctness first — a channel turned Slack Connect must stop now.
     await this.assertChannelEligible();
     return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink);
   }
