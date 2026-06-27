@@ -1,0 +1,32 @@
+{
+  "name": "vouchr",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Self-hostable, Slack-native credential broker for AI agents.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "pg:up": "docker run --rm -d --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr -p 5433:5432 postgres:16-alpine",
+    "pg:down": "docker rm -f vouchr-pg",
+    "example:github": "node --import tsx examples/bolt-github/app.ts"
+  },
+  "dependencies": {
+    "@slack/bolt": "^3.22.0",
+    "@slack/web-api": "^6.12.0",
+    "better-sqlite3": "^11.0.0",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.20.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.5.0"
+  }
+}
