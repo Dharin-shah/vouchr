@@ -94,6 +94,15 @@ function schema(blob: string, int: string): string {
       actor TEXT,
       meta TEXT,
       at ${int} NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS installation (
+      id TEXT PRIMARY KEY,
+      enterprise_id TEXT,
+      team_id TEXT,
+      bot_token ${blob},
+      data ${blob} NOT NULL,
+      updated_at ${int} NOT NULL
     );`;
 }
 

@@ -1,4 +1,5 @@
 import { WebClient } from '@slack/web-api';
+import type { InstallationStore } from '@slack/bolt';
 import { openDb } from '../core/db';
 import { loadMasterKey } from '../core/crypto';
 import { ProviderRegistry, type Provider } from '../core/providers';
@@ -47,6 +48,13 @@ export interface VouchrOptions {
   policy?: Policy;
   /** Bot token used only to post the "connected" confirmation back to Slack. */
   botToken?: string;
+  /**
+   * Multi-workspace token source. When set, the post-OAuth confirmation DM is sent with the
+   * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
+   * so an app installed to many workspaces / org-wide works. When omitted, behaves exactly as
+   * before — a single `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
+   */
+  installationStore?: InstallationStore;
   /** Connection lifetime. Defaults to idle 7d / max-age 30d. Pass `{}` to disable expiry. */
   ttl?: TtlPolicy;
   /** External secret-manager resolvers, keyed by source id (e.g. { 'aws-sm': resolveArn }). */
@@ -304,6 +312,26 @@ export async function createVouchr(opts: VouchrOptions) {
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
 
+  /**
+   * The WebClient used to post the post-OAuth confirmation DM. With an installationStore,
+   * resolve the connecting user's own workspace bot token via fetchInstallation; without one,
+   * fall back to the single env/opts token (unchanged behavior). The DM is best-effort, so a
+   * missing install just means no nudge — never throw, and never log the token.
+   */
+  async function confirmClientFor(identity: SlackIdentity): Promise<WebClient | null> {
+    if (!opts.installationStore) return confirmClient;
+    try {
+      const inst = await opts.installationStore.fetchInstallation({
+        teamId: identity.teamId,
+        enterpriseId: identity.enterpriseId ?? undefined,
+        isEnterpriseInstall: false,
+      });
+      return inst.bot?.token ? new WebClient(inst.bot.token) : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Bolt global middleware: attach `context.vouchr` for each request with a user. */
   const middleware = async (args: any): Promise<void> => {
     const identity = resolveIdentity(args);
@@ -343,9 +371,10 @@ export async function createVouchr(opts: VouchrOptions) {
         );
         if (!result.ok) return res.status(result.status).send(result.error);
 
-        // Best-effort nudge back into Slack.
-        if (confirmClient) {
-          await confirmClient.chat
+        // Best-effort nudge back into Slack, from the connecting user's own workspace.
+        const client = await confirmClientFor(result.identity);
+        if (client) {
+          await client.chat
             .postMessage({
               channel: result.identity.userId,
               text: `✅ ${result.provider} connected${result.account ? ` as ${result.account}` : ''}.`,
