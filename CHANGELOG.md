@@ -3,32 +3,67 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
 
-## [0.1.0]
+## [0.1.0] — production target (pending external validation)
 
-First hardened cut. Not yet published; not yet run in production.
+The 0.1.0 line is the first production-intended release. Everything below is on `main` and
+green in CI (typecheck + full suite incl. a real Postgres backend). It is **not declared
+production until an independent security review / pen test is completed** — the one gate that
+can't be self-served. (An early `v0.1.0` git tag points at a pre-feature snapshot and will be
+re-cut at the production release.)
 
-### Added
+### Core capability
 
-- `examples/slack-manifest.yml` — ready-to-import Slack app manifest (scopes, events,
-  interactivity, the `/vouchr` command).
-- `context.vouchr` is now typed via a `@slack/bolt` module augmentation (no `as any`).
-- Continuous integration: typecheck + test (including a real Postgres backend) on push and PR.
+- Capability-handle broker: `context.vouchr.connect(provider)` returns a handle whose `fetch()`
+  injects the secret only at the outbound HTTP boundary — the agent, LLM, and chat never see it.
+- Per-user and per-channel (admin-configured, shared) credential ownership; owner vs acting-human
+  kept separate for audit attribution.
+- Declarative provider model: OAuth2 + static-key providers, custom header injection, PKCE,
+  Basic token auth, form/JSON token bodies, per-provider egress allowlists; built-ins for
+  GitHub, Google, GitLab, Notion.
+- Storage: SQLite (default) or Postgres, behind a small async driver.
 
-### Fixed
+### Security
 
-- **Postgres pool resilience.** The connection pool now has an `error` listener (an idle-client
-  error no longer crashes the process) and connection/statement timeouts (a slow or down database
-  fails fast instead of hanging the request).
-- **User-key modal submit** now awaits the write — a storage failure surfaces inline instead of
-  becoming an unhandled rejection, and the success DM no longer fires before the write lands.
-- **Token refresh is single-flight** per owner+provider — concurrent calls share one refresh, so a
-  rotating refresh token can no longer brick a connection.
-- **OAuth callback** has an error boundary; an async failure returns a 500 instead of hanging the browser.
-- **Egress requires https** (loopback exempt) so a bearer token is never sent over cleartext.
-- SQLite `busy_timeout`; atomic single-use consent (`DELETE … RETURNING`); post-call bookkeeping is
-  best-effort so it can't discard an already-successful response.
+- At-rest AES-256-GCM (fresh IV per secret); optional KMS-style **envelope encryption** via an
+  `EnvelopeProvider` (per-secret data key wrapped by an external KEK), backward compatible.
+- External secret references (e.g. AWS Secrets Manager ARN) resolved just-in-time, never persisted.
+- Egress allowlist checked before any secret is read; **https required** (loopback exempt);
+  redirects not auto-followed with the credential attached. Optional path/method/validator egress refinement.
+- Single-use OAuth `state` (atomic `DELETE … RETURNING`) + PKCE; full owner-key tenant isolation.
+- **Upstream token revocation** on disconnect/offboard (best-effort, audited), per-provider.
+- Defensive **audit redaction** of credential-shaped values; channel is a first-class audit column.
+- Channel-class restriction: shared channel creds refused in Slack Connect / externally shared,
+  DM/group-DM, and archived channels (fail-closed).
+- Policy gate applied consistently to per-user and shared-channel paths; optional global default-deny.
+- Opt-in `isAdmin` override and `requireChannelMembership` enforcement.
 
-### Changed
+### Lifecycle & operations
 
-- Node ≥ 20.6 (the example uses `--env-file`).
-- Removed dead code (`idKey`) and merged the two duplicated modal-submit handlers into one.
+- Token auto-refresh (single-flight per owner+provider), idle/max-age TTL + sweep, offboarding on
+  Slack deactivation, and cross-team `offboardUserEverywhere` for SCIM/Enterprise-Grid deprovisioning.
+- Multi-workspace support via a DB-backed `DbInstallationStore` (per-workspace bot token resolution).
+- No-secret observability `EventSink` (connect/inject/refresh/deny/revoke/expire events).
+- Operator CLI (`bin/vouchr.ts`): credential inventory, channel config, `doctor`, provider `health`.
+
+### Channel tool plane
+
+- Per-channel provider enablement (`channel_tool`), channel-filtered `toolManifest()`, and
+  `/vouchr tools | enable | disable | mode` (admin-gated). Backward compatible (a channel with no
+  rows enables all).
+
+### Developer & supply-chain
+
+- Transport-agnostic core enforced by `test/architecture.test.ts`, enabling a sidecar + thin
+  clients (reference implementation in `examples/sidecar`).
+- CI: typecheck + tests (with Postgres) and a security workflow (npm audit, gitleaks, CycloneDX
+  SBOM) + dependabot. Property/fuzz tests for egress, redaction, policy, state, and URL building.
+- Docs: README, SECURITY.md, THREAT-MODEL.md, ARCHITECTURE.md, SECURITY-WHITEPAPER.md, DEPLOYMENT.md
+  (incl. key-rotation and backup/restore runbooks), plus runnable examples
+  (bolt-github, google-user, internal-api-key, aws-secrets-manager, postgres-kms, mcp-gateway, sidecar, scim).
+- Node ≥ 20.6.
+
+### Deferred (intentionally out of 0.1.0)
+
+- Intent/session narrowing (enterprise; egress path/method limits provide a baseline today).
+- Signed releases / provenance (needs publish infrastructure; disabled `release.yml` stub in place).
+- External security review / pen test — the production gate.

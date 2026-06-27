@@ -89,13 +89,14 @@ export class Vault {
           external_account, created_at, updated_at, last_used_at)
        VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-         source='vault', access_token_enc=excluded.access_token_enc,
+         source='vault', enterprise_id=excluded.enterprise_id,
+         access_token_enc=excluded.access_token_enc,
          refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
          scopes=excluded.scopes, expires_at=excluded.expires_at,
          external_account=excluded.external_account, updated_at=excluded.updated_at,
          created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
       [
-        randomUUID(), null, owner.teamId, owner.kind, owner.id, provider,
+        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
         accessEnc, refreshEnc,
         t.scopes, t.expiresAt, t.externalAccount, now, now, now,
       ],
@@ -120,12 +121,13 @@ export class Vault {
           external_account, created_at, updated_at, last_used_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)
        ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-         source=excluded.source, access_token_enc=NULL, refresh_token_enc=NULL,
+         source=excluded.source, enterprise_id=excluded.enterprise_id,
+         access_token_enc=NULL, refresh_token_enc=NULL,
          secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
          external_account=excluded.external_account, updated_at=excluded.updated_at,
          created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
       [
-        randomUUID(), null, owner.teamId, owner.kind, owner.id, provider, r.source,
+        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider, r.source,
         r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
       ],
     );

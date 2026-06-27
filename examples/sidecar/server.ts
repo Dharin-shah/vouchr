@@ -198,8 +198,11 @@ export async function startServer(): Promise<ReturnType<typeof createServer>> {
 
   const server = createServer((req, res) => {
     (async () => {
+      const path = (req.url ?? '').split('?')[0];
+      // Unauthenticated liveness probe (no secrets, no DB work) for load balancers / k8s.
+      if (req.method === 'GET' && path === '/health') return send(res, 200, { ok: true });
       if (req.method !== 'POST') throw new HttpError(405, 'POST only');
-      const route = routes[(req.url ?? '').split('?')[0]];
+      const route = routes[path];
       if (!route) throw new HttpError(404, 'no such endpoint');
       if (!authorized(req, token)) throw new HttpError(401, 'unauthorized');
       await route(req, res, deps);
