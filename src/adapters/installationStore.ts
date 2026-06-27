@@ -1,5 +1,5 @@
-import type { Db } from './db';
-import { encrypt, decrypt } from './crypto';
+import type { Db } from '../core/db';
+import { encrypt, decrypt } from '../core/crypto';
 import type { Installation, InstallationQuery, InstallationStore, Logger } from '@slack/bolt';
 
 /**

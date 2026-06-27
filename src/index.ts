@@ -9,7 +9,7 @@ export { ConnectionHandle } from './core/injector';
 export type { Resolvers } from './core/injector';
 export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';
-export { DbInstallationStore } from './core/installationStore';
+export { DbInstallationStore } from './adapters/installationStore';
 // Re-export Bolt's installation types so consumers can wire the store without importing @slack/bolt directly.
 export type { Installation, InstallationQuery, InstallationStore } from '@slack/bolt';
 export type { ChannelMode } from './core/channelConfig';

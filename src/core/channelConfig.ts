@@ -10,6 +10,33 @@ import type { Db } from './db';
  */
 export type ChannelMode = 'shared' | 'per-user';
 
+/** The subset of Slack's conversations.info shape that channel-credential eligibility depends on. */
+export interface ChannelInfo {
+  is_ext_shared?: boolean;
+  is_shared?: boolean;
+  is_pending_ext_shared?: boolean;
+  is_im?: boolean;
+  is_mpim?: boolean;
+  is_archived?: boolean;
+}
+
+/**
+ * Why a channel is INELIGIBLE for a shared (channel-owned) credential (invariant 6), or null if
+ * it's eligible. The classification rule lives in core — transport-agnostic — so every adapter
+ * (the Bolt middleware today, a sidecar + thin clients later) enforces the SAME security rule
+ * instead of re-implementing it. The adapter only fetches the info; pass `null` if it couldn't
+ * (fails closed). Externally shared / Slack Connect is the security-critical case (cross-org leak).
+ */
+export function channelIneligibleReason(info: ChannelInfo | null | undefined): string | null {
+  if (!info) return 'Could not verify the channel type; channel credentials are refused.';
+  if (info.is_ext_shared || info.is_shared || info.is_pending_ext_shared) {
+    return 'Channel credentials are not allowed in externally shared channels.';
+  }
+  if (info.is_im || info.is_mpim) return 'Channel credentials are not allowed in DMs or group DMs.';
+  if (info.is_archived) return 'Channel credentials are not allowed in archived channels.';
+  return null;
+}
+
 /** Store for `(team_id, channel, provider) → mode`. Non-secret; just the policy bit. */
 export class ChannelConfig {
   constructor(private db: Db) {}

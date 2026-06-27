@@ -53,8 +53,12 @@ examples/      bolt-github — runnable demo
 test/          owner · channel · userkey · inject · integration · offline · postgres
 ```
 
-Core is provider- and adapter-agnostic; the Bolt adapter is a thin consumer of it. Keep new
-logic in `core/` unless it is genuinely Bolt-specific.
+Core is provider- and transport-agnostic; the Bolt adapter is a thin consumer of it. Keep new
+logic — especially security logic — in `core/` unless it is genuinely Slack/Bolt-specific (those
+pieces, e.g. the InstallationStore, live in `adapters/`). This boundary is load-bearing: it is what
+will let a sidecar + thin clients (other languages) reuse the same core instead of re-implementing
+the security rules. `test/architecture.test.ts` fails if anything in `core/` imports `@slack/*` or
+the adapter, so don't couple them.
 
 ## Dev setup
 

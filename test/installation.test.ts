@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import type { Installation } from '@slack/bolt';
 import { openDb } from '../src/core/db';
-import { DbInstallationStore } from '../src/core/installationStore';
+import { DbInstallationStore } from '../src/adapters/installationStore';
 
 const KEY = randomBytes(32);
 

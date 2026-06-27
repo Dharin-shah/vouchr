@@ -10,7 +10,7 @@ import { Policy } from '../core/policy';
 import { resolveIdentity, isSlackAdmin, type SlackIdentity } from '../core/identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { ConnectionHandle, type Resolvers } from '../core/injector';
-import { ChannelConfig } from '../core/channelConfig';
+import { ChannelConfig, channelIneligibleReason, type ChannelInfo } from '../core/channelConfig';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser } from '../core/offboard';
 import { sweepExpired } from '../core/sweep';
@@ -174,23 +174,17 @@ export class ConnectContext {
    * cross-org. Error messages name the reason and never carry tokens.
    */
   private async assertChannelEligible(): Promise<void> {
-    let info: any;
+    // Adapter fetches the channel info; the eligibility RULE lives in core (channelIneligibleReason)
+    // so a future sidecar + thin clients enforce the same rule rather than re-implementing it.
+    // null info => fails closed.
+    let info: ChannelInfo | null = null;
     try {
-      info = await this.client.conversations.info({ channel: this.channel! });
+      info = ((await this.client.conversations.info({ channel: this.channel! })) as any)?.channel ?? null;
     } catch {
-      throw new Error('Could not verify the channel type; channel credentials are refused.');
+      info = null;
     }
-    const ch = info?.channel;
-    if (!ch) throw new Error('Could not verify the channel type; channel credentials are refused.');
-    if (ch.is_ext_shared || ch.is_shared || ch.is_pending_ext_shared) {
-      throw new Error('Channel credentials are not allowed in externally shared channels.');
-    }
-    if (ch.is_im || ch.is_mpim) {
-      throw new Error('Channel credentials are not allowed in DMs or group DMs.');
-    }
-    if (ch.is_archived) {
-      throw new Error('Channel credentials are not allowed in archived channels.');
-    }
+    const reason = channelIneligibleReason(info);
+    if (reason) throw new Error(reason);
   }
 
   /**
