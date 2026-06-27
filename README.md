@@ -12,6 +12,36 @@ The user connects once via an in-Slack button. Vouchr stores the token encrypted
 Slack identity, and injects it only at the outbound HTTP call — your code gets a `fetch` handle,
 never the secret.
 
+## How it works
+
+```mermaid
+sequenceDiagram
+    participant U as User (in Slack)
+    participant A as Your agent (Bolt)
+    participant V as Vouchr
+    participant P as Provider API (e.g. GitHub)
+
+    rect rgb(245,245,245)
+    Note over U,P: First time — the user connects their account
+    U->>A: @mention / command
+    A->>V: context.vouchr.connect('github')
+    V-->>U: ephemeral "Connect GitHub" button (only the user sees it)
+    U->>V: authorize in the browser (OAuth)
+    V->>V: store token encrypted, keyed to the Slack identity
+    end
+
+    rect rgb(235,245,235)
+    Note over U,P: Every call after — the agent acts as the user
+    U->>A: @mention / command
+    A->>V: context.vouchr.connect('github') → handle
+    A->>V: handle.fetch(api url)
+    V->>P: request, with the token injected at the HTTP boundary
+    P-->>V: response
+    V-->>A: response (your code and the LLM never see the token)
+    A-->>U: reply
+    end
+```
+
 ## Example
 
 ```ts
