@@ -75,8 +75,8 @@ Boundaries, and what crosses each:
   persisted or cached (`injector.ts:resolveRef`). Both are operator-supplied; Vouchr
   ships no cloud SDK.
 - **Vouchr ↔ provider API.** The only place a secret leaves the process. Egress is
-  restricted to the provider's `egressAllow` host list and forced to HTTPS
-  (`injector.ts:fetch`).
+  restricted to the provider's `egressAllow` host list, forced to HTTPS, and can be
+  narrowed further by optional path/method/validator controls (`injector.ts:fetch`).
 - **LLM / MCP / tool runtime.** Treated as fully untrusted for secrets. They sit
   *inside* the agent boundary and never receive a token by construction.
 
@@ -173,13 +173,14 @@ An attacker with read access to the SQLite file or Postgres.
 An attacker manipulates the request URL or DNS to send the bearer somewhere
 unintended.
 
-- **Mitigated at the host level.** Egress allowlist (`provider.egressAllow`) + HTTPS
-  enforcement + `redirect: 'manual'` (`injector.ts`). The check is on `url.hostname`
-  before the secret is read.
-- **Not mitigated:** path/method/scope-level restriction. The allowlist is host-only;
-  a handle can hit any path the token's own scopes permit (SECURITY.md, "It is not
-  fine-grained authorization"). DNS rebinding against an allowlisted host is not
-  specifically defended; constrain the token's provider-side scopes.
+- **Mitigated before secret access.** Egress allowlist (`provider.egressAllow`) + HTTPS
+  enforcement + `redirect: 'manual'` (`injector.ts`). Optional path/method/validator
+  controls are checked in the same pre-secret block. URLs with embedded userinfo are
+  refused before vault access.
+- **Not fully mitigated:** provider-side scope/action restriction. Even with path/method
+  narrowing, Vouchr is not the provider's authorization engine; constrain the token's
+  own scopes and permissions at the provider. DNS rebinding against an allowlisted host
+  is not specifically defended.
 
 ### Replayed OAuth callback / state
 
@@ -204,10 +205,11 @@ agent keep acting as them.
   (`src/core/offboard.ts`, `consent.deleteForUser`; wired in
   `registerOffboarding`). Local delete happens first (the security-meaningful action);
   upstream revoke is best-effort.
-- **Honest limit:** disconnect/offboard is local — it does not guarantee upstream
-  revocation (best-effort only) and is scoped to the `(team_id, user_id)` the event
-  carries; org-wide Grid deprovisioning should go through SCIM (SECURITY.md,
-  "Disconnect/offboard is local"; offboarding scoping note in `bolt.ts`).
+- **Honest limit:** disconnect/offboard guarantees local deletion first, but upstream
+  provider revocation is best-effort only. The Slack event path is scoped to the
+  `(team_id, user_id)` the event carries; org-wide Grid deprovisioning should go
+  through SCIM (SECURITY.md, "Disconnect/offboard revoke is best-effort"; offboarding
+  scoping note in `bolt.ts`).
 
 ### Slack Connect cross-org exposure
 
@@ -257,10 +259,11 @@ These mirror what the code (and the test suite) enforce:
 Vouchr is a credential *boundary*, not a complete authorization system. The explicit
 non-goals live in [SECURITY.md → "What Vouchr does not protect against"](./SECURITY.md):
 
-- Not fine-grained authorization — egress allowlist is host-level, not path/method/scope.
+- Not provider-side authorization — egress checks can narrow host/path/method, but provider scopes
+  still decide what the credential can actually do.
 - Provider response bodies flow back to the agent once fetched.
 - Raw keys typed into a Slack modal pass through Slack (prefer external references).
-- Disconnect/offboard is local; upstream revocation is best-effort.
+- Disconnect/offboard deletes locally first; upstream revocation is best-effort.
 - Audit metadata is caller-supplied; don't put secrets in it.
 - The SQLite file is not wholly encrypted at rest.
 

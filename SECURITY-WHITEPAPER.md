@@ -90,13 +90,13 @@ row, and the SQLite file as a whole, is *not* encrypted by Vouchr (see Limits).
 
 Vouchr is a credential boundary, not a complete authorization system. See
 [SECURITY.md → "What Vouchr does not protect against"](./SECURITY.md) for the full
-list. In brief: it is **not fine-grained authorization** (the egress allowlist is
-host-level, not path/method/scope by default — constrain the token's own scopes at
-the provider); **provider response bodies flow back** to your agent once fetched;
-**raw keys typed into a Slack modal transit Slack** (prefer an external reference);
-**disconnect/offboard is local** (upstream revocation is best-effort); **audit
-metadata is caller-supplied**; and **the store file is not wholly encrypted at
-rest** — only token columns are.
+list. In brief: it is **not provider-side authorization** (egress checks can narrow
+host/path/method, but the token's own scopes still decide what the provider allows);
+**provider response bodies flow back** to your agent once fetched; **raw keys typed
+into a Slack modal transit Slack** (prefer an external reference);
+**disconnect/offboard revocation is best-effort upstream** after local delete;
+**audit metadata is caller-supplied**; and **the store file is not wholly encrypted
+at rest** — only token columns are.
 
 ## Operational posture
 

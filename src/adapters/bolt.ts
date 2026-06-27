@@ -418,6 +418,11 @@ export async function createVouchr(opts: VouchrOptions) {
       // ignore: observability is best-effort, never fatal
     }
   };
+  const commandAdmin = async (client: WebClient, identity: SlackIdentity): Promise<boolean> => {
+    return opts.isAdmin
+      ? await opts.isAdmin(client, identity.userId, identity.teamId).catch(() => false)
+      : await isSlackAdmin(client, identity.userId);
+  };
 
   /**
    * The WebClient used to post the post-OAuth confirmation DM. With an installationStore,
@@ -544,7 +549,7 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!arg) return respond(`Usage: \`/vouchr ${sub} <provider>\``);
         if (!command.channel_id) return respond(`Run \`/vouchr ${sub}\` from inside the channel you want to configure.`);
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
-        if (!(await isSlackAdmin(client, identity.userId))) {
+        if (!(await commandAdmin(client, identity))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
           return respond('Only a workspace admin can change channel tools.');
         }
@@ -571,7 +576,7 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'configure') {
         if (!arg) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
-        if (!(await isSlackAdmin(client, identity.userId))) {
+        if (!(await commandAdmin(client, identity))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
           return respond('Only a workspace admin can configure channel credentials.');
         }

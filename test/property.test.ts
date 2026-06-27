@@ -44,6 +44,12 @@ const egProvider = defineProvider({
   clientSecret: 'sec',
 });
 
+function pathAllowed(pathname: string, allowed: string): boolean {
+  if (allowed === '/') return true;
+  if (allowed.endsWith('/')) return pathname.startsWith(allowed);
+  return pathname === allowed || pathname.startsWith(`${allowed}/`);
+}
+
 // One handle, reused across iterations; the resolver counter is reset per case. A referenced cred
 // means the ONLY way to read the secret is the resolver — count 0 proves the secret was never read.
 async function makeEgressHandle(provider: Provider) {
@@ -108,14 +114,14 @@ test('property: only matching path+method pass; mismatches denied with secret un
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
     const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
-    const paths = ['/repos/x', '/repos/', '/repos', '/user', '/user/abc', '/secrets', '/other', '/'];
+    const paths = ['/repos/x', '/repos/', '/repos', '/user', '/user/abc', '/userish', '/secrets', '/other', '/'];
     const methods = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'get', 'post'];
     const N = 400;
     for (let i = 0; i < N; i++) {
       const path = pick(paths);
       const method = pick(methods);
       const m = method.toUpperCase();
-      const pathOk = egProvider.egressPaths!.some((p) => path.startsWith(p));
+      const pathOk = egProvider.egressPaths!.some((p) => pathAllowed(path, p));
       const methodOk = egProvider.egressMethods!.some((mm) => mm.toUpperCase() === m);
       reset();
       if (pathOk && methodOk) {

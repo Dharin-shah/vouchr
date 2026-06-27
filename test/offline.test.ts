@@ -144,6 +144,31 @@ test('tokens: client auth + body format honor the provider (Basic+JSON vs body+f
   }
 });
 
+test('tokens: provider-supplied OAuth error text is not propagated', async () => {
+  const realFetch = globalThis.fetch;
+  const leaked = 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    error: 'invalid_grant',
+    error_description: `provider echoed ${leaked}`,
+  }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })) as any;
+  try {
+    await assert.rejects(
+      () => exchangeCode(github({ clientId: 'cid', clientSecret: 'csec' }), 'CODE', 'https://cb', 'v'),
+      (e: any) => {
+        assert.match(e.message, /OAuth error/);
+        assert.ok(!e.message.includes(leaked));
+        assert.ok(!e.message.includes('provider echoed'));
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('injector: egress allowlist blocks disallowed hosts before any token use', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);

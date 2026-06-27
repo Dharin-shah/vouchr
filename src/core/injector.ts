@@ -39,6 +39,12 @@ export type EventSink = (e: VouchrEvent) => void;
  */
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 
+function pathAllowed(pathname: string, allowed: string): boolean {
+  if (allowed === '/') return true;
+  if (allowed.endsWith('/')) return pathname.startsWith(allowed);
+  return pathname === allowed || pathname.startsWith(`${allowed}/`);
+}
+
 export class ConnectionHandle {
   constructor(
     private provider: Provider,
@@ -69,6 +75,10 @@ export class ConnectionHandle {
 
   async fetch(input: string, init: RequestInit = {}): Promise<Response> {
     const url = new URL(input);
+    if (url.username || url.password) {
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      throw new Error(`Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
+    }
     // Egress allowlist first — before any secret is even read.
     if (!this.provider.egressAllow.includes(url.hostname)) {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
@@ -84,7 +94,7 @@ export class ConnectionHandle {
     }
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
     // never reaches the vault — the secret is read strictly after every egress check passes.
-    if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => url.pathname.startsWith(p))) {
+    if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(
         `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`,

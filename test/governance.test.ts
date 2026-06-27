@@ -8,7 +8,7 @@ import { Consent } from '../src/core/consent';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
-import { ConnectContext } from '../src/adapters/bolt';
+import { ConnectContext, createVouchr } from '../src/adapters/bolt';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -103,4 +103,42 @@ test('requireChannelMembership: membership check errors → refused', async () =
   await c.setChannelSecret('mcp', SECRET);
   await assert.rejects(() => c.connectChannel('mcp'), /member of this channel/);
   assert.ok((await auditRows(db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
+});
+
+test('/vouchr commands honor the custom isAdmin override', async () => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const lan = await createVouchr({
+    providers: [provider],
+    baseUrl: 'http://127.0.0.1:1',
+    dbPath: ':memory:',
+    isAdmin: async () => true, // overrides the mocked Slack users.info=false below
+  });
+  let handler: any;
+  lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+
+  const out: string[] = [];
+  let opened: any = null;
+  const client = {
+    users: { info: async () => ({ user: { is_admin: false } }) },
+    views: { open: async (a: any) => { opened = a; } },
+  };
+  const base = { team_id: 'T1', user_id: 'U_ADMIN', channel_id: 'C_FIN', trigger_id: 'trig' };
+
+  await handler({
+    command: { ...base, text: 'enable mcp' },
+    ack: async () => {},
+    respond: async (m: string) => out.push(m),
+    client,
+  });
+  assert.match(out[0], /Enabled/);
+  const row = await lan.db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
+  assert.equal(row.enabled, 1);
+
+  await handler({
+    command: { ...base, text: 'configure mcp' },
+    ack: async () => {},
+    respond: async (m: string) => out.push(m),
+    client,
+  });
+  assert.equal(opened?.trigger_id, 'trig');
 });
