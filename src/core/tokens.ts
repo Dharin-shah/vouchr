@@ -72,3 +72,29 @@ export async function refreshToken(
 ): Promise<TokenResponse> {
   return tokenRequest(provider, { grant_type: 'refresh_token', refresh_token: refresh });
 }
+
+/**
+ * Best-effort upstream token revocation. No-op when the provider declares no revoke
+ * capability (no `revokeUrl`/`revoke`). Uses the provider's `revoke` function for
+ * non-standard endpoints, otherwise POSTs `token=<token>` (form, RFC 7009) to `revokeUrl`,
+ * adding client_id/client_secret when `revokeAuth === 'body'`. NEVER logs the token or puts
+ * it in an error; MAY throw on network/HTTP failure (callers wrap it best-effort).
+ */
+export async function revokeToken(provider: Provider, token: string): Promise<void> {
+  if (provider.revoke) return provider.revoke(provider, token);
+  if (!provider.revokeUrl) return; // no documented revoke (e.g. Notion) — honest no-op
+
+  const fields: Record<string, string> = { token };
+  if (provider.revokeAuth === 'body') {
+    fields.client_id = provider.clientId!;
+    fields.client_secret = provider.clientSecret!;
+  }
+  const res = await fetch(provider.revokeUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(fields).toString(),
+  });
+  if (!res.ok) {
+    throw new Error(`Revoke endpoint ${provider.revokeUrl} returned HTTP ${res.status}`); // never includes the token
+  }
+}

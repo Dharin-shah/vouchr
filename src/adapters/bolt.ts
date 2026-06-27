@@ -13,6 +13,7 @@ import { ConnectionHandle, type Resolvers } from '../core/injector';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo } from '../core/channelConfig';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser } from '../core/offboard';
+import { revokeToken } from '../core/tokens';
 import { sweepExpired } from '../core/sweep';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
@@ -429,11 +430,18 @@ export async function createVouchr(opts: VouchrOptions) {
       }
       if (sub === 'disconnect') {
         if (!arg) return respond('Usage: `/vouchr disconnect <provider>`');
-        // Note: local delete only — the agent immediately loses access, which is the
-        // security-meaningful action. Upstream token revocation when a provider exposes a
-        // revoke endpoint (add provider.revokeUrl then call it best-effort here).
+        // Read the token BEFORE deleting; local delete (the security-meaningful action) FIRST,
+        // then best-effort upstream revoke. A revoke failure is non-fatal — the user still sees
+        // a successful disconnect (local access is already gone).
+        const cred = registry.has(arg) ? await vault.get(userOwner(identity), arg) : null;
         await vault.delete(userOwner(identity), arg);
-        await audit.record('revoke', identity, arg, {});
+        let ok = true;
+        try {
+          if (cred?.accessToken) await revokeToken(registry.get(arg), cred.accessToken);
+        } catch {
+          ok = false;
+        }
+        await audit.record('revoke', identity, arg, { ok }); // never the token
         return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
       }
 
@@ -497,7 +505,7 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /** Remove all of a user's own connections + pending consent (offboarding). */
   function offboard(identity: SlackIdentity): Promise<string[]> {
-    return offboardUser(vault, audit, consent, identity);
+    return offboardUser(vault, audit, consent, identity, registry); // registry → best-effort upstream revoke
   }
 
   /**

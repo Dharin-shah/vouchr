@@ -2,7 +2,34 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 
-/** Append-only audit log. `meta` must NEVER contain token material. */
+/** Shape of `meta` accepted by the audit log — values must NEVER be token material. */
+export type AuditMeta = Record<string, unknown>;
+
+const REDACTED = '[redacted]';
+
+// Clear "this is a credential" signals. Keys are kept; only matching string values are scrubbed.
+const TOKEN_PREFIX = /^(xox[bpars]-|ghp_|gho_|ghu_|ghs_|github_pat_|sk-|sk_|AKIA|Bearer )/;
+// Generic high-entropy secret: one whitespace-free base64/base64url/hex blob, long enough that a
+// channel id (C0123ABC), hostname, or status code can't trip it.
+const HIGH_ENTROPY = /^[A-Za-z0-9_\-+/=]{40,}$/;
+
+function looksSecret(s: string): boolean {
+  return TOKEN_PREFIX.test(s) || HIGH_ENTROPY.test(s);
+}
+
+/** Deep-copy `meta`, replacing any credential-shaped string with a sentinel. Never throws, never mutates input. */
+function redact(value: unknown): unknown {
+  if (typeof value === 'string') return looksSecret(value) ? REDACTED : value;
+  if (Array.isArray(value)) return value.map(redact);
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = redact(v); // keys intact, values scrubbed
+    return out;
+  }
+  return value; // numbers, booleans, null, undefined pass through
+}
+
+/** Append-only audit log. `meta` must NEVER contain token material; defense-in-depth redaction enforces it anyway. */
 export class Audit {
   constructor(private db: Db) {}
 
@@ -10,13 +37,13 @@ export class Audit {
     action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'config',
     i: SlackIdentity,
     provider: string,
-    meta: Record<string, unknown> = {},
+    meta: AuditMeta = {},
     actor?: string,
   ): Promise<void> {
     await this.db.run(
       `INSERT INTO audit (id, team_id, user_id, provider, action, actor, meta, at)
        VALUES (?,?,?,?,?,?,?,?)`,
-      [randomUUID(), i.teamId, i.userId, provider, action, actor ?? null, JSON.stringify(meta), Date.now()],
+      [randomUUID(), i.teamId, i.userId, provider, action, actor ?? null, JSON.stringify(redact(meta)), Date.now()],
     );
   }
 }

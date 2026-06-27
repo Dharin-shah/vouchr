@@ -33,6 +33,19 @@ export interface Provider {
   tokenAuth?: 'body' | 'basic';
   /** Token request body encoding. Default 'form'. */
   bodyFormat?: 'form' | 'json';
+  /**
+   * OPTIONAL upstream token revocation (RFC 7009 style). When unset, revoke is a no-op
+   * (e.g. Notion has no documented endpoint — not faked). The declarative path POSTs
+   * `token=<token>` (form) to `revokeUrl`; `revokeAuth: 'body'` additionally sends
+   * client_id/client_secret in the body (GitLab). `revokeAuth: 'none'` (default) sends no
+   * client auth (Google). For genuinely non-standard endpoints (e.g. GitHub's DELETE with
+   * Basic auth + JSON + client_id in the path) use the `revoke` function escape hatch.
+   */
+  revokeUrl?: string;
+  /** Client auth at the revoke endpoint. Default 'none'. 'body' = client_id/client_secret in the body. */
+  revokeAuth?: 'none' | 'body';
+  /** Escape hatch for non-standard revoke endpoints; takes precedence over `revokeUrl`. */
+  revoke?: (provider: Provider, token: string) => Promise<void>;
   /** Required for `credential: 'oauth'` (the default); unused for `credential: 'key'`. */
   clientId?: string;
   clientSecret?: string;
@@ -68,6 +81,16 @@ export function github(cfg: ProviderConfig = {}): Provider {
     pkce: false, // GitHub OAuth Apps use the client secret, not PKCE
     clientId: cfg.clientId ?? process.env.GITHUB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITHUB_CLIENT_SECRET ?? '',
+    // Non-standard shape (DELETE + Basic + JSON + client_id in the path) → function escape hatch.
+    revoke: async (p, token) => {
+      const creds = Buffer.from(`${p.clientId}:${p.clientSecret}`).toString('base64');
+      const r = await fetch(`https://api.github.com/applications/${p.clientId}/token`, {
+        method: 'DELETE',
+        headers: { Authorization: `Basic ${creds}`, Accept: 'application/vnd.github+json', 'User-Agent': 'vouchr' },
+        body: JSON.stringify({ access_token: token }),
+      });
+      if (!r.ok && r.status !== 404) throw new Error(`GitHub token revoke returned HTTP ${r.status}`); // 404 = already gone
+    },
     accountProbe: async (token) => {
       const r = await fetch('https://api.github.com/user', {
         headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'vouchr' },
@@ -94,6 +117,7 @@ export function google(cfg: ProviderConfig = {}): Provider {
     refresh: 'rotating',
     pkce: true,
     authorizeParams: { access_type: 'offline', prompt: 'consent' },
+    revokeUrl: 'https://oauth2.googleapis.com/revoke', // form token=<token>, no client auth
     clientId: cfg.clientId ?? process.env.GOOGLE_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? '',
     accountProbe: async (token) => {
@@ -117,6 +141,8 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     egressAllow: ['gitlab.com'],
     refresh: 'rotating',
     pkce: true,
+    revokeUrl: 'https://gitlab.com/oauth/revoke', // form client_id+client_secret+token
+    revokeAuth: 'body',
     clientId: cfg.clientId ?? process.env.GITLAB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITLAB_CLIENT_SECRET ?? '',
     accountProbe: async (token) => {

@@ -163,10 +163,20 @@ A few things an adopter hits in practice:
   rest of each row — and the SQLite file as a whole — is not. Keep the DB
   access-controlled and the key in a secret manager; see [SECURITY.md](./SECURITY.md).
 
+## Deployment
+
+[DEPLOYMENT.md](./DEPLOYMENT.md) has copy-pasteable recipes — SQLite vs Postgres, multi-workspace
+installs, the AWS Secrets Manager resolver, optional KMS envelope encryption, the Slack app/OAuth
+flow — and a [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) to work
+through before going live.
+
 ## Status
 
-Pre-1.0. The embedded Bolt surface is built and tested (SQLite + Postgres); not yet run in
-production. See [SECURITY.md](./SECURITY.md) for the security model and reporting, and
+Pre-1.0. The embedded Bolt surface is built, and the full test suite — including the Postgres
+backend — is green in CI on every push and PR. That's CI green, not production mileage: Vouchr has
+not yet been run in production. See the
+[production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before adopting,
+[SECURITY.md](./SECURITY.md) for the security model and reporting, and
 [CONTRIBUTING.md](./CONTRIBUTING.md) to help.
 
 License: [Apache-2.0](./LICENSE).

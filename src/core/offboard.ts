@@ -2,6 +2,8 @@ import type { Vault } from './vault';
 import type { Audit } from './audit';
 import type { Consent } from './consent';
 import type { SlackIdentity } from './identity';
+import type { ProviderRegistry } from './providers';
+import { revokeToken } from './tokens';
 import { userOwner } from './owner';
 
 /**
@@ -21,16 +23,30 @@ export async function offboardUser(
   audit: Audit,
   consent: Consent,
   identity: SlackIdentity,
+  // Optional: when supplied, also revoke each token upstream (best-effort). Omitted callers
+  // keep the prior local-only behavior.
+  registry?: ProviderRegistry,
   reason = 'offboarded',
 ): Promise<string[]> {
   await consent.deleteForUser(identity); // kill pending OAuth so it can't resurrect a connection
+  const owner = userOwner(identity);
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only
   for (const provider of providers) {
-    await vault.delete(userOwner(identity), provider);
-    await audit.record('revoke', identity, provider, { reason });
+    // Read the token BEFORE deleting so we can hand it to the upstream revoke.
+    const cred = registry?.has(provider) ? await vault.get(owner, provider) : null;
+    await vault.delete(owner, provider); // local delete FIRST — the security-meaningful action
+    // Best-effort upstream revocation: swallow per-connection errors so offboarding always completes.
+    const meta: Record<string, unknown> = { reason };
+    if (registry) {
+      let ok = true;
+      try {
+        if (cred?.accessToken) await revokeToken(registry.get(provider), cred.accessToken);
+      } catch {
+        ok = false; // network/HTTP failure — local access is already gone; nothing is faked
+      }
+      meta.ok = ok; // never the token, just whether the upstream call succeeded
+    }
+    await audit.record('revoke', identity, provider, meta);
   }
   return providers;
-  // Note: local delete stops the agent acting as this user immediately, which is the
-  // security-meaningful action. Best-effort upstream revocation (provider.revokeUrl) is a
-  // separate follow-up, not faked here.
 }
