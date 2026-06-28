@@ -60,7 +60,6 @@ jobs:
           if-no-files-found: warn
 
   owasp-dependency-check:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
