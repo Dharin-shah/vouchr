@@ -11,13 +11,13 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 app.event('app_mention', async ({ context, event, client }) => {
   try {
     const gh = await context.vouchr.connect('github');
-    // The token is injected at the HTTP boundary — this code never sees it.
+    // The token is injected at the HTTP boundary. This code never sees it.
     const res = await gh.fetch('https://api.github.com/user');
     const me: any = await res.json();
     await client.chat.postMessage({
       channel: event.channel,
       thread_ts: event.ts,
-      text: `You are *${me.login}* on GitHub — ${me.public_repos} public repos.`,
+      text: `You are *${me.login}* on GitHub, ${me.public_repos} public repos.`,
     });
   } catch (e) {
     if (e instanceof ConsentRequiredError) return; // Connect prompt already posted.
@@ -40,5 +40,5 @@ app.event('app_mention', async ({ context, event, client }) => {
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.start(port);
-  console.log(`⚡ Vouchr GitHub demo on :${port} — callback at ${process.env.PUBLIC_URL}/vouchr/oauth/callback`);
+  console.log(`⚡ Vouchr GitHub demo on :${port}. Callback at ${process.env.PUBLIC_URL}/vouchr/oauth/callback`);
 })();

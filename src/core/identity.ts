@@ -1,4 +1,4 @@
-/** Slack's native identity tuple — the key everything in the vault hangs off. */
+/** Slack's native identity tuple: the key everything in the vault hangs off. */
 export interface SlackIdentity {
   enterpriseId: string | null;
   teamId: string;
@@ -33,7 +33,7 @@ export function resolveIdentity(args: {
 }
 
 /**
- * Whether `userId` is a Slack workspace admin/owner — the gate for channel-credential
+ * Whether `userId` is a Slack workspace admin/owner, the gate for channel-credential
  * config (invariant 7). Fail-closed: any API error or missing flag → not admin.
  */
 export async function isSlackAdmin(
@@ -49,7 +49,7 @@ export async function isSlackAdmin(
 }
 
 /**
- * Whether `userId` is a member of `channel` — the gate for using a SHARED channel credential when
+ * Whether `userId` is a member of `channel`, the gate for using a SHARED channel credential when
  * `requireChannelMembership` is on. Fail-closed: any API error (or a member list we can't read)
  * → not a member, so a non-member can never borrow the channel's cred. Pages conversations.members
  * (Slack returns at most 1000/page) until the user is seen or the cursor runs out; a missing/empty

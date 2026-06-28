@@ -1,9 +1,9 @@
 # MCP gateway with Vouchr
 
 A minimal illustration of Vouchr as the **credential and policy layer in front of
-tools** — the seam where an MCP gateway belongs. The point: a tool call routes
-through Vouchr so the secret stays in the broker, leaves only to an allowlisted
-host, and is attributed to the human who triggered it.
+tools**, the seam where an MCP gateway belongs. A tool call routes through
+Vouchr so the secret stays in the broker, leaves only to an allowlisted host,
+and is attributed to the human who triggered it.
 
 ## Why route MCP/tool calls through Vouchr
 
@@ -14,13 +14,13 @@ host, and is attributed to the human who triggered it.
   the conversation transcript.
 - **Egress allowlist.** Each provider pins the hostnames its credential may be sent
   to. A tool can't be tricked into shipping the GitHub token (or an internal key)
-  to an attacker-controlled URL — the handle refuses any host off the allowlist,
+  to an attacker-controlled URL. The handle refuses any host off the allowlist,
   and requires https.
 - **Channel policy decides the visible tool manifest.** The same `Policy` that gates
   execution also builds the per-channel manifest (`manifestFor`): the agent only
   ever sees tools it can actually run here. In this example the internal-API tool is
   visible only in the ops channel; GitHub is allowed everywhere. The policy is
-  checked **before** the tool runs (and `connect()` re-checks it — defense in depth).
+  checked **before** the tool runs (and `connect()` re-checks it, defense in depth).
 - **Acting-human audit.** Even when a shared channel credential is used, Vouchr
   records the inject against the human who triggered the call, not the credential's
   owner. A shared token never launders away who acted.
@@ -33,7 +33,7 @@ host, and is attributed to the human who triggered it.
 | `manifestFor(channel)` | `ListTools` (policy-filtered manifest) |
 | `dispatch(...)` | `CallTool` handler |
 | `app_mention` handler | the MCP client transport |
-| `handle.fetch(...)` | unchanged — the egress injection point |
+| `handle.fetch(...)` | unchanged, the egress injection point |
 
 Drop a real MCP server in where `dispatch` and `manifestFor` live: serve the
 policy-filtered manifest from `ListTools`, and have `CallTool` policy-check, call
@@ -52,7 +52,7 @@ don't change.
 
 ## Run
 
-Same setup as the other examples — Slack signing secret, bot token, a public
+Same setup as the other examples: Slack signing secret, bot token, a public
 callback origin (`PUBLIC_URL`), GitHub OAuth client env, and `OPS_CHANNEL_ID` for
 the internal tool's allowed channel. Mention the bot with a tool name (e.g.
 `@bot github.whoami`) or with none to list the channel's manifest.

@@ -91,7 +91,7 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
     const posts: any[] = [];
     const client = { chat: { postEphemeral: async (a: any) => posts.push(a), postMessage: async (a: any) => posts.push(a) } };
 
-    // 1. Run the middleware as Bolt would, then call connect() — should prompt + throw.
+    // 1. Run the middleware as Bolt would, then call connect(), should prompt + throw.
     const ctx: any = {};
     await lan.middleware({
       context: ctx,

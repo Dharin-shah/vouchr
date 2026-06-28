@@ -18,7 +18,7 @@ import {
 // calls the provider through `handle.fetch(...)`, so the credential is injected at
 // the egress boundary and never reaches the model or the tool's own code. A
 // per-channel `Policy` decides which tools/providers are usable in the current
-// channel BEFORE the tool runs — that same policy shapes the tool manifest the
+// channel BEFORE the tool runs. That same policy shapes the tool manifest the
 // agent is even allowed to see.
 //
 // This is NOT a full MCP runtime. Tools are modeled as a small typed map and a
@@ -27,7 +27,7 @@ import {
 
 /**
  * An internal/first-party API exposed as a Vouchr provider. It's a `key` provider
- * (a user/admin pastes a static key into a private modal — no OAuth), and its
+ * (a user/admin pastes a static key into a private modal, no OAuth), and its
  * egress allowlist pins the one host its key may ever be sent to. The key is
  * attached as `x-api-key` at the fetch boundary, not by the tool.
  *
@@ -51,7 +51,7 @@ const internalApi = (): Provider =>
 //
 // A tool declares which Vouchr provider it needs and a `run(handle)` that talks to
 // the provider ONLY through the injected handle. It never sees, stores, or logs a
-// token — it gets a `ConnectionHandle` and calls `.fetch(...)`.
+// token: it gets a `ConnectionHandle` and calls `.fetch(...)`.
 interface Tool {
   name: string;
   /** Vouchr provider whose credential this tool needs. */
@@ -108,7 +108,7 @@ function manifestFor(channel: string | null): Tool[] {
 /**
  * Dispatch a tool call. In a real MCP server this is the CallTool handler.
  *
- *   1. Policy gate BEFORE anything runs — defense even if a hidden tool is named.
+ *   1. Policy gate BEFORE anything runs: defense even if a hidden tool is named.
  *   2. Ask Vouchr for a leak-safe handle. connect() re-checks the same policy and,
  *      if the acting user hasn't connected, posts a Connect prompt and throws
  *      ConsentRequiredError (stop this turn). The credential never enters this code.
@@ -150,7 +150,7 @@ app.event('app_mention', async ({ context, event, client }) => {
     await client.chat.postMessage({ channel, thread_ts: event.ts, text });
   } catch (e) {
     if (e instanceof ConsentRequiredError) return; // Connect prompt already posted to the user.
-    // Policy denials and tool errors are safe to surface — they never carry a secret.
+    // Policy denials and tool errors are safe to surface: they never carry a secret.
     await client.chat.postMessage({ channel, thread_ts: event.ts, text: (e as Error).message });
   }
 });
@@ -167,5 +167,5 @@ app.event('app_mention', async ({ context, event, client }) => {
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.start(port);
-  console.log(`Vouchr MCP-gateway demo on :${port} — mention the bot with a tool name.`);
+  console.log(`Vouchr MCP-gateway demo on :${port}. Mention the bot with a tool name.`);
 })();

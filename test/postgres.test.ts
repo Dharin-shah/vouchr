@@ -24,7 +24,7 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
     db = await openDb({ databaseUrl: PG_URL });
     await db.exec('TRUNCATE connection, consent_request, channel_config, audit');
   } catch {
-    t.skip('Postgres not reachable — run `npm run pg:up` to exercise the PG backend');
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
     return;
   }
 

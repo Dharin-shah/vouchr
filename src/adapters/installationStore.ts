@@ -4,10 +4,10 @@ import type { Installation, InstallationQuery, InstallationStore, Logger } from 
 
 /**
  * DB-backed Slack Bolt `InstallationStore` so ONE Vouchr deployment serves MANY
- * workspaces — and org-wide / Enterprise Grid installs. Without it Vouchr only knows
+ * workspaces, and org-wide / Enterprise Grid installs. Without it Vouchr only knows
  * the single env bot token and just one workspace works.
  *
- * The full Installation carries the bot (and user) tokens — secrets — so the JSON is
+ * The full Installation carries the bot (and user) tokens, which are secrets, so the JSON is
  * encrypted at rest with the master key, exactly like the Vault. Rows are keyed by
  * (enterprise_id, team_id) using the same shape Bolt's own stores use.
  */
@@ -59,7 +59,7 @@ export class DbInstallationStore implements InstallationStore {
     if (query.isEnterpriseInstall && query.enterpriseId === undefined) {
       throw new Error('enterpriseId is required to fetch an enterprise installation');
     }
-    // Exact key first; then fall back to the org-wide install — an Enterprise Grid org-wide
+    // Exact key first; then fall back to the org-wide install: an Enterprise Grid org-wide
     // install serves every workspace in the org, so a team-level query must resolve to it.
     const keys = [DbInstallationStore.rowKey(query.enterpriseId, query.teamId, query.isEnterpriseInstall)];
     if (!query.isEnterpriseInstall && query.enterpriseId !== undefined) {

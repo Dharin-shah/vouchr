@@ -27,7 +27,7 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 app.event('app_mention', async ({ context, event, client }) => {
   try {
     // First time a user hits this, connect() posts an ephemeral "set up your key"
-    // button (wired by registerCommands) and throws — no OAuth, no admin needed.
+    // button (wired by registerCommands) and throws: no OAuth, no admin needed.
     const api = await context.vouchr.connect('internal');
     const res = await api.fetch('https://api.internal.example/v1/me');
     const me: any = await res.json();

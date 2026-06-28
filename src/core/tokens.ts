@@ -82,7 +82,7 @@ export async function refreshToken(
  */
 export async function revokeToken(provider: Provider, token: string): Promise<void> {
   if (provider.revoke) return provider.revoke(provider, token);
-  if (!provider.revokeUrl) return; // no documented revoke (e.g. Notion) — honest no-op
+  if (!provider.revokeUrl) return; // no documented revoke (e.g. Notion): honest no-op
 
   const fields: Record<string, string> = { token };
   if (provider.revokeAuth === 'body') {

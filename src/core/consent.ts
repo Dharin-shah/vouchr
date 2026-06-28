@@ -53,7 +53,7 @@ export class Consent {
     return { authorizeUrl: url.toString(), state };
   }
 
-  /** Delete any in-flight consent for a user — prevents a pending OAuth from
+  /** Delete any in-flight consent for a user, preventing a pending OAuth from
    *  resurrecting a connection for a just-offboarded user. */
   async deleteForUser(i: SlackIdentity): Promise<void> {
     await this.db.run(`DELETE FROM consent_request WHERE team_id=? AND user_id=?`, [i.teamId, i.userId]);

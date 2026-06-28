@@ -1,13 +1,13 @@
 # Deploying Vouchr
 
 Concrete recipes for the deployments Vouchr actually supports. Every option named here is real
-(`src/adapters/bolt.ts` → `VouchrOptions`); nothing is invented. For the security model and what
-Vouchr does *not* protect against, see [SECURITY.md](./SECURITY.md) — not repeated here.
+(`src/adapters/bolt.ts` → `VouchrOptions`). For the security model and what
+Vouchr does *not* protect against, see [SECURITY.md](./SECURITY.md), which is not repeated here.
 
 Common to every deploy: a 32-byte `VOUCHR_MASTER_KEY` (`openssl rand -base64 32`) and a public
 HTTPS `baseUrl` reachable at the OAuth callback (`$baseUrl/vouchr/oauth/callback`).
 
-## SQLite (local / single instance) — the default
+## SQLite (local / single instance): the default
 
 Zero config. With no `databaseUrl`, Vouchr opens a SQLite file (`vouchr.db` by default).
 
@@ -20,7 +20,7 @@ const vouchr = await createVouchr({
 ```
 
 Path resolution: `dbPath` option → `VOUCHR_DB` env → `vouchr.db`. Fine for a single instance
-(the file is local). The file is **not** fully encrypted at rest — only token columns are — so put
+(the file is local). The file is **not** fully encrypted at rest (only token columns are), so put
 it on an encrypted, access-controlled volume.
 
 ## Postgres (multi-instance / stateless)
@@ -48,8 +48,8 @@ npm run pg:down # tear it down
 Multi-instance notes:
 - All instances share one Postgres; credentials are isolated by `team_id`, so multiple workspaces
   are safe on one database.
-- For an app installed to **many** workspaces, also wire a `DbInstallationStore` (next section) —
-  it persists per-workspace bot tokens in the `installation` table so any instance can post the
+- For an app installed to **many** workspaces, also wire a `DbInstallationStore` (next section).
+  It persists per-workspace bot tokens in the `installation` table so any instance can post the
   post-OAuth confirmation DM with the connecting user's own workspace token.
 
 ## Multi-workspace install (`DbInstallationStore`)
@@ -108,7 +108,7 @@ interface EnvelopeProvider {
 }
 ```
 
-A real AWS KMS provider — no SDK added to Vouchr, you bring `@aws-sdk/client-kms`:
+A real AWS KMS provider (no SDK added to Vouchr, you bring `@aws-sdk/client-kms`):
 
 ```ts
 import { KMSClient, EncryptCommand, DecryptCommand } from '@aws-sdk/client-kms';
@@ -118,7 +118,7 @@ const KEY_ID = process.env.VOUCHR_KMS_KEY_ID!;
 
 const kmsEnvelope: EnvelopeProvider = {
   // seal() mints its own DEK, so we KMS-Encrypt it to get the wrapped form.
-  // (GenerateDataKey — which returns plaintext + ciphertext DEK in one call — is the
+  // (GenerateDataKey, which returns plaintext + ciphertext DEK in one call, is the
   //  alternative if you let KMS mint the DEK instead.)
   async wrapDataKey(dek) {
     const r = await kms.send(new EncryptCommand({ KeyId: KEY_ID, Plaintext: dek }));
@@ -143,7 +143,7 @@ Create the app from [`examples/slack-manifest.yml`](./examples/slack-manifest.ym
 
 - **Bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `users:read`.
 - **Events:** `app_mention`, `user_change` (the latter drives auto-revoke on deactivation).
-- **Interactivity:** enabled — **required** for the Connect button and the key/configure modals.
+- **Interactivity:** enabled, and **required** for the Connect button and the key/configure modals.
 - **Slash command:** `/vouchr` (status | disconnect | configure).
 
 Wire the four hooks (see the README example):
@@ -168,7 +168,7 @@ yours. Don't go live until each holds.
 |---|---|
 | Strong `VOUCHR_MASTER_KEY` (32 random bytes) in a secret manager, never in source control | operator |
 | Credential store (SQLite file or Postgres) encrypted at rest and access-controlled at the infra layer | operator (Vouchr encrypts only token columns) |
-| Public URL is HTTPS — egress also requires https, loopback exempt | operator (Vouchr enforces https egress) |
+| Public URL is HTTPS. Egress also requires https, loopback exempt | operator (Vouchr enforces https egress) |
 | Least-privilege IAM for any resolver (read-only on the specific secrets) | operator (example policy provided) |
 | Slack scopes / events / interactivity applied from the manifest | operator (manifest provided) |
 | TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; operator schedules |
@@ -179,7 +179,7 @@ yours. Don't go live until each holds.
 | Multi-instance? Postgres + `DbInstallationStore` wired into Bolt and Vouchr | Vouchr provides; operator wires |
 
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as
-having run this in production — Vouchr has not yet been run in production. Treat this list as the gap.
+having run this in production. Vouchr has not yet been run in production. Treat this list as the gap.
 
 ## Key rotation
 
@@ -203,11 +203,11 @@ version byte). The same key encrypts and decrypts every vaulted row, so:
   reconnect (a reconnect re-vaults under the current key via `upsert`).
 - **Compromise response in this mode** is therefore disruptive: rotate the key, and
   either re-encrypt or force reconnect. Revoke the affected provider tokens upstream
-  regardless — a leaked master key means the ciphertext may already be decrypted.
+  regardless. A leaked master key means the ciphertext may already be decrypted.
 
 For any deployment where you expect to rotate, **prefer envelope mode** below.
 
-### Envelope mode (KMS-wrapped data keys) — recommended for rotatable deploys
+### Envelope mode (KMS-wrapped data keys): recommended for rotatable deploys
 
 With an `EnvelopeProvider`, each secret has its own data key (DEK) wrapped by your
 external key-encryption key (KEK) in KMS/Vault. Scheme `0x01` rows store the *wrapped*
@@ -216,7 +216,7 @@ DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`)
 - **Rotate the KEK in KMS, not the rows.** AWS KMS (and equivalents) version the key
   under a stable key id / alias: rotation creates a new backing key while the old
   versions stay available for decrypt. Existing `0x01` rows keep decrypting because
-  KMS still unwraps their DEKs — **no row re-encryption needed.** New writes are
+  KMS still unwraps their DEKs: **no row re-encryption needed.** New writes are
   wrapped under the new KEK version automatically.
 - **What rotation requires** is only that the KEK (every version any stored DEK was
   wrapped under) remains available to `unwrapDataKey`. Do not disable or schedule
@@ -233,12 +233,12 @@ The credential store and the key that protects it must be backed up **separately
 
 - **Direct mode:** the DB (SQLite file or Postgres dump) holds only ciphertext for
   token columns; the master key (`VOUCHR_MASTER_KEY`) is what makes it readable.
-  Back up the key separately, in your secret manager — **never alongside the DB
+  Back up the key separately, in your secret manager, **never alongside the DB
   backup.** A backup that contains both the ciphertext and the key is a single point
   of compromise that leaks everything; a DB backup without the key is useless to an
-  attacker (and useless to you for restore — hence "separately", not "not at all").
+  attacker (and useless to you for restore, hence "separately", not "not at all").
 - **Envelope mode:** token DEKs are wrapped by the KMS KEK, so a DB backup is inert
-  without KMS access. Back up nothing key-related yourself — just ensure the KEK
+  without KMS access. Back up nothing key-related yourself: just ensure the KEK
   (and every version any backed-up row was wrapped under) is retained in KMS for the
   life of the backup. Treat scheduled KEK deletion as a backup-invalidating event.
 - **External-reference rows** contain no secret at all (only an ARN-style `secret_ref`);
@@ -250,7 +250,7 @@ The credential store and the key that protects it must be backed up **separately
 ### Backing up
 
 - **SQLite:** stop writers or use SQLite's online backup / `VACUUM INTO` to get a
-  consistent copy (the DB runs in WAL mode — copying the bare `.db` file mid-write can
+  consistent copy (the DB runs in WAL mode, so copying the bare `.db` file mid-write can
   miss the `-wal`/`-shm` sidecars). Store the copy encrypted at rest.
 - **Postgres:** `pg_dump` (or your managed-DB snapshot mechanism) on its own schedule.
 
@@ -260,7 +260,7 @@ The credential store and the key that protects it must be backed up **separately
 2. Make the key available to the *same* process: set `VOUCHR_MASTER_KEY` to the exact
    key the rows were sealed under (direct mode), or grant the restored process KMS
    access to the KEK that wraps their DEKs (envelope mode). A wrong/missing key fails
-   closed — decrypt throws, it does not silently return garbage.
+   closed: decrypt throws, it does not silently return garbage.
 3. External-reference rows need their resolver IAM/role intact for the restored
    environment; the secrets themselves are restored on the external manager's policy.
 4. Verify: a `connect()` + `handle.fetch()` against one connection per mode confirms

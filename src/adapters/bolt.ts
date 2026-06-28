@@ -33,7 +33,7 @@ const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 *
 /** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
 export class ConsentRequiredError extends Error {
   constructor(public provider: string) {
-    super(`Consent required for "${provider}" — a Connect prompt was posted to the user.`);
+    super(`Consent required for "${provider}". A Connect prompt was posted to the user.`);
     this.name = 'ConsentRequiredError';
   }
 }
@@ -45,7 +45,7 @@ export interface VouchrOptions {
   callbackPath?: string;
   /** SQLite file path (the zero-config default). */
   dbPath?: string;
-  /** Postgres connection string — for stateless / multi-instance infra. Overrides dbPath. */
+  /** Postgres connection string, for stateless / multi-instance infra. Overrides dbPath. */
   databaseUrl?: string;
   policy?: Policy;
   /** Bot token used only to post the "connected" confirmation back to Slack. */
@@ -54,7 +54,7 @@ export interface VouchrOptions {
    * Multi-workspace token source. When set, the post-OAuth confirmation DM is sent with the
    * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
    * so an app installed to many workspaces / org-wide works. When omitted, behaves exactly as
-   * before — a single `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
+   * before, a single `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
    */
   installationStore?: InstallationStore;
   /** Connection lifetime. Defaults to idle 7d / max-age 30d. Pass `{}` to disable expiry. */
@@ -70,13 +70,13 @@ export interface VouchrOptions {
   /**
    * Optional structured, NO-SECRET event hook for metrics/logs. Called fire-and-forget at key
    * points (inject, refresh, egress deny, connect, revoke, sweep). A throwing sink never affects
-   * behavior. Events carry only non-secret fields (provider id, host, status, counts, booleans) —
+   * behavior. Events carry only non-secret fields (provider id, host, status, counts, booleans),
    * never tokens, references, or user/team ids.
    */
   onEvent?: EventSink;
   /**
    * Custom admin check for channel-credential config (governance). When set, `requireAdmin` uses
-   * it INSTEAD of the built-in Slack is_admin/is_owner gate — e.g. to defer to your own RBAC or an
+   * it INSTEAD of the built-in Slack is_admin/is_owner gate, e.g. to defer to your own RBAC or an
    * allow-list. When omitted, the gate is exactly as before (`isSlackAdmin`). The default-deny +
    * audit-on-denial behavior is identical regardless of which check runs. Fail closed yourself:
    * a thrown override is treated as "not admin".
@@ -85,7 +85,7 @@ export interface VouchrOptions {
   /**
    * When true, using a SHARED channel credential (`connectChannel`) requires the ACTING user to be
    * a member of the channel; a non-member (or a membership check we can't verify) is refused
-   * fail-closed and audited 'denied' with reason 'not-member'. Default false — membership is not
+   * fail-closed and audited 'denied' with reason 'not-member'. Default false: membership is not
    * checked, behaving exactly as before.
    */
   requireChannelMembership?: boolean;
@@ -119,7 +119,7 @@ export class ConnectContext {
     private requireMembership: boolean = false,
   ) {}
 
-  /** Fire the sink, swallowing any error — a bad sink must never break a request. */
+  /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
     try {
       this.sink(e);
@@ -143,7 +143,7 @@ export class ConnectContext {
     }
 
     // Channel tool manifest: refuse a provider not enabled for this channel (backward-compat rule
-    // in ChannelTools — an unconfigured channel allows all). A null channel keeps current behavior.
+    // in ChannelTools, an unconfigured channel allows all). A null channel keeps current behavior.
     if (this.channel && this.channelTools &&
         !(await this.channelTools.isEnabled(this.identity.teamId, this.channel, providerId))) {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
@@ -156,7 +156,7 @@ export class ConnectContext {
       );
     }
 
-    // Key providers have no OAuth — post a self-service "set up your key" prompt instead.
+    // Key providers have no OAuth: post a self-service "set up your key" prompt instead.
     if (provider.credential === 'key') {
       await this.postKeySetupPrompt(providerId);
       this.emit({ type: 'connect_prompted', provider: providerId });
@@ -175,7 +175,7 @@ export class ConnectContext {
   }
 
   /**
-   * Store the acting user's OWN static key for `providerId` (key providers). Self-service —
+   * Store the acting user's OWN static key for `providerId` (key providers). Self-service,
    * NOT admin-gated (it's the user's own credential), keyed to `userOwner`. Leak-safe: the
    * secret never enters audit meta, the return value, or any error string.
    */
@@ -221,14 +221,14 @@ export class ConnectContext {
 
   private channelTarget(providerId: string) {
     if (!this.channelConfig) throw new Error('Channel config store not available.');
-    if (!this.channel) throw new Error('No channel in context — run this inside a channel.');
+    if (!this.channel) throw new Error('No channel in context. Run this inside a channel.');
     return { cfg: this.channelConfig, owner: channelOwner(this.identity.teamId, this.channel), channel: this.channel };
   }
 
   /**
    * Refuse channel-owned (shared) credentials on channel classes where membership doesn't mean
    * "this workspace's own members" (invariant 6). Fails CLOSED: if we can't read the class, deny.
-   * Externally-shared/Slack-Connect is the security-critical case — a shared cred there would leak
+   * Externally-shared/Slack-Connect is the security-critical case: a shared cred there would leak
    * cross-org. Error messages name the reason and never carry tokens.
    */
   private async assertChannelEligible(): Promise<void> {
@@ -289,7 +289,7 @@ export class ConnectContext {
 
   /**
    * Lock/unlock the channel's mode for a provider. Admin-only, audited. Flipping to
-   * `'per-user'` removes the live shared cred (a re-own that must be re-authorized — the admin
+   * `'per-user'` removes the live shared cred (a re-own that must be re-authorized, the admin
    * gate is that authorization). Members then use their own creds via `connect()`.
    */
   async setChannelMode(providerId: string, mode: 'shared' | 'per-user'): Promise<void> {
@@ -310,7 +310,7 @@ export class ConnectContext {
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
     const provider = this.registry.get(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
-    // Same provider/channel policy gate as connect() — a deny applies to shared channel creds too.
+    // Same provider/channel policy gate as connect(): a deny applies to shared channel creds too.
     if (!this.policy.check(providerId, this.channel)) {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
       this.emit({ type: 'policy_denied', provider: providerId });
@@ -327,7 +327,7 @@ export class ConnectContext {
     if (!(await this.vault.get(owner, providerId))) {
       throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
     }
-    // Governance (opt-in): a shared cred is only usable by an actual channel member. Fail-closed —
+    // Governance (opt-in): a shared cred is only usable by an actual channel member. Fail-closed.
     // isChannelMember returns false on any error, so an unverifiable membership refuses the cred.
     if (this.requireMembership && !(await isChannelMember(this.client, channel, this.identity.userId))) {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'not-member' });
@@ -335,7 +335,7 @@ export class ConnectContext {
     }
     // Defense in depth: re-verify class at use time (a channel can change class after config).
     // This is one conversations.info per use; cache the class with a short TTL if a hot channel
-    // throttles. Correctness first — a channel turned Slack Connect must stop now.
+    // throttles. Correctness first: a channel turned Slack Connect must stop now.
     await this.assertChannelEligible();
     return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink);
   }
@@ -344,7 +344,7 @@ export class ConnectContext {
    * The channel-filtered tool manifest an agent / MCP gateway asks for before planning: every
    * registered provider with whether it's enabled in THIS channel (backward-compat rule applies)
    * and the channel's credential mode for it. With no channel (a DM-less context) every provider
-   * is reported enabled with a null mode — no channel restriction, matching connect().
+   * is reported enabled with a null mode (no channel restriction), matching connect().
    */
   async toolManifest(): Promise<ToolManifestEntry[]> {
     const out: ToolManifestEntry[] = [];
@@ -428,7 +428,7 @@ export async function createVouchr(opts: VouchrOptions) {
    * The WebClient used to post the post-OAuth confirmation DM. With an installationStore,
    * resolve the connecting user's own workspace bot token via fetchInstallation; without one,
    * fall back to the single env/opts token (unchanged behavior). The DM is best-effort, so a
-   * missing install just means no nudge — never throw, and never log the token.
+   * missing install just means no nudge. Never throw, and never log the token.
    */
   async function confirmClientFor(identity: SlackIdentity): Promise<WebClient | null> {
     if (!opts.installationStore) return confirmClient;
@@ -539,7 +539,7 @@ export async function createVouchr(opts: VouchrOptions) {
         const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
         if (!manifest.length) return respond('No providers are registered.');
         const lines = manifest
-          .map((m) => `• *${m.provider}* — ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}`)
+          .map((m) => `• *${m.provider}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}`)
           .join('\n');
         return respond(`Tools for <#${command.channel_id}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`);
       }
@@ -586,7 +586,7 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'disconnect') {
         if (!arg) return respond('Usage: `/vouchr disconnect <provider>`');
         // Read the token BEFORE deleting; local delete (the security-meaningful action) FIRST,
-        // then best-effort upstream revoke. A revoke failure is non-fatal — the user still sees
+        // then best-effort upstream revoke. A revoke failure is non-fatal: the user still sees
         // a successful disconnect (local access is already gone).
         const cred = registry.has(arg) ? await vault.get(userOwner(identity), arg) : null;
         await vault.delete(userOwner(identity), arg);
@@ -604,13 +604,13 @@ export async function createVouchr(opts: VouchrOptions) {
       const conns = await vault.listForUser(identity);
       if (!conns.length) return respond('No connected accounts. They are created on demand when an agent needs one.');
       const lines = conns
-        .map((c) => `• *${c.provider}*${c.externalAccount ? ` — ${c.externalAccount}` : ''}`)
+        .map((c) => `• *${c.provider}*${c.externalAccount ? ` (${c.externalAccount})` : ''}`)
         .join('\n');
       return respond(`Your connected accounts:\n${lines}\n\nDisconnect with \`/vouchr disconnect <provider>\`.`);
     });
 
     // Modal submit (channel-shared OR per-user). One handler so both paths stay leak-safe and both
-    // await the write — the typed value lives only in this view's state, never echoed, posted, logged,
+    // await the write. The typed value lives only in this view's state, never echoed, posted, logged,
     // or put in audit meta (invariant 8 / T7).
     const handleSecretSubmit = async ({ ack, body, view, client }: any, kind: 'channel' | 'user') => {
       const identity = resolveIdentity({ body });
@@ -619,7 +619,7 @@ export async function createVouchr(opts: VouchrOptions) {
       try {
         ({ channel = '', provider } = JSON.parse(view.private_metadata));
       } catch {
-        return ack({ response_action: 'errors', errors: { ref: 'Malformed request — please reopen the modal.' } });
+        return ack({ response_action: 'errors', errors: { ref: 'Malformed request. Please reopen the modal.' } });
       }
       const ref = view.state?.values?.ref?.v?.value?.trim() || '';
       const raw = view.state?.values?.raw?.v?.value || '';
@@ -641,7 +641,7 @@ export async function createVouchr(opts: VouchrOptions) {
         return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: (e as Error).message } });
       }
       await ack();
-      // Private confirmation DM — no secret, just the fact it was set.
+      // Private confirmation DM (no secret), just the fact it was set.
       const text = kind === 'channel'
         ? `✅ Saved the *${provider}* credential for <#${channel}>.`
         : `✅ Your *${provider}* credential is set. Ask me again and I'll use it.`;
@@ -673,7 +673,7 @@ export async function createVouchr(opts: VouchrOptions) {
    * Enterprise Grid a user may hold connections under several workspace team_ids;
    * org-wide deprovisioning should be wired through SCIM (which carries the proper
    * org/user context) to offboard per workspace. We intentionally do NOT delete by
-   * user_id alone — Slack user ids are unique only within a workspace, so a bare
+   * user_id alone: Slack user ids are unique only within a workspace, so a bare
    * user_id delete could remove a different person's connection in another workspace.
    */
   function registerOffboarding(app: {

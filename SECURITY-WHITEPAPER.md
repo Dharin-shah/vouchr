@@ -5,12 +5,12 @@ posture; it does not restate the details. Read alongside
 [ARCHITECTURE.md](./ARCHITECTURE.md) (design), [THREAT-MODEL.md](./THREAT-MODEL.md)
 (trust boundaries, attacker model, invariants), and [SECURITY.md](./SECURITY.md)
 (non-goals, operator responsibilities, reporting). Every claim here is grounded in
-`src/core/*`; where a limit exists it is stated plainly, not glossed.
+`src/core/*`; where a limit exists it is stated plainly.
 
 ## The problem
 
-A Slack agent often needs to act *as a user* against a third-party API — open a
-GitHub issue as them, read their calendar — which means it needs the user's token.
+A Slack agent often needs to act *as a user* against a third-party API (open a
+GitHub issue as them, read their calendar), which means it needs the user's token.
 The naive design hands that token to agent code, and from there it leaks: into the
 LLM context, the chat transcript, logs, error strings, the audit trail. An agent
 needs **delegated authority without ever holding the secret that carries it.**
@@ -24,7 +24,7 @@ Vouchr is a credential *boundary*. Five mechanisms compose it:
   only. There is no API that returns the token to caller code
   (`src/core/injector.ts`).
 - **Injection boundary.** The token is attached to the outbound request *inside*
-  `handle.fetch()`, at the HTTP call — the single point where a secret leaves the
+  `handle.fetch()`, at the HTTP call: the single point where a secret leaves the
   process.
 - **Egress allowlist.** Before the secret is ever read, the destination host must
   be in the provider's `egressAllow` list; HTTPS is required (loopback exempt) so
@@ -34,16 +34,17 @@ Vouchr is a credential *boundary*. Five mechanisms compose it:
 - **Owner / acting separation.** The principal that *owns* a credential (a user, or
   a channel) keys the vault; the human who *triggered* the call keys the audit.
   A shared channel credential is used under the channel owner but always audited as
-  the human who acted — a shared cred never launders away who used it.
+  the human who acted. A shared cred never launders away who used it.
 - **Channel scoping.** Per-user by default. Channel-shared credentials are
-  admin-gated and refused (fail-closed) in ineligible channel classes — externally
-  shared / Slack Connect, DMs/MPIMs, archived — re-checked at *use* time, not just
+  admin-gated and refused (fail-closed) in ineligible channel classes such as
+  externally shared / Slack Connect, DMs/MPIMs, and archived. Eligibility is
+  re-checked at *use* time, not just
   config time, so a channel that turns Slack Connect stops working immediately.
 
 ## Cryptography at rest
 
-Token material — `access_token_enc`, `refresh_token_enc`, and the installation
-`bot_token`/`data` columns — is encrypted with **AES-256-GCM**. The rest of each
+Token material (`access_token_enc`, `refresh_token_enc`, and the installation
+`bot_token`/`data` columns) is encrypted with **AES-256-GCM**. The rest of each
 row, and the SQLite file as a whole, is *not* encrypted by Vouchr (see Limits).
 
 - **Per-secret IV.** Each encryption generates a fresh random 12-byte IV.
@@ -58,7 +59,7 @@ row, and the SQLite file as a whole, is *not* encrypted by Vouchr (see Limits).
   external KEK alongside the ciphertext. Scheme byte `0x01`, layout:
   `0x01 | dekLen(2, big-endian) | wrappedDek | iv(12) | tag(16) | ciphertext`
   (`seal`). The plaintext DEK is scrubbed from memory after use; only the wrapped
-  copy persists. Vouchr ships no cloud SDK — the KMS binding is operator-supplied.
+  copy persists. Vouchr ships no cloud SDK. The KMS binding is operator-supplied.
 - **Format dispatch, back-compatible.** Reads dispatch on the stored format
   (`open`): no provider → always legacy direct decrypt; provider + leading byte
   `0x01` → envelope path, falling back to legacy on any failure (covering the
@@ -66,7 +67,7 @@ row, and the SQLite file as a whole, is *not* encrypted by Vouchr (see Limits).
   enabling envelope is non-destructive.
 - **External references.** A credential can instead store a *non-secret* pointer
   (e.g. an AWS Secrets Manager ARN) plus a resolver `source` id. The secret stays in
-  the external manager and is resolved just-in-time at the injection boundary —
+  the external manager and is resolved just-in-time at the injection boundary,
   never persisted, cached, or logged (`injector.ts`, `resolveRef`). Rotation stays
   where the secret lives, and Vouchr never holds it.
 
@@ -96,7 +97,7 @@ host/path/method, but the token's own scopes still decide what the provider allo
 into a Slack modal transit Slack** (prefer an external reference);
 **disconnect/offboard revocation is best-effort upstream** after local delete;
 **audit metadata is caller-supplied**; and **the store file is not wholly encrypted
-at rest** — only token columns are.
+at rest**: only token columns are.
 
 ## Operational posture
 
@@ -105,7 +106,7 @@ at rest** — only token columns are.
 - **Scale.** SQLite (embedded, zero-config) by default; Postgres for stateless /
   multi-instance deploys, with credentials isolated per `team_id` on a shared DB.
 - **Observability.** A no-secret `EventSink` emits structured events
-  (provider/host/status/counts only — never tokens, refs, or user content) for
+  (provider/host/status/counts only, never tokens, refs, or user content) for
   metrics and alerting (`injector.ts`).
 - **Revocation & lifecycle.** TTL sweep (idle + max-age), lazy expiry on read,
   single-flight token refresh that cannot defer the max-age TTL, declarative
@@ -122,11 +123,11 @@ A buyer/security team can run this against the repository:
   fully offline). `npm run pg:up && npm test` exercises the Postgres backend. CI runs
   typecheck + tests (including Postgres) on every push and PR.
 - **Architecture boundary.** Confirm `src/core/` imports nothing from `@slack/*` or
-  `src/adapters/` — enforced by `test/architecture.test.ts`. Security logic lives in
+  `src/adapters/`, enforced by `test/architecture.test.ts`. Security logic lives in
   core; the Bolt adapter only supplies inputs.
-- **Threat model.** Walk [THREAT-MODEL.md](./THREAT-MODEL.md) — trust boundaries, the
+- **Threat model.** Walk [THREAT-MODEL.md](./THREAT-MODEL.md): trust boundaries, the
   attacker model (prompt injection, malicious user, DB reader, Slack Connect cross-org
-  exposure, replayed OAuth), and the nine enforced invariants — against the code it
+  exposure, replayed OAuth), and the nine enforced invariants, against the code it
   cites.
 - **Crypto review.** Read `src/core/crypto.ts` (AES-256-GCM, per-secret IV, scheme
   `0x01` envelope, format dispatch) and `test/envelope.test.ts`.

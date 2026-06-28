@@ -15,7 +15,7 @@ const O1 = userOwner(ID);
  * Mock EnvelopeProvider: the KEK is a local AES-256-GCM key, so wrap = encrypt the DEK under the
  * KEK and unwrap = decrypt it. `unwraps` proves the read path actually calls the provider.
  *
- * A REAL AWS KMS provider (no SDK imported here — core stays dependency-free) looks like:
+ * A REAL AWS KMS provider (no SDK imported here, core stays dependency-free) looks like:
  *
  *   import { KMSClient, EncryptCommand, DecryptCommand } from '@aws-sdk/client-kms';
  *   const kms = new KMSClient({});
@@ -72,7 +72,7 @@ test('envelope: round-trips through Vault, stores scheme 0x01, invokes unwrap on
   assert.ok(!buf.toString('utf8').includes('tok_env'), 'ciphertext must not contain the plaintext');
 });
 
-test('envelope: local-path rows (no provider) still decrypt — under both a local and an envelope vault', async () => {
+test('envelope: local-path rows (no provider) still decrypt under both a local and an envelope vault', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const local = new Vault(db, KEY); // no provider → current behavior
   await local.upsert(O1, 'github', {

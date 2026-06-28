@@ -11,13 +11,13 @@ export interface ToolManifestEntry {
 
 /**
  * Per-channel "tool manifest": the set of providers an agent is allowed to use in a channel.
- * Non-secret policy bits only — same kind of store as ChannelConfig, over the async `Db`.
+ * Non-secret policy bits only: same kind of store as ChannelConfig, over the async `Db`.
  *
  * BACKWARD-COMPAT RULE (important): a channel with NO rows here treats EVERY provider as
  * enabled, so existing channels keep working untouched. The moment ANY provider is explicitly
  * set for the channel (enabled OR disabled), the channel flips to an allowlist: only providers
  * with an `enabled` row are usable; anything not listed is implicitly disabled. Re-enable all by
- * setting every provider back on, or there's no "clear all" — that's intentional (an empty
+ * setting every provider back on, or there's no "clear all". That's intentional (an empty
  * allowlist = nothing usable, never silently reverts to all-on once configured).
  */
 export class ChannelTools {
@@ -33,7 +33,7 @@ export class ChannelTools {
   }
 
   /** Providers explicitly enabled in this channel. Empty array means either "unconfigured"
-   *  (→ all enabled, see the rule above) or "configured but everything off" — callers that need
+   *  (→ all enabled, see the rule above) or "configured but everything off", callers that need
    *  to tell them apart use `isEnabled`, which applies the backward-compat rule. */
   async listEnabled(teamId: string, channel: string): Promise<string[]> {
     const rows = (await this.db.all(

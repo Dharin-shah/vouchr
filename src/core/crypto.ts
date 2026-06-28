@@ -40,7 +40,7 @@ export function decrypt(blob: Buffer, key: Buffer): string {
 /**
  * Operator-supplied KMS/Vault binding for envelope encryption (like the `Resolvers` pattern).
  * `wrapDataKey` encrypts a freshly generated 32-byte data key (DEK) under an external
- * key-encryption key (KEK); `unwrapDataKey` reverses it. Both are async — a real KMS is a network
+ * key-encryption key (KEK); `unwrapDataKey` reverses it. Both are async: a real KMS is a network
  * call. Implementations MUST NOT log the DEK or the KEK. Core deliberately ships no AWS SDK
  * dependency; a real AWS KMS impl (GenerateDataKey/Decrypt) is sketched in test/envelope.test.ts.
  */
@@ -82,7 +82,7 @@ export async function seal(plaintext: string, key: Buffer, envelope?: EnvelopePr
  *
  * Detection (unambiguous, fail-closed):
  *  - No provider  → ALWAYS legacy. A no-provider deploy never wrote envelope rows, so the bytes
- *    are the unprefixed iv|tag|ct format and decrypt directly under the master key — exactly as
+ *    are the unprefixed iv|tag|ct format and decrypt directly under the master key, exactly as
  *    the current code does. This is what keeps a local deploy reading its own existing data.
  *  - Provider + first byte != 0x01 → legacy (envelope rows always start 0x01).
  *  - Provider + first byte == 0x01 → try the envelope path; on ANY failure fall back to legacy.
@@ -103,7 +103,7 @@ export async function open(blob: Buffer, key: Buffer, envelope?: EnvelopeProvide
       dek.fill(0); // scrub the unwrapped DEK once we're done with it
     }
   } catch {
-    // Not a real envelope row (legacy IV starting 0x01) — or genuinely bad data. Legacy decrypt
+    // Not a real envelope row (legacy IV starting 0x01), or genuinely bad data. Legacy decrypt
     // either recovers it or throws, so corruption/tampering still fails closed.
     return decrypt(blob, key);
   }

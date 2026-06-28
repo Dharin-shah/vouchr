@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * vouchr — operator CLI for self-hosted deployments.
+ * vouchr: operator CLI for self-hosted deployments.
  *
  * Connects to the SAME credential store the app uses (SQLite via VOUCHR_DB/--db,
  * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. Read-only, metadata-only:
@@ -58,7 +58,7 @@ async function cmdInventory(db: Db, f: Flags): Promise<void> {
   const params: any[] = [];
   if (f.values.team) { where.push('team_id=?'); params.push(f.values.team); }
   if (f.values.provider) { where.push('provider=?'); params.push(f.values.provider); }
-  // Metadata columns only — token ciphertext columns are never selected.
+  // Metadata columns only. Token ciphertext columns are never selected.
   const rows = await db.all<any>(
     `SELECT team_id, owner_kind, owner_id, provider, source, secret_ref, created_at, last_used_at, expires_at
      FROM connection ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
@@ -104,10 +104,10 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
 
 async function cmdDoctor(f: Flags): Promise<number> {
   let failed = false;
-  const pass = (label: string, msg = '') => console.log(`PASS ${label}${msg ? ' — ' + msg : ''}`);
-  const fail = (label: string, msg = '') => { failed = true; console.log(`FAIL ${label}${msg ? ' — ' + msg : ''}`); };
+  const pass = (label: string, msg = '') => console.log(`PASS ${label}${msg ? ': ' + msg : ''}`);
+  const fail = (label: string, msg = '') => { failed = true; console.log(`FAIL ${label}${msg ? ': ' + msg : ''}`); };
 
-  // 1. Master key — load via loadMasterKey, never print the key itself.
+  // 1. Master key: load via loadMasterKey, never print the key itself.
   try {
     const len = loadMasterKey().length;
     len === 32 ? pass('master key', '32 bytes') : fail('master key', `decoded ${len} bytes (want 32)`);
@@ -116,7 +116,7 @@ async function cmdDoctor(f: Flags): Promise<number> {
   }
 
   // 2. Backend in use (informational).
-  console.log(`INFO backend — ${describeBackend(f.values.db)}`);
+  console.log(`INFO backend: ${describeBackend(f.values.db)}`);
 
   // 3. DB reachable + counts.
   let db: Db | undefined;
@@ -126,8 +126,8 @@ async function cmdDoctor(f: Flags): Promise<number> {
     pass('db reachable');
     const conns = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM connection');
     const consents = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM consent_request');
-    console.log(`INFO connections — ${conns?.n ?? 0}`);
-    console.log(`INFO consent_requests — ${consents?.n ?? 0}`);
+    console.log(`INFO connections: ${conns?.n ?? 0}`);
+    console.log(`INFO consent_requests: ${consents?.n ?? 0}`);
   } catch (e: any) {
     fail('db reachable', e?.message ?? 'open failed');
   } finally {
@@ -181,7 +181,7 @@ async function cmdHealth(f: Flags): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`vouchr — operator CLI (read-only, secret-free)
+  console.log(`vouchr: operator CLI (read-only, secret-free)
 
 Usage: vouchr <command> [options]
 

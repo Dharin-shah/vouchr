@@ -7,7 +7,7 @@ injects it at the HTTP boundary so the agent (and the LLM) never sees it.
 ```ts
 const internal = defineProvider({
   id: 'internal',
-  credential: 'key',                 // no OAuth — user pastes a key
+  credential: 'key',                 // no OAuth; user pastes a key
   authorizeUrl: '', tokenUrl: '',    // unused for key providers
   scopesDefault: [],
   egressAllow: ['api.internal.example'],
@@ -21,7 +21,7 @@ const internal = defineProvider({
 
 1. A user @-mentions the bot. The handler calls `connect('internal')`.
 2. They have no key yet, so Vouchr posts an **ephemeral "set up your key" button**
-   (wired by `registerCommands`) and throws `ConsentRequiredError` — the handler
+   (wired by `registerCommands`) and throws `ConsentRequiredError`. The handler
    stops this turn.
 3. The user clicks the button and pastes their key into a **private modal**. The
    key never appears in the channel, the audit log, or any error string.
@@ -29,7 +29,7 @@ const internal = defineProvider({
    calls the internal API with the key injected as `x-api-key`.
 
 Users can also paste an **external secret-manager reference** instead of a raw
-key in the same modal (resolved just-in-time via a `resolvers` entry — see
+key in the same modal (resolved just-in-time via a `resolvers` entry, see
 `../aws-secrets-manager`).
 
 ## Env

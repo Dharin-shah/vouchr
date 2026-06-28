@@ -77,7 +77,7 @@ test('consent: state is single-use and expires', async () => {
 test('providers: ANY OAuth2 provider works via generic defineProvider', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const consent = new Consent(db);
-  // A provider Vouchr ships nothing for — defined in ~10 lines by the user.
+  // A provider Vouchr ships nothing for, defined in ~10 lines by the user.
   const acme = defineProvider({
     id: 'acme',
     authorizeUrl: 'https://acme.example/oauth/authorize',
@@ -369,7 +369,7 @@ test('offboardUser removes connections + pending consent, idempotently, leaving 
 
   assert.deepEqual((await offboardUser(vault, audit, consent, ID)).sort(), ['github', 'google']);
   assert.equal((await vault.listForUser(ID)).length, 0);
-  assert.equal(await consent.consume(state), null); // pending consent purged — no resurrection
+  assert.equal(await consent.consume(state), null); // pending consent purged (no resurrection)
   assert.equal((await vault.listForUser({ ...ID, userId: 'U2' })).length, 1); // other user untouched
   assert.deepEqual(await offboardUser(vault, audit, consent, ID), []); // idempotent
 });

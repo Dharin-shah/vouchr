@@ -1,6 +1,6 @@
 # Security Policy
 
-Vouchr is a credential broker — security reports are taken seriously and prioritized.
+Vouchr is a credential broker. Security reports are taken seriously and prioritized.
 
 ## Reporting a vulnerability
 
@@ -17,14 +17,14 @@ coordinate a fix and disclosure timeline with you.
 
 Of particular interest:
 
-- **Secret leakage** — any path where a credential reaches logs, Slack messages, the audit
+- **Secret leakage**: any path where a credential reaches logs, Slack messages, the audit
   table, error strings, an LLM/tool schema, or a resolved external-reference secret being
   persisted or cached.
-- **Tenant / owner isolation** — any query or code path that lets one `(team, owner_kind,
+- **Tenant / owner isolation**: any query or code path that lets one `(team, owner_kind,
   owner_id, provider)` read or overwrite another's credential.
-- **Authorization** — bypassing the admin gate on channel-credential configuration, or using
+- **Authorization**: bypassing the admin gate on channel-credential configuration, or using
   a channel credential without proven authorization for that channel.
-- **OAuth flow** — `state` reuse/fixation, PKCE downgrade, or open-redirect / egress-allowlist
+- **OAuth flow**: `state` reuse/fixation, PKCE downgrade, or open-redirect / egress-allowlist
   bypass at the injection boundary.
 
 ## What Vouchr does not protect against
@@ -40,7 +40,7 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   must decide what reaches the model or the Slack reply.
 - **Raw keys typed into a Slack modal pass through Slack.** The value is in the modal submission
   payload. Vouchr never echoes, logs, or stores it unsafely, but an external secret reference (an
-  ARN resolved just in time) avoids putting the secret in Slack at all — prefer it.
+  ARN resolved just in time) avoids putting the secret in Slack at all. Prefer it.
 - **Disconnect/offboard revoke is best-effort.** Removing a connection deletes Vouchr's stored
   credential first; Vouchr then attempts upstream provider revocation when the provider declares a
   revoke path. A network/provider failure cannot keep local access alive, but upstream revocation is

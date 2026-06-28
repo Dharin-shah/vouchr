@@ -8,10 +8,10 @@ import { Consent } from '../../src/core/consent';
 // ─────────────────────────────────────────────────────────────────────────────
 // SCIM / admin-API deprovisioning hook.
 //
-// Slack does NOT call your app for SCIM lifecycle events — your IdP (Okta, Entra,
+// Slack does NOT call your app for SCIM lifecycle events. Your IdP (Okta, Entra,
 // etc.) or your own admin tooling does. When a user is deactivated org-wide, that
 // system POSTs here and we revoke every connection the user holds across EVERY
-// workspace in the Enterprise Grid org — not just one team.
+// workspace in the Enterprise Grid org, not just one team.
 //
 // Connect / consent stays in the Slack app (see the bolt-* examples). This endpoint
 // is offboarding ONLY: it removes credentials, it never mints them.
@@ -27,7 +27,7 @@ export interface DeprovisionEvent {
 
 /**
  * Build the deps once and reuse them. Same Postgres + same master key as the Slack
- * app — this MUST point at the very store the app writes connections to, or there is
+ * app. This MUST point at the very store the app writes connections to, or there is
  * nothing to offboard. Postgres so the webhook can run as its own stateless service.
  */
 async function deps() {
@@ -62,7 +62,7 @@ export async function onDeprovision(
       registry,
       'scim-deprovision',
     );
-    // Log counts only — provider ids and team ids are not secret; tokens never appear here.
+    // Log counts only: provider ids and team ids are not secret; tokens never appear here.
     const removed = summary.reduce((n, t) => n + t.providers.length, 0);
     console.log(`[vouchr] deprovisioned ${event.userId}: ${removed} connection(s) across ${summary.length} team(s)`);
     return summary;

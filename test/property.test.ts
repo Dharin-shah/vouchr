@@ -27,7 +27,7 @@ const randStr = (len: number, alphabet = ALNUM) =>
   Array.from({ length: len }, () => alphabet[rint(alphabet.length)]).join('');
 
 // =====================================================================================
-// 1. Egress matching — a denial NEVER reads the secret (resolver call-counter stays 0).
+// 1. Egress matching: a denial NEVER reads the secret (resolver call-counter stays 0).
 // =====================================================================================
 const EG_HOST = 'api.acme.example';
 const egProvider = defineProvider({
@@ -51,7 +51,7 @@ function pathAllowed(pathname: string, allowed: string): boolean {
 }
 
 // One handle, reused across iterations; the resolver counter is reset per case. A referenced cred
-// means the ONLY way to read the secret is the resolver — count 0 proves the secret was never read.
+// means the ONLY way to read the secret is the resolver, and count 0 proves the secret was never read.
 async function makeEgressHandle(provider: Provider) {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
@@ -143,7 +143,7 @@ test('property: only matching path+method pass; mismatches denied with secret un
 });
 
 // =====================================================================================
-// 2. Metadata redaction — credential-shaped values become '[redacted]', benign values pass through.
+// 2. Metadata redaction: credential-shaped values become '[redacted]', benign values pass through.
 // =====================================================================================
 function secretValue(): string {
   switch (rint(6)) {
@@ -169,7 +169,7 @@ function benignValue(): string {
 test('property: token-shaped values are redacted, benign values pass through unchanged', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const audit = new Audit(db);
-  // Query by a per-iteration unique provider id — `at` is a ms timestamp and collides in a tight loop,
+  // Query by a per-iteration unique provider id. `at` is a ms timestamp and collides in a tight loop,
   // so ORDER BY at would read back the wrong row.
   const readBack = async (provider: string) =>
     JSON.parse((await db.get('SELECT meta FROM audit WHERE provider=?', [provider]) as any).meta);
@@ -191,7 +191,7 @@ test('property: token-shaped values are redacted, benign values pass through unc
 });
 
 // =====================================================================================
-// 3. Policy decisions — check() never throws; fallback / denyChannels / allowChannels invariants.
+// 3. Policy decisions: check() never throws; fallback / denyChannels / allowChannels invariants.
 // =====================================================================================
 test('property: policy check() never throws and honors its invariants', async () => {
   const pool = ['C1', 'C2', 'C3', 'C4', 'C5'];
@@ -229,7 +229,7 @@ test('property: policy check() never throws and honors its invariants', async ()
 });
 
 // =====================================================================================
-// 4. OAuth state single-use — begin() then consume() once; second/unknown/expired return null.
+// 4. OAuth state single-use, begin() then consume() once; second/unknown/expired return null.
 // =====================================================================================
 const STATE_TTL_MS = 10 * 60 * 1000; // mirrors consent.ts (not exported)
 const consentProvider = defineProvider({
@@ -275,7 +275,7 @@ test('property: rows older than the TTL are treated as expired (null)', async ()
   const N = 100;
   for (let i = 0; i < N; i++) {
     const state = `stale-${randStr(24)}`;
-    // Insert a row directly with a created_at older than the TTL — can't control the clock otherwise.
+    // Insert a row directly with a created_at older than the TTL (can't control the clock otherwise).
     const age = STATE_TTL_MS + 1000 + rint(60_000);
     await db.run(
       `INSERT INTO consent_request (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
@@ -287,7 +287,7 @@ test('property: rows older than the TTL are treated as expired (null)', async ()
 });
 
 // =====================================================================================
-// 5. Provider URL building — required params always present; code_challenge iff provider.pkce.
+// 5. Provider URL building: required params always present; code_challenge iff provider.pkce.
 // =====================================================================================
 test('property: authorize URL always carries the required params; code_challenge iff pkce', async () => {
   const db = await openDb({ dbPath: ':memory:' });

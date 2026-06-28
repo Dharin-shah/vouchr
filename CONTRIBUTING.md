@@ -3,7 +3,7 @@
 Thanks for helping. Vouchr is a security-sensitive credential broker, so the bar is
 correctness and simplicity over feature volume.
 
-**Before you start, read [`AGENTS.md`](./AGENTS.md)** — it's written for both humans and
+**Before you start, read [`AGENTS.md`](./AGENTS.md)**: it's written for both humans and
 AI agents and covers the working principles (never fake it; build the correct general
 structure; simplest thing that works; security is never simplified away), the layout, dev
 setup, and testing expectations.

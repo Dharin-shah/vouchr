@@ -3,10 +3,10 @@
 // Resolves a secret JIT: when the injector needs the credential it calls this
 // resolver with the ARN the admin configured, fetches the live SecretString from
 // AWS Secrets Manager, and hands it straight to the outbound request. The secret
-// is never stored by Vouchr (only the non-secret ARN is) and never cached here —
-// rotation stays entirely in AWS SM, so a rotated secret is picked up on the next call.
+// is never stored by Vouchr (only the non-secret ARN is) and never cached here.
+// Rotation stays entirely in AWS SM, so a rotated secret is picked up on the next call.
 //
-// Auth uses the ambient IAM role (task role / instance profile / EKS IRSA) — no
+// Auth uses the ambient IAM role (task role / instance profile / EKS IRSA). No
 // static credentials in code. Grant the role secretsmanager:GetSecretValue on the
 // specific secret ARNs (see README).
 import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
@@ -27,7 +27,7 @@ export function awsSecretsManager(): Resolvers {
         return Buffer.from(out.SecretBinary as Uint8Array).toString('utf8');
       }
 
-      // Error names the ARN (non-secret) only — never any secret material.
+      // Error names the ARN (non-secret) only, never any secret material.
       throw new Error(`AWS Secrets Manager returned no value for "${arn}".`);
     },
   };

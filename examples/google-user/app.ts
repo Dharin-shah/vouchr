@@ -11,7 +11,7 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 app.event('app_mention', async ({ context, event, client }) => {
   try {
     const g = await context.vouchr.connect('google');
-    // Token injected at the HTTP boundary — this code never sees it. The host
+    // Token injected at the HTTP boundary. This code never sees it. The host
     // (www.googleapis.com) is on the built-in google() egress allowlist.
     const res = await g.fetch('https://www.googleapis.com/oauth2/v3/userinfo');
     const me: any = await res.json();
@@ -29,7 +29,7 @@ app.event('app_mention', async ({ context, event, client }) => {
 (async () => {
   // 3. Vouchr: one provider (Google), public callback origin (e.g. an ngrok URL).
   //    google() uses PKCE and asks for a refresh token (access_type=offline +
-  //    prompt=consent), so connections survive past the ~1h access-token lifetime —
+  //    prompt=consent), so connections survive past the ~1h access-token lifetime.
   //    Vouchr refreshes them on demand (refresh: 'rotating').
   const vouchr = await createVouchr({
     providers: [google()],
@@ -43,5 +43,5 @@ app.event('app_mention', async ({ context, event, client }) => {
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.start(port);
-  console.log(`⚡ Vouchr Google demo on :${port} — callback at ${process.env.PUBLIC_URL}/vouchr/oauth/callback`);
+  console.log(`⚡ Vouchr Google demo on :${port}, callback at ${process.env.PUBLIC_URL}/vouchr/oauth/callback`);
 })();

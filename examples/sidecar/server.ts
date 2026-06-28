@@ -17,7 +17,7 @@ import type { SlackIdentity } from '../../src/core/identity';
 /**
  * ─── Trust model (the honest boundary) ───────────────────────────────────────────────────────
  * The sidecar is a LOCALHOST component. It trusts the authenticated CALLER (the app) to assert the
- * already-verified Slack identity in `owner`. The sidecar does NOT verify Slack itself — the caller
+ * already-verified Slack identity in `owner`. The sidecar does NOT verify Slack itself. The caller
  * is responsible for having done so before it ever reaches here. Authentication here is a single
  * shared bearer token (VOUCHR_SIDECAR_TOKEN): it proves "you are the app I trust", nothing finer.
  *
@@ -25,11 +25,11 @@ import type { SlackIdentity } from '../../src/core/identity';
  *  - The token is injected at the sidecar's EGRESS (inside ConnectionHandle.fetch) and is NEVER
  *    returned to the caller. Same leak-safe property as the embedded handle: the secret never
  *    leaves the vault boundary, the LLM/caller only ever sees the provider's RESPONSE.
- *  - Egress allowlist + https-only still apply — they live in ConnectionHandle, not here.
+ *  - Egress allowlist + https-only still apply: they live in ConnectionHandle, not here.
  *
  * What stays in the Slack app (NOT faked here): OAuth connect + consent. Those need a browser and a
  * verified Slack interaction; the embedded Bolt adapter owns them. The sidecar is purely the USE
- * path (proxying outbound calls with an already-stored credential) — which is what other-language
+ * path (proxying outbound calls with an already-stored credential), which is what other-language
  * agents actually need to reuse. Connect once via Slack; both share the same vault DB.
  */
 
@@ -55,7 +55,7 @@ function parseOwner(raw: unknown): Owner {
 /**
  * The ACTING human (audit attribution). The caller asserts it; we default to the owner's id when the
  * owner IS a user, since for a user-owned credential the owner and the actor are the same person.
- * For a channel-owned (shared) credential there is no implicit actor — the caller MUST supply one,
+ * For a channel-owned (shared) credential there is no implicit actor. The caller MUST supply one,
  * so a shared credential never launders away WHO acted (see ConnectionHandle's owner/acting split).
  */
 function parseActing(owner: Owner, rawActing: unknown): SlackIdentity {
@@ -75,7 +75,7 @@ class HttpError extends Error {
 /**
  * Register the built-in providers whose OAuth client env is configured. Built-ins throw at
  * construction if clientId/clientSecret are missing, so we skip the unconfigured ones rather than
- * crash at startup — the sidecar only needs the providers it'll actually serve.
+ * crash at startup. The sidecar only needs the providers it'll actually serve.
  * Built-ins only; add custom defineProvider() calls here if you run your own providers.
  */
 function buildRegistry(): ProviderRegistry {
@@ -84,7 +84,7 @@ function buildRegistry(): ProviderRegistry {
     try {
       providers.push(make());
     } catch {
-      // missing clientId/clientSecret for this built-in — skip it
+      // missing clientId/clientSecret for this built-in: skip it
     }
   }
   return new ProviderRegistry(providers);
@@ -116,7 +116,7 @@ function send(res: ServerResponse, status: number, body: unknown): void {
 }
 
 /**
- * POST /proxy — the core USE path. Build a ConnectionHandle for owner+provider and call it; return
+ * POST /proxy: the core USE path. Build a ConnectionHandle for owner+provider and call it; return
  * the provider's status/headers/body. The credential is injected inside handle.fetch and is NEVER
  * in our response. Egress allowlist + https-only are enforced inside the handle.
  */
@@ -131,7 +131,7 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse, d: Deps): 
   }
 
   const provider = d.registry.get(body.provider); // throws -> 400 below for unknown provider
-  // Resolvers default to {} — this reference serves vault-stored credentials only. Wire resolvers
+  // Resolvers default to {}. This reference serves vault-stored credentials only. Wire resolvers
   // here (same shape as the embedded handle) if you also serve external secret-manager references.
   const handle = new ConnectionHandle(provider, owner, acting, d.vault, d.audit, {}, d.inflight);
 
@@ -146,24 +146,24 @@ async function handleProxy(req: IncomingMessage, res: ServerResponse, d: Deps): 
     headers[k] = v;
   });
   const text = await upstream.text();
-  // NOTE: no token anywhere in this response — only the provider's own reply.
+  // NOTE: no token anywhere in this response, only the provider's own reply.
   send(res, 200, { status: upstream.status, headers, body: text });
 }
 
-/** POST /status — list the owner's connected providers (no secrets). */
+/** POST /status: list the owner's connected providers (no secrets). */
 async function handleStatus(req: IncomingMessage, res: ServerResponse, d: Deps): Promise<void> {
   const body = await readJson(req);
   const owner = parseOwner(body.owner);
   if (owner.kind !== 'user') {
     // The core Vault only exposes listForUser(). Channel-owned listing isn't a public vault method,
-    // so we don't invent SQL here — surface the limitation honestly.
+    // so we don't invent SQL here. Surface the limitation honestly.
     throw new HttpError(400, 'status currently supports user owners only (core Vault exposes listForUser)');
   }
   const providers = await d.vault.listForUser({ enterpriseId: null, teamId: owner.teamId, userId: owner.id });
   send(res, 200, { providers });
 }
 
-/** POST /disconnect — delete the stored credential. Upstream OAuth revoke stays in the Slack app. */
+/** POST /disconnect: delete the stored credential. Upstream OAuth revoke stays in the Slack app. */
 async function handleDisconnect(req: IncomingMessage, res: ServerResponse, d: Deps): Promise<void> {
   const body = await readJson(req);
   const owner = parseOwner(body.owner);
@@ -216,7 +216,7 @@ export async function startServer(): Promise<ReturnType<typeof createServer>> {
     });
   });
 
-  // Bind to loopback only — this is a localhost component, never exposed to the network.
+  // Bind to loopback only. This is a localhost component, never exposed to the network.
   await new Promise<void>((resolve) => server.listen(PORT, '127.0.0.1', resolve));
   console.log(`vouchr sidecar listening on http://127.0.0.1:${PORT}`);
   return server;

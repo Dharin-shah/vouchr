@@ -1,23 +1,22 @@
 # Vouchr
 
-**Let a Slack agent act on a user's behalf against third-party APIs — without the user's token ever touching your agent code, the LLM, or the chat.**
+**Let a Slack agent act on a user's behalf against third-party APIs, without the user's token ever touching your agent code, the LLM, or the chat.**
 
 Vouchr gives Slack agents a channel-scoped credential and tool plane: each channel sees only the
 tools and service credentials it's authorized for, and credentials are injected at the egress
-boundary so the secret never reaches the agent or the chat.
+boundary.
 
 A Slack agent often needs to *do things as the user*: open a GitHub issue as them, read their
 calendar, call an internal API with their access. That means storing per-user tokens, running a
 "connect your account" flow, and using those tokens without leaking them. Vouchr is that piece,
-as a drop-in for [Slack Bolt](https://slack.dev/bolt-js) — self-hosted, so tokens stay on your
+a drop-in for [Slack Bolt](https://slack.dev/bolt-js). It is self-hosted, so tokens stay on your
 infra.
 
 **Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [THREAT-MODEL.md](./THREAT-MODEL.md) ·
 [SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md) · [DEPLOYMENT.md](./DEPLOYMENT.md).
 
 The user connects once via an in-Slack button. Vouchr stores the token encrypted, keyed to their
-Slack identity, and injects it only at the outbound HTTP call — your code gets a `fetch` handle,
-never the secret.
+Slack identity, and injects it only at the outbound HTTP call; your code gets a `fetch` handle.
 
 ## How it works
 
@@ -28,8 +27,8 @@ sequenceDiagram
     participant V as Vouchr
     participant P as Provider API (e.g. GitHub)
 
-    rect rgb(245,245,245)
-    Note over U,P: First time — the user connects their account
+    rect rgba(125,170,255,0.15)
+    Note over U,P: First time: the user connects their account
     U->>A: @mention / command
     A->>V: context.vouchr.connect('github')
     V-->>U: ephemeral "Connect GitHub" button (only the user sees it)
@@ -37,10 +36,10 @@ sequenceDiagram
     V->>V: store token encrypted, keyed to the Slack identity
     end
 
-    rect rgb(235,245,235)
-    Note over U,P: Every call after — the agent acts as the user
+    rect rgba(125,220,150,0.15)
+    Note over U,P: Every call after: the agent acts as the user
     U->>A: @mention / command
-    A->>V: context.vouchr.connect('github') → handle
+    A->>V: context.vouchr.connect('github') returns a handle
     A->>V: handle.fetch(api url)
     V->>P: request, with the token injected at the HTTP boundary
     P-->>V: response
@@ -69,7 +68,7 @@ app.event('app_mention', async ({ context, event, say }) => {
   // If the user hasn't connected GitHub, this posts a "Connect" button to them and stops.
   const gh = await context.vouchr.connect('github');
 
-  // The token is attached inside fetch(), at the HTTP boundary — never visible here.
+  // The token is attached inside fetch(), at the HTTP boundary, never visible here.
   const me = await (await gh.fetch('https://api.github.com/user')).json();
   await say(`You're *${me.login}* on GitHub.`);
 });
@@ -77,20 +76,20 @@ app.event('app_mention', async ({ context, event, say }) => {
 
 ## What you get
 
-- **In-Slack connect** — a Block Kit button for OAuth providers; a private modal to paste a key
+- **In-Slack connect.** A Block Kit button for OAuth providers; a private modal to paste a key
   for non-OAuth APIs. No vendor dashboard.
-- **Leak-safe by construction** — the agent/LLM receives a handle, never a token. Secrets never
+- **Leak-safe by construction.** The agent/LLM receives a handle, never a token. Secrets never
   reach logs, messages, the audit log, or error strings. Outbound calls are restricted to a
   per-provider host allowlist.
 - **Per-user by default**, with **per-channel shared credentials** for service accounts an admin
   configures (e.g. one API key the whole `#support` channel's agents use).
-- **Channel tool plane** — admins scope which providers a channel may use via
+- **Channel tool plane.** Admins scope which providers a channel may use via
   `/vouchr tools | enable | disable`; `connect()` and shared creds refuse a disabled provider, and
   `toolManifest()` returns the channel-filtered list for building per-channel agent toolsets.
-- **Bring your own secret manager** — point a credential at an AWS Secrets Manager ARN (or any
+- **Bring your own secret manager.** Point a credential at an AWS Secrets Manager ARN (or any
   resolver); Vouchr stores the reference, not the secret, so rotation stays where it lives.
-- **Encrypted store** — SQLite by default, Postgres for stateless/multi-instance deploys.
-- **Lifecycle** — token auto-refresh, audit log keyed to the acting human, TTL, and automatic
+- **Encrypted store.** SQLite by default, Postgres for stateless/multi-instance deploys.
+- **Lifecycle.** Token auto-refresh, audit log keyed to the acting human, TTL, and automatic
   revocation when Slack deactivates a user.
 
 ## Setup
@@ -129,7 +128,7 @@ access-controlled (see [SECURITY.md](./SECURITY.md)).
 ## Providers
 
 Built-ins: `github()`, `google()`, `gitlab()`, `notion()`. Any other OAuth2 provider is a few
-lines — set `egressAllow` (the hosts its token may be sent to), the refresh strategy, and PKCE:
+lines: set `egressAllow` (the hosts its token may be sent to), the refresh strategy, and PKCE:
 
 ```ts
 const linear = defineProvider({
@@ -152,12 +151,12 @@ A few things an adopter hits in practice:
 
 - **Workspaces / bot tokens.** A single-workspace app just sets `SLACK_BOT_TOKEN`. For an app
   installed to many workspaces or org-wide, pass a `DbInstallationStore` to both Bolt's OAuth
-  `installationStore` and `createVouchr({ installationStore })` — the post-OAuth confirmation DM is
+  `installationStore` and `createVouchr({ installationStore })`; the post-OAuth confirmation DM is
   then sent with the connecting user's own workspace token (resolved per enterprise and team).
   Credentials are isolated by `team_id` either way.
 - **`ConsentRequiredError` is control flow, not an error.** When a user hasn't
   connected, `connect()` posts the Connect prompt and throws `ConsentRequiredError`.
-  Catch it and stop the turn — don't log it as a failure:
+  Catch it and stop the turn; do not log it as a failure:
   ```ts
   import { ConsentRequiredError } from 'vouchr';
   // inside your handler:
@@ -170,22 +169,24 @@ A few things an adopter hits in practice:
   }
   ```
 - **Storage at rest.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
-  rest of each row — and the SQLite file as a whole — is not. Keep the DB
+  rest of each row, and the SQLite file as a whole, is not. Keep the DB
   access-controlled and the key in a secret manager; see [SECURITY.md](./SECURITY.md).
 
 ## Deployment
 
-[DEPLOYMENT.md](./DEPLOYMENT.md) has copy-pasteable recipes — SQLite vs Postgres, multi-workspace
+[DEPLOYMENT.md](./DEPLOYMENT.md) has copy-pasteable recipes (SQLite vs Postgres, multi-workspace
 installs, the AWS Secrets Manager resolver, optional KMS envelope encryption, the Slack app/OAuth
-flow — and a [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) to work
+flow) plus a [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) to work
 through before going live.
 
 ## Status
 
-Pre-1.0. The embedded Bolt surface is built, and the full test suite — including the Postgres
-backend — is green in CI on every push and PR. The security workflow runs npm audit, gitleaks,
-SBOM generation, and OWASP Dependency-Check. That's CI green, not production mileage: Vouchr has
-not yet been run in production. See the
+**Pre-production. Not yet tested in a live deployment.**
+
+The embedded Bolt surface is built, and the full test suite (including the Postgres backend) is
+green in CI on every push and PR. The security workflow runs npm audit, gitleaks, SBOM generation,
+and OWASP Dependency-Check. That is CI green, not production mileage: Vouchr has yet to be tested
+in production. Review the
 [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before adopting,
 [SECURITY.md](./SECURITY.md) for the security model and reporting, and
 [CONTRIBUTING.md](./CONTRIBUTING.md) to help.

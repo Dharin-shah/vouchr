@@ -29,7 +29,7 @@ google({ scopes: ['openid', 'email', 'https://www.googleapis.com/auth/gmail.read
 ```
 
 Egress for `google()` is allowlisted to `www.googleapis.com`,
-`gmail.googleapis.com`, and `people.googleapis.com` — a `fetch` to any other host
+`gmail.googleapis.com`, and `people.googleapis.com`. A `fetch` to any other host
 is blocked at the injection boundary.
 
 ## Refresh tokens
@@ -37,7 +37,7 @@ is blocked at the injection boundary.
 `google()` sets `access_type=offline` + `prompt=consent` and `refresh:
 'rotating'`, so Google issues a refresh token and Vouchr renews the short-lived
 access token on demand (and on a 401). It also uses **PKCE** on the authorize +
-token exchange. Nothing to configure — it just keeps working past the ~1h access
+token exchange. Nothing to configure: it just keeps working past the ~1h access
 token expiry.
 
 ## Env
