@@ -13,7 +13,7 @@ import { awsSecretsManager } from './resolver';
 //   arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/github-bot-AbCdEf
 //
 // Vouchr stores only that ARN. When an agent acts on GitHub, the injector calls the
-// resolver above JIT to fetch the live secret — Vouchr never persists it.
+// resolver above JIT to fetch the live secret. Vouchr never persists it.
 (async () => {
   const vouchr = await createVouchr({
     providers: [github()],

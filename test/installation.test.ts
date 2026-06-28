@@ -18,7 +18,7 @@ const teamInstall = (teamId: string, botToken: string, enterpriseId?: string): I
   authVersion: 'v2',
 });
 
-/** A minimal org-wide (Enterprise Grid) install — no team, keyed by enterprise. */
+/** A minimal org-wide (Enterprise Grid) install: no team, keyed by enterprise. */
 const orgInstall = (enterpriseId: string, botToken: string): Installation => ({
   team: undefined,
   enterprise: { id: enterpriseId, name: 'Org' },
@@ -80,7 +80,7 @@ test('per-team token resolution returns the right workspace token', async () => 
   assert.equal(t2.bot?.token, 'xoxb-T2');
   assert.notEqual(t1.bot?.token, t2.bot?.token);
 
-  // A workspace with no install resolves to nothing (fetch throws — caller treats as best-effort).
+  // A workspace with no install resolves to nothing (fetch throws, caller treats as best-effort).
   await assert.rejects(
     () => store.fetchInstallation({ teamId: 'T_UNKNOWN', enterpriseId: undefined, isEnterpriseInstall: false }),
     /No installation found/,

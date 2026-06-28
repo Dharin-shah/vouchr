@@ -31,7 +31,7 @@ export interface Provider {
    * How the secret is attached to the outbound request. Mutate `headers` in place.
    * Default (unset): `Authorization: Bearer <secret>`. Use for non-Bearer APIs/MCPs,
    * e.g. `(h, s) => h.set('x-api-key', s)`.
-   * Note: header-only — covers Bearer/x-api-key/Basic. Add a URL arg if a provider
+   * Note: header-only, covers Bearer/x-api-key/Basic. Add a URL arg if a provider
    * ever needs the secret in a query param.
    */
   inject?: (headers: Headers, secret: string) => void;
@@ -46,7 +46,7 @@ export interface Provider {
   bodyFormat?: 'form' | 'json';
   /**
    * OPTIONAL upstream token revocation (RFC 7009 style). When unset, revoke is a no-op
-   * (e.g. Notion has no documented endpoint — not faked). The declarative path POSTs
+   * (e.g. Notion has no documented endpoint, not faked). The declarative path POSTs
    * `token=<token>` (form) to `revokeUrl`; `revokeAuth: 'body'` additionally sends
    * client_id/client_secret in the body (GitLab). `revokeAuth: 'none'` (default) sends no
    * client auth (Google). For genuinely non-standard endpoints (e.g. GitHub's DELETE with

@@ -89,7 +89,7 @@ test("connect() refuses a disabled provider (audited 'tool-disabled') and allows
   assert.ok(await c.connect('mcp'));
 });
 
-// connectChannel(): same gate — disabled refused, enabled (with a shared cred) returns a handle.
+// connectChannel(): same gate. Disabled refused, enabled (with a shared cred) returns a handle.
 test('connectChannel() refuses a disabled provider and allows an enabled one', async () => {
   const { c, vault, tools } = await ctx(true);
   await tools.setEnabled('T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, other off

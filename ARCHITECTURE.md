@@ -4,7 +4,7 @@ Vouchr is a self-hosted Slack credential broker built on a single idea: the agen
 receives a **capability handle**, never a secret. A user connects an account once via
 an in-Slack button; Vouchr stores the token encrypted, keyed to the Slack identity (or
 to a channel, for shared service accounts), and injects it **only at the outbound HTTP
-boundary**, after an egress-allowlist check — so the token never reaches the agent code,
+boundary**, after an egress-allowlist check, so the token never reaches the agent code,
 the LLM, the chat transcript, logs, or the audit table. Credentials are owner-scoped
 (per-user by default, per-channel when an admin configures it) and isolated per Slack
 tenant.
@@ -54,7 +54,7 @@ Two phases:
 - **Connect phase** (first time). `context.vouchr.connect('github')` finds no stored
   credential, so the adapter posts an ephemeral Block Kit "Connect" button (only the
   user sees it), records a single-use OAuth `state` + PKCE verifier, and throws
-  `ConsentRequiredError` — control flow, not an error. The browser OAuth returns to the
+  `ConsentRequiredError` (control flow, not an error). The browser OAuth returns to the
   callback route, which consumes the state, exchanges the code, and vaults the encrypted
   token. Key providers instead get a private modal where the user pastes a key or an
   external reference.
@@ -65,7 +65,7 @@ Two phases:
 
 ## Core / adapter boundary
 
-The security logic lives in `src/core/`, which is **transport-agnostic** — it imports
+The security logic lives in `src/core/`, which is **transport-agnostic**: it imports
 nothing from `@slack/*` or `src/adapters/`. The Bolt adapter (`src/adapters/bolt.ts`)
 is a thin consumer: it resolves identity and channel from verified Slack events, fetches
 Slack-side facts (admin status, channel class), and delegates every security decision to
@@ -76,7 +76,7 @@ This boundary is enforced by `test/architecture.test.ts`, which scans every file
 the channel-eligibility rule (`channelIneligibleReason`) lives in core.
 
 Why it matters: the boundary is what lets a future **sidecar + thin clients** (other
-languages) reuse the identical core — and its security rules — instead of
+languages) reuse the identical core (and its security rules) instead of
 re-implementing them. The eligibility classification, owner keying, egress check, and
 crypto are all decided in one place; an adapter only supplies inputs (e.g.
 `conversations.info` output is passed to `channelIneligibleReason`, which fails closed on
@@ -84,8 +84,8 @@ crypto are all decided in one place; an adapter only supplies inputs (e.g.
 
 ## Storage schema
 
-One store, two backends — SQLite (embedded, zero-config default) or Postgres (stateless
-/ multi-instance) — behind a minimal async `Db` seam (`src/core/db.ts`, `?`
+One store, two backends: SQLite (embedded, zero-config default) or Postgres (stateless
+/ multi-instance), behind a minimal async `Db` seam (`src/core/db.ts`, `?`
 placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
 
 | Table | Purpose | Key |
@@ -96,9 +96,8 @@ placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
 | `audit` | Append-only action log | PK `id` |
 | `installation` | Encrypted Slack install (bot/user tokens) for multi-workspace | PK rowKey `(enterprise, team)` |
 
-The **owner key `(team_id, owner_kind, owner_id, provider)`** is the heart of the model:
-every vault read/write is scoped by it, and the UNIQUE constraint enforces one credential
-per principal+provider. `owner_kind` is `user` or `channel`; `team_id` is always the
+Every vault read/write is scoped by the **owner key `(team_id, owner_kind, owner_id,
+provider)`**, and the UNIQUE constraint enforces one credential per principal+provider. `owner_kind` is `user` or `channel`; `team_id` is always the
 authenticated user's, never derived from a channel id (`src/core/owner.ts`). This is the
 tenant- and owner-isolation boundary.
 
@@ -129,8 +128,8 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
   version byte). Reads dispatch on the stored format, so both modes read existing rows.
 - **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
   an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
-  non-secret ref and resolves it JIT at injection time — never persisted, cached, or
-  logged. Rotation stays where the secret lives.
+  non-secret ref and resolves it JIT at injection time. The ref is never persisted,
+  cached, or logged. Rotation stays where the secret lives.
 
 ## Lifecycle
 
@@ -151,7 +150,7 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    timer, and audits as the acting human.
 5. **Refresh.** On a 401 (or near-expiry) for a vaulted OAuth credential, a single-flight
    refresh (`inflight` map dedups concurrent refreshes of a rotating token) updates the
-   tokens via `updateTokens` — which leaves `created_at` intact, so refresh cannot defer
+   tokens via `updateTokens`, which leaves `created_at` intact, so refresh cannot defer
    the max-age TTL.
 6. **TTL / sweep** (`src/core/sweep.ts`, `vault.ts`). `get()` returns `null` for an
    expired connection (lazy expiry); a periodic `sweepExpired()` deletes idle/aged rows

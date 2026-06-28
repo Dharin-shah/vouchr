@@ -10,7 +10,7 @@ export type Resolvers = Record<string, (ref: string) => Promise<string>>;
 
 /**
  * A structured, NO-SECRET observability event. Operators wire a single `EventSink` to feed
- * metrics/logs. Fields are non-secret only — provider id, host, status, counts, booleans.
+ * metrics/logs. Fields are non-secret only: provider id, host, status, counts, booleans.
  * NEVER carries tokens, secretRef values, user/team ids, or any user content.
  */
 export type VouchrEvent =
@@ -33,8 +33,8 @@ export type EventSink = (e: VouchrEvent) => void;
  * the egress allowlist check.
  *
  * Two identities are carried separately and must never be conflated:
- *  - `owner`  — the principal that OWNS the credential (vault key); a user or a channel.
- *  - `acting` — the human who triggered this request (audit attribution), even when a
+ *  - `owner`:  the principal that OWNS the credential (vault key); a user or a channel.
+ *  - `acting`: the human who triggered this request (audit attribution), even when a
  *    shared channel credential is used. A shared cred never launders away who acted.
  */
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
@@ -54,13 +54,13 @@ export class ConnectionHandle {
     private audit: Audit,
     private resolvers: Resolvers = {},
     // Shared across handles so concurrent fetches for the same owner+provider refresh once.
-    // Default = per-instance (no cross-request dedup) — fine for direct construction in tests.
+    // Default = per-instance (no cross-request dedup), fine for direct construction in tests.
     private inflight: Map<string, Promise<string | null>> = new Map(),
     // No-secret observability hook. Default no-op (zero behavior change when unset).
     private sink: EventSink = () => {},
   ) {}
 
-  /** Fire the sink, swallowing any error — a bad sink must never break a request. */
+  /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
     try {
       this.sink(e);
@@ -79,7 +79,7 @@ export class ConnectionHandle {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(`Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
     }
-    // Egress allowlist first — before any secret is even read.
+    // Egress allowlist first, before any secret is even read.
     if (!this.provider.egressAllow.includes(url.hostname)) {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(
@@ -93,7 +93,7 @@ export class ConnectionHandle {
       throw new Error(`Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
-    // never reaches the vault — the secret is read strictly after every egress check passes.
+    // never reaches the vault: the secret is read strictly after every egress check passes.
     if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
       throw new Error(
@@ -124,7 +124,7 @@ export class ConnectionHandle {
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);
       else headers.set('Authorization', `Bearer ${t}`);
-      // redirect:'manual' — never auto-follow a 3xx off the allowlisted host with the bearer attached.
+      // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
       return fetch(input, { ...init, headers, redirect: 'manual' });
     };
 
@@ -135,17 +135,17 @@ export class ConnectionHandle {
       if (refreshed) res = await send(refreshed);
     }
 
-    // Mark the connection used (resets its idle TTL) and audit AS THE ACTING HUMAN — never the secret.
+    // Mark the connection used (resets its idle TTL) and audit AS THE ACTING HUMAN, never the secret.
     // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
     // failed fetch (the caller might retry a non-idempotent request).
     await this.vault.touch(this.owner, this.provider.id).catch(() => undefined);
     // Attribute the injection to the channel when the cred is channel-owned (owner.id IS the channel
-    // id then). For a user-owned cred owner.id is a user id, not a channel — leave channel unset.
+    // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
     const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
     await this.audit
       .record('inject', this.acting, this.provider.id, { host: url.hostname, status: res.status, ...channelMeta })
       .catch(() => undefined);
-    // No-secret observability: provider/host/status/ownerKind only — never the token or the actor.
+    // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind });
     return res;
   }
@@ -196,7 +196,7 @@ export class ConnectionHandle {
     const stored = await this.vault.get(this.owner, this.provider.id);
     if (!stored?.refreshToken) return null;
     const refreshed = await refreshToken(this.provider, stored.refreshToken);
-    // updateTokens, not upsert — refresh must not reset created_at (max-age TTL).
+    // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
     await this.vault.updateTokens(this.owner, this.provider.id, {
       accessToken: refreshed.accessToken,
       refreshToken: refreshed.refreshToken ?? stored.refreshToken,

@@ -2,7 +2,7 @@ import type { Owner } from '../../src/core/owner';
 
 /**
  * Tiny TS thin client for the Vouchr sidecar. This is the shape OTHER languages replicate: three
- * POSTs over localhost HTTP with a shared bearer. A Python/Go client is the same contract — see
+ * POSTs over localhost HTTP with a shared bearer. A Python/Go client is the same contract. See
  * README.md. The token is NEVER returned by /proxy; you only ever get the provider's response.
  */
 

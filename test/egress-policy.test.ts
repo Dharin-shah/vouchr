@@ -29,7 +29,7 @@ const guarded = defineProvider({
   clientSecret: 'sec',
 });
 
-// Wire the handle so its secret comes ONLY from the resolver — a resolver call count of 0 proves
+// Wire the handle so its secret comes ONLY from the resolver, and a resolver call count of 0 proves
 // the token was never read. The injector reads the secret strictly after every egress check passes.
 async function makeHandle(provider = guarded) {
   const db = await openDb({ dbPath: ':memory:' });
@@ -76,7 +76,7 @@ test('egress: disallowed path is denied before the token is read', async () => {
     const { handle, calls } = await makeHandle();
     await assert.rejects(() => handle.fetch('https://api.acme.example/secrets', { method: 'GET' }), /not in the allowed paths/);
     await assert.rejects(() => handle.fetch('https://api.acme.example/userish', { method: 'GET' }), /not in the allowed paths/);
-    assert.equal(calls(), 0); // resolver never called — secret never read
+    assert.equal(calls(), 0); // resolver never called, secret never read
     assert.equal(fetched, false); // request never went out
   } finally {
     globalThis.fetch = realFetch;
@@ -144,7 +144,7 @@ test('egress: provider WITHOUT the new fields is unchanged (hostname-only baseli
       clientSecret: 'sec',
     });
     const { handle } = await makeHandle(plain);
-    // Any path, any method — only the hostname allowlist applies, exactly as before.
+    // Any path, any method: only the hostname allowlist applies, exactly as before.
     const res = await handle.fetch('https://api.acme.example/anything/at/all', { method: 'DELETE' });
     assert.equal(res.status, 200);
     // And a disallowed host is still blocked.

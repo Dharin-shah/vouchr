@@ -19,7 +19,7 @@ const KEY = randomBytes(32);
 const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
 
 // T3 + invariant 4: a user cred and a channel cred sharing an id string, and the same channel
-// id in another team, are all independently addressable — no lookup satisfies another's.
+// id in another team, are all independently addressable. No lookup satisfies another's.
 test('owner isolation: (team,channel) vs (team,user) vs (otherTeam,channel) never cross', async () => {
   const vault = new Vault(await openDb({ dbPath: ':memory:' }), KEY);
   await vault.upsert(channelOwner('T1', 'X'), 'p', tok('chan-T1'));
@@ -43,7 +43,7 @@ test('referenced secret-source: resolved JIT, injected, never persisted', async 
   const owner = channelOwner('T1', 'C_FIN');
   await vault.reference(owner, 'mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:...:k' });
 
-  // The secret itself appears nowhere in the row — only the ARN ref does.
+  // The secret itself appears nowhere in the row. Only the ARN ref does.
   const row = await db.get('SELECT access_token_enc, secret_ref, source FROM connection') as any;
   assert.equal(row.access_token_enc, null);
   assert.equal(row.source, 'aws-sm');
@@ -123,13 +123,13 @@ test('audit attribution: shared-cred injection records the acting user, not the 
     const acting = { enterpriseId: null, teamId: 'T1', userId: 'U_HUMAN' };
     await new ConnectionHandle(provider, owner, acting, vault, audit).fetch('https://api.test/x');
     const row = await db.get(`SELECT user_id FROM audit WHERE action='inject'`) as any;
-    assert.equal(row.user_id, 'U_HUMAN'); // the human who acted — not 'C_FIN'
+    assert.equal(row.user_id, 'U_HUMAN'); // the human who acted, not 'C_FIN'
   } finally {
     globalThis.fetch = realFetch;
   }
 });
 
-// Migration: a pre-owner-keying DB (user_id, no owner_kind) is rebuilt — each row becomes an
+// Migration: a pre-owner-keying DB (user_id, no owner_kind) is rebuilt: each row becomes an
 // owner_kind='user' row with ciphertext + timestamps preserved verbatim.
 test('migration: legacy user_id rows backfill to owner_kind=user, ciphertext preserved', async () => {
   const path = join(tmpdir(), `vouchr-mig-${randomBytes(6).toString('hex')}.db`);

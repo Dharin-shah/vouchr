@@ -53,7 +53,7 @@ async function ctx(opts: {
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
 
 // isAdmin override: a custom check overrides the built-in Slack gate. slackAdmin:false proves the
-// override (not users.info) decides — a non-Slack-admin can configure when the override says yes.
+// override (not users.info) decides: a non-Slack-admin can configure when the override says yes.
 test('isAdmin override: custom true lets a non-Slack-admin configure', async () => {
   const { c, vault, db } = await ctx({ adminCheck: async () => true, slackAdmin: false });
   await c.setChannelSecret('mcp', SECRET);
@@ -61,7 +61,7 @@ test('isAdmin override: custom true lets a non-Slack-admin configure', async () 
   assert.deepEqual((await auditRows(db)).map((r) => r.action), ['config']);
 });
 
-// Override false blocks even a real Slack admin — default-deny + audited denial stays intact.
+// Override false blocks even a real Slack admin. Default-deny + audited denial stays intact.
 test('isAdmin override: custom false blocks and audits denied', async () => {
   const { c, vault, db } = await ctx({ adminCheck: async () => false, slackAdmin: true });
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /admin/);
@@ -89,7 +89,7 @@ test('requireChannelMembership: non-member refused + audited, member allowed', a
   assert.ok(await ok.c.connectChannel('mcp')); // member → handle
 });
 
-// requireChannelMembership OFF (default): membership is never checked — a non-member still gets the
+// requireChannelMembership OFF (default): membership is never checked, a non-member still gets the
 // shared cred, exactly as before this feature.
 test('requireChannelMembership: off → membership not checked', async () => {
   const { c } = await ctx({ requireMembership: false, members: 'throw' });

@@ -2,9 +2,9 @@ import type { Db } from './db';
 
 /**
  * Per-channel credential mode for a provider:
- *  - 'shared'   — the channel owns one credential every member's agent injects (a static
+ *  - 'shared':   the channel owns one credential every member's agent injects (a static
  *                 key or an external ref). Set by an admin.
- *  - 'per-user' — the channel is LOCKED to per-user identity: no shared cred may exist here,
+ *  - 'per-user': the channel is LOCKED to per-user identity: no shared cred may exist here,
  *                 each member must use their own (invariant 7). setChannelSecret refuses.
  * No row → unconfigured: no shared cred, and an admin may set one (defaults to 'shared').
  */
@@ -22,7 +22,7 @@ export interface ChannelInfo {
 
 /**
  * Why a channel is INELIGIBLE for a shared (channel-owned) credential (invariant 6), or null if
- * it's eligible. The classification rule lives in core — transport-agnostic — so every adapter
+ * it's eligible. The classification rule lives in core (transport-agnostic) so every adapter
  * (the Bolt middleware today, a sidecar + thin clients later) enforces the SAME security rule
  * instead of re-implementing it. The adapter only fetches the info; pass `null` if it couldn't
  * (fails closed). Externally shared / Slack Connect is the security-critical case (cross-org leak).

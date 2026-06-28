@@ -2,7 +2,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import { Pool, types } from 'pg';
 
 /**
- * Minimal async data handle — the seam that lets the same store code run on SQLite
+ * Minimal async data handle: the seam that lets the same store code run on SQLite
  * (embedded, the zero-config default) or Postgres (for stateless / multi-instance infra).
  * Not a public extension point: just the two backends this project ships.
  *
@@ -127,7 +127,7 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
       statement_timeout: 10_000, // fail a request fast instead of hanging the Bolt handler
     });
     // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
-    // throws and kills the whole process; swallow it — pg reconnects on the next query.
+    // throws and kills the whole process; swallow it, pg reconnects on the next query.
     pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
     const db = new PgDb(pool);
     await db.exec(schema('BYTEA', 'BIGINT'));
@@ -147,7 +147,7 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
 function migrateSqlite(db: BetterSqlite3.Database): void {
   db.exec(schema('BLOB', 'INTEGER'));
 
-  // Forward-migrate a pre-owner-keying DB (had user_id, no owner_kind) by rebuilding the table —
+  // Forward-migrate a pre-owner-keying DB (had user_id, no owner_kind) by rebuilding the table:
   // SQLite can't ALTER a UNIQUE constraint. Each old per-user row becomes an owner_kind='user' row;
   // ciphertext, enterprise_id and timestamps are preserved verbatim.
   const cols = (db.prepare(`PRAGMA table_info(connection)`).all() as any[]).map((c) => c.name);
@@ -171,7 +171,7 @@ function migrateSqlite(db: BetterSqlite3.Database): void {
     `);
   }
 
-  // Add the `channel` audit column to a pre-existing audit table (plain ADD COLUMN — no UNIQUE rebuild).
+  // Add the `channel` audit column to a pre-existing audit table (plain ADD COLUMN, no UNIQUE rebuild).
   const auditCols = (db.prepare(`PRAGMA table_info(audit)`).all() as any[]).map((c) => c.name);
   if (!auditCols.includes('channel')) {
     db.exec(`ALTER TABLE audit ADD COLUMN channel TEXT`);

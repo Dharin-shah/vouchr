@@ -1,7 +1,7 @@
 # vouchr operator CLI
 
 A read-only, secret-free CLI for self-hosted operators. It connects to the **same**
-credential store the app uses and only ever reads metadata — it never decrypts or
+credential store the app uses and only ever reads metadata. It never decrypts or
 prints tokens, refresh tokens, or secret ciphertext.
 
 ## Run
@@ -22,7 +22,7 @@ and `npm link`/install it can also be invoked as `vouchr`.)
 | `--db <path>`         | SQLite file path (overrides `VOUCHR_DB`; default `vouchr.db`) |
 | `VOUCHR_DB`           | SQLite file path                                             |
 | `VOUCHR_DATABASE_URL` | Postgres connection string (takes precedence over SQLite)   |
-| `VOUCHR_MASTER_KEY`   | base64 32-byte key — only loaded/validated by `doctor`      |
+| `VOUCHR_MASTER_KEY`   | base64 32-byte key, only loaded/validated by `doctor`      |
 
 ## Commands
 

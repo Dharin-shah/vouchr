@@ -3,18 +3,18 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
 
-## [0.1.0] — production target (pending external validation)
+## [0.1.0]: production target (pending external validation)
 
 The 0.1.0 line is the first production-intended release. Everything below is on `main` and
 green in CI (typecheck + full suite incl. a real Postgres backend). It is **not declared
-production until an independent security review / pen test is completed** — the one gate that
-can't be self-served. There is intentionally no `v0.1.0` git tag yet; cut it after external
+production until an independent security review / pen test is completed**. That is the one gate
+that can't be self-served. There is intentionally no `v0.1.0` git tag yet; cut it after external
 validation passes.
 
 ### Core capability
 
 - Capability-handle broker: `context.vouchr.connect(provider)` returns a handle whose `fetch()`
-  injects the secret only at the outbound HTTP boundary — the agent, LLM, and chat never see it.
+  injects the secret only at the outbound HTTP boundary: the agent, LLM, and chat never see it.
 - Per-user and per-channel (admin-configured, shared) credential ownership; owner vs acting-human
   kept separate for audit attribution.
 - Declarative provider model: OAuth2 + static-key providers, custom header injection, PKCE,
@@ -66,4 +66,4 @@ validation passes.
 
 - Intent/session narrowing (enterprise; egress path/method limits provide a baseline today).
 - Signed releases / provenance (needs publish infrastructure; `release.yml` is manual-only for now).
-- External security review / pen test — the production gate.
+- External security review / pen test (the production gate).

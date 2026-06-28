@@ -90,7 +90,7 @@ not).
 A crafted message or tool output tries to make the agent exfiltrate the token or
 call an arbitrary host.
 
-- **Token exfiltration: mitigated by construction.** The model never holds a token —
+- **Token exfiltration: mitigated by construction.** The model never holds a token;
   it only ever sees a `ConnectionHandle`. There is no API that returns the secret to
   caller code; `fetch()` attaches it internally (`injector.ts`).
 - **Arbitrary host call: mitigated.** Even if the prompt coerces the agent into
@@ -119,7 +119,7 @@ A channel is used to trick the agent into using a shared credential inappropriat
 or a channel changes class after a shared credential was configured.
 
 - **Mitigated.** Shared (channel-owned) credentials are refused in ineligible channel
-  classes — externally shared / Slack Connect, DMs/MPIMs, archived — at both config
+  classes (externally shared / Slack Connect, DMs/MPIMs, archived) at both config
   time and *use* time (`assertChannelEligible` is re-checked in `connectChannel`,
   `src/adapters/bolt.ts`). A channel turned Slack Connect after configuration stops
   working immediately.
@@ -145,7 +145,7 @@ A custom `Provider` (its `inject`, `revoke`, `accountProbe`) is itself the attac
 or buggy.
 
 - **Partially mitigated.** A custom provider runs inside the Vouchr process and is
-  trusted with the token it is given — by design it must attach the secret somewhere.
+  trusted with the token it is given. By design it must attach the secret somewhere.
   Vouchr constrains *where* outbound calls go (egress allowlist applies to
   `handle.fetch`), but a malicious `accountProbe`/`revoke`/`inject` could send the
   token to an arbitrary host or place caller-supplied data into audit metadata.
@@ -220,7 +220,7 @@ org via an externally shared channel.
   credentials are refused in `is_ext_shared` / `is_shared` / `is_pending_ext_shared`
   channels at config time and re-verified at use time, failing closed if the class
   can't be read (`channelIneligibleReason`, `connectChannel`). Per-user credentials
-  are unaffected — each member uses their own.
+  are unaffected. Each member uses their own.
 
 ## Security invariants
 
@@ -239,7 +239,7 @@ These mirror what the code (and the test suite) enforce:
    audited as the human who triggered the call (`injector.ts`, `owner.ts`).
 4. **Channel credentials are refused in externally shared channels** (and other
    ineligible classes), fail-closed (`channelConfig.ts`).
-5. **OAuth `state` is single-use and expiring** — atomic `DELETE ... RETURNING` +
+5. **OAuth `state` is single-use and expiring**: atomic `DELETE ... RETURNING` +
    10-minute TTL (`consent.ts`).
 6. **Offboarding clears pending consent** so a deactivated user's in-flight OAuth
    can't resurrect a connection (`offboard.ts`).
@@ -259,7 +259,7 @@ These mirror what the code (and the test suite) enforce:
 Vouchr is a credential *boundary*, not a complete authorization system. The explicit
 non-goals live in [SECURITY.md → "What Vouchr does not protect against"](./SECURITY.md):
 
-- Not provider-side authorization — egress checks can narrow host/path/method, but provider scopes
+- Not provider-side authorization: egress checks can narrow host/path/method, but provider scopes
   still decide what the credential can actually do.
 - Provider response bodies flow back to the agent once fetched.
 - Raw keys typed into a Slack modal pass through Slack (prefer external references).

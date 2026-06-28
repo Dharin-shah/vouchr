@@ -106,7 +106,7 @@ export class Vault {
   /**
    * Store a REFERENCED credential: the secret stays in an external manager (e.g. AWS
    * Secrets Manager). We persist only a non-secret `ref` + the resolver `source` id;
-   * the injector resolves it just-in-time. Rotation stays external — Vouchr never holds it.
+   * the injector resolves it just-in-time. Rotation stays external: Vouchr never holds it.
    */
   async reference(
     owner: Owner,
@@ -175,7 +175,7 @@ export class Vault {
   }
 
   /**
-   * Every connection currently past its TTL — for the periodic sweep. Filters in SQL
+   * Every connection currently past its TTL (for the periodic sweep). Filters in SQL
    * (only expired rows cross the wire) rather than scanning the whole table in memory.
    * The predicate MUST mirror isExpired(): idle uses last_used_at (falling back to
    * created_at), max-age uses created_at; an empty policy expires nothing.

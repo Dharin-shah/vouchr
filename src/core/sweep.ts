@@ -20,7 +20,7 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
       owner.kind === 'channel' ? 'system' : undefined);
   }
   await consent.sweepStale();
-  // No-secret observability: just the count. Best-effort — a bad sink must never break the sweep.
+  // No-secret observability: just the count. Best-effort, a bad sink must never break the sweep.
   if (sink) try { sink({ type: 'expired', count: expired.length }); } catch { /* ignore */ }
   return expired.length;
 }

@@ -8,7 +8,7 @@ import { revokeToken } from './tokens';
 import { userOwner } from './owner';
 
 /**
- * Remove ALL of a user's own connections — the offboarding cleanup. Triggered
+ * Remove ALL of a user's own connections: the offboarding cleanup. Triggered
  * automatically when Slack deactivates the account (see the Bolt adapter's
  * registerOffboarding), and callable from a SCIM deprovision hook or an admin.
  *
@@ -35,7 +35,7 @@ export async function offboardUser(
   for (const provider of providers) {
     // Read the token BEFORE deleting so we can hand it to the upstream revoke.
     const cred = registry?.has(provider) ? await vault.get(owner, provider) : null;
-    await vault.delete(owner, provider); // local delete FIRST — the security-meaningful action
+    await vault.delete(owner, provider); // local delete FIRST (the security-meaningful action)
     // Best-effort upstream revocation: swallow per-connection errors so offboarding always completes.
     const meta: Record<string, unknown> = { reason };
     if (registry) {
@@ -43,7 +43,7 @@ export async function offboardUser(
       try {
         if (cred?.accessToken) await revokeToken(registry.get(provider), cred.accessToken);
       } catch {
-        ok = false; // network/HTTP failure — local access is already gone; nothing is faked
+        ok = false; // network/HTTP failure: local access is already gone; nothing is faked
       }
       meta.ok = ok; // never the token, just whether the upstream call succeeded
     }
@@ -56,15 +56,15 @@ export async function offboardUser(
  * Enterprise Grid / SCIM offboarding: remove a user across EVERY workspace, not just one.
  *
  * The Vault API is team-scoped (the full owner key is team_id + kind + id), so "everywhere" can
- * only mean "every team this user touches". We discover those teams honestly at the DB level —
- * the distinct team_ids where the user has either an own connection OR an in-flight consent — then
+ * only mean "every team this user touches". We discover those teams honestly at the DB level:
+ * the distinct team_ids where the user has either an own connection OR an in-flight consent, then
  * replay {@link offboardUser} once per team. That keeps the upstream-revoke + audit + consent-purge
- * logic in exactly one place and, crucially, each per-team call still uses the FULL owner key
+ * logic in exactly one place and each per-team call still uses the FULL owner key
  * (team_id + 'user' + userId), so the cross-team sweep can never reach beyond this user's own rows.
  *
  * In Enterprise Grid the Slack userId is unique org-wide, so `userId` alone is a complete span key;
  * `enterpriseId`, when given, additionally narrows discovery to that org's rows. (Caveat: vault
- * writes currently persist connection.enterprise_id as NULL — see Vault.upsert — so passing
+ * writes currently persist connection.enterprise_id as NULL (see Vault.upsert) so passing
  * enterpriseId under-matches *connections* today; consent rows do store it. Prefer userId-only.)
  *
  * Best-effort and non-fatal per team: one workspace's DB/revoke failure never blocks the others.
@@ -93,7 +93,7 @@ export async function offboardUserEverywhere(
 
   const summary: { teamId: string; providers: string[] }[] = [];
   for (const { team_id: teamId } of rows) {
-    // Full owner key per team — never a partial key. offboardUser does the local delete first, then
+    // Full owner key per team, never a partial key. offboardUser does the local delete first, then
     // best-effort upstream revoke + audit, and purges this team's pending consent.
     const identity: SlackIdentity = { enterpriseId: user.enterpriseId ?? null, teamId, userId: user.userId };
     try {
@@ -101,7 +101,7 @@ export async function offboardUserEverywhere(
     } catch {
       // Non-fatal per team; local deletes were already attempted inside offboardUser. Record the
       // team with no providers rather than aborting the whole sweep. Never surface the error (it
-      // could carry connection detail) — secrets stay out of logs/returns.
+      // could carry connection detail). Secrets stay out of logs/returns.
       summary.push({ teamId, providers: [] });
     }
   }

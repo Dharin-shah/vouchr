@@ -13,7 +13,7 @@ const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const KEY = randomBytes(32);
 const tok = (t: string) => ({ accessToken: t, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
 
-// Read the channel COLUMN directly (not via JSON meta) — this is the whole point of the change.
+// Read the channel COLUMN directly (not via JSON meta): this is the whole point of the change.
 const lastChannel = (db: any) =>
   db.get('SELECT channel FROM audit ORDER BY at DESC LIMIT 1').then((r: any) => r.channel);
 

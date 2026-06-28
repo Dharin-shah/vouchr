@@ -51,7 +51,7 @@ function secretFields(): unknown[] {
       hint: {
         type: 'plain_text',
         // Note: Block Kit has no masked input. The value is never echoed back, posted, or
-        // logged — but a reference is still preferable.
+        // logged, but a reference is still preferable.
         text: 'Stored encrypted by Vouchr. Use a reference instead when your secret manager can hold it.',
       },
       element: { type: 'plain_text_input', action_id: 'v' },
@@ -60,7 +60,7 @@ function secretFields(): unknown[] {
 }
 
 /**
- * Private secret-entry modal (leak-safe UX). The value typed here lives only in this view —
+ * Private secret-entry modal (leak-safe UX). The value typed here lives only in this view,
  * never posted, logged, or put in audit meta. `meta` rides in private_metadata so the submit
  * binds to the right owner (a channel for admin config, or nothing for a per-user key).
  */
@@ -76,7 +76,7 @@ function secretModal(o: { callbackId: string; meta: object; title: string; intro
   };
 }
 
-/** Admin modal: set the CHANNEL's shared credential (invariant 7 — admin-gated upstream). */
+/** Admin modal: set the CHANNEL's shared credential (invariant 7, admin-gated upstream). */
 export function configureModal(provider: string, channel: string): unknown {
   return secretModal({
     callbackId: CONFIGURE_CALLBACK,
@@ -84,7 +84,7 @@ export function configureModal(provider: string, channel: string): unknown {
     title: 'Channel credential',
     intro:
       `Set the *${provider}* credential for this channel. Only you can see what you ` +
-      `type here — it is never posted to the channel.`,
+      `type here. It is never posted to the channel.`,
   });
 }
 
@@ -96,7 +96,7 @@ export function userKeyModal(provider: string): unknown {
     title: 'Your credential',
     intro:
       `Set your own *${provider}* key. Only you can see this; it is stored encrypted and used ` +
-      `only when you ask the agent — never shown to the agent or posted in Slack.`,
+      `only when you ask the agent, never shown to the agent or posted in Slack.`,
   });
 }
 
@@ -109,7 +109,7 @@ export function keySetupBlocks(provider: string): unknown[] {
         type: 'mrkdwn',
         text:
           `:key: *Set up your ${provider} access*\n` +
-          `I need a ${provider} key to act for you. Add yours — it is stored encrypted on this ` +
+          `I need a ${provider} key to act for you. Add yours. It is stored encrypted on this ` +
           `server and is never shown to the agent or posted in Slack.`,
       },
     },

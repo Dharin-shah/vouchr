@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 
-/** Shape of `meta` accepted by the audit log — values must NEVER be token material. */
+/** Shape of `meta` accepted by the audit log: values must NEVER be token material. */
 export type AuditMeta = Record<string, unknown>;
 
 const REDACTED = '[redacted]';

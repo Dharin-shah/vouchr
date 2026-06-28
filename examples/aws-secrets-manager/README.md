@@ -36,7 +36,7 @@ source id, which this resolver handles.
 ## Authentication
 
 The resolver uses the **ambient IAM role** (ECS/Fargate task role, EC2 instance
-profile, or EKS IRSA) — there are **no static credentials in code**. Region and
+profile, or EKS IRSA). There are **no static credentials in code**. Region and
 credentials are resolved by the AWS SDK's default provider chain.
 
 ## Least-privilege IAM policy
