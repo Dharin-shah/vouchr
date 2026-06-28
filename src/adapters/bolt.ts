@@ -16,10 +16,16 @@ import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser } from '../core/offboard';
 import { revokeToken } from '../core/tokens';
 import { sweepExpired } from '../core/sweep';
+import { SessionGrants, type SessionEnforcement } from '../core/session';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
+  sessionApprovalBlocks, APPROVE_SESSION_ACTION,
 } from './blocks';
+
+/** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
+ *  how long a single approval can live before the user must re-approve in the thread. */
+const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
 /** Map an external ref to its resolver source id. Add resolvers → extend this. */
 function refSource(ref: string): string {
@@ -35,6 +41,15 @@ export class ConsentRequiredError extends Error {
   constructor(public provider: string) {
     super(`Consent required for "${provider}". A Connect prompt was posted to the user.`);
     this.name = 'ConsentRequiredError';
+  }
+}
+
+/** Thrown by `connect()` when a thread-scoped session is required and not yet approved: an in-thread
+ *  "Allow … here" button was posted. Stop this turn; the user approves and re-invokes. */
+export class SessionApprovalRequiredError extends Error {
+  constructor(public provider: string) {
+    super(`Session approval required for "${provider}": an approval button was posted in the thread.`);
+    this.name = 'SessionApprovalRequiredError';
   }
 }
 
@@ -89,6 +104,15 @@ export interface VouchrOptions {
    * checked, behaving exactly as before.
    */
   requireChannelMembership?: boolean;
+  /**
+   * Opt-in thread-scoped sessions. When set, `connect()` for a covered provider returns a handle
+   * only if the acting user has approved that provider IN THE CURRENT Slack thread; otherwise it
+   * posts an in-thread "Allow … here" button and throws `SessionApprovalRequiredError`. A grant is
+   * bound to (team, channel, thread, user, provider) and cannot be used in any other thread. It
+   * always expires after `ttlMs` (safety ceiling, default 8h). `providers` limits which providers
+   * require a session ('all' or an explicit list); omit for 'all'. Unset = no session gate (default).
+   */
+  session?: { ttlMs?: number; providers?: string[] | 'all' };
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -117,6 +141,11 @@ export class ConnectContext {
     private adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>,
     // Governance: when true, connectChannel requires the acting user to be a channel member.
     private requireMembership: boolean = false,
+    // The Slack thread (thread_ts) this request is in, for thread-scoped sessions. Null off-thread.
+    private thread: string | null = null,
+    // Thread-scoped session store + enforcement config. Undefined cfg = no session gate (default).
+    private sessions?: SessionGrants,
+    private sessionCfg?: SessionEnforcement,
   ) {}
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -148,6 +177,21 @@ export class ConnectContext {
         !(await this.channelTools.isEnabled(this.identity.teamId, this.channel, providerId))) {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
       throw new Error(`"${providerId}" is not enabled in this channel.`);
+    }
+
+    // Thread-scoped session (opt-in): a covered provider is usable only inside the Slack thread the
+    // user approved it in. No grant → post an in-thread approval button and stop the turn. Checked
+    // before the stored-connection shortcut, so "connected once" still needs per-thread approval.
+    if (this.sessionCfg?.requires(providerId)) {
+      if (!this.channel || !this.thread) {
+        await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'no-thread' });
+        throw new Error(`"${providerId}" needs a thread-scoped session; ask me inside a thread.`);
+      }
+      if (!this.sessions || !(await this.sessions.isGranted(this.identity, this.channel, this.thread, providerId))) {
+        await this.postSessionApprovalPrompt(providerId, this.thread);
+        await this.audit.record('session', this.identity, providerId, { channel: this.channel, thread: this.thread, event: 'prompt' });
+        throw new SessionApprovalRequiredError(providerId);
+      }
     }
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
@@ -365,6 +409,19 @@ export class ConnectContext {
     return out;
   }
 
+  /** Ephemeral in-thread prompt to approve a thread-scoped session. Only the acting user sees it.
+   *  Caller guarantees we're in a channel + thread. */
+  private async postSessionApprovalPrompt(providerId: string, thread: string): Promise<void> {
+    const blocks = sessionApprovalBlocks(providerId, thread);
+    await this.client.chat.postEphemeral({
+      channel: this.channel!,
+      user: this.identity.userId,
+      thread_ts: thread,
+      blocks: blocks as any,
+      text: `Approve ${providerId} for this thread`,
+    });
+  }
+
   /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
   private async postKeySetupPrompt(providerId: string): Promise<void> {
     const blocks = keySetupBlocks(providerId);
@@ -405,6 +462,18 @@ export async function createVouchr(opts: VouchrOptions) {
   const consent = new Consent(db);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
+  const sessions = new SessionGrants(db);
+  // Thread-scoped session enforcement, resolved once from opts.session. Undefined = no gate.
+  const sessionTtlMs = opts.session?.ttlMs ?? DEFAULT_SESSION_TTL_MS;
+  const sessionCfg: SessionEnforcement | undefined = opts.session
+    ? {
+        ttlMs: sessionTtlMs,
+        requires: (p) => {
+          const list = opts.session!.providers;
+          return !list || list === 'all' || list.includes(p);
+        },
+      }
+    : undefined;
   const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
   const policy = opts.policy ?? new Policy();
   const resolvers = opts.resolvers ?? {};
@@ -455,6 +524,9 @@ export async function createVouchr(opts: VouchrOptions) {
     if (identity) {
       const channel: string | null =
         args.event?.channel ?? args.body?.channel_id ?? args.body?.channel?.id ?? null;
+      // The thread this request is in: thread_ts when in a thread, else the message's own ts (which
+      // is the thread root). Null when there's no event (slash command / action).
+      const thread: string | null = args.event?.thread_ts ?? args.event?.ts ?? null;
       args.context.vouchr = new ConnectContext(
         identity,
         channel,
@@ -473,6 +545,9 @@ export async function createVouchr(opts: VouchrOptions) {
         providerIds,
         opts.isAdmin,
         opts.requireChannelMembership ?? false,
+        thread,
+        sessions,
+        sessionCfg,
       );
     }
     await args.next();
@@ -517,7 +592,7 @@ export async function createVouchr(opts: VouchrOptions) {
     return new ConnectContext(
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, sink, providerIds,
-      opts.isAdmin, opts.requireChannelMembership ?? false,
+      opts.isAdmin, opts.requireChannelMembership ?? false, null, sessions, sessionCfg,
     );
   }
 
@@ -662,11 +737,27 @@ export async function createVouchr(opts: VouchrOptions) {
       if (!provider || !body.trigger_id) return;
       await client.views.open({ trigger_id: body.trigger_id, view: userKeyModal(provider) });
     });
+
+    // Thread-scoped session approval: the user clicks "Allow … here" → grant for THIS thread only.
+    // provider + thread come from the (verified) button value; channel/user/team from the payload.
+    app.action(APPROVE_SESSION_ACTION, async ({ ack, body, respond }: any) => {
+      await ack();
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      let provider = '', thread = '';
+      try { ({ provider, thread } = JSON.parse(body.actions?.[0]?.value ?? '{}')); } catch { return; }
+      const channel: string | undefined = body.channel?.id ?? body.container?.channel_id;
+      if (!provider || !thread || !channel || !registry.has(provider)) return;
+      await sessions.grant(identity, channel, thread, provider, sessionTtlMs);
+      await audit.record('session', identity, provider, { channel, thread, event: 'grant' });
+      if (respond) await respond({ replace_original: true, text: `✅ Approved *${provider}* for this thread. Ask me again.` });
+    });
   }
 
-  /** Remove all of a user's own connections + pending consent (offboarding). */
+  /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).
+   *  offboardUser clears the session grants (passed through), so the Grid/SCIM path gets it too. */
   function offboard(identity: SlackIdentity): Promise<string[]> {
-    return offboardUser(vault, audit, consent, identity, registry); // registry → best-effort upstream revoke
+    return offboardUser(vault, audit, consent, identity, registry, 'offboarded', sessions);
   }
 
   /**
@@ -695,9 +786,11 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
-  /** Delete every connection past its TTL + clear stale consent. Run on a timer. */
-  function sweep(): Promise<number> {
-    return sweepExpired(vault, audit, consent, sink);
+  /** Delete every connection past its TTL + clear stale consent + expired thread sessions. Run on a timer. */
+  async function sweep(): Promise<number> {
+    const n = await sweepExpired(vault, audit, consent, sink);
+    await sessions.sweepExpired();
+    return n;
   }
 
   return {

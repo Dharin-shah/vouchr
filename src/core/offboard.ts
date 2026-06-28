@@ -6,14 +6,15 @@ import type { SlackIdentity } from './identity';
 import type { ProviderRegistry } from './providers';
 import { revokeToken } from './tokens';
 import { userOwner } from './owner';
+import { SessionGrants } from './session';
 
 /**
  * Remove ALL of a user's own connections: the offboarding cleanup. Triggered
  * automatically when Slack deactivates the account (see the Bolt adapter's
  * registerOffboarding), and callable from a SCIM deprovision hook or an admin.
  *
- * Also purges any in-flight consent for the user, so a pending "Connect" click
- * can't complete after offboarding and resurrect a live connection.
+ * Also purges any in-flight consent AND any thread session grants for the user, so neither a
+ * pending "Connect" click nor a lingering thread grant can resurrect access after offboarding.
  *
  * Only the user's own connections are removed. Channel/shared connections belong
  * to the channel, not the person, so they are intentionally left in place and
@@ -28,8 +29,12 @@ export async function offboardUser(
   // keep the prior local-only behavior.
   registry?: ProviderRegistry,
   reason = 'offboarded',
+  // Optional: when supplied, also clear the user's thread session grants. Centralized here so
+  // every offboarding path (per-team and the Grid/SCIM sweep) gets the same cleanup.
+  sessions?: SessionGrants,
 ): Promise<string[]> {
   await consent.deleteForUser(identity); // kill pending OAuth so it can't resurrect a connection
+  await sessions?.revokeForUser(identity); // thread grants must not outlive the user
   const owner = userOwner(identity);
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only
   for (const provider of providers) {
@@ -57,9 +62,10 @@ export async function offboardUser(
  *
  * The Vault API is team-scoped (the full owner key is team_id + kind + id), so "everywhere" can
  * only mean "every team this user touches". We discover those teams honestly at the DB level:
- * the distinct team_ids where the user has either an own connection OR an in-flight consent, then
- * replay {@link offboardUser} once per team. That keeps the upstream-revoke + audit + consent-purge
- * logic in exactly one place and each per-team call still uses the FULL owner key
+ * the distinct team_ids where the user has an own connection, an in-flight consent, OR a thread
+ * session grant, then replay {@link offboardUser} once per team. That keeps the upstream-revoke +
+ * audit + consent-purge + session-purge logic in exactly one place and each per-team call still
+ * uses the FULL owner key
  * (team_id + 'user' + userId), so the cross-team sweep can never reach beyond this user's own rows.
  *
  * In Enterprise Grid the Slack userId is unique org-wide, so `userId` alone is a complete span key;
@@ -80,24 +86,28 @@ export async function offboardUserEverywhere(
   reason = 'offboarded',
 ): Promise<{ teamId: string; providers: string[] }[]> {
   const ent = user.enterpriseId != null;
-  // The ONLY query that spans teams. UNION so a team with a pending "Connect" but no live
-  // connection is still found and purged (otherwise that consent could resurrect a connection).
+  const sessions = new SessionGrants(db);
+  // The ONLY query that spans teams. UNION so a team with only a pending "Connect" or only a
+  // lingering thread session grant (no live connection) is still found and purged. session_grant
+  // has no enterprise_id column, so it is always matched by user_id alone (userId is org-unique).
   const rows = (await db.all(
     `SELECT team_id FROM connection WHERE owner_kind='user' AND owner_id=?${ent ? ' AND enterprise_id=?' : ''}
      UNION
-     SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND enterprise_id=?' : ''}`,
+     SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND enterprise_id=?' : ''}
+     UNION
+     SELECT team_id FROM session_grant WHERE user_id=?`,
     ent
-      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId]
-      : [user.userId, user.userId],
+      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId]
+      : [user.userId, user.userId, user.userId],
   )) as { team_id: string }[];
 
   const summary: { teamId: string; providers: string[] }[] = [];
   for (const { team_id: teamId } of rows) {
     // Full owner key per team, never a partial key. offboardUser does the local delete first, then
-    // best-effort upstream revoke + audit, and purges this team's pending consent.
+    // best-effort upstream revoke + audit, and purges this team's pending consent + session grants.
     const identity: SlackIdentity = { enterpriseId: user.enterpriseId ?? null, teamId, userId: user.userId };
     try {
-      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason) });
+      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason, sessions) });
     } catch {
       // Non-fatal per team; local deletes were already attempted inside offboardUser. Record the
       // team with no providers rather than aborting the whole sweep. Never surface the error (it

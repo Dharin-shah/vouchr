@@ -28,6 +28,7 @@ export function connectBlocks(provider: string, authorizeUrl: string): unknown[]
 export const CONFIGURE_CALLBACK = 'vouchr_configure';
 export const USER_KEY_CALLBACK = 'vouchr_user_key';
 export const SETUP_KEY_ACTION = 'vouchr_setup_key';
+export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
 
 /** The two leak-safe secret-entry fields: an external reference (preferred) OR a raw key. */
 function secretFields(): unknown[] {
@@ -121,6 +122,35 @@ export function keySetupBlocks(provider: string): unknown[] {
           text: { type: 'plain_text', text: `Set up ${provider}`, emoji: true },
           action_id: SETUP_KEY_ACTION,
           value: provider,
+          style: 'primary',
+        },
+      ],
+    },
+  ];
+}
+
+/** Ephemeral in-thread prompt: a button granting the agent use of `provider` for THIS thread only.
+ *  `thread` is carried in the button value so the action handler grants the exact thread. */
+export function sessionApprovalBlocks(provider: string, thread: string): unknown[] {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          `:lock: *Allow ${provider} in this thread?*\n` +
+          `The agent will be able to act as you on ${provider} only inside this thread, until the ` +
+          `session expires. This approval does not apply to any other thread or channel.`,
+      },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: `Allow ${provider} here`, emoji: true },
+          action_id: APPROVE_SESSION_ACTION,
+          value: JSON.stringify({ provider, thread }),
           style: 'primary',
         },
       ],

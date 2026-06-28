@@ -34,7 +34,7 @@ export class Audit {
   constructor(private db: Db) {}
 
   async record(
-    action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'config',
+    action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'config' | 'session',
     i: SlackIdentity,
     provider: string,
     meta: AuditMeta = {},
