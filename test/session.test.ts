@@ -1,0 +1,116 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { openDb } from '../src/core/db';
+import { Vault } from '../src/core/vault';
+import { Audit } from '../src/core/audit';
+import { Consent } from '../src/core/consent';
+import { Policy } from '../src/core/policy';
+import { SessionGrants, type SessionEnforcement } from '../src/core/session';
+import { ProviderRegistry, defineProvider } from '../src/core/providers';
+import { userOwner } from '../src/core/owner';
+import { ConnectContext, SessionApprovalRequiredError } from '../src/adapters/bolt';
+
+const KEY = randomBytes(32);
+const ID = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
+
+const gh = defineProvider({
+  id: 'gh', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+  egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+});
+
+// ── Store unit tests ──────────────────────────────────────────────────────────────────────
+test('SessionGrants: thread-scoped grant, isolation, expiry, revoke, sweep', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const s = new SessionGrants(db);
+
+  // No grant initially.
+  assert.equal(await s.isGranted(ID, 'C1', 'TH_A', 'gh'), false);
+
+  // Grant binds to exactly (team, channel, thread, user, provider).
+  await s.grant(ID, 'C1', 'TH_A', 'gh', 60_000);
+  assert.equal(await s.isGranted(ID, 'C1', 'TH_A', 'gh'), true);
+
+  // A different thread / channel / provider is NOT covered by that grant.
+  assert.equal(await s.isGranted(ID, 'C1', 'TH_B', 'gh'), false); // other thread
+  assert.equal(await s.isGranted(ID, 'C2', 'TH_A', 'gh'), false); // other channel
+  assert.equal(await s.isGranted(ID, 'C1', 'TH_A', 'other'), false); // other provider
+  assert.equal(await s.isGranted({ ...ID, userId: 'U2' }, 'C1', 'TH_A', 'gh'), false); // other user
+
+  // Expired grant (negative ttl => already past) is not granted, and sweep removes it.
+  await s.grant(ID, 'C1', 'TH_OLD', 'gh', -1);
+  assert.equal(await s.isGranted(ID, 'C1', 'TH_OLD', 'gh'), false);
+  const swept = await s.sweepExpired();
+  assert.ok(swept >= 1);
+
+  // Revoke clears every grant for the user.
+  await s.revokeForUser(ID);
+  assert.equal(await s.isGranted(ID, 'C1', 'TH_A', 'gh'), false);
+});
+
+// ── connect() gate ────────────────────────────────────────────────────────────────────────
+async function setup(cfg: SessionEnforcement = { ttlMs: 60_000, requires: () => true }) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const sessions = new SessionGrants(db);
+  const posted: any[] = [];
+  const client = { chat: { postEphemeral: async (p: any) => { posted.push(p); return {}; } } } as any;
+  // No channelConfig/channelTools (undefined) so only the session gate is exercised.
+  const make = (thread: string | null, channel: string | null = 'C1') =>
+    new ConnectContext(
+      ID, channel, client, new ProviderRegistry([gh]), vault, audit,
+      new Consent(db), new Policy(), 'http://x', {}, undefined, undefined,
+      new Map(), () => {}, ['gh'], undefined, false, thread, sessions, cfg,
+    );
+  const auditRows = async () => (await db.all('SELECT action, meta FROM audit')) as any[];
+  return { db, vault, sessions, posted, make, auditRows };
+}
+
+test('connect(): covered provider with no grant posts an in-thread approval and throws', async () => {
+  const { vault, posted, make, auditRows } = await setup();
+  await vault.upsert(userOwner(ID), 'gh', {
+    accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  // In a thread, no grant yet → approval prompt + SessionApprovalRequiredError (even though a cred
+  // is stored: "connected once" still needs per-thread approval).
+  await assert.rejects(() => make('TH_A').connect('gh'), SessionApprovalRequiredError);
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].thread_ts, 'TH_A');
+  assert.equal(posted[0].user, 'U1');
+  const sessionRows = (await auditRows()).filter((r) => r.action === 'session');
+  assert.equal(sessionRows.length, 1);
+  assert.match(sessionRows[0].meta, /prompt/);
+});
+
+test('connect(): after granting the thread, the same thread proceeds but other threads do not', async () => {
+  const { vault, sessions, make } = await setup();
+  await vault.upsert(userOwner(ID), 'gh', {
+    accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  await sessions.grant(ID, 'C1', 'TH_A', 'gh', 60_000);
+  assert.ok(await make('TH_A').connect('gh')); // granted thread → real handle
+
+  // A different thread has no grant → still blocked. The grant cannot leak across threads.
+  await assert.rejects(() => make('TH_B').connect('gh'), SessionApprovalRequiredError);
+});
+
+test('connect(): covered provider off-thread is refused (no thread to scope a session)', async () => {
+  const { make, auditRows } = await setup();
+  await assert.rejects(() => make(null).connect('gh'), /thread-scoped session/);
+  const denied = (await auditRows()).filter((r) => r.action === 'denied');
+  assert.equal(denied.length, 1);
+  assert.match(denied[0].meta, /no-thread/);
+});
+
+test('connect(): a provider not covered by the session policy is not gated', async () => {
+  // requires() excludes 'gh' → no session needed; with a stored cred connect() returns a handle.
+  const { vault, posted, make } = await setup({ ttlMs: 60_000, requires: (p) => p === 'other' });
+  await vault.upsert(userOwner(ID), 'gh', {
+    accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  assert.ok(await make('TH_A').connect('gh'));
+  assert.equal(posted.length, 0); // no approval prompt
+});

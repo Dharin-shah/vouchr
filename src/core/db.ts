@@ -93,6 +93,17 @@ function schema(blob: string, int: string): string {
       PRIMARY KEY (team_id, channel, provider)
     );
 
+    CREATE TABLE IF NOT EXISTS session_grant (
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      thread TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      expires_at ${int} NOT NULL,
+      PRIMARY KEY (team_id, channel, thread, user_id, provider)
+    );
+
     CREATE TABLE IF NOT EXISTS audit (
       id TEXT PRIMARY KEY,
       team_id TEXT NOT NULL,
