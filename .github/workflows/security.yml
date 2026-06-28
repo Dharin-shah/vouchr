@@ -18,11 +18,9 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      # Non-blocking: surfaces high/critical advisories without red-X'ing the build
-      # for transitive issues we can't immediately fix.
+      # Blocking PR gate: a PR that introduces a high+ advisory red-X's here.
       - name: npm audit (high+)
         run: npm audit --audit-level=high
-        continue-on-error: true
 
   gitleaks:
     runs-on: ubuntu-latest
