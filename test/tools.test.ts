@@ -26,7 +26,7 @@ const other = defineProvider({
 const PROVIDER_IDS = ['mcp', 'other'];
 
 // Mirrors test/channel.test.ts: builds a ConnectContext over an in-memory DB + a mocked Slack client.
-async function ctx(isAdmin = true, channel: string | null = 'C_FIN') {
+async function ctx(isAdmin = true, channel: string | null = 'C_FIN', policy = new Policy()) {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -37,7 +37,7 @@ async function ctx(isAdmin = true, channel: string | null = 'C_FIN') {
   } as any;
   const c = new ConnectContext(
     ID, channel, client, new ProviderRegistry([mcp, other]), vault, audit,
-    new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db), tools,
+    new Consent(db), policy, 'http://x', {}, new ChannelConfig(db), tools,
     new Map(), () => {}, PROVIDER_IDS,
   );
   return { c, db, vault, audit, tools };
@@ -119,6 +119,26 @@ test('toolManifest returns the expected shape', async () => {
     { provider: 'mcp', mode: 'per-user', enabled: true },
     { provider: 'other', mode: null, enabled: false },
   ]);
+});
+
+// toolManifest() must reflect Policy too, not just the channel tool allowlist: a provider the
+// channel enables but Policy denies is reported disabled, matching what connect() would do.
+test('toolManifest reflects a Policy deny (intersects channel tools and policy)', async () => {
+  const deny = new Policy({ other: { defaultAllow: false, allowChannels: [] } });
+  const { c, tools } = await ctx(true, 'C_FIN', deny);
+
+  // Channel allowlist enables both, but policy denies 'other' in this channel.
+  await tools.setEnabled('T1', 'C_FIN', 'mcp', true);
+  await tools.setEnabled('T1', 'C_FIN', 'other', true);
+
+  const m = await c.toolManifest();
+  assert.deepEqual(m, [
+    { provider: 'mcp', mode: null, enabled: true },
+    { provider: 'other', mode: null, enabled: false }, // tool-enabled but policy-denied
+  ]);
+
+  // Consistency: connect() actually refuses the provider the manifest marks disabled.
+  await assert.rejects(() => c.connect('other'), /Policy denies/);
 });
 
 // A null channel (DM-less) keeps current behavior: no tool restriction, manifest all-enabled.

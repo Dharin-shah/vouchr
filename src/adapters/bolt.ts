@@ -342,16 +342,21 @@ export class ConnectContext {
 
   /**
    * The channel-filtered tool manifest an agent / MCP gateway asks for before planning: every
-   * registered provider with whether it's enabled in THIS channel (backward-compat rule applies)
-   * and the channel's credential mode for it. With no channel (a DM-less context) every provider
-   * is reported enabled with a null mode (no channel restriction), matching connect().
+   * registered provider with whether it's usable in THIS channel and the channel's credential mode.
+   * `enabled` intersects the channel tool allowlist (backward-compat rule applies) with Policy, so
+   * it matches what connect() would actually allow. With no channel (a DM-less context) there is no
+   * tool-allowlist restriction and mode is null, but Policy still applies: a default-deny or
+   * allow-channel-only policy can still report a provider disabled.
    */
   async toolManifest(): Promise<ToolManifestEntry[]> {
     const out: ToolManifestEntry[] = [];
     for (const provider of this.providerIds) {
-      const enabled = this.channel && this.channelTools
+      const toolEnabled = this.channel && this.channelTools
         ? await this.channelTools.isEnabled(this.identity.teamId, this.channel, provider)
         : true;
+      // Intersect with Policy so the manifest matches what connect() would actually allow: a
+      // provider the channel tool allowlist enables but Policy denies is not usable here.
+      const enabled = toolEnabled && this.policy.check(provider, this.channel);
       const mode = this.channel && this.channelConfig
         ? await this.channelConfig.getMode(this.identity.teamId, this.channel, provider)
         : null;
