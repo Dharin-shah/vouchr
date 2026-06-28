@@ -26,7 +26,7 @@ jobs:
       # Exercises the real Postgres backend (the suite skips PG if this is unreachable).
       VOUCHR_TEST_PG_URL: postgres://vouchr:vouchr@localhost:5432/vouchr
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version: 22
