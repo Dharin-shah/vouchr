@@ -1,22 +1,29 @@
 # Vouchr
 
+[![CI](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml/badge.svg)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml)
+[![Security](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml/badge.svg)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A5%2020.6-3c873a.svg)](#setup)
+[![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#status)
+
 **Let a Slack agent act on a user's behalf against third-party APIs, without the user's token ever touching your agent code, the LLM, or the chat.**
 
-Vouchr gives Slack agents a channel-scoped credential and tool plane: each channel sees only the
-tools and service credentials it's authorized for, and credentials are injected at the egress
-boundary.
+Your Slack agent can open a GitHub issue as the person who asked, query an internal API with *their*
+access, or update a Jira ticket as them. Vouchr is the piece in the middle: the in-Slack "connect
+your account" flow, the encrypted per-user token store, and credential injection at the outbound HTTP
+call so the secret never reaches the model or the transcript. Self-hosted, a drop-in for
+[Slack Bolt](https://slack.dev/bolt-js), so tokens stay on your infra.
 
-A Slack agent often needs to *do things as the user*: open a GitHub issue as them, read their
-calendar, call an internal API with their access. That means storing per-user tokens, running a
-"connect your account" flow, and using those tokens without leaking them. Vouchr is that piece,
-a drop-in for [Slack Bolt](https://slack.dev/bolt-js). It is self-hosted, so tokens stay on your
-infra.
+```ts
+app.event('app_mention', async ({ context, say }) => {
+  const gh = await context.vouchr.connect('github');        // prompts the user to connect, if needed
+  const me = await (await gh.fetch('https://api.github.com/user')).json();
+  await say(`You're *${me.login}* on GitHub.`);              // acted as the user; the token never left Vouchr
+});
+```
 
 **Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [THREAT-MODEL.md](./THREAT-MODEL.md) ·
-[SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md) · [DEPLOYMENT.md](./DEPLOYMENT.md).
-
-The user connects once via an in-Slack button. Vouchr stores the token encrypted, keyed to their
-Slack identity, and injects it only at the outbound HTTP call; your code gets a `fetch` handle.
+[SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
 
 ## How it works
 
@@ -48,7 +55,30 @@ sequenceDiagram
     end
 ```
 
-## Example
+## What you get
+
+- **Leak-safe by construction.** The agent and LLM receive a `fetch` handle, never a token. Secrets
+  never reach logs, messages, the audit log, or error strings, and outbound calls are restricted to a
+  per-provider host allowlist.
+- **Acts as the human.** Per-user OAuth (or a pasted key for non-OAuth APIs), with every action
+  audited against the acting person. No giant shared bot token.
+- **Per-channel auth mode.** Each channel sets, per provider, whether `connect()` uses the user's own
+  token (`per-user`), a shared channel token (`shared`), or a per-user token gated by a per-thread
+  approval (`session`). [See below](#auth-mode-per-channel).
+- **Bring your own secret manager.** Point a credential at an AWS Secrets Manager ARN (or any
+  resolver); Vouchr stores the reference, not the secret, so rotation stays where it lives.
+- **Encrypted store, full lifecycle.** SQLite by default, Postgres for multi-instance. Token
+  auto-refresh, TTL, and automatic revocation when Slack deactivates a user.
+
+## Setup
+
+Requires Node ≥ 20.6 (developed on 22).
+
+```bash
+npm install
+cp .env.example .env     # set VOUCHR_MASTER_KEY (openssl rand -base64 32), Slack + provider creds
+npm test                 # unit + integration, fully offline
+```
 
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
@@ -60,131 +90,28 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
 app.use(vouchr.middleware);
 vouchr.mountRoutes(receiver.router);   // the OAuth callback
-vouchr.registerCommands(app);          // /vouchr status | disconnect | configure (+ the modals)
+vouchr.registerCommands(app);          // /vouchr status | disconnect | configure | mode (+ modals)
 vouchr.registerOffboarding(app);       // revoke a user's connections when Slack deactivates them
 setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
-
-app.event('app_mention', async ({ context, event, say }) => {
-  // If the user hasn't connected GitHub, this posts a "Connect" button to them and stops.
-  const gh = await context.vouchr.connect('github');
-
-  // The token is attached inside fetch(), at the HTTP boundary, never visible here.
-  const me = await (await gh.fetch('https://api.github.com/user')).json();
-  await say(`You're *${me.login}* on GitHub.`);
-});
 ```
 
-## What you get
-
-- **In-Slack connect.** A Block Kit button for OAuth providers; a private modal to paste a key
-  for non-OAuth APIs. No vendor dashboard.
-- **Leak-safe by construction.** The agent/LLM receives a handle, never a token. Secrets never
-  reach logs, messages, the audit log, or error strings. Outbound calls are restricted to a
-  per-provider host allowlist.
-- **Per-user by default**, with **per-channel shared credentials** for service accounts an admin
-  configures (e.g. one API key the whole `#support` channel's agents use).
-- **Channel tool plane.** Admins scope which providers a channel may use via
-  `/vouchr tools | enable | disable`; `connect()` and shared creds refuse a disabled provider, and
-  `toolManifest()` returns the channel-filtered list for building per-channel agent toolsets.
-- **Bring your own secret manager.** Point a credential at an AWS Secrets Manager ARN (or any
-  resolver); Vouchr stores the reference, not the secret, so rotation stays where it lives.
-- **Encrypted store.** SQLite by default, Postgres for stateless/multi-instance deploys.
-- **Lifecycle.** Token auto-refresh, audit log keyed to the acting human, TTL, and automatic
-  revocation when Slack deactivates a user.
-- **Per-channel auth mode.** Each channel sets, per provider, whether `connect()` uses the user's
-  own token (`per-user`), a shared channel token (`shared`), or a per-user token gated by a
-  per-thread approval (`session`) via `/vouchr mode <provider> <mode>`. The agent code stays the
-  same; the channel decides.
-
-## Setup
-
-Requires Node ≥ 20.6 (developed on 22; `--env-file` needs 20.6).
-
-```bash
-npm install
-cp .env.example .env     # set VOUCHR_MASTER_KEY (openssl rand -base64 32), Slack + provider creds
-npm test                 # unit + integration, fully offline
-npm run pg:up && npm test # optional: also exercise the Postgres backend (throwaway Docker PG)
-```
-
-### Slack app
-
-Create an app from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)
-(api.slack.com/apps → From a manifest), replacing `YOUR_PUBLIC_URL`. It sets the bot scopes
-(`app_mentions:read`, `chat:write`, `commands`, `users:read`), the `app_mention` + `user_change`
-events, **Interactivity** (required for the Connect button and the key/configure modals), and the
-`/vouchr` slash command. `vouchr.registerCommands(app)` is what wires those modals and the command,
-so it's mandatory if you use a `credential: 'key'` provider or channel config.
-
-### Run the demo
-
-You need the Slack app above, a GitHub OAuth app (callback
-`$PUBLIC_URL/vouchr/oauth/callback`), and a public URL (`ngrok http 3000`):
+Create the Slack app from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)
+(api.slack.com/apps → From a manifest). Then, with a GitHub OAuth app (callback
+`$PUBLIC_URL/vouchr/oauth/callback`) and a public URL (`ngrok http 3000`):
 
 ```bash
 npm run example:github   # then @-mention the bot in a channel
 ```
 
-For Postgres instead of SQLite, set `VOUCHR_DATABASE_URL` (or `databaseUrl` in `createVouchr`).
-Note the SQLite file itself isn't encrypted at rest, only the token columns are; keep it
-access-controlled (see [SECURITY.md](./SECURITY.md)).
-
-## Providers
-
-Built-ins: `github()`, `google()`, `gitlab()`, `notion()`. Any other OAuth2 provider is a few
-lines: set `egressAllow` (the hosts its token may be sent to), the refresh strategy, and PKCE:
-
-```ts
-const linear = defineProvider({
-  id: 'linear',
-  authorizeUrl: 'https://linear.app/oauth/authorize',
-  tokenUrl: 'https://api.linear.app/oauth/token',
-  scopesDefault: ['read', 'write'],
-  egressAllow: ['api.linear.app'],
-  refresh: 'none', pkce: false,
-  clientId: process.env.LINEAR_CLIENT_ID!, clientSecret: process.env.LINEAR_CLIENT_SECRET!,
-});
-```
-
-For a non-OAuth API, set `credential: 'key'` and how to attach it
-(`inject: (h, key) => h.set('x-api-key', key)`); the user pastes their key into a private modal.
-
-## Production notes
-
-A few things an adopter hits in practice:
-
-- **Workspaces / bot tokens.** A single-workspace app just sets `SLACK_BOT_TOKEN`. For an app
-  installed to many workspaces or org-wide, pass a `DbInstallationStore` to both Bolt's OAuth
-  `installationStore` and `createVouchr({ installationStore })`; the post-OAuth confirmation DM is
-  then sent with the connecting user's own workspace token (resolved per enterprise and team).
-  Credentials are isolated by `team_id` either way.
-- **`ConsentRequiredError` is control flow, not an error.** When a user hasn't
-  connected, `connect()` posts the Connect prompt and throws `ConsentRequiredError`.
-  Catch it and stop the turn; do not log it as a failure:
-  ```ts
-  import { ConsentRequiredError } from 'vouchr';
-  // inside your handler:
-  try {
-    const gh = await context.vouchr.connect('github');
-    // ...use gh...
-  } catch (e) {
-    if (e instanceof ConsentRequiredError) return; // prompt was shown; wait for the user
-    throw e;
-  }
-  ```
-- **Storage at rest.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
-  rest of each row, and the SQLite file as a whole, is not. Keep the DB
-  access-controlled and the key in a secret manager; see [SECURITY.md](./SECURITY.md).
-
 ## Auth mode per channel
 
-Each channel decides, per provider, which credential model `connect()` uses. It's one setting, set
+Each channel decides, per provider, which credential model `connect()` uses. It is one setting, set
 in Slack by an admin, not hardcoded in your agent:
 
 ```
-/vouchr mode github   session    # per-user token, but only inside the approving thread
-/vouchr mode confluence shared   # one channel token (set via /vouchr configure)
-/vouchr mode gdocs    per-user   # each user's own token (the default)
+/vouchr mode github     session    # per-user token, only inside the approving thread
+/vouchr mode confluence shared     # one channel token (set via /vouchr configure)
+/vouchr mode gdocs      per-user   # each user's own token (the default)
 ```
 
 Your handler stays scope-agnostic; `connect(provider)` reads the mode and routes automatically:
@@ -195,31 +122,45 @@ const cf = await context.vouchr.connect('confluence');  // → channel token
 const gd = await context.vouchr.connect('gdocs');       // → user token
 ```
 
-**Session mode** requires a per-thread approval: the provider is usable only inside the thread the
-user approved it in, and the approval cannot be reused in another thread or channel. When the agent
-calls `connect('github')` in a thread without a grant, Vouchr posts an ephemeral "Allow github here"
-button and throws `SessionApprovalRequiredError` (catch it and stop the turn, like
-`ConsentRequiredError`). The user clicks once, then re-asks. A grant always expires after a TTL
-ceiling (`sessionTtlMs`, default 8h), is cleared on offboarding, and is swept by `sweepExpired()`.
-`registerCommands(app)` wires the approval button.
+In **session** mode the provider is usable only inside the thread the user approved it in; the
+approval cannot be reused elsewhere. The first call posts an ephemeral "Allow github here" button and
+throws `SessionApprovalRequiredError` (catch and stop the turn, like `ConsentRequiredError`). Grants
+expire after a TTL ceiling (`sessionTtlMs`, default 8h) and are cleared on offboarding.
 
-## Deployment
+## Providers
 
-[DEPLOYMENT.md](./DEPLOYMENT.md) has copy-pasteable recipes (SQLite vs Postgres, multi-workspace
-installs, the AWS Secrets Manager resolver, optional KMS envelope encryption, the Slack app/OAuth
-flow) plus a [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) to work
-through before going live.
+Built-ins: `github()`, `google()`, `gitlab()`, `notion()`. Any other OAuth2 provider is a few lines
+via `defineProvider`; for a non-OAuth API set `credential: 'key'` and how to attach it
+(`inject: (h, key) => h.set('x-api-key', key)`).
+
+```ts
+const linear = defineProvider({
+  id: 'linear',
+  authorizeUrl: 'https://linear.app/oauth/authorize',
+  tokenUrl: 'https://api.linear.app/oauth/token',
+  scopesDefault: ['read', 'write'],
+  egressAllow: ['api.linear.app'],          // hosts its token may be sent to
+  refresh: 'none', pkce: false,
+  clientId: process.env.LINEAR_CLIENT_ID!, clientSecret: process.env.LINEAR_CLIENT_SECRET!,
+});
+```
+
+## Production notes
+
+- **`ConsentRequiredError` is control flow, not an error.** When a user hasn't connected, `connect()`
+  posts the Connect prompt and throws it. Catch it and stop the turn; do not log it as a failure.
+- **Storage at rest.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the rest of each row
+  (and the SQLite file as a whole) is not. Keep the DB access-controlled and the key in a secret
+  manager.
+- **Multi-workspace / Postgres / KMS.** [DEPLOYMENT.md](./DEPLOYMENT.md) has copy-pasteable recipes
+  and a [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) to work
+  through before going live. See [SECURITY.md](./SECURITY.md) for the security model and reporting.
 
 ## Status
 
-**Pre-production. Not yet tested in a live deployment.**
-
-The embedded Bolt surface is built, and the full test suite (including the Postgres backend) is
-green in CI on every push and PR. The security workflow runs npm audit, gitleaks, SBOM generation,
-and OWASP Dependency-Check. That is CI green, not production mileage: Vouchr has yet to be tested
-in production. Review the
-[production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before adopting,
-[SECURITY.md](./SECURITY.md) for the security model and reporting, and
-[CONTRIBUTING.md](./CONTRIBUTING.md) to help.
+**Pre-production. Not yet tested in a live deployment.** CI runs the full suite (including Postgres)
+plus a security workflow (npm audit, gitleaks, SBOM, OWASP Dependency-Check) on every push and PR.
+Review the [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before
+adopting, and [CONTRIBUTING.md](./CONTRIBUTING.md) to help.
 
 License: [Apache-2.0](./LICENSE).
