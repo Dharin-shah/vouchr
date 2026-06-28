@@ -9,6 +9,7 @@ import { Policy } from '../src/core/policy';
 import { SessionGrants, type SessionEnforcement } from '../src/core/session';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
+import { offboardUserEverywhere } from '../src/core/offboard';
 import { ConnectContext, SessionApprovalRequiredError } from '../src/adapters/bolt';
 
 const KEY = randomBytes(32);
@@ -46,6 +47,31 @@ test('SessionGrants: thread-scoped grant, isolation, expiry, revoke, sweep', asy
   // Revoke clears every grant for the user.
   await s.revokeForUser(ID);
   assert.equal(await s.isGranted(ID, 'C1', 'TH_A', 'gh'), false);
+});
+
+// Regression: the Grid/SCIM cross-team sweep must clear session grants too, including a team that
+// is discoverable ONLY by a lingering grant (no connection/consent there).
+test('offboardUserEverywhere clears session grants across teams', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
+
+  // T1: only a session grant (no connection/consent), found solely via session_grant discovery.
+  await sessions.grant({ ...ID, teamId: 'T1' }, 'C1', 'TH_A', 'gh', 60_000);
+  // T2: a grant plus a stored connection.
+  await sessions.grant({ ...ID, teamId: 'T2' }, 'C2', 'TH_B', 'gh', 60_000);
+  await vault.upsert(userOwner({ ...ID, teamId: 'T2' }), 'gh', {
+    accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  await offboardUserEverywhere(db, vault, audit, consent, { userId: ID.userId });
+
+  assert.equal(await sessions.isGranted({ ...ID, teamId: 'T1' }, 'C1', 'TH_A', 'gh'), false);
+  assert.equal(await sessions.isGranted({ ...ID, teamId: 'T2' }, 'C2', 'TH_B', 'gh'), false);
+  const left = (await db.all('SELECT 1 AS x FROM session_grant WHERE user_id=?', [ID.userId])) as any[];
+  assert.equal(left.length, 0);
 });
 
 // ── connect() gate ────────────────────────────────────────────────────────────────────────

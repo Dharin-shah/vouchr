@@ -94,6 +94,7 @@ placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
 | `consent_request` | In-flight OAuth `state` + PKCE verifier | PK `state` |
 | `channel_config` | Per-channel mode (`shared` / `per-user`) | PK `(team_id, channel, provider)` |
 | `channel_tool` | Per-channel tool allowlist (which providers an agent may use) | PK `(team_id, channel, provider)` |
+| `session_grant` | Opt-in thread-scoped authorization (who may use a provider in which thread) | PK `(team_id, channel, thread, user_id, provider)` |
 | `audit` | Append-only action log | PK `id` |
 | `installation` | Encrypted Slack install (bot/user tokens) for multi-workspace | PK rowKey `(enterprise, team)` |
 
@@ -158,9 +159,16 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    (default idle 7d / max-age 30d) and clears stale consent. Filtering happens in SQL.
 7. **Offboard / revoke** (`src/core/offboard.ts`, `src/core/tokens.ts`). On Slack
    deactivation (or `/vouchr disconnect`, or a SCIM hook), the local credential is deleted
-   first (the security-meaningful action), pending consent is purged, and an upstream
-   revoke is attempted best-effort. Channel/shared credentials are intentionally left for
-   an admin to review.
+   first (the security-meaningful action), pending consent and thread session grants are
+   purged, and an upstream revoke is attempted best-effort. The Grid/SCIM
+   `offboardUserEverywhere` sweep applies the same cleanup across every team. Channel/shared
+   credentials are intentionally left for an admin to review.
+
+**Thread sessions (opt-in).** When `session` is configured, `connect()` adds an authorization
+gate before the credential is resolved: a covered provider is usable only inside the Slack thread
+the user approved it in (a grant keyed `(team_id, channel, thread, user_id, provider)`), with a TTL
+ceiling. Grants live in `session_grant`, are cleared on offboarding, and are removed by
+`sweepExpired()`.
 
 See [SECURITY.md](./SECURITY.md) for the security model and limits, and
 [THREAT-MODEL.md](./THREAT-MODEL.md) for trust boundaries, the attacker model, and the

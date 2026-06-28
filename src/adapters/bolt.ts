@@ -754,10 +754,10 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
-  /** Remove all of a user's own connections + pending consent + thread sessions (offboarding). */
-  async function offboard(identity: SlackIdentity): Promise<string[]> {
-    await sessions.revokeForUser(identity); // a deactivated user's thread grants must not survive
-    return offboardUser(vault, audit, consent, identity, registry); // registry → best-effort upstream revoke
+  /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).
+   *  offboardUser clears the session grants (passed through), so the Grid/SCIM path gets it too. */
+  function offboard(identity: SlackIdentity): Promise<string[]> {
+    return offboardUser(vault, audit, consent, identity, registry, 'offboarded', sessions);
   }
 
   /**
