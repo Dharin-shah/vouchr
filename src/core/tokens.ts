@@ -38,7 +38,7 @@ async function tokenRequest(
   }
   const json: any = await res.json();
   if (json.error) {
-    throw new Error(`Token error: ${json.error_description ?? json.error}`);
+    throw new Error('Token endpoint returned an OAuth error');
   }
   if (!json.access_token) {
     throw new Error('Token endpoint returned no access_token');

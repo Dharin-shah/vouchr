@@ -100,6 +100,7 @@ function schema(blob: string, int: string): string {
       provider TEXT NOT NULL,
       action TEXT NOT NULL,
       actor TEXT,
+      channel TEXT,
       meta TEXT,
       at ${int} NOT NULL
     );
@@ -130,6 +131,8 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
     pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
     const db = new PgDb(pool);
     await db.exec(schema('BYTEA', 'BIGINT'));
+    // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
+    await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
     return db;
   }
 
@@ -166,5 +169,11 @@ function migrateSqlite(db: BetterSqlite3.Database): void {
       DROP TABLE connection;
       ALTER TABLE connection_new RENAME TO connection;
     `);
+  }
+
+  // Add the `channel` audit column to a pre-existing audit table (plain ADD COLUMN — no UNIQUE rebuild).
+  const auditCols = (db.prepare(`PRAGMA table_info(audit)`).all() as any[]).map((c) => c.name);
+  if (!auditCols.includes('channel')) {
+    db.exec(`ALTER TABLE audit ADD COLUMN channel TEXT`);
   }
 }

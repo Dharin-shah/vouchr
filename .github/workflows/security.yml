@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '27 4 * * 1'
 
 jobs:
   audit:
@@ -23,6 +26,10 @@ jobs:
 
   gitleaks:
     runs-on: ubuntu-latest
+    # gitleaks-action lists PR commits via the API; needs pull-requests: read
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -50,4 +57,28 @@ jobs:
         with:
           name: sbom
           path: sbom.json
+          if-no-files-found: warn
+
+  owasp-dependency-check:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: OWASP Dependency-Check
+        uses: dependency-check/Dependency-Check_Action@1e54355a8b4c8abaa8cc7d0b70aa655a3bb15a6c
+        with:
+          project: Vouchr
+          path: .
+          format: HTML
+          out: reports/dependency-check
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+            --exclude **/node_modules/**
+            --exclude **/dist/**
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: owasp-dependency-check
+          path: reports/dependency-check
           if-no-files-found: warn

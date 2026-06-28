@@ -19,3 +19,6 @@ export type { TtlPolicy } from './core/vault';
 export type { EnvelopeProvider } from './core/crypto';
 // Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);
 // registerOffboarding() wires the user_change handler. No standalone re-exports — one obvious way.
+// Exception: Enterprise Grid / SCIM deprovisioning spans ALL workspaces, which createVouchr's
+// single-team offboard can't express, so the cross-team entry point is exported directly.
+export { offboardUserEverywhere } from './core/offboard';

@@ -16,9 +16,9 @@ export function loadMasterKey(): Buffer {
 }
 
 /**
- * AES-256-GCM with the master key directly. Layout: iv(12) | tag(16) | ciphertext.
- * M2 upgrades this to envelope encryption (per-connection data key wrapped by a
- * KMS/Vault root key) — the call sites here do not change when it does.
+ * AES-256-GCM with the master key directly: the unversioned scheme-0 path. Layout:
+ * iv(12) | tag(16) | ciphertext. The optional envelope path (per-secret data key wrapped
+ * by a KMS/Vault KEK) lives in seal()/open() with an EnvelopeProvider; these stay the direct path.
  */
 export function encrypt(plaintext: string, key: Buffer): Buffer {
   const iv = randomBytes(12);

@@ -1,6 +1,6 @@
 # Production template: Postgres + KMS envelope encryption
 
-A **template**, not a runnable demo — the KMS provider is a stub you fill in.
+A **template**, not a runnable demo — you must fill in the KMS provider before use.
 It wires the three things a real deployment wants:
 
 - **`databaseUrl`** — Postgres instead of the SQLite default, so the deployment is
@@ -23,9 +23,9 @@ const vouchr = await createVouchr({
 
 ## Fill in the KMS provider
 
-`kmsEnvelope` in `app.ts` is a stub whose bodies throw `configure KMS`. Replace
-them with `EncryptCommand` / `DecryptCommand` calls (the real implementation is in
-the file's comment). That needs `@aws-sdk/client-kms`, which is intentionally
+`kmsEnvelope` in `app.ts` fails closed until you replace its bodies with
+`EncryptCommand` / `DecryptCommand` calls (the real implementation is in the
+file's comment). That needs `@aws-sdk/client-kms`, which is intentionally
 **not** a dependency of this repo — add it in your own project:
 
 ```

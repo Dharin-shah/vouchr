@@ -68,10 +68,18 @@ export interface ProviderConfig {
   clientId?: string;
   clientSecret?: string;
   scopes?: string[];
-  /** Optional finer egress controls (see Provider). Built-ins ignore these unless wired explicitly. */
+  /** Optional finer egress controls (see Provider). */
   egressPaths?: string[];
   egressMethods?: string[];
   egressValidate?: (url: URL, init: RequestInit) => boolean;
+}
+
+function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate'> {
+  return {
+    egressPaths: cfg.egressPaths,
+    egressMethods: cfg.egressMethods,
+    egressValidate: cfg.egressValidate,
+  };
 }
 
 export function defineProvider(spec: Provider): Provider {
@@ -92,6 +100,7 @@ export function github(cfg: ProviderConfig = {}): Provider {
     tokenUrl: 'https://github.com/login/oauth/access_token',
     scopesDefault: cfg.scopes ?? ['read:user', 'repo'],
     egressAllow: ['api.github.com'],
+    ...egressOptions(cfg),
     refresh: 'none',
     pkce: false, // GitHub OAuth Apps use the client secret, not PKCE
     clientId: cfg.clientId ?? process.env.GITHUB_CLIENT_ID ?? '',
@@ -101,7 +110,12 @@ export function github(cfg: ProviderConfig = {}): Provider {
       const creds = Buffer.from(`${p.clientId}:${p.clientSecret}`).toString('base64');
       const r = await fetch(`https://api.github.com/applications/${p.clientId}/token`, {
         method: 'DELETE',
-        headers: { Authorization: `Basic ${creds}`, Accept: 'application/vnd.github+json', 'User-Agent': 'vouchr' },
+        headers: {
+          Authorization: `Basic ${creds}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'vouchr',
+        },
         body: JSON.stringify({ access_token: token }),
       });
       if (!r.ok && r.status !== 404) throw new Error(`GitHub token revoke returned HTTP ${r.status}`); // 404 = already gone
@@ -129,6 +143,7 @@ export function google(cfg: ProviderConfig = {}): Provider {
       'https://www.googleapis.com/auth/userinfo.profile',
     ],
     egressAllow: ['www.googleapis.com', 'gmail.googleapis.com', 'people.googleapis.com'],
+    ...egressOptions(cfg),
     refresh: 'rotating',
     pkce: true,
     authorizeParams: { access_type: 'offline', prompt: 'consent' },
@@ -154,6 +169,7 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     tokenUrl: 'https://gitlab.com/oauth/token',
     scopesDefault: cfg.scopes ?? ['read_user', 'api'],
     egressAllow: ['gitlab.com'],
+    ...egressOptions(cfg),
     refresh: 'rotating',
     pkce: true,
     revokeUrl: 'https://gitlab.com/oauth/revoke', // form client_id+client_secret+token
@@ -183,6 +199,7 @@ export function notion(cfg: ProviderConfig = {}): Provider {
     tokenUrl: 'https://api.notion.com/v1/oauth/token',
     scopesDefault: cfg.scopes ?? [],
     egressAllow: ['api.notion.com'],
+    ...egressOptions(cfg),
     refresh: 'none',
     pkce: false,
     tokenAuth: 'basic',

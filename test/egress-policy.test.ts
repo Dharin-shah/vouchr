@@ -5,7 +5,7 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
-import { defineProvider } from '../src/core/providers';
+import { defineProvider, github } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -75,8 +75,29 @@ test('egress: disallowed path is denied before the token is read', async () => {
   try {
     const { handle, calls } = await makeHandle();
     await assert.rejects(() => handle.fetch('https://api.acme.example/secrets', { method: 'GET' }), /not in the allowed paths/);
+    await assert.rejects(() => handle.fetch('https://api.acme.example/userish', { method: 'GET' }), /not in the allowed paths/);
     assert.equal(calls(), 0); // resolver never called — secret never read
     assert.equal(fetched, false); // request never went out
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('egress: URL userinfo is denied before the token is read', async () => {
+  const realFetch = globalThis.fetch;
+  let fetched = false;
+  globalThis.fetch = (async () => {
+    fetched = true;
+    return new Response('{}', { status: 200 });
+  }) as any;
+  try {
+    const { handle, calls } = await makeHandle();
+    await assert.rejects(
+      () => handle.fetch('https://caller:password@api.acme.example/user', { method: 'GET' }),
+      /URL credentials are not allowed/,
+    );
+    assert.equal(calls(), 0);
+    assert.equal(fetched, false);
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -131,4 +152,18 @@ test('egress: provider WITHOUT the new fields is unchanged (hostname-only baseli
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('egress: built-in provider factories pass through fine-grained egress controls', () => {
+  const validate = () => true;
+  const provider = github({
+    clientId: 'id',
+    clientSecret: 'sec',
+    egressPaths: ['/user'],
+    egressMethods: ['GET'],
+    egressValidate: validate,
+  });
+  assert.deepEqual(provider.egressPaths, ['/user']);
+  assert.deepEqual(provider.egressMethods, ['GET']);
+  assert.equal(provider.egressValidate, validate);
 });

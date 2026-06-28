@@ -31,9 +31,8 @@ import {
  * egress allowlist pins the one host its key may ever be sent to. The key is
  * attached as `x-api-key` at the fetch boundary, not by the tool.
  *
- * ponytail: a local provider modeled inside the example — the built-in providers
- * (github/google/gitlab/notion) are OAuth SaaS; an internal API is the realistic
- * second tool, so it's defined here rather than invented in src.
+ * This provider is local to the example because the built-ins are OAuth SaaS
+ * integrations. Internal APIs are defined by operators with defineProvider().
  */
 const internalApi = (): Provider =>
   defineProvider({

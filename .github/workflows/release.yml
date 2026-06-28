@@ -1,27 +1,15 @@
-# Release stub — intentionally DISABLED.
-#
-# Signed releases / SLSA provenance are out of scope for now: they require
-# signing keys / publish credentials this repo does not have. When that lands,
-# add the trigger and steps below and supply the needed secrets.
-#
-# name: Release
-#
-# on:
-#   push:
-#     tags: ['v*']
-#
-# permissions:
-#   contents: write
-#   id-token: write   # for OIDC-based provenance / keyless signing
-#
-# jobs:
-#   release:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-#       - uses: actions/setup-node@v4
-#         with:
-#           node-version: 22
-#           cache: npm
-#       - run: npm ci
-#       # - build, sign (cosign), generate provenance, publish...
+name: Release
+
+# Manual-only until publish credentials and signing keys exist. When that lands,
+# switch the trigger to version tags, add contents/id-token permissions, and wire
+# the build/sign/publish steps.
+on:
+  workflow_dispatch:
+
+jobs:
+  not-configured:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "Signed releases are not configured yet."
+          echo "See CHANGELOG.md (Deferred) and DEPLOYMENT.md; wire publish creds + signing keys to enable."

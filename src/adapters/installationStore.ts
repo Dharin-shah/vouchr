@@ -34,9 +34,9 @@ export class DbInstallationStore implements InstallationStore {
     const isOrg = installation.isEnterpriseInstall === true;
     const enterpriseId = installation.enterprise?.id;
     const teamId = installation.team?.id;
-    // ponytail: bot_token is the denormalized secret per the spec; resolution still goes
-    // through fetchInstallation (Bolt's contract). Kept for ops lookups without decrypting
-    // the whole blob. Both columns are encrypted at rest.
+    // bot_token is denormalized per Bolt's InstallationStore shape; resolution still goes through
+    // fetchInstallation. Kept for ops lookups without decrypting the whole blob. Both columns are
+    // encrypted at rest.
     const botToken = installation.bot?.token ?? null;
     await this.db.run(
       `INSERT INTO installation (id, enterprise_id, team_id, bot_token, data, updated_at)

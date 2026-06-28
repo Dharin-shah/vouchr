@@ -50,7 +50,7 @@ export async function handleOAuthCallback(
     });
     await deps.audit.record('connect', row.identity, provider.id, { account });
     return { ok: true, provider: provider.id, account, identity: row.identity };
-  } catch (e: any) {
-    return { ok: false, status: 500, error: `Connection failed: ${e.message}` };
+  } catch {
+    return { ok: false, status: 500, error: 'Connection failed. Please try again.' };
   }
 }

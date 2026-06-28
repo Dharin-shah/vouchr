@@ -5,7 +5,7 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { defineProvider, ProviderRegistry } from '../src/core/providers';
+import { defineProvider, github, ProviderRegistry } from '../src/core/providers';
 import { revokeToken } from '../src/core/tokens';
 import { offboardUser } from '../src/core/offboard';
 import { userOwner } from '../src/core/owner';
@@ -92,6 +92,25 @@ test('revokeToken is a no-op for a provider with no revoke capability (fetch not
   try {
     await revokeToken(norevoke, 'TOK'); // must not throw, must not fetch
     assert.equal(called, false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('built-in GitHub revoke uses the non-standard DELETE + Basic + JSON shape', async () => {
+  const realFetch = globalThis.fetch;
+  let seen: any = null;
+  globalThis.fetch = (async (url: any, init: any) => {
+    seen = { url, init };
+    return new Response(null, { status: 204 });
+  }) as any;
+  try {
+    await revokeToken(github({ clientId: 'cid', clientSecret: 'csec' }), 'TOK');
+    assert.equal(String(seen.url), 'https://api.github.com/applications/cid/token');
+    assert.equal(seen.init.method, 'DELETE');
+    assert.equal(seen.init.headers.Authorization, `Basic ${Buffer.from('cid:csec').toString('base64')}`);
+    assert.equal(seen.init.headers['Content-Type'], 'application/json');
+    assert.deepEqual(JSON.parse(seen.init.body), { access_token: 'TOK' });
   } finally {
     globalThis.fetch = realFetch;
   }

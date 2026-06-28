@@ -13,7 +13,7 @@ import { userOwner } from '../src/core/owner';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_MAYA' };
-const SECRET = 'maya-personal-key-7777';
+const SECRET = 'test-user-key-7777';
 
 // A key-based provider: no OAuth client; the user pastes their own key.
 const keyProvider = defineProvider({
