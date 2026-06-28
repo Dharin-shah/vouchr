@@ -93,6 +93,7 @@ placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
 | `connection` | Credentials (vaulted or external-reference) | UNIQUE `(team_id, owner_kind, owner_id, provider)` |
 | `consent_request` | In-flight OAuth `state` + PKCE verifier | PK `state` |
 | `channel_config` | Per-channel mode (`shared` / `per-user`) | PK `(team_id, channel, provider)` |
+| `channel_tool` | Per-channel tool allowlist (which providers an agent may use) | PK `(team_id, channel, provider)` |
 | `audit` | Append-only action log | PK `id` |
 | `installation` | Encrypted Slack install (bot/user tokens) for multi-workspace | PK rowKey `(enterprise, team)` |
 
