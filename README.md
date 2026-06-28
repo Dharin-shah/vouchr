@@ -95,11 +95,17 @@ vouchr.registerOffboarding(app);       // revoke a user's connections when Slack
 setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 ```
 
-This is **your agent's own Slack app**, not a separate Vouchr app: Vouchr runs as middleware inside
-your Bolt process. Create it from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)
-(api.slack.com/apps → From a manifest; the demo names it `Vouchr`). If you already have an agent,
-merge the manifest's scopes, events, interactivity, and the `/vouchr` command into your existing app
-instead.
+Vouchr runs as middleware inside your existing Bolt agent, so it uses **your agent's own Slack app**.
+Enable these on it (api.slack.com/apps) for Vouchr's in-Slack flow:
+
+- **Bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `users:read`
+- **Events:** `app_mention`, `user_change`
+- **Interactivity:** on (the Connect button and the key/configure modals)
+- **Slash command:** `/vouchr`
+
+Don't have an agent app yet, or just want to run the demo? Create one from
+[`examples/slack-manifest.yml`](./examples/slack-manifest.yml) (→ From a manifest), which has all of
+the above pre-filled.
 
 Separately, register a **GitHub OAuth app** (callback `$PUBLIC_URL/vouchr/oauth/callback`). That is
 the *provider* credential Vouchr brokers on the user's behalf, one per provider you support, and is
