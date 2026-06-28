@@ -1,14 +1,16 @@
 import type { Db } from './db';
 
 /**
- * Per-channel credential mode for a provider:
- *  - 'shared':   the channel owns one credential every member's agent injects (a static
- *                 key or an external ref). Set by an admin.
- *  - 'per-user': the channel is LOCKED to per-user identity: no shared cred may exist here,
- *                 each member must use their own (invariant 7). setChannelSecret refuses.
- * No row → unconfigured: no shared cred, and an admin may set one (defaults to 'shared').
+ * Per-channel auth mode for a provider. The single source of truth for which credential model
+ * `connect()` uses in this channel:
+ *  - 'shared':   the channel owns one credential every member's agent injects (a static key or an
+ *                 external ref, admin-set). connect() routes to the shared credential.
+ *  - 'per-user': each member uses their own credential; no shared cred may exist here (invariant 7).
+ *  - 'session':  per-user, but usable only inside the Slack thread the user approved it in (a thread
+ *                 session grant), with a TTL ceiling.
+ * No row → unconfigured, treated as 'per-user' (each member uses their own; an admin may set a mode).
  */
-export type ChannelMode = 'shared' | 'per-user';
+export type ChannelMode = 'shared' | 'per-user' | 'session';
 
 /** The subset of Slack's conversations.info shape that channel-credential eligibility depends on. */
 export interface ChannelInfo {

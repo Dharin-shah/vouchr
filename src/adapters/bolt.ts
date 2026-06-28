@@ -10,13 +10,13 @@ import { Policy } from '../core/policy';
 import { resolveIdentity, isSlackAdmin, isChannelMember, type SlackIdentity } from '../core/identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
-import { ChannelConfig, channelIneligibleReason, type ChannelInfo } from '../core/channelConfig';
+import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser } from '../core/offboard';
 import { revokeToken } from '../core/tokens';
 import { sweepExpired } from '../core/sweep';
-import { SessionGrants, type SessionEnforcement } from '../core/session';
+import { SessionGrants } from '../core/session';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
@@ -105,14 +105,11 @@ export interface VouchrOptions {
    */
   requireChannelMembership?: boolean;
   /**
-   * Opt-in thread-scoped sessions. When set, `connect()` for a covered provider returns a handle
-   * only if the acting user has approved that provider IN THE CURRENT Slack thread; otherwise it
-   * posts an in-thread "Allow … here" button and throws `SessionApprovalRequiredError`. A grant is
-   * bound to (team, channel, thread, user, provider) and cannot be used in any other thread. It
-   * always expires after `ttlMs` (safety ceiling, default 8h). `providers` limits which providers
-   * require a session ('all' or an explicit list); omit for 'all'. Unset = no session gate (default).
+   * Safety-ceiling lifetime for a thread session grant, in ms (default 8h). A grant always expires
+   * after this, regardless of thread activity. Which providers use sessions is a per-channel setting
+   * (`/vouchr mode <provider> session`), not a global list; this only tunes the ceiling.
    */
-  session?: { ttlMs?: number; providers?: string[] | 'all' };
+  sessionTtlMs?: number;
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -143,9 +140,8 @@ export class ConnectContext {
     private requireMembership: boolean = false,
     // The Slack thread (thread_ts) this request is in, for thread-scoped sessions. Null off-thread.
     private thread: string | null = null,
-    // Thread-scoped session store + enforcement config. Undefined cfg = no session gate (default).
+    // Thread session-grant store. The 'session' channel mode drives whether the gate runs.
     private sessions?: SessionGrants,
-    private sessionCfg?: SessionEnforcement,
   ) {}
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -165,6 +161,15 @@ export class ConnectContext {
   async connect(providerId: string): Promise<ConnectionHandle> {
     const provider = this.registry.get(providerId);
 
+    // The channel's configured auth mode for this provider decides the credential model:
+    //   'shared'  → the channel's shared credential (delegate to connectChannel)
+    //   'session' → the user's own credential, gated by a per-thread approval
+    //   'per-user' / unset → the user's own credential, no gate
+    const mode = this.channel && this.channelConfig
+      ? await this.channelConfig.getMode(this.identity.teamId, this.channel, providerId)
+      : null;
+    if (mode === 'shared') return this.connectChannel(providerId);
+
     if (!this.policy.check(providerId, this.channel)) {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
@@ -179,10 +184,11 @@ export class ConnectContext {
       throw new Error(`"${providerId}" is not enabled in this channel.`);
     }
 
-    // Thread-scoped session (opt-in): a covered provider is usable only inside the Slack thread the
-    // user approved it in. No grant → post an in-thread approval button and stop the turn. Checked
-    // before the stored-connection shortcut, so "connected once" still needs per-thread approval.
-    if (this.sessionCfg?.requires(providerId)) {
+    // Thread-scoped session: when the channel sets this provider to 'session', the user's token is
+    // usable only inside the Slack thread they approved it in. No grant → post an in-thread approval
+    // button and stop the turn. Checked before the stored-connection shortcut, so being connected
+    // once still needs per-thread approval.
+    if (mode === 'session') {
       if (!this.channel || !this.thread) {
         await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'no-thread' });
         throw new Error(`"${providerId}" needs a thread-scoped session; ask me inside a thread.`);
@@ -300,8 +306,9 @@ export class ConnectContext {
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
-      throw new Error(`Channel is set to per-user for "${providerId}"; static keys are not allowed.`);
+    const cm = await cfg.getMode(owner.teamId, channel, providerId);
+    if (cm === 'per-user' || cm === 'session') {
+      throw new Error(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
     }
     await this.vault.upsert(owner, providerId, {
       accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -323,8 +330,9 @@ export class ConnectContext {
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
-      throw new Error(`Channel is set to per-user for "${providerId}"; shared references are not allowed.`);
+    const cm = await cfg.getMode(owner.teamId, channel, providerId);
+    if (cm === 'per-user' || cm === 'session') {
+      throw new Error(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
     }
     await this.vault.reference(owner, providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
     await cfg.setMode(owner.teamId, channel, providerId, 'shared');
@@ -332,16 +340,16 @@ export class ConnectContext {
   }
 
   /**
-   * Lock/unlock the channel's mode for a provider. Admin-only, audited. Flipping to
-   * `'per-user'` removes the live shared cred (a re-own that must be re-authorized, the admin
-   * gate is that authorization). Members then use their own creds via `connect()`.
+   * Set the channel's auth mode for a provider. Admin-only, audited. Flipping to a user-owned mode
+   * (`'per-user'` or `'session'`) removes any live shared cred (a re-own that must be re-authorized;
+   * the admin gate is that authorization). Members then use their own creds via `connect()`.
    */
-  async setChannelMode(providerId: string, mode: 'shared' | 'per-user'): Promise<void> {
+  async setChannelMode(providerId: string, mode: ChannelMode): Promise<void> {
     this.registry.get(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    if (mode === 'per-user') await this.vault.delete(owner, providerId);
+    if (mode !== 'shared') await this.vault.delete(owner, providerId); // user-owned: drop any shared cred
     await cfg.setMode(owner.teamId, channel, providerId, mode);
     await this.audit.record('config', this.identity, providerId, { owner: 'channel', channel, mode });
   }
@@ -365,8 +373,9 @@ export class ConnectContext {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'tool-disabled' });
       throw new Error(`"${providerId}" is not enabled in this channel.`);
     }
-    if ((await cfg.getMode(owner.teamId, channel, providerId)) === 'per-user') {
-      throw new Error(`Channel "${channel}" uses per-user credentials for "${providerId}"; use connect() instead.`);
+    const m = await cfg.getMode(owner.teamId, channel, providerId);
+    if (m === 'per-user' || m === 'session') {
+      throw new Error(`Channel "${channel}" uses ${m} credentials for "${providerId}"; use connect() instead.`);
     }
     if (!(await this.vault.get(owner, providerId))) {
       throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
@@ -463,17 +472,8 @@ export async function createVouchr(opts: VouchrOptions) {
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
-  // Thread-scoped session enforcement, resolved once from opts.session. Undefined = no gate.
-  const sessionTtlMs = opts.session?.ttlMs ?? DEFAULT_SESSION_TTL_MS;
-  const sessionCfg: SessionEnforcement | undefined = opts.session
-    ? {
-        ttlMs: sessionTtlMs,
-        requires: (p) => {
-          const list = opts.session!.providers;
-          return !list || list === 'all' || list.includes(p);
-        },
-      }
-    : undefined;
+  // The 'session' channel mode drives whether a thread grant is required; this is just the TTL ceiling.
+  const sessionTtlMs = opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
   const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
   const policy = opts.policy ?? new Policy();
   const resolvers = opts.resolvers ?? {};
@@ -547,7 +547,6 @@ export async function createVouchr(opts: VouchrOptions) {
         opts.requireChannelMembership ?? false,
         thread,
         sessions,
-        sessionCfg,
       );
     }
     await args.next();
@@ -592,7 +591,7 @@ export async function createVouchr(opts: VouchrOptions) {
     return new ConnectContext(
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, sink, providerIds,
-      opts.isAdmin, opts.requireChannelMembership ?? false, null, sessions, sessionCfg,
+      opts.isAdmin, opts.requireChannelMembership ?? false, null, sessions,
     );
   }
 
@@ -639,11 +638,13 @@ export async function createVouchr(opts: VouchrOptions) {
         return respond(`${on ? 'Enabled' : 'Disabled'} *${arg}* in <#${command.channel_id}>.`);
       }
 
-      // Shortcut for the existing per-channel credential mode (admin-gated + audited in setChannelMode).
+      // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant).
+      // Admin-gated + audited in setChannelMode.
       if (sub === 'mode') {
-        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user')) {
-          return respond('Usage: `/vouchr mode <provider> <shared|per-user>`');
+        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user' && arg2 !== 'session')) {
+          return respond('Usage: `/vouchr mode <provider> <shared|per-user|session>`');
         }
+        if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
         if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');
         try {
           await contextFor(identity, command.channel_id, client).setChannelMode(arg, arg2);

@@ -91,9 +91,10 @@ app.event('app_mention', async ({ context, event, say }) => {
 - **Encrypted store.** SQLite by default, Postgres for stateless/multi-instance deploys.
 - **Lifecycle.** Token auto-refresh, audit log keyed to the acting human, TTL, and automatic
   revocation when Slack deactivates a user.
-- **Thread-scoped sessions (opt-in).** Require the user to approve a provider inside a specific
-  Slack thread before the agent can use it there. The grant is bound to that thread and cannot be
-  used in any other thread or channel, with a TTL as a safety ceiling.
+- **Per-channel auth mode.** Each channel sets, per provider, whether `connect()` uses the user's
+  own token (`per-user`), a shared channel token (`shared`), or a per-user token gated by a
+  per-thread approval (`session`) via `/vouchr mode <provider> <mode>`. The agent code stays the
+  same; the channel decides.
 
 ## Setup
 
@@ -175,25 +176,32 @@ A few things an adopter hits in practice:
   rest of each row, and the SQLite file as a whole, is not. Keep the DB
   access-controlled and the key in a secret manager; see [SECURITY.md](./SECURITY.md).
 
-## Thread-scoped sessions
+## Auth mode per channel
 
-By default a connected user can be acted for in any Slack context. Turn on `session` to require a
-per-thread approval first: a covered provider is usable only inside the thread the user approved it
-in, and the approval cannot be reused in another thread or channel. A grant always expires after
-`ttlMs` (safety ceiling, default 8h).
+Each channel decides, per provider, which credential model `connect()` uses. It's one setting, set
+in Slack by an admin, not hardcoded in your agent:
 
-```ts
-const vouchr = await createVouchr({
-  providers: [github()],
-  baseUrl: process.env.PUBLIC_URL!,
-  session: { providers: ['github'], ttlMs: 60 * 60 * 1000 }, // omit `providers` to cover all
-});
+```
+/vouchr mode github   session    # per-user token, but only inside the approving thread
+/vouchr mode confluence shared   # one channel token (set via /vouchr configure)
+/vouchr mode gdocs    per-user   # each user's own token (the default)
 ```
 
-When the agent calls `connect('github')` in a thread without a grant, Vouchr posts an ephemeral
-"Allow github here" button to the user and throws `SessionApprovalRequiredError` (catch it and stop
-the turn, like `ConsentRequiredError`). The user clicks once, then re-asks. Grants are cleared on
-offboarding and swept with `sweepExpired()`. `registerCommands(app)` wires the approval button.
+Your handler stays scope-agnostic; `connect(provider)` reads the mode and routes automatically:
+
+```ts
+const gh = await context.vouchr.connect('github');     // → thread session
+const cf = await context.vouchr.connect('confluence');  // → channel token
+const gd = await context.vouchr.connect('gdocs');       // → user token
+```
+
+**Session mode** requires a per-thread approval: the provider is usable only inside the thread the
+user approved it in, and the approval cannot be reused in another thread or channel. When the agent
+calls `connect('github')` in a thread without a grant, Vouchr posts an ephemeral "Allow github here"
+button and throws `SessionApprovalRequiredError` (catch it and stop the turn, like
+`ConsentRequiredError`). The user clicks once, then re-asks. A grant always expires after a TTL
+ceiling (`sessionTtlMs`, default 8h), is cleared on offboarding, and is swept by `sweepExpired()`.
+`registerCommands(app)` wires the approval button.
 
 ## Deployment
 

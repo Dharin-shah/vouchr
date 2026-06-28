@@ -1,7 +1,6 @@
 export { createVouchr, ConsentRequiredError, SessionApprovalRequiredError, ConnectContext } from './adapters/bolt';
 export type { VouchrOptions } from './adapters/bolt';
 export { SessionGrants } from './core/session';
-export type { SessionEnforcement } from './core/session';
 export { github, google, gitlab, notion, defineProvider, ProviderRegistry } from './core/providers';
 export type { Provider, ProviderConfig, RefreshStrategy } from './core/providers';
 export { Policy } from './core/policy';

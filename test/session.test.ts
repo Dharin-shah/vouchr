@@ -6,7 +6,8 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { Policy } from '../src/core/policy';
-import { SessionGrants, type SessionEnforcement } from '../src/core/session';
+import { SessionGrants } from '../src/core/session';
+import { ChannelConfig } from '../src/core/channelConfig';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import { offboardUserEverywhere } from '../src/core/offboard';
@@ -74,20 +75,22 @@ test('offboardUserEverywhere clears session grants across teams', async () => {
   assert.equal(left.length, 0);
 });
 
-// ── connect() gate ────────────────────────────────────────────────────────────────────────
-async function setup(cfg: SessionEnforcement = { ttlMs: 60_000, requires: () => true }) {
+// ── connect() gate (driven by the 'session' channel mode) ───────────────────────────────────
+// `ghMode` sets the channel auth mode for 'gh' in channel C1 (default 'session' to exercise the gate).
+async function setup(ghMode: 'session' | 'per-user' | 'shared' = 'session') {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const sessions = new SessionGrants(db);
+  const channelConfig = new ChannelConfig(db);
+  await channelConfig.setMode('T1', 'C1', 'gh', ghMode);
   const posted: any[] = [];
   const client = { chat: { postEphemeral: async (p: any) => { posted.push(p); return {}; } } } as any;
-  // No channelConfig/channelTools (undefined) so only the session gate is exercised.
   const make = (thread: string | null, channel: string | null = 'C1') =>
     new ConnectContext(
       ID, channel, client, new ProviderRegistry([gh]), vault, audit,
-      new Consent(db), new Policy(), 'http://x', {}, undefined, undefined,
-      new Map(), () => {}, ['gh'], undefined, false, thread, sessions, cfg,
+      new Consent(db), new Policy(), 'http://x', {}, channelConfig, undefined,
+      new Map(), () => {}, ['gh'], undefined, false, thread, sessions,
     );
   const auditRows = async () => (await db.all('SELECT action, meta FROM audit')) as any[];
   return { db, vault, sessions, posted, make, auditRows };
@@ -131,12 +134,19 @@ test('connect(): covered provider off-thread is refused (no thread to scope a se
   assert.match(denied[0].meta, /no-thread/);
 });
 
-test('connect(): a provider not covered by the session policy is not gated', async () => {
-  // requires() excludes 'gh' → no session needed; with a stored cred connect() returns a handle.
-  const { vault, posted, make } = await setup({ ttlMs: 60_000, requires: (p) => p === 'other' });
+test('connect(): a provider in per-user mode is not gated', async () => {
+  // Channel mode is 'per-user' for gh → no session needed; with a stored cred connect() returns a handle.
+  const { vault, posted, make } = await setup('per-user');
   await vault.upsert(userOwner(ID), 'gh', {
     accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   assert.ok(await make('TH_A').connect('gh'));
   assert.equal(posted.length, 0); // no approval prompt
+});
+
+test('connect(): shared mode routes to the channel-credential path', async () => {
+  // With no shared cred configured, connect() in 'shared' mode surfaces connectChannel's specific
+  // error, proving it delegated to the channel path rather than the per-user one.
+  const { make } = await setup('shared');
+  await assert.rejects(() => make('TH_A').connect('gh'), /No channel credential configured/);
 });

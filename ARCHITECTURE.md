@@ -92,7 +92,7 @@ placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
 | --- | --- | --- |
 | `connection` | Credentials (vaulted or external-reference) | UNIQUE `(team_id, owner_kind, owner_id, provider)` |
 | `consent_request` | In-flight OAuth `state` + PKCE verifier | PK `state` |
-| `channel_config` | Per-channel mode (`shared` / `per-user`) | PK `(team_id, channel, provider)` |
+| `channel_config` | Per-channel auth mode (`shared` / `per-user` / `session`) | PK `(team_id, channel, provider)` |
 | `channel_tool` | Per-channel tool allowlist (which providers an agent may use) | PK `(team_id, channel, provider)` |
 | `session_grant` | Opt-in thread-scoped authorization (who may use a provider in which thread) | PK `(team_id, channel, thread, user_id, provider)` |
 | `audit` | Append-only action log | PK `id` |
@@ -164,11 +164,14 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    `offboardUserEverywhere` sweep applies the same cleanup across every team. Channel/shared
    credentials are intentionally left for an admin to review.
 
-**Thread sessions (opt-in).** When `session` is configured, `connect()` adds an authorization
-gate before the credential is resolved: a covered provider is usable only inside the Slack thread
-the user approved it in (a grant keyed `(team_id, channel, thread, user_id, provider)`), with a TTL
-ceiling. Grants live in `session_grant`, are cleared on offboarding, and are removed by
-`sweepExpired()`.
+**Per-channel auth mode.** `channel_config.mode` is the single source of truth for which credential
+model `connect()` uses for a provider in a channel: `per-user` (the default), `shared` (route to the
+channel credential), or `session`. `connect()` resolves the mode and routes accordingly, so the
+model is configured in Slack (`/vouchr mode <provider> <mode>`), not hardcoded in the agent. In
+`session` mode `connect()` adds an authorization gate before the credential is resolved: the
+provider is usable only inside the Slack thread the user approved it in (a grant keyed
+`(team_id, channel, thread, user_id, provider)`), with a TTL ceiling. Grants live in `session_grant`,
+are cleared on offboarding, and are removed by `sweepExpired()`.
 
 See [SECURITY.md](./SECURITY.md) for the security model and limits, and
 [THREAT-MODEL.md](./THREAT-MODEL.md) for trust boundaries, the attacker model, and the
