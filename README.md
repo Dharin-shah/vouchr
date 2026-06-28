@@ -183,7 +183,8 @@ through before going live.
 ## Status
 
 Pre-1.0. The embedded Bolt surface is built, and the full test suite — including the Postgres
-backend — is green in CI on every push and PR. That's CI green, not production mileage: Vouchr has
+backend — is green in CI on every push and PR. The security workflow runs npm audit, gitleaks,
+SBOM generation, and OWASP Dependency-Check. That's CI green, not production mileage: Vouchr has
 not yet been run in production. See the
 [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before adopting,
 [SECURITY.md](./SECURITY.md) for the security model and reporting, and
