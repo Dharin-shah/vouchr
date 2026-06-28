@@ -1,15 +1,6 @@
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 
-/** How session enforcement is resolved per provider. Built from VouchrOptions.session. */
-export interface SessionEnforcement {
-  /** Safety-ceiling lifetime of a grant, in ms. A grant always expires after this, regardless of
-   *  thread activity. The thread binding is the primary scope; the TTL is the backstop. */
-  ttlMs: number;
-  /** Whether `provider` requires a thread-scoped session grant before connect() returns a handle. */
-  requires: (provider: string) => boolean;
-}
-
 /**
  * Thread-scoped session grants. A grant says: the acting user may use `provider` only inside the
  * exact Slack thread (team, channel, thread) it was approved in, until `expires_at`. A different
