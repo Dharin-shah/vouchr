@@ -53,7 +53,7 @@ jobs:
       - name: Generate SBOM
         run: npx -y @cyclonedx/cyclonedx-npm --output-file sbom.json
         continue-on-error: true
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sbom
           path: sbom.json
@@ -76,7 +76,7 @@ jobs:
             --enableRetired
             --exclude **/node_modules/**
             --exclude **/dist/**
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: owasp-dependency-check
