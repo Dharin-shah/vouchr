@@ -22,7 +22,7 @@
     <circle cx="88" cy="78" r="9" fill="#ff605c"/>
     <circle cx="118" cy="78" r="9" fill="#ffbd44"/>
     <circle cx="148" cy="78" r="9" fill="#00ca4e"/>
-    <text class="text" x="198" y="87" fill="#ffffff" font-size="24" font-weight="700"># product-agent</text>
+    <text class="text" x="198" y="87" fill="#ffffff" font-size="24" font-weight="700"># product-bugs</text>
 
     <rect x="46" y="112" width="490" height="466" fill="#ffffff"/>
     <g filter="url(#softBlur)" opacity="0.5">
