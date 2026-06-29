@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" role="img" aria-labelledby="title desc">
+  <title id="title">Vouchr Slack connect prompt</title>
+  <desc id="desc">A mock Slack conversation where John tags company-agent to file a GitHub issue and Vouchr posts a private connect prompt.</desc>
+  <defs>
+    <filter id="windowShadow" x="-8%" y="-8%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#1d1c1d" flood-opacity="0.16"/>
+    </filter>
+    <style>
+      .text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="920" height="560" fill="#f6f4ef"/>
+
+  <g filter="url(#windowShadow)">
+    <rect x="60" y="48" width="800" height="464" rx="22" fill="#ffffff"/>
+    <rect x="60" y="48" width="800" height="70" rx="22" fill="#4a154b"/>
+    <rect x="60" y="92" width="800" height="26" fill="#4a154b"/>
+    <circle cx="102" cy="84" r="9" fill="#ff605c"/>
+    <circle cx="132" cy="84" r="9" fill="#ffbd44"/>
+    <circle cx="162" cy="84" r="9" fill="#00ca4e"/>
+    <text class="text" x="214" y="93" fill="#ffffff" font-size="24" font-weight="700"># product-bugs</text>
+
+    <rect x="104" y="154" width="44" height="44" rx="10" fill="#1264a3"/>
+    <text class="text" x="174" y="171" fill="#1d1c1d" font-size="15" font-weight="700">John</text>
+    <text class="text" x="174" y="197" fill="#1264a3" font-size="20" font-weight="700">@company-agent</text>
+    <text class="text" x="356" y="197" fill="#1d1c1d" font-size="20">file this as a GitHub issue?</text>
+
+    <rect x="104" y="248" width="44" height="44" rx="10" fill="#2eb67d"/>
+    <text class="text" x="174" y="265" fill="#1d1c1d" font-size="15" font-weight="700">company-agent</text>
+    <text class="text" x="174" y="291" fill="#1d1c1d" font-size="20">I need your GitHub permission first.</text>
+
+    <rect x="174" y="324" width="592" height="172" rx="14" fill="#ffffff" stroke="#d9d9d9"/>
+    <rect x="204" y="354" width="46" height="46" rx="10" fill="#24292f"/>
+    <text class="text" x="282" y="373" fill="#1d1c1d" font-size="22" font-weight="800">Connect your github account</text>
+    <text class="text" x="282" y="402" fill="#454245" font-size="16">I need to act as you on github for this.</text>
+    <text class="text" x="282" y="425" fill="#454245" font-size="16">Your token is stored encrypted and never posted in Slack.</text>
+
+    <rect x="282" y="444" width="164" height="40" rx="6" fill="#2ea44f"/>
+    <text class="text" x="309" y="470" fill="#ffffff" font-size="16" font-weight="800">Connect github</text>
+    <rect x="468" y="448" width="154" height="32" rx="16" fill="#fff4cf"/>
+    <text class="text" x="488" y="469" fill="#7a4d00" font-size="14" font-weight="700">Only John sees this</text>
+  </g>
+</svg>
