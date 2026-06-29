@@ -6,69 +6,85 @@
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2020.6-3c873a.svg)](#setup)
 [![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#status)
 
-**Let a Slack agent act on a user's behalf against third-party APIs, without the user's token ever touching your agent code, the LLM, or the chat.**
+**Vouchr lets a Slack agent act as the user who asked, without giving that user's token to the
+agent, the LLM, logs, or the Slack transcript.**
 
-Your Slack agent can open a GitHub issue as the person who asked, query an internal API with *their*
-access, or update a Jira ticket as them. Vouchr is the piece in the middle: the in-Slack "connect
-your account" flow, the encrypted per-user token store, and credential injection at the outbound HTTP
-call so the secret never reaches the model or the transcript. Self-hosted, a drop-in for
-[Slack Bolt](https://slack.dev/bolt-js), so tokens stay on your infra.
+Use it when your Slack bot needs to open a GitHub issue as Maya, read an internal API with Maya's
+permissions, or update a Jira ticket as the person who requested the work. Vouchr is a self-hosted
+middleware layer for [Slack Bolt](https://slack.dev/bolt-js): it handles the Slack "connect your
+account" flow, stores the credential encrypted, and injects it only when making an outbound HTTP
+request.
+
+## What users see
+
+For OAuth providers, Vouchr sends the user a private Slack prompt with a Connect button. The image
+below is an illustrative mockup of the Block Kit payload; the live rendering comes from Slack and
+uses your app's name.
+
+![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
+
+For non-OAuth APIs or shared channel credentials, Vouchr opens a private Slack modal instead:
+
+![Vouchr Slack credential modal](./assets/slack-secret-modal.svg)
+
+## The short version
+
+Without Vouchr, you usually have two bad choices:
+
+- give the agent one broad bot/service token, so every action is "the bot did it"
+- pass user tokens into tool code or prompts, where they can leak
+
+With Vouchr:
+
+1. A user asks your Slack agent to do something with GitHub, Google, Jira, or an internal API.
+2. Your handler calls `context.vouchr.connect('github')`.
+3. If the user has not connected yet, Vouchr sends them a private Slack prompt and handles OAuth.
+4. Your code gets back a safe `ConnectionHandle`, not a token.
+5. Your code calls `handle.fetch(url)`. Vouchr checks the destination, injects the token inside
+   Vouchr, and sends the request.
+
+```mermaid
+flowchart LR
+    user["Slack user"] --> agent["Your Bolt agent"]
+    agent -->|"connect('github')"| vouchr["Vouchr"]
+    vouchr -->|"private Connect button if needed"| user
+    vouchr --> vault["encrypted credential store"]
+    agent -->|"handle.fetch(url)"| vouchr
+    vouchr -->|"token injected here only"| api["Provider API"]
+```
+
+The important boundary: **the token only exists inside Vouchr and the provider request.** Your agent
+receives a handle with `fetch()`, not the credential itself.
+
+## Tiny example
 
 ```ts
 app.event('app_mention', async ({ context, say }) => {
-  const gh = await context.vouchr.connect('github');        // prompts the user to connect, if needed
+  const gh = await context.vouchr.connect('github');
   const me = await (await gh.fetch('https://api.github.com/user')).json();
-  await say(`You're *${me.login}* on GitHub.`);              // acted as the user; the token never left Vouchr
+
+  await say(`You're *${me.login}* on GitHub.`);
 });
 ```
 
-**Docs:** [ARCHITECTURE.md](./ARCHITECTURE.md) · [THREAT-MODEL.md](./THREAT-MODEL.md) ·
-[SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md) · [DEPLOYMENT.md](./DEPLOYMENT.md)
+If Maya has not connected GitHub yet, `connect('github')` posts the private Slack prompt shown above
+and throws `ConsentRequiredError`. Catch it and stop the turn. Maya clicks once, finishes OAuth in
+the browser, then asks again.
 
-## How it works
+## What Vouchr handles for you
 
-```mermaid
-sequenceDiagram
-    participant U as User (in Slack)
-    participant A as Your agent (Bolt)
-    participant V as Vouchr
-    participant P as Provider API (e.g. GitHub)
+- **The connect UX:** Slack prompt, OAuth callback, and private key-entry modal for non-OAuth APIs.
+- **A credential vault:** encrypted SQLite by default, Postgres for multi-instance deployments.
+- **A safe HTTP boundary:** provider host allowlist, HTTPS checks, no token in your handler.
+- **Acting as the human:** per-user credentials and audit entries tied to the Slack user.
+- **Channel controls:** admins can choose per provider whether a channel uses `per-user`, `shared`,
+  or `session` auth mode.
+- **Lifecycle:** token refresh, TTL, disconnect, offboarding cleanup, and optional external secret
+  manager references.
 
-    rect rgba(125,170,255,0.15)
-    Note over U,P: First time: the user connects their account
-    U->>A: @mention / command
-    A->>V: context.vouchr.connect('github')
-    V-->>U: ephemeral "Connect GitHub" button (only the user sees it)
-    U->>V: authorize in the browser (OAuth)
-    V->>V: store token encrypted, keyed to the Slack identity
-    end
-
-    rect rgba(125,220,150,0.15)
-    Note over U,P: Every call after: the agent acts as the user
-    U->>A: @mention / command
-    A->>V: context.vouchr.connect('github') returns a handle
-    A->>V: handle.fetch(api url)
-    V->>P: request, with the token injected at the HTTP boundary
-    P-->>V: response
-    V-->>A: response (your code and the LLM never see the token)
-    A-->>U: reply
-    end
-```
-
-## What you get
-
-- **Leak-safe by construction.** The agent and LLM receive a `fetch` handle, never a token. Secrets
-  never reach logs, messages, the audit log, or error strings, and outbound calls are restricted to a
-  per-provider host allowlist.
-- **Acts as the human.** Per-user OAuth (or a pasted key for non-OAuth APIs), with every action
-  audited against the acting person. No giant shared bot token.
-- **Per-channel auth mode.** Each channel sets, per provider, whether `connect()` uses the user's own
-  token (`per-user`), a shared channel token (`shared`), or a per-user token gated by a per-thread
-  approval (`session`). [See below](#auth-mode-per-channel).
-- **Bring your own secret manager.** Point a credential at an AWS Secrets Manager ARN (or any
-  resolver); Vouchr stores the reference, not the secret, so rotation stays where it lives.
-- **Encrypted store, full lifecycle.** SQLite by default, Postgres for multi-instance. Token
-  auto-refresh, TTL, and automatic revocation when Slack deactivates a user.
+Need the deeper model? See [ARCHITECTURE.md](./ARCHITECTURE.md),
+[THREAT-MODEL.md](./THREAT-MODEL.md), [SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md), and
+[DEPLOYMENT.md](./DEPLOYMENT.md).
 
 ## Setup
 
