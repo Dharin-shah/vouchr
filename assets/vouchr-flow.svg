@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="430" viewBox="0 0 920 430" role="img" aria-labelledby="title desc">
+  <title id="title">Vouchr credential flow</title>
+  <desc id="desc">A simplified flow showing a Slack request, agent code, Vouchr as the credential boundary, and a provider API request where the token is attached only at the final outbound step.</desc>
+  <defs>
+    <filter id="shadow" x="-8%" y="-8%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="14" stdDeviation="16" flood-color="#1d1c1d" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrowDark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#334155"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#007a5a"/>
+    </marker>
+    <style>
+      .text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+      .mono { font-family: SFMono-Regular, Menlo, Consolas, monospace; }
+      .label { fill: #64748b; font-size: 13px; font-weight: 700; letter-spacing: 0; }
+      .title { fill: #111827; font-size: 19px; font-weight: 800; letter-spacing: 0; }
+      .body { fill: #334155; font-size: 14px; letter-spacing: 0; }
+      .small { fill: #64748b; font-size: 12px; letter-spacing: 0; }
+    </style>
+  </defs>
+
+  <rect width="920" height="430" rx="20" fill="#f7f5ef"/>
+
+  <g filter="url(#shadow)">
+    <rect x="44" y="46" width="832" height="300" rx="22" fill="#ffffff"/>
+    <rect x="44" y="46" width="832" height="54" rx="22" fill="#4a154b"/>
+    <rect x="44" y="80" width="832" height="20" fill="#4a154b"/>
+    <circle cx="76" cy="73" r="7" fill="#ff605c"/>
+    <circle cx="100" cy="73" r="7" fill="#ffbd44"/>
+    <circle cx="124" cy="73" r="7" fill="#00ca4e"/>
+    <text class="text" x="160" y="80" fill="#ffffff" font-size="19" font-weight="800">Vouchr credential boundary</text>
+
+    <rect x="74" y="132" width="190" height="146" rx="16" fill="#f8fafc" stroke="#d8dee8"/>
+    <text class="text label" x="96" y="162">SLACK REQUEST</text>
+    <rect x="96" y="184" width="34" height="34" rx="9" fill="#1264a3"/>
+    <text class="text" x="144" y="197" fill="#111827" font-size="13" font-weight="800">John</text>
+    <text class="text" x="144" y="218" fill="#334155" font-size="13">tags</text>
+    <text class="text" x="96" y="242" fill="#1264a3" font-size="13" font-weight="800">@company-agent</text>
+    <text class="text body" x="96" y="266">Do this with GitHub.</text>
+
+    <rect x="304" y="132" width="176" height="146" rx="16" fill="#f8fafc" stroke="#d8dee8"/>
+    <text class="text label" x="326" y="162">AGENT CODE</text>
+    <rect x="326" y="184" width="132" height="28" rx="7" fill="#eef2f7"/>
+    <text class="mono" x="340" y="203" fill="#111827" font-size="13">connect('github')</text>
+    <rect x="326" y="226" width="132" height="28" rx="7" fill="#ecfdf5"/>
+    <text class="mono" x="351" y="245" fill="#007a5a" font-size="13">handle.fetch()</text>
+    <text class="text small" x="326" y="270">No token returned.</text>
+
+    <rect x="520" y="116" width="186" height="178" rx="18" fill="#10223f"/>
+    <text class="text" x="546" y="151" fill="#ffffff" font-size="20" font-weight="800">Vouchr</text>
+    <text class="text" x="546" y="178" fill="#cbd5e1" font-size="14">Consent, storage,</text>
+    <text class="text" x="546" y="199" fill="#cbd5e1" font-size="14">policy, injection.</text>
+    <rect x="546" y="220" width="134" height="30" rx="15" fill="#173d34"/>
+    <text class="text" x="567" y="240" fill="#8ee6bf" font-size="13" font-weight="800">token boundary</text>
+
+    <rect x="746" y="132" width="100" height="146" rx="16" fill="#f8fafc" stroke="#d8dee8"/>
+    <text class="text label" x="768" y="162">API</text>
+    <rect x="774" y="184" width="44" height="44" rx="12" fill="#24292f"/>
+    <text class="text body" x="769" y="252">Provider</text>
+
+    <path d="M 264 205 L 304 205" stroke="#334155" stroke-width="2" marker-end="url(#arrowDark)" fill="none"/>
+    <path d="M 480 205 L 520 205" stroke="#334155" stroke-width="2" marker-end="url(#arrowDark)" fill="none"/>
+    <path d="M 706 205 L 746 205" stroke="#007a5a" stroke-width="2.5" marker-end="url(#arrowGreen)" fill="none"/>
+
+    <rect x="520" y="314" width="186" height="58" rx="14" fill="#ffffff" stroke="#d8dee8"/>
+    <text class="text label" x="546" y="338">ENCRYPTED STORE</text>
+    <text class="text small" x="546" y="359">OAuth tokens and keys</text>
+    <path d="M 613 314 L 613 294" stroke="#007a5a" stroke-width="2.5" marker-end="url(#arrowGreen)" fill="none"/>
+  </g>
+
+  <rect x="80" y="372" width="760" height="34" rx="17" fill="#e8f5ee"/>
+  <text class="text" x="151" y="394" fill="#007a5a" font-size="14" font-weight="800">The agent receives a handle. The credential stays inside Vouchr and the outbound provider request.</text>
+</svg>

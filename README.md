@@ -31,36 +31,27 @@ For non-OAuth APIs or shared channel credentials, Vouchr opens a private Slack m
 
 ![Vouchr Slack credential modal](./assets/slack-secret-modal.svg)
 
-## The short version
+## How Vouchr works
 
-Without Vouchr, you usually have two bad choices:
+Vouchr sits between your Slack agent and provider APIs. Your agent asks for a connection; Vouchr
+handles consent, storage, policy checks, and credential injection.
 
-- give the agent one broad bot/service token, so every action is "the bot did it"
-- pass user tokens into tool code or prompts, where they can leak
+![Vouchr credential flow](./assets/vouchr-flow.svg)
 
-With Vouchr:
+Without a broker, teams usually choose between a broad service token or passing user tokens through
+tool code. Vouchr keeps both out of the agent path:
 
-1. A user asks your Slack agent to do something with GitHub, Google, Jira, or an internal API.
-2. Your handler calls `context.vouchr.connect('github')`.
-3. If the user has not connected yet, Vouchr sends them a private Slack prompt and handles OAuth.
-4. Your code gets back a safe `ConnectionHandle`, not a token.
-5. Your code calls `handle.fetch(url)`. Vouchr checks the destination, injects the token inside
-   Vouchr, and sends the request.
+1. Your Bolt handler calls `context.vouchr.connect('github')`.
+2. Vouchr resolves the channel's credential mode: `per-user`, `shared`, or `session`.
+3. If access is missing, Slack shows a private prompt or modal and the turn stops.
+4. The handler receives a `ConnectionHandle`, never a credential.
+5. Requests go through `handle.fetch(url)`, where Vouchr enforces the provider allowlist and
+   attaches the credential only for that outbound request.
 
-```mermaid
-flowchart LR
-    user["Slack user"] --> agent["Your Bolt agent"]
-    agent -->|"connect('github')"| vouchr["Vouchr"]
-    vouchr -->|"private Connect button if needed"| user
-    vouchr --> vault["encrypted credential store"]
-    agent -->|"handle.fetch(url)"| vouchr
-    vouchr -->|"token injected here only"| api["Provider API"]
-```
+**Boundary:** tokens live in Vouchr's encrypted store and the provider request. They do not enter the
+model, Slack transcript, tool schema, or application logs.
 
-The important boundary: **the token only exists inside Vouchr and the provider request.** Your agent
-receives a handle with `fetch()`, not the credential itself.
-
-## Tiny example
+## Minimal example
 
 ```ts
 app.event('app_mention', async ({ context, say }) => {
