@@ -1,42 +1,43 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="520" viewBox="0 0 760 520" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" role="img" aria-labelledby="title desc">
   <title id="title">Vouchr Slack connect prompt</title>
-  <desc id="desc">A mock Slack conversation where the user's Slack agent asks them to connect github with a private button.</desc>
+  <desc id="desc">A mock Slack conversation where John asks an agent to file a GitHub issue and Vouchr posts a private connect prompt.</desc>
   <defs>
-    <filter id="shadow" x="-10%" y="-10%" width="120%" height="130%">
-      <feDropShadow dx="0" dy="16" stdDeviation="16" flood-color="#1d1c1d" flood-opacity="0.16"/>
+    <filter id="windowShadow" x="-8%" y="-8%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#1d1c1d" flood-opacity="0.16"/>
     </filter>
     <style>
-      .text { font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
     </style>
   </defs>
 
-  <rect width="760" height="520" fill="#f4f2ee"/>
+  <rect width="920" height="560" fill="#f6f4ef"/>
 
-  <g filter="url(#shadow)">
-    <rect x="52" y="46" width="656" height="428" rx="18" fill="#ffffff"/>
-    <rect x="52" y="46" width="656" height="62" rx="18" fill="#4a154b"/>
-    <rect x="52" y="90" width="656" height="18" fill="#4a154b"/>
-    <circle cx="88" cy="78" r="8" fill="#ff605c"/>
-    <circle cx="114" cy="78" r="8" fill="#ffbd44"/>
-    <circle cx="140" cy="78" r="8" fill="#00ca4e"/>
-    <text class="text" x="184" y="86" fill="#ffffff" font-size="22" font-weight="700"># support-agent</text>
+  <g filter="url(#windowShadow)">
+    <rect x="60" y="48" width="800" height="464" rx="22" fill="#ffffff"/>
+    <rect x="60" y="48" width="800" height="70" rx="22" fill="#4a154b"/>
+    <rect x="60" y="92" width="800" height="26" fill="#4a154b"/>
+    <circle cx="102" cy="84" r="9" fill="#ff605c"/>
+    <circle cx="132" cy="84" r="9" fill="#ffbd44"/>
+    <circle cx="162" cy="84" r="9" fill="#00ca4e"/>
+    <text class="text" x="214" y="93" fill="#ffffff" font-size="24" font-weight="700"># product-agent</text>
 
-    <rect x="88" y="138" width="42" height="42" rx="10" fill="#1264a3"/>
-    <text class="text" x="154" y="154" fill="#1d1c1d" font-size="15" font-weight="700">Maya</text>
-    <text class="text" x="154" y="178" fill="#1d1c1d" font-size="18">Can you open a GitHub issue for this bug?</text>
+    <rect x="104" y="154" width="44" height="44" rx="10" fill="#1264a3"/>
+    <text class="text" x="174" y="171" fill="#1d1c1d" font-size="15" font-weight="700">John</text>
+    <text class="text" x="174" y="197" fill="#1d1c1d" font-size="20">Can you file this as a GitHub issue?</text>
 
-    <rect x="88" y="222" width="42" height="42" rx="10" fill="#2eb67d"/>
-    <text class="text" x="154" y="238" fill="#1d1c1d" font-size="15" font-weight="700">your-agent</text>
-    <text class="text" x="154" y="262" fill="#1d1c1d" font-size="18">I need your GitHub permission first.</text>
+    <rect x="104" y="248" width="44" height="44" rx="10" fill="#2eb67d"/>
+    <text class="text" x="174" y="265" fill="#1d1c1d" font-size="15" font-weight="700">your-agent</text>
+    <text class="text" x="174" y="291" fill="#1d1c1d" font-size="20">I need your GitHub permission first.</text>
 
-    <rect x="154" y="292" width="488" height="166" rx="12" fill="#ffffff" stroke="#d9d9d9"/>
-    <rect x="178" y="318" width="44" height="44" rx="10" fill="#24292f"/>
-    <text class="text" x="248" y="337" fill="#1d1c1d" font-size="21" font-weight="800">Connect your github account</text>
-    <text class="text" x="248" y="366" fill="#454245" font-size="15">I need to act as you on github for this.</text>
-    <text class="text" x="248" y="389" fill="#454245" font-size="15">Your token is encrypted and never posted in Slack.</text>
-    <rect x="248" y="407" width="150" height="40" rx="6" fill="#2ea44f"/>
-    <text class="text" x="277" y="433" fill="#ffffff" font-size="16" font-weight="800">Connect github</text>
-    <rect x="420" y="411" width="150" height="32" rx="16" fill="#fff7d6"/>
-    <text class="text" x="439" y="432" fill="#7a4d00" font-size="14" font-weight="700">Only visible to Maya</text>
+    <rect x="174" y="326" width="592" height="162" rx="14" fill="#ffffff" stroke="#d9d9d9"/>
+    <rect x="204" y="356" width="46" height="46" rx="10" fill="#24292f"/>
+    <text class="text" x="282" y="374" fill="#1d1c1d" font-size="22" font-weight="800">Connect your github account</text>
+    <text class="text" x="282" y="404" fill="#454245" font-size="16">I need to act as you on github for this.</text>
+    <text class="text" x="282" y="428" fill="#454245" font-size="16">Your token is stored encrypted and never posted in Slack.</text>
+
+    <rect x="282" y="444" width="164" height="40" rx="6" fill="#2ea44f"/>
+    <text class="text" x="309" y="470" fill="#ffffff" font-size="16" font-weight="800">Connect github</text>
+    <rect x="468" y="448" width="154" height="32" rx="16" fill="#fff4cf"/>
+    <text class="text" x="488" y="469" fill="#7a4d00" font-size="14" font-weight="700">Only John sees this</text>
   </g>
 </svg>

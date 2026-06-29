@@ -9,19 +9,23 @@
 **Vouchr lets a Slack agent act as the user who asked, without giving that user's token to the
 agent, the LLM, logs, or the Slack transcript.**
 
-Use it when your Slack bot needs to open a GitHub issue as Maya, read an internal API with Maya's
-permissions, or update a Jira ticket as the person who requested the work. Vouchr is a self-hosted
-middleware layer for [Slack Bolt](https://slack.dev/bolt-js): it handles the Slack "connect your
-account" flow, stores the credential encrypted, and injects it only when making an outbound HTTP
-request.
+Vouchr is a self-hosted middleware layer for [Slack Bolt](https://slack.dev/bolt-js). It gives your
+agent a safe way to use the right credential for each request: per-user OAuth tokens, shared channel
+credentials, or thread-scoped session approvals. It handles the Slack "connect your account" flow,
+stores credentials encrypted, and injects them only when making an outbound HTTP request.
 
 ## What users see
 
-For OAuth providers, Vouchr sends the user a private Slack prompt with a Connect button. The image
-below is an illustrative mockup of the Block Kit payload; the live rendering comes from Slack and
-uses your app's name.
+Vouchr's Slack surfaces are intentionally small. These are illustrative mockups of the Block Kit
+payloads; the live rendering comes from Slack and uses your app's name.
+
+For OAuth providers, Vouchr sends the user a private Slack prompt with a Connect button.
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
+
+For session-scoped providers, Vouchr asks for approval inside the current Slack thread only.
+
+![Vouchr Slack session approval](./assets/slack-session-thread.svg)
 
 For non-OAuth APIs or shared channel credentials, Vouchr opens a private Slack modal instead:
 
@@ -67,9 +71,9 @@ app.event('app_mention', async ({ context, say }) => {
 });
 ```
 
-If Maya has not connected GitHub yet, `connect('github')` posts the private Slack prompt shown above
-and throws `ConsentRequiredError`. Catch it and stop the turn. Maya clicks once, finishes OAuth in
-the browser, then asks again.
+If the user has not connected GitHub yet, `connect('github')` posts the private Slack prompt shown
+above and throws `ConsentRequiredError`. Catch it and stop the turn. The user clicks once, finishes
+OAuth in the browser, then asks again.
 
 ## What Vouchr handles for you
 

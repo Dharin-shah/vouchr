@@ -1,0 +1,71 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="620" viewBox="0 0 920 620" role="img" aria-labelledby="title desc">
+  <title id="title">Vouchr Slack session approval</title>
+  <desc id="desc">A mock Slack thread where John approves github only for the current thread while the main channel is blurred.</desc>
+  <defs>
+    <filter id="windowShadow" x="-8%" y="-8%" width="116%" height="124%">
+      <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#1d1c1d" flood-opacity="0.16"/>
+    </filter>
+    <filter id="softBlur">
+      <feGaussianBlur stdDeviation="2.4"/>
+    </filter>
+    <style>
+      .text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect width="920" height="620" fill="#f6f4ef"/>
+
+  <g filter="url(#windowShadow)">
+    <rect x="46" y="42" width="828" height="536" rx="22" fill="#ffffff"/>
+    <rect x="46" y="42" width="828" height="70" rx="22" fill="#4a154b"/>
+    <rect x="46" y="86" width="828" height="26" fill="#4a154b"/>
+    <circle cx="88" cy="78" r="9" fill="#ff605c"/>
+    <circle cx="118" cy="78" r="9" fill="#ffbd44"/>
+    <circle cx="148" cy="78" r="9" fill="#00ca4e"/>
+    <text class="text" x="198" y="87" fill="#ffffff" font-size="24" font-weight="700"># product-agent</text>
+
+    <rect x="46" y="112" width="490" height="466" fill="#ffffff"/>
+    <g filter="url(#softBlur)" opacity="0.5">
+      <rect x="92" y="154" width="44" height="44" rx="10" fill="#1264a3"/>
+      <rect x="166" y="160" width="72" height="16" rx="8" fill="#cfcacf"/>
+      <rect x="166" y="188" width="316" height="14" rx="7" fill="#dedade"/>
+      <rect x="166" y="212" width="260" height="14" rx="7" fill="#ebe8eb"/>
+
+      <rect x="92" y="270" width="44" height="44" rx="10" fill="#2eb67d"/>
+      <rect x="166" y="276" width="92" height="16" rx="8" fill="#cfcacf"/>
+      <rect x="166" y="304" width="326" height="14" rx="7" fill="#dedade"/>
+      <rect x="166" y="328" width="284" height="14" rx="7" fill="#ebe8eb"/>
+
+      <rect x="92" y="398" width="44" height="44" rx="10" fill="#e01e5a"/>
+      <rect x="166" y="404" width="118" height="16" rx="8" fill="#cfcacf"/>
+      <rect x="166" y="432" width="300" height="14" rx="7" fill="#dedade"/>
+      <rect x="166" y="456" width="224" height="14" rx="7" fill="#ebe8eb"/>
+    </g>
+
+    <line x1="536" y1="112" x2="536" y2="578" stroke="#dedede"/>
+    <rect x="536" y="112" width="338" height="466" fill="#ffffff"/>
+    <text class="text" x="568" y="154" fill="#1d1c1d" font-size="20" font-weight="800">Thread</text>
+    <text class="text" x="568" y="180" fill="#616061" font-size="13">github access request</text>
+    <line x1="536" y1="204" x2="874" y2="204" stroke="#e8e8e8"/>
+
+    <rect x="568" y="232" width="38" height="38" rx="9" fill="#1264a3"/>
+    <text class="text" x="622" y="247" fill="#1d1c1d" font-size="14" font-weight="700">John</text>
+    <text class="text" x="622" y="270" fill="#1d1c1d" font-size="15">Can this thread use</text>
+    <text class="text" x="622" y="291" fill="#1d1c1d" font-size="15">GitHub?</text>
+
+    <rect x="568" y="324" width="38" height="38" rx="9" fill="#2eb67d"/>
+    <text class="text" x="622" y="339" fill="#1d1c1d" font-size="14" font-weight="700">your-agent</text>
+    <text class="text" x="622" y="362" fill="#1d1c1d" font-size="15">I need approval</text>
+    <text class="text" x="622" y="383" fill="#1d1c1d" font-size="15">here first.</text>
+
+    <rect x="568" y="400" width="276" height="136" rx="14" fill="#ffffff" stroke="#d9d9d9"/>
+    <text class="text" x="592" y="430" fill="#1d1c1d" font-size="17" font-weight="800">Allow github in this thread?</text>
+    <text class="text" x="592" y="458" fill="#454245" font-size="14">The agent can act as you on github</text>
+    <text class="text" x="592" y="478" fill="#454245" font-size="14">only inside this thread.</text>
+    <rect x="592" y="496" width="166" height="36" rx="6" fill="#007a5a"/>
+    <text class="text" x="612" y="519" fill="#ffffff" font-size="14" font-weight="800">Allow github here</text>
+
+    <rect x="568" y="548" width="276" height="26" rx="13" fill="#e8f5ee"/>
+    <text class="text" x="611" y="566" fill="#007a5a" font-size="13" font-weight="800">Grant stays in this thread</text>
+  </g>
+</svg>
