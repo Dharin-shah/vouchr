@@ -4,7 +4,7 @@
 [![Security](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml/badge.svg)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A5%2020.6-3c873a.svg)](#setup)
-[![Status](https://img.shields.io/badge/status-pre--production-orange.svg)](#status)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 **Vouchr lets a Slack agent act as the user who asked, without giving that user's token to the
 agent, the LLM, logs, or the Slack transcript.**
@@ -186,7 +186,7 @@ const linear = defineProvider({
 
 ## Status
 
-**Pre-production. Not yet tested in a live deployment.** CI runs the full suite (including Postgres)
+**Alpha. Not yet tested in a live deployment.** CI runs the full suite (including Postgres)
 plus a security workflow (npm audit, gitleaks, SBOM, OWASP Dependency-Check) on every push and PR.
 Review the [production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before
 adopting, and [CONTRIBUTING.md](./CONTRIBUTING.md) to help.
