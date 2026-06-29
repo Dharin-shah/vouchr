@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="560" viewBox="0 0 920 560" role="img" aria-labelledby="title desc">
   <title id="title">Vouchr Slack connect prompt</title>
-  <desc id="desc">A mock Slack conversation where John asks an agent to file a GitHub issue and Vouchr posts a private connect prompt.</desc>
+  <desc id="desc">A mock Slack conversation where John tags company-agent to file a GitHub issue and Vouchr posts a private connect prompt.</desc>
   <defs>
     <filter id="windowShadow" x="-8%" y="-8%" width="116%" height="124%">
       <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#1d1c1d" flood-opacity="0.16"/>
@@ -23,10 +23,11 @@
 
     <rect x="104" y="154" width="44" height="44" rx="10" fill="#1264a3"/>
     <text class="text" x="174" y="171" fill="#1d1c1d" font-size="15" font-weight="700">John</text>
-    <text class="text" x="174" y="197" fill="#1d1c1d" font-size="20">Can you file this as a GitHub issue?</text>
+    <text class="text" x="174" y="197" fill="#1264a3" font-size="20" font-weight="700">@company-agent</text>
+    <text class="text" x="356" y="197" fill="#1d1c1d" font-size="20">file this as a GitHub issue?</text>
 
     <rect x="104" y="248" width="44" height="44" rx="10" fill="#2eb67d"/>
-    <text class="text" x="174" y="265" fill="#1d1c1d" font-size="15" font-weight="700">your-agent</text>
+    <text class="text" x="174" y="265" fill="#1d1c1d" font-size="15" font-weight="700">company-agent</text>
     <text class="text" x="174" y="291" fill="#1d1c1d" font-size="20">I need your GitHub permission first.</text>
 
     <rect x="174" y="324" width="592" height="172" rx="14" fill="#ffffff" stroke="#d9d9d9"/>

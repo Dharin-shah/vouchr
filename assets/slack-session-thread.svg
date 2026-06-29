@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="920" height="620" viewBox="0 0 920 620" role="img" aria-labelledby="title desc">
   <title id="title">Vouchr Slack session approval</title>
-  <desc id="desc">A mock Slack thread where John approves github only for the current thread while the main channel is blurred.</desc>
+  <desc id="desc">A mock Slack thread where John tags company-agent and approves github only for the current thread while the main channel is blurred.</desc>
   <defs>
     <filter id="windowShadow" x="-8%" y="-8%" width="116%" height="124%">
       <feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#1d1c1d" flood-opacity="0.16"/>
@@ -50,11 +50,11 @@
 
     <rect x="568" y="232" width="38" height="38" rx="9" fill="#1264a3"/>
     <text class="text" x="622" y="247" fill="#1d1c1d" font-size="14" font-weight="700">John</text>
-    <text class="text" x="622" y="270" fill="#1d1c1d" font-size="15">Can this thread use</text>
-    <text class="text" x="622" y="291" fill="#1d1c1d" font-size="15">GitHub?</text>
+    <text class="text" x="622" y="270" fill="#1264a3" font-size="15" font-weight="700">@company-agent</text>
+    <text class="text" x="622" y="291" fill="#1d1c1d" font-size="15">can this thread use GitHub?</text>
 
     <rect x="568" y="324" width="38" height="38" rx="9" fill="#2eb67d"/>
-    <text class="text" x="622" y="339" fill="#1d1c1d" font-size="14" font-weight="700">your-agent</text>
+    <text class="text" x="622" y="339" fill="#1d1c1d" font-size="14" font-weight="700">company-agent</text>
     <text class="text" x="622" y="362" fill="#1d1c1d" font-size="15">I need approval</text>
     <text class="text" x="622" y="383" fill="#1d1c1d" font-size="15">here first.</text>
 
