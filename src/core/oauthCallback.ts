@@ -1,6 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import type { ProviderRegistry } from './providers';
 import type { Vault } from './vault';
-import type { Audit } from './audit';
+import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import type { Consent } from './consent';
 import type { SlackIdentity } from './identity';
 import { userOwner } from './owner';
@@ -12,6 +13,36 @@ export interface CallbackDeps {
   audit: Audit;
   consent: Consent;
   redirectUri: string;
+  /** Optional audit STREAM sink (raw actor id). No-op when unset; the audit table is authoritative. */
+  auditSink?: AuditSink;
+}
+
+/** Emit a consent_granted/denied audit-stream copy. Best-effort; a throwing sink never breaks the callback. */
+function emitConsent(
+  deps: CallbackDeps,
+  identity: SlackIdentity,
+  provider: string,
+  egressHost: string,
+  action: 'consent_granted' | 'consent_denied',
+  status: number,
+): void {
+  const e: VouchrAuditEvent = {
+    ts: new Date().toISOString(),
+    teamId: identity.teamId,
+    userId: identity.userId, // raw actor id, never a token
+    provider,
+    ownerKind: 'user', // consent always establishes a user-owned credential
+    ownerId: identity.userId,
+    action,
+    egressHost,
+    status,
+    jti: randomUUID(),
+  };
+  try {
+    deps.auditSink?.(e);
+  } catch {
+    // ignore: best-effort, never fatal
+  }
 }
 
 export type CallbackResult =
@@ -49,8 +80,10 @@ export async function handleOAuthCallback(
       externalAccount: account,
     });
     await deps.audit.record('connect', row.identity, provider.id, { account });
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_granted', 200);
     return { ok: true, provider: provider.id, account, identity: row.identity };
   } catch {
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 500);
     return { ok: false, status: 500, error: 'Connection failed. Please try again.' };
   }
 }

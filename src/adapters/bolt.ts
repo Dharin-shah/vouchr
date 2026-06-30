@@ -4,7 +4,7 @@ import { openDb } from '../core/db';
 import { loadMasterKey, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
-import { Audit } from '../core/audit';
+import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
 import { resolveIdentity, isSlackAdmin, isChannelMember, type SlackIdentity } from '../core/identity';
@@ -90,6 +90,15 @@ export interface VouchrOptions {
    */
   onEvent?: EventSink;
   /**
+   * Optional audit STREAM sink for host-side ingestion (e.g. a Redis stream the host consumes into
+   * its own store). Fires IN ADDITION to the authoritative `audit` table at fetch / refresh /
+   * consent. Unlike `onEvent` (deliberately actor-free), this carries the RAW acting user id so a
+   * host can answer "who used this token, when, against which host". The streamed copy is LOSSY by
+   * design (a capped stream may drop events) — the table remains the source of truth. Each event
+   * carries a `jti` for idempotent host-side ingest. No-op when unset. Never carries token material.
+   */
+  auditSink?: AuditSink;
+  /**
    * Custom admin check for channel-credential config (governance). When set, `requireAdmin` uses
    * it INSTEAD of the built-in Slack is_admin/is_owner gate, e.g. to defer to your own RBAC or an
    * allow-list. When omitted, the gate is exactly as before (`isSlackAdmin`). The default-deny +
@@ -142,6 +151,8 @@ export class ConnectContext {
     private thread: string | null = null,
     // Thread session-grant store. The 'session' channel mode drives whether the gate runs.
     private sessions?: SessionGrants,
+    // Optional audit stream sink (raw actor id). Default no-op; the audit table stays authoritative.
+    private auditSink: AuditSink = () => {},
   ) {}
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -202,7 +213,7 @@ export class ConnectContext {
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
       return new ConnectionHandle(
-        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink,
+        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
       );
     }
 
@@ -390,7 +401,7 @@ export class ConnectContext {
     // This is one conversations.info per use; cache the class with a short TTL if a hot channel
     // throttles. Correctness first: a channel turned Slack Connect must stop now.
     await this.assertChannelEligible();
-    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink);
+    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink);
   }
 
   /**
@@ -483,6 +494,8 @@ export async function createVouchr(opts: VouchrOptions) {
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
   const sink: EventSink = opts.onEvent ?? (() => {});
+  // Optional audit stream sink (raw actor id). Separate from `sink`, which is deliberately actor-free.
+  const auditSink: AuditSink = opts.auditSink ?? (() => {});
   // Safe emit for the createVouchr-level paths (OAuth callback, disconnect) that aren't inside a
   // ConnectContext/ConnectionHandle. A throwing sink must never break a request.
   const emit = (e: VouchrEvent): void => {
@@ -547,12 +560,13 @@ export async function createVouchr(opts: VouchrOptions) {
         opts.requireChannelMembership ?? false,
         thread,
         sessions,
+        auditSink,
       );
     }
     await args.next();
   };
 
-  const callbackDeps = { registry, vault, audit, consent, redirectUri };
+  const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink };
 
   /** Mount the OAuth callback on the receiver's Express router. */
   function mountRoutes(router: any): void {
@@ -591,7 +605,7 @@ export async function createVouchr(opts: VouchrOptions) {
     return new ConnectContext(
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, sink, providerIds,
-      opts.isAdmin, opts.requireChannelMembership ?? false, null, sessions,
+      opts.isAdmin, opts.requireChannelMembership ?? false, null, sessions, auditSink,
     );
   }
 

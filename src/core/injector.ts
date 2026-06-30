@@ -2,8 +2,9 @@ import type { Provider } from './providers';
 import type { Vault, StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
-import type { Audit } from './audit';
+import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import { refreshToken } from './tokens';
+import { randomUUID } from 'node:crypto';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided. */
 export type Resolvers = Record<string, (ref: string) => Promise<string>>;
@@ -68,6 +69,9 @@ export class ConnectionHandle {
     private inflight: Map<string, Promise<string | null>> = new Map(),
     // No-secret observability hook. Default no-op (zero behavior change when unset).
     private sink: EventSink = () => {},
+    // Optional audit STREAM sink (carries the raw actor id). Separate from `sink`, which is
+    // deliberately actor-free. Default no-op. The authoritative copy is still the audit table.
+    private auditSink: AuditSink = () => {},
   ) {}
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -76,6 +80,26 @@ export class ConnectionHandle {
       this.sink(e);
     } catch {
       // ignore: observability is best-effort, never fatal
+    }
+  }
+
+  /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
+  private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number): void {
+    try {
+      this.auditSink({
+        ts: new Date().toISOString(),
+        teamId: this.acting.teamId,
+        userId: this.acting.userId, // raw actor id, never a token
+        provider: this.provider.id,
+        ownerKind: this.owner.kind,
+        ownerId: this.owner.id,
+        action,
+        egressHost,
+        status,
+        jti: randomUUID(),
+      });
+    } catch {
+      // ignore: best-effort, never fatal
     }
   }
 
@@ -162,6 +186,8 @@ export class ConnectionHandle {
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
+    // Audit stream copy (raw actor id, for host-side ingestion). Lossy; the audit table is authoritative.
+    this.emitAudit('fetch', url.hostname, res.status);
     return res;
   }
 
@@ -257,6 +283,8 @@ export class ConnectionHandle {
     if (rotated) {
       await this.audit.record('refresh', this.acting, this.provider.id, {}).catch(() => undefined);
       this.emit({ type: 'refreshed', provider: this.provider.id, ms: refreshMs });
+      // egressHost = the provider token endpoint we refreshed against; status 200 (it succeeded).
+      this.emitAudit('refresh', new URL(this.provider.tokenUrl).hostname, 200);
     }
     return token;
   }

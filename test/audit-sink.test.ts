@@ -1,0 +1,157 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { openDb } from '../src/core/db';
+import { Vault } from '../src/core/vault';
+import { Audit, type VouchrAuditEvent } from '../src/core/audit';
+import { Consent } from '../src/core/consent';
+import { ConnectionHandle } from '../src/core/injector';
+import { handleOAuthCallback } from '../src/core/oauthCallback';
+import { github, defineProvider, ProviderRegistry } from '../src/core/providers';
+import { userOwner } from '../src/core/owner';
+import type { SlackIdentity } from '../src/core/identity';
+
+const KEY = randomBytes(32);
+const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
+const O1 = userOwner(ID);
+const TOKEN = 'xoxb-super-secret-access-token-value'; // must never appear in any audit event
+const REFRESH = 'refresh_secret_abcdefghijklmnop'; // must never appear either
+
+// A rotating provider with its own token endpoint, so the refresh path is exercisable.
+const ACME = defineProvider({
+  id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
+  clientId: 'c', clientSecret: 's',
+});
+
+async function handleWith(auditSink: (e: VouchrAuditEvent) => void, provider = github({ clientId: 'cid', clientSecret: 'csec' })) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(userOwner(ID), provider.id, { accessToken: TOKEN, refreshToken: REFRESH, scopes: 'repo', expiresAt: null, externalAccount: null });
+  // 9th arg = the audit stream sink (the no-secret EventSink is the 8th, left as default no-op).
+  return new ConnectionHandle(provider, O1, ID, vault, audit, {}, new Map(), () => {}, auditSink);
+}
+
+test('audit-sink: fetch emits a VouchrAuditEvent with the RAW actor id and a jti, no token', async () => {
+  const events: VouchrAuditEvent[] = [];
+  const handle = await handleWith((e) => events.push(e));
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
+  try {
+    await handle.fetch('https://api.github.com/user');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(events.length, 1);
+  const e = events[0];
+  assert.equal(e.action, 'fetch');
+  assert.equal(e.provider, 'github');
+  assert.equal(e.teamId, 'T1');
+  assert.equal(e.userId, 'U1'); // RAW actor id, not a hash
+  assert.equal(e.ownerKind, 'user');
+  assert.equal(e.ownerId, 'U1');
+  assert.equal(e.egressHost, 'api.github.com');
+  assert.equal(e.status, 200);
+  assert.ok(e.jti && typeof e.jti === 'string', 'jti missing');
+  assert.ok(!Number.isNaN(Date.parse(e.ts)), 'ts not an ISO timestamp');
+});
+
+test('audit-sink: refresh on a 401 emits a refresh audit event; never the token/refresh-token', async () => {
+  const events: VouchrAuditEvent[] = [];
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: REFRESH, scopes: 'x', expiresAt: null, externalAccount: null });
+  const handle = new ConnectionHandle(ACME, O1, ID, vault, audit, {}, new Map(), () => {}, (e) => events.push(e));
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any) => {
+    if (String(url).includes('/token')) {
+      return new Response(JSON.stringify({ access_token: TOKEN, refresh_token: 'r2' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const auth = new Headers(init?.headers).get('authorization');
+    if (auth === 'Bearer old') return new Response('expired', { status: 401 });
+    return new Response('{}', { status: 200 });
+  }) as any;
+  try {
+    await handle.fetch('https://api.acme.example/data');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  const refresh = events.find((e) => e.action === 'refresh');
+  assert.ok(refresh, 'refresh audit event not emitted');
+  assert.equal(refresh.egressHost, 'acme.example'); // the token endpoint host
+  assert.equal(refresh.userId, 'U1');
+  assert.ok(refresh.jti, 'jti missing on refresh event');
+  for (const e of events) {
+    const blob = JSON.stringify(e);
+    assert.ok(!blob.includes(TOKEN), `audit event leaked access token: ${blob}`);
+    assert.ok(!blob.includes(REFRESH), `audit event leaked refresh token: ${blob}`);
+  }
+});
+
+test('audit-sink: consent_granted fires on a successful OAuth callback; no token, has jti', async () => {
+  const events: VouchrAuditEvent[] = [];
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const registry = new ProviderRegistry([ACME]);
+  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: TOKEN, refresh_token: REFRESH }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  try {
+    const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://app.example/cb', auditSink: (e) => events.push(e) }, 'thecode', state);
+    assert.equal(res.ok, true);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(events.length, 1);
+  const e = events[0];
+  assert.equal(e.action, 'consent_granted');
+  assert.equal(e.userId, 'U1');
+  assert.equal(e.ownerKind, 'user');
+  assert.equal(e.egressHost, 'acme.example');
+  assert.ok(e.jti, 'jti missing');
+  assert.ok(!JSON.stringify(e).includes(TOKEN), 'consent event leaked token');
+});
+
+test('audit-sink: consent_denied fires when the token exchange fails', async () => {
+  const events: VouchrAuditEvent[] = [];
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const registry = new ProviderRegistry([ACME]);
+  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('nope', { status: 400 })) as any; // exchange fails
+  try {
+    const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://app.example/cb', auditSink: (e) => events.push(e) }, 'thecode', state);
+    assert.equal(res.ok, false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(events.length, 1);
+  assert.equal(events[0].action, 'consent_denied');
+  assert.equal(events[0].userId, 'U1');
+  assert.ok(events[0].jti, 'jti missing');
+});
+
+test('audit-sink: unset sink is a no-op and a throwing sink never breaks the request', async () => {
+  // Unset (default no-op): fetch must succeed.
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'github', { accessToken: TOKEN, refreshToken: null, scopes: 'repo', expiresAt: null, externalAccount: null });
+  const plain = new ConnectionHandle(github({ clientId: 'cid', clientSecret: 'csec' }), O1, ID, vault, new Audit(db), {}, new Map());
+  // Throwing sink: fetch must still succeed.
+  const throwing = await handleWith(() => { throw new Error('bad audit sink'); });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
+  try {
+    assert.equal((await plain.fetch('https://api.github.com/user')).status, 200);
+    assert.equal((await throwing.fetch('https://api.github.com/user')).status, 200);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
