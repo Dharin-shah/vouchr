@@ -86,6 +86,29 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
   }
 });
 
+// A long-lived pod refreshes many times over its lifetime. The dedicated refresh pool's idle-client
+// 'error' handler must attach exactly ONCE (at pool creation), not per withRefreshLock call — else
+// listeners grow unbounded and pg logs MaxListenersExceededWarning.
+test('postgres backend: withRefreshLock registers the pool error listener exactly once', async (t) => {
+  let db: Awaited<ReturnType<typeof openDb>> | undefined;
+  try {
+    db = await openDb({ databaseUrl: PG_URL });
+    await db.exec('SELECT 1');
+  } catch {
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
+    return;
+  }
+  try {
+    for (let i = 0; i < 15; i++) {
+      await db.withRefreshLock!(`leak-probe:${i % 3}`, async () => i); // distinct + repeated keys
+    }
+    const pool = (db as any).refreshPool;
+    assert.equal(pool.listenerCount('error'), 1, 'refresh-pool error listener must attach exactly once');
+  } finally {
+    await db.close();
+  }
+});
+
 // Cross-process refresh coordination: two SEPARATE connections (two "pods", each its own pool and
 // own in-process inflight map) refresh the same (owner, provider) at once. The Postgres advisory
 // xact lock + re-read-under-lock must collapse this to exactly one provider /token call; the loser

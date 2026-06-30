@@ -55,21 +55,31 @@ class PgDb implements Db {
   async exec(sql: string) { await this.pool.query(sql); }
 
   async withRefreshLock<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T> {
-    this.refreshPool ??= new Pool({
-      connectionString: this.connectionString,
-      max: 4, // bounded: a stuck token endpoint caps at this many pinned backends, never the read pool
-      connectionTimeoutMillis: 5_000,
-      idleTimeoutMillis: 30_000,
-    });
-    this.refreshPool.on('error', (e) => console.error('[vouchr] postgres refresh-pool idle-client error:', e.message));
+    if (!this.refreshPool) {
+      this.refreshPool = new Pool({
+        connectionString: this.connectionString,
+        max: 4, // bounded: a stuck token endpoint caps at this many pinned backends, never the read pool
+        connectionTimeoutMillis: 5_000,
+        idleTimeoutMillis: 30_000,
+      });
+      // Attach the idle-client error handler exactly ONCE, at pool creation. If this sat after the
+      // lazy-init it would re-register on every withRefreshLock call (unbounded 'error' listeners +
+      // MaxListenersExceededWarning over a long-lived pod's lifetime).
+      this.refreshPool.on('error', (e) => console.error('[vouchr] postgres refresh-pool idle-client error:', e.message));
+    }
     const client = await this.refreshPool.connect();
     try {
       await client.query('BEGIN');
-      await client.query("SET LOCAL statement_timeout = '8s'"); // never pin a connection on a slow /token
       // ponytail: hashtext is 32-bit, so two distinct keys can collide and over-serialize. That only
       // adds latency, never incorrectness. Upgrade to a 64-bit key (two-arg pg_advisory_xact_lock)
       // only if a real collision hot-spot shows up.
+      // Acquire the lock BEFORE arming statement_timeout: a loser blocks on this SELECT until the
+      // winner COMMITs, which can exceed 8s for a slow /token round-trip. If the 8s capped this wait
+      // the loser would abort and throw instead of reusing the winner's rotated token. statement_timeout
+      // is set only after the lock, to bound the in-lock DB statements (re-read / updateTokens) — not the
+      // /token fetch, which is JS and bounded by the refresh pool size, not by statement_timeout.
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]); // released at COMMIT
+      await client.query("SET LOCAL statement_timeout = '8s'");
       const out = await fn(new PgClientDb(client));
       await client.query('COMMIT');
       return out;
