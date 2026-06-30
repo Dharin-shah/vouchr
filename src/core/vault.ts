@@ -157,6 +157,22 @@ export class Vault {
     );
   }
 
+  /** True when the backend coordinates refresh across processes (Postgres advisory lock). */
+  get crossProcessRefresh(): boolean { return !!this.db.withRefreshLock; }
+
+  /**
+   * Run `fn` while holding the cross-process refresh lock for (owner, provider), with the vault
+   * rebound to the locked transaction so `fn`'s reads/writes (get/updateTokens) see the same tx.
+   * On a backend without a lock (SQLite) this is a passthrough that runs `fn(this)` — the injector's
+   * in-process single-flight map already serializes a single process. Key matches the injector's
+   * inflight key so in-process and cross-process coordination agree on identity.
+   */
+  async withRefreshLock<T>(owner: Owner, provider: string, fn: (locked: Vault) => Promise<T>): Promise<T> {
+    if (!this.db.withRefreshLock) return fn(this);
+    const key = `${owner.teamId}:${owner.kind}:${owner.id}:${provider}`;
+    return this.db.withRefreshLock(key, (txDb) => fn(new Vault(txDb, this.key, this.ttl, this.envelope)));
+  }
+
   /** Mark a connection as used now (resets the idle timer). Called after each injection. */
   async touch(owner: Owner, provider: string): Promise<void> {
     await this.db.run(

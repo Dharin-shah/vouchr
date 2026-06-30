@@ -1,5 +1,5 @@
 import BetterSqlite3 from 'better-sqlite3';
-import { Pool, types } from 'pg';
+import { Pool, types, type PoolClient } from 'pg';
 
 /**
  * Minimal async data handle: the seam that lets the same store code run on SQLite
@@ -14,6 +14,15 @@ export interface Db {
   run(sql: string, params?: any[]): Promise<{ changes: number }>;
   exec(sql: string): Promise<void>;
   close(): Promise<void>;
+  /**
+   * Postgres only: run `fn` inside a transaction holding a cross-process advisory lock for `key`,
+   * with `fn`'s Db bound to that locked transaction (so its reads/writes see the same tx, and a
+   * concurrent caller blocks until COMMIT). Absent on SQLite — a single process is already
+   * serialized by the in-process single-flight map in the injector, so callers fall back to
+   * running `fn` directly. Used by refresh coordination to re-read-under-lock and avoid two pods
+   * both consuming a rotating refresh token.
+   */
+  withRefreshLock?<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T>;
 }
 
 export interface DbOptions {
@@ -32,15 +41,60 @@ class SqliteDb implements Db {
   async close() { this.db.close(); }
 }
 
+// Positional rewrite. Our SQL never contains a literal '?', so a plain replace is safe.
+function toPositional(sql: string): string { let i = 0; return sql.replace(/\?/g, () => `$${++i}`); }
+
 class PgDb implements Db {
-  constructor(private pool: Pool) {}
-  // Note: positional rewrite. Our SQL never contains a literal '?', so a plain replace is safe.
-  private q(sql: string): string { let i = 0; return sql.replace(/\?/g, () => `$${++i}`); }
-  async get(sql: string, params: any[] = []) { return (await this.pool.query(this.q(sql), params)).rows[0]; }
-  async all(sql: string, params: any[] = []) { return (await this.pool.query(this.q(sql), params)).rows; }
-  async run(sql: string, params: any[] = []) { return { changes: (await this.pool.query(this.q(sql), params)).rowCount ?? 0 }; }
+  // Dedicated small pool for token refresh, separate from the read pool, so a hung provider
+  // /token endpoint inside a held lock can't starve the connections serving normal requests.
+  private refreshPool?: Pool;
+  constructor(private pool: Pool, private connectionString: string) {}
+  async get(sql: string, params: any[] = []) { return (await this.pool.query(toPositional(sql), params)).rows[0]; }
+  async all(sql: string, params: any[] = []) { return (await this.pool.query(toPositional(sql), params)).rows; }
+  async run(sql: string, params: any[] = []) { return { changes: (await this.pool.query(toPositional(sql), params)).rowCount ?? 0 }; }
   async exec(sql: string) { await this.pool.query(sql); }
-  async close() { await this.pool.end(); }
+
+  async withRefreshLock<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T> {
+    this.refreshPool ??= new Pool({
+      connectionString: this.connectionString,
+      max: 4, // bounded: a stuck token endpoint caps at this many pinned backends, never the read pool
+      connectionTimeoutMillis: 5_000,
+      idleTimeoutMillis: 30_000,
+    });
+    this.refreshPool.on('error', (e) => console.error('[vouchr] postgres refresh-pool idle-client error:', e.message));
+    const client = await this.refreshPool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SET LOCAL statement_timeout = '8s'"); // never pin a connection on a slow /token
+      // ponytail: hashtext is 32-bit, so two distinct keys can collide and over-serialize. That only
+      // adds latency, never incorrectness. Upgrade to a 64-bit key (two-arg pg_advisory_xact_lock)
+      // only if a real collision hot-spot shows up.
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]); // released at COMMIT
+      const out = await fn(new PgClientDb(client));
+      await client.query('COMMIT');
+      return out;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async close() {
+    await this.pool.end();
+    if (this.refreshPool) await this.refreshPool.end();
+  }
+}
+
+/** A Db bound to a single checked-out client, so every query runs on the same (locked) transaction. */
+class PgClientDb implements Db {
+  constructor(private client: PoolClient) {}
+  async get(sql: string, params: any[] = []) { return (await this.client.query(toPositional(sql), params)).rows[0]; }
+  async all(sql: string, params: any[] = []) { return (await this.client.query(toPositional(sql), params)).rows; }
+  async run(sql: string, params: any[] = []) { return { changes: (await this.client.query(toPositional(sql), params)).rowCount ?? 0 }; }
+  async exec(sql: string) { await this.client.query(sql); }
+  async close() { /* lifecycle owned by withRefreshLock (BEGIN/COMMIT/release); nothing to do here */ }
 }
 
 /** Schema DDL, parameterized by the engine's blob/integer type names. */
@@ -140,7 +194,7 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
     // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
     // throws and kills the whole process; swallow it, pg reconnects on the next query.
     pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
-    const db = new PgDb(pool);
+    const db = new PgDb(pool, url);
     await db.exec(schema('BYTEA', 'BIGINT'));
     // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
     await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);

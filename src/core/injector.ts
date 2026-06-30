@@ -16,6 +16,9 @@ export type Resolvers = Record<string, (ref: string) => Promise<string>>;
 export type VouchrEvent =
   | { type: 'injected'; provider: string; host: string; status: number; ownerKind: 'user' | 'channel' }
   | { type: 'refreshed'; provider: string }
+  // Cross-process (Postgres) refresh coordination: time spent waiting for the advisory lock, and
+  // whether this caller LOST the race and reused a concurrent winner's already-rotated token.
+  | { type: 'refresh_lock_wait'; provider: string; waitMs: number; reused: boolean }
   | { type: 'egress_denied'; provider: string; host: string }
   | { type: 'resolver_failed'; provider: string; source: string }
   | { type: 'connect_prompted'; provider: string }
@@ -193,18 +196,36 @@ export class ConnectionHandle {
   }
 
   private async doRefresh(): Promise<string | null> {
-    const stored = await this.vault.get(this.owner, this.provider.id);
-    if (!stored?.refreshToken) return null;
-    const refreshed = await refreshToken(this.provider, stored.refreshToken);
-    // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
-    await this.vault.updateTokens(this.owner, this.provider.id, {
-      accessToken: refreshed.accessToken,
-      refreshToken: refreshed.refreshToken ?? stored.refreshToken,
-      scopes: refreshed.scopes ?? stored.scopes,
-      expiresAt: refreshed.expiresAt,
+    // The refresh token we're about to consume. On Postgres a peer pod may rotate it while we wait
+    // for the lock; we detect that by re-reading under the lock and comparing against this value.
+    const before = await this.vault.get(this.owner, this.provider.id);
+    if (!before?.refreshToken) return null;
+    const lockWait = this.vault.crossProcessRefresh; // only emit the wait metric when a real lock exists
+    const t0 = Date.now();
+    return this.vault.withRefreshLock(this.owner, this.provider.id, async (vault) => {
+      // Re-read UNDER the lock: another tx may already have rotated since the read above.
+      const stored = await vault.get(this.owner, this.provider.id);
+      const waitMs = Date.now() - t0;
+      if (!stored?.refreshToken) return null;
+      // Loser path: the stored refresh token moved, so a concurrent winner already refreshed. Reuse
+      // its access token — refreshing again would consume a token the winner invalidated (rotating
+      // providers brick on a double refresh).
+      if (stored.refreshToken !== before.refreshToken) {
+        if (lockWait) this.emit({ type: 'refresh_lock_wait', provider: this.provider.id, waitMs, reused: true });
+        return stored.accessToken;
+      }
+      if (lockWait) this.emit({ type: 'refresh_lock_wait', provider: this.provider.id, waitMs, reused: false });
+      const refreshed = await refreshToken(this.provider, stored.refreshToken);
+      // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
+      await vault.updateTokens(this.owner, this.provider.id, {
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken ?? stored.refreshToken,
+        scopes: refreshed.scopes ?? stored.scopes,
+        expiresAt: refreshed.expiresAt,
+      });
+      await this.audit.record('refresh', this.acting, this.provider.id, {});
+      this.emit({ type: 'refreshed', provider: this.provider.id });
+      return refreshed.accessToken;
     });
-    await this.audit.record('refresh', this.acting, this.provider.id, {});
-    this.emit({ type: 'refreshed', provider: this.provider.id });
-    return refreshed.accessToken;
   }
 }
