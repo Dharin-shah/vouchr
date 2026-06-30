@@ -1,22 +1,30 @@
 import http from 'node:http';
+import { timingSafeEqual } from 'node:crypto';
 import type { Db } from '../../core/db';
 import type { Vault } from '../../core/vault';
 import type { Audit } from '../../core/audit';
+import type { Policy } from '../../core/policy';
+import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, type Resolvers } from '../../core/injector';
-import { userOwner, channelOwner, type Owner } from '../../core/owner';
+import { userOwner, type Owner } from '../../core/owner';
 import type { SlackIdentity } from '../../core/identity';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims } from './identity';
 
 /**
- * The opaque, NO-SECRET handle the caller holds. It names a provider and whether the user's OWN
- * credential or the CHANNEL's shared one is wanted. The owner *id* (team/user/channel) is taken
- * from the verified identity token, never from this handle — so the handle can be forged without
+ * The opaque, NO-SECRET handle the caller holds. It names a provider; the owner is always the acting
+ * user from the verified identity token, never this handle — so the handle can be forged without
  * granting any cross-tenant access.
+ *
+ * ponytail: `owner` is user-only. A CHANNEL shared credential additionally needs the Slack-Connect
+ * eligibility gate (channelIneligibleReason via conversations.info) and the requireMembership /
+ * isChannelMember governance the Bolt adapter enforces (bolt.ts:362-393) — both of which require a
+ * Slack WebClient a headless broker cannot have (hard rule: no @slack/* here). Shipping owner:'channel'
+ * without those gates is a control bypass, so it's omitted until a transport-agnostic channel-gate exists.
  */
 export interface ConnectionHandleRef {
   provider: string;
-  owner: 'user' | 'channel';
+  owner: 'user';
 }
 
 /** Read-only by construction: the type itself admits only GET/HEAD; the runtime re-checks (#25). */
@@ -39,6 +47,18 @@ export interface BrokerOptions {
   /** HS256 secret shared ONLY by the upstream minter and this broker. */
   identitySecret: string;
   resolvers?: Resolvers;
+  /**
+   * Operator authorization, identical to the Bolt path (#21/#22). When set, /v1/fetch enforces
+   * `policy.check(provider, channel)` before injecting a credential; the channel comes from the
+   * VERIFIED identity claims, never the request body. Unset = allow-all (same as a no-rule Policy).
+   */
+  policy?: Policy;
+  /**
+   * Per-channel tool allowlist, identical to the Bolt path. When set, /v1/fetch enforces
+   * `channelTools.isEnabled(teamId, channel, provider)` (backward-compat: an unconfigured channel
+   * allows all). Unset = no tool gate.
+   */
+  channelTools?: ChannelTools;
   /**
    * #25 provider-level fail-closed switch. When true, a provider with UNSET `egressMethods` is
    * treated as GET/HEAD-only (default-deny) instead of "any method". Providers that need writes
@@ -117,12 +137,11 @@ async function readCapped(res: Response, cap: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-function ownerFromClaims(c: IdentityClaims, kind: 'user' | 'channel'): { owner: Owner; acting: SlackIdentity } {
+function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
   const acting: SlackIdentity = { enterpriseId: null, teamId: c.teamId, userId: c.userId };
-  // The owner id comes ONLY from verified claims: user -> the acting user, channel -> the claim's
-  // channel. The request body's handle never supplies an id, so a forged body can't cross tenants.
-  const owner = kind === 'channel' ? channelOwner(c.teamId, c.channel) : userOwner(acting);
-  return { owner, acting };
+  // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
+  // supplies an id, so a forged body can't cross tenants.
+  return { owner: userOwner(acting), acting };
 }
 
 export function createBroker(opts: BrokerOptions): http.Server {
@@ -132,11 +151,12 @@ export function createBroker(opts: BrokerOptions): http.Server {
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
   const replay = new ReplayGuard();
 
-  /** Coarse network perimeter (NOT identity). When unset, no gate. */
+  /** Coarse network perimeter (NOT identity). When unset, no gate. Constant-time compare (it's a secret). */
   function networkGate(req: http.IncomingMessage): void {
     if (!opts.brokerToken) return;
-    const auth = req.headers.authorization ?? '';
-    if (auth !== `Bearer ${opts.brokerToken}`) throw new HttpError(401, { error: 'unauthorized' });
+    const a = Buffer.from(req.headers.authorization ?? '');
+    const b = Buffer.from(`Bearer ${opts.brokerToken}`);
+    if (a.length !== b.length || !timingSafeEqual(a, b)) throw new HttpError(401, { error: 'unauthorized' });
   }
 
   function verify(token: string): IdentityClaims {
@@ -148,15 +168,35 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
   }
 
-  function resolveTarget(body: BrokerFetchRequest): { handle: ConnectionHandle; provider: Provider } {
+  /**
+   * Operator authorization, mirroring the Bolt credential-use path (bolt.ts:173-185): Policy then the
+   * channel tool allowlist. The channel/team come ONLY from verified claims. A deny is audited (no
+   * secret) and returns 403 — the credential is never injected. Runs AFTER identity is verified, so a
+   * denied request still spends its single-use jti (no free retries) but the vault is never read.
+   */
+  async function authorize(provider: string, claims: IdentityClaims): Promise<void> {
+    const channel = claims.channel;
+    const acting: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: claims.userId };
+    if (opts.policy && !opts.policy.check(provider, channel)) {
+      await opts.audit.record('denied', acting, provider, { channel });
+      throw new HttpError(403, { error: 'policy denies this provider in this channel' });
+    }
+    if (opts.channelTools && !(await opts.channelTools.isEnabled(claims.teamId, channel, provider))) {
+      await opts.audit.record('denied', acting, provider, { channel, reason: 'tool-disabled' });
+      throw new HttpError(403, { error: 'provider is not enabled in this channel' });
+    }
+  }
+
+  async function resolveTarget(body: BrokerFetchRequest): Promise<{ handle: ConnectionHandle; provider: Provider }> {
     const ref = body.handle;
-    if (!ref || (ref.owner !== 'user' && ref.owner !== 'channel') || typeof ref.provider !== 'string') {
+    if (!ref || ref.owner !== 'user' || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     const claims = verify(body.identityToken);
+    await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
-    const { owner, acting } = ownerFromClaims(claims, ref.owner);
+    const { owner, acting } = ownerFromClaims(claims);
     const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {});
     return { handle, provider };
   }
@@ -166,10 +206,15 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (body.method !== 'GET' && body.method !== 'HEAD') {
       throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
     }
-    const { handle, provider } = resolveTarget(body);
+    const { handle, provider } = await resolveTarget(body);
 
     const host = body.host ?? provider.egressAllow[0];
-    const url = new URL(`https://${host}${body.path ?? '/'}`);
+    let url: URL;
+    try {
+      url = new URL(`https://${host}${body.path ?? '/'}`); // caller input -> 4xx, not a 500
+    } catch {
+      throw new HttpError(400, { error: 'invalid host or path' });
+    }
     for (const [k, v] of Object.entries(body.query ?? {})) url.searchParams.set(k, v);
 
     // Forward only a tiny safe header allowlist; never the caller's Authorization (broker injects).
@@ -206,12 +251,12 @@ export function createBroker(opts: BrokerOptions): http.Server {
 
   async function handleResolve(body: { handle: ConnectionHandleRef; identityToken: string }): Promise<Record<string, unknown>> {
     const ref = body.handle;
-    if (!ref || (ref.owner !== 'user' && ref.owner !== 'channel') || typeof ref.provider !== 'string') {
+    if (!ref || ref.owner !== 'user' || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     const claims = verify(body.identityToken);
-    const { owner } = ownerFromClaims(claims, ref.owner);
+    const { owner } = ownerFromClaims(claims);
     const connected = (await opts.vault.get(owner, ref.provider)) != null;
     // NO secret: only existence + a coarse consent state. The token is never read into the response.
     return { connected, consentState: connected ? 'connected' : 'needs_consent' };

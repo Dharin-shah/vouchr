@@ -5,6 +5,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
+import { Policy } from '../src/core/policy';
+import { ChannelTools } from '../src/core/tools';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { ConnectionHandle } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
@@ -270,6 +272,115 @@ test('healthz: reflects DB reachability + signing key loaded', async () => {
     const down = await get(port, '/healthz');
     assert.equal(down.status, 503);
     assert.equal(down.json.dbReachable, false);
+  } finally {
+    server.close();
+  }
+});
+
+// ── operator authorization parity with the Bolt path (#21/#22): Policy + ChannelTools ──
+
+/** Build a broker over a fresh in-memory db with U1's acme credential seeded, returning the db so a
+ *  test can wire a Policy / ChannelTools backed by the SAME store the broker reads. */
+async function makeBrokerOn(build: (db: any, vault: Vault, audit: Audit) => Partial<Parameters<typeof createBroker>[0]>) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, ...build(db, vault, audit) });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, db, audit, port: (server.address() as any).port };
+}
+
+test('fetch: a Policy that denies the provider in this channel -> 403, credential NEVER injected', async () => {
+  // Policy denies acme in C1 (the channel comes from the verified claims, not the body).
+  const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
+  const { server, db, audit, port } = await makeBrokerOn(() => ({ policy }));
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(r.status, 403);
+    assert.equal(up.seen.length, 0, 'denied: the vault/token was never read and nothing went upstream');
+    const denied = (await db.get(`SELECT count(*) AS n FROM audit WHERE action='denied'`)) as { n: number };
+    assert.equal(denied.n, 1, 'the deny was audited (no secret)');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: a ChannelTools allowlist that disables the provider here -> 403, credential NEVER injected', async () => {
+  const { server, db, audit, port } = await makeBrokerOn((db) => ({ channelTools: new ChannelTools(db) }));
+  // Configure the channel as an allowlist that does NOT include acme -> acme is disabled here.
+  await new ChannelTools(db).setEnabled('T1', 'C1', 'other', true);
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(r.status, 403);
+    assert.equal(up.seen.length, 0, 'tool-disabled: nothing went upstream');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: a caller-supplied Authorization header is DROPPED; only the broker-injected Bearer reaches upstream', async () => {
+  const { server, port } = await makeBroker();
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/x',
+      headers: { authorization: 'Bearer attacker-token', Authorization: 'Bearer attacker-token-2' },
+    });
+    assert.equal(r.status, 200);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`, 'the attacker Authorization was dropped; the injected Bearer reached upstream');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: brokerToken network gate — wrong/absent token 401, correct token passes', async () => {
+  const { server, port } = await makeBroker({ brokerToken: 'perimeter-secret' });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const body = { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' };
+    const noTok = await post(port, '/v1/fetch', body);
+    assert.equal(noTok.status, 401);
+    const wrong = await post(port, '/v1/fetch', body, { authorization: 'Bearer nope' });
+    assert.equal(wrong.status, 401);
+    const ok = await post(port, '/v1/fetch', body, { authorization: 'Bearer perimeter-secret' });
+    assert.equal(ok.status, 200);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: a malformed host -> clean 400, not a 500', async () => {
+  const { server, port } = await makeBroker();
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/x', host: 'api.acme.example:notaport',
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch/resolve: owner:"channel" is rejected (the channel shared-cred path is omitted from this broker)', async () => {
+  const { server, port } = await makeBroker();
+  try {
+    const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'channel' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' } as any);
+    assert.equal(f.status, 400);
+    const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'channel' }, identityToken: signIdentity(claims(), SECRET) } as any);
+    assert.equal(rv.status, 400);
   } finally {
     server.close();
   }
