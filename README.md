@@ -31,6 +31,21 @@ For non-OAuth APIs or shared channel credentials, Vouchr opens a private Slack m
 
 ![Vouchr Slack credential modal](./assets/slack-secret-modal.svg)
 
+## Use case: create a meeting from chat
+
+John is discussing a production issue in Slack and asks:
+
+> `@company-agent create a follow-up meeting from this thread tomorrow with everyone here`
+
+The agent can read the thread, draft the title, attendees, agenda, and links. When it needs to write
+to Google Calendar, it calls `context.vouchr.connect('google')` and uses the returned handle to make
+the Calendar API request. Vouchr supplies John's Google credential at the HTTP boundary, so the event
+is created from John's calendar, not from a shared bot account, and the token never reaches the
+agent or the model.
+
+If another person asks for a meeting in the same thread, Vouchr checks that person's own connection
+and approval. It does not reuse John's Google Calendar token for someone else's request.
+
 ## How Vouchr works
 
 Vouchr sits between your Slack agent and provider APIs. Your agent asks for a connection; Vouchr
