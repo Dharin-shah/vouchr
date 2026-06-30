@@ -2,7 +2,7 @@ import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { Db } from '../../core/db';
 import type { Vault } from '../../core/vault';
-import type { Audit } from '../../core/audit';
+import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
@@ -60,6 +60,15 @@ export interface BrokerOptions {
    * Fire-and-forget; a throwing sink can never affect a request (ConnectionHandle swallows it).
    */
   onEvent?: EventSink;
+  /**
+   * Optional audit STREAM sink for host-side ingestion. Fires IN ADDITION to the authoritative
+   * `audit` table on each /v1/fetch (action 'fetch') and on the refresh path. Unlike `onEvent`
+   * (deliberately actor-free), it carries the RAW acting user id from the VERIFIED claims so a host
+   * can answer "who used this token, when, against which host". This is the canonical host-side
+   * ingestion surface (host != broker). Lossy by design; the table stays the source of truth. A
+   * throwing sink can never affect a request (ConnectionHandle swallows it). No-op when unset.
+   */
+  auditSink?: AuditSink;
   /**
    * Operator authorization, identical to the Bolt path (#21/#22). When set, /v1/fetch enforces
    * `policy.check(provider, channel)` before injecting a credential; the channel comes from the
@@ -229,8 +238,9 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
     const { owner, acting } = ownerFromClaims(claims);
     // ponytail: per-request inflight Map (parent's design — cross-request single-flight is its scope,
-    // not this task's). The 8th arg wires the metrics sink so the broker path stops being a black box.
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, new Map(), opts.onEvent);
+    // not this task's). The 8th arg wires the metrics sink so the broker path stops being a black box;
+    // the 9th wires the audit STREAM sink (raw actor id) for host-side ingestion.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, new Map(), opts.onEvent, opts.auditSink);
     return { handle, provider };
   }
 

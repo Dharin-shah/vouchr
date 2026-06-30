@@ -156,6 +156,33 @@ test('fetch: the broker forwards metrics events to onEvent (no longer a black bo
   for (const e of events) assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'metric event leaked the token');
 });
 
+test('fetch: the broker emits an audit-STREAM event (raw verified actor id) to auditSink, no secret', async () => {
+  const events: any[] = [];
+  const { server, port } = await makeBroker({ auditSink: (e) => events.push(e) });
+  const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/data',
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    up.restore();
+    server.close();
+  }
+  assert.equal(events.length, 1, 'broker did not emit an audit-stream copy');
+  const e = events[0];
+  assert.equal(e.action, 'fetch');
+  assert.equal(e.provider, 'acme');
+  assert.equal(e.teamId, 'T1');
+  assert.equal(e.userId, 'U1'); // RAW actor id, from the VERIFIED claims (never the request body)
+  assert.equal(e.ownerKind, 'user');
+  assert.equal(e.egressHost, 'api.acme.example');
+  assert.equal(e.status, 200);
+  assert.ok(e.jti, 'jti missing');
+  assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'audit-stream event leaked the token');
+});
+
 test('fetch: an incoming traceparent is propagated onto the outbound provider fetch', async () => {
   const { server, port } = await makeBroker();
   const real = globalThis.fetch;

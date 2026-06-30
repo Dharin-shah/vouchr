@@ -116,6 +116,29 @@ test('audit-sink: consent_granted fires on a successful OAuth callback; no token
   assert.ok(!JSON.stringify(e).includes(TOKEN), 'consent event leaked token');
 });
 
+test('audit-sink: consent_denied fires on a REAL user denial (?error=access_denied), status 400', async () => {
+  const events: VouchrAuditEvent[] = [];
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const registry = new ProviderRegistry([ACME]);
+  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  // No code, an error param, and a valid state: the user clicked "Deny" at the provider.
+  const res = await handleOAuthCallback(
+    { registry, vault, audit, consent, redirectUri: 'https://app.example/cb', auditSink: (e) => events.push(e) },
+    undefined, state, 'access_denied',
+  );
+  assert.equal(res.ok, false);
+  assert.equal(events.length, 1, 'user denial emitted no consent_denied event');
+  assert.equal(events[0].action, 'consent_denied');
+  assert.equal(events[0].status, 400); // real denial is 400, distinct from the synthetic 500 below
+  assert.equal(events[0].userId, 'U1'); // attributed to the resolved identity
+  assert.ok(events[0].jti, 'jti missing');
+  // State was consumed by the denial: it can't be replayed for a later exchange.
+  assert.equal(await consent.consume(state), null);
+});
+
 test('audit-sink: consent_denied fires when the token exchange fails', async () => {
   const events: VouchrAuditEvent[] = [];
   const db = await openDb({ dbPath: ':memory:' });

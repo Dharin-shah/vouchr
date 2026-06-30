@@ -25,6 +25,10 @@ export interface VouchrAuditEvent {
   ownerId: string; // user id or channel id that OWNS the credential
   action: 'fetch' | 'refresh' | 'consent_granted' | 'consent_denied';
   egressHost: string;
+  // HTTP-ish status. Only 'fetch' carries a REAL upstream status; the others are synthetic: 'refresh'
+  // is hardcoded 200 (it only emits after refresh already succeeded), 'consent_granted' is 200, and
+  // 'consent_denied' is 400 for a real user denial or 500 for a post-consent connection failure.
+  // Don't treat `status` as a uniform provider response code across actions; key on `action` first.
   status: number;
   jti: string;
 }
