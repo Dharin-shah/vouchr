@@ -121,7 +121,7 @@ export interface VouchrOptions {
    */
   sessionTtlMs?: number;
   /**
-   * Opt into production safety mode. When true (or via VOUCHR_PRODUCTION=1 / NODE_ENV=production),
+   * Opt into production safety mode. When true (or via the Vouchr-namespaced VOUCHR_PRODUCTION=1),
    * boot fails fast unless the deployment is multi-instance safe: Postgres (`databaseUrl`) AND an
    * `envelope` provider (KMS-wrapped DEKs). Default false keeps the zero-config dev path — SQLite,
    * no envelope — working unchanged. A Postgres URL with `envelope` off still fails: storage-level

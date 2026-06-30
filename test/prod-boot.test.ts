@@ -52,10 +52,44 @@ test('non-production: SQLite + no envelope is fine (zero-config dev path unchang
   });
 });
 
-test('NODE_ENV=production opts in even without an explicit flag', () => {
+test('VOUCHR_PRODUCTION=1 opts in without an explicit flag', () => {
+  withCleanEnv(() => {
+    process.env.VOUCHR_PRODUCTION = '1';
+    assert.equal(isProduction({}), true);
+    assert.throws(() => assertProductionConfig({}), /requires Postgres in production/);
+  });
+});
+
+// Backward-compat guard: NODE_ENV=production is set by nearly every Node host, so it must NOT
+// silently flip an existing zero-config SQLite deployment into fail-closed mode on upgrade.
+test('NODE_ENV=production alone does NOT opt in (default behavior unchanged)', () => {
   withCleanEnv(() => {
     process.env.NODE_ENV = 'production';
-    assert.throws(() => assertProductionConfig({}), /requires Postgres in production/);
+    assert.equal(isProduction({}), false);
+    assert.doesNotThrow(() => assertProductionConfig({}));
+  });
+});
+
+// usingPostgres mirrors openDb's env resolution; cover the DATABASE_URL fallback so a regression
+// in that chain fails the suite (the whole reason the resolution is duplicated).
+test('prod + envelope + Postgres via DATABASE_URL env fallback passes', () => {
+  withCleanEnv(() => {
+    process.env.DATABASE_URL = PG;
+    assert.equal(usingPostgres({}), true);
+    assert.doesNotThrow(() => assertProductionConfig({ production: true, envelope: ENVELOPE }));
+  });
+});
+
+// Secret-leak rule: a credential-bearing DB URL must never surface in the thrown boot error.
+test('boot error never leaks the DB password from a credential-bearing postgres URL', () => {
+  withCleanEnv(() => {
+    const err = (() => {
+      try { assertProductionConfig({ production: true, databaseUrl: PG }); return null; }
+      catch (e) { return e as Error; }
+    })();
+    assert.ok(err, 'expected a throw');
+    assert.doesNotMatch(err.message, /:p@/);     // password segment of postgres://u:p@host
+    assert.doesNotMatch(err.message, /localhost/); // no host/connection material either
   });
 });
 

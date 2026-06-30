@@ -6,9 +6,13 @@ export interface BootConfig {
   databaseUrl?: string;
   envelope?: unknown;
   /**
-   * Opt into production safety mode. When true (or VOUCHR_PRODUCTION=1 / NODE_ENV=production),
+   * Opt into production safety mode. When true (or via the Vouchr-namespaced VOUCHR_PRODUCTION=1),
    * boot fails fast unless the deployment is multi-instance safe: Postgres + an envelope provider.
    * Default false keeps the zero-config dev path (SQLite, no envelope) working unchanged.
+   *
+   * Deliberately NOT triggered by NODE_ENV=production: nearly every Node host sets that, so keying
+   * off it would hard-fail existing zero-config SQLite deployments on upgrade (acceptance: default
+   * behavior is unchanged). Opt-in must be explicit and Vouchr-specific.
    */
   production?: boolean;
 }
@@ -20,11 +24,9 @@ export function usingPostgres(opts: BootConfig): boolean {
   return !!url && /^postgres(ql)?:\/\//.test(url);
 }
 
-/** True when the operator opted into production mode (explicit flag or env). */
+/** True when the operator explicitly opted into production mode (flag or Vouchr-namespaced env). */
 export function isProduction(opts: BootConfig): boolean {
-  return opts.production === true
-    || process.env.VOUCHR_PRODUCTION === '1'
-    || process.env.NODE_ENV === 'production';
+  return opts.production === true || process.env.VOUCHR_PRODUCTION === '1';
 }
 
 /**
