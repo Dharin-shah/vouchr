@@ -134,6 +134,36 @@ test('fetch: token is NEVER present in the response body', async () => {
   }
 });
 
+test('fetch: an incoming traceparent is propagated onto the outbound provider fetch', async () => {
+  const { server, port } = await makeBroker();
+  const real = globalThis.fetch;
+  let outbound: Headers | null = null;
+  globalThis.fetch = (async (_u: any, init: any) => {
+    outbound = new Headers(init?.headers);
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  const TP = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01';
+  try {
+    // with a traceparent header -> forwarded verbatim
+    const r = await post(port, '/v1/fetch',
+      { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' },
+      { traceparent: TP, tracestate: 'vendor=1' });
+    assert.equal(r.status, 200);
+    assert.equal(outbound!.get('traceparent'), TP);
+    assert.equal(outbound!.get('tracestate'), 'vendor=1');
+
+    // no-op when unset -> no trace headers fabricated
+    outbound = null;
+    const r2 = await post(port, '/v1/fetch',
+      { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(r2.status, 200);
+    assert.equal(outbound!.get('traceparent'), null);
+  } finally {
+    globalThis.fetch = real;
+    server.close();
+  }
+});
+
 test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async () => {
   const { server, port } = await makeBroker();
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));

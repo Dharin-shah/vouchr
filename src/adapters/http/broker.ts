@@ -144,6 +144,16 @@ async function readCapped(res: Response, cap: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** W3C trace-context headers present on the incoming request, lower-cased; empty when none sent. */
+function traceHeaders(req: http.IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const h of ['traceparent', 'tracestate']) {
+    const v = req.headers[h];
+    if (typeof v === 'string' && v) out[h] = v;
+  }
+  return out;
+}
+
 function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
   const acting: SlackIdentity = { enterpriseId: null, teamId: c.teamId, userId: c.userId };
   // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
@@ -216,7 +226,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     return { handle, provider };
   }
 
-  async function handleFetch(body: BrokerFetchRequest): Promise<{ status: number; payload: Record<string, unknown> }> {
+  async function handleFetch(body: BrokerFetchRequest, trace: Record<string, string> = {}): Promise<{ status: number; payload: Record<string, unknown> }> {
     // #25: fail-closed read-only. Reject non-GET/HEAD with 405 BEFORE the vault is ever touched.
     if (body.method !== 'GET' && body.method !== 'HEAD') {
       throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
@@ -237,6 +247,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
     for (const [k, v] of Object.entries(body.headers ?? {})) {
       if (['accept', 'accept-language', 'if-none-match'].includes(k.toLowerCase())) headers[k] = v;
     }
+    // W3C trace context read off the INCOMING request (not the body), forwarded verbatim onto the
+    // outbound provider fetch so a host can stitch the broker hop into the agent's trace. Non-secret
+    // (traceid/spanid/flags only); no-op when the caller sends no traceparent; no vendor dep.
+    // ponytail: forward as-is rather than minting a child span — span management is the host's job.
+    Object.assign(headers, trace);
 
     let res: Response;
     try {
@@ -304,7 +319,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           networkGate(req);
-          const r = await handleFetch(await readJson(req));
+          const r = await handleFetch(await readJson(req), traceHeaders(req));
           return send(r.status, r.payload);
         }
         if (req.method === 'POST' && url === '/v1/resolve') {

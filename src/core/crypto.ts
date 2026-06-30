@@ -90,13 +90,14 @@ export async function seal(plaintext: string, key: Buffer, envelope?: EnvelopePr
  *    (relevant only when migrating an existing local deploy to envelope). Tampered/corrupt data
  *    still fails closed: the legacy attempt's GCM tag check then throws too.
  */
-export async function open(blob: Buffer, key: Buffer, envelope?: EnvelopeProvider): Promise<string> {
+export async function open(blob: Buffer, key: Buffer, envelope?: EnvelopeProvider, onUnwrap?: () => void): Promise<string> {
   if (!envelope || blob[0] !== SCHEME_ENVELOPE) return decrypt(blob, key);
   try {
     const dekLen = blob.readUInt16BE(1);
     const wrapped = blob.subarray(3, 3 + dekLen);
     const body = blob.subarray(3 + dekLen);
     const dek = await envelope.unwrapDataKey(wrapped);
+    onUnwrap?.(); // a real KMS/Vault decrypt happened; count it for observability (never logs the DEK)
     try {
       return decrypt(body, dek);
     } finally {
