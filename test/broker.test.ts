@@ -8,7 +8,7 @@ import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
 import { ChannelTools } from '../src/core/tools';
 import { defineProvider, type Provider } from '../src/core/providers';
-import { ConnectionHandle } from '../src/core/injector';
+import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
 import { signIdentity, verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims } from '../src/adapters/http/identity';
@@ -132,6 +132,28 @@ test('fetch: token is NEVER present in the response body', async () => {
     up.restore();
     server.close();
   }
+});
+
+test('fetch: the broker forwards metrics events to onEvent (no longer a black box), no secret', async () => {
+  const events: VouchrEvent[] = [];
+  const { server, port } = await makeBroker({ onEvent: (e) => events.push(e) });
+  const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/data',
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    up.restore();
+    server.close();
+  }
+  const injected = events.find((e) => e.type === 'injected') as Extract<VouchrEvent, { type: 'injected' }> | undefined;
+  assert.ok(injected, 'broker did not forward the injected metric — it is still a black box');
+  assert.equal(injected.provider, 'acme');
+  assert.equal(injected.status, 200);
+  assert.equal(typeof injected.ms, 'number');
+  for (const e of events) assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'metric event leaked the token');
 });
 
 test('fetch: an incoming traceparent is propagated onto the outbound provider fetch', async () => {

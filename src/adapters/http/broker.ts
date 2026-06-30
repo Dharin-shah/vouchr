@@ -6,7 +6,7 @@ import type { Audit } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, type Resolvers } from '../../core/injector';
+import { ConnectionHandle, type Resolvers, type EventSink } from '../../core/injector';
 import { userOwner, type Owner } from '../../core/owner';
 import type { SlackIdentity } from '../../core/identity';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
@@ -54,6 +54,12 @@ export interface BrokerOptions {
    */
   replayStore?: ReplayStore;
   resolvers?: Resolvers;
+  /**
+   * No-secret observability sink (the SAME EventSink the Bolt path uses). Without it the broker is an
+   * operational black box: injected.ms / kms_decrypt / refreshed.ms / egress_denied.reason never fire.
+   * Fire-and-forget; a throwing sink can never affect a request (ConnectionHandle swallows it).
+   */
+  onEvent?: EventSink;
   /**
    * Operator authorization, identical to the Bolt path (#21/#22). When set, /v1/fetch enforces
    * `policy.check(provider, channel)` before injecting a credential; the channel comes from the
@@ -222,7 +228,9 @@ export function createBroker(opts: BrokerOptions): http.Server {
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
     const { owner, acting } = ownerFromClaims(claims);
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {});
+    // ponytail: per-request inflight Map (parent's design — cross-request single-flight is its scope,
+    // not this task's). The 8th arg wires the metrics sink so the broker path stops being a black box.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, new Map(), opts.onEvent);
     return { handle, provider };
   }
 

@@ -208,10 +208,15 @@ export class ConnectionHandle {
   }
 
   private async doRefresh(): Promise<string | null> {
+    // Count real KMS/envelope DEK unwraps on BOTH refresh-path reads (the pre-lock read and the
+    // re-read under the lock) so the kms_decrypt volume metric isn't understated on a refresh.
+    let kms = 0;
+    const onDecrypt = () => { kms++; };
+    const emitKms = () => { if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms }); };
     // The refresh token we're about to consume. On Postgres a peer pod may rotate it while we wait
     // for the lock; we detect that by re-reading under the lock and comparing against this value.
-    const before = await this.vault.get(this.owner, this.provider.id);
-    if (!before?.refreshToken) return null;
+    const before = await this.vault.get(this.owner, this.provider.id, onDecrypt);
+    if (!before?.refreshToken) { emitKms(); return null; }
     const lockWait = this.vault.crossProcessRefresh; // only emit the wait metric when a real lock exists
     const t0 = Date.now();
     // Track whether we actually rotated so the audit/emit run AFTER the transaction commits — never
@@ -223,7 +228,8 @@ export class ConnectionHandle {
     let refreshMs = 0; // #27 timing, captured in-lock but emitted post-commit with the 'refreshed' event
     const token = await this.vault.withRefreshLock(this.owner, this.provider.id, async (vault) => {
       // Re-read UNDER the lock: another tx may already have rotated since the read above.
-      const stored = await vault.get(this.owner, this.provider.id);
+      const stored = await vault.get(this.owner, this.provider.id, onDecrypt);
+      emitKms(); // both reads done — report total unwraps once for this refresh
       const waitMs = Date.now() - t0;
       if (!stored?.refreshToken) return null;
       // Loser path: the stored refresh token moved, so a concurrent winner already refreshed. Reuse
