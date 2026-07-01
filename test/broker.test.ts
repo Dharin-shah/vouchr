@@ -29,6 +29,13 @@ const acme = defineProvider({
   clientSecret: 'sec',
 });
 
+// A service-to-service tool the broker must refuse (no human credential to broker).
+const svc = defineProvider({
+  id: 'svc', identity: 'service', credential: 'key',
+  authorizeUrl: 'https://svc.example/auth', tokenUrl: 'https://svc.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.svc.example'], refresh: 'none', pkce: false,
+});
+
 function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
 }
@@ -276,6 +283,18 @@ test('fetch: a shared replayStore rejects a replay across DIFFERENT broker insta
     up.restore();
     a.server.close();
     b.server.close();
+  }
+});
+
+test('fetch: a service-to-service provider is refused (403), never brokered', async () => {
+  const { server, port } = await makeBroker({ providers: [acme, svc] });
+  try {
+    const token = signIdentity(claims(), SECRET);
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'svc', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
+    assert.equal(r.status, 403);
+    assert.ok(!r.raw.includes(SECRET_TOKEN)); // and no credential material anywhere in the response
+  } finally {
+    server.close();
   }
 });
 

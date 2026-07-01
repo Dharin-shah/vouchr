@@ -149,6 +149,17 @@ test('service identity: connect refuses without any consent prompt', async () =>
   assert.equal(consentRows.length, 0); // and no consent round-trip was started
 });
 
+// The service boundary must hold on EVERY credential entry point, not just connect(): storing a
+// user key, or an admin setting a channel mode/credential, must also refuse a service tool — else a
+// service provider could still get a human credential stored/used through Vouchr.
+test('service identity: user-key and channel-config paths also refuse it', async () => {
+  const { c } = await ctx();
+  await assert.rejects(() => c.setUserSecret('svc', 'k'), /service-to-service/);
+  await assert.rejects(() => c.referenceUserSecret('svc', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:x' }), /service-to-service/);
+  await assert.rejects(() => c.setChannelMode('svc', 'shared'), /service-to-service/);
+  await assert.rejects(() => c.setChannelSecret('svc', 'k'), /service-to-service/);
+});
+
 // Contrast: an acting_human tool with no stored cred DOES route through the consent flow.
 test('acting_human identity: connect routes through consent', async () => {
   const { c, db, posted } = await ctx();

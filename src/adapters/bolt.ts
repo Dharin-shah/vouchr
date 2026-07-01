@@ -178,17 +178,25 @@ export class ConnectContext {
    * If they haven't connected, post an ephemeral Block Kit Connect prompt and
    * throw ConsentRequiredError (the caller should stop this turn).
    */
-  async connect(providerId: string): Promise<ConnectionHandle> {
+  /**
+   * Fetch a provider AND refuse service-to-service tools. `identity: 'service'` tools have no human
+   * credential to broker — the host runs them with its own service auth (see ToolManifestEntry.identity
+   * / Provider.identity) — so EVERY Vouchr credential entry point (connect, user/channel key storage,
+   * channel mode) routes through here, not just connect(). Also validates the provider exists.
+   */
+  private brokerable(providerId: string): Provider {
     const provider = this.registry.get(providerId);
-
-    // Service-to-service tools are out of Vouchr's scope by design: there is no human credential to
-    // broker, so the host runs them with its own service auth. Refuse here BEFORE any consent flow —
-    // no Connect prompt, no vault lookup. (See ToolManifestEntry.identity / Provider.identity.)
     if (provider.identity === 'service') {
       throw new Error(
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
     }
+    return provider;
+  }
+
+  async connect(providerId: string): Promise<ConnectionHandle> {
+    // Refuse service-to-service tools BEFORE any consent flow — no Connect prompt, no vault lookup.
+    const provider = this.brokerable(providerId);
 
     // The channel's configured auth mode for this provider decides the credential model:
     //   'shared'  → the channel's shared credential (delegate to connectChannel)
@@ -307,7 +315,7 @@ export class ConnectContext {
    * secret never enters audit meta, the return value, or any error string.
    */
   async setUserSecret(providerId: string, secret: string): Promise<void> {
-    this.registry.get(providerId);
+    this.brokerable(providerId);
     await this.vault.upsert(userOwner(this.identity), providerId, {
       accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
@@ -316,7 +324,7 @@ export class ConnectContext {
 
   /** Point the acting user's OWN credential at an external secret manager (self-service). */
   async referenceUserSecret(providerId: string, r: { source: string; secretRef: string; scopes?: string }): Promise<void> {
-    this.registry.get(providerId);
+    this.brokerable(providerId);
     await this.vault.reference(userOwner(this.identity), providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
     await this.audit.record('config', this.identity, providerId, { owner: 'user', kind: 'ref', source: r.source });
   }
@@ -379,7 +387,7 @@ export class ConnectContext {
    * `referenceChannelSecret` so rotation stays in your secret manager.
    */
   async setChannelSecret(providerId: string, secret: string): Promise<void> {
-    this.registry.get(providerId); // validate provider exists before anything else
+    this.brokerable(providerId); // validate provider exists + refuse service tools
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
@@ -403,7 +411,7 @@ export class ConnectContext {
     providerId: string,
     r: { source: string; secretRef: string; scopes?: string },
   ): Promise<void> {
-    this.registry.get(providerId);
+    this.brokerable(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
@@ -422,7 +430,7 @@ export class ConnectContext {
    * the admin gate is that authorization). Members then use their own creds via `connect()`.
    */
   async setChannelMode(providerId: string, mode: ChannelMode): Promise<void> {
-    this.registry.get(providerId);
+    this.brokerable(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
@@ -437,7 +445,7 @@ export class ConnectContext {
    * channel is per-user-locked or has no shared cred configured.
    */
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
-    const provider = this.registry.get(providerId);
+    const provider = this.brokerable(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
     // Same provider/channel policy gate as connect(): a deny applies to shared channel creds too.
     if (!this.policy.check(providerId, this.channel)) {

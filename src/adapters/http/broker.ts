@@ -233,6 +233,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
+    // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
+    // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
+    if (registry.get(ref.provider).identity === 'service') {
+      throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    }
     const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
