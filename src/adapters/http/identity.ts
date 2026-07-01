@@ -42,12 +42,21 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
 }
 
 /**
- * Single-use jti replay guard.
- * ponytail: in-memory per-process set. A multi-instance broker fleet needs a shared store
- * (e.g. Redis `SET jti 1 NX PX=<ttl-to-exp>`); swap `use()` for that when you scale past one
- * process. Single process is correct today and the only thing the headless broker ships with.
+ * Single-use jti store. `use()` returns true if the jti is fresh (and records it until `exp`),
+ * false if it was already used. May be async so a multi-instance broker can back it with a shared
+ * store (e.g. Redis `SET jti 1 NX PX=<ttl-to-exp>`). Supply one via `BrokerOptions.replayStore`.
  */
-export class ReplayGuard {
+export interface ReplayStore {
+  use(jti: string, exp: number): boolean | Promise<boolean>;
+}
+
+/**
+ * Default single-use jti replay guard: an in-memory per-process set.
+ * ponytail: single process only. In a multi-instance broker fleet a jti can be replayed once PER
+ * POD within its (<=5min) window, so single-use is NOT cluster-wide with this default — a horizontally
+ * scaled broker MUST pass a shared `replayStore` (Redis SET NX PX). Upgrade path: any `ReplayStore`.
+ */
+export class ReplayGuard implements ReplayStore {
   private seen = new Map<string, number>(); // jti -> exp (epoch ms)
 
   /** Returns true if this jti is fresh (and records it); false if it was already used. */

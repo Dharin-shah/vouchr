@@ -4,7 +4,7 @@ export type { VouchrOptions } from './adapters/bolt';
 export { createBroker } from './adapters/http/broker';
 export type { BrokerOptions, BrokerFetchRequest, ConnectionHandleRef } from './adapters/http/broker';
 export { signIdentity, verifyIdentity, ReplayGuard, IdentityError, MAX_LIFETIME_MS } from './adapters/http/identity';
-export type { IdentityClaims } from './adapters/http/identity';
+export type { IdentityClaims, ReplayStore } from './adapters/http/identity';
 export { SessionGrants } from './core/session';
 export { github, google, gitlab, notion, defineProvider, ProviderRegistry } from './core/providers';
 export type { Provider, ProviderConfig, RefreshStrategy } from './core/providers';

@@ -179,6 +179,27 @@ test('fetch: a replayed jti is rejected on the second call', async () => {
   }
 });
 
+test('fetch: a shared replayStore rejects a replay across DIFFERENT broker instances (multi-pod)', async () => {
+  // A shared store makes single-use cluster-wide, not per-process (the default in-memory guard would
+  // let each instance accept the same jti once). Simulates two pods behind one Redis-backed store.
+  const seen = new Map<string, number>();
+  const replayStore = { use: (jti: string, exp: number) => (seen.has(jti) ? false : (seen.set(jti, exp), true)) };
+  const a = await makeBroker({ replayStore });
+  const b = await makeBroker({ replayStore });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const token = signIdentity(claims(), SECRET);
+    const first = await post(a.port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
+    assert.equal(first.status, 200);
+    const onOther = await post(b.port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
+    assert.equal(onOther.status, 401); // second pod refuses the already-used jti
+  } finally {
+    up.restore();
+    a.server.close();
+    b.server.close();
+  }
+});
+
 test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the attacker their OWN (empty) owner', async () => {
   const { server, port } = await makeBroker();
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));

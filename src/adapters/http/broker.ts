@@ -9,7 +9,7 @@ import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, type Resolvers } from '../../core/injector';
 import { userOwner, type Owner } from '../../core/owner';
 import type { SlackIdentity } from '../../core/identity';
-import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims } from './identity';
+import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
 
 /**
  * The opaque, NO-SECRET handle the caller holds. It names a provider; the owner is always the acting
@@ -46,6 +46,13 @@ export interface BrokerOptions {
   db: Db;
   /** HS256 secret shared ONLY by the upstream minter and this broker. */
   identitySecret: string;
+  /**
+   * Single-use jti store for replay protection. Default is an in-memory per-process guard, which is
+   * single-use ONLY within one process — a horizontally scaled broker fleet MUST supply a shared
+   * store (e.g. Redis `SET jti 1 NX PX=<ttl>`) or a signed token can be replayed once per pod within
+   * its (<=5min) window. See ReplayStore / #22.
+   */
+  replayStore?: ReplayStore;
   resolvers?: Resolvers;
   /**
    * Operator authorization, identical to the Bolt path (#21/#22). When set, /v1/fetch enforces
@@ -149,7 +156,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
   const registry = new ProviderRegistry(opts.providers);
   const allowedCt = (opts.allowedContentTypes ?? DEFAULT_ALLOWED_CT).map((c) => c.toLowerCase());
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
-  const replay = new ReplayGuard();
+  // Default in-memory guard is single-process only; a multi-instance fleet passes a shared replayStore.
+  const replay: ReplayStore = opts.replayStore ?? new ReplayGuard();
 
   /** Coarse network perimeter (NOT identity). When unset, no gate. Constant-time compare (it's a secret). */
   function networkGate(req: http.IncomingMessage): void {
@@ -159,13 +167,20 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (a.length !== b.length || !timingSafeEqual(a, b)) throw new HttpError(401, { error: 'unauthorized' });
   }
 
-  function verify(token: string): IdentityClaims {
+  async function verify(token: string): Promise<IdentityClaims> {
+    let claims: IdentityClaims;
     try {
-      return verifyIdentity(token, opts.identitySecret, { replay });
+      // Signature + claims + exp (pure, sync). Replay is enforced separately below so it can await a
+      // shared (possibly async) store, making single-use cluster-wide rather than per-process.
+      claims = verifyIdentity(token, opts.identitySecret);
     } catch (e) {
       if (e instanceof IdentityError) throw new HttpError(401, { error: 'invalid identity token' });
       throw e;
     }
+    if (!(await replay.use(claims.jti, claims.exp))) {
+      throw new HttpError(401, { error: 'invalid identity token' });
+    }
+    return claims;
   }
 
   /**
@@ -193,7 +208,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
-    const claims = verify(body.identityToken);
+    const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
     const { owner, acting } = ownerFromClaims(claims);
@@ -255,7 +270,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
-    const claims = verify(body.identityToken);
+    const claims = await verify(body.identityToken);
     const { owner } = ownerFromClaims(claims);
     const connected = (await opts.vault.get(owner, ref.provider)) != null;
     // NO secret: only existence + a coarse consent state. The token is never read into the response.
