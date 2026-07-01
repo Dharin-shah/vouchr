@@ -1,5 +1,5 @@
 {
-  "name": "vouchr",
+  "name": "@vouchr/core",
   "version": "0.1.0",
   "description": "Self-hostable, Slack-native credential broker for AI agents.",
   "license": "Apache-2.0",
