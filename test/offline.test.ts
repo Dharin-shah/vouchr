@@ -320,6 +320,41 @@ test('injector: an audit failure during refresh does NOT roll back or fail the r
   }
 });
 
+test('injector: the /token refresh fetch is given a bounded (10s) abort signal', async () => {
+  // A refresh runs while holding the advisory lock + refresh-pool connection; without a timeout a hung
+  // /token endpoint would pin both. Assert the signal is armed (~10s) — captured, not waited on.
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const provider = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true, clientId: 'id', clientSecret: 'sec',
+  });
+  await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
+
+  const realFetch = globalThis.fetch;
+  const realTimeout = AbortSignal.timeout;
+  let tokenSignalMs = -1;
+  (AbortSignal as any).timeout = (ms: number) => { tokenSignalMs = ms; return realTimeout.call(AbortSignal, ms); };
+  globalThis.fetch = (async (url: any, init: any) => {
+    if (String(url) === 'https://acme.example/token') {
+      assert.ok(init.signal instanceof AbortSignal); // the refresh fetch carries an abort signal
+      return new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const auth = new Headers(init.headers).get('authorization');
+    if (auth === 'Bearer old') return new Response('expired', { status: 401 });
+    return new Response(JSON.stringify({ saw: auth }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const res = await new ConnectionHandle(provider, O1, ID, vault, audit).fetch('https://api.acme.example/thing');
+    assert.equal(res.status, 200);
+    assert.equal(tokenSignalMs, 10_000); // TOKEN_FETCH_TIMEOUT_MS — bounded, not unbounded
+  } finally {
+    globalThis.fetch = realFetch;
+    (AbortSignal as any).timeout = realTimeout;
+  }
+});
+
 test('vault: list returns a user\'s connected providers, isolated per identity', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
