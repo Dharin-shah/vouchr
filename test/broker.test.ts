@@ -8,7 +8,7 @@ import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
 import { ChannelTools } from '../src/core/tools';
 import { defineProvider, type Provider } from '../src/core/providers';
-import { ConnectionHandle } from '../src/core/injector';
+import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
 import { signIdentity, verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims } from '../src/adapters/http/identity';
@@ -27,6 +27,13 @@ const acme = defineProvider({
   pkce: false,
   clientId: 'id',
   clientSecret: 'sec',
+});
+
+// A service-to-service tool the broker must refuse (no human credential to broker).
+const svc = defineProvider({
+  id: 'svc', identity: 'service', credential: 'key',
+  authorizeUrl: 'https://svc.example/auth', tokenUrl: 'https://svc.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.svc.example'], refresh: 'none', pkce: false,
 });
 
 function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
@@ -134,6 +141,85 @@ test('fetch: token is NEVER present in the response body', async () => {
   }
 });
 
+test('fetch: the broker forwards metrics events to onEvent (no longer a black box), no secret', async () => {
+  const events: VouchrEvent[] = [];
+  const { server, port } = await makeBroker({ onEvent: (e) => events.push(e) });
+  const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/data',
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    up.restore();
+    server.close();
+  }
+  const injected = events.find((e) => e.type === 'injected') as Extract<VouchrEvent, { type: 'injected' }> | undefined;
+  assert.ok(injected, 'broker did not forward the injected metric — it is still a black box');
+  assert.equal(injected.provider, 'acme');
+  assert.equal(injected.status, 200);
+  assert.equal(typeof injected.ms, 'number');
+  for (const e of events) assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'metric event leaked the token');
+});
+
+test('fetch: the broker emits an audit-STREAM event (raw verified actor id) to auditSink, no secret', async () => {
+  const events: any[] = [];
+  const { server, port } = await makeBroker({ auditSink: (e) => events.push(e) });
+  const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/data',
+    });
+    assert.equal(r.status, 200);
+  } finally {
+    up.restore();
+    server.close();
+  }
+  assert.equal(events.length, 1, 'broker did not emit an audit-stream copy');
+  const e = events[0];
+  assert.equal(e.action, 'fetch');
+  assert.equal(e.provider, 'acme');
+  assert.equal(e.teamId, 'T1');
+  assert.equal(e.userId, 'U1'); // RAW actor id, from the VERIFIED claims (never the request body)
+  assert.equal(e.ownerKind, 'user');
+  assert.equal(e.egressHost, 'api.acme.example');
+  assert.equal(e.status, 200);
+  assert.ok(e.jti, 'jti missing');
+  assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'audit-stream event leaked the token');
+});
+
+test('fetch: an incoming traceparent is propagated onto the outbound provider fetch', async () => {
+  const { server, port } = await makeBroker();
+  const real = globalThis.fetch;
+  let outbound: Headers | null = null;
+  globalThis.fetch = (async (_u: any, init: any) => {
+    outbound = new Headers(init?.headers);
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  const TP = '00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01';
+  try {
+    // with a traceparent header -> forwarded verbatim
+    const r = await post(port, '/v1/fetch',
+      { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' },
+      { traceparent: TP, tracestate: 'vendor=1' });
+    assert.equal(r.status, 200);
+    assert.equal(outbound!.get('traceparent'), TP);
+    assert.equal(outbound!.get('tracestate'), 'vendor=1');
+
+    // no-op when unset -> no trace headers fabricated
+    outbound = null;
+    const r2 = await post(port, '/v1/fetch',
+      { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(r2.status, 200);
+    assert.equal(outbound!.get('traceparent'), null);
+  } finally {
+    globalThis.fetch = real;
+    server.close();
+  }
+});
+
 test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async () => {
   const { server, port } = await makeBroker();
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -197,6 +283,29 @@ test('fetch: a shared replayStore rejects a replay across DIFFERENT broker insta
     up.restore();
     a.server.close();
     b.server.close();
+  }
+});
+
+test('fetch: a service-to-service provider is refused (403), never brokered', async () => {
+  const { server, port } = await makeBroker({ providers: [acme, svc] });
+  try {
+    const token = signIdentity(claims(), SECRET);
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'svc', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
+    assert.equal(r.status, 403);
+    assert.ok(!r.raw.includes(SECRET_TOKEN)); // and no credential material anywhere in the response
+  } finally {
+    server.close();
+  }
+});
+
+test('resolve: a service-to-service provider is refused (403), never reported connected', async () => {
+  const { server, port } = await makeBroker({ providers: [acme, svc] });
+  try {
+    const token = signIdentity(claims(), SECRET);
+    const r = await post(port, '/v1/resolve', { handle: { provider: 'svc', owner: 'user' }, identityToken: token });
+    assert.equal(r.status, 403); // not {connected|needs_consent}: Vouchr does not broker service tools
+  } finally {
+    server.close();
   }
 });
 

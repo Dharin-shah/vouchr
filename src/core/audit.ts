@@ -5,6 +5,37 @@ import type { SlackIdentity } from './identity';
 /** Shape of `meta` accepted by the audit log: values must NEVER be token material. */
 export type AuditMeta = Record<string, unknown>;
 
+/**
+ * A convenience copy of an audit event for host-side ingestion (e.g. a Redis stream the host
+ * consumes into its own observability/storage). The `audit` TABLE is AUTHORITATIVE / the source of
+ * truth; this stream is a LOSSY convenience copy — a capped stream (Redis `MAXLEN ~`) may drop
+ * events. Unlike the no-secret `VouchrEvent` metrics sink, this carries the RAW actor id so a host
+ * can answer "who used this connection's token, when, against which host". The sink is expected to
+ * live inside the host's existing trust boundary (which already stores user ids); a one-way hash
+ * would defeat that use case and is brute-forceable over one workspace anyway. NEVER carries token
+ * or secret material. `jti` is the dedupe key for idempotent host-side ingest (ack on a consumer
+ * group, dedupe redeliveries on `jti`).
+ */
+export interface VouchrAuditEvent {
+  ts: string; // ISO-8601
+  teamId: string;
+  userId: string; // raw acting actor id, NOT a hash
+  provider: string;
+  ownerKind: 'user' | 'channel';
+  ownerId: string; // user id or channel id that OWNS the credential
+  action: 'fetch' | 'refresh' | 'consent_granted' | 'consent_denied';
+  egressHost: string;
+  // HTTP-ish status. Only 'fetch' carries a REAL upstream status; the others are synthetic: 'refresh'
+  // is hardcoded 200 (it only emits after refresh already succeeded), 'consent_granted' is 200, and
+  // 'consent_denied' is 400 for a real user denial or 500 for a post-consent connection failure.
+  // Don't treat `status` as a uniform provider response code across actions; key on `action` first.
+  status: number;
+  jti: string;
+}
+
+/** Fire-and-forget audit stream sink. Sync; a throwing sink must never affect request behavior. */
+export type AuditSink = (e: VouchrAuditEvent) => void;
+
 const REDACTED = '[redacted]';
 
 // Clear "this is a credential" signals. Keys are kept; only matching string values are scrubbed.

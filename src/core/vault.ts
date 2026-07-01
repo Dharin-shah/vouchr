@@ -58,8 +58,12 @@ export class Vault {
     return false;
   }
 
-  /** Returns the credential, or null if absent OR expired per the TTL policy. */
-  async get(owner: Owner, provider: string): Promise<StoredCredential | null> {
+  /**
+   * Returns the credential, or null if absent OR expired per the TTL policy.
+   * `onDecrypt` (optional) fires once per real KMS/envelope DEK unwrap, so a caller can meter
+   * decrypt volume without the vault holding an event sink. No-op on the legacy direct path.
+   */
+  async get(owner: Owner, provider: string, onDecrypt?: () => void): Promise<StoredCredential | null> {
     const row = (await this.db.get(
       `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
       [owner.teamId, owner.kind, owner.id, provider],
@@ -68,8 +72,8 @@ export class Vault {
     if (this.isExpired(row.created_at, row.last_used_at ?? row.created_at)) return null;
     return {
       source: row.source,
-      accessToken: row.access_token_enc ? await open(toBuffer(row.access_token_enc), this.key, this.envelope) : null,
-      refreshToken: row.refresh_token_enc ? await open(toBuffer(row.refresh_token_enc), this.key, this.envelope) : null,
+      accessToken: row.access_token_enc ? await open(toBuffer(row.access_token_enc), this.key, this.envelope, onDecrypt) : null,
+      refreshToken: row.refresh_token_enc ? await open(toBuffer(row.refresh_token_enc), this.key, this.envelope, onDecrypt) : null,
       secretRef: row.secret_ref,
       scopes: row.scopes,
       expiresAt: row.expires_at,
@@ -155,6 +159,22 @@ export class Vault {
         owner.teamId, owner.kind, owner.id, provider,
       ],
     );
+  }
+
+  /** True when the backend coordinates refresh across processes (Postgres advisory lock). */
+  get crossProcessRefresh(): boolean { return !!this.db.withRefreshLock; }
+
+  /**
+   * Run `fn` while holding the cross-process refresh lock for (owner, provider), with the vault
+   * rebound to the locked transaction so `fn`'s reads/writes (get/updateTokens) see the same tx.
+   * On a backend without a lock (SQLite) this is a passthrough that runs `fn(this)` — the injector's
+   * in-process single-flight map already serializes a single process. Key matches the injector's
+   * inflight key so in-process and cross-process coordination agree on identity.
+   */
+  async withRefreshLock<T>(owner: Owner, provider: string, fn: (locked: Vault) => Promise<T>): Promise<T> {
+    if (!this.db.withRefreshLock) return fn(this);
+    const key = `${owner.teamId}:${owner.kind}:${owner.id}:${provider}`;
+    return this.db.withRefreshLock(key, (txDb) => fn(new Vault(txDb, this.key, this.ttl, this.envelope)));
   }
 
   /** Mark a connection as used now (resets the idle timer). Called after each injection. */

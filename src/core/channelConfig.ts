@@ -8,9 +8,14 @@ import type { Db } from './db';
  *  - 'per-user': each member uses their own credential; no shared cred may exist here (invariant 7).
  *  - 'session':  per-user, but usable only inside the Slack thread the user approved it in (a thread
  *                 session grant), with a TTL ceiling.
+ *  - 'union':    "any connected member" — connect() resolves to WHICHEVER channel member has connected
+ *                 the provider and acts as THAT member (their user-owned cred is the key; that member is
+ *                 the audited actor). Still per-user creds (no shared channel cred), just resolved across
+ *                 the channel's members instead of only the caller. No owner/actor conflation: the audited
+ *                 actor is the real member whose credential is used, never the channel and never the caller.
  * No row → unconfigured, treated as 'per-user' (each member uses their own; an admin may set a mode).
  */
-export type ChannelMode = 'shared' | 'per-user' | 'session';
+export type ChannelMode = 'shared' | 'per-user' | 'session' | 'union';
 
 /** The subset of Slack's conversations.info shape that channel-credential eligibility depends on. */
 export interface ChannelInfo {

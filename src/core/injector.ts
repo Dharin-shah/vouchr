@@ -2,8 +2,9 @@ import type { Provider } from './providers';
 import type { Vault, StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
-import type { Audit } from './audit';
+import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import { refreshToken } from './tokens';
+import { randomUUID } from 'node:crypto';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided. */
 export type Resolvers = Record<string, (ref: string) => Promise<string>>;
@@ -14,9 +15,19 @@ export type Resolvers = Record<string, (ref: string) => Promise<string>>;
  * NEVER carries tokens, secretRef values, user/team ids, or any user content.
  */
 export type VouchrEvent =
-  | { type: 'injected'; provider: string; host: string; status: number; ownerKind: 'user' | 'channel' }
-  | { type: 'refreshed'; provider: string }
-  | { type: 'egress_denied'; provider: string; host: string }
+  // `ms` = wall-clock latency of the outbound provider fetch (incl. a refresh-retry round trip).
+  | { type: 'injected'; provider: string; host: string; status: number; ownerKind: 'user' | 'channel'; ms: number }
+  // `ms` = wall-clock latency of the provider /token round trip.
+  | { type: 'refreshed'; provider: string; ms: number }
+  // Cross-process (Postgres) refresh coordination: time spent waiting for the advisory lock, and
+  // whether this caller LOST the race and reused a concurrent winner's already-rotated token.
+  | { type: 'refresh_lock_wait'; provider: string; waitMs: number; reused: boolean }
+  // KMS/envelope decrypt volume: number of DEK unwraps (real KMS calls) for one credential read.
+  // Only fires when envelope encryption is in use (count > 0); the legacy direct path makes no KMS call.
+  | { type: 'kms_decrypt'; provider: string; count: number }
+  // `reason` splits the single denial type by the gate that rejected: bad URL creds / non-allowlisted
+  // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator'.
+  | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' }
   | { type: 'resolver_failed'; provider: string; source: string }
   | { type: 'connect_prompted'; provider: string }
   | { type: 'connected'; provider: string }
@@ -58,6 +69,9 @@ export class ConnectionHandle {
     private inflight: Map<string, Promise<string | null>> = new Map(),
     // No-secret observability hook. Default no-op (zero behavior change when unset).
     private sink: EventSink = () => {},
+    // Optional audit STREAM sink (carries the raw actor id). Separate from `sink`, which is
+    // deliberately actor-free. Default no-op. The authoritative copy is still the audit table.
+    private auditSink: AuditSink = () => {},
   ) {}
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -69,6 +83,26 @@ export class ConnectionHandle {
     }
   }
 
+  /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
+  private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number): void {
+    try {
+      this.auditSink({
+        ts: new Date().toISOString(),
+        teamId: this.acting.teamId,
+        userId: this.acting.userId, // raw actor id, never a token
+        provider: this.provider.id,
+        ownerKind: this.owner.kind,
+        ownerId: this.owner.id,
+        action,
+        egressHost,
+        status,
+        jti: randomUUID(),
+      });
+    } catch {
+      // ignore: best-effort, never fatal
+    }
+  }
+
   async account(): Promise<string | null> {
     return (await this.vault.get(this.owner, this.provider.id))?.externalAccount ?? null;
   }
@@ -76,12 +110,12 @@ export class ConnectionHandle {
   async fetch(input: string, init: RequestInit = {}): Promise<Response> {
     const url = new URL(input);
     if (url.username || url.password) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
       throw new Error(`Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
     }
     // Egress allowlist first, before any secret is even read.
     if (!this.provider.egressAllow.includes(url.hostname)) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
       throw new Error(
         `Egress blocked: "${url.hostname}" is not in the allowlist for provider "${this.provider.id}"`,
       );
@@ -89,13 +123,13 @@ export class ConnectionHandle {
     // The caller (and the LLM) controls this URL. Require https so the bearer is never sent in
     // cleartext (it goes out before any http→https redirect). Loopback is exempt for local dev.
     if (url.protocol !== 'https:' && !LOOPBACK.has(url.hostname)) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
       throw new Error(`Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
     // never reaches the vault: the secret is read strictly after every egress check passes.
     if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'path' });
       throw new Error(
         `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`,
       );
@@ -103,19 +137,22 @@ export class ConnectionHandle {
     if (this.provider.egressMethods) {
       const method = (init.method ?? 'GET').toUpperCase();
       if (!this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
-        this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+        this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'method' });
         throw new Error(
           `Egress blocked: method "${method}" is not allowed for provider "${this.provider.id}"`,
         );
       }
     }
     if (this.provider.egressValidate && !this.provider.egressValidate(url, init)) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname });
+      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'validator' });
       throw new Error(`Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
     }
 
-    const cred = await this.vault.get(this.owner, this.provider.id);
+    // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
+    let kms = 0;
+    const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
     if (!cred) throw new Error(`No connection for provider "${this.provider.id}"`);
+    if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     const vaulted = cred.source === 'vault';
 
     let token = vaulted ? await this.vaultToken(cred) : await this.resolveRef(cred);
@@ -128,12 +165,14 @@ export class ConnectionHandle {
       return fetch(input, { ...init, headers, redirect: 'manual' });
     };
 
+    const t0 = Date.now();
     let res = await send(token);
     // Refresh-on-401 only applies to vaulted OAuth creds; referenced secrets rotate externally.
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
       const refreshed = await this.refreshAndStore();
       if (refreshed) res = await send(refreshed);
     }
+    const fetchMs = Date.now() - t0;
 
     // Mark the connection used (resets its idle TTL) and audit AS THE ACTING HUMAN, never the secret.
     // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
@@ -146,7 +185,9 @@ export class ConnectionHandle {
       .record('inject', this.acting, this.provider.id, { host: url.hostname, status: res.status, ...channelMeta })
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
-    this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind });
+    this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
+    // Audit stream copy (raw actor id, for host-side ingestion). Lossy; the audit table is authoritative.
+    this.emitAudit('fetch', url.hostname, res.status);
     return res;
   }
 
@@ -193,18 +234,58 @@ export class ConnectionHandle {
   }
 
   private async doRefresh(): Promise<string | null> {
-    const stored = await this.vault.get(this.owner, this.provider.id);
-    if (!stored?.refreshToken) return null;
-    const refreshed = await refreshToken(this.provider, stored.refreshToken);
-    // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
-    await this.vault.updateTokens(this.owner, this.provider.id, {
-      accessToken: refreshed.accessToken,
-      refreshToken: refreshed.refreshToken ?? stored.refreshToken,
-      scopes: refreshed.scopes ?? stored.scopes,
-      expiresAt: refreshed.expiresAt,
+    // Count real KMS/envelope DEK unwraps on BOTH refresh-path reads (the pre-lock read and the
+    // re-read under the lock) so the kms_decrypt volume metric isn't understated on a refresh.
+    let kms = 0;
+    const onDecrypt = () => { kms++; };
+    const emitKms = () => { if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms }); };
+    // The refresh token we're about to consume. On Postgres a peer pod may rotate it while we wait
+    // for the lock; we detect that by re-reading under the lock and comparing against this value.
+    const before = await this.vault.get(this.owner, this.provider.id, onDecrypt);
+    if (!before?.refreshToken) { emitKms(); return null; }
+    const lockWait = this.vault.crossProcessRefresh; // only emit the wait metric when a real lock exists
+    const t0 = Date.now();
+    // Track whether we actually rotated so the audit/emit run AFTER the transaction commits — never
+    // inside it. On rotating-token providers the /token call has already consumed the old refresh
+    // token by the time we write the new one, so if audit.record() threw inside withRefreshLock it
+    // would ROLL BACK the freshly-stored token, leaving us holding an already-invalidated refresh
+    // token and bricking the connection. Bookkeeping must not be able to undo a committed rotation.
+    let rotated = false;
+    let refreshMs = 0; // #27 timing, captured in-lock but emitted post-commit with the 'refreshed' event
+    const token = await this.vault.withRefreshLock(this.owner, this.provider.id, async (vault) => {
+      // Re-read UNDER the lock: another tx may already have rotated since the read above.
+      const stored = await vault.get(this.owner, this.provider.id, onDecrypt);
+      emitKms(); // both reads done — report total unwraps once for this refresh
+      const waitMs = Date.now() - t0;
+      if (!stored?.refreshToken) return null;
+      // Loser path: the stored refresh token moved, so a concurrent winner already refreshed. Reuse
+      // its access token — refreshing again would consume a token the winner invalidated (rotating
+      // providers brick on a double refresh).
+      if (stored.refreshToken !== before.refreshToken) {
+        if (lockWait) this.emit({ type: 'refresh_lock_wait', provider: this.provider.id, waitMs, reused: true });
+        return stored.accessToken;
+      }
+      if (lockWait) this.emit({ type: 'refresh_lock_wait', provider: this.provider.id, waitMs, reused: false });
+      const r0 = Date.now();
+      const refreshed = await refreshToken(this.provider, stored.refreshToken);
+      // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
+      await vault.updateTokens(this.owner, this.provider.id, {
+        accessToken: refreshed.accessToken,
+        refreshToken: refreshed.refreshToken ?? stored.refreshToken,
+        scopes: refreshed.scopes ?? stored.scopes,
+        expiresAt: refreshed.expiresAt,
+      });
+      rotated = true;
+      refreshMs = Date.now() - r0;
+      return refreshed.accessToken;
     });
-    await this.audit.record('refresh', this.acting, this.provider.id, {});
-    this.emit({ type: 'refreshed', provider: this.provider.id });
-    return refreshed.accessToken;
+    // Post-commit, best-effort: a failed audit write must not surface as a failed refresh nor undo it.
+    if (rotated) {
+      await this.audit.record('refresh', this.acting, this.provider.id, {}).catch(() => undefined);
+      this.emit({ type: 'refreshed', provider: this.provider.id, ms: refreshMs });
+      // egressHost = the provider token endpoint we refreshed against; status 200 (it succeeded).
+      this.emitAudit('refresh', new URL(this.provider.tokenUrl).hostname, 200);
+    }
+    return token;
   }
 }

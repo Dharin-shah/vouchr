@@ -76,3 +76,31 @@ export async function isChannelMember(
     return false;
   }
 }
+
+/**
+ * The user ids of every member of `channel`, paged from conversations.members. Used by the 'union'
+ * channel mode to find a member who has connected a provider. Fail-closed: any API error yields an
+ * empty list (no member resolves → the caller falls back to prompting the asker), so a read we can't
+ * complete never silently borrows a credential.
+ */
+export async function listChannelMembers(
+  client: {
+    conversations: {
+      members: (a: { channel: string; cursor?: string; limit?: number }) => Promise<any>;
+    };
+  },
+  channel: string,
+): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    let cursor: string | undefined;
+    do {
+      const res = await client.conversations.members({ channel, cursor, limit: 1000 });
+      if (Array.isArray(res?.members)) out.push(...res.members);
+      cursor = res?.response_metadata?.next_cursor || undefined;
+    } while (cursor);
+  } catch {
+    return [];
+  }
+  return out;
+}

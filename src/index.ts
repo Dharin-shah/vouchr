@@ -13,6 +13,7 @@ export type { PolicyRule } from './core/policy';
 export type { SlackIdentity } from './core/identity';
 export { ConnectionHandle } from './core/injector';
 export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
+export type { VouchrAuditEvent, AuditSink } from './core/audit';
 export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';
 export { DbInstallationStore } from './adapters/installationStore';

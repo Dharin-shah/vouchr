@@ -2,11 +2,11 @@ import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import type { Db } from '../../core/db';
 import type { Vault } from '../../core/vault';
-import type { Audit } from '../../core/audit';
+import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, type Resolvers } from '../../core/injector';
+import { ConnectionHandle, type Resolvers, type EventSink } from '../../core/injector';
 import { userOwner, type Owner } from '../../core/owner';
 import type { SlackIdentity } from '../../core/identity';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
@@ -54,6 +54,21 @@ export interface BrokerOptions {
    */
   replayStore?: ReplayStore;
   resolvers?: Resolvers;
+  /**
+   * No-secret observability sink (the SAME EventSink the Bolt path uses). Without it the broker is an
+   * operational black box: injected.ms / kms_decrypt / refreshed.ms / egress_denied.reason never fire.
+   * Fire-and-forget; a throwing sink can never affect a request (ConnectionHandle swallows it).
+   */
+  onEvent?: EventSink;
+  /**
+   * Optional audit STREAM sink for host-side ingestion. Fires IN ADDITION to the authoritative
+   * `audit` table on each /v1/fetch (action 'fetch') and on the refresh path. Unlike `onEvent`
+   * (deliberately actor-free), it carries the RAW acting user id from the VERIFIED claims so a host
+   * can answer "who used this token, when, against which host". This is the canonical host-side
+   * ingestion surface (host != broker). Lossy by design; the table stays the source of truth. A
+   * throwing sink can never affect a request (ConnectionHandle swallows it). No-op when unset.
+   */
+  auditSink?: AuditSink;
   /**
    * Operator authorization, identical to the Bolt path (#21/#22). When set, /v1/fetch enforces
    * `policy.check(provider, channel)` before injecting a credential; the channel comes from the
@@ -144,6 +159,16 @@ async function readCapped(res: Response, cap: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** W3C trace-context headers present on the incoming request, lower-cased; empty when none sent. */
+function traceHeaders(req: http.IncomingMessage): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const h of ['traceparent', 'tracestate']) {
+    const v = req.headers[h];
+    if (typeof v === 'string' && v) out[h] = v;
+  }
+  return out;
+}
+
 function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
   const acting: SlackIdentity = { enterpriseId: null, teamId: c.teamId, userId: c.userId };
   // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
@@ -208,15 +233,23 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
+    // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
+    // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
+    if (registry.get(ref.provider).identity === 'service') {
+      throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    }
     const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
     const { owner, acting } = ownerFromClaims(claims);
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {});
+    // ponytail: per-request inflight Map (parent's design — cross-request single-flight is its scope,
+    // not this task's). The 8th arg wires the metrics sink so the broker path stops being a black box;
+    // the 9th wires the audit STREAM sink (raw actor id) for host-side ingestion.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, new Map(), opts.onEvent, opts.auditSink);
     return { handle, provider };
   }
 
-  async function handleFetch(body: BrokerFetchRequest): Promise<{ status: number; payload: Record<string, unknown> }> {
+  async function handleFetch(body: BrokerFetchRequest, trace: Record<string, string> = {}): Promise<{ status: number; payload: Record<string, unknown> }> {
     // #25: fail-closed read-only. Reject non-GET/HEAD with 405 BEFORE the vault is ever touched.
     if (body.method !== 'GET' && body.method !== 'HEAD') {
       throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
@@ -237,6 +270,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
     for (const [k, v] of Object.entries(body.headers ?? {})) {
       if (['accept', 'accept-language', 'if-none-match'].includes(k.toLowerCase())) headers[k] = v;
     }
+    // W3C trace context read off the INCOMING request (not the body), forwarded verbatim onto the
+    // outbound provider fetch so a host can stitch the broker hop into the agent's trace. Non-secret
+    // (traceid/spanid/flags only); no-op when the caller sends no traceparent; no vendor dep.
+    // ponytail: forward as-is rather than minting a child span — span management is the host's job.
+    Object.assign(headers, trace);
 
     let res: Response;
     try {
@@ -270,6 +308,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
+    // Service-to-service tools are not brokered by Vouchr — don't even report their consent state
+    // (else /v1/resolve would call a service tool "connected"/"needs_consent"). Refuse like /v1/fetch.
+    if (registry.get(ref.provider).identity === 'service') {
+      throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    }
     const claims = await verify(body.identityToken);
     const { owner } = ownerFromClaims(claims);
     const connected = (await opts.vault.get(owner, ref.provider)) != null;
@@ -304,7 +347,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           networkGate(req);
-          const r = await handleFetch(await readJson(req));
+          const r = await handleFetch(await readJson(req), traceHeaders(req));
           return send(r.status, r.payload);
         }
         if (req.method === 'POST' && url === '/v1/resolve') {

@@ -8,7 +8,8 @@ import { Consent } from '../src/core/consent';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { sweepExpired } from '../src/core/sweep';
 import { userOwner, channelOwner } from '../src/core/owner';
-import { github } from '../src/core/providers';
+import { github, defineProvider } from '../src/core/providers';
+import { ConnectionHandle } from '../src/core/injector';
 
 // Runs the security-critical invariants against a REAL Postgres (not a mock).
 //   npm run pg:up   # start a throwaway postgres:16 in Docker
@@ -82,5 +83,103 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
     assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), 'per-user');
   } finally {
     await db.close();
+  }
+});
+
+// A long-lived pod refreshes many times over its lifetime. The dedicated refresh pool's idle-client
+// 'error' handler must attach exactly ONCE (at pool creation), not per withRefreshLock call — else
+// listeners grow unbounded and pg logs MaxListenersExceededWarning.
+test('postgres backend: withRefreshLock registers the pool error listener exactly once', async (t) => {
+  let db: Awaited<ReturnType<typeof openDb>> | undefined;
+  try {
+    db = await openDb({ databaseUrl: PG_URL });
+    await db.exec('SELECT 1');
+  } catch {
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
+    return;
+  }
+  try {
+    for (let i = 0; i < 15; i++) {
+      await db.withRefreshLock!(`leak-probe:${i % 3}`, async () => i); // distinct + repeated keys
+    }
+    const pool = (db as any).refreshPool;
+    assert.equal(pool.listenerCount('error'), 1, 'refresh-pool error listener must attach exactly once');
+  } finally {
+    await db.close();
+  }
+});
+
+// Cross-process refresh coordination: two SEPARATE connections (two "pods", each its own pool and
+// own in-process inflight map) refresh the same (owner, provider) at once. The Postgres advisory
+// xact lock + re-read-under-lock must collapse this to exactly one provider /token call; the loser
+// reuses the winner's rotated token instead of consuming the (now-invalidated) old refresh token.
+test('postgres backend: concurrent cross-process refresh => one /token call, loser reuses winner token', async (t) => {
+  let dbA: Awaited<ReturnType<typeof openDb>> | undefined;
+  let dbB: Awaited<ReturnType<typeof openDb>> | undefined;
+  try {
+    dbA = await openDb({ databaseUrl: PG_URL });
+    await dbA.exec('TRUNCATE connection, audit');
+  } catch {
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
+    return;
+  }
+  dbB = await openDb({ databaseUrl: PG_URL });
+
+  const realFetch = globalThis.fetch;
+  try {
+    const provider = defineProvider({
+      id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+      scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
+      clientId: 'id', clientSecret: 'sec',
+    });
+    const id = { enterpriseId: null, teamId: 'TL', userId: 'UL' };
+    const O = userOwner(id);
+    const vaultA = new Vault(dbA, KEY);
+    const vaultB = new Vault(dbB, KEY);
+    await vaultA.upsert(O, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
+
+    let tokenCalls = 0;
+    let validRefresh = 'r1';
+    const leaked: string[] = [];
+    globalThis.fetch = (async (url: any, init: any) => {
+      if (String(url) === 'https://acme.example/token') {
+        tokenCalls++;
+        const sent = new URLSearchParams(init.body as string).get('refresh_token');
+        // Rotating provider: the previous refresh token is invalid the instant it's used once.
+        if (sent !== validRefresh) {
+          return new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400, headers: { 'content-type': 'application/json' } });
+        }
+        validRefresh = 'r2';
+        await new Promise((r) => setTimeout(r, 60)); // hold the advisory lock long enough to force the loser to wait
+        return new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2', expires_in: 3600 }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }
+      const auth = new Headers(init.headers).get('authorization');
+      if (auth === 'Bearer old') return new Response('expired', { status: 401 }); // force a refresh
+      return new Response(JSON.stringify({ saw: auth }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as any;
+
+    const sink = (e: any) => leaked.push(JSON.stringify(e));
+    const hA = new ConnectionHandle(provider, O, id, vaultA, new Audit(dbA), {}, new Map(), sink);
+    const hB = new ConnectionHandle(provider, O, id, vaultB, new Audit(dbB), {}, new Map(), sink);
+    const [ra, rb] = await Promise.all([
+      hA.fetch('https://api.acme.example/a'),
+      hB.fetch('https://api.acme.example/b'),
+    ]);
+
+    assert.equal(ra.status, 200);
+    assert.equal(rb.status, 200);
+    assert.equal(tokenCalls, 1); // cross-process lock collapsed the two refreshes into one
+    assert.equal((await ra.json()).saw, 'Bearer new'); // both retried with the winner's rotated token
+    assert.equal((await rb.json()).saw, 'Bearer new');
+    assert.equal((await vaultA.get(O, 'acme'))?.refreshToken, 'r2'); // winner's rotation persisted
+    // No event (including the new refresh_lock_wait) ever carries a secret/token.
+    assert.ok(leaked.some((e) => e.includes('refresh_lock_wait')), 'lock-wait metric was emitted');
+    for (const e of leaked) {
+      assert.ok(!e.includes('new') && !e.includes('r1') && !e.includes('r2'), `event leaked a token: ${e}`);
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    await dbA?.close();
+    await dbB?.close();
   }
 });

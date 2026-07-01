@@ -1,5 +1,11 @@
 import type { Provider } from './providers';
 
+// Bound the /token round-trip. A refresh runs while HOLDING the Postgres advisory lock and a
+// refresh-pool connection (see injector.doRefresh / db.withRefreshLock); without this a hung token
+// endpoint would pin the lock and a pool backend indefinitely (statement_timeout only bounds DB
+// statements, not this outbound fetch). Slightly above the 8s in-lock statement_timeout.
+const TOKEN_FETCH_TIMEOUT_MS = 10_000;
+
 export interface TokenResponse {
   accessToken: string;
   refreshToken: string | null;
@@ -32,7 +38,12 @@ async function tokenRequest(
     body = new URLSearchParams(fields).toString();
   }
 
-  const res = await fetch(provider.tokenUrl, { method: 'POST', headers, body });
+  const res = await fetch(provider.tokenUrl, {
+    method: 'POST',
+    headers,
+    body,
+    signal: AbortSignal.timeout(TOKEN_FETCH_TIMEOUT_MS), // release the lock/pool if the endpoint hangs
+  });
   if (!res.ok) {
     throw new Error(`Token endpoint ${provider.tokenUrl} returned HTTP ${res.status}`);
   }
