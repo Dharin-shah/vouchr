@@ -35,13 +35,13 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          registry-url: https://registry.npmjs.org
+      # Trusted Publishing (OIDC) — no npm token. Auth comes from the workflow's id-token; the
+      # @vouchr/core package must have this repo+workflow configured as a Trusted Publisher on npm.
+      # Needs npm >= 11.5.1 (Node 22 ships 10.x), and provenance is generated automatically.
+      - run: npm install -g npm@latest
       - run: npm ci
       - run: npm run build
-      # Honors package.json publishConfig (public, dist-tag "next"). Provenance signs the release.
-      - run: npm publish --provenance
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish
 
   docker-ghcr:
     needs: verify
