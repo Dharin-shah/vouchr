@@ -7,6 +7,17 @@ export interface ToolManifestEntry {
   provider: string;
   mode: ChannelMode | null;
   enabled: boolean;
+  /**
+   * Who the agent acts AS when it calls this tool, and therefore whether Vouchr is in the path:
+   *  - 'acting_human' (default): the tool acts as the human in the channel against a third-party
+   *     provider with that human's credential + consent. THIS is what Vouchr brokers — connect()
+   *     resolves it through the vault and the consent flow.
+   *  - 'service': a service-to-service tool the agent calls as ITSELF (its own service identity, an
+   *     internal egress allowlist). There is no human credential to broker, so Vouchr is deliberately
+   *     NOT in this path: connect() refuses it and the host wires its own service auth. It appears in
+   *     the manifest only so the host can see the full tool set in one place.
+   */
+  identity: 'service' | 'acting_human';
 }
 
 /**

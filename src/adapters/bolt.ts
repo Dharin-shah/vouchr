@@ -7,7 +7,7 @@ import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
-import { resolveIdentity, isSlackAdmin, isChannelMember, type SlackIdentity } from '../core/identity';
+import { resolveIdentity, isSlackAdmin, isChannelMember, listChannelMembers, type SlackIdentity } from '../core/identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
@@ -181,9 +181,19 @@ export class ConnectContext {
   async connect(providerId: string): Promise<ConnectionHandle> {
     const provider = this.registry.get(providerId);
 
+    // Service-to-service tools are out of Vouchr's scope by design: there is no human credential to
+    // broker, so the host runs them with its own service auth. Refuse here BEFORE any consent flow —
+    // no Connect prompt, no vault lookup. (See ToolManifestEntry.identity / Provider.identity.)
+    if (provider.identity === 'service') {
+      throw new Error(
+        `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
+      );
+    }
+
     // The channel's configured auth mode for this provider decides the credential model:
     //   'shared'  → the channel's shared credential (delegate to connectChannel)
     //   'session' → the user's own credential, gated by a per-thread approval
+    //   'union'   → any connected member's own credential, acting as that member
     //   'per-user' / unset → the user's own credential, no gate
     const mode = this.channel && this.channelConfig
       ? await this.channelConfig.getMode(this.identity.teamId, this.channel, providerId)
@@ -220,6 +230,20 @@ export class ConnectContext {
       }
     }
 
+    // 'union' (any connected member): resolve to WHICHEVER channel member has connected this provider
+    // and act AS that member — their user-owned cred is the vault key AND they are the audited actor.
+    // No owner/actor conflation: we never key on the channel and we attribute the real member, not the
+    // caller. If no member is connected yet, fall through so the caller is prompted to connect (and so
+    // becomes the connected member next time).
+    if (mode === 'union') {
+      const member = await this.resolveUnionMember(providerId);
+      if (member) {
+        return new ConnectionHandle(
+          provider, userOwner(member), member, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+        );
+      }
+    }
+
     if (await this.vault.get(userOwner(this.identity), providerId)) {
       return new ConnectionHandle(
         provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
@@ -242,6 +266,24 @@ export class ConnectContext {
     await this.postConnectPrompt(providerId, authorizeUrl);
     this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId);
+  }
+
+  /**
+   * 'union' mode resolver: the first channel member who has a live connection to `provider`, built as
+   * a SlackIdentity (their userId, the caller's team — invariant 2: never the channel's). Returns null
+   * when no member is connected (fail-closed list → no resolution). The member becomes BOTH the vault
+   * owner and the audited actor, so the credential's owner and the acting human stay the same real
+   * person; the channel is never the owner and the caller is never credited with another's action.
+   */
+  private async resolveUnionMember(provider: string): Promise<SlackIdentity | null> {
+    if (!this.channel) return null;
+    // ponytail: linear scan of members × one vault.get each; fine for normal channels. If a huge
+    // channel makes this hot, add a "connected members for (team, channel, provider)" index query.
+    for (const userId of await listChannelMembers(this.client, this.channel)) {
+      const member: SlackIdentity = { enterpriseId: this.identity.enterpriseId, teamId: this.identity.teamId, userId };
+      if (await this.vault.get(userOwner(member), provider)) return member;
+    }
+    return null;
   }
 
   /**
@@ -327,7 +369,7 @@ export class ConnectContext {
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
-    if (cm === 'per-user' || cm === 'session') {
+    if (cm != null && cm !== 'shared') {
       throw new Error(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
     }
     await this.vault.upsert(owner, providerId, {
@@ -351,7 +393,7 @@ export class ConnectContext {
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
-    if (cm === 'per-user' || cm === 'session') {
+    if (cm != null && cm !== 'shared') {
       throw new Error(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
     }
     await this.vault.reference(owner, providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
@@ -394,7 +436,7 @@ export class ConnectContext {
       throw new Error(`"${providerId}" is not enabled in this channel.`);
     }
     const m = await cfg.getMode(owner.teamId, channel, providerId);
-    if (m === 'per-user' || m === 'session') {
+    if (m != null && m !== 'shared') {
       throw new Error(`Channel "${channel}" uses ${m} credentials for "${providerId}"; use connect() instead.`);
     }
     if (!(await this.vault.get(owner, providerId))) {
@@ -433,7 +475,9 @@ export class ConnectContext {
       const mode = this.channel && this.channelConfig
         ? await this.channelConfig.getMode(this.identity.teamId, this.channel, provider)
         : null;
-      out.push({ provider, mode, enabled });
+      // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
+      const identity = this.registry.get(provider).identity ?? 'acting_human';
+      out.push({ provider, mode, enabled, identity });
     }
     return out;
   }
@@ -663,11 +707,11 @@ export async function createVouchr(opts: VouchrOptions) {
         return respond(`${on ? 'Enabled' : 'Disabled'} *${arg}* in <#${command.channel_id}>.`);
       }
 
-      // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant).
-      // Admin-gated + audited in setChannelMode.
+      // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant)
+      // | union (any connected member, acting as that member). Admin-gated + audited in setChannelMode.
       if (sub === 'mode') {
-        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user' && arg2 !== 'session')) {
-          return respond('Usage: `/vouchr mode <provider> <shared|per-user|session>`');
+        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user' && arg2 !== 'session' && arg2 !== 'union')) {
+          return respond('Usage: `/vouchr mode <provider> <shared|per-user|session|union>`');
         }
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
         if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');

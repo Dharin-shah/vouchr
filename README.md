@@ -135,6 +135,7 @@ in Slack by an admin, not hardcoded in your agent:
 /vouchr mode github     session    # per-user token, only inside the approving thread
 /vouchr mode confluence shared     # one channel token (set via /vouchr configure)
 /vouchr mode gdocs      per-user   # each user's own token (the default)
+/vouchr mode jira       union      # any connected member's token, acting AS that member
 ```
 
 Your handler stays scope-agnostic; `connect(provider)` reads the mode and routes automatically:
@@ -149,6 +150,30 @@ In **session** mode the provider is usable only inside the thread the user appro
 approval cannot be reused elsewhere. The first call posts an ephemeral "Allow github here" button and
 throws `SessionApprovalRequiredError` (catch and stop the turn, like `ConsentRequiredError`). Grants
 expire after a TTL ceiling (`sessionTtlMs`, default 8h) and are cleared on offboarding.
+
+In **union** mode `connect()` resolves against *whichever* channel member has connected the provider
+and acts **as that member** — their own credential is used and **that member is the audited actor**,
+never the caller and never the channel. It's still per-user credentials (there is no shared channel
+token); union just widens resolution from "only you" to "any connected member", which fits a shared
+team channel where anyone's connection should let the agent act. If no member is connected yet, the
+caller gets the normal Connect prompt and becomes the first connected member. There is no owner/actor
+conflation: the credential owner and the acting human are the same real person.
+
+## When to use Vouchr vs a service-to-service MCP
+
+Scoping "tools per channel" splits into two structurally different things that need different
+mechanisms — the boundary is **whose identity the tool acts as**:
+
+| | Acts as… | Credential | Use |
+|---|---|---|---|
+| **Per-human tool** (`identity: 'acting_human'`, default) | the human in the channel | that human's OAuth/key + explicit consent | **Vouchr.** `connect()` resolves the credential, runs the consent flow, and audits the acting human. |
+| **Service-to-service tool** (`identity: 'service'`) | the agent itself | the agent's own service auth (internal egress allowlist) | **Not Vouchr.** There is no human credential to broker, so the host wires its own service auth. `connect()` on a `service` provider refuses with no consent flow. |
+
+The trap is pushing a service-to-service tool through the consent flow — there's no human credential
+there, so consent is meaningless. A provider declares which it is (`identity: 'service'` on
+`defineProvider`; default `'acting_human'`), and `toolManifest()` reports it per provider so a host
+can render one manifest with both kinds side by side. See
+[`examples/channel-tool-manifest.ts`](./examples/channel-tool-manifest.ts) for a mixed manifest.
 
 ## Providers
 

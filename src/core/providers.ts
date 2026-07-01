@@ -11,6 +11,14 @@ export interface Provider {
    *    are unused.
    */
   credential?: 'oauth' | 'key';
+  /**
+   * Whether the agent calls this provider AS the human (default) or AS a service. Drives the
+   * tool-manifest `identity` and whether Vouchr brokers it:
+   *  - 'acting_human' (default): Vouchr resolves the human's credential + consent via connect().
+   *  - 'service': a service-to-service tool the host runs with its own service auth; connect()
+   *     refuses it (no human credential to broker, no consent flow). See ToolManifestEntry.identity.
+   */
+  identity?: 'service' | 'acting_human';
   authorizeUrl: string;
   tokenUrl: string;
   scopesDefault: string[];

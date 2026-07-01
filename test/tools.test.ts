@@ -107,8 +107,8 @@ test('toolManifest returns the expected shape', async () => {
   // Unconfigured channel → every provider enabled, mode null.
   let m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: true },
-    { provider: 'other', mode: null, enabled: true },
+    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: true, identity: 'acting_human' },
   ]);
 
   // After configuring: mcp enabled + shared, other implicitly disabled.
@@ -116,8 +116,8 @@ test('toolManifest returns the expected shape', async () => {
   await c.setChannelMode('mcp', 'per-user');
   m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: 'per-user', enabled: true },
-    { provider: 'other', mode: null, enabled: false },
+    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' },
   ]);
 });
 
@@ -133,8 +133,8 @@ test('toolManifest reflects a Policy deny (intersects channel tools and policy)'
 
   const m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: true },
-    { provider: 'other', mode: null, enabled: false }, // tool-enabled but policy-denied
+    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' }, // tool-enabled but policy-denied
   ]);
 
   // Consistency: connect() actually refuses the provider the manifest marks disabled.
