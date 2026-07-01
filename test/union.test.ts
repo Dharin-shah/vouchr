@@ -30,28 +30,38 @@ const svc = defineProvider({
   egressAllow: ['api.test'], refresh: 'none', pkce: false,
 });
 
-function build(channel: string | null = 'C_FIN', members: string[] = ['U_CALLER', 'U_ALICE']) {
+const ELIGIBLE = { id: 'C_FIN', is_channel: true };
+
+function build(members: string[] = ['U_CALLER', 'U_ALICE'], info: any = ELIGIBLE, isMember = true) {
   const posted: any[] = [];
   const client = {
     users: { info: async () => ({ user: { is_admin: true } }) },
     conversations: {
-      info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }),
+      info: async () => ({ channel: info }),
       members: async () => ({ members }),
     },
     chat: { postEphemeral: async (a: any) => { posted.push(a); }, postMessage: async (a: any) => { posted.push(a); } },
   } as any;
+  // isChannelMember() calls conversations.members and checks inclusion; honor the isMember knob by
+  // omitting the caller from the returned list when membership should read false.
+  if (!isMember) client.conversations.members = async () => ({ members: members.filter((m: string) => m !== 'U_CALLER') });
   return { client, posted };
 }
 
-async function ctx(channel: string | null = 'C_FIN', members: string[] = ['U_CALLER', 'U_ALICE']) {
+async function ctx(
+  channel: string | null = 'C_FIN',
+  members: string[] = ['U_CALLER', 'U_ALICE'],
+  opts: { info?: any; requireMembership?: boolean; isMember?: boolean } = {},
+) {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const { client, posted } = build(channel, members);
+  const { client, posted } = build(members, opts.info ?? ELIGIBLE, opts.isMember ?? true);
   const c = new ConnectContext(
     CALLER, channel, client, new ProviderRegistry([mcp, svc]), vault, audit,
     new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db), new ChannelTools(db),
     new Map(), () => {}, ['mcp', 'svc'],
+    undefined, opts.requireMembership ?? false,
   );
   return { c, db, vault, audit, posted, cfg: new ChannelConfig(db) };
 }
@@ -91,6 +101,43 @@ test('union with no connected member prompts the caller for consent', async () =
   await (c as any).channelConfig.setMode('T1', 'C_FIN', 'mcp', 'union');
   await assert.rejects(() => c.connect('mcp'), ConsentRequiredError);
   assert.equal(posted.length, 1); // a Connect prompt was posted to the caller
+});
+
+// SECURITY: a channel set to union while internal, then converted to Slack Connect / externally
+// shared, must STOP borrowing a member's cred at use time — a member's third-party credential must
+// never leak cross-org. Mirrors the shared-cred ext-shared refusal.
+test('union refuses on an externally-shared channel (use-time eligibility re-check)', async () => {
+  const { c, db, vault } = await ctx('C_FIN', ['U_CALLER', 'U_ALICE'], {
+    info: { id: 'C_FIN', is_ext_shared: true }, // channel turned Slack Connect after union was set
+  });
+  await new ChannelConfig(db).setMode('T1', 'C_FIN', 'mcp', 'union');
+  await vault.upsert(userOwner(ALICE), 'mcp', tok('alice@example.com')); // Alice is connected
+  // No handle is returned: the ineligible channel refuses BEFORE resolving any member's credential.
+  await assert.rejects(() => c.connect('mcp'), /externally shared/);
+});
+
+// SECURITY: with requireChannelMembership on, a non-member (e.g. an external caller) cannot borrow a
+// member's union credential. Fail-closed and audited 'denied' with reason 'not-member'.
+test('union refuses a non-member caller when membership is required', async () => {
+  const { c, db, vault } = await ctx('C_FIN', ['U_ALICE'], { requireMembership: true, isMember: false });
+  await new ChannelConfig(db).setMode('T1', 'C_FIN', 'mcp', 'union');
+  await vault.upsert(userOwner(ALICE), 'mcp', tok('alice@example.com'));
+  await assert.rejects(() => c.connect('mcp'), /must be a member/);
+  const denied = (await db.get(`SELECT meta FROM audit WHERE action='denied' ORDER BY at DESC LIMIT 1`)) as any;
+  assert.ok(denied.meta.includes('not-member')); // audited fail-closed with the reason
+});
+
+// With 2+ connected members, selection is DETERMINISTIC (sorted by userId), so the borrowed and
+// audited credential can't drift between calls regardless of Slack's member ordering.
+test('union picks the same member deterministically with multiple connected members', async () => {
+  // Slack returns members in arbitrary order; sorted selection must always pick U_ALICE (< U_BOB).
+  const BOB = { enterpriseId: null, teamId: 'T1', userId: 'U_BOB' };
+  const { c, db, vault } = await ctx('C_FIN', ['U_BOB', 'U_ALICE', 'U_CALLER']);
+  await new ChannelConfig(db).setMode('T1', 'C_FIN', 'mcp', 'union');
+  await vault.upsert(userOwner(ALICE), 'mcp', tok('alice@example.com'));
+  await vault.upsert(userOwner(BOB), 'mcp', tok('bob@example.com'));
+  const handle = await c.connect('mcp');
+  assert.equal(await handle.account(), 'alice@example.com'); // U_ALICE < U_BOB → Alice always wins
 });
 
 // A 'service' tool is OUT of Vouchr's scope: connect() refuses it with NO consent flow at all.

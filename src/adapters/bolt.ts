@@ -236,6 +236,18 @@ export class ConnectContext {
     // caller. If no member is connected yet, fall through so the caller is prompted to connect (and so
     // becomes the connected member next time).
     if (mode === 'union') {
+      // Union borrows another member's user-owned cred THROUGH the channel, so it inherits the SAME
+      // channel-eligibility rule as a shared cred (invariant 6): never resolve on an externally-shared /
+      // Slack Connect channel, or a member's third-party credential would leak cross-org. Re-checked at
+      // USE time (not just at config) because a channel can turn Slack Connect after union was set —
+      // mirrors connectChannel's use-time guard. Fails CLOSED (null info → refuse).
+      await this.assertChannelEligible();
+      // Governance parity with shared creds: when membership is required, only an actual channel member
+      // may borrow. Fail-closed (isChannelMember is false on any error / unverifiable membership).
+      if (this.requireMembership && !(await isChannelMember(this.client, this.channel!, this.identity.userId))) {
+        await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'not-member' });
+        throw new Error(`You must be a member of this channel to use a shared "${providerId}" connection.`);
+      }
       const member = await this.resolveUnionMember(providerId);
       if (member) {
         return new ConnectionHandle(
@@ -279,7 +291,10 @@ export class ConnectContext {
     if (!this.channel) return null;
     // ponytail: linear scan of members × one vault.get each; fine for normal channels. If a huge
     // channel makes this hot, add a "connected members for (team, channel, provider)" index query.
-    for (const userId of await listChannelMembers(this.client, this.channel)) {
+    // Sort by userId so selection is DETERMINISTIC: Slack's conversations.members ordering is
+    // arbitrary, and with 2+ connected members a non-deterministic pick would make the borrowed (and
+    // audited) credential change between calls. Sorted → the same member always wins.
+    for (const userId of [...(await listChannelMembers(this.client, this.channel))].sort()) {
       const member: SlackIdentity = { enterpriseId: this.identity.enterpriseId, teamId: this.identity.teamId, userId };
       if (await this.vault.get(userOwner(member), provider)) return member;
     }
