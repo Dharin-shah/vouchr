@@ -4,13 +4,22 @@
  * human is acting. The broker verifies the token and injects the real credential; your agent never
  * sees it.
  *
- * Run against a local broker (two terminals):
- *   1) VOUCHR_IDENTITY_SECRET=dev-secret VOUCHR_MASTER_KEY=$(openssl rand -base64 32) \
- *      VOUCHR_DB=:memory: VOUCHR_PROVIDERS='[{"id":"github","credential":"key","egressAllow":["api.github.com"]}]' \
- *      npm run broker
- *   2) BROKER_URL=http://localhost:3000 VOUCHR_IDENTITY_SECRET=dev-secret \
- *      node --import tsx examples/broker-client/client.ts
- * (You'll get "not connected" until a credential is seeded — see `npm run seed` in DEPLOYMENT.md.)
+ * Run against a local broker. The seed and the broker must share the SAME db file AND master key
+ * (a file DB, not :memory: — that's per-process; a random key per process wouldn't decrypt either):
+ *
+ *   export VOUCHR_MASTER_KEY=$(openssl rand -base64 32)
+ *   export VOUCHR_DB=/tmp/vouchr-demo.db
+ *   export VOUCHR_IDENTITY_SECRET=dev-secret
+ *
+ *   # terminal A — seed a credential for user T1/U1, then start the broker:
+ *   VOUCHR_SEED_ACCESS_TOKEN=ghp_xxx node --import tsx bin/broker-seed.ts key \
+ *       --provider github --team T1 --user U1
+ *   VOUCHR_PROVIDERS='[{"id":"github","credential":"key","egressAllow":["api.github.com"]}]' npm run broker
+ *
+ *   # terminal B — call through the broker as that user:
+ *   BROKER_URL=http://localhost:3000 node --import tsx examples/broker-client/client.ts
+ *
+ * See `npm run seed` in guides/DEPLOYMENT.md for reference vs key modes.
  */
 import { mintIdentity } from '../../src'; // published package: from 'vouchr'
 
