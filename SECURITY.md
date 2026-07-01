@@ -2,6 +2,9 @@
 
 Vouchr is a credential broker. Security reports are taken seriously and prioritized.
 
+For the detailed trust-boundary review, see the [threat model](./guides/THREAT-MODEL.md).
+For production setup, see the [deployment guide](./guides/DEPLOYMENT.md).
+
 ## Reporting a vulnerability
 
 **Do not open a public issue for a vulnerability.** Use GitHub's private vulnerability

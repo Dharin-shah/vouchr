@@ -105,7 +105,7 @@ tenant- and owner-isolation boundary.
 
 Token columns (`access_token_enc`, `refresh_token_enc`) and the installation
 `bot_token`/`data` are encrypted; the rest of each row is plaintext (see
-[SECURITY.md](./SECURITY.md) for at-rest caveats). A `source` of `vault` means Vouchr
+[SECURITY.md](../SECURITY.md) for at-rest caveats). A `source` of `vault` means Vouchr
 holds the encrypted secret; any other `source` means the row stores a non-secret
 `secret_ref` resolved just-in-time.
 
@@ -173,6 +173,6 @@ provider is usable only inside the Slack thread the user approved it in (a grant
 `(team_id, channel, thread, user_id, provider)`), with a TTL ceiling. Grants live in `session_grant`,
 are cleared on offboarding, and are removed by `sweepExpired()`.
 
-See [SECURITY.md](./SECURITY.md) for the security model and limits, and
+See [SECURITY.md](../SECURITY.md) for the security model and limits, and
 [THREAT-MODEL.md](./THREAT-MODEL.md) for trust boundaries, the attacker model, and the
 enforced invariants.

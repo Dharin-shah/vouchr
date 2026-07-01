@@ -31,10 +31,8 @@
     "LICENSE",
     "CHANGELOG.md",
     "SECURITY.md",
-    "THREAT-MODEL.md",
-    "ARCHITECTURE.md",
-    "DEPLOYMENT.md",
-    "SECURITY-WHITEPAPER.md"
+    "CONTRIBUTING.md",
+    "guides/**"
   ],
   "engines": {
     "node": ">=22"
