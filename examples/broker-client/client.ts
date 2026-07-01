@@ -21,7 +21,7 @@
  *
  * See `npm run seed` in guides/DEPLOYMENT.md for reference vs key modes.
  */
-import { mintIdentity } from '../../src'; // published package: from 'vouchr'
+import { mintIdentity } from '../../src'; // published package: from '@vouchr/core'
 
 export interface Acting {
   teamId: string;

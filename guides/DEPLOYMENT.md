@@ -236,13 +236,14 @@ setting both is rejected at boot.
 
 Vouchr ships two ways; pick by how your platform builds:
 
-- **npm library (`vouchr`)** — the primary artifact. `npm install vouchr`, then a thin service that
-  calls `buildBrokerServer`. This is the right fit when your platform builds images from its own base
-  and needs to inject a rotating-serviceauth `authorize` hook (see below). A ~15-line wrapper:
+- **npm library (`@vouchr/core`)** — the primary artifact. `npm install @vouchr/core`, then a thin
+  service that calls `buildBrokerServer`. This is the right fit when your platform builds images from
+  its own base and needs to inject a rotating-serviceauth `authorize` hook (see below). A ~15-line
+  wrapper:
 
   ```ts
   // server.ts — your repo, your base image, your auth
-  import { buildBrokerServer } from 'vouchr/broker-server';
+  import { buildBrokerServer } from '@vouchr/core/broker-server';
   import { readFileSync } from 'node:fs';
 
   const built = await buildBrokerServer(process.env, {

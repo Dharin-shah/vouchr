@@ -8,7 +8,7 @@ request, and never persists or caches it. Rotation stays entirely in AWS SM.
 ## Usage
 
 ```ts
-import { createVouchr, github } from 'vouchr';
+import { createVouchr, github } from '@vouchr/core';
 import { awsSecretsManager } from './resolver';
 
 const vouchr = await createVouchr({
