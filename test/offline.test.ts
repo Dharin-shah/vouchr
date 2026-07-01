@@ -284,6 +284,42 @@ test('injector: refreshes on 401, retries with the new token, and persists it', 
   }
 });
 
+test('injector: an audit failure during refresh does NOT roll back or fail the rotation', async () => {
+  // The provider consumes (rotates) the old refresh token during /token, so audit must run AFTER the
+  // refresh commits and be best-effort — otherwise a thrown audit write would undo the stored new
+  // token and leave us holding an already-invalidated refresh token (bricked connection).
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const brokenAudit = {
+    record: async (action: string) => { if (action === 'refresh') throw new Error('audit sink down'); },
+  } as unknown as Audit;
+  const provider = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true, clientId: 'id', clientSecret: 'sec',
+  });
+  await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any) => {
+    if (String(url) === 'https://acme.example/token') {
+      return new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const auth = new Headers(init.headers).get('authorization');
+    if (auth === 'Bearer old') return new Response('expired', { status: 401 });
+    return new Response(JSON.stringify({ saw: auth }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const handle = new ConnectionHandle(provider, O1, ID, vault, brokenAudit);
+    const res = await handle.fetch('https://api.acme.example/thing'); // must not throw despite audit failure
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).saw, 'Bearer new');
+    assert.equal((await vault.get(O1, 'acme'))?.accessToken, 'new'); // rotation survived the audit failure
+    assert.equal((await vault.get(O1, 'acme'))?.refreshToken, 'r2');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('vault: list returns a user\'s connected providers, isolated per identity', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);

@@ -202,7 +202,13 @@ export class ConnectionHandle {
     if (!before?.refreshToken) return null;
     const lockWait = this.vault.crossProcessRefresh; // only emit the wait metric when a real lock exists
     const t0 = Date.now();
-    return this.vault.withRefreshLock(this.owner, this.provider.id, async (vault) => {
+    // Track whether we actually rotated so the audit/emit run AFTER the transaction commits — never
+    // inside it. On rotating-token providers the /token call has already consumed the old refresh
+    // token by the time we write the new one, so if audit.record() threw inside withRefreshLock it
+    // would ROLL BACK the freshly-stored token, leaving us holding an already-invalidated refresh
+    // token and bricking the connection. Bookkeeping must not be able to undo a committed rotation.
+    let rotated = false;
+    const token = await this.vault.withRefreshLock(this.owner, this.provider.id, async (vault) => {
       // Re-read UNDER the lock: another tx may already have rotated since the read above.
       const stored = await vault.get(this.owner, this.provider.id);
       const waitMs = Date.now() - t0;
@@ -223,9 +229,14 @@ export class ConnectionHandle {
         scopes: refreshed.scopes ?? stored.scopes,
         expiresAt: refreshed.expiresAt,
       });
-      await this.audit.record('refresh', this.acting, this.provider.id, {});
-      this.emit({ type: 'refreshed', provider: this.provider.id });
+      rotated = true;
       return refreshed.accessToken;
     });
+    // Post-commit, best-effort: a failed audit write must not surface as a failed refresh nor undo it.
+    if (rotated) {
+      await this.audit.record('refresh', this.acting, this.provider.id, {}).catch(() => undefined);
+      this.emit({ type: 'refreshed', provider: this.provider.id });
+    }
+    return token;
   }
 }
