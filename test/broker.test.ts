@@ -298,6 +298,17 @@ test('fetch: a service-to-service provider is refused (403), never brokered', as
   }
 });
 
+test('resolve: a service-to-service provider is refused (403), never reported connected', async () => {
+  const { server, port } = await makeBroker({ providers: [acme, svc] });
+  try {
+    const token = signIdentity(claims(), SECRET);
+    const r = await post(port, '/v1/resolve', { handle: { provider: 'svc', owner: 'user' }, identityToken: token });
+    assert.equal(r.status, 403); // not {connected|needs_consent}: Vouchr does not broker service tools
+  } finally {
+    server.close();
+  }
+});
+
 test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the attacker their OWN (empty) owner', async () => {
   const { server, port } = await makeBroker();
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));

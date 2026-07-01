@@ -308,6 +308,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
+    // Service-to-service tools are not brokered by Vouchr — don't even report their consent state
+    // (else /v1/resolve would call a service tool "connected"/"needs_consent"). Refuse like /v1/fetch.
+    if (registry.get(ref.provider).identity === 'service') {
+      throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    }
     const claims = await verify(body.identityToken);
     const { owner } = ownerFromClaims(claims);
     const connected = (await opts.vault.get(owner, ref.provider)) != null;

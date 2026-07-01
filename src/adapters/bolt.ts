@@ -329,8 +329,10 @@ export class ConnectContext {
     await this.audit.record('config', this.identity, providerId, { owner: 'user', kind: 'ref', source: r.source });
   }
 
-  /** Whether the user already has a stored connection (no prompt side-effect). */
+  /** Whether the user already has a stored connection (no prompt side-effect). A service-to-service
+   *  tool is never a Vouchr-brokered connection, so it always reports false (never "connected"). */
   async isConnected(providerId: string): Promise<boolean> {
+    if (this.registry.get(providerId).identity === 'service') return false;
     return (await this.vault.get(userOwner(this.identity), providerId)) != null;
   }
 
@@ -774,7 +776,11 @@ export async function createVouchr(opts: VouchrOptions) {
         return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
       }
 
-      const conns = await vault.listForUser(identity);
+      // Never list a service-to-service tool as a "connected account": Vouchr doesn't broker those,
+      // so they don't belong in the user's Vouchr connection status (defensive — storage is blocked).
+      const conns = (await vault.listForUser(identity)).filter((c) => {
+        try { return registry.get(c.provider).identity !== 'service'; } catch { return true; }
+      });
       if (!conns.length) return respond('No connected accounts. They are created on demand when an agent needs one.');
       const lines = conns
         .map((c) => `• *${c.provider}*${c.externalAccount ? ` (${c.externalAccount})` : ''}`)

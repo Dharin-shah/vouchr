@@ -160,6 +160,15 @@ test('service identity: user-key and channel-config paths also refuse it', async
   await assert.rejects(() => c.setChannelSecret('svc', 'k'), /service-to-service/);
 });
 
+// Read/status paths must not report a service tool as a Vouchr connection either.
+test('service identity: isConnected always reports false (never a Vouchr connection)', async () => {
+  const { c, vault } = await ctx();
+  // Even if a stray cred somehow existed, a service tool is not brokered → isConnected is false.
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U_CALLER' }), 'svc', tok('x'));
+  assert.equal(await c.isConnected('svc'), false);
+  assert.equal(await c.isConnected('mcp'), false); // acting_human with no cred is genuinely not connected
+});
+
 // Contrast: an acting_human tool with no stored cred DOES route through the consent flow.
 test('acting_human identity: connect routes through consent', async () => {
   const { c, db, posted } = await ctx();
