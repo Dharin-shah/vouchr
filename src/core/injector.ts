@@ -84,7 +84,7 @@ export class ConnectionHandle {
   }
 
   /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
-  private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number): void {
+  private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number, method?: string): void {
     try {
       this.auditSink({
         ts: new Date().toISOString(),
@@ -95,6 +95,7 @@ export class ConnectionHandle {
         ownerId: this.owner.id,
         action,
         egressHost,
+        method,
         status,
         jti: randomUUID(),
       });
@@ -109,6 +110,7 @@ export class ConnectionHandle {
 
   async fetch(input: string, init: RequestInit = {}): Promise<Response> {
     const url = new URL(input);
+    const method = (init.method ?? 'GET').toUpperCase();
     if (url.username || url.password) {
       this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
       throw new Error(`Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
@@ -135,7 +137,6 @@ export class ConnectionHandle {
       );
     }
     if (this.provider.egressMethods) {
-      const method = (init.method ?? 'GET').toUpperCase();
       if (!this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
         this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'method' });
         throw new Error(
@@ -182,12 +183,12 @@ export class ConnectionHandle {
     // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
     const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
     await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, status: res.status, ...channelMeta })
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta })
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
     // Audit stream copy (raw actor id, for host-side ingestion). Lossy; the audit table is authoritative.
-    this.emitAudit('fetch', url.hostname, res.status);
+    this.emitAudit('fetch', url.hostname, res.status, method);
     return res;
   }
 

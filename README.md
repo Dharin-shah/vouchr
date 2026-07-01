@@ -231,6 +231,25 @@ More examples:
 - [Postgres + KMS deployment](./examples/postgres-kms)
 - [Sidecar broker](./examples/sidecar)
 
+## Headless Broker Writes
+
+The HTTP broker is read-only by default: non-`GET`/`HEAD` requests return `405` before any credential
+lookup. Write requests require two explicit opt-ins:
+
+```ts
+const broker = createBroker({
+  providers: [
+    github({ egressMethods: ['GET', 'POST'] }), // provider-level method allowlist
+  ],
+  allowWrites: true,                            // broker-level write switch
+  // vault, audit, db, identitySecret...
+});
+```
+
+Providers without `egressMethods` remain `GET`/`HEAD`-only even when `allowWrites` is enabled.
+Write bodies are small JSON/text payloads, capped at 64 KiB, and still go through the same identity
+verification, replay guard, policy, channel-tool, host/path/method, and HTTPS checks as reads.
+
 ## Production Notes
 
 - **Treat consent prompts as control flow.** `ConsentRequiredError` and

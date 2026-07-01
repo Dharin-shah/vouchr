@@ -27,15 +27,15 @@ export interface ConnectionHandleRef {
   owner: 'user';
 }
 
-/** Read-only by construction: the type itself admits only GET/HEAD; the runtime re-checks (#25). */
 export interface BrokerFetchRequest {
   handle: ConnectionHandleRef;
   identityToken: string; // caller-minted, HS256-signed; broker verifies (see identity.ts)
-  method: 'GET' | 'HEAD';
+  method: string;
   path: string; // appended to the provider host; the injector enforces the egress allowlist
   host?: string; // optional pick among a multi-host provider; defaults to egressAllow[0]
   query?: Record<string, string>;
   headers?: Record<string, string>; // allowlisted; Authorization is dropped (broker injects)
+  body?: string; // optional small write payload; capped before forwarding
 }
 
 export interface BrokerOptions {
@@ -87,6 +87,12 @@ export interface BrokerOptions {
    * opt in explicitly with `egressMethods`. Off (default) preserves the additive behavior.
    */
   defaultDenyNonGet?: boolean;
+  /**
+   * Opt-in broker write path. Default false keeps the historical GET/HEAD-only broker behavior.
+   * When true, non-GET/HEAD requests are still allowed only for providers with explicit
+   * `egressMethods`; providers with no method allowlist remain GET/HEAD-only.
+   */
+  allowWrites?: boolean;
   /** #26 content-type allowlist (lower-cased, charset-stripped match). Default application/json. */
   allowedContentTypes?: string[];
   /** #26 response size cap in bytes; over-cap is rejected 413, never truncated. Default 1 MiB. */
@@ -100,7 +106,9 @@ export interface BrokerOptions {
 
 const DEFAULT_ALLOWED_CT = ['application/json'];
 const DEFAULT_MAX_BYTES = 1024 * 1024;
-const REQUEST_BODY_CAP = 64 * 1024; // request envelopes are tiny; reject anything larger.
+const READ_REQUEST_CAP = 64 * 1024; // read envelopes are tiny; reject anything larger.
+const WRITE_BODY_CAP = 64 * 1024;
+const WRITE_REQUEST_CAP = WRITE_BODY_CAP + READ_REQUEST_CAP;
 
 class HttpError extends Error {
   constructor(public status: number, public payload: Record<string, unknown>) {
@@ -114,17 +122,35 @@ export function withEgressDefaults(p: Provider, defaultDenyNonGet?: boolean): Pr
   return p;
 }
 
+function requestMethod(method: unknown): string {
+  return typeof method === 'string' ? method.toUpperCase() : '';
+}
+
+function requestBody(body: unknown): string | undefined {
+  if (body == null) return undefined;
+  if (typeof body !== 'string') throw new HttpError(400, { error: 'invalid body' });
+  if (Buffer.byteLength(body, 'utf8') > WRITE_BODY_CAP) {
+    throw new HttpError(413, { error: 'request body too large' });
+  }
+  return body;
+}
+
 /** #26: normalize a content-type to its bare type, case-folded, charset/params dropped. */
 function normalizeContentType(ct: string | null): string {
   return (ct ?? '').split(';')[0].trim().toLowerCase();
 }
 
-async function readJson(req: http.IncomingMessage): Promise<any> {
+function responseHasNoBody(res: Response): boolean {
+  const contentLength = res.headers.get('content-length');
+  return res.status === 204 || res.status === 205 || (contentLength != null && Number(contentLength) === 0);
+}
+
+async function readJson(req: http.IncomingMessage, cap = READ_REQUEST_CAP): Promise<any> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > REQUEST_BODY_CAP) throw new HttpError(413, { error: 'request body too large' });
+    if (total > cap) throw new HttpError(413, { error: 'request body too large' });
     chunks.push(chunk as Buffer);
   }
   if (!chunks.length) return {};
@@ -240,7 +266,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
     const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
-    const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet);
+    const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet || opts.allowWrites);
     const { owner, acting } = ownerFromClaims(claims);
     // ponytail: per-request inflight Map (parent's design — cross-request single-flight is its scope,
     // not this task's). The 8th arg wires the metrics sink so the broker path stops being a black box;
@@ -250,9 +276,14 @@ export function createBroker(opts: BrokerOptions): http.Server {
   }
 
   async function handleFetch(body: BrokerFetchRequest, trace: Record<string, string> = {}): Promise<{ status: number; payload: Record<string, unknown> }> {
-    // #25: fail-closed read-only. Reject non-GET/HEAD with 405 BEFORE the vault is ever touched.
-    if (body.method !== 'GET' && body.method !== 'HEAD') {
+    const method = requestMethod(body.method);
+    // Default fail-closed read-only. Reject non-GET/HEAD with 405 BEFORE identity/vault/upstream.
+    if (!opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
       throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
+    }
+    const outboundBody = requestBody(body.body);
+    if ((method === 'GET' || method === 'HEAD') && outboundBody !== undefined) {
+      throw new HttpError(400, { error: 'GET and HEAD requests cannot carry a body' });
     }
     const { handle, provider } = await resolveTarget(body);
 
@@ -268,7 +299,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // Forward only a tiny safe header allowlist; never the caller's Authorization (broker injects).
     const headers: Record<string, string> = {};
     for (const [k, v] of Object.entries(body.headers ?? {})) {
-      if (['accept', 'accept-language', 'if-none-match'].includes(k.toLowerCase())) headers[k] = v;
+      if (['accept', 'accept-language', 'if-none-match', 'content-type'].includes(k.toLowerCase())) headers[k] = v;
     }
     // W3C trace context read off the INCOMING request (not the body), forwarded verbatim onto the
     // outbound provider fetch so a host can stitch the broker hop into the agent's trace. Non-secret
@@ -278,7 +309,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
 
     let res: Response;
     try {
-      res = await handle.fetch(url.toString(), { method: body.method, headers });
+      res = await handle.fetch(url.toString(), { method, headers, body: outboundBody });
     } catch (e) {
       const msg = (e as Error).message;
       if (/Egress blocked/.test(msg)) throw new HttpError(403, { error: 'egress blocked' });
@@ -287,8 +318,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
 
     const contentType = res.headers.get('content-type') ?? '';
-    // HEAD has no body to guard or relay; return status + content-type only.
-    if (body.method === 'HEAD') {
+    // HEAD/no-content responses have no body to guard or relay; return status + content-type only.
+    if (method === 'HEAD' || responseHasNoBody(res)) {
       res.body?.cancel().catch(() => undefined);
       return { status: 200, payload: { status: res.status, contentType, body: '' } };
     }
@@ -347,7 +378,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           networkGate(req);
-          const r = await handleFetch(await readJson(req), traceHeaders(req));
+          const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req));
           return send(r.status, r.payload);
         }
         if (req.method === 'POST' && url === '/v1/resolve') {
