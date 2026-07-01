@@ -106,7 +106,9 @@ export interface BrokerOptions {
 
 const DEFAULT_ALLOWED_CT = ['application/json'];
 const DEFAULT_MAX_BYTES = 1024 * 1024;
-const REQUEST_BODY_CAP = 64 * 1024; // request envelopes are tiny; reject anything larger.
+const READ_REQUEST_CAP = 64 * 1024; // read envelopes are tiny; reject anything larger.
+const WRITE_BODY_CAP = 64 * 1024;
+const WRITE_REQUEST_CAP = WRITE_BODY_CAP + READ_REQUEST_CAP;
 
 class HttpError extends Error {
   constructor(public status: number, public payload: Record<string, unknown>) {
@@ -127,7 +129,7 @@ function requestMethod(method: unknown): string {
 function requestBody(body: unknown): string | undefined {
   if (body == null) return undefined;
   if (typeof body !== 'string') throw new HttpError(400, { error: 'invalid body' });
-  if (Buffer.byteLength(body, 'utf8') > REQUEST_BODY_CAP) {
+  if (Buffer.byteLength(body, 'utf8') > WRITE_BODY_CAP) {
     throw new HttpError(413, { error: 'request body too large' });
   }
   return body;
@@ -138,12 +140,17 @@ function normalizeContentType(ct: string | null): string {
   return (ct ?? '').split(';')[0].trim().toLowerCase();
 }
 
-async function readJson(req: http.IncomingMessage): Promise<any> {
+function responseHasNoBody(res: Response): boolean {
+  const contentLength = res.headers.get('content-length');
+  return res.status === 204 || res.status === 205 || (contentLength != null && Number(contentLength) === 0);
+}
+
+async function readJson(req: http.IncomingMessage, cap = READ_REQUEST_CAP): Promise<any> {
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
     total += chunk.length;
-    if (total > REQUEST_BODY_CAP) throw new HttpError(413, { error: 'request body too large' });
+    if (total > cap) throw new HttpError(413, { error: 'request body too large' });
     chunks.push(chunk as Buffer);
   }
   if (!chunks.length) return {};
@@ -311,8 +318,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
 
     const contentType = res.headers.get('content-type') ?? '';
-    // HEAD has no body to guard or relay; return status + content-type only.
-    if (method === 'HEAD') {
+    // HEAD/no-content responses have no body to guard or relay; return status + content-type only.
+    if (method === 'HEAD' || responseHasNoBody(res)) {
       res.body?.cancel().catch(() => undefined);
       return { status: 200, payload: { status: res.status, contentType, body: '' } };
     }
@@ -371,7 +378,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           networkGate(req);
-          const r = await handleFetch(await readJson(req), traceHeaders(req));
+          const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req));
           return send(r.status, r.payload);
         }
         if (req.method === 'POST' && url === '/v1/resolve') {

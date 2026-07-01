@@ -277,6 +277,54 @@ test('fetch: allowWrites + provider egressMethods lets a POST body reach upstrea
   }
 });
 
+test('fetch: write no-content responses pass through as empty successful bodies', async () => {
+  const writeAcme = { ...acme, egressMethods: ['PUT', 'DELETE', 'PATCH'] } as Provider;
+  const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
+  const responses = [
+    () => new Response(null, { status: 204 }),
+    () => new Response(null, { status: 205 }),
+    () => new Response('', { status: 200, headers: { 'content-length': '0' } }),
+  ];
+  const up = mockUpstream(() => responses.shift()!());
+  try {
+    const put = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'PUT',
+      path: '/issue/1',
+      body: '{}',
+    });
+    assert.equal(put.status, 200);
+    assert.equal(put.json.status, 204);
+    assert.equal(put.json.body, '');
+
+    const del = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'DELETE',
+      path: '/issue/1',
+      body: '{}',
+    });
+    assert.equal(del.status, 200);
+    assert.equal(del.json.status, 205);
+    assert.equal(del.json.body, '');
+
+    const patch = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'PATCH',
+      path: '/issue/1',
+      body: '{}',
+    });
+    assert.equal(patch.status, 200);
+    assert.equal(patch.json.status, 200);
+    assert.equal(patch.json.body, '');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('fetch: allowWrites still requires per-provider egressMethods', async () => {
   const { server, port } = await makeBroker({ allowWrites: true }); // acme has no egressMethods
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -321,15 +369,26 @@ test('fetch: write body over the broker cap is rejected, never truncated or forw
   const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
+    const maxBody = 'x'.repeat(64 * 1024);
+    const ok = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'POST',
+      path: '/x',
+      body: maxBody,
+    });
+    assert.equal(ok.status, 200);
+    assert.equal(up.seen[0].body, maxBody);
+
     const r = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'user' },
       identityToken: signIdentity(claims(), SECRET),
       method: 'POST',
       path: '/x',
-      body: 'x'.repeat(65 * 1024),
+      body: 'x'.repeat(64 * 1024 + 1),
     });
     assert.equal(r.status, 413);
-    assert.equal(up.seen.length, 0);
+    assert.equal(up.seen.length, 1);
   } finally {
     up.restore();
     server.close();
