@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
 
 /**
  * Verified claims about WHO is acting, minted by a trusted upstream (the receiver that already
@@ -39,6 +39,33 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
   const payload = b64url(JSON.stringify(claims));
   const sig = createHmac('sha256', secret).update(payload).digest('base64url');
   return `${payload}.${sig}`;
+}
+
+/** The acting-human fields a caller supplies per request; the minter fills `jti` and `exp` safely. */
+export type MintIdentityInput = Pick<IdentityClaims, 'teamId' | 'userId' | 'channel' | 'threadTs'>;
+
+/**
+ * Mint a short-lived, single-use identity token for ONE broker call — the safe wrapper around
+ * `signIdentity`. It fills the two fields that are easy to get wrong:
+ *   - a fresh random `jti` (reuse it and the broker rejects the second call as a replay), and
+ *   - `exp = now + ttlMs`, clamped to the 5-minute ceiling the broker enforces.
+ *
+ * Call it on the CALLER side — the agent/runtime that already authenticated the acting human — then
+ * send the returned string as `identityToken` in the /v1/fetch body. The signing secret is the
+ * broker's trust root: keep it only in the minter and the broker, never in the model or the agent's
+ * tool surface. Mint per request; do not cache or reuse a token across calls.
+ */
+export function mintIdentity(input: MintIdentityInput, secret: string, ttlMs = 60_000, now = Date.now()): string {
+  const lifetime = Math.min(Math.max(1, ttlMs), MAX_LIFETIME_MS);
+  const claims: IdentityClaims = {
+    teamId: input.teamId,
+    userId: input.userId,
+    channel: input.channel,
+    ...(input.threadTs !== undefined ? { threadTs: input.threadTs } : {}),
+    jti: randomUUID(),
+    exp: now + lifetime,
+  };
+  return signIdentity(claims, secret);
 }
 
 /**

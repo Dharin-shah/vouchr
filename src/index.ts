@@ -3,8 +3,8 @@ export type { VouchrOptions } from './adapters/bolt';
 // Headless HTTP broker (non-Bolt agent runtimes): signed identity + fail-closed read-only egress.
 export { createBroker } from './adapters/http/broker';
 export type { BrokerOptions, BrokerFetchRequest, ConnectionHandleRef } from './adapters/http/broker';
-export { signIdentity, verifyIdentity, ReplayGuard, IdentityError, MAX_LIFETIME_MS } from './adapters/http/identity';
-export type { IdentityClaims, ReplayStore } from './adapters/http/identity';
+export { signIdentity, mintIdentity, verifyIdentity, ReplayGuard, IdentityError, MAX_LIFETIME_MS } from './adapters/http/identity';
+export type { IdentityClaims, MintIdentityInput, ReplayStore } from './adapters/http/identity';
 export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
