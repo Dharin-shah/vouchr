@@ -183,3 +183,28 @@ test('postgres backend: concurrent cross-process refresh => one /token call, los
     await dbB?.close();
   }
 });
+
+test('postgres backend: DbReplayStore makes a jti single-use cluster-wide', async (t) => {
+  const { DbReplayStore } = await import('../src/adapters/http/replayStore');
+  let db;
+  try {
+    db = await openDb({ databaseUrl: PG_URL });
+    await db.exec('CREATE TABLE IF NOT EXISTS broker_jti (jti TEXT PRIMARY KEY, exp BIGINT NOT NULL)');
+    await db.exec('TRUNCATE broker_jti');
+  } catch {
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
+    return;
+  }
+  try {
+    const podA = new DbReplayStore(db);
+    const podB = new DbReplayStore(db); // two "replicas" sharing one Postgres table
+    const exp = Date.now() + 60_000;
+    assert.equal(await podA.use('pg-jti-1', exp), true);   // fresh on A
+    assert.equal(await podB.use('pg-jti-1', exp), false);  // replay rejected on B (cluster-wide)
+    // concurrent claim of one jti across both pods admits exactly one
+    const race = await Promise.all([podA, podB, podA, podB].map((s) => s.use('pg-race', exp)));
+    assert.equal(race.filter(Boolean).length, 1);
+  } finally {
+    await db.close();
+  }
+});

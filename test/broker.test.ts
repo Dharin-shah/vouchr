@@ -801,3 +801,73 @@ test('egress default-deny: unset egressMethods means GET/HEAD-only under the bro
     globalThis.fetch = real;
   }
 });
+
+// ── standalone-broker seams (PR1) ─────────────────────────────────────────────
+
+test('health: GET /health is an alias for /healthz', async () => {
+  const { server, port } = await makeBroker();
+  try {
+    const hz = await get(port, '/healthz');
+    const h = await get(port, '/health');
+    assert.equal(hz.status, 200);
+    assert.equal(h.status, 200);
+    assert.equal(h.json.ok, true);
+    assert.equal(h.json.dbReachable, true);
+    assert.equal(h.json.signingKeyLoaded, true);
+  } finally {
+    server.close();
+  }
+});
+
+test('perimeter: a custom authorize hook replaces the brokerToken gate (reject then accept)', async () => {
+  const authorize = (req: any) => { if (req.headers['x-svc'] !== 'ok') throw new Error('nope'); };
+  const { server, port } = await makeBroker({ authorize });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const denied = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(denied.status, 401);            // hook threw a plain Error -> 401, before identity verify
+    assert.equal(up.seen.length, 0);             // never reached upstream
+    const ok = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' }, { 'x-svc': 'ok' });
+    assert.equal(ok.status, 200);                // hook passed -> normal flow
+    assert.equal(up.seen.length, 1);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('refresh single-flight: concurrent broker requests collapse to ONE /token call (shared inflight map)', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const refreshing = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: false, clientId: 'id', clientSecret: 'sec',
+  });
+  // Expired token so both concurrent requests trigger a refresh; a slow /token keeps both in the
+  // refresh window at once, so a per-request inflight map would fire TWO /token calls.
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: Date.now() - 1000, externalAccount: null });
+  const server = createBroker({ providers: [refreshing], vault, audit, db, identitySecret: SECRET });
+  await new Promise<void>((r) => server.listen(0, r));
+  const port = (server.address() as any).port;
+  const real = globalThis.fetch;
+  let tokenCalls = 0;
+  globalThis.fetch = (async (url: any) => {
+    if (String(url) === 'https://acme.example/token') {
+      tokenCalls++;
+      await new Promise((r) => setTimeout(r, 50)); // hold both requests in the refresh window
+      return new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const req = () => post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    const [a, b] = await Promise.all([req(), req()]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(tokenCalls, 1, 'shared inflight map must collapse the two concurrent refreshes into one /token call');
+  } finally {
+    globalThis.fetch = real;
+    server.close();
+  }
+});
