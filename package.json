@@ -17,6 +17,10 @@
       "types": "./dist/src/index.d.ts",
       "require": "./dist/src/index.js"
     },
+    "./broker-server": {
+      "types": "./dist/bin/broker-server.d.ts",
+      "require": "./dist/bin/broker-server.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -36,10 +40,14 @@
     "node": ">=22"
   },
   "bin": {
-    "vouchr": "dist/bin/vouchr.js"
+    "vouchr": "dist/bin/vouchr.js",
+    "vouchr-broker": "dist/bin/broker-server.js",
+    "vouchr-seed": "dist/bin/broker-seed.js"
   },
   "scripts": {
     "cli": "node --import tsx bin/vouchr.ts",
+    "broker": "node --import tsx bin/broker-server.ts",
+    "seed": "node --import tsx bin/broker-seed.ts",
     "prepack": "npm run build",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

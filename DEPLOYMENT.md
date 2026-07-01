@@ -136,6 +136,145 @@ const vouchr = await createVouchr({ /* ... */, envelope: kmsEnvelope });
 IAM: `kms:Encrypt` and `kms:Decrypt` on that one key. See `test/envelope.test.ts` for the worked
 sketch this is drawn from.
 
+## Standalone headless broker (no Slack)
+
+Run Vouchr as a plain HTTP service for non-Bolt agent runtimes. Same core (encrypted store, egress
+allowlist, refresh, audit); the front door is signed identity tokens instead of Slack. This is the
+**use** path — it injects credentials the caller already consented to. It is **not** a consent
+product: see *Provisioning* below for how credentials get into the store.
+
+Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
+`POST /v1/resolve`, and `GET /healthz` (alias `/health`) on `VOUCHR_PORT` (default 3000).
+
+### Trust model
+
+The broker trusts a **signed identity token** (HS256, `VOUCHR_IDENTITY_SECRET` shared only with your
+upstream minter), never the request body — the owner is always the verified acting user. Each token
+carries a `jti` that is single-use; on Postgres this is enforced **cluster-wide** (see *Replay*). A
+network perimeter (`VOUCHR_BROKER_TOKEN`, or a pluggable `authorize` hook) is a coarse gate in front,
+NOT identity.
+
+### Environment contract
+
+| Var | Required | Purpose |
+| --- | --- | --- |
+| `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. |
+| `VOUCHR_MASTER_KEY` | yes | base64 of 32 bytes; encrypts tokens at rest (`openssl rand -base64 32`). |
+| `VOUCHR_DATABASE_URL` | prod | `postgres://…` → Postgres. Unset → SQLite (`VOUCHR_DB`, single replica). `DATABASE_URL` is read as a fallback, so a platform-injected one selects the backend. |
+| `VOUCHR_PROVIDERS` / `VOUCHR_PROVIDERS_FILE` | yes | provider config (inline JSON / file path); see below. |
+| `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` | per OAuth provider | client creds, kept out of the JSON. |
+| `VOUCHR_KMS_KEY_ID` | prod | enables the KMS envelope (KEK). Needs `@aws-sdk/client-kms` in the image. |
+| `VOUCHR_BROKER_TOKEN` | no | static bearer for the coarse perimeter gate on `/v1/*`. |
+| `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
+| `VOUCHR_PRODUCTION` | prod | `1` → boot fails fast unless Postgres **and** a KMS envelope are configured. |
+| `VOUCHR_PORT` | no | listen port (default 3000). |
+| `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |
+| `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
+
+Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
+prints one line: port, backend, provider ids, `allowWrites`, mode).
+
+### Provider config (declarative)
+
+Declare providers without editing source. Declarative fields only — a provider needing function
+fields (`inject`, `egressValidate`, `revoke`) must be registered in code. Unknown fields are
+rejected (fail closed). Secrets come from the per-provider env vars above, never the JSON:
+
+```json
+[
+  {
+    "id": "confluence",
+    "authorizeUrl": "https://auth.atlassian.com/authorize",
+    "tokenUrl": "https://auth.atlassian.com/oauth/token",
+    "scopesDefault": ["read:confluence-content.all"],
+    "egressAllow": ["api.atlassian.com"],
+    "refresh": "rotating",
+    "pkce": true
+  }
+]
+```
+
+With no `egressMethods`, the broker default-denies non-GET/HEAD — a read-only provider. Opt into
+writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the provider.
+
+### Provisioning (how credentials get in)
+
+- **Shared / referenced credential** (channel- or team-owned): seed it without Slack.
+  ```bash
+  # a pointer to an external secret manager (nothing sensitive stored by Vouchr):
+  npm run seed -- reference --provider confluence --team T1 --channel C1 \
+      --source aws-sm --secret-ref arn:aws:secretsmanager:…:secret/confluence
+  # or a static token — pass it in the environment, NOT on the command line:
+  VOUCHR_SEED_ACCESS_TOKEN="$TOKEN" npm run seed -- key --provider internal --team T1 --channel C1
+  ```
+  Prefer `VOUCHR_SEED_ACCESS_TOKEN`: a `--access-token` flag lands in `process.argv`, visible via
+  `ps`/`/proc` to any co-tenant. The flag exists only for interactive use.
+- **Per-user credentials** (each human's own account): the broker does **not** run OAuth consent.
+  Run the Bolt control-plane Vouchr against the **same Postgres database**; users connect in Slack,
+  and the headless broker reads what they consented to. One store, two front doors.
+
+### Replay (multi-replica)
+
+A signed `jti` must be single-use across the fleet. On Postgres the broker installs a shared
+`DbReplayStore` (`INSERT … ON CONFLICT DO NOTHING` on a `broker_jti` table) automatically, so a token
+replayed against a different pod is rejected. This is why `replicas > 1` is safe on Postgres and
+**not** on SQLite (the in-memory guard is per-process — run a single replica there).
+
+### Perimeter auth
+
+`VOUCHR_BROKER_TOKEN` gives a static shared-bearer gate. When your platform issues rotating service
+tokens (serviceauth/SPIFFE/mesh mTLS), don't try to express that as a static token — either enforce
+it at the mesh/sidecar in front of the broker, or inject a `BrokerOptions.authorize(req)` hook from a
+thin wrapper around `buildBrokerServer` (throw to reject). `authorize` replaces the static gate;
+setting both is rejected at boot.
+
+### Consuming Vouchr: library vs image
+
+Vouchr ships two ways; pick by how your platform builds:
+
+- **npm library (`vouchr`)** — the primary artifact. `npm install vouchr`, then a thin service that
+  calls `buildBrokerServer`. This is the right fit when your platform builds images from its own base
+  and needs to inject a rotating-serviceauth `authorize` hook (see below). A ~15-line wrapper:
+
+  ```ts
+  // server.ts — your repo, your base image, your auth
+  import { buildBrokerServer } from 'vouchr/broker-server';
+  import { readFileSync } from 'node:fs';
+
+  const built = await buildBrokerServer(process.env, {
+    // Verify your platform's per-request service token (read fresh each call). Throw to reject.
+    authorize: (req) => verifyServiceauth(req, readFileSync('/var/run/secrets/serviceauth/...','utf8')),
+  });
+  built.server.listen(built.port);
+  ```
+  Then your own `Dockerfile FROM <your-registry>/node:22` + `npm ci && npm run build`, and your Helm
+  chart. Vouchr stays a versioned dependency you bump. GYG-style deployments use this path.
+
+- **Container image (GHCR)** — `ghcr.io/dharin-shah/vouchr-broker:<tag>` for a quick `docker run`
+  without a build. Best for non-GYG/self-host quick starts; the perimeter must then be enforced at
+  the mesh (there's no code hook in a prebuilt image).
+
+### Container & Kubernetes
+
+A [`Dockerfile`](./Dockerfile) (ARG base images so you can pin an internal mirror, `npm ci` build,
+non-root, `HEALTHCHECK` on `/healthz`) and a reference [`deploy/k8s.yaml`](./deploy/k8s.yaml)
+(multi-replica, readiness on `/healthz`, process-only TCP liveness, `envFrom` a synced Secret,
+commented ServiceAccount for IRSA) ship in the repo. Both are shapes to adapt — no registry or IAM
+ARN is hardcoded. For KMS, add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount;
+the SDK default credential chain does the rest.
+
+**SQLite in a container** (non-prod only): the default `vouchr.db` path is not writable under a
+non-root, read-only-root-filesystem pod. Set `VOUCHR_DB` to a mounted writable volume, or use
+`:memory:` for ephemeral tests. Production is Postgres (and `VOUCHR_PRODUCTION=1` refuses SQLite).
+
+### Production mode
+
+Set `VOUCHR_PRODUCTION=1` to make the broker refuse to boot unless it is multi-instance safe:
+Postgres **and** a KMS envelope. This turns the two easy-to-forget footguns (SQLite in prod, no
+envelope) into a startup failure instead of a silent weakness. Enabling it in the reference manifest
+means uncommenting `VOUCHR_PRODUCTION`, `VOUCHR_KMS_KEY_ID`, **and** adding `@aws-sdk/client-kms` to
+the image together — turning on production alone (without KMS) is a deliberate boot failure.
+
 ## Slack app + OAuth install flow
 
 Create the app from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)

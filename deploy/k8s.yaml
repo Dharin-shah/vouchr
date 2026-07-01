@@ -1,0 +1,70 @@
+# Reference manifest for the standalone headless Vouchr broker. This is a SHAPE to adapt to your
+# platform (Helm/Kustomize/meta-chart), not a drop-in — replace the image, the Secret source, and
+# the ServiceAccount with your own. No registry, IAM ARN, or vendor annotation is hardcoded.
+#
+# Multi-replica is safe here ONLY because the broker runs on Postgres with the shared DbReplayStore
+# (identity-token jti is single-use cluster-wide). On SQLite, run a single replica.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vouchr-broker
+  labels: { app: vouchr-broker }
+spec:
+  replicas: 2 # requires Postgres (shared jti replay). Use 1 replica on SQLite.
+  selector:
+    matchLabels: { app: vouchr-broker }
+  template:
+    metadata:
+      labels: { app: vouchr-broker }
+    spec:
+      # For KMS via IRSA / workload identity, bind a ServiceAccount here; the AWS SDK default
+      # credential chain then works with zero code. Create the SA out-of-band with your IAM role.
+      # serviceAccountName: vouchr-broker
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: broker
+          image: REPLACE_ME/vouchr-broker:latest # pin to your registry + immutable tag
+          ports:
+            - { name: http, containerPort: 3000 }
+          # Secrets (VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, provider client
+          # secrets, optional VOUCHR_BROKER_TOKEN) come from a Secret your secret manager syncs
+          # (e.g. externalSecrets → this Secret). Non-secret config can go in a ConfigMap envFrom.
+          envFrom:
+            - secretRef: { name: vouchr-broker }
+          env:
+            - { name: VOUCHR_PORT, value: "3000" }
+            # Production mode requires Postgres AND a KMS envelope or the broker refuses to boot.
+            # Enable these THREE together: uncomment VOUCHR_PRODUCTION + VOUCHR_KMS_KEY_ID AND add
+            # @aws-sdk/client-kms to the image (see Dockerfile). Enabling only PRODUCTION crashloops.
+            # - { name: VOUCHR_PRODUCTION, value: "1" }
+            # - { name: VOUCHR_KMS_KEY_ID, value: "<kms-key-arn>" }
+            # - { name: VOUCHR_PROVIDERS_FILE, value: "/etc/vouchr/providers.json" }
+          # Readiness hits /healthz (checks the DB) so a pod drains from the Service when Postgres is
+          # unreachable. Liveness is process-only (TCP) — a DB blip must NOT restart the whole fleet.
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits: { memory: "256Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vouchr-broker
+  labels: { app: vouchr-broker }
+spec:
+  selector: { app: vouchr-broker }
+  ports:
+    - { name: http, port: 80, targetPort: http }
