@@ -33,7 +33,7 @@
     "SECURITY-WHITEPAPER.md"
   ],
   "engines": {
-    "node": ">=20.6"
+    "node": ">=22"
   },
   "bin": {
     "vouchr": "dist/bin/vouchr.js"
