@@ -10,9 +10,9 @@
 Slack, your agent receives a safe handle, and Vouchr injects the right credential only at the
 outbound HTTP request.**
 
-It is built for [Slack Bolt](https://slack.dev/bolt-js) agents that need to act as the human who
-asked: open a GitHub issue, create a Google Calendar event, update Jira, call an internal API, or use
-another provider without handing raw tokens to the LLM, tool schema, Slack transcript, or app logs.
+Bolt is the default integration. For split-process systems, the same core also exposes a headless
+HTTP broker: a verified Slack identity goes in, a provider response comes out, and the token stays
+inside Vouchr.
 
 ## Why Vouchr
 
@@ -79,6 +79,26 @@ The request flow is deliberately small:
 **Security boundary:** tokens live in Vouchr's encrypted store and the provider request. They do not
 enter the model, Slack transcript, tool schema, or application logs.
 
+For the deeper model, see [ARCHITECTURE.md](./ARCHITECTURE.md),
+[THREAT-MODEL.md](./THREAT-MODEL.md), [SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md), and
+[DEPLOYMENT.md](./DEPLOYMENT.md).
+
+## Embedded or Headless
+
+Vouchr has one security boundary and multiple ways to reach it:
+
+- **Bolt middleware** for the simplest path: Slack prompts, OAuth callback, approvals, and
+  `context.vouchr.connect()` in one app.
+- **Headless HTTP broker** when a Slack-facing service verifies the user, then separate workers call
+  Vouchr over HTTP.
+- **Local sidecar** when a Python, Go, Rust, or MCP runtime wants a tiny localhost contract. See
+  [`examples/sidecar`](./examples/sidecar).
+
+Headless is the credential **use path**, not a replacement for Slack consent. Users still connect or
+approve access through the Slack app first. The production HTTP broker is user-owned today; shared
+channel credentials stay in the Bolt path until channel eligibility and membership checks have a
+transport-agnostic gate.
+
 ## Credential Modes
 
 Each channel can choose how a provider is authorized:
@@ -142,19 +162,6 @@ app.event('app_mention', async ({ context, say }) => {
 If the user has not connected GitHub yet, `connect('github')` posts the private Slack prompt shown
 above and throws `ConsentRequiredError`. Catch it and stop the turn. The user clicks once, finishes
 OAuth in the browser, then asks again.
-
-## What Vouchr Includes
-
-- Slack-native connect prompts, session approvals, OAuth callback handling, and private key modals.
-- Encrypted SQLite storage by default, with Postgres support for multi-instance deployments.
-- A safe HTTP boundary with provider host allowlists and HTTPS checks.
-- Per-user, thread-scoped, shared channel, and union credential modes.
-- Token refresh, TTLs, disconnect, offboarding cleanup, and optional external secret references.
-- Audit records that attribute credential use to the Slack user or channel that authorized it.
-
-Need the deeper model? See [ARCHITECTURE.md](./ARCHITECTURE.md),
-[THREAT-MODEL.md](./THREAT-MODEL.md), [SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md), and
-[DEPLOYMENT.md](./DEPLOYMENT.md).
 
 ## Setup
 
@@ -231,7 +238,23 @@ More examples:
 - [Postgres + KMS deployment](./examples/postgres-kms)
 - [Sidecar broker](./examples/sidecar)
 
-## Headless Broker Writes
+## Headless HTTP Broker
+
+Use `createBroker()` when your Slack-facing service and agent worker are separate. The Slack-facing
+service verifies Slack, mints a short-lived `identityToken` with `signIdentity()`, and the worker
+calls `POST /v1/fetch`:
+
+```json
+{
+  "handle": { "provider": "github", "owner": "user" },
+  "identityToken": "<signed by your Slack-facing service>",
+  "method": "GET",
+  "path": "/user"
+}
+```
+
+The broker resolves the user from the signed token, performs the provider request inside Vouchr, and
+returns only the provider response.
 
 The HTTP broker is read-only by default: non-`GET`/`HEAD` requests return `405` before any credential
 lookup. Write requests require two explicit opt-ins:
@@ -249,6 +272,10 @@ const broker = createBroker({
 Providers without `egressMethods` remain `GET`/`HEAD`-only even when `allowWrites` is enabled.
 Write bodies are small JSON/text payloads, capped at 64 KiB, and still go through the same identity
 verification, replay guard, policy, channel-tool, host/path/method, and HTTPS checks as reads.
+
+Keep `identitySecret` with the Slack verifier and broker, not arbitrary workers. For multi-instance
+brokers, pass a shared `replayStore`; the default replay guard is process-local. If the user has not
+connected yet, route them back through the Slack connect/approval flow.
 
 ## Production Notes
 
