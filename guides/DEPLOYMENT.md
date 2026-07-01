@@ -154,6 +154,10 @@ carries a `jti` that is single-use; on Postgres this is enforced **cluster-wide*
 network perimeter (`VOUCHR_BROKER_TOKEN`, or a pluggable `authorize` hook) is a coarse gate in front,
 NOT identity.
 
+Mint tokens on the caller side with the exported `mintIdentity(acting, secret)` helper — it fills a
+fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay/expiry rules. See
+[`examples/broker-client/client.ts`](../examples/broker-client/client.ts) for the full call.
+
 ### Environment contract
 
 | Var | Required | Purpose |

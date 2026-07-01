@@ -1,0 +1,82 @@
+/**
+ * Caller-side integration for the headless broker: mint a per-request identity token and call
+ * /v1/fetch. This is the code that runs in YOUR agent/runtime — the thing that already knows which
+ * human is acting. The broker verifies the token and injects the real credential; your agent never
+ * sees it.
+ *
+ * Run against a local broker (two terminals):
+ *   1) VOUCHR_IDENTITY_SECRET=dev-secret VOUCHR_MASTER_KEY=$(openssl rand -base64 32) \
+ *      VOUCHR_DB=:memory: VOUCHR_PROVIDERS='[{"id":"github","credential":"key","egressAllow":["api.github.com"]}]' \
+ *      npm run broker
+ *   2) BROKER_URL=http://localhost:3000 VOUCHR_IDENTITY_SECRET=dev-secret \
+ *      node --import tsx examples/broker-client/client.ts
+ * (You'll get "not connected" until a credential is seeded — see `npm run seed` in DEPLOYMENT.md.)
+ */
+import { mintIdentity } from '../../src'; // published package: from 'vouchr'
+
+export interface Acting {
+  teamId: string;
+  userId: string;
+  channel: string;
+  threadTs?: string;
+}
+
+export interface BrokerCall {
+  provider: string;
+  method: string;
+  path: string;
+  host?: string;
+  query?: Record<string, string>;
+  headers?: Record<string, string>;
+  body?: string;
+}
+
+/**
+ * Mint a fresh token for `acting` and POST one request through the broker. `secret` is the shared
+ * HS256 identity secret (VOUCHR_IDENTITY_SECRET); `brokerToken` is the optional coarse perimeter
+ * bearer if your broker sets one. Returns the broker's JSON response.
+ */
+export async function fetchThroughBroker(
+  brokerUrl: string,
+  secret: string,
+  acting: Acting,
+  call: BrokerCall,
+  brokerToken?: string,
+): Promise<{ status: number; body: unknown }> {
+  const identityToken = mintIdentity(acting, secret); // fresh jti + short exp, per call
+
+  const res = await fetch(`${brokerUrl}/v1/fetch`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      ...(brokerToken ? { authorization: `Bearer ${brokerToken}` } : {}),
+    },
+    body: JSON.stringify({
+      handle: { provider: call.provider, owner: 'user' }, // owner is the verified token, never this
+      identityToken,
+      method: call.method,
+      path: call.path,
+      host: call.host,
+      query: call.query,
+      headers: call.headers,
+      body: call.body,
+    }),
+  });
+  return { status: res.status, body: await res.json().catch(() => null) };
+}
+
+if (require.main === module) {
+  const brokerUrl = process.env.BROKER_URL ?? 'http://localhost:3000';
+  const secret = process.env.VOUCHR_IDENTITY_SECRET ?? 'dev-secret';
+  // In a real agent these come from the event you already authenticated, not from user input.
+  const acting: Acting = { teamId: 'T1', userId: 'U1', channel: 'C1' };
+
+  fetchThroughBroker(brokerUrl, secret, acting, {
+    provider: 'github',
+    method: 'GET',
+    path: '/user',
+    host: 'api.github.com',
+  })
+    .then((r) => console.log(`broker responded ${r.status}:`, r.body))
+    .catch((e) => console.error('broker call failed:', e.message));
+}
