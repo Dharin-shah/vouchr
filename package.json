@@ -1,6 +1,6 @@
 {
   "name": "vouchr",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.0",
   "description": "Self-hostable, Slack-native credential broker for AI agents.",
   "license": "Apache-2.0",
   "author": "Dharin Shah",
@@ -8,7 +8,7 @@
   "repository": { "type": "git", "url": "git+https://github.com/Dharin-shah/vouchr.git" },
   "bugs": { "url": "https://github.com/Dharin-shah/vouchr/issues" },
   "keywords": ["slack", "oauth", "credentials", "ai-agents", "bolt", "secrets", "security"],
-  "publishConfig": { "access": "public", "tag": "next" },
+  "publishConfig": { "access": "public", "tag": "latest" },
   "type": "commonjs",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
