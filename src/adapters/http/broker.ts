@@ -102,6 +102,15 @@ export interface BrokerOptions {
    * perimeter check ONLY, NOT identity — identity comes from the signed token. Documented per #22.
    */
   brokerToken?: string;
+  /**
+   * Optional pluggable perimeter check on /v1/* requests, called BEFORE identity verification. Throw
+   * to reject (a thrown HttpError maps to its status; anything else → 401). Use this when the static
+   * `brokerToken` cannot express your perimeter — e.g. a rotating per-request service token
+   * (serviceauth/SPIFFE) read fresh from a mounted file, or a JWKS-validated caller assertion. When
+   * set it REPLACES the static `brokerToken` gate. Still NOT identity — the signed `identityToken`
+   * remains the only source of user claims. Keeps deployer-specific auth out of `src/`.
+   */
+  authorize?: (req: http.IncomingMessage) => void | Promise<void>;
 }
 
 const DEFAULT_ALLOWED_CT = ['application/json'];
@@ -204,14 +213,34 @@ function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdenti
 
 export function createBroker(opts: BrokerOptions): http.Server {
   if (!opts.identitySecret) throw new Error('createBroker: identitySecret is required');
+  // authorize REPLACES the static brokerToken gate (not AND). Setting both means the bearer is never
+  // checked — reject it so nobody wires both expecting defense-in-depth.
+  if (opts.authorize && opts.brokerToken) {
+    throw new Error('createBroker: set either authorize or brokerToken, not both (authorize replaces the bearer gate)');
+  }
   const registry = new ProviderRegistry(opts.providers);
   const allowedCt = (opts.allowedContentTypes ?? DEFAULT_ALLOWED_CT).map((c) => c.toLowerCase());
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
   // Default in-memory guard is single-process only; a multi-instance fleet passes a shared replayStore.
   const replay: ReplayStore = opts.replayStore ?? new ReplayGuard();
+  // ONE inflight map shared by every request's ConnectionHandle, so concurrent requests for the same
+  // owner+provider collapse to a single token refresh (rotating-refresh providers brick on a double
+  // refresh). Per-request maps would defeat that. On Postgres the advisory lock also coordinates
+  // cross-pod; this covers in-process concurrency (incl. the SQLite single-replica case).
+  const inflight = new Map<string, Promise<string | null>>();
 
-  /** Coarse network perimeter (NOT identity). When unset, no gate. Constant-time compare (it's a secret). */
-  function networkGate(req: http.IncomingMessage): void {
+  /** Perimeter check on /v1/* BEFORE identity. Prefers a pluggable `authorize` hook (e.g. serviceauth),
+   *  else the static `brokerToken` bearer, else no gate. NOT identity — that's the signed token. */
+  async function perimeter(req: http.IncomingMessage): Promise<void> {
+    if (opts.authorize) {
+      try {
+        await opts.authorize(req);
+      } catch (e) {
+        if (e instanceof HttpError) throw e;
+        throw new HttpError(401, { error: 'unauthorized' });
+      }
+      return;
+    }
     if (!opts.brokerToken) return;
     const a = Buffer.from(req.headers.authorization ?? '');
     const b = Buffer.from(`Bearer ${opts.brokerToken}`);
@@ -268,10 +297,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet || opts.allowWrites);
     const { owner, acting } = ownerFromClaims(claims);
-    // ponytail: per-request inflight Map (parent's design — cross-request single-flight is its scope,
-    // not this task's). The 8th arg wires the metrics sink so the broker path stops being a black box;
-    // the 9th wires the audit STREAM sink (raw actor id) for host-side ingestion.
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, new Map(), opts.onEvent, opts.auditSink);
+    // The 7th arg is the createBroker-scoped SHARED inflight map, so concurrent requests for the same
+    // owner+provider collapse to one token refresh (rotating-refresh providers brick on a double
+    // refresh). The 8th wires the metrics sink so the broker path stops being a black box; the 9th
+    // wires the audit STREAM sink (raw actor id) for host-side ingestion.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink);
     return { handle, provider };
   }
 
@@ -372,17 +402,17 @@ export function createBroker(opts: BrokerOptions): http.Server {
       };
       try {
         const url = req.url ?? '/';
-        if (req.method === 'GET' && url === '/healthz') {
+        if (req.method === 'GET' && (url === '/healthz' || url === '/health')) {
           const r = await handleHealthz();
           return send(r.status, r.payload);
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
-          networkGate(req);
+          await perimeter(req);
           const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req));
           return send(r.status, r.payload);
         }
         if (req.method === 'POST' && url === '/v1/resolve') {
-          networkGate(req);
+          await perimeter(req);
           return send(200, await handleResolve(await readJson(req)));
         }
         send(404, { error: 'not found' });
