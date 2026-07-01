@@ -79,9 +79,8 @@ The request flow is deliberately small:
 **Security boundary:** tokens live in Vouchr's encrypted store and the provider request. They do not
 enter the model, Slack transcript, tool schema, or application logs.
 
-For the deeper model, see [ARCHITECTURE.md](./ARCHITECTURE.md),
-[THREAT-MODEL.md](./THREAT-MODEL.md), [SECURITY-WHITEPAPER.md](./SECURITY-WHITEPAPER.md), and
-[DEPLOYMENT.md](./DEPLOYMENT.md).
+For the deeper model, see the [architecture](./guides/ARCHITECTURE.md),
+[threat model](./guides/THREAT-MODEL.md), and [deployment guide](./guides/DEPLOYMENT.md).
 
 ## Embedded or Headless
 
@@ -284,14 +283,14 @@ connected yet, route them back through the Slack connect/approval flow.
   turn; do not log them as failures.
 - **Protect storage and keys.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
   database and key still need normal production controls.
-- **Review the deployment checklist.** [DEPLOYMENT.md](./DEPLOYMENT.md) covers Postgres,
+- **Review the deployment checklist.** The [deployment guide](./guides/DEPLOYMENT.md) covers Postgres,
   multi-workspace setup, KMS/envelope encryption, and production readiness.
 
 ## Status
 
 **Alpha. Not yet tested in a live deployment.** CI runs the full suite, including Postgres coverage,
 plus security checks on every push and PR. Review the
-[production readiness checklist](./DEPLOYMENT.md#production-readiness-checklist) before adopting,
+[production readiness checklist](./guides/DEPLOYMENT.md#production-readiness-checklist) before adopting,
 and see [CONTRIBUTING.md](./CONTRIBUTING.md) to help.
 
 License: [Apache-2.0](./LICENSE).

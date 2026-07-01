@@ -8,7 +8,7 @@ The token is injected only at the outbound HTTP call, after an egress check.
 This document is a formal, honest threat model: trust boundaries, an attacker
 model with concrete mitigations (and where there are none), and the security
 invariants the code and tests enforce. It cross-references
-[SECURITY.md](./SECURITY.md) rather than restating it; read that for the reporting
+[SECURITY.md](../SECURITY.md) rather than restating it; read that for the reporting
 process and the explicit non-goals.
 
 Every claim here is grounded in `src/core/*` and `src/adapters/*`.
@@ -257,7 +257,7 @@ These mirror what the code (and the test suite) enforce:
 ## Non-goals (cross-reference)
 
 Vouchr is a credential *boundary*, not a complete authorization system. The explicit
-non-goals live in [SECURITY.md → "What Vouchr does not protect against"](./SECURITY.md):
+non-goals live in [SECURITY.md -> "What Vouchr does not protect against"](../SECURITY.md):
 
 - Not provider-side authorization: egress checks can narrow host/path/method, but provider scopes
   still decide what the credential can actually do.

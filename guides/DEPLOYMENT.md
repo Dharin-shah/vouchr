@@ -2,7 +2,7 @@
 
 Concrete recipes for the deployments Vouchr actually supports. Every option named here is real
 (`src/adapters/bolt.ts` → `VouchrOptions`). For the security model and what
-Vouchr does *not* protect against, see [SECURITY.md](./SECURITY.md), which is not repeated here.
+Vouchr does *not* protect against, see [SECURITY.md](../SECURITY.md), which is not repeated here.
 
 Common to every deploy: a 32-byte `VOUCHR_MASTER_KEY` (`openssl rand -base64 32`) and a public
 HTTPS `baseUrl` reachable at the OAuth callback (`$baseUrl/vouchr/oauth/callback`).
@@ -90,7 +90,7 @@ const vouchr = await createVouchr({
 An admin then runs `/vouchr configure github` and pastes an ARN into the private modal. Full setup,
 auth (ambient IAM role, no static creds), and the least-privilege policy
 (`secretsmanager:GetSecretValue` scoped to the specific ARNs, `kms:Decrypt` if the secret uses a CMK)
-are in [`examples/aws-secrets-manager/README.md`](./examples/aws-secrets-manager/README.md).
+are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manager/README.md).
 
 ## KMS envelope encryption (optional)
 
@@ -256,8 +256,8 @@ Vouchr ships two ways; pick by how your platform builds:
 
 ### Container & Kubernetes
 
-A [`Dockerfile`](./Dockerfile) (ARG base images so you can pin an internal mirror, `npm ci` build,
-non-root, `HEALTHCHECK` on `/healthz`) and a reference [`deploy/k8s.yaml`](./deploy/k8s.yaml)
+A [`Dockerfile`](../Dockerfile) (ARG base images so you can pin an internal mirror, `npm ci` build,
+non-root, `HEALTHCHECK` on `/healthz`) and a reference [`deploy/k8s.yaml`](../deploy/k8s.yaml)
 (multi-replica, readiness on `/healthz`, process-only TCP liveness, `envFrom` a synced Secret,
 commented ServiceAccount for IRSA) ship in the repo. Both are shapes to adapt — no registry or IAM
 ARN is hardcoded. For KMS, add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount;
@@ -277,7 +277,7 @@ the image together — turning on production alone (without KMS) is a deliberate
 
 ## Slack app + OAuth install flow
 
-Create the app from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)
+Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)
 (api.slack.com/apps → From a manifest), replacing `YOUR_PUBLIC_URL`. The manifest sets:
 
 - **Bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `users:read`.
