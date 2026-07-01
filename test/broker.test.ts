@@ -89,9 +89,16 @@ function get(port: number, path: string): Promise<{ status: number; json: any }>
 /** Mock the upstream provider call (global fetch). Returns the requested Response and records what it saw. */
 function mockUpstream(response: () => Response) {
   const real = globalThis.fetch;
-  const seen: { auth: string | null; method: string }[] = [];
-  globalThis.fetch = (async (_url: any, init: any) => {
-    seen.push({ auth: new Headers(init?.headers).get('authorization'), method: init?.method ?? 'GET' });
+  const seen: { auth: string | null; method: string; url: string; contentType: string | null; body: unknown }[] = [];
+  globalThis.fetch = (async (url: any, init: any) => {
+    const headers = new Headers(init?.headers);
+    seen.push({
+      auth: headers.get('authorization'),
+      method: init?.method ?? 'GET',
+      url: String(url),
+      contentType: headers.get('content-type'),
+      body: init?.body,
+    });
     return response();
   }) as any;
   return { seen, restore: () => { globalThis.fetch = real; } };
@@ -230,6 +237,146 @@ test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async ()
     });
     assert.equal(r.status, 405);
     assert.equal(up.seen.length, 0, 'upstream (and therefore the vault) was never reached');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: allowWrites + provider egressMethods lets a POST body reach upstream, with audit method', async () => {
+  const events: any[] = [];
+  const writeAcme = { ...acme, egressMethods: ['GET', 'POST'] } as Provider;
+  const { server, db, port } = await makeBroker({ providers: [writeAcme], allowWrites: true, auditSink: (e) => events.push(e) });
+  const up = mockUpstream(() => new Response('{"created":true}', { status: 201, headers: { 'content-type': 'application/json' } }));
+  try {
+    const payload = JSON.stringify({ title: 'from broker' });
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'POST',
+      path: '/issues',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer attacker-token' },
+      body: payload,
+    });
+
+    assert.equal(r.status, 200);
+    assert.equal(r.json.status, 201);
+    assert.equal(r.json.body, '{"created":true}');
+    assert.equal(up.seen.length, 1);
+    assert.equal(up.seen[0].method, 'POST');
+    assert.equal(up.seen[0].body, payload);
+    assert.equal(up.seen[0].contentType, 'application/json');
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`, 'caller Authorization was dropped; Vouchr injected the token');
+
+    const row = await db.get(`SELECT meta FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`) as any;
+    assert.equal(JSON.parse(row.meta).method, 'POST');
+    assert.equal(events[0].method, 'POST');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: allowWrites still requires per-provider egressMethods', async () => {
+  const { server, port } = await makeBroker({ allowWrites: true }); // acme has no egressMethods
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'POST',
+      path: '/x',
+      body: '{}',
+    });
+    assert.equal(r.status, 403);
+    assert.equal(up.seen.length, 0, 'provider without egressMethods stays read-only');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: allowWrites denies methods not listed by the provider', async () => {
+  const writeAcme = { ...acme, egressMethods: ['GET', 'POST'] } as Provider;
+  const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'DELETE',
+      path: '/x',
+      body: '{}',
+    });
+    assert.equal(r.status, 403);
+    assert.equal(up.seen.length, 0, 'method denial happens before upstream');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: write body over the broker cap is rejected, never truncated or forwarded', async () => {
+  const writeAcme = { ...acme, egressMethods: ['POST'] } as Provider;
+  const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'POST',
+      path: '/x',
+      body: 'x'.repeat(65 * 1024),
+    });
+    assert.equal(r.status, 413);
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: write requests still enforce host, path, validator, and replay checks', async () => {
+  const guarded = {
+    ...acme,
+    egressMethods: ['POST'],
+    egressPaths: ['/allowed'],
+    egressValidate: (url: URL) => url.searchParams.get('ok') === '1',
+  } as Provider;
+  const { server, port } = await makeBroker({ providers: [guarded], allowWrites: true });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const blockedHost = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'POST', host: 'evil.example.com', path: '/allowed', query: { ok: '1' }, body: '{}',
+    });
+    assert.equal(blockedHost.status, 403);
+
+    const blockedPath = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'POST', path: '/blocked', query: { ok: '1' }, body: '{}',
+    });
+    assert.equal(blockedPath.status, 403);
+
+    const blockedValidator = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'POST', path: '/allowed', query: { ok: '0' }, body: '{}',
+    });
+    assert.equal(blockedValidator.status, 403);
+    assert.equal(up.seen.length, 0, 'egress denials happen before upstream');
+
+    const token = signIdentity(claims(), SECRET);
+    const first = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: token,
+      method: 'POST', path: '/allowed', query: { ok: '1' }, body: '{}',
+    });
+    assert.equal(first.status, 200);
+    const replay = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: token,
+      method: 'POST', path: '/allowed', query: { ok: '1' }, body: '{}',
+    });
+    assert.equal(replay.status, 401);
+    assert.equal(up.seen.length, 1, 'replay did not reach upstream');
   } finally {
     up.restore();
     server.close();
@@ -440,6 +587,27 @@ test('fetch: a Policy that denies the provider in this channel -> 403, credentia
   }
 });
 
+test('fetch: write requests still honor Policy before injection', async () => {
+  const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
+  const writeAcme = { ...acme, egressMethods: ['POST'] } as Provider;
+  const { server, port } = await makeBrokerOn(() => ({ providers: [writeAcme], allowWrites: true, policy }));
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'POST',
+      path: '/x',
+      body: '{}',
+    });
+    assert.equal(r.status, 403);
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('fetch: a ChannelTools allowlist that disables the provider here -> 403, credential NEVER injected', async () => {
   const { server, db, audit, port } = await makeBrokerOn((db) => ({ channelTools: new ChannelTools(db) }));
   // Configure the channel as an allowlist that does NOT include acme -> acme is disabled here.
@@ -449,6 +617,31 @@ test('fetch: a ChannelTools allowlist that disables the provider here -> 403, cr
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(r.status, 403);
     assert.equal(up.seen.length, 0, 'tool-disabled: nothing went upstream');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('fetch: write requests still honor ChannelTools before injection', async () => {
+  const writeAcme = { ...acme, egressMethods: ['POST'] } as Provider;
+  const { server, db, port } = await makeBrokerOn((db) => ({
+    providers: [writeAcme],
+    allowWrites: true,
+    channelTools: new ChannelTools(db),
+  }));
+  await new ChannelTools(db).setEnabled('T1', 'C1', 'other', true);
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'POST',
+      path: '/x',
+      body: '{}',
+    });
+    assert.equal(r.status, 403);
+    assert.equal(up.seen.length, 0);
   } finally {
     up.restore();
     server.close();
