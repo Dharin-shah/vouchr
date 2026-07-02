@@ -183,6 +183,15 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 
 const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
 
+vouchr.install(app, receiver); // middleware + OAuth callback + /vouchr command + offboarding + TTL sweep
+```
+
+`install()` is the one-call path for the common case. It bundles the middleware, the
+`/vouchr/oauth/callback` route, the `/vouchr` slash command, the deactivation→offboard hook, and the
+hourly TTL sweep, and returns `{ stop }` to clear the sweep timer on shutdown. Need finer control?
+Call the pieces yourself instead:
+
+```ts
 app.use(vouchr.middleware);
 vouchr.mountRoutes(receiver.router);   // /vouchr/oauth/callback
 vouchr.registerCommands(app);          // /vouchr status | disconnect | configure | mode
