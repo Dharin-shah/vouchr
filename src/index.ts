@@ -32,3 +32,7 @@ export type { EnvelopeProvider } from './core/crypto';
 // Exception: Enterprise Grid / SCIM deprovisioning spans ALL workspaces, which createVouchr's
 // single-team offboard can't express, so the cross-team entry point is exported directly.
 export { offboardUserEverywhere } from './core/offboard';
+// #54 single-user lifecycle helpers, exported so a headless host can drive offboarding / TTL sweep
+// in-process (the same core the /v1/disconnect, /v1/admin/offboard routes and broker-server timer use).
+export { offboardUser, disconnectProvider } from './core/offboard';
+export { sweepExpired } from './core/sweep';

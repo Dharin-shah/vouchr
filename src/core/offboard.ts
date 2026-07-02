@@ -9,6 +9,36 @@ import { userOwner } from './owner';
 import { SessionGrants } from './session';
 
 /**
+ * Disconnect ONE provider for a user: delete the local credential (the security-meaningful action)
+ * FIRST, then best-effort upstream token revocation. A revoke failure is non-fatal — local access is
+ * already gone. Audited as 'revoke' (never the token). Transport-agnostic, so the Bolt `/vouchr
+ * disconnect` command and the headless broker's `/v1/disconnect` route share ONE implementation.
+ * Returns whether a credential existed and whether the upstream revoke succeeded.
+ */
+export async function disconnectProvider(
+  vault: Vault,
+  audit: Audit,
+  registry: ProviderRegistry | undefined,
+  identity: SlackIdentity,
+  provider: string,
+): Promise<{ removed: boolean; ok: boolean }> {
+  const owner = userOwner(identity);
+  // Read the token BEFORE deleting: needed both to detect existence and to hand to the upstream revoke.
+  const cred = await vault.get(owner, provider);
+  await vault.delete(owner, provider); // local delete FIRST
+  let ok = true;
+  if (registry?.has(provider)) {
+    try {
+      if (cred?.accessToken) await revokeToken(registry.get(provider), cred.accessToken);
+    } catch {
+      ok = false; // network/HTTP failure: local access is already gone; nothing is faked
+    }
+  }
+  await audit.record('revoke', identity, provider, { ok }); // never the token
+  return { removed: cred != null, ok };
+}
+
+/**
  * Remove ALL of a user's own connections: the offboarding cleanup. Triggered
  * automatically when Slack deactivates the account (see the Bolt adapter's
  * registerOffboarding), and callable from a SCIM deprovision hook or an admin.

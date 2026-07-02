@@ -15,6 +15,18 @@ export interface IdentityClaims {
   exp: number;
   /** Single-use id (replay guard within the exp window). */
   jti: string;
+  /**
+   * Admin authority for admin-gated routes (#54 `/v1/admin/*`). The broker cannot verify workspace
+   * admin itself (no Slack client), so the trusted caller sets this AFTER its own admin check and
+   * SIGNS it. The broker fails closed: an admin route with this absent/false is refused. A forged
+   * request body can never assert it.
+   */
+  isAdmin?: boolean;
+  /**
+   * Enterprise/org id (#54). When present on an admin offboard, the removal spans EVERY workspace the
+   * target touches (Enterprise Grid / SCIM deprovision) via offboardUserEverywhere. Signed.
+   */
+  enterpriseId?: string;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -41,8 +53,12 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
   return `${payload}.${sig}`;
 }
 
-/** The acting-human fields a caller supplies per request; the minter fills `jti` and `exp` safely. */
-export type MintIdentityInput = Pick<IdentityClaims, 'teamId' | 'userId' | 'channel' | 'threadTs'>;
+/** The acting-human fields a caller supplies per request; the minter fills `jti` and `exp` safely.
+ *  `isAdmin`/`enterpriseId` (#54) are optional and default to a non-admin, single-workspace request. */
+export type MintIdentityInput = Pick<
+  IdentityClaims,
+  'teamId' | 'userId' | 'channel' | 'threadTs' | 'isAdmin' | 'enterpriseId'
+>;
 
 /**
  * Mint a short-lived, single-use identity token for ONE broker call — the safe wrapper around
@@ -62,6 +78,8 @@ export function mintIdentity(input: MintIdentityInput, secret: string, ttlMs = 6
     userId: input.userId,
     channel: input.channel,
     ...(input.threadTs !== undefined ? { threadTs: input.threadTs } : {}),
+    ...(input.isAdmin !== undefined ? { isAdmin: input.isAdmin } : {}),
+    ...(input.enterpriseId !== undefined ? { enterpriseId: input.enterpriseId } : {}),
     jti: randomUUID(),
     exp: now + lifetime,
   };
@@ -105,7 +123,11 @@ function isClaims(v: unknown): v is IdentityClaims {
     typeof c.channel === 'string' &&
     typeof c.exp === 'number' &&
     typeof c.jti === 'string' &&
-    (c.threadTs === undefined || typeof c.threadTs === 'string')
+    (c.threadTs === undefined || typeof c.threadTs === 'string') &&
+    // Admin/lifecycle claims (#54): reject a wrong-typed value rather than coercing — a malformed
+    // signed isAdmin fails closed (it can't slip through as true).
+    (c.isAdmin === undefined || typeof c.isAdmin === 'boolean') &&
+    (c.enterpriseId === undefined || typeof c.enterpriseId === 'string')
   );
 }
 
