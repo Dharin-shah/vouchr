@@ -144,8 +144,9 @@ allowlist, refresh, audit); the front door is signed identity tokens instead of 
 product: see *Provisioning* below for how credentials get into the store.
 
 Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
-`POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, and `GET /healthz` (alias
-`/health`) on `VOUCHR_PORT` (default 3000), and runs the TTL sweep on a timer (see *Lifecycle*).
+`POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `GET /healthz` (alias
+`/health`), and — when channel modes are enabled — `POST /v1/admin/reference` on `VOUCHR_PORT`
+(default 3000), and runs the TTL sweep on a timer (see *Lifecycle*).
 
 ### Trust model
 
@@ -189,6 +190,26 @@ const token = mintIdentity(
 `shared` resolves to the channel's credential (audited as the acting human); `union` resolves to the
 signed member's own credential (audited as that member). `per-user` / `session` channels are **not**
 reachable this way — those are user-owned modes, so the caller uses `owner: "user"`.
+
+#### Admin channel-credential config (`POST /v1/admin/reference`, #53)
+
+With channel modes enabled (`VOUCHR_CHANNEL_MODES=1`), an admin can point a channel's **shared**
+credential at an external secret manager over HTTP — **reference only, never a raw secret**:
+
+```
+POST /v1/admin/reference
+{ "handle": { "provider": "<id>" }, "identityToken": "<signed>",
+  "source": "aws-sm", "secretRef": "arn:aws:secretsmanager:…" }
+```
+
+- Admin authority comes from the **signed `isAdmin` claim** (your minter sets it after its own
+  workspace-admin check — the broker can't verify Slack admin itself); fail closed.
+- Channel eligibility is enforced on the signed `channelEligible` claim (shared creds refused on
+  ineligible / externally-shared channels).
+- It stores only the non-secret reference (`vault.reference`) and flips the channel to `shared`; the
+  configured `resolvers` resolve it JIT at egress. **No raw secret ever crosses the broker** — the
+  broker deliberately has no raw-key HTTP ingest. A headless host wanting static keys points at a
+  secret manager instead. Returns `{ ok: true }`.
 
 ### Environment contract
 

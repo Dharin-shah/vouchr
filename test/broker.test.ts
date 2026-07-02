@@ -1073,3 +1073,114 @@ test('#54 /v1/admin/offboard requires a targetUserId', async () => {
     server.close();
   }
 });
+
+// ── #53 admin channel-credential reference (POST /v1/admin/reference) ─────────
+
+async function makeAdminBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const channelConfig = new ChannelConfig(db);
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, channelConfig, ...extra });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, vault, db, channelConfig, port: (server.address() as any).port };
+}
+
+function adminToken(over: Partial<IdentityClaims> = {}): string {
+  return signIdentity(claims({ userId: 'ADMIN', isAdmin: true, channelEligible: true, ...over }), SECRET);
+}
+
+test('#53 admin reference stores a channel ref, flips to shared; a member fetch resolves it at egress', async () => {
+  const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:xyz' ? SECRET_TOKEN : 'WRONG') };
+  const { server, port, channelConfig } = await makeAdminBroker({ resolvers });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.ok, true);
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), 'shared');
+    // A channel member's fetch now injects the JIT-resolved secret (never stored raw).
+    const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x' });
+    assert.equal(f.status, 200);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#53 non-admin signed token -> refused (nothing configured)', async () => {
+  const { server, port, channelConfig } = await makeAdminBroker();
+  try {
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET), source: 'aws-sm', secretRef: 'arn:xyz',
+    });
+    assert.equal(r.status, 403);
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('#53 forged body admin flag (no signed isAdmin claim) -> refused', async () => {
+  const { server, port } = await makeAdminBroker();
+  try {
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET),
+      source: 'aws-sm', secretRef: 'arn:xyz', isAdmin: true,
+    } as any);
+    assert.equal(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test('#53 ineligible channel (signed eligibility false) -> refused', async () => {
+  const { server, port, channelConfig } = await makeAdminBroker();
+  try {
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: adminToken({ channelEligible: false }), source: 'aws-sm', secretRef: 'arn:xyz',
+    });
+    assert.equal(r.status, 403);
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('#53 refused when channel modes are not enabled (no channelConfig)', async () => {
+  const { server, port } = await makeBroker(); // no channelConfig
+  try {
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
+    });
+    assert.equal(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test('#53 no raw secret is accepted (source + secretRef are required, not a token)', async () => {
+  const { server, port } = await makeAdminBroker();
+  try {
+    const r = await post(port, '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken() } as any);
+    assert.equal(r.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async () => {
+  const { server, port, channelConfig } = await makeAdminBroker();
+  await channelConfig.setMode('T1', 'C1', 'acme', 'per-user');
+  try {
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
+    });
+    assert.equal(r.status, 409);
+  } finally {
+    server.close();
+  }
+});
