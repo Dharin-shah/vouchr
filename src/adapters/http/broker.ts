@@ -224,7 +224,7 @@ function traceHeaders(req: http.IncomingMessage): Record<string, string> {
 }
 
 function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
-  const acting: SlackIdentity = { enterpriseId: null, teamId: c.teamId, userId: c.userId };
+  const acting: SlackIdentity = { enterpriseId: c.enterpriseId ?? null, teamId: c.teamId, userId: c.userId };
   // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
   // supplies an id, so a forged body can't cross tenants.
   return { owner: userOwner(acting), acting };
@@ -295,7 +295,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
    */
   async function authorize(provider: string, claims: IdentityClaims): Promise<void> {
     const channel = claims.channel;
-    const acting: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: claims.userId };
+    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     if (opts.policy && !opts.policy.check(provider, channel)) {
       await opts.audit.record('denied', acting, provider, { channel });
       throw new HttpError(403, { error: 'policy denies this provider in this channel' });
@@ -323,7 +323,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (ownerKind === 'user') return ownerFromClaims(claims);
 
     // ── channel-owned (opt-in, fail-closed) ──
-    const acting: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: claims.userId };
+    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     if ((opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
       await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
@@ -339,7 +339,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
       // Slack client) already resolved which connected member to act as via listChannelMembers.
       const memberId = claims.actingMemberId;
       if (!memberId) throw new HttpError(400, { error: 'union mode requires a signed actingMemberId' });
-      const member: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: memberId };
+      const member: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: memberId };
       return { owner: userOwner(member), acting: member };
     }
     // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
