@@ -27,6 +27,24 @@ export interface IdentityClaims {
    * target touches (Enterprise Grid / SCIM deprovision) via offboardUserEverywhere. Signed.
    */
   enterpriseId?: string;
+  /**
+   * Channel-owned credential mode (#51). Signed, so a forged request body cannot assert it — the
+   * broker resolves the credential owner ONLY from this claim, never from the handle. Absent → 'user'
+   * (the historical default; channel modes are strictly opt-in on the broker via `channelConfig`).
+   */
+  ownerKind?: 'user' | 'channel';
+  /**
+   * The caller's channelIneligibleReason() === null verdict, signed (#51). The broker has no Slack
+   * client, so the trusted caller computes eligibility (externally-shared / Slack-Connect / DM /
+   * archived refuse a shared cred) and signs the result. The broker fails CLOSED: a channel-owned
+   * request with this absent/false is refused.
+   */
+  channelEligible?: boolean;
+  /**
+   * For `union` mode: the connected channel member the caller selected to act as (#51). The audited
+   * actor is this real member — never the channel, never the caller. Signed so the body can't forge it.
+   */
+  actingMemberId?: string;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -54,10 +72,11 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
 }
 
 /** The acting-human fields a caller supplies per request; the minter fills `jti` and `exp` safely.
- *  `isAdmin`/`enterpriseId` (#54) are optional and default to a non-admin, single-workspace request. */
+ *  The admin/lifecycle (#54) and channel-fact (#51) fields are optional and default to a non-admin,
+ *  single-workspace, user-owned request when omitted. */
 export type MintIdentityInput = Pick<
   IdentityClaims,
-  'teamId' | 'userId' | 'channel' | 'threadTs' | 'isAdmin' | 'enterpriseId'
+  'teamId' | 'userId' | 'channel' | 'threadTs' | 'isAdmin' | 'enterpriseId' | 'ownerKind' | 'channelEligible' | 'actingMemberId'
 >;
 
 /**
@@ -80,6 +99,9 @@ export function mintIdentity(input: MintIdentityInput, secret: string, ttlMs = 6
     ...(input.threadTs !== undefined ? { threadTs: input.threadTs } : {}),
     ...(input.isAdmin !== undefined ? { isAdmin: input.isAdmin } : {}),
     ...(input.enterpriseId !== undefined ? { enterpriseId: input.enterpriseId } : {}),
+    ...(input.ownerKind !== undefined ? { ownerKind: input.ownerKind } : {}),
+    ...(input.channelEligible !== undefined ? { channelEligible: input.channelEligible } : {}),
+    ...(input.actingMemberId !== undefined ? { actingMemberId: input.actingMemberId } : {}),
     jti: randomUUID(),
     exp: now + lifetime,
   };
@@ -127,7 +149,12 @@ function isClaims(v: unknown): v is IdentityClaims {
     // Admin/lifecycle claims (#54): reject a wrong-typed value rather than coercing — a malformed
     // signed isAdmin fails closed (it can't slip through as true).
     (c.isAdmin === undefined || typeof c.isAdmin === 'boolean') &&
-    (c.enterpriseId === undefined || typeof c.enterpriseId === 'string')
+    (c.enterpriseId === undefined || typeof c.enterpriseId === 'string') &&
+    // Channel-fact claims (#51): reject a wrong-typed value rather than coercing it — a malformed
+    // signed claim fails closed (an unknown ownerKind can't slip through as 'channel').
+    (c.ownerKind === undefined || c.ownerKind === 'user' || c.ownerKind === 'channel') &&
+    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean') &&
+    (c.actingMemberId === undefined || typeof c.actingMemberId === 'string')
   );
 }
 

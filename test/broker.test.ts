@@ -9,7 +9,8 @@ import { Policy } from '../src/core/policy';
 import { ChannelTools } from '../src/core/tools';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
-import { userOwner } from '../src/core/owner';
+import { userOwner, channelOwner } from '../src/core/owner';
+import { ChannelConfig } from '../src/core/channelConfig';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
 import { signIdentity, verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims } from '../src/adapters/http/identity';
 
@@ -756,13 +757,143 @@ test('fetch: a malformed host -> clean 400, not a 500', async () => {
   }
 });
 
-test('fetch/resolve: owner:"channel" is rejected (the channel shared-cred path is omitted from this broker)', async () => {
+test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; forged body can\'t reach a channel cred)', async () => {
   const { server, port } = await makeBroker();
   try {
+    // #51: a forged body owner:'channel' on a PLAIN user token (no signed ownerKind) is refused — the
+    // signed claim defaults to 'user' and must match the handle. 403, never a channel-credential read.
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'channel' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' } as any);
-    assert.equal(f.status, 400);
+    assert.equal(f.status, 403);
+    // /v1/resolve stays user-only in #51: a channel handle is an invalid handle there.
     const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'channel' }, identityToken: signIdentity(claims(), SECRET) } as any);
     assert.equal(rv.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+// ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
+
+/** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
+async function makeChannelBroker(mode: 'shared' | 'union' | 'per-user') {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const channelConfig = new ChannelConfig(db);
+  await channelConfig.setMode('T1', 'C1', 'acme', mode);
+  if (mode === 'shared') {
+    // The channel owns one credential every member injects.
+    await vault.upsert(channelOwner('T1', 'C1'), 'acme', {
+      accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+    });
+  }
+  if (mode === 'union') {
+    // A connected member (U9) whose OWN credential the caller elects to act as.
+    await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U9' }), 'acme', {
+      accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+    });
+  }
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, vault, db, port: (server.address() as any).port };
+}
+
+/** Sign a channel-owned identity token (the SIGNED facts a trusted caller supplies). */
+function channelToken(over: Partial<IdentityClaims> = {}): string {
+  return signIdentity(claims({ ownerKind: 'channel', channelEligible: true, ...over }), SECRET);
+}
+
+test('#51 shared: owner:"channel" resolves to the channel credential and injects it', async () => {
+  const { server, db, port } = await makeChannelBroker('shared');
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`, 'the channel-owned token was injected');
+    // Audited as the acting human (invariant 9); the channel-owned inject promotes the channel column.
+    const row = (await db.get(`SELECT user_id, channel FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`)) as any;
+    assert.equal(row.user_id, 'U1'); // the real acting human, never the channel
+    assert.equal(row.channel, 'C1'); // attributed to the channel that owns the credential
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#51 union: resolves to and audits the SIGNED acting member (never the caller)', async () => {
+  const { server, db, port } = await makeChannelBroker('union');
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    // Caller (U1) elects to act as connected member U9; the member is the vault owner AND audited actor.
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken({ actingMemberId: 'U9' }), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+    const row = (await db.get(`SELECT user_id, channel FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`)) as any;
+    assert.equal(row.user_id, 'U9');   // audited as U9 (the real member whose cred was used), not caller U1
+    assert.equal(row.channel, null);   // union uses U9's OWN (user-owned) cred, so no channel attribution
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#51 union without a signed actingMemberId -> 400 (no member to act as)', async () => {
+  const { server, port } = await makeChannelBroker('union');
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test('#51 ineligible signed claim -> refused (fail closed, cred never read)', async () => {
+  const { server, port } = await makeChannelBroker('shared');
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    // channelEligible:false (the caller computed channelIneligibleReason() != null) -> 403.
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken({ channelEligible: false }), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 403);
+    // Also refused when the eligibility claim is simply ABSENT (fail closed).
+    const r2 = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: signIdentity(claims({ ownerKind: 'channel' }), SECRET), method: 'GET', path: '/x',
+    });
+    assert.equal(r2.status, 403);
+    assert.equal(up.seen.length, 0, 'the vault/upstream was never reached');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#51 a per-user channel is not reachable via owner:"channel"', async () => {
+  const { server, port } = await makeChannelBroker('per-user');
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test('#51 forged signed ownerKind mismatch: body owner:"user" but claim says "channel" -> refused', async () => {
+  const { server, port } = await makeChannelBroker('shared');
+  try {
+    // The handle must match the SIGNED ownerKind; a user handle with a channel claim is refused.
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: channelToken(), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 403);
   } finally {
     server.close();
   }

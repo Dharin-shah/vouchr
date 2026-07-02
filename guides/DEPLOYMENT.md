@@ -159,6 +159,37 @@ Mint tokens on the caller side with the exported `mintIdentity(acting, secret)` 
 fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay/expiry rules. See
 [`examples/broker-client/client.ts`](../examples/broker-client/client.ts) for the full call.
 
+### Channel-owned credentials headless (`owner: "channel"`)
+
+By default the broker is **user-only**: a `handle.owner` of `"channel"` is refused. Set
+`VOUCHR_CHANNEL_MODES=1` to enable the transport-agnostic channel gate (#51), which lets a headless
+caller reach the same `shared` / `union` channel modes the Bolt adapter offers — **without** a Slack
+client in the broker. The broker has no way to read Slack, so **the caller supplies the Slack-derived
+facts as signed claims** and the broker trusts them at the same level as `teamId`/`userId`:
+
+- `ownerKind: "channel"` — the request targets a channel-owned credential. It must match `handle.owner`
+  or the request is refused, so a forged body alone can never reach a channel credential.
+- `channelEligible` — the caller's `channelIneligibleReason(conversations.info) === null` verdict. The
+  caller **must** compute this with the exported `channelIneligibleReason` (refuse externally-shared /
+  Slack-Connect / DM / archived channels — the cross-org leak case). The broker **fails closed**: a
+  channel request with this absent or false is refused.
+- `actingMemberId` — for `union` mode, the connected member the caller elected to act as. That member
+  is the vault owner **and** the audited actor — never the channel, never the caller.
+
+Mint them via `mintIdentity`'s optional fields:
+
+```ts
+const token = mintIdentity(
+  { teamId, userId, channel, ownerKind: 'channel', channelEligible: channelIneligibleReason(info) === null,
+    actingMemberId /* union only */ },
+  process.env.VOUCHR_IDENTITY_SECRET!,
+);
+```
+
+`shared` resolves to the channel's credential (audited as the acting human); `union` resolves to the
+signed member's own credential (audited as that member). `per-user` / `session` channels are **not**
+reachable this way — those are user-owned modes, so the caller uses `owner: "user"`.
+
 ### Environment contract
 
 | Var | Required | Purpose |
@@ -173,6 +204,7 @@ fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay
 | `VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS` | no | credential idle / max-age TTL (#54). Default 7d / 30d (matches the Bolt path); `0` disables that dimension. |
 | `VOUCHR_SWEEP_INTERVAL_MS` | no | TTL sweep interval (#54). Default hourly; `0` defers to an external scheduler. |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
+| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared/union) via signed channel-fact claims (#51). Off → user-only broker. |
 | `VOUCHR_PRODUCTION` | prod | `1` → boot fails fast unless Postgres **and** a KMS envelope are configured. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |

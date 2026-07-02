@@ -7,7 +7,8 @@ import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, type Resolvers, type EventSink } from '../../core/injector';
-import { userOwner, type Owner } from '../../core/owner';
+import { userOwner, channelOwner, type Owner } from '../../core/owner';
+import type { ChannelConfig } from '../../core/channelConfig';
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
@@ -19,15 +20,16 @@ import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type R
  * user from the verified identity token, never this handle — so the handle can be forged without
  * granting any cross-tenant access.
  *
- * ponytail: `owner` is user-only. A CHANNEL shared credential additionally needs the Slack-Connect
- * eligibility gate (channelIneligibleReason via conversations.info) and the requireMembership /
- * isChannelMember governance the Bolt adapter enforces (bolt.ts:362-393) — both of which require a
- * Slack WebClient a headless broker cannot have (hard rule: no @slack/* here). Shipping owner:'channel'
- * without those gates is a control bypass, so it's omitted until a transport-agnostic channel-gate exists.
+ * `owner: 'channel'` (#51) is a transport-agnostic channel gate: the broker still has no Slack client,
+ * so the trusted caller supplies the Slack-derived facts (eligibility, the union acting-member) as
+ * SIGNED claims and the broker resolves the credential owner from those claims, never from this handle.
+ * It stays fail-closed: a deployer must opt in with `BrokerOptions.channelConfig`, and the signed
+ * `ownerKind` must match this field or the request is refused (a forged body `owner:'channel'` alone
+ * can't reach a channel credential). See `resolveOwner`.
  */
 export interface ConnectionHandleRef {
   provider: string;
-  owner: 'user';
+  owner: 'user' | 'channel';
 }
 
 export interface BrokerFetchRequest {
@@ -84,6 +86,20 @@ export interface BrokerOptions {
    * allows all). Unset = no tool gate.
    */
   channelTools?: ChannelTools;
+  /**
+   * #51 transport-agnostic channel gate. Setting this ENABLES `owner: 'channel'` handles; unset keeps
+   * the historical user-only broker (any `owner:'channel'` request is refused). The store resolves the
+   * channel's mode (`shared` → the channel credential; `union` → the signed `actingMemberId`'s own
+   * credential, audited as that member). Owner + eligibility come ONLY from the signed identity claims,
+   * never the request body — so a forged body cannot assert a channel credential.
+   */
+  channelConfig?: ChannelConfig;
+  /**
+   * #51 fail-closed eligibility. When true (default), a `owner:'channel'` request is refused unless the
+   * SIGNED `channelEligible` claim is true — the caller must have computed `channelIneligibleReason()`
+   * and signed the verdict. Set false ONLY if eligibility is enforced entirely upstream of the broker.
+   */
+  requireChannelEligibility?: boolean;
   /**
    * #25 provider-level fail-closed switch. When true, a provider with UNSET `egressMethods` is
    * treated as GET/HEAD-only (default-deny) instead of "any method". Providers that need writes
@@ -208,7 +224,7 @@ function traceHeaders(req: http.IncomingMessage): Record<string, string> {
 }
 
 function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
-  const acting: SlackIdentity = { enterpriseId: null, teamId: c.teamId, userId: c.userId };
+  const acting: SlackIdentity = { enterpriseId: c.enterpriseId ?? null, teamId: c.teamId, userId: c.userId };
   // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
   // supplies an id, so a forged body can't cross tenants.
   return { owner: userOwner(acting), acting };
@@ -279,7 +295,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
    */
   async function authorize(provider: string, claims: IdentityClaims): Promise<void> {
     const channel = claims.channel;
-    const acting: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: claims.userId };
+    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     if (opts.policy && !opts.policy.check(provider, channel)) {
       await opts.audit.record('denied', acting, provider, { channel });
       throw new HttpError(403, { error: 'policy denies this provider in this channel' });
@@ -290,9 +306,49 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
   }
 
+  /**
+   * #51 owner resolution — the ONLY place the credential owner is chosen. It reads the SIGNED
+   * `ownerKind` (never the body): the body handle's `owner` must merely MATCH the signed claim, so a
+   * forged `owner:'channel'` on a plain user token is refused rather than silently downgraded. Channel
+   * mode is fail-closed: refused unless `channelConfig` is set (opt-in) and the signed eligibility
+   * verdict is present. `shared` keys the vault on the channel and audits the acting human; `union`
+   * keys on and audits the signed acting member — never the channel, never the caller.
+   */
+  async function resolveOwner(
+    ref: ConnectionHandleRef,
+    claims: IdentityClaims,
+  ): Promise<{ owner: Owner; acting: SlackIdentity }> {
+    const ownerKind = claims.ownerKind ?? 'user';
+    if (ref.owner !== ownerKind) throw new HttpError(403, { error: 'handle owner does not match verified claims' });
+    if (ownerKind === 'user') return ownerFromClaims(claims);
+
+    // ── channel-owned (opt-in, fail-closed) ──
+    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
+    if ((opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
+      await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
+      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+    }
+    const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
+    if (mode === 'shared') {
+      // The channel owns the credential; the audited actor is still the acting human (invariant 9).
+      return { owner: channelOwner(claims.teamId, claims.channel), acting };
+    }
+    if (mode === 'union') {
+      // Borrow the signed member's OWN credential and act as THAT member — the caller (who has the
+      // Slack client) already resolved which connected member to act as via listChannelMembers.
+      const memberId = claims.actingMemberId;
+      if (!memberId) throw new HttpError(400, { error: 'union mode requires a signed actingMemberId' });
+      const member: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: memberId };
+      return { owner: userOwner(member), acting: member };
+    }
+    // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
+    throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
+  }
+
   async function resolveTarget(body: BrokerFetchRequest): Promise<{ handle: ConnectionHandle; provider: Provider }> {
     const ref = body.handle;
-    if (!ref || ref.owner !== 'user' || typeof ref.provider !== 'string') {
+    if (!ref || (ref.owner !== 'user' && ref.owner !== 'channel') || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
     }
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
@@ -304,7 +360,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet || opts.allowWrites);
-    const { owner, acting } = ownerFromClaims(claims);
+    const { owner, acting } = await resolveOwner(ref, claims);
     // The 7th arg is the createBroker-scoped SHARED inflight map, so concurrent requests for the same
     // owner+provider collapse to one token refresh (rotating-refresh providers brick on a double
     // refresh). The 8th wires the metrics sink so the broker path stops being a black box; the 9th
