@@ -11,6 +11,7 @@ import { openDb, type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
+import { ChannelConfig } from '../src/core/channelConfig';
 import { DbReplayStore } from '../src/adapters/http/replayStore';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
@@ -104,6 +105,12 @@ export async function buildBrokerServer(
   // broker's default in-memory guard is sufficient there.
   const replayStore = backend === 'postgres' ? new DbReplayStore(db) : undefined;
 
+  // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
+  // default (user-only broker). The caller supplies eligibility/union facts as signed claims; the
+  // store here only maps (team, channel, provider) → mode.
+  const channelModes = env.VOUCHR_CHANNEL_MODES === '1' || env.VOUCHR_CHANNEL_MODES === 'true';
+  const channelConfig = channelModes ? new ChannelConfig(db) : undefined;
+
   const server = createBroker({
     providers,
     vault,
@@ -113,6 +120,7 @@ export async function buildBrokerServer(
     allowWrites,
     brokerToken,
     replayStore,
+    channelConfig,
     ...overrides,
   });
 
