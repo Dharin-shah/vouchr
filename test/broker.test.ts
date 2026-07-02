@@ -1321,3 +1321,72 @@ test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async ()
     server.close();
   }
 });
+
+// ── #55 batch status + tool manifest (POST /v1/status, GET /v1/manifest) ──────
+
+const other = defineProvider({
+  id: 'other', authorizeUrl: 'https://other.example/auth', tokenUrl: 'https://other.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.other.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
+});
+
+async function makeMultiBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  // Only acme is connected for U1; `other` is not; `svc` is a service tool (never brokered).
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const server = createBroker({ providers: [acme, other, svc], vault, audit, db, identitySecret: SECRET, ...extra });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, db, port: (server.address() as any).port };
+}
+
+test('#55 /v1/status batches connection state across brokered providers (service omitted)', async () => {
+  const { server, port } = await makeMultiBroker();
+  try {
+    const r = await post(port, '/v1/status', { identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.json.providers.map((p: any) => [p.provider, p]));
+    assert.deepEqual(byId.acme, { provider: 'acme', connected: true, consentState: 'connected' });
+    assert.deepEqual(byId.other, { provider: 'other', connected: false, consentState: 'needs_consent' });
+    assert.equal(byId.svc, undefined, 'service tools are not brokered, so they are omitted from status');
+    assert.ok(!r.raw.includes(SECRET_TOKEN), 'status must never carry secret material');
+  } finally {
+    server.close();
+  }
+});
+
+test('#55 /v1/status rejects a tampered identity token', async () => {
+  const { server, port } = await makeMultiBroker();
+  try {
+    const r = await post(port, '/v1/status', { identityToken: 'nope' });
+    assert.equal(r.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('#55 /v1/manifest lists providers with their acting_human/service identity', async () => {
+  const { server, port } = await makeMultiBroker();
+  try {
+    const r = await get(port, '/v1/manifest');
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.json.providers.map((p: any) => [p.provider, p.identity]));
+    assert.equal(byId.acme, 'acting_human');
+    assert.equal(byId.other, 'acting_human');
+    assert.equal(byId.svc, 'service');
+  } finally {
+    server.close();
+  }
+});
+
+test('#55 /v1/manifest sits behind the perimeter gate', async () => {
+  const { server, port } = await makeMultiBroker({ brokerToken: 'sekret' });
+  try {
+    const missing = await get(port, '/v1/manifest'); // no bearer
+    assert.equal(missing.status, 401);
+  } finally {
+    server.close();
+  }
+});

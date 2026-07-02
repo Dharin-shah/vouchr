@@ -597,6 +597,36 @@ export function createBroker(opts: BrokerOptions): http.Server {
     return { status: result.status, html: landingHtml('Connection failed', escapeHtml(result.error)) };
   }
 
+  /**
+   * #55 `POST /v1/status` — the acting user's connection state across ALL brokered providers in one
+   * call (the batched form of /v1/resolve; saves N round-trips rendering a "your connected accounts"
+   * view). NO secret: existence + coarse consent state only. Service tools aren't brokered, so they're
+   * omitted (same rule as /v1/resolve refusing them). Identity from the signed token.
+   */
+  async function handleStatus(body: { identityToken: string }): Promise<Record<string, unknown>> {
+    const claims = await verify(body.identityToken);
+    const owner = userOwner({ enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId });
+    const providers: { provider: string; connected: boolean; consentState: string }[] = [];
+    for (const p of opts.providers) {
+      if (registry.get(p.id).identity === 'service') continue; // not brokered by Vouchr
+      const connected = (await opts.vault.get(owner, p.id)) != null;
+      providers.push({ provider: p.id, connected, consentState: connected ? 'connected' : 'needs_consent' });
+    }
+    return { providers };
+  }
+
+  /**
+   * #55 `GET /v1/manifest` — the provider manifest: each provider's id and whether the agent acts as
+   * the human (Vouchr brokers it) or as a service (host wires its own auth). Purely non-secret policy
+   * metadata; keeps the source of truth in one place so a host needn't re-derive it. No identity
+   * needed (not user-specific), but it still sits behind the /v1/* perimeter gate.
+   */
+  function handleManifest(): Record<string, unknown> {
+    return {
+      providers: opts.providers.map((p) => ({ provider: p.id, identity: registry.get(p.id).identity ?? 'acting_human' })),
+    };
+  }
+
   async function handleHealthz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     let dbReachable = false;
     try {
@@ -634,6 +664,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
           await perimeter(req);
           return send(200, await handleConnect(await readJson(req)));
         }
+        if (req.method === 'GET' && url === '/v1/manifest') {
+          await perimeter(req);
+          return send(200, handleManifest());
+        }
         if (req.method === 'POST' && url === '/v1/fetch') {
           await perimeter(req);
           const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req));
@@ -654,6 +688,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'POST' && url === '/v1/admin/reference') {
           await perimeter(req);
           return send(200, await handleAdminReference(await readJson(req)));
+        }
+        if (req.method === 'POST' && url === '/v1/status') {
+          await perimeter(req);
+          return send(200, await handleStatus(await readJson(req)));
         }
         send(404, { error: 'not found' });
       } catch (e) {
