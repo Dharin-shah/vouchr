@@ -97,6 +97,33 @@ test('buildBrokerServer: boots on SQLite and serves /healthz + /health', async (
   }
 });
 
+test('#54 buildBrokerServer.sweep removes an expired connection (headless TTL sweep)', async () => {
+  const built = await buildBrokerServer(baseEnv());
+  try {
+    const vault = new Vault(built.db, Buffer.from(KEY_B64, 'base64'));
+    await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
+      accessToken: 'x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+    });
+    // Backdate so the default idle-TTL (7d) reclaims the row (created_at=now would not be expired yet).
+    await built.db.run(`UPDATE connection SET last_used_at=0, created_at=0 WHERE owner_id='U1' AND provider='internal'`);
+    const n = await built.sweep();
+    assert.equal(n, 1);
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal'), null);
+  } finally {
+    await built.db.close();
+  }
+});
+
+test('#54 sweep interval: default is hourly; VOUCHR_SWEEP_INTERVAL_MS=0 disables it', async () => {
+  const dflt = await buildBrokerServer(baseEnv());
+  assert.equal(dflt.sweepIntervalMs, 60 * 60 * 1000);
+  await dflt.db.close();
+  const off = await buildBrokerServer(baseEnv({ VOUCHR_SWEEP_INTERVAL_MS: '0' }));
+  assert.equal(off.sweepIntervalMs, 0);
+  await off.db.close();
+  await assert.rejects(buildBrokerServer(baseEnv({ VOUCHR_SWEEP_INTERVAL_MS: 'nope' })), /VOUCHR_SWEEP_INTERVAL_MS/);
+});
+
 test('buildBrokerServer: fails fast naming the missing secret', async () => {
   const { VOUCHR_IDENTITY_SECRET, ...noSecret } = baseEnv();
   await assert.rejects(buildBrokerServer(noSecret), /VOUCHR_IDENTITY_SECRET/);

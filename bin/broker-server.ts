@@ -12,6 +12,9 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
 import { DbReplayStore } from '../src/adapters/http/replayStore';
+import { Consent } from '../src/core/consent';
+import { SessionGrants } from '../src/core/session';
+import { sweepExpired } from '../src/core/sweep';
 import type { EnvelopeProvider } from '../src/core/crypto';
 import { assertProductionConfig } from '../src/core/options';
 import { loadProviders } from './providerConfig';
@@ -28,6 +31,11 @@ export interface BuiltBroker {
   providerIds: string[];
   allowWrites: boolean;
   production: boolean;
+  /** #54 TTL sweep: delete expired connections + stale consent + expired thread grants. Idempotent,
+   *  so overlapping runs across replicas are safe (noisy, not destructive). Returns the count swept. */
+  sweep: () => Promise<number>;
+  /** #54 sweep interval (ms); 0 disables the timer (VOUCHR_SWEEP_INTERVAL_MS). Default hourly. */
+  sweepIntervalMs: number;
 }
 
 /**
@@ -75,8 +83,22 @@ export async function buildBrokerServer(
   // instead of falling back to an ambient process.env DATABASE_URL that isn't what we opened.
   assertProductionConfig({ databaseUrl: url ?? '', envelope, production });
 
+  // #54 TTL policy: without one, get()-time expiry and the sweep are both no-ops (a credential lives
+  // forever). Default matches the Bolt path (7d idle / 30d max), so the two front doors behave the
+  // same on a shared database. Override per-dimension via env; set a var to 0 to disable that limit.
+  const ttlDim = (raw: string | undefined, dflt: number): number | undefined => {
+    if (raw === undefined) return dflt;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) fail(`invalid TTL env value: ${raw}`);
+    return n === 0 ? undefined : n; // 0 → disable this dimension (null in TtlPolicy)
+  };
+  const ttl = {
+    idleMs: ttlDim(env.VOUCHR_TTL_IDLE_MS, 7 * 24 * 60 * 60 * 1000),
+    maxAgeMs: ttlDim(env.VOUCHR_TTL_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000),
+  };
+
   const db = await openDb(backend === 'postgres' ? { databaseUrl: url } : { dbPath: env.VOUCHR_DB });
-  const vault = new Vault(db, masterKey, {}, envelope);
+  const vault = new Vault(db, masterKey, ttl, envelope);
   const audit = new Audit(db);
   // Multi-replica safety: a shared durable jti store on Postgres. SQLite is single-replica, so the
   // broker's default in-memory guard is sufficient there.
@@ -94,7 +116,19 @@ export async function buildBrokerServer(
     ...overrides,
   });
 
-  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, production };
+  // #54 TTL sweep, wired the same way the Bolt path does (core sweepExpired + session-grant sweep).
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
+  const sweep = async (): Promise<number> => {
+    const n = await sweepExpired(vault, audit, consent);
+    await sessions.sweepExpired();
+    return n;
+  };
+  const rawInterval = env.VOUCHR_SWEEP_INTERVAL_MS;
+  const sweepIntervalMs = rawInterval !== undefined ? Number(rawInterval) : 60 * 60 * 1000;
+  if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs < 0) fail(`VOUCHR_SWEEP_INTERVAL_MS invalid: ${rawInterval}`);
+
+  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, production, sweep, sweepIntervalMs };
 }
 
 async function main(): Promise<void> {
@@ -108,10 +142,25 @@ async function main(): Promise<void> {
     );
   });
 
+  // #54 TTL sweep: once at startup, then on an interval. Idempotent, so multi-replica overlap is safe
+  // (a log line is enough — no distributed lock). Set VOUCHR_SWEEP_INTERVAL_MS=0 to defer to an
+  // external scheduler driving built.sweep() instead. Errors are logged, never fatal.
+  const runSweep = () => built.sweep().then(
+    (n) => { if (n) console.log(`[vouchr] sweep removed ${n} expired connection(s)`); },
+    (e) => console.error(`[vouchr] sweep failed: ${(e as Error).message}`),
+  );
+  let sweepTimer: NodeJS.Timeout | undefined;
+  if (built.sweepIntervalMs > 0) {
+    void runSweep();
+    sweepTimer = setInterval(runSweep, built.sweepIntervalMs);
+    sweepTimer.unref(); // never keep the process alive for the sweep alone
+  }
+
   let closing = false;
   const shutdown = (sig: string) => {
     if (closing) return;
     closing = true;
+    if (sweepTimer) clearInterval(sweepTimer);
     console.log(`[vouchr] ${sig} received; draining connections`);
     built.server.close(() => {
       built.db.close().catch(() => undefined).finally(() => process.exit(0));

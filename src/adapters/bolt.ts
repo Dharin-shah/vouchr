@@ -13,8 +13,7 @@ import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } fr
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { handleOAuthCallback } from '../core/oauthCallback';
-import { offboardUser } from '../core/offboard';
-import { revokeToken } from '../core/tokens';
+import { offboardUser, disconnectProvider } from '../core/offboard';
 import { sweepExpired } from '../core/sweep';
 import { SessionGrants } from '../core/session';
 import { assertProductionConfig } from '../core/options';
@@ -760,18 +759,9 @@ export async function createVouchr(opts: VouchrOptions) {
       }
       if (sub === 'disconnect') {
         if (!arg) return respond('Usage: `/vouchr disconnect <provider>`');
-        // Read the token BEFORE deleting; local delete (the security-meaningful action) FIRST,
-        // then best-effort upstream revoke. A revoke failure is non-fatal: the user still sees
-        // a successful disconnect (local access is already gone).
-        const cred = registry.has(arg) ? await vault.get(userOwner(identity), arg) : null;
-        await vault.delete(userOwner(identity), arg);
-        let ok = true;
-        try {
-          if (cred?.accessToken) await revokeToken(registry.get(arg), cred.accessToken);
-        } catch {
-          ok = false;
-        }
-        await audit.record('revoke', identity, arg, { ok }); // never the token
+        // Shared with the headless broker's /v1/disconnect (core disconnectProvider): local delete
+        // FIRST, then best-effort upstream revoke — a revoke failure is non-fatal.
+        const { ok } = await disconnectProvider(vault, audit, registry, identity, arg);
         emit({ type: 'revoked', provider: arg, ok });
         return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
       }

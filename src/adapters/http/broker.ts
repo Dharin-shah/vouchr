@@ -9,6 +9,9 @@ import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, type Resolvers, type EventSink } from '../../core/injector';
 import { userOwner, type Owner } from '../../core/owner';
 import type { SlackIdentity } from '../../core/identity';
+import { Consent } from '../../core/consent';
+import { SessionGrants } from '../../core/session';
+import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
 
 /**
@@ -229,6 +232,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // cross-pod; this covers in-process concurrency (incl. the SQLite single-replica case).
   const inflight = new Map<string, Promise<string | null>>();
 
+  // #54 lifecycle: consent + session stores for offboarding (purge pending consent + thread grants so
+  // neither can resurrect access after a user is removed). Cheap Db wrappers; construct once.
+  const consent = new Consent(opts.db);
+  const sessions = new SessionGrants(opts.db);
+
   /** Perimeter check on /v1/* BEFORE identity. Prefers a pluggable `authorize` hook (e.g. serviceauth),
    *  else the static `brokerToken` bearer, else no gate. NOT identity — that's the signed token. */
   async function perimeter(req: http.IncomingMessage): Promise<void> {
@@ -381,6 +389,46 @@ export function createBroker(opts: BrokerOptions): http.Server {
     return { connected, consentState: connected ? 'connected' : 'needs_consent' };
   }
 
+  /**
+   * #54 `POST /v1/disconnect` — the acting user revokes their OWN connection for one provider (the
+   * headless analogue of `/vouchr disconnect <provider>`). Identity from the signed token; a forged
+   * body can't disconnect someone else. Best-effort upstream revoke; local delete always wins. No secret.
+   */
+  async function handleDisconnect(body: { handle?: { provider?: unknown }; identityToken: string }): Promise<Record<string, unknown>> {
+    const providerId = body.handle?.provider;
+    if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
+    const claims = await verify(body.identityToken);
+    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    const { removed, ok } = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId);
+    return { ok, revoked: removed ? [providerId] : [] };
+  }
+
+  /**
+   * #54 `POST /v1/admin/offboard` — remove ALL of a target user's connections + pending consent +
+   * thread grants (the headless analogue of the Bolt `registerOffboarding` hook). Admin authority
+   * comes from the SIGNED `isAdmin` claim (the broker can't verify workspace admin itself); fail
+   * closed. A signed `enterpriseId` routes the cross-workspace (Grid/SCIM) case to
+   * offboardUserEverywhere. `targetUserId` is the subject, never the actor.
+   */
+  async function handleOffboard(body: { identityToken: string; targetUserId?: unknown }): Promise<Record<string, unknown>> {
+    const claims = await verify(body.identityToken);
+    if (claims.isAdmin !== true) {
+      const actor: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+      await opts.audit.record('denied', actor, 'offboard', { reason: 'not-admin' });
+      throw new HttpError(403, { error: 'admin authority required' });
+    }
+    const targetUserId = body.targetUserId;
+    if (typeof targetUserId !== 'string' || !targetUserId) throw new HttpError(400, { error: 'targetUserId is required' });
+    // Enterprise/Grid: span every workspace the target touches; else this one workspace.
+    if (claims.enterpriseId) {
+      const summary = await offboardUserEverywhere(opts.db, opts.vault, opts.audit, consent, { enterpriseId: claims.enterpriseId, userId: targetUserId }, registry);
+      return { ok: true, revoked: summary.flatMap((s) => s.providers) };
+    }
+    const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
+    const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions);
+    return { ok: true, revoked: providers };
+  }
+
   async function handleHealthz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     let dbReachable = false;
     try {
@@ -414,6 +462,14 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'POST' && url === '/v1/resolve') {
           await perimeter(req);
           return send(200, await handleResolve(await readJson(req)));
+        }
+        if (req.method === 'POST' && url === '/v1/disconnect') {
+          await perimeter(req);
+          return send(200, await handleDisconnect(await readJson(req)));
+        }
+        if (req.method === 'POST' && url === '/v1/admin/offboard') {
+          await perimeter(req);
+          return send(200, await handleOffboard(await readJson(req)));
         }
         send(404, { error: 'not found' });
       } catch (e) {

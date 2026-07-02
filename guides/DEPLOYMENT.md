@@ -144,7 +144,8 @@ allowlist, refresh, audit); the front door is signed identity tokens instead of 
 product: see *Provisioning* below for how credentials get into the store.
 
 Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
-`POST /v1/resolve`, and `GET /healthz` (alias `/health`) on `VOUCHR_PORT` (default 3000).
+`POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, and `GET /healthz` (alias
+`/health`) on `VOUCHR_PORT` (default 3000), and runs the TTL sweep on a timer (see *Lifecycle*).
 
 ### Trust model
 
@@ -169,6 +170,8 @@ fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay
 | `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` | per OAuth provider | client creds, kept out of the JSON. |
 | `VOUCHR_KMS_KEY_ID` | prod | enables the KMS envelope (KEK). Needs `@aws-sdk/client-kms` in the image. |
 | `VOUCHR_BROKER_TOKEN` | no | static bearer for the coarse perimeter gate on `/v1/*`. |
+| `VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS` | no | credential idle / max-age TTL (#54). Default 7d / 30d (matches the Bolt path); `0` disables that dimension. |
+| `VOUCHR_SWEEP_INTERVAL_MS` | no | TTL sweep interval (#54). Default hourly; `0` defers to an external scheduler. |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
 | `VOUCHR_PRODUCTION` | prod | `1` → boot fails fast unless Postgres **and** a KMS envelope are configured. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
@@ -216,6 +219,29 @@ writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the p
 - **Per-user credentials** (each human's own account): the broker does **not** run OAuth consent.
   Run the Bolt control-plane Vouchr against the **same Postgres database**; users connect in Slack,
   and the headless broker reads what they consented to. One store, two front doors.
+
+### Lifecycle: disconnect, offboard, TTL sweep (#54)
+
+The headless broker can **revoke** credentials, not just inject them — the two checklist items
+"deactivated users lose access" and "TTL sweep scheduled" are satisfied without the Bolt control plane.
+
+- `POST /v1/disconnect` — body `{ handle: { provider }, identityToken }`. The acting user revokes their
+  OWN connection for one provider (identity from the signed token; a forged body can't disconnect
+  someone else). Local delete first, best-effort upstream revoke. Returns `{ ok, revoked: string[] }`.
+- `POST /v1/admin/offboard` — body `{ identityToken, targetUserId }`. Removes ALL of the target's
+  connections + pending consent + thread grants (wire it to your directory/deprovision hook). Admin
+  authority comes from the **signed `isAdmin` claim** — the broker can't verify workspace admin itself,
+  so your minter sets it after its own check; fail closed. A signed `enterpriseId` routes the
+  cross-workspace (Grid/SCIM) case to `offboardUserEverywhere`.
+- **TTL sweep** — `broker-server` runs the sweep at startup and every `VOUCHR_SWEEP_INTERVAL_MS`
+  (default hourly; `0` to defer to your own scheduler). It deletes connections past the TTL policy
+  (`VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS`, default 7d / 30d) plus stale consent and expired
+  thread grants. The sweep is idempotent, so overlapping runs across replicas are safe. **Note:** the
+  default TTL now matches the Bolt path — a pure-headless deployment that previously kept credentials
+  forever will start expiring them; set both TTL vars to `0` to preserve unbounded lifetime.
+
+For in-process control, `offboardUser`, `sweepExpired`, and `disconnectProvider` are exported from the
+package root.
 
 ### Replay (multi-replica)
 
@@ -315,8 +341,8 @@ yours. Don't go live until each holds.
 | Public URL is HTTPS. Egress also requires https, loopback exempt | operator (Vouchr enforces https egress) |
 | Least-privilege IAM for any resolver (read-only on the specific secrets) | operator (example policy provided) |
 | Slack scopes / events / interactivity applied from the manifest | operator (manifest provided) |
-| TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; operator schedules |
-| Offboarding wired (`registerOffboarding`) so deactivated users lose access | Vouchr provides; operator wires |
+| TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; Bolt: schedule it. Headless: `broker-server` runs it automatically (#54) |
+| Offboarding wired so deactivated users lose access | Vouchr provides; Bolt: `registerOffboarding`. Headless: `POST /v1/admin/offboard` from your deprovision hook (#54) |
 | Envelope encryption considered for token columns (`EnvelopeProvider` + KMS) | Vouchr provides hook; operator opts in |
 | Backups of the credential store (and a restore drill) | operator |
 | Monitoring/alerting on resolver and KMS failures, and on auth/refresh errors | operator |

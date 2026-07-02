@@ -871,3 +871,74 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
     server.close();
   }
 });
+
+// ── #54 lifecycle: disconnect / admin offboard ───────────────────────────────
+
+test('#54 /v1/disconnect removes the acting user\'s connection; resolve then needs_consent', async () => {
+  const { server, port, vault } = await makeBroker(); // seeds U1's acme cred
+  try {
+    const d = await post(port, '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(d.status, 200);
+    assert.deepEqual(d.json.revoked, ['acme']);
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
+    const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(rv.json.consentState, 'needs_consent');
+  } finally {
+    server.close();
+  }
+});
+
+test('#54 /v1/disconnect acts only on the token identity (a different user is untouched)', async () => {
+  const { server, port, vault } = await makeBroker();
+  // Seed a second user U2 whose cred must survive U1 disconnecting.
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    await post(port, '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET) });
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
+    assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), 'U2 must be untouched');
+  } finally {
+    server.close();
+  }
+});
+
+test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user', async () => {
+  const { server, port, vault } = await makeBroker();
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET), targetUserId: 'U2' });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.revoked, ['acme']);
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('#54 /v1/admin/offboard without the signed isAdmin claim -> 403 (forged body can\'t assert admin)', async () => {
+  const { server, port, vault } = await makeBroker();
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    // A plain user token, plus a forged body isAdmin flag (ignored — authority is the signed claim only).
+    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims(), SECRET), targetUserId: 'U2', isAdmin: true } as any);
+    assert.equal(r.status, 403);
+    assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), 'a refused offboard must not remove anything');
+  } finally {
+    server.close();
+  }
+});
+
+test('#54 /v1/admin/offboard requires a targetUserId', async () => {
+  const { server, port } = await makeBroker();
+  try {
+    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ isAdmin: true }), SECRET) });
+    assert.equal(r.status, 400);
+  } finally {
+    server.close();
+  }
+});
