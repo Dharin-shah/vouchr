@@ -627,6 +627,37 @@ export function createBroker(opts: BrokerOptions): http.Server {
     };
   }
 
+  /**
+   * #58 `POST /v1/user/reference` — the acting user points their OWN credential for a provider at an
+   * external secret-manager REFERENCE (the headless analogue of the Bolt key-setup modal's "reference
+   * a secret manager"). Self-service (NOT admin-gated — it's the user's own credential), identity from
+   * the signed token. Reference only: no raw secret crosses the broker (the injector resolves it JIT
+   * at egress via `resolvers`). Refuses service tools. No secret in the response.
+   */
+  async function handleUserReference(body: {
+    handle?: { provider?: unknown };
+    identityToken: string;
+    source?: unknown;
+    secretRef?: unknown;
+    scopes?: unknown;
+  }): Promise<Record<string, unknown>> {
+    const providerId = body.handle?.provider;
+    if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
+    if (typeof body.source !== 'string' || typeof body.secretRef !== 'string' || !body.source || !body.secretRef) {
+      throw new HttpError(400, { error: 'source and secretRef are required' });
+    }
+    if (body.scopes !== undefined && typeof body.scopes !== 'string') throw new HttpError(400, { error: 'invalid scopes' });
+    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    const claims = await verify(body.identityToken);
+    // Carry the signed enterpriseId so an enterprise offboard (Grid/SCIM) can discover this reference.
+    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    // Owner is the VERIFIED acting user, never the body — a forged body can't reference into another's slot.
+    await opts.vault.reference(userOwner(identity), providerId, { source: body.source, secretRef: body.secretRef, scopes: body.scopes });
+    await opts.audit.record('config', identity, providerId, { owner: 'user', kind: 'ref', source: body.source });
+    return { ok: true };
+  }
+
   async function handleHealthz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     let dbReachable = false;
     try {
@@ -692,6 +723,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'POST' && url === '/v1/status') {
           await perimeter(req);
           return send(200, await handleStatus(await readJson(req)));
+        }
+        if (req.method === 'POST' && url === '/v1/user/reference') {
+          await perimeter(req);
+          return send(200, await handleUserReference(await readJson(req)));
         }
         send(404, { error: 'not found' });
       } catch (e) {

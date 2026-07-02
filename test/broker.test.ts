@@ -1390,3 +1390,58 @@ test('#55 /v1/manifest sits behind the perimeter gate', async () => {
     server.close();
   }
 });
+
+// ── #58 per-user reference-only config (POST /v1/user/reference) ──────────────
+
+async function makeRefBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, ...extra });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, vault, db, port: (server.address() as any).port };
+}
+
+test('#58 user reference stores the acting user\'s ref; their fetch resolves it at egress', async () => {
+  const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:user' ? SECRET_TOKEN : 'WRONG') };
+  const { server, port, vault } = await makeRefBroker({ resolvers });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/user/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn:user',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.ok, true);
+    // Stored against the acting user (U1) as a reference — no raw secret persisted.
+    const cred = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+    assert.equal(cred?.secretRef, 'arn:user');
+    const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(f.status, 200);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#58 user reference is bound to the token identity (a forged body can\'t reference into another slot)', async () => {
+  const { server, port, vault } = await makeRefBroker();
+  try {
+    await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET), source: 'aws-sm', secretRef: 'arn:user' });
+    assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), 'stored for the token user U1');
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), null, 'never for another user');
+  } finally {
+    server.close();
+  }
+});
+
+test('#58 user reference rejects a tampered token, service tools, and a missing secretRef', async () => {
+  const { server, port } = await makeRefBroker();
+  try {
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: 'nope', source: 'aws-sm', secretRef: 'arn' })).status, 401);
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn' })).status, 403);
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm' } as any)).status, 400);
+  } finally {
+    server.close();
+  }
+});
