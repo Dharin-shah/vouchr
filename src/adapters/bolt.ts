@@ -882,7 +882,40 @@ export async function createVouchr(opts: VouchrOptions) {
     return n;
   }
 
+  /**
+   * One-call wiring for the common case. Does everything a Bolt app needs in the right order:
+   * the credential-injection middleware, the OAuth callback route, the `/vouchr` slash command, the
+   * deactivation → offboard hook, and the hourly TTL sweep (once at startup, then on a timer). The
+   * granular methods above remain for apps that need finer control. Returns `{ stop }` to clear the
+   * sweep timer on shutdown. `sweepIntervalMs: 0` disables the timer (drive `sweepExpired()` yourself).
+   */
+  function install(
+    app: {
+      use: (m: typeof middleware) => void;
+      command: (name: string, handler: (args: any) => Promise<void>) => void;
+      view: (id: string, handler: (args: any) => Promise<void>) => void;
+      action: (id: string, handler: (args: any) => Promise<void>) => void;
+      event: (name: string, handler: (args: any) => Promise<void>) => void;
+    },
+    receiver: { router: any },
+    opts: { sweepIntervalMs?: number } = {},
+  ): { stop: () => void } {
+    app.use(middleware);
+    mountRoutes(receiver.router);
+    registerCommands(app);
+    registerOffboarding(app);
+    const intervalMs = opts.sweepIntervalMs ?? 60 * 60 * 1000;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    if (intervalMs > 0) {
+      void sweep().catch(() => undefined); // reclaim expired rows at startup; errors are non-fatal
+      timer = setInterval(() => void sweep().catch(() => undefined), intervalMs);
+      timer.unref(); // never keep the process alive for the sweep alone
+    }
+    return { stop: () => { if (timer) clearInterval(timer); } };
+  }
+
   return {
+    install,
     middleware,
     mountRoutes,
     registerCommands,
