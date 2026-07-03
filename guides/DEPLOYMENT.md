@@ -145,10 +145,11 @@ per-user consent end-to-end, so a headless host needs **no Slack app** to onboar
 *Provisioning* below for the other ways credentials get into the store.
 
 Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
-`POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `GET /healthz` (alias
-`/health`), and — when channel modes are enabled — `POST /v1/admin/reference`, on `VOUCHR_PORT`
-(default 3000), and runs the TTL sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it
-additionally serves `POST /v1/connect` and the OAuth callback (below).
+`POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `POST /v1/status`,
+`POST /v1/user/reference`, `GET /v1/manifest`, `GET /healthz` (alias `/health`), and — when channel
+modes are enabled — `POST /v1/admin/reference`, on `VOUCHR_PORT` (default 3000), and runs the TTL
+sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it additionally serves
+`POST /v1/connect` and the OAuth callback (below).
 
 ### OAuth connect flow (headless consent, #52)
 
@@ -166,6 +167,17 @@ core state/PKCE/exchange the Bolt adapter uses, no duplicated crypto:
 When a `/v1/resolve` returns `needs_consent`, drive the user through `POST /v1/connect`; the next
 `/v1/fetch` for that user then succeeds. The broker never handles a raw token itself — it is only ever
 written to the vault inside the callback.
+
+### Convenience: batch status + manifest (#55)
+
+Two non-secret helpers so a host needn't loop `/v1/resolve` or re-derive the provider list:
+
+- `POST /v1/status` — body `{ identityToken }`. Returns the acting user's state across ALL brokered
+  providers in one call: `{ providers: [{ provider, connected, consentState }] }` (service tools
+  omitted). No secret material — the batched form of `/v1/resolve`.
+- `GET /v1/manifest` — `{ providers: [{ provider, identity }] }`, where `identity` is `acting_human`
+  (Vouchr brokers it) or `service` (host wires its own auth). Non-secret policy metadata; behind the
+  perimeter gate.
 
 ### Trust model
 
@@ -294,6 +306,11 @@ writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the p
   (`VOUCHR_BASE_URL`, #52) and drive users through `POST /v1/connect` → callback directly, **or** run
   the Bolt control-plane Vouchr against the **same Postgres database** so users connect in Slack and
   the headless broker reads what they consented to. One store, two front doors.
+- **Per-user *referenced* credentials** (a user's own key for a non-OAuth provider): the user points
+  their credential at an external secret-manager reference with `POST /v1/user/reference` (#58) —
+  body `{ handle: { provider }, identityToken, source, secretRef, scopes? }`. Self-service (identity
+  from the signed token), **reference only** — no raw secret crosses the broker; the configured
+  `resolvers` resolve it JIT at egress. Raw-key ingest stays out of the broker by design.
 
 ### Lifecycle: disconnect, offboard, TTL sweep (#54)
 

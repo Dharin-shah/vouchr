@@ -1321,3 +1321,127 @@ test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async ()
     server.close();
   }
 });
+
+// ── #55 batch status + tool manifest (POST /v1/status, GET /v1/manifest) ──────
+
+const other = defineProvider({
+  id: 'other', authorizeUrl: 'https://other.example/auth', tokenUrl: 'https://other.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.other.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
+});
+
+async function makeMultiBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  // Only acme is connected for U1; `other` is not; `svc` is a service tool (never brokered).
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const server = createBroker({ providers: [acme, other, svc], vault, audit, db, identitySecret: SECRET, ...extra });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, db, port: (server.address() as any).port };
+}
+
+test('#55 /v1/status batches connection state across brokered providers (service omitted)', async () => {
+  const { server, port } = await makeMultiBroker();
+  try {
+    const r = await post(port, '/v1/status', { identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.json.providers.map((p: any) => [p.provider, p]));
+    assert.deepEqual(byId.acme, { provider: 'acme', connected: true, consentState: 'connected' });
+    assert.deepEqual(byId.other, { provider: 'other', connected: false, consentState: 'needs_consent' });
+    assert.equal(byId.svc, undefined, 'service tools are not brokered, so they are omitted from status');
+    assert.ok(!r.raw.includes(SECRET_TOKEN), 'status must never carry secret material');
+  } finally {
+    server.close();
+  }
+});
+
+test('#55 /v1/status rejects a tampered identity token', async () => {
+  const { server, port } = await makeMultiBroker();
+  try {
+    const r = await post(port, '/v1/status', { identityToken: 'nope' });
+    assert.equal(r.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('#55 /v1/manifest lists providers with their acting_human/service identity', async () => {
+  const { server, port } = await makeMultiBroker();
+  try {
+    const r = await get(port, '/v1/manifest');
+    assert.equal(r.status, 200);
+    const byId = Object.fromEntries(r.json.providers.map((p: any) => [p.provider, p.identity]));
+    assert.equal(byId.acme, 'acting_human');
+    assert.equal(byId.other, 'acting_human');
+    assert.equal(byId.svc, 'service');
+  } finally {
+    server.close();
+  }
+});
+
+test('#55 /v1/manifest sits behind the perimeter gate', async () => {
+  const { server, port } = await makeMultiBroker({ brokerToken: 'sekret' });
+  try {
+    const missing = await get(port, '/v1/manifest'); // no bearer
+    assert.equal(missing.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+// ── #58 per-user reference-only config (POST /v1/user/reference) ──────────────
+
+async function makeRefBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, ...extra });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, vault, db, port: (server.address() as any).port };
+}
+
+test('#58 user reference stores the acting user\'s ref; their fetch resolves it at egress', async () => {
+  const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:user' ? SECRET_TOKEN : 'WRONG') };
+  const { server, port, vault } = await makeRefBroker({ resolvers });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const r = await post(port, '/v1/user/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn:user',
+    });
+    assert.equal(r.status, 200);
+    assert.equal(r.json.ok, true);
+    // Stored against the acting user (U1) as a reference — no raw secret persisted.
+    const cred = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+    assert.equal(cred?.secretRef, 'arn:user');
+    const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(f.status, 200);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#58 user reference is bound to the token identity (a forged body can\'t reference into another slot)', async () => {
+  const { server, port, vault } = await makeRefBroker();
+  try {
+    await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET), source: 'aws-sm', secretRef: 'arn:user' });
+    assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), 'stored for the token user U1');
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), null, 'never for another user');
+  } finally {
+    server.close();
+  }
+});
+
+test('#58 user reference rejects a tampered token, service tools, and a missing secretRef', async () => {
+  const { server, port } = await makeRefBroker();
+  try {
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: 'nope', source: 'aws-sm', secretRef: 'arn' })).status, 401);
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn' })).status, 403);
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm' } as any)).status, 400);
+  } finally {
+    server.close();
+  }
+});
