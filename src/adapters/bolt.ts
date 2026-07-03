@@ -8,7 +8,7 @@ import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
-import { resolveIdentity, isSlackAdmin, isChannelMember, listChannelMembers } from './slack-identity';
+import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
@@ -103,10 +103,11 @@ export interface VouchrOptions {
   auditSink?: AuditSink;
   /**
    * Custom admin check for channel-credential config (governance). When set, `requireAdmin` uses
-   * it INSTEAD of the built-in Slack is_admin/is_owner gate, e.g. to defer to your own RBAC or an
-   * allow-list. When omitted, the gate is exactly as before (`isSlackAdmin`). The default-deny +
-   * audit-on-denial behavior is identical regardless of which check runs. Fail closed yourself:
-   * a thrown override is treated as "not admin".
+   * it INSTEAD of the built-in gate, e.g. to defer to your own RBAC or an allow-list. When omitted,
+   * the default gate is "workspace admin OR channel creator" (a channel owner can self-serve without
+   * waiting for IT); set `isAdmin: (c,u)=>isSlackAdmin(c,u)` for strict workspace-only. The
+   * default-deny + audit-on-denial behavior is identical regardless of which check runs. Fail closed
+   * yourself: a thrown override is treated as "not admin".
    */
   isAdmin?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
   /**
@@ -158,7 +159,8 @@ export interface ConnectContextDeps {
   sink?: EventSink;
   /** The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed. */
   providerIds?: string[];
-  /** Governance: custom admin check (overrides isSlackAdmin). Undefined = built-in Slack gate. */
+  /** Governance: custom admin check (overrides the default). Undefined = built-in gate (workspace
+   *  admin OR channel creator). */
   adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
   /** Governance: when true, connectChannel requires the acting user to be a channel member. */
   requireMembership?: boolean;
@@ -400,12 +402,15 @@ export class ConnectContext {
   // `this.channel` comes from the VERIFIED Slack event, so the channel binding cannot be
   // forged (invariant 1). teamId is always the authenticated user's (invariant 2).
 
-  /** Default-deny admin gate for config mutations (invariant 7). Audits the denial. */
+  /** Default-deny admin gate for config mutations (invariant 7). Audits the denial. Default allows a
+   *  workspace admin OR the channel creator (self-serve: a channel owner needn't wait for IT); a
+   *  custom `adminCheck` fully replaces that default (set it to strict workspace-only if desired). */
   private async requireAdmin(providerId: string): Promise<void> {
-    // A custom check overrides the built-in Slack gate; a thrown override fails closed (not admin).
+    // A custom check overrides the built-in gate; a thrown override fails closed (not admin).
     const ok = this.adminCheck
       ? await this.adminCheck(this.client, this.identity.userId, this.identity.teamId).catch(() => false)
-      : await isSlackAdmin(this.client, this.identity.userId);
+      : (await isSlackAdmin(this.client, this.identity.userId)
+        || await isChannelAdmin(this.client, this.channel ?? '', this.identity.userId));
     if (!ok) {
       await this.audit.record('denied', this.identity, providerId, {
         reason: 'not-admin',
