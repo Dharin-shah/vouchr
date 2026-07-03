@@ -1151,13 +1151,16 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
   const { server, port } = await makeOauthBroker();
   const NEW = 'NEW_ACCESS_TOKEN_from_oauth';
   const real = globalThis.fetch;
+  let upstreamAuth: string | null = null; // what the provider API received on the wire
   globalThis.fetch = (async (u: any, init: any) => {
     if (String(u).startsWith('https://acme.example/token')) {
       return new Response(JSON.stringify({ access_token: NEW }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    // upstream provider API: echo the injected Authorization so we can assert the new token flows.
+    // upstream provider API: capture the injected Authorization so we can assert the new token flows on
+    // the wire (the injection proof — the broker relays the body verbatim, no response sanitization).
     const auth = new Headers(init?.headers).get('authorization');
-    return new Response(JSON.stringify({ auth }), { status: 200, headers: { 'content-type': 'application/json' } });
+    upstreamAuth = auth;
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
   try {
     const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
@@ -1168,7 +1171,8 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
     // The token is now vaulted; a subsequent fetch injects it and resolve reports connected.
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(f.status, 200);
-    assert.equal(JSON.parse(f.json.body).auth, `Bearer ${NEW}`);
+    // The new OAuth token was injected — observed on the wire (the upstream received it).
+    assert.equal(upstreamAuth, `Bearer ${NEW}`);
     const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(rv.json.consentState, 'connected');
   } finally {

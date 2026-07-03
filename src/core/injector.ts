@@ -28,6 +28,11 @@ export type VouchrEvent =
   // `reason` splits the single denial type by the gate that rejected: bad URL creds / non-allowlisted
   // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator'.
   | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' }
+  // No-secret UPSTREAM-FAILURE signal: a network-level throw (DNS/connection refused) or a token-refresh
+  // throw. Without this a provider outage / refresh breakage is a silent black box (the broker maps it to
+  // 502 with no event, no audit). `host` = url.hostname only, `reason` a static string ('fetch_failed'/
+  // 'refresh_failed') — NEVER the error message (it could carry the secret).
+  | { type: 'egress_error'; provider: string; host: string; reason: string }
   | { type: 'resolver_failed'; provider: string; source: string }
   | { type: 'connect_prompted'; provider: string }
   | { type: 'connected'; provider: string }
@@ -49,6 +54,27 @@ export type EventSink = (e: VouchrEvent) => void;
  *    shared channel credential is used. A shared cred never launders away who acted.
  */
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
+
+/**
+ * Egress allowlist / policy rejection — the requested target failed a gate BEFORE any secret was read.
+ * The broker maps this to 403. The `.message` TEXT is preserved verbatim from the pre-typed
+ * `Error('Egress blocked: …')` so callers that still string-match the message (e.g. bolt.ts) keep working;
+ * this is purely additive typing so the broker can switch its regex to an `instanceof` check.
+ */
+export class EgressBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EgressBlockedError';
+  }
+}
+
+/** No stored credential for this owner+provider. The broker maps this to 409. Message TEXT preserved. */
+export class NoConnectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoConnectionError';
+  }
+}
 
 function pathAllowed(pathname: string, allowed: string): boolean {
   if (allowed === '/') return true;
@@ -72,7 +98,17 @@ export class ConnectionHandle {
     // Optional audit STREAM sink (carries the raw actor id). Separate from `sink`, which is
     // deliberately actor-free. Default no-op. The authoritative copy is still the audit table.
     private auditSink: AuditSink = () => {},
+    // The human who TRIGGERED this request, when it differs from `acting` (union mode: `acting` is the
+    // borrowed member, not the caller). Added to the inject audit meta so non-repudiation records BOTH
+    // the acted-as member and the real triggerer. Default null = same as acting (nothing extra recorded).
+    private triggeredBy: string | null = null,
   ) {}
+
+  /** Union non-repudiation: record the real triggerer alongside the acted-as member when they differ
+   *  (a plain userId, never a secret). Empty on every non-union path. Shared by success + failure audits. */
+  private triggerMeta(): Record<string, string> {
+    return this.triggeredBy && this.triggeredBy !== this.acting.userId ? { triggeredBy: this.triggeredBy } : {};
+  }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
@@ -96,7 +132,31 @@ export class ConnectionHandle {
   ): Promise<never> {
     this.emit({ type: 'egress_denied', provider: this.provider.id, host, reason });
     await this.audit.record('denied', this.acting, this.provider.id, { host, reason });
-    throw new Error(message);
+    throw new EgressBlockedError(message);
+  }
+
+  /**
+   * No-secret UPSTREAM-FAILURE signal for a network throw / refresh throw. Fires the egress_error metric
+   * AND writes an attributable audit row so a provider outage / refresh breakage isn't a silent 502.
+   * Meta carries ONLY the hostname + a static reason — NEVER the url, headers, or the error message (any
+   * of which could carry the secret). Audit is best-effort: it must never mask the original throw.
+   */
+  private async egressError(host: string, reason: string): Promise<void> {
+    this.emit({ type: 'egress_error', provider: this.provider.id, host, reason });
+    // Carry the same union triggerer as the success path so a FAILED call keeps its non-repudiation.
+    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...this.triggerMeta() }).catch(() => undefined);
+  }
+
+  /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502.
+   *  host = the OAuth TOKEN endpoint (where a refresh actually fails), not the target API host — matching
+   *  the refresh-SUCCESS audit. tokenUrl is always present here (only OAuth providers refresh). */
+  private async refreshSignalled(): Promise<string | null> {
+    try {
+      return await this.refreshAndStore();
+    } catch (e) {
+      await this.egressError(new URL(this.provider.tokenUrl).hostname, 'refresh_failed');
+      throw e;
+    }
   }
 
   /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
@@ -162,25 +222,32 @@ export class ConnectionHandle {
     // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
     let kms = 0;
     const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
-    if (!cred) throw new Error(`No connection for provider "${this.provider.id}"`);
+    if (!cred) throw new NoConnectionError(`No connection for provider "${this.provider.id}"`);
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     const vaulted = cred.source === 'vault';
 
     let token = vaulted ? await this.vaultToken(cred) : await this.resolveRef(cred);
-    const send = (t: string) => {
+    const send = async (t: string) => {
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);
       else headers.set('Authorization', `Bearer ${t}`);
-      // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
-      return fetch(input, { ...init, headers, redirect: 'manual' });
+      try {
+        // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
+        return await fetch(input, { ...init, headers, redirect: 'manual' });
+      } catch (e) {
+        // Network-level throw (DNS/connection refused): fire the no-secret failure signal, then re-throw
+        // so the broker still maps it to 502 — the signal is emitted, not swallowed.
+        await this.egressError(url.hostname, 'fetch_failed');
+        throw e;
+      }
     };
 
     const t0 = Date.now();
     let res = await send(token);
     // Refresh-on-401 only applies to vaulted OAuth creds; referenced secrets rotate externally.
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshAndStore();
+      const refreshed = await this.refreshSignalled();
       if (refreshed) {
         // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
         res.body?.cancel().catch(() => undefined);
@@ -197,7 +264,7 @@ export class ConnectionHandle {
     // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
     const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
     await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta })
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...this.triggerMeta() })
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
@@ -226,7 +293,7 @@ export class ConnectionHandle {
   private async vaultToken(cred: StoredCredential): Promise<string> {
     const expiringSoon = cred.expiresAt != null && cred.expiresAt < Date.now() + 30_000;
     if (expiringSoon && cred.refreshToken && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshAndStore();
+      const refreshed = await this.refreshSignalled();
       if (refreshed) return refreshed;
     }
     if (cred.accessToken == null) throw new Error(`Vaulted connection for "${this.provider.id}" has no token`);

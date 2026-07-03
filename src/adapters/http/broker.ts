@@ -6,7 +6,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import type { ChannelConfig, ChannelMode } from '../../core/channelConfig';
 import { authorizeProvider, resolveCredentialOwner } from '../../core/authz';
@@ -421,21 +421,25 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (!ref || (ref.owner !== 'user' && ref.owner !== 'channel') || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
     }
+    // Identity is verified BEFORE any provider-existence probe, so an unauthenticated caller past the
+    // perimeter can't enumerate registered providers via distinct 404/403 responses (#enumeration).
+    const claims = await verify(body.identityToken);
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
     // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
     if (registry.get(ref.provider).identity === 'service') {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
-    const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.allowWrites);
     const { owner, acting } = await resolveOwner(ref, claims);
     // The 7th arg is the createBroker-scoped SHARED inflight map, so concurrent requests for the same
     // owner+provider collapse to one token refresh (rotating-refresh providers brick on a double
     // refresh). The 8th wires the metrics sink so the broker path stops being a black box; the 9th
-    // wires the audit STREAM sink (raw actor id) for host-side ingestion.
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink);
+    // wires the audit STREAM sink (raw actor id) for host-side ingestion. The 10th is the real
+    // triggering caller (claims.userId): in union mode `acting` is the borrowed member, so passing the
+    // caller lets the inject audit record BOTH for non-repudiation (no-op when they're the same).
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId);
     return { handle, provider };
   }
 
@@ -475,9 +479,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
     try {
       res = await handle.fetch(url.toString(), { method, headers, body: outboundBody });
     } catch (e) {
-      const msg = (e as Error).message;
-      if (/Egress blocked/.test(msg)) throw new HttpError(403, { error: 'egress blocked' });
-      if (/No connection/.test(msg)) throw new HttpError(409, { error: 'not connected' });
+      // Typed classes, not a message regex (the stringly-typed contract is gone). The upstream-failure
+      // egress_error signal (metric + audit) already fired inside the injector before the throw reached
+      // here, so mapping to 502 doesn't swallow it.
+      if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
+      if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
       throw new HttpError(502, { error: 'upstream fetch failed' });
     }
 
@@ -502,13 +508,14 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (!ref || ref.owner !== 'user' || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
     }
+    // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
+    const claims = await verify(body.identityToken);
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools are not brokered by Vouchr — don't even report their consent state
     // (else /v1/resolve would call a service tool "connected"/"needs_consent"). Refuse like /v1/fetch.
     if (registry.get(ref.provider).identity === 'service') {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
-    const claims = await verify(body.identityToken);
     const { owner } = ownerFromClaims(claims);
     const connected = (await opts.vault.get(owner, ref.provider)) != null;
     // NO secret: only existence + a coarse consent state. The token is never read into the response.
@@ -576,10 +583,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'source and secretRef are required' });
     }
     if (body.scopes !== undefined && typeof body.scopes !== 'string') throw new HttpError(400, { error: 'invalid scopes' });
+    // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
+    const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
 
-    const claims = await verify(body.identityToken);
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // Admin authority: SIGNED claim only (the broker can't verify Slack admin). Fail closed + audited.
     if (claims.isAdmin !== true) {
@@ -611,11 +619,12 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (!redirectUri) throw new HttpError(404, { error: 'oauth connect is not configured' });
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
+    // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
+    const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     const provider = registry.get(providerId);
     if (provider.identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     if (provider.credential === 'key') throw new HttpError(400, { error: 'provider has no OAuth flow; supply a key instead' });
-    const claims = await verify(body.identityToken);
     // Carry the signed enterpriseId so the resulting connection is discoverable by an enterprise
     // offboard (Grid/SCIM) — else a headless-OAuth connection would be pinned to enterpriseId:null.
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
@@ -696,9 +705,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'source and secretRef are required' });
     }
     if (body.scopes !== undefined && typeof body.scopes !== 'string') throw new HttpError(400, { error: 'invalid scopes' });
+    // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
+    const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
-    const claims = await verify(body.identityToken);
     // Carry the signed enterpriseId so an enterprise offboard (Grid/SCIM) can discover this reference.
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // Owner is the VERIFIED acting user, never the body — a forged body can't reference into another's slot.
