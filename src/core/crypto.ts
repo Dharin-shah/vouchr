@@ -85,13 +85,17 @@ export async function seal(plaintext: string, key: Buffer, envelope?: EnvelopePr
  *    are the unprefixed iv|tag|ct format and decrypt directly under the master key, exactly as
  *    the current code does. This is what keeps a local deploy reading its own existing data.
  *  - Provider + first byte != 0x01 → legacy (envelope rows always start 0x01).
- *  - Provider + first byte == 0x01 → try the envelope path; on ANY failure fall back to legacy.
- *    The fallback covers the 1-in-256 case of a legacy random IV that happens to begin with 0x01
- *    (relevant only when migrating an existing local deploy to envelope). Tampered/corrupt data
- *    still fails closed: the legacy attempt's GCM tag check then throws too.
+ *  - Provider + first byte == 0x01 → the envelope path. On failure, we DON'T blindly return the
+ *    legacy decrypt: that masked a transient KMS unwrap outage behind an opaque GCM "bad data"
+ *    error. Instead we probe the legacy decrypt only to disambiguate the 1-in-256 case of a legacy
+ *    IV that happens to begin with 0x01 (a genuine non-envelope row, relevant when migrating a
+ *    local deploy to envelope): if that probe SUCCEEDS the row really was legacy, so return it; if
+ *    it FAILS the row was a true envelope row, so re-raise the ENVELOPE error — the clear KMS/tamper
+ *    message, never the legacy GCM one. Either way nothing is returned unless a decrypt authenticated.
  */
 export async function open(blob: Buffer, key: Buffer, envelope?: EnvelopeProvider, onUnwrap?: () => void): Promise<string> {
   if (!envelope || blob[0] !== SCHEME_ENVELOPE) return decrypt(blob, key);
+  let envErr: unknown;
   try {
     const dekLen = blob.readUInt16BE(1);
     const wrapped = blob.subarray(3, 3 + dekLen);
@@ -103,10 +107,13 @@ export async function open(blob: Buffer, key: Buffer, envelope?: EnvelopeProvide
     } finally {
       dek.fill(0); // scrub the unwrapped DEK once we're done with it
     }
+  } catch (e) {
+    envErr = e; // KMS unwrap outage, envelope tamper, OR a legacy 0x01-IV collision — disambiguate below.
+  }
+  try {
+    return decrypt(blob, key); // recovers a genuine legacy row whose IV collided with 0x01.
   } catch {
-    // Not a real envelope row (legacy IV starting 0x01), or genuinely bad data. Legacy decrypt
-    // either recovers it or throws, so corruption/tampering still fails closed.
-    return decrypt(blob, key);
+    throw envErr; // not legacy → this was a real envelope row; surface its clear error, not the GCM one.
   }
 }
 

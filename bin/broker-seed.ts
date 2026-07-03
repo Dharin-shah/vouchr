@@ -23,7 +23,7 @@ import { loadMasterKey } from '../src/core/crypto';
 import { Vault } from '../src/core/vault';
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { EnvelopeProvider } from '../src/core/crypto';
-import { assertProductionConfig } from '../src/core/options';
+import { assertProductionConfig, isPostgresUrl } from '../src/core/options';
 
 function parseFlags(argv: string[]): Record<string, string> {
   const out: Record<string, string> = {};
@@ -60,7 +60,7 @@ async function main(): Promise<void> {
   const scopes = f.scopes ? f.scopes.split(',').map((s) => s.trim()).filter(Boolean).join(' ') : undefined;
 
   const url = process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
-  const backend = url && /^postgres(ql)?:\/\//.test(url) ? 'postgres' : 'sqlite';
+  const backend = isPostgresUrl(url) ? 'postgres' : 'sqlite';
   let envelope: EnvelopeProvider | undefined;
   if (process.env.VOUCHR_KMS_KEY_ID) {
     const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms');

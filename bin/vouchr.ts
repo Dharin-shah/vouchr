@@ -11,6 +11,7 @@
  */
 import { openDb, type Db } from '../src/core/db';
 import { loadMasterKey } from '../src/core/crypto';
+import { isPostgresUrl } from '../src/core/options';
 import { github, google, gitlab, notion, type Provider } from '../src/core/providers';
 
 type Flags = { values: Record<string, string>; positional: string[] };
@@ -49,7 +50,7 @@ function printTable(headers: string[], rows: string[][]): void {
 /** Mirror openDb's backend resolution so `doctor` can report it without opening twice. */
 function describeBackend(dbPath?: string): string {
   const url = process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
-  if (url && /^postgres(ql)?:\/\//.test(url)) return 'Postgres (VOUCHR_DATABASE_URL)';
+  if (isPostgresUrl(url)) return 'Postgres (VOUCHR_DATABASE_URL)';
   return `SQLite path=${dbPath ?? process.env.VOUCHR_DB ?? 'vouchr.db'}`;
 }
 
