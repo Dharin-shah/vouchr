@@ -131,11 +131,6 @@ test('buildBrokerServer: fails fast naming the missing secret', async () => {
   await assert.rejects(buildBrokerServer({ ...baseEnv(), VOUCHR_MASTER_KEY: 'dG9vc2hvcnQ=' }), /32 bytes/);
 });
 
-test('buildBrokerServer: production without an envelope is rejected (fail fast)', async () => {
-  const env = baseEnv({ VOUCHR_PRODUCTION: '1', VOUCHR_DATABASE_URL: 'postgres://user:pw@db/vouchr' });
-  await assert.rejects(buildBrokerServer(env), /envelope/); // Postgres present, envelope missing
-});
-
 // ── T8: seed CLI ─────────────────────────────────────────────────────────────
 
 test('broker-seed: reference mode writes a credential the broker can resolve', async () => {
@@ -155,18 +150,4 @@ test('broker-seed: reference mode writes a credential the broker can resolve', a
   } finally {
     await db.close();
   }
-});
-
-test('broker-seed: production mode requires the same envelope contract as the broker', () => {
-  const env = {
-    ...process.env,
-    VOUCHR_MASTER_KEY: KEY_B64,
-    VOUCHR_PRODUCTION: '1',
-    VOUCHR_DATABASE_URL: 'postgres://user:pw@db/vouchr',
-  };
-  assert.throws(() => execFileSync(process.execPath, [
-    '--import', 'tsx', 'bin/broker-seed.ts', 'reference',
-    '--provider', 'confluence', '--team', 'T1', '--user', 'U1',
-    '--source', 'aws-sm', '--secret-ref', 'arn:aws:secretsmanager:xyz',
-  ], { env, stdio: 'pipe' }), /Vouchr requires an envelope provider/);
 });

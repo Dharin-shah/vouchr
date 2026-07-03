@@ -19,7 +19,6 @@ import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser, disconnectProvider } from '../core/offboard';
 import { sweepExpired } from '../core/sweep';
 import { SessionGrants } from '../core/session';
-import { assertProductionConfig } from '../core/options';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
@@ -137,14 +136,6 @@ export interface VouchrOptions {
    * (`/vouchr mode <provider> session`), not a global list; this only tunes the ceiling.
    */
   sessionTtlMs?: number;
-  /**
-   * Opt into production safety mode. When true (or via the Vouchr-namespaced VOUCHR_PRODUCTION=1),
-   * boot fails fast unless the deployment is multi-instance safe: Postgres (`databaseUrl`) AND an
-   * `envelope` provider (KMS-wrapped DEKs). Default false keeps the zero-config dev path — SQLite,
-   * no envelope — working unchanged. A Postgres URL with `envelope` off still fails: storage-level
-   * encryption is not per-secret KMS wrapping.
-   */
-  production?: boolean;
 }
 
 /**
@@ -640,8 +631,6 @@ export class ConnectContext {
 }
 
 export async function createVouchr(opts: VouchrOptions) {
-  // Fail fast BEFORE opening the DB / any side effects, so an unsafe prod config never half-boots.
-  assertProductionConfig(opts);
   const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
   const key = loadMasterKey();
   const registry = new ProviderRegistry(opts.providers);

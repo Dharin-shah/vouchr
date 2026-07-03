@@ -7,6 +7,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Breaking
 
+- Removed the production self-gating feature: the `production` option (Bolt `VouchrOptions` and the
+  broker), the `VOUCHR_PRODUCTION` env var, and the `assertProductionConfig` / `isProduction` exports
+  from `src/core/options`. Vouchr no longer refuses to boot on SQLite or without a KMS envelope —
+  it boots with whatever backend it is given and lets the integrating/hosting system decide its own
+  infra requirements. Postgres + a KMS envelope remain the recommended configuration for
+  multi-instance / production deployments (see `guides/DEPLOYMENT.md`), just no longer enforced.
 - `ConnectContext`'s constructor now takes a single `ConnectContextDeps` object instead of ~20
   positional arguments (`new ConnectContext({ identity, channel, client, ... })`). Optional fields
   keep their previous defaults, so runtime behavior is identical — this is a source-level change
