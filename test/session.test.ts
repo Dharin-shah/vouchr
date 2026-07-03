@@ -87,11 +87,11 @@ async function setup(ghMode: 'session' | 'per-user' | 'shared' = 'session') {
   const posted: any[] = [];
   const client = { chat: { postEphemeral: async (p: any) => { posted.push(p); return {}; } } } as any;
   const make = (thread: string | null, channel: string | null = 'C1') =>
-    new ConnectContext(
-      ID, channel, client, new ProviderRegistry([gh]), vault, audit,
-      new Consent(db), new Policy(), 'http://x', {}, channelConfig, undefined,
-      new Map(), () => {}, ['gh'], undefined, false, thread, sessions,
-    );
+    new ConnectContext({
+      identity: ID, channel, client, registry: new ProviderRegistry([gh]), vault, audit,
+      consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
+      channelConfig, providerIds: ['gh'], thread, sessions,
+    });
   const auditRows = async () => (await db.all('SELECT action, meta FROM audit')) as any[];
   return { db, vault, sessions, posted, make, auditRows };
 }

@@ -131,39 +131,89 @@ export interface VouchrOptions {
   production?: boolean;
 }
 
+/**
+ * Deps/options for {@link ConnectContext}. A single named-field object instead of a ~20-arg
+ * positional list: adjacent same-typed args (e.g. two `string | null`s, several optional stores)
+ * can no longer be silently mis-ordered past the type-checker. Optional fields keep their old
+ * defaults (see the constructor).
+ */
+export interface ConnectContextDeps {
+  identity: SlackIdentity;
+  channel: string | null;
+  client: WebClient;
+  registry: ProviderRegistry;
+  vault: Vault;
+  audit: Audit;
+  consent: Consent;
+  policy: Policy;
+  redirectUri: string;
+  resolvers?: Resolvers;
+  channelConfig?: ChannelConfig;
+  /** Per-channel tool manifest (which providers an agent may use here). Threaded like channelConfig. */
+  channelTools?: ChannelTools;
+  /** Shared single-flight refresh map (see ConnectionHandle). One per createVouchr instance. */
+  inflight?: Map<string, Promise<string | null>>;
+  /** No-secret observability hook. Default no-op (zero behavior change when unset). */
+  sink?: EventSink;
+  /** The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed. */
+  providerIds?: string[];
+  /** Governance: custom admin check (overrides isSlackAdmin). Undefined = built-in Slack gate. */
+  adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
+  /** Governance: when true, connectChannel requires the acting user to be a channel member. */
+  requireMembership?: boolean;
+  /** The Slack thread (thread_ts) this request is in, for thread-scoped sessions. Null off-thread. */
+  thread?: string | null;
+  /** Thread session-grant store. The 'session' channel mode drives whether the gate runs. */
+  sessions?: SessionGrants;
+  /** Optional audit stream sink (raw actor id). Default no-op; the audit table stays authoritative. */
+  auditSink?: AuditSink;
+}
+
 /** Per-request handle attached to Bolt's `context.vouchr`. */
 export class ConnectContext {
-  constructor(
-    private identity: SlackIdentity,
-    private channel: string | null,
-    private client: WebClient,
-    private registry: ProviderRegistry,
-    private vault: Vault,
-    private audit: Audit,
-    private consent: Consent,
-    private policy: Policy,
-    private redirectUri: string,
-    private resolvers: Resolvers = {},
-    private channelConfig?: ChannelConfig,
-    // Per-channel tool manifest (which providers an agent may use here). Threaded like channelConfig.
-    private channelTools?: ChannelTools,
-    // Shared single-flight refresh map (see ConnectionHandle). One per createVouchr instance.
-    private inflight: Map<string, Promise<string | null>> = new Map(),
-    // No-secret observability hook. Default no-op (zero behavior change when unset).
-    private sink: EventSink = () => {},
-    // The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed.
-    private providerIds: string[] = [],
-    // Governance: custom admin check (overrides isSlackAdmin). Undefined = built-in Slack gate.
-    private adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>,
-    // Governance: when true, connectChannel requires the acting user to be a channel member.
-    private requireMembership: boolean = false,
-    // The Slack thread (thread_ts) this request is in, for thread-scoped sessions. Null off-thread.
-    private thread: string | null = null,
-    // Thread session-grant store. The 'session' channel mode drives whether the gate runs.
-    private sessions?: SessionGrants,
-    // Optional audit stream sink (raw actor id). Default no-op; the audit table stays authoritative.
-    private auditSink: AuditSink = () => {},
-  ) {}
+  private identity: SlackIdentity;
+  private channel: string | null;
+  private client: WebClient;
+  private registry: ProviderRegistry;
+  private vault: Vault;
+  private audit: Audit;
+  private consent: Consent;
+  private policy: Policy;
+  private redirectUri: string;
+  private resolvers: Resolvers;
+  private channelConfig?: ChannelConfig;
+  private channelTools?: ChannelTools;
+  private inflight: Map<string, Promise<string | null>>;
+  private sink: EventSink;
+  private providerIds: string[];
+  private adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
+  private requireMembership: boolean;
+  private thread: string | null;
+  private sessions?: SessionGrants;
+  private auditSink: AuditSink;
+
+  constructor(deps: ConnectContextDeps) {
+    this.identity = deps.identity;
+    this.channel = deps.channel;
+    this.client = deps.client;
+    this.registry = deps.registry;
+    this.vault = deps.vault;
+    this.audit = deps.audit;
+    this.consent = deps.consent;
+    this.policy = deps.policy;
+    this.redirectUri = deps.redirectUri;
+    this.resolvers = deps.resolvers ?? {};
+    this.channelConfig = deps.channelConfig;
+    this.channelTools = deps.channelTools;
+    this.inflight = deps.inflight ?? new Map();
+    this.sink = deps.sink ?? (() => {});
+    this.providerIds = deps.providerIds ?? [];
+    this.adminCheck = deps.adminCheck;
+    this.requireMembership = deps.requireMembership ?? false;
+    this.thread = deps.thread ?? null;
+    this.sessions = deps.sessions;
+    this.auditSink = deps.auditSink ?? (() => {});
+  }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
@@ -639,10 +689,10 @@ export async function createVouchr(opts: VouchrOptions) {
       // The thread this request is in: thread_ts when in a thread, else the message's own ts (which
       // is the thread root). Null when there's no event (slash command / action).
       const thread: string | null = args.event?.thread_ts ?? args.event?.ts ?? null;
-      args.context.vouchr = new ConnectContext(
+      args.context.vouchr = new ConnectContext({
         identity,
         channel,
-        args.client,
+        client: args.client,
         registry,
         vault,
         audit,
@@ -655,12 +705,12 @@ export async function createVouchr(opts: VouchrOptions) {
         inflight,
         sink,
         providerIds,
-        opts.isAdmin,
-        opts.requireChannelMembership ?? false,
+        adminCheck: opts.isAdmin,
+        requireMembership: opts.requireChannelMembership ?? false,
         thread,
         sessions,
         auditSink,
-      );
+      });
     }
     await args.next();
   };
@@ -701,11 +751,12 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /** Build a per-request ConnectContext bound to a specific channel (for the modal submit). */
   function contextFor(identity: SlackIdentity, channel: string | null, client: WebClient): ConnectContext {
-    return new ConnectContext(
+    return new ConnectContext({
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, sink, providerIds,
-      opts.isAdmin, opts.requireChannelMembership ?? false, null, sessions, auditSink,
-    );
+      adminCheck: opts.isAdmin, requireMembership: opts.requireChannelMembership ?? false,
+      thread: null, sessions, auditSink,
+    });
   }
 
   /**
