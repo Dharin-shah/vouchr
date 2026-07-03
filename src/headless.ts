@@ -80,4 +80,6 @@ export type {
   BrokerStatusResponse,
   BrokerConnectResponse,
   BrokerManifestResponse,
+  BrokerAdminOkResponse,
+  BrokerAdminConfigResponse,
 } from './broker-types';

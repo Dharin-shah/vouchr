@@ -7,12 +7,15 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
+import { channelOwner } from '../src/core/owner';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
+
+const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK';
 
 const acme = defineProvider({
   id: 'acme',
@@ -24,6 +27,13 @@ const acme = defineProvider({
   pkce: false,
   clientId: 'id',
   clientSecret: 'sec',
+});
+
+// A service-to-service tool the config routes must refuse (no human credential to broker).
+const svc = defineProvider({
+  id: 'svc', identity: 'service', credential: 'key',
+  authorizeUrl: 'https://svc.example/auth', tokenUrl: 'https://svc.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.svc.example'], refresh: 'none', pkce: false,
 });
 
 function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
@@ -38,9 +48,9 @@ async function makeConfigBroker() {
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig, channelTools });
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, channelConfig, channelTools });
   await new Promise<void>((r) => server.listen(0, r));
-  return { server, db, channelConfig, channelTools, port: (server.address() as any).port };
+  return { server, db, vault, channelConfig, channelTools, port: (server.address() as any).port };
 }
 
 function post(port: number, path: string, body: unknown): Promise<{ status: number; json: any }> {
@@ -78,7 +88,9 @@ function getConfig(port: number, token?: string): Promise<{ status: number; json
   });
 }
 
-const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, ...over }), SECRET);
+// Admin token; channelEligible defaults true so a `shared` write passes the eligibility gate (parity
+// with /v1/admin/reference and Bolt's assertChannelEligible). Override to false to exercise the refusal.
+const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
 
 // (a) an admin token can set the mode, and GET /v1/admin/config reflects it.
 test('admin/mode: an admin claim sets the channel mode; GET /v1/admin/config reflects it', async () => {
@@ -193,5 +205,107 @@ test('admin config routes validate input and require the stores to be enabled', 
     assert.equal(cfg.json.providers[0].enabled, true); // channelTools unset -> default enabled
   } finally {
     bare.close();
+  }
+});
+
+// P1: flipping a channel OFF `shared` deletes the shared credential (the re-authorization boundary),
+// and it does NOT silently resurrect on a later flip back to `shared`.
+test('admin/mode: flipping shared -> per-user deletes the shared credential (no dormant resurrection)', async () => {
+  const { server, port, vault } = await makeConfigBroker();
+  const owner = channelOwner('T1', 'C1');
+  // The channel owns a shared credential + is marked shared.
+  await vault.upsert(owner, 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: admin() });
+  assert.ok(await vault.get(owner, 'acme'), 'precondition: shared cred exists');
+
+  // Flip to a user-owned mode -> the shared cred is dropped.
+  const flip = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'per-user', identityToken: admin() });
+  assert.equal(flip.status, 200);
+  assert.equal(await vault.get(owner, 'acme'), null, 'shared cred was deleted on the non-shared flip');
+
+  // Flip back to shared -> NO resurrection; the operator must re-ingest a credential.
+  await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: admin() });
+  assert.equal(await vault.get(owner, 'acme'), null, 'no dormant credential silently reactivated');
+  server.close();
+});
+
+// P2: marking `shared` on an ineligible channel is refused (parity with /v1/admin/reference + Bolt).
+test('admin/mode: `shared` on an ineligible channel is refused (eligibility parity)', async () => {
+  const { server, port, channelConfig } = await makeConfigBroker();
+  try {
+    const r = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: admin({ channelEligible: false }) });
+    assert.equal(r.status, 403);
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null, 'refused: no mode written');
+    // A user-owned mode has no eligibility requirement, so it still succeeds on the same channel.
+    const ok = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'per-user', identityToken: admin({ channelEligible: false }) });
+    assert.equal(ok.status, 200);
+  } finally {
+    server.close();
+  }
+});
+
+// P3(d): a mode write emits a `config` audit row (the non-repudiation claim).
+test('admin/mode: a mode write is audited as `config` with owner:channel (non-repudiation)', async () => {
+  const { server, port, db } = await makeConfigBroker();
+  try {
+    await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'union', identityToken: admin() });
+    const row = (await db.get(`SELECT user_id, channel, meta FROM audit WHERE action='config' ORDER BY at DESC LIMIT 1`)) as any;
+    assert.ok(row, 'a config audit row was written');
+    assert.equal(row.user_id, 'U1'); // the acting admin, from the SIGNED claims
+    assert.equal(row.channel, 'C1');
+    const meta = JSON.parse(row.meta);
+    assert.equal(meta.mode, 'union');
+    assert.equal(meta.owner, 'channel');
+  } finally {
+    server.close();
+  }
+});
+
+// P3(a): the channel is the SIGNED one on /tools too — a body-supplied channel is ignored.
+test('admin/tools: channel comes from the signed claim, never the body (no spoofing)', async () => {
+  const { server, port, channelTools } = await makeConfigBroker();
+  try {
+    const r = await post(port, '/v1/admin/tools', {
+      provider: 'acme', enabled: false, identityToken: admin({ channel: 'C1' }),
+      channel: 'CEVIL', teamId: 'TEVIL',
+    } as any);
+    assert.equal(r.status, 200);
+    assert.equal(await channelTools.isEnabled('T1', 'C1', 'acme'), false, 'written to the signed channel');
+    assert.equal(await channelTools.isEnabled('TEVIL', 'CEVIL', 'acme'), true, 'body channel untouched (unconfigured -> all enabled)');
+  } finally {
+    server.close();
+  }
+});
+
+// P3(b): unknown provider -> 404, service-to-service provider -> 403, on both write routes.
+test('admin config write routes reject unknown (404) and service (403) providers', async () => {
+  const { server, port } = await makeConfigBroker();
+  try {
+    const unknownMode = await post(port, '/v1/admin/mode', { provider: 'nope', mode: 'shared', identityToken: admin() });
+    assert.equal(unknownMode.status, 404);
+    const unknownTools = await post(port, '/v1/admin/tools', { provider: 'nope', enabled: true, identityToken: admin() });
+    assert.equal(unknownTools.status, 404);
+    const svcMode = await post(port, '/v1/admin/mode', { provider: 'svc', mode: 'shared', identityToken: admin() });
+    assert.equal(svcMode.status, 403);
+    const svcTools = await post(port, '/v1/admin/tools', { provider: 'svc', enabled: true, identityToken: admin() });
+    assert.equal(svcTools.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+// P3(c): an unsigned/expired identity token -> 401 on all three routes.
+test('admin config routes reject an invalid/expired identity token (401)', async () => {
+  const { server, port } = await makeConfigBroker();
+  try {
+    const badMode = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: 'not.a.token' });
+    assert.equal(badMode.status, 401);
+    const badTools = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: 'not.a.token' });
+    assert.equal(badTools.status, 401);
+    const expired = signIdentity(claims({ isAdmin: true, exp: Date.now() - 1 }), SECRET);
+    const badConfig = await getConfig(port, expired);
+    assert.equal(badConfig.status, 401);
+  } finally {
+    server.close();
   }
 });

@@ -16,6 +16,7 @@ import { SessionGrants } from '../../core/session';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
+import type { BrokerAdminOkResponse, BrokerAdminConfigResponse } from '../../broker-types';
 
 /**
  * The opaque, NO-SECRET handle the caller holds. It names a provider; the owner is always the acting
@@ -638,7 +639,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
    * the body), admin authority from the SIGNED `isAdmin` claim. Config, NOT secret ingest — calls the
    * SAME core `ChannelConfig.setMode` the Bolt path uses. Requires channelConfig opt-in; fail closed.
    */
-  async function handleAdminMode(body: { provider?: unknown; mode?: unknown; identityToken: string }): Promise<Record<string, unknown>> {
+  async function handleAdminMode(body: { provider?: unknown; mode?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
@@ -648,8 +649,21 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
     const claims = await verifyBrokerableProvider(providerId, body.identityToken);
     const acting = await requireAdmin(claims, providerId);
+    const owner = channelOwner(claims.teamId, claims.channel);
+    // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
+    // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
+    // channel from the SIGNED verdict. Fail closed + audited. resolveOwner re-checks at use, so this is
+    // defense-in-depth, but the two config doors must agree.
+    if (mode === 'shared' && (opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
+      await opts.audit.record('denied', acting, providerId, { reason: 'channel-ineligible', owner: 'channel', channel: claims.channel });
+      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+    }
+    // Flipping to a user-owned mode drops any live shared credential — the deliberate re-authorization
+    // boundary (mirrors Bolt setChannelMode): else a dormant shared cred silently reactivates on a later
+    // flip back to `shared` with no re-ingest/re-auth.
+    if (mode !== 'shared') await opts.vault.delete(owner, providerId);
     await opts.channelConfig.setMode(claims.teamId, claims.channel, providerId, mode);
-    await opts.audit.record('config', acting, providerId, { channel: claims.channel, mode });
+    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, mode });
     return { ok: true };
   }
 
@@ -659,7 +673,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
    * from the SIGNED claims only. Calls the SAME core `ChannelTools.setEnabled` the Bolt path uses.
    * Requires channelTools opt-in; fail closed. Config, NOT secret ingest.
    */
-  async function handleAdminTools(body: { provider?: unknown; enabled?: unknown; identityToken: string }): Promise<Record<string, unknown>> {
+  async function handleAdminTools(body: { provider?: unknown; enabled?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
     if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
@@ -667,7 +681,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const claims = await verifyBrokerableProvider(providerId, body.identityToken);
     const acting = await requireAdmin(claims, providerId);
     await opts.channelTools.setEnabled(claims.teamId, claims.channel, providerId, body.enabled);
-    await opts.audit.record('config', acting, providerId, { channel: claims.channel, toolEnabled: body.enabled });
+    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, toolEnabled: body.enabled });
     return { ok: true };
   }
 
@@ -679,7 +693,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
    * NO secret: policy bits only. `mode` is null when channelConfig is unset; `enabled` defaults true
    * when channelTools is unset (the same backward-compat rule ChannelTools.isEnabled applies).
    */
-  async function handleAdminConfig(token: string): Promise<Record<string, unknown>> {
+  async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
     await requireAdmin(claims, 'config');
     const providers = await Promise.all(
@@ -866,11 +880,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         if (req.method === 'POST' && url === '/v1/admin/mode') {
           await perimeter(req);
-          return send(200, await handleAdminMode(await readJson(req)));
+          return send(200, { ...await handleAdminMode(await readJson(req)) });
         }
         if (req.method === 'POST' && url === '/v1/admin/tools') {
           await perimeter(req);
-          return send(200, await handleAdminTools(await readJson(req)));
+          return send(200, { ...await handleAdminTools(await readJson(req)) });
         }
         if (req.method === 'GET' && url === '/v1/admin/config') {
           await perimeter(req);
@@ -878,7 +892,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
           // string — keeps it out of access logs). Channel/team/admin all come from this signed token.
           const token = req.headers['x-vouchr-identity'];
           if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
-          return send(200, await handleAdminConfig(token));
+          return send(200, { ...await handleAdminConfig(token) });
         }
         if (req.method === 'POST' && url === '/v1/status') {
           await perimeter(req);
