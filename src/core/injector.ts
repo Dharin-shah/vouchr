@@ -28,6 +28,11 @@ export type VouchrEvent =
   // `reason` splits the single denial type by the gate that rejected: bad URL creds / non-allowlisted
   // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator'.
   | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' }
+  // No-secret UPSTREAM-FAILURE signal: a network-level throw (DNS/connection refused) or a token-refresh
+  // throw. Without this a provider outage / refresh breakage is a silent black box (the broker maps it to
+  // 502 with no event, no audit). `host` = url.hostname only, `reason` a static string ('fetch_failed'/
+  // 'refresh_failed') — NEVER the error message (it could carry the secret).
+  | { type: 'egress_error'; provider: string; host: string; reason: string }
   | { type: 'resolver_failed'; provider: string; source: string }
   | { type: 'connect_prompted'; provider: string }
   | { type: 'connected'; provider: string }
@@ -99,6 +104,27 @@ export class ConnectionHandle {
     throw new Error(message);
   }
 
+  /**
+   * No-secret UPSTREAM-FAILURE signal for a network throw / refresh throw. Fires the egress_error metric
+   * AND writes an attributable audit row so a provider outage / refresh breakage isn't a silent 502.
+   * Meta carries ONLY the hostname + a static reason — NEVER the url, headers, or the error message (any
+   * of which could carry the secret). Audit is best-effort: it must never mask the original throw.
+   */
+  private async egressError(host: string, reason: string): Promise<void> {
+    this.emit({ type: 'egress_error', provider: this.provider.id, host, reason });
+    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false }).catch(() => undefined);
+  }
+
+  /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502. */
+  private async refreshSignalled(host: string): Promise<string | null> {
+    try {
+      return await this.refreshAndStore();
+    } catch (e) {
+      await this.egressError(host, 'refresh_failed');
+      throw e;
+    }
+  }
+
   /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
   private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number, method?: string): void {
     try {
@@ -166,21 +192,28 @@ export class ConnectionHandle {
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     const vaulted = cred.source === 'vault';
 
-    let token = vaulted ? await this.vaultToken(cred) : await this.resolveRef(cred);
-    const send = (t: string) => {
+    let token = vaulted ? await this.vaultToken(cred, url.hostname) : await this.resolveRef(cred);
+    const send = async (t: string) => {
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);
       else headers.set('Authorization', `Bearer ${t}`);
-      // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
-      return fetch(input, { ...init, headers, redirect: 'manual' });
+      try {
+        // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
+        return await fetch(input, { ...init, headers, redirect: 'manual' });
+      } catch (e) {
+        // Network-level throw (DNS/connection refused): fire the no-secret failure signal, then re-throw
+        // so the broker still maps it to 502 — the signal is emitted, not swallowed.
+        await this.egressError(url.hostname, 'fetch_failed');
+        throw e;
+      }
     };
 
     const t0 = Date.now();
     let res = await send(token);
     // Refresh-on-401 only applies to vaulted OAuth creds; referenced secrets rotate externally.
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshAndStore();
+      const refreshed = await this.refreshSignalled(url.hostname);
       if (refreshed) {
         // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
         res.body?.cancel().catch(() => undefined);
@@ -223,10 +256,10 @@ export class ConnectionHandle {
     }
   }
 
-  private async vaultToken(cred: StoredCredential): Promise<string> {
+  private async vaultToken(cred: StoredCredential, host: string): Promise<string> {
     const expiringSoon = cred.expiresAt != null && cred.expiresAt < Date.now() + 30_000;
     if (expiringSoon && cred.refreshToken && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshAndStore();
+      const refreshed = await this.refreshSignalled(host);
       if (refreshed) return refreshed;
     }
     if (cred.accessToken == null) throw new Error(`Vaulted connection for "${this.provider.id}" has no token`);
