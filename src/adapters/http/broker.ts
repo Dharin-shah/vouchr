@@ -8,7 +8,8 @@ import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
-import type { ChannelConfig } from '../../core/channelConfig';
+import type { ChannelConfig, ChannelMode } from '../../core/channelConfig';
+import { authorizeProvider, resolveCredentialOwner } from '../../core/authz';
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
@@ -327,12 +328,16 @@ export function createBroker(opts: BrokerOptions): http.Server {
   async function authorize(provider: string, claims: IdentityClaims): Promise<void> {
     const channel = claims.channel;
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    if (opts.policy && !opts.policy.check(provider, channel)) {
+    // The Policy + channel-tool CHECK is the shared core decision; the broker keeps its own audit/emit/
+    // status mapping (it emits policy_denied on BOTH a policy and a tool-disabled deny — the Bolt path does
+    // not emit on tool-disabled, so the mapping deliberately stays per-adapter).
+    const denial = await authorizeProvider(opts.policy, opts.channelTools, acting, channel, provider);
+    if (denial === 'policy') {
       await opts.audit.record('denied', acting, provider, { channel });
       emit({ type: 'policy_denied', provider });
       throw new HttpError(403, { error: 'policy denies this provider in this channel' });
     }
-    if (opts.channelTools && !(await opts.channelTools.isEnabled(claims.teamId, channel, provider))) {
+    if (denial === 'tool-disabled') {
       await opts.audit.record('denied', acting, provider, { channel, reason: 'tool-disabled' });
       emit({ type: 'policy_denied', provider });
       throw new HttpError(403, { error: 'provider is not enabled in this channel' });
@@ -352,54 +357,63 @@ export function createBroker(opts: BrokerOptions): http.Server {
     claims: IdentityClaims,
   ): Promise<{ owner: Owner; acting: SlackIdentity }> {
     const ownerKind = claims.ownerKind ?? 'user';
+    // The body handle's owner must MATCH the signed ownerKind — a forged body owner:'channel' on a plain
+    // user token is refused, never silently downgraded. This claims-integrity check is broker-specific
+    // (Bolt has no untrusted body), so it runs here BEFORE the shared core decision.
     if (ref.owner !== ownerKind) throw new HttpError(403, { error: 'handle owner does not match verified claims' });
+    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+
     if (ownerKind === 'user') {
-      const user = ownerFromClaims(claims);
-      // SECURITY (#54): `session` mode is a user-owned credential the Bolt path gates behind a
-      // per-thread grant (bolt.ts:228). Headless callers send `owner:'user'` on the SAME db, so
-      // without this the broker would serve the plain credential with no grant check — a weaker
-      // posture on one store. Fail closed: when channelConfig is opted in AND this provider is
-      // `session` here, require a live grant for the SIGNED thread (never the body). No thread in
-      // the signed claims → we can't scope a session → refuse rather than serve unscoped.
-      // ponytail: enforced surgically in this user branch (smallest fail-closed fix); the fuller
-      // both-adapters resolveOwner/mode dedup shared with Bolt is a follow-up.
+      // SECURITY (#54): `session` mode is a user-owned credential gated behind a per-thread grant. This
+      // gate now lives in ONE core function (resolveCredentialOwner) the Bolt path calls too, so the two
+      // transports can no longer drift (that drift is how this check went missing on the broker). Only
+      // meaningful when channelConfig is opted in; otherwise mode stays null and the gate is inert.
+      let mode: ChannelMode | null = null;
+      let hasSessionGrant = false;
+      const thread = claims.threadTs ?? null;
       if (opts.channelConfig) {
-        const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
-        if (mode === 'session') {
-          const thread = claims.threadTs;
-          if (!thread || !(await sessions.isGranted(user.acting, claims.channel, thread, ref.provider))) {
-            await opts.audit.record('denied', user.acting, ref.provider, {
-              channel: claims.channel, reason: thread ? 'no-session-grant' : 'no-thread',
-            });
-            throw new HttpError(403, { error: 'provider requires a thread-scoped session approval' });
-          }
+        mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
+        if (mode === 'session' && thread) {
+          hasSessionGrant = await sessions.isGranted(acting, claims.channel, thread, ref.provider);
         }
       }
-      return user;
+      const r = resolveCredentialOwner({ path: 'user', mode, principal: acting, channel: claims.channel, thread, hasSessionGrant });
+      if (r.status === 'needs_session') {
+        await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, reason: r.reason });
+        throw new HttpError(403, { error: 'provider requires a thread-scoped session approval' });
+      }
+      // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
+      // resolved owner here — the injector 409s later if the credential is missing.
+      if (r.status !== 'resolved') throw new HttpError(409, { error: 'not connected' });
+      return { owner: r.owner, acting: r.acting };
     }
 
     // ── channel-owned (opt-in, fail-closed) ──
-    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
-    if ((opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
-      await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
-      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
-    }
+    // Eligibility from the SIGNED verdict (the broker has no Slack client). Fail-closed: only an explicit
+    // true is eligible. When eligibility is enforced entirely upstream, requireChannelEligibility:false
+    // treats every channel-owned request as eligible (unchanged).
+    const eligible = (opts.requireChannelEligibility ?? true) ? claims.channelEligible === true : true;
     const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
-    if (mode === 'shared') {
-      // The channel owns the credential; the audited actor is still the acting human (invariant 9).
-      return { owner: channelOwner(claims.teamId, claims.channel), acting };
+    const memberId = claims.actingMemberId;
+    const actingMember: SlackIdentity | null = memberId
+      ? { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: memberId }
+      : null;
+    const r = resolveCredentialOwner({ path: 'channel', mode, principal: acting, channel: claims.channel, eligible, actingMember });
+    if (r.status === 'refused') {
+      if (r.code === 'ineligible') {
+        await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
+        throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+      }
+      // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
+      throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
     }
-    if (mode === 'union') {
-      // Borrow the signed member's OWN credential and act as THAT member — the caller (who has the
-      // Slack client) already resolved which connected member to act as via listChannelMembers.
-      const memberId = claims.actingMemberId;
-      if (!memberId) throw new HttpError(400, { error: 'union mode requires a signed actingMemberId' });
-      const member: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: memberId };
-      return { owner: userOwner(member), acting: member };
+    if (r.status !== 'resolved') {
+      // union with no signed actingMemberId → no member to act as (the caller resolves it via the Slack
+      // client and signs it). A bad request, not a policy denial.
+      throw new HttpError(400, { error: 'union mode requires a signed actingMemberId' });
     }
-    // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
-    throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
+    return { owner: r.owner, acting: r.acting };
   }
 
   async function resolveTarget(body: BrokerFetchRequest): Promise<{ handle: ConnectionHandle; provider: Provider }> {
