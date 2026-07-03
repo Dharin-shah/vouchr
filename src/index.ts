@@ -45,7 +45,14 @@ export {
   CONFIGURE_CALLBACK,
   USER_KEY_CALLBACK,
   SETUP_KEY_ACTION,
+  connectedBlocks,
+  consentDeniedBlocks,
+  statusBlocks,
+  disconnectConfirmBlocks,
+  homeView,
+  DISCONNECT_ACTION,
 } from './adapters/blocks';
+export type { Connection } from './adapters/blocks';
 export type { TtlPolicy } from './core/vault';
 export type { EnvelopeProvider } from './core/crypto';
 // Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);

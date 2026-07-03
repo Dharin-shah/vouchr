@@ -158,6 +158,135 @@ export function sessionApprovalBlocks(provider: string, thread: string): unknown
   ];
 }
 
+export const DISCONNECT_ACTION = 'vouchr_disconnect';
+
+/** One connection row for the status / home views. `channel` null = a personal (DM) credential. */
+export type Connection = { provider: string; channel: string | null; mode?: string };
+
+/** A readable line for one connection, reused by the status list and the App Home tab. */
+function connectionLine(c: Connection): string {
+  const where = c.channel ? `<#${c.channel}>` : 'your DMs';
+  const mode = c.mode ? ` — _${c.mode}_` : '';
+  return `• *${c.provider}* in ${where}${mode}`;
+}
+
+/** DM shown after a user successfully connects a credential: what, where, and how to undo. */
+export function connectedBlocks(provider: string, o: { channel: string | null; scope?: string }): unknown[] {
+  const where = o.channel ? `<#${o.channel}>` : 'your DMs';
+  const scope = o.scope ? ` (${o.scope})` : '';
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          `:white_check_mark: *${provider} connected*\n` +
+          `Vouchr can now act as you on ${provider} in ${where}${scope}. Your token is stored ` +
+          `encrypted and is never shown to the agent or posted in Slack.`,
+      },
+    },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `Disconnect any time with \`/vouchr disconnect ${provider}\`.` }],
+    },
+  ];
+}
+
+/** Message shown when a user declines consent (or consent is required and not granted). */
+export function consentDeniedBlocks(provider: string, reason?: string): unknown[] {
+  const why = reason ?? `You haven't allowed ${provider} for this request.`;
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          `:no_entry: *${provider} not authorized*\n` +
+          `${why} Nothing was sent on your behalf.`,
+      },
+    },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `Re-run the request to be prompted again, or connect with \`/vouchr connect ${provider}\`.` }],
+    },
+  ];
+}
+
+/** `/vouchr status`: a user's current connections and per-channel modes. */
+export function statusBlocks(connections: Connection[]): unknown[] {
+  if (connections.length === 0) {
+    return [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: ":information_source: *No connections yet*\nUse `/vouchr connect <provider>` to get started." },
+      },
+    ];
+  }
+  return [
+    { type: 'header', text: { type: 'plain_text', text: 'Your Vouchr connections', emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: connections.map(connectionLine).join('\n') } },
+  ];
+}
+
+/** Ephemeral confirm-prompt: a destructive button to disconnect `provider`.
+ *  `provider` rides in the button value so the action handler removes the exact credential. */
+export function disconnectConfirmBlocks(provider: string): unknown[] {
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          `:warning: *Disconnect ${provider}?*\n` +
+          `Vouchr will delete your stored ${provider} credential. The agent won't be able to act as ` +
+          `you on ${provider} until you connect again.`,
+      },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: `Disconnect ${provider}`, emoji: true },
+          action_id: DISCONNECT_ACTION,
+          value: provider,
+          style: 'danger',
+        },
+      ],
+    },
+  ];
+}
+
+/** App Home tab: a summary of the user's connections plus providers available to connect. */
+export function homeView(o: { connections: Connection[]; providers: string[] }): unknown {
+  const connected = new Set(o.connections.map((c) => c.provider));
+  const available = o.providers.filter((p) => !connected.has(p));
+  const blocks: unknown[] = [
+    { type: 'header', text: { type: 'plain_text', text: 'Vouchr', emoji: true } },
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: o.connections.length
+          ? '*Your connections*\n' + o.connections.map(connectionLine).join('\n')
+          : "*Your connections*\nNone yet — connect a provider below to let the agent act as you.",
+      },
+    },
+  ];
+  if (available.length) {
+    blocks.push({ type: 'divider' });
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: '*Available providers*\n' + available.map((p) => `• ${p}`).join('\n') },
+    });
+    blocks.push({
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: 'Connect with `/vouchr connect <provider>`.' }],
+    });
+  }
+  return { type: 'home', blocks };
+}
+
 /** Confirmation HTML shown in the browser tab after a successful connect. */
 export function connectedHtml(provider: string, account: string | null): string {
   const who = account ? ` as ${account}` : '';
