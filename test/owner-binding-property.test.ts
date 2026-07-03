@@ -148,6 +148,12 @@ test('#51 owner-binding: exhaustive enumeration — a channel credential is reac
               //     returning 403 (it would fall through to the channel branch), so this assertion fails.
               assert.equal(r.status, 403, `owner mismatch must be 403 for ${label}`);
               assert.equal(reachedChannel, false, `a refused mismatch must not read a channel cred for ${label}`);
+            } else if (bodyOwner === 'channel' && signedKind === 'channel') {
+              // A fully-matched channel request that is STILL refused: channelConfig unset OR the signed
+              //     eligibility verdict is false/absent. Assert the request is refused OUTRIGHT (403), not
+              //     just that no channel cred was read — a regression that DOWNGRADED to serving the
+              //     caller's own USER credential would also read no channel owner and slip past that alone.
+              assert.equal(r.status, 403, `matched channel but ineligible/disabled must be refused 403 for ${label}`);
             }
           }
         }
