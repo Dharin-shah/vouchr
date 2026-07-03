@@ -100,6 +100,14 @@ export class ConnectionHandle {
     private auditSink: AuditSink = () => {},
   ) {}
 
+  /**
+   * The exact secret last injected on an outbound request. Set by `send()` at injection time so the
+   * in-process broker can scrub it from a reflected/echoed response body (defense-in-depth against an
+   * allowlisted host with a header-reflecting endpoint). NEVER logged, emitted, or audited — read only
+   * by the broker, in-process, on the same request. `null` until the first injection.
+   */
+  injectedSecret: string | null = null;
+
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
     try {
@@ -215,6 +223,8 @@ export class ConnectionHandle {
 
     let token = vaulted ? await this.vaultToken(cred, url.hostname) : await this.resolveRef(cred);
     const send = async (t: string) => {
+      // Record the exact secret injected so the broker can scrub it from a reflected response body.
+      this.injectedSecret = t;
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);
