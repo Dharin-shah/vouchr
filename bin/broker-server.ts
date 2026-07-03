@@ -63,6 +63,10 @@ export async function buildBrokerServer(
 
   const allowWrites = env.VOUCHR_ALLOW_WRITES === '1' || env.VOUCHR_ALLOW_WRITES === 'true';
   const brokerToken = env.VOUCHR_BROKER_TOKEN || undefined;
+  // #52 setting VOUCHR_BASE_URL mounts the OAuth connect flow (/v1/connect + the callback). Unset →
+  // the historical use-only broker (no consent kickoff).
+  const baseUrl = env.VOUCHR_BASE_URL || undefined;
+  const callbackPath = env.VOUCHR_CALLBACK_PATH || undefined;
 
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
@@ -121,6 +125,8 @@ export async function buildBrokerServer(
     brokerToken,
     replayStore,
     channelConfig,
+    baseUrl,
+    callbackPath,
     ...overrides,
   });
 

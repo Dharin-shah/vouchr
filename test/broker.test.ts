@@ -1074,6 +1074,143 @@ test('#54 /v1/admin/offboard requires a targetUserId', async () => {
   }
 });
 
+// ── #52 OAuth connect + callback routes ──────────────────────────────────────
+
+/** A broker with the OAuth connect flow mounted (baseUrl set), starting with NO stored cred. */
+async function makeOauthBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const server = createBroker({
+    providers: [acme, svc], vault, audit, db, identitySecret: SECRET,
+    baseUrl: 'https://broker.example', callbackPath: '/oauth/callback', ...extra,
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  return { server, vault, db, port: (server.address() as any).port };
+}
+
+/** Raw GET (the callback returns HTML, not JSON). */
+function getRaw(port: number, path: string): Promise<{ status: number; raw: string; contentType: string | null }> {
+  return new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: res.statusCode ?? 0, raw: Buffer.concat(chunks).toString('utf8'), contentType: res.headers['content-type'] ?? null }));
+    }).on('error', reject);
+  });
+}
+
+test('#52 /v1/connect mints an authorizeUrl + single-use state bound to the verified user', async () => {
+  const { server, port, db } = await makeOauthBroker();
+  try {
+    const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(r.status, 200);
+    assert.match(r.json.authorizeUrl, /^https:\/\/acme\.example\/auth\?/);
+    assert.match(r.json.authorizeUrl, /redirect_uri=https%3A%2F%2Fbroker\.example%2Foauth%2Fcallback/);
+    assert.ok(r.json.state, 'no state returned');
+    // State is persisted bound to the VERIFIED identity (U1), never the body.
+    const row = (await db.get(`SELECT user_id, provider FROM consent_request WHERE state=?`, [r.json.state])) as any;
+    assert.equal(row.user_id, 'U1');
+    assert.equal(row.provider, 'acme');
+  } finally {
+    server.close();
+  }
+});
+
+test('#52 /v1/connect refuses a tampered identity token (identity only from the signed token)', async () => {
+  const { server, port } = await makeOauthBroker();
+  try {
+    const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: 'not-a-real-token' });
+    assert.equal(r.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test('#52 /v1/connect refuses a service tool (no human credential / OAuth handshake)', async () => {
+  const { server, port } = await makeOauthBroker();
+  try {
+    const r = await post(port, '/v1/connect', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(r.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
+test('#52 /v1/connect is 404 when baseUrl is unset (use-only broker unchanged)', async () => {
+  const { server, port } = await makeBroker(); // no baseUrl
+  try {
+    const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(r.status, 404);
+  } finally {
+    server.close();
+  }
+});
+
+test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds', async () => {
+  const { server, port } = await makeOauthBroker();
+  const NEW = 'NEW_ACCESS_TOKEN_from_oauth';
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (u: any, init: any) => {
+    if (String(u).startsWith('https://acme.example/token')) {
+      return new Response(JSON.stringify({ access_token: NEW }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    // upstream provider API: echo the injected Authorization so we can assert the new token flows.
+    const auth = new Headers(init?.headers).get('authorization');
+    return new Response(JSON.stringify({ auth }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    const cb = await getRaw(port, `/oauth/callback?code=abc123&state=${encodeURIComponent(c.json.state)}`);
+    assert.equal(cb.status, 200);
+    assert.match(cb.contentType ?? '', /text\/html/);
+    assert.match(cb.raw, /connected/);
+    // The token is now vaulted; a subsequent fetch injects it and resolve reports connected.
+    const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
+    assert.equal(f.status, 200);
+    assert.equal(JSON.parse(f.json.body).auth, `Bearer ${NEW}`);
+    const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(rv.json.consentState, 'connected');
+  } finally {
+    globalThis.fetch = real;
+    server.close();
+  }
+});
+
+test('#52 callback with provider denial (?error) audits consent_denied and stores no token', async () => {
+  const events: any[] = [];
+  const { server, port, db } = await makeOauthBroker({ auditSink: (e) => events.push(e) });
+  try {
+    const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    const cb = await getRaw(port, `/oauth/callback?error=access_denied&state=${encodeURIComponent(c.json.state)}`);
+    assert.equal(cb.status, 400);
+    assert.ok(events.some((e) => e.action === 'consent_denied'), 'consent_denied not emitted on the audit stream');
+    const conn = await db.get(`SELECT 1 AS x FROM connection WHERE owner_id='U1' AND provider='acme'`);
+    assert.equal(conn, undefined, 'a denied consent must not store a connection');
+  } finally {
+    server.close();
+  }
+});
+
+test('#52 callback state is single-use: replaying it fails (no second connection)', async () => {
+  const { server, port } = await makeOauthBroker();
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (u: any) =>
+    String(u).startsWith('https://acme.example/token')
+      ? new Response(JSON.stringify({ access_token: 'x' }), { status: 200, headers: { 'content-type': 'application/json' } })
+      : new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  try {
+    const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    const first = await getRaw(port, `/oauth/callback?code=abc&state=${encodeURIComponent(c.json.state)}`);
+    assert.equal(first.status, 200);
+    const replay = await getRaw(port, `/oauth/callback?code=abc&state=${encodeURIComponent(c.json.state)}`);
+    assert.equal(replay.status, 400); // state already consumed
+  } finally {
+    globalThis.fetch = real;
+    server.close();
+  }
+});
+
 // ── #53 admin channel-credential reference (POST /v1/admin/reference) ─────────
 
 async function makeAdminBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
