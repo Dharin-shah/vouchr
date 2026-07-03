@@ -41,6 +41,15 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
 - **Provider responses flow back to your agent.** Vouchr keeps the *token* from the agent/LLM, but
   the response body is returned to your handler. If that data is sensitive, your code (and prompt)
   must decide what reaches the model or the Slack reply.
+- **A verbatim-relaying response is a token-reflection path.** The response body is returned as-is
+  (the headless `/v1/fetch` relays the provider response verbatim; `handle.fetch()` hands you the raw
+  `Response`). Vouchr injects the bearer into the *outbound* request, so if an allowlisted host exposes
+  a header-reflecting / echo endpoint (e.g. a debug route that returns the request headers), the
+  injected `Authorization` header can be echoed back to the caller — a same-tenant token-reflection
+  leak. Egress host-allowlisting alone does not stop this. **Mitigation:** for providers brokering
+  human credentials, constrain the reachable paths so echo/debug routes are unreachable — use the
+  provider's `egressPaths` (path-prefix allowlist) and/or `egressValidate` (per-request validator) in
+  addition to `egressAllow`. Both are checked before the secret is read.
 - **Raw keys typed into a Slack modal pass through Slack.** The value is in the modal submission
   payload. Vouchr never echoes, logs, or stores it unsafely, but an external secret reference (an
   ARN resolved just in time) avoids putting the secret in Slack at all. Prefer it.
