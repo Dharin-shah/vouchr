@@ -259,13 +259,12 @@ POST /v1/admin/reference
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared/union) via signed channel-fact claims (#51). Off → user-only broker. |
-| `VOUCHR_PRODUCTION` | prod | `1` → boot fails fast unless Postgres **and** a KMS envelope are configured. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 
 Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
-prints one line: port, backend, provider ids, `allowWrites`, mode).
+prints one line: port, backend, provider ids, `allowWrites`).
 
 ### Provider config (declarative)
 
@@ -394,17 +393,24 @@ commented ServiceAccount for IRSA) ship in the repo. Both are shapes to adapt �
 ARN is hardcoded. For KMS, add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount;
 the SDK default credential chain does the rest.
 
-**SQLite in a container** (non-prod only): the default `vouchr.db` path is not writable under a
+**SQLite in a container**: the default `vouchr.db` path is not writable under a
 non-root, read-only-root-filesystem pod. Set `VOUCHR_DB` to a mounted writable volume, or use
-`:memory:` for ephemeral tests. Production is Postgres (and `VOUCHR_PRODUCTION=1` refuses SQLite).
+`:memory:` for ephemeral tests. SQLite is single-replica; for a multi-instance deployment use
+Postgres (see the recommendation below).
 
-### Production mode
+### Recommended production configuration
 
-Set `VOUCHR_PRODUCTION=1` to make the broker refuse to boot unless it is multi-instance safe:
-Postgres **and** a KMS envelope. This turns the two easy-to-forget footguns (SQLite in prod, no
-envelope) into a startup failure instead of a silent weakness. Enabling it in the reference manifest
-means uncommenting `VOUCHR_PRODUCTION`, `VOUCHR_KMS_KEY_ID`, **and** adding `@aws-sdk/client-kms` to
-the image together — turning on production alone (without KMS) is a deliberate boot failure.
+Vouchr does not self-gate its configuration — it boots with whatever backend it is given, and the
+hosting/integrating system decides its own infra requirements. For a **multi-instance / production**
+deployment we recommend:
+
+- **Postgres** (`VOUCHR_DATABASE_URL`) — SQLite is a single-file lock with no cross-instance story.
+- **A KMS envelope** (`VOUCHR_KMS_KEY_ID`) — per-secret KMS-wrapped data keys, not just
+  storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount.
+
+These are recommendations, not enforced preconditions: Vouchr will not refuse to boot on SQLite or
+without an envelope. Enabling KMS in the reference manifest means uncommenting `VOUCHR_KMS_KEY_ID`
+and adding `@aws-sdk/client-kms` to the image together.
 
 ## Slack app + OAuth install flow
 

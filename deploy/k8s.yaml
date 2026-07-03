@@ -35,10 +35,9 @@ spec:
             - secretRef: { name: vouchr-broker }
           env:
             - { name: VOUCHR_PORT, value: "3000" }
-            # Production mode requires Postgres AND a KMS envelope or the broker refuses to boot.
-            # Enable these THREE together: uncomment VOUCHR_PRODUCTION + VOUCHR_KMS_KEY_ID AND add
-            # @aws-sdk/client-kms to the image (see Dockerfile). Enabling only PRODUCTION crashloops.
-            # - { name: VOUCHR_PRODUCTION, value: "1" }
+            # Recommended for multi-instance / production: Postgres (VOUCHR_DATABASE_URL) AND a KMS
+            # envelope. To enable KMS, uncomment VOUCHR_KMS_KEY_ID AND add @aws-sdk/client-kms to the
+            # image (see Dockerfile) together. Vouchr does not enforce this — the host decides.
             # - { name: VOUCHR_KMS_KEY_ID, value: "<kms-key-arn>" }
             # - { name: VOUCHR_PROVIDERS_FILE, value: "/etc/vouchr/providers.json" }
           # Readiness hits /healthz (checks the DB) so a pod drains from the Service when Postgres is

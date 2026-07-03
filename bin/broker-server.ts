@@ -17,7 +17,7 @@ import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
 import type { EnvelopeProvider } from '../src/core/crypto';
-import { assertProductionConfig, isPostgresUrl } from '../src/core/options';
+import { isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
 
 function fail(msg: string): never {
@@ -31,7 +31,6 @@ export interface BuiltBroker {
   backend: 'postgres' | 'sqlite';
   providerIds: string[];
   allowWrites: boolean;
-  production: boolean;
   /** #54 TTL sweep: delete expired connections + stale consent + expired thread grants. Idempotent,
    *  so overlapping runs across replicas are safe (noisy, not destructive). Returns the count swept. */
   sweep: () => Promise<number>;
@@ -73,20 +72,13 @@ export async function buildBrokerServer(
 
   const url = env.VOUCHR_DATABASE_URL ?? env.DATABASE_URL;
   const backend: 'postgres' | 'sqlite' = isPostgresUrl(url) ? 'postgres' : 'sqlite';
-  const production = env.VOUCHR_PRODUCTION === '1';
 
-  // Optional KMS envelope — only when configured. Built BEFORE the prod assertion so an unset KMS in
-  // production fails fast with the assertion's message rather than a confusing later error.
+  // Optional KMS envelope — only when configured.
   let envelope: EnvelopeProvider | undefined;
   if (env.VOUCHR_KMS_KEY_ID) {
     const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms');
     envelope = kmsEnvelope(env.VOUCHR_KMS_KEY_ID, await awsKmsClient({ region: env.AWS_REGION }));
   }
-
-  // Fail fast on an unsafe production config (SQLite or no envelope) BEFORE opening the store. Pass
-  // `url ?? ''` (not undefined) so the assertion checks the SAME resolved backend openDb will open,
-  // instead of falling back to an ambient process.env DATABASE_URL that isn't what we opened.
-  assertProductionConfig({ databaseUrl: url ?? '', envelope, production });
 
   // #54 TTL policy: without one, get()-time expiry and the sweep are both no-ops (a credential lives
   // forever). Default matches the Bolt path (7d idle / 30d max), so the two front doors behave the
@@ -142,7 +134,7 @@ export async function buildBrokerServer(
   const sweepIntervalMs = rawInterval !== undefined ? Number(rawInterval) : 60 * 60 * 1000;
   if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs < 0) fail(`VOUCHR_SWEEP_INTERVAL_MS invalid: ${rawInterval}`);
 
-  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, production, sweep, sweepIntervalMs };
+  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, sweep, sweepIntervalMs };
 }
 
 async function main(): Promise<void> {
@@ -151,8 +143,7 @@ async function main(): Promise<void> {
     // One line, no secrets — startup provenance for ops.
     console.log(
       `[vouchr] broker listening port=${built.port} backend=${built.backend} ` +
-        `providers=[${built.providerIds.join(',')}] allowWrites=${built.allowWrites} ` +
-        `mode=${built.production ? 'production' : 'non-production'}`,
+        `providers=[${built.providerIds.join(',')}] allowWrites=${built.allowWrites}`,
     );
   });
 
