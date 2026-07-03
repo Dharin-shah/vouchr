@@ -17,7 +17,7 @@ import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
 import type { EnvelopeProvider } from '../src/core/crypto';
-import { assertProductionConfig } from '../src/core/options';
+import { assertProductionConfig, isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
 
 function fail(msg: string): never {
@@ -72,7 +72,7 @@ export async function buildBrokerServer(
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
 
   const url = env.VOUCHR_DATABASE_URL ?? env.DATABASE_URL;
-  const backend: 'postgres' | 'sqlite' = !!url && /^postgres(ql)?:\/\//.test(url) ? 'postgres' : 'sqlite';
+  const backend: 'postgres' | 'sqlite' = isPostgresUrl(url) ? 'postgres' : 'sqlite';
   const production = env.VOUCHR_PRODUCTION === '1';
 
   // Optional KMS envelope — only when configured. Built BEFORE the prod assertion so an unset KMS in

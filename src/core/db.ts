@@ -1,5 +1,6 @@
 import BetterSqlite3 from 'better-sqlite3';
 import { Pool, types, type PoolClient } from 'pg';
+import { isPostgresUrl } from './options';
 
 /**
  * Minimal async data handle: the seam that lets the same store code run on SQLite
@@ -193,7 +194,7 @@ function schema(blob: string, int: string): string {
 /** Open (and migrate) the credential store. Postgres if a connection string is set, else SQLite. */
 export async function openDb(opts: DbOptions = {}): Promise<Db> {
   const url = opts.databaseUrl ?? process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
-  if (url && /^postgres(ql)?:\/\//.test(url)) {
+  if (isPostgresUrl(url)) {
     types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
     const pool = new Pool({
       connectionString: url,
