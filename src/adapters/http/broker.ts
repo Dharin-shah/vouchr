@@ -501,11 +501,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // #26: size cap -> 413, never a truncated partial body.
     const text = await readCapped(res, maxBytes);
     // Token-reflection defense-in-depth: /v1/fetch relays the provider body verbatim, so an allowlisted
-    // host with a header-reflecting endpoint could echo the injected bearer back to the caller. Redact the
-    // exact injected secret before returning. No-op when nothing was injected or the body is empty.
-    const secret = handle.injectedSecret;
-    const scrubbed = secret ? text.replaceAll(secret, '[REDACTED]') : text;
-    return { status: 200, payload: { status: res.status, contentType, body: scrubbed } };
+    // host with a header-reflecting endpoint could echo the injected bearer back to the caller. The handle
+    // redacts its own injected secret (the raw value is a private field it never exposes); no-op when
+    // nothing was injected or the body is empty.
+    return { status: 200, payload: { status: res.status, contentType, body: handle.redactSecret(text) } };
   }
 
   async function handleResolve(body: { handle: ConnectionHandleRef; identityToken: string }): Promise<Record<string, unknown>> {

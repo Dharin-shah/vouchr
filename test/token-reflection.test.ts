@@ -7,6 +7,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
+import { ConnectionHandle } from '../src/core/injector';
 import { createBroker } from '../src/adapters/http/broker';
 import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
 
@@ -85,4 +86,37 @@ test('token-reflection: a header-reflecting upstream cannot echo the injected be
     globalThis.fetch = real;
     server.close();
   }
+});
+
+// The handle is handed to agent/tool code, which calls handle.fetch(). The injected credential must
+// NEVER be readable back off the handle — otherwise the scrubber would have turned the handle into a
+// token carrier (a worse leak than the reflection it closes). It's a true #private field: no public
+// property, no getter, not enumerable. redactSecret() still scrubs it from a body without exposing it.
+test('token-reflection: the injected credential is not readable off the handle after fetch()', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vault.upsert(owner, 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const handle = new ConnectionHandle(acme, owner, { enterpriseId: null, teamId: 'T1', userId: 'U1' }, vault, new Audit(db));
+
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('ok', { status: 200 })) as any;
+  try {
+    await handle.fetch('https://api.acme.example/x');
+  } finally {
+    globalThis.fetch = real;
+  }
+
+  // No public field (the pre-fix public `injectedSecret` would return the raw token here); a `#private`
+  // field is not reachable as a string key either.
+  assert.equal((handle as any).injectedSecret, undefined, 'no public injectedSecret field may exist');
+  assert.ok(!Object.getOwnPropertyNames(handle).includes('injectedSecret'), 'injectedSecret must not be an own property');
+  // The token must not surface through any enumerable own property (functions/#private are omitted by
+  // JSON.stringify; this catches any accidental data property carrying the credential).
+  assert.ok(!JSON.stringify(handle).includes(SECRET_TOKEN), 'the handle serialized the token');
+  for (const name of Object.getOwnPropertyNames(handle)) {
+    assert.ok(!String((handle as any)[name] ?? '').includes(SECRET_TOKEN), `property ${name} exposed the token`);
+  }
+  // But redactSecret still works internally — scrubs the token without ever returning it.
+  assert.equal(handle.redactSecret(`{"auth":"Bearer ${SECRET_TOKEN}"}`), '{"auth":"Bearer [REDACTED]"}');
 });

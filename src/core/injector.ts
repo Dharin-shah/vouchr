@@ -105,12 +105,28 @@ export class ConnectionHandle {
   ) {}
 
   /**
-   * The exact secret last injected on an outbound request. Set by `send()` at injection time so the
-   * in-process broker can scrub it from a reflected/echoed response body (defense-in-depth against an
-   * allowlisted host with a header-reflecting endpoint). NEVER logged, emitted, or audited — read only
-   * by the broker, in-process, on the same request. `null` until the first injection.
+   * The exact secret last injected on an outbound request, set by `send()` at injection time. A TRUE
+   * private field (`#`, runtime-enforced): the handle is handed to agent/tool code, which must NEVER be
+   * able to read the credential back off it. There is deliberately NO getter — the only way out is
+   * `redactSecret()`, which returns text with the secret REMOVED, never the secret. `null` until first
+   * injection.
    */
-  injectedSecret: string | null = null;
+  #injectedSecret: string | null = null;
+
+  /**
+   * Scrub the injected secret out of a relayed response body — defense-in-depth against an allowlisted
+   * host with a header-reflecting endpoint that echoes the injected bearer back. Returns `text` with the
+   * secret replaced by `[REDACTED]`; a no-op when nothing was injected. NEVER exposes the secret itself.
+   */
+  redactSecret(text: string): string {
+    return this.#injectedSecret ? text.replaceAll(this.#injectedSecret, '[REDACTED]') : text;
+  }
+
+  /** Union non-repudiation: record the real triggerer alongside the acted-as member when they differ
+   *  (a plain userId, never a secret). Empty on every non-union path. Shared by success + failure audits. */
+  private triggerMeta(): Record<string, string> {
+    return this.triggeredBy && this.triggeredBy !== this.acting.userId ? { triggeredBy: this.triggeredBy } : {};
+  }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
@@ -145,7 +161,8 @@ export class ConnectionHandle {
    */
   private async egressError(host: string, reason: string): Promise<void> {
     this.emit({ type: 'egress_error', provider: this.provider.id, host, reason });
-    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false }).catch(() => undefined);
+    // Carry the same union triggerer as the success path so a FAILED call keeps its non-repudiation.
+    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...this.triggerMeta() }).catch(() => undefined);
   }
 
   /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502. */
@@ -228,7 +245,7 @@ export class ConnectionHandle {
     let token = vaulted ? await this.vaultToken(cred, url.hostname) : await this.resolveRef(cred);
     const send = async (t: string) => {
       // Record the exact secret injected so the broker can scrub it from a reflected response body.
-      this.injectedSecret = t;
+      this.#injectedSecret = t;
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);
@@ -264,11 +281,8 @@ export class ConnectionHandle {
     // Attribute the injection to the channel when the cred is channel-owned (owner.id IS the channel
     // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
     const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
-    // Union mode audits the borrowed member as `acting`; also record the real triggerer so
-    // non-repudiation keeps BOTH. Only added when it differs (a plain userId, never a secret).
-    const triggerMeta = this.triggeredBy && this.triggeredBy !== this.acting.userId ? { triggeredBy: this.triggeredBy } : {};
     await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...triggerMeta })
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...this.triggerMeta() })
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
