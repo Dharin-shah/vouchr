@@ -48,3 +48,15 @@ export { offboardUserEverywhere } from './core/offboard';
 // in-process (the same core the /v1/disconnect, /v1/admin/offboard routes and broker-server timer use).
 export { offboardUser, disconnectProvider } from './core/offboard';
 export { sweepExpired } from './core/sweep';
+// Exported wire RESPONSE types for the HTTP broker — the request types (BrokerFetchRequest,
+// ConnectionHandleRef) were already exported; these give clients the response contract too, so they
+// stop hand-typing it. Standalone interfaces (not wired into the handlers). Also on `./headless`.
+export type {
+  BrokerConsentState,
+  BrokerError,
+  BrokerFetchResponse,
+  BrokerResolveResponse,
+  BrokerStatusResponse,
+  BrokerConnectResponse,
+  BrokerManifestResponse,
+} from './broker-types';
