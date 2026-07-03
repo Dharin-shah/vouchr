@@ -252,7 +252,7 @@ These mirror what the code (and the test suite) enforce:
    never derived from the channel id (`owner.ts:channelOwner`).
 9. **Channel-credential config is admin-gated, default-closed.** `isSlackAdmin`
    fails closed on any API error; non-admin attempts are audited as `denied`
-   (`identity.ts`, `bolt.ts:requireAdmin`).
+   (`adapters/slack-identity.ts`, `bolt.ts:requireAdmin`).
 
 ## Non-goals (cross-reference)
 

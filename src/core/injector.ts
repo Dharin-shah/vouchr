@@ -136,7 +136,8 @@ export class ConnectionHandle {
     }
     // Allowlist matches hostname only, so an explicit port on a trusted host (e.g. api.provider.com:2375)
     // would otherwise sail through and let the broker connect to an arbitrary port. Fail-closed: only the
-    // implicit HTTPS port is permitted (an explicit port makes url.port non-empty, even if it's 443).
+    // implicit HTTPS port is permitted: WHATWG normalizes the default `:443` to an empty `url.port`,
+    // so `https://host:443` is allowed, while any non-default explicit port (e.g. `:2375`) is blocked.
     // Loopback is exempt for local dev, mirroring the https carve-out below (dev servers bind a port).
     if (url.port !== '' && !LOOPBACK.has(url.hostname)) {
       await this.denyEgress(url.hostname, 'host', `Egress blocked: explicit port ":${url.port}" is not allowed for provider "${this.provider.id}"`);
