@@ -10,6 +10,14 @@ export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
 export { SessionGrants } from './core/session';
+// Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
+// (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
+// `./headless`. SessionGrants/sweepExpired/TtlPolicy are already exported below.
+export { openDb } from './core/db';
+export type { Db, DbOptions } from './core/db';
+export { Vault } from './core/vault';
+export { Audit } from './core/audit';
+export { Consent } from './core/consent';
 export { github, google, gitlab, notion, defineProvider, ProviderRegistry } from './core/providers';
 export type { Provider, ProviderConfig, RefreshStrategy } from './core/providers';
 export { Policy } from './core/policy';
@@ -49,3 +57,15 @@ export { offboardUserEverywhere } from './core/offboard';
 // in-process (the same core the /v1/disconnect, /v1/admin/offboard routes and broker-server timer use).
 export { offboardUser, disconnectProvider } from './core/offboard';
 export { sweepExpired } from './core/sweep';
+// Exported wire RESPONSE types for the HTTP broker — the request types (BrokerFetchRequest,
+// ConnectionHandleRef) were already exported; these give clients the response contract too, so they
+// stop hand-typing it. Standalone interfaces (not wired into the handlers). Also on `./headless`.
+export type {
+  BrokerConsentState,
+  BrokerError,
+  BrokerFetchResponse,
+  BrokerResolveResponse,
+  BrokerStatusResponse,
+  BrokerConnectResponse,
+  BrokerManifestResponse,
+} from './broker-types';

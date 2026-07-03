@@ -17,6 +17,10 @@
       "types": "./dist/src/index.d.ts",
       "require": "./dist/src/index.js"
     },
+    "./headless": {
+      "types": "./dist/src/headless.d.ts",
+      "require": "./dist/src/headless.js"
+    },
     "./broker-server": {
       "types": "./dist/bin/broker-server.d.ts",
       "require": "./dist/bin/broker-server.js"

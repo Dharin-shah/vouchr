@@ -23,8 +23,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      # Build before test so dist/ exists for artifact-inspecting tests (see ci.yml).
       - run: npm run build
+      - run: npm test
 
   npm-publish:
     needs: verify
