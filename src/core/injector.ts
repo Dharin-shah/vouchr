@@ -104,24 +104,6 @@ export class ConnectionHandle {
     private triggeredBy: string | null = null,
   ) {}
 
-  /**
-   * The exact secret last injected on an outbound request, set by `send()` at injection time. A TRUE
-   * private field (`#`, runtime-enforced): the handle is handed to agent/tool code, which must NEVER be
-   * able to read the credential back off it. There is deliberately NO getter — the only way out is
-   * `redactSecret()`, which returns text with the secret REMOVED, never the secret. `null` until first
-   * injection.
-   */
-  #injectedSecret: string | null = null;
-
-  /**
-   * Scrub the injected secret out of a relayed response body — defense-in-depth against an allowlisted
-   * host with a header-reflecting endpoint that echoes the injected bearer back. Returns `text` with the
-   * secret replaced by `[REDACTED]`; a no-op when nothing was injected. NEVER exposes the secret itself.
-   */
-  redactSecret(text: string): string {
-    return this.#injectedSecret ? text.replaceAll(this.#injectedSecret, '[REDACTED]') : text;
-  }
-
   /** Union non-repudiation: record the real triggerer alongside the acted-as member when they differ
    *  (a plain userId, never a secret). Empty on every non-union path. Shared by success + failure audits. */
   private triggerMeta(): Record<string, string> {
@@ -244,8 +226,6 @@ export class ConnectionHandle {
 
     let token = vaulted ? await this.vaultToken(cred, url.hostname) : await this.resolveRef(cred);
     const send = async (t: string) => {
-      // Record the exact secret injected so the broker can scrub it from a reflected response body.
-      this.#injectedSecret = t;
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);

@@ -1156,11 +1156,11 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
     if (String(u).startsWith('https://acme.example/token')) {
       return new Response(JSON.stringify({ access_token: NEW }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    // upstream provider API: capture the injected Authorization AND echo it, so we can assert the new
-    // token flows on the wire while the broker's scrubber keeps it out of the relayed body.
+    // upstream provider API: capture the injected Authorization so we can assert the new token flows on
+    // the wire (the injection proof — the broker relays the body verbatim, no response sanitization).
     const auth = new Headers(init?.headers).get('authorization');
     upstreamAuth = auth;
-    return new Response(JSON.stringify({ auth }), { status: 200, headers: { 'content-type': 'application/json' } });
+    return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
   try {
     const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
@@ -1171,11 +1171,8 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
     // The token is now vaulted; a subsequent fetch injects it and resolve reports connected.
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(f.status, 200);
-    // The new OAuth token was injected — observed on the wire (the upstream received it), not echoed back.
+    // The new OAuth token was injected — observed on the wire (the upstream received it).
     assert.equal(upstreamAuth, `Bearer ${NEW}`);
-    // And the token-reflection scrubber keeps the raw bearer out of the RELAYED body (regression lock).
-    assert.ok(!f.raw.includes(NEW), 'the injected token must not be reflected back in the relayed response');
-    assert.equal(JSON.parse(f.json.body).auth, 'Bearer [REDACTED]');
     const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(rv.json.consentState, 'connected');
   } finally {
