@@ -55,6 +55,27 @@ export type EventSink = (e: VouchrEvent) => void;
  */
 const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 
+/**
+ * Egress allowlist / policy rejection — the requested target failed a gate BEFORE any secret was read.
+ * The broker maps this to 403. The `.message` TEXT is preserved verbatim from the pre-typed
+ * `Error('Egress blocked: …')` so callers that still string-match the message (e.g. bolt.ts) keep working;
+ * this is purely additive typing so the broker can switch its regex to an `instanceof` check.
+ */
+export class EgressBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'EgressBlockedError';
+  }
+}
+
+/** No stored credential for this owner+provider. The broker maps this to 409. Message TEXT preserved. */
+export class NoConnectionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'NoConnectionError';
+  }
+}
+
 function pathAllowed(pathname: string, allowed: string): boolean {
   if (allowed === '/') return true;
   if (allowed.endsWith('/')) return pathname.startsWith(allowed);
@@ -101,7 +122,7 @@ export class ConnectionHandle {
   ): Promise<never> {
     this.emit({ type: 'egress_denied', provider: this.provider.id, host, reason });
     await this.audit.record('denied', this.acting, this.provider.id, { host, reason });
-    throw new Error(message);
+    throw new EgressBlockedError(message);
   }
 
   /**
@@ -188,7 +209,7 @@ export class ConnectionHandle {
     // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
     let kms = 0;
     const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
-    if (!cred) throw new Error(`No connection for provider "${this.provider.id}"`);
+    if (!cred) throw new NoConnectionError(`No connection for provider "${this.provider.id}"`);
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     const vaulted = cred.source === 'vault';
 

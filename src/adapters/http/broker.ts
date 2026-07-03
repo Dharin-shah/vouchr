@@ -6,7 +6,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import type { ChannelConfig, ChannelMode } from '../../core/channelConfig';
 import { authorizeProvider, resolveCredentialOwner } from '../../core/authz';
@@ -475,9 +475,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
     try {
       res = await handle.fetch(url.toString(), { method, headers, body: outboundBody });
     } catch (e) {
-      const msg = (e as Error).message;
-      if (/Egress blocked/.test(msg)) throw new HttpError(403, { error: 'egress blocked' });
-      if (/No connection/.test(msg)) throw new HttpError(409, { error: 'not connected' });
+      // Typed classes, not a message regex (the stringly-typed contract is gone). The upstream-failure
+      // egress_error signal (metric + audit) already fired inside the injector before the throw reached
+      // here, so mapping to 502 doesn't swallow it.
+      if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
+      if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
       throw new HttpError(502, { error: 'upstream fetch failed' });
     }
 
