@@ -220,3 +220,28 @@ test('integration: /vouchr status lists connections and disconnect revokes', asy
   assert.match(out[1], /Disconnected/);
   assert.equal((await lan.vault.listForUser(id)).length, 0); // revoked
 });
+
+test('integration: install() wires middleware, routes, commands, offboarding in one call', async () => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const lan = await createVouchr({
+    providers: [github({ clientId: 'a', clientSecret: 'b' })],
+    baseUrl: 'http://127.0.0.1:1',
+    dbPath: ':memory:',
+  });
+
+  const wired = { middleware: false, route: false, command: false, event: false };
+  const app = {
+    use: (_m: any) => { wired.middleware = true; },
+    command: (_n: string, _h: any) => { wired.command = true; },
+    view: () => undefined,
+    action: () => undefined,
+    event: (_n: string, _h: any) => { wired.event = true; },
+  };
+  const receiver = { router: { get: (_p: string, _h: any) => { wired.route = true; } } };
+
+  // sweepIntervalMs: 0 → no background timer to leak into the test run.
+  const handle = lan.install(app, receiver, { sweepIntervalMs: 0 });
+  assert.deepEqual(wired, { middleware: true, route: true, command: true, event: true });
+  assert.equal(typeof handle.stop, 'function');
+  handle.stop(); // idempotent no-op when the timer is disabled
+});

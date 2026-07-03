@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { channelIneligibleReason } from '../src/core/channelConfig';
+import {
+  connectBlocks, configureModal, userKeyModal,
+  CONFIGURE_CALLBACK, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
+} from '../src';
 
 // The broker core must stay transport-agnostic: no Slack/Bolt or adapter imports. That boundary is
 // what lets a future sidecar + thin clients reuse the SAME core (and its security logic) instead of
@@ -29,4 +33,18 @@ test('channelIneligibleReason: classifies channel classes, fails closed on unkno
   assert.match(channelIneligibleReason({ is_im: true })!, /DMs/);
   assert.match(channelIneligibleReason({ is_mpim: true })!, /DMs/);
   assert.match(channelIneligibleReason({ is_archived: true })!, /archived/);
+});
+
+// #64: the pure Block Kit builders are importable from the package root so a headless host reuses the
+// modal SHAPE with its own client instead of hand-copying (and drifting from) the Bolt JSON.
+test('#64 block builders + callback ids are exported from the package root as usable Block Kit', () => {
+  // Modals carry the callback_id a host's view-submission handler routes on.
+  assert.equal((configureModal('jira', 'C1') as any).callback_id, CONFIGURE_CALLBACK);
+  assert.equal((userKeyModal('jira') as any).callback_id, USER_KEY_CALLBACK);
+  assert.equal((configureModal('jira', 'C1') as any).type, 'modal');
+  // The connect prompt is a block array with a link button to the authorize URL.
+  const blocks = connectBlocks('jira', 'https://issuer.example/authorize?x=1');
+  assert.ok(Array.isArray(blocks) && blocks.length > 0);
+  assert.ok(JSON.stringify(blocks).includes('https://issuer.example/authorize?x=1'));
+  assert.equal(typeof SETUP_KEY_ACTION, 'string');
 });
