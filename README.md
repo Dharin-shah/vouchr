@@ -105,15 +105,16 @@ broker can do everything the slash command can:
 | --- | --- | --- |
 | Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
 | Use a `shared` / `union` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
-| Set the channel mode (`shared`/`union`/`per-user`/`session`) | ✅ `/vouchr mode` | ❌ no route |
+| Set the channel mode (`shared`/`union`/`per-user`/`session`) | ✅ `/vouchr mode` | ⚠️ no generic route (but `/v1/admin/reference` marks a channel `shared`) |
 | Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ❌ no route |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
 
 The headless broker is deliberately **reference-only** for credential ingest: `/v1/admin/reference`
 and `/v1/user/reference` accept secret-manager references (e.g. an AWS Secrets Manager ARN), never a
-raw key over the wire. Setting channel mode and the tool allowlist stay Bolt-only; the headless broker
-only *reads* the modes a Slack admin configured.
+raw key over the wire. There is no generic mode-setting or tool-allowlist route on the headless broker;
+it otherwise *reads* the modes a Slack admin configured. The one exception is `/v1/admin/reference`,
+which configures a shared secret-manager reference and marks that channel `shared`.
 
 ## Credential Modes
 
