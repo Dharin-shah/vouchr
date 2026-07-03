@@ -147,12 +147,14 @@ export class ConnectionHandle {
     await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...this.triggerMeta() }).catch(() => undefined);
   }
 
-  /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502. */
-  private async refreshSignalled(host: string): Promise<string | null> {
+  /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502.
+   *  host = the OAuth TOKEN endpoint (where a refresh actually fails), not the target API host — matching
+   *  the refresh-SUCCESS audit. tokenUrl is always present here (only OAuth providers refresh). */
+  private async refreshSignalled(): Promise<string | null> {
     try {
       return await this.refreshAndStore();
     } catch (e) {
-      await this.egressError(host, 'refresh_failed');
+      await this.egressError(new URL(this.provider.tokenUrl).hostname, 'refresh_failed');
       throw e;
     }
   }
@@ -224,7 +226,7 @@ export class ConnectionHandle {
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     const vaulted = cred.source === 'vault';
 
-    let token = vaulted ? await this.vaultToken(cred, url.hostname) : await this.resolveRef(cred);
+    let token = vaulted ? await this.vaultToken(cred) : await this.resolveRef(cred);
     const send = async (t: string) => {
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
@@ -245,7 +247,7 @@ export class ConnectionHandle {
     let res = await send(token);
     // Refresh-on-401 only applies to vaulted OAuth creds; referenced secrets rotate externally.
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshSignalled(url.hostname);
+      const refreshed = await this.refreshSignalled();
       if (refreshed) {
         // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
         res.body?.cancel().catch(() => undefined);
@@ -288,10 +290,10 @@ export class ConnectionHandle {
     }
   }
 
-  private async vaultToken(cred: StoredCredential, host: string): Promise<string> {
+  private async vaultToken(cred: StoredCredential): Promise<string> {
     const expiringSoon = cred.expiresAt != null && cred.expiresAt < Date.now() + 30_000;
     if (expiringSoon && cred.refreshToken && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshSignalled(host);
+      const refreshed = await this.refreshSignalled();
       if (refreshed) return refreshed;
     }
     if (cred.accessToken == null) throw new Error(`Vaulted connection for "${this.provider.id}" has no token`);
