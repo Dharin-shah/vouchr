@@ -16,6 +16,7 @@ import { SessionGrants } from '../../core/session';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
+import type { BrokerAdminOkResponse, BrokerAdminConfigResponse } from '../../broker-types';
 
 /**
  * The opaque, NO-SECRET handle the caller holds. It names a provider; the owner is always the acting
@@ -610,6 +611,104 @@ export function createBroker(opts: BrokerOptions): http.Server {
   }
 
   /**
+   * Provider must be a real, brokerable (non-service) provider. Verifies identity FIRST so an
+   * unauthenticated caller past the perimeter can't enumerate providers via distinct 404/403s.
+   * Shared by the admin config write routes below; mirrors the check in handleAdminReference.
+   */
+  async function verifyBrokerableProvider(providerId: string, token: string): Promise<IdentityClaims> {
+    const claims = await verify(token);
+    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    return claims;
+  }
+
+  /** Admin gate, identical to the reference/offboard routes: authority is the SIGNED `isAdmin` claim
+   *  ONLY (the broker can't verify workspace admin). Fail closed + audited (no secret). Never the body. */
+  async function requireAdmin(claims: IdentityClaims, subject: string): Promise<SlackIdentity> {
+    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    if (claims.isAdmin !== true) {
+      await opts.audit.record('denied', acting, subject, { reason: 'not-admin', channel: claims.channel });
+      throw new HttpError(403, { error: 'admin authority required' });
+    }
+    return acting;
+  }
+
+  /**
+   * `POST /v1/admin/mode` — set the channel's credential MODE for a provider (the headless analogue of
+   * `/vouchr mode`). Body `{ provider, mode }`; the channel/team come ONLY from the signed claims (never
+   * the body), admin authority from the SIGNED `isAdmin` claim. Config, NOT secret ingest — calls the
+   * SAME core `ChannelConfig.setMode` the Bolt path uses. Requires channelConfig opt-in; fail closed.
+   */
+  async function handleAdminMode(body: { provider?: unknown; mode?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
+    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
+    const providerId = body.provider;
+    if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
+    const mode = body.mode;
+    if (mode !== 'shared' && mode !== 'union' && mode !== 'per-user' && mode !== 'session') {
+      throw new HttpError(400, { error: 'mode must be one of shared|union|per-user|session' });
+    }
+    const claims = await verifyBrokerableProvider(providerId, body.identityToken);
+    const acting = await requireAdmin(claims, providerId);
+    const owner = channelOwner(claims.teamId, claims.channel);
+    // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
+    // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
+    // channel from the SIGNED verdict. Fail closed + audited. resolveOwner re-checks at use, so this is
+    // defense-in-depth, but the two config doors must agree.
+    if (mode === 'shared' && (opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
+      await opts.audit.record('denied', acting, providerId, { reason: 'channel-ineligible', owner: 'channel', channel: claims.channel });
+      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+    }
+    // Flipping to a user-owned mode drops any live shared credential — the deliberate re-authorization
+    // boundary (mirrors Bolt setChannelMode): else a dormant shared cred silently reactivates on a later
+    // flip back to `shared` with no re-ingest/re-auth.
+    if (mode !== 'shared') await opts.vault.delete(owner, providerId);
+    await opts.channelConfig.setMode(claims.teamId, claims.channel, providerId, mode);
+    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, mode });
+    return { ok: true };
+  }
+
+  /**
+   * `POST /v1/admin/tools` — enable/disable a provider in the channel's tool allowlist (the headless
+   * analogue of `/vouchr enable|disable`). Body `{ provider, enabled }`; channel/team + admin authority
+   * from the SIGNED claims only. Calls the SAME core `ChannelTools.setEnabled` the Bolt path uses.
+   * Requires channelTools opt-in; fail closed. Config, NOT secret ingest.
+   */
+  async function handleAdminTools(body: { provider?: unknown; enabled?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
+    if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
+    const providerId = body.provider;
+    if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
+    if (typeof body.enabled !== 'boolean') throw new HttpError(400, { error: 'enabled must be a boolean' });
+    const claims = await verifyBrokerableProvider(providerId, body.identityToken);
+    const acting = await requireAdmin(claims, providerId);
+    await opts.channelTools.setEnabled(claims.teamId, claims.channel, providerId, body.enabled);
+    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, toolEnabled: body.enabled });
+    return { ok: true };
+  }
+
+  /**
+   * `GET /v1/admin/config` — the read side of the two write routes above: the caller's channel's
+   * per-provider mode + tool-enabled state, so an agent can inspect before changing. Admin-gated
+   * (SIGNED `isAdmin` only); the channel/team come from the signed claims (identity token in the
+   * `x-vouchr-identity` header — a GET carries no JSON body). Service tools are omitted (not brokered).
+   * NO secret: policy bits only. `mode` is null when channelConfig is unset; `enabled` defaults true
+   * when channelTools is unset (the same backward-compat rule ChannelTools.isEnabled applies).
+   */
+  async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
+    const claims = await verify(token);
+    await requireAdmin(claims, 'config');
+    const providers = await Promise.all(
+      opts.providers
+        .filter((p) => registry.get(p.id).identity !== 'service') // service tools aren't brokered by Vouchr
+        .map(async (p) => ({
+          provider: p.id,
+          mode: opts.channelConfig ? await opts.channelConfig.getMode(claims.teamId, claims.channel, p.id) : null,
+          enabled: opts.channelTools ? await opts.channelTools.isEnabled(claims.teamId, claims.channel, p.id) : true,
+        })),
+    );
+    return { providers };
+  }
+
+  /**
    * #52 `POST /v1/connect` — mint an OAuth authorize URL for the VERIFIED user. State is bound to the
    * identity in the signed token (never the body), so a forged body can't mint consent for someone
    * else. The broker handles no raw token here; the token is only ever written to the vault inside the
@@ -778,6 +877,22 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'POST' && url === '/v1/admin/reference') {
           await perimeter(req);
           return send(200, await handleAdminReference(await readJson(req)));
+        }
+        if (req.method === 'POST' && url === '/v1/admin/mode') {
+          await perimeter(req);
+          return send(200, { ...await handleAdminMode(await readJson(req)) });
+        }
+        if (req.method === 'POST' && url === '/v1/admin/tools') {
+          await perimeter(req);
+          return send(200, { ...await handleAdminTools(await readJson(req)) });
+        }
+        if (req.method === 'GET' && url === '/v1/admin/config') {
+          await perimeter(req);
+          // A GET carries no JSON body, so the signed identity token rides a header (never a query
+          // string — keeps it out of access logs). Channel/team/admin all come from this signed token.
+          const token = req.headers['x-vouchr-identity'];
+          if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
+          return send(200, { ...await handleAdminConfig(token) });
         }
         if (req.method === 'POST' && url === '/v1/status') {
           await perimeter(req);

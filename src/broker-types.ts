@@ -7,6 +7,8 @@
  * exported contract; enforcing them on the handlers is a fine follow-up. Keep them in sync with broker.ts.
  */
 
+import type { ChannelMode } from './core/channelConfig';
+
 /** Coarse per-provider consent state — no secret, existence + state only. */
 export type BrokerConsentState = 'connected' | 'needs_consent';
 
@@ -42,4 +44,15 @@ export interface BrokerConnectResponse {
 /** `GET /v1/manifest` — each provider's id and whether Vouchr brokers a human credential for it. */
 export interface BrokerManifestResponse {
   providers: { provider: string; identity: 'service' | 'acting_human' }[];
+}
+
+/** `POST /v1/admin/mode` · `POST /v1/admin/tools` — admin config write acknowledgement. No secret. */
+export interface BrokerAdminOkResponse {
+  ok: true;
+}
+
+/** `GET /v1/admin/config` — the caller's channel's per-provider mode + tool-enabled state (read side
+ *  of the admin config write routes). Policy bits only, NO secret. `mode` is null when unconfigured. */
+export interface BrokerAdminConfigResponse {
+  providers: { provider: string; mode: ChannelMode | null; enabled: boolean }[];
 }
