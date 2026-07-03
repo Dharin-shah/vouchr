@@ -7,7 +7,7 @@ import http from 'node:http';
 // Direct-construction path: EVERYTHING here comes from `../src/headless` and NOTHING else, proving a
 // typed pure-headless consumer can build createBroker end-to-end without reaching into internal paths.
 // This is also the compile-level proof (tsc --noEmit in the gate type-checks this file).
-import { openDb, Vault, Audit, createBroker, github, sweepExpired, Consent } from '../src/headless';
+import { openDb, Vault, Audit, createBroker, github, sweepExpired, Consent, Policy, ChannelTools } from '../src/headless';
 import type { Db, TtlPolicy } from '../src/headless';
 
 /**
@@ -47,7 +47,11 @@ test('headless entry: createBroker is constructible end-to-end from ./headless a
     const vault = new Vault(db, Buffer.alloc(32), ttl);
     const audit = new Audit(db);
     const provider = github({ clientId: 'id', clientSecret: 'secret' });
-    const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: 'test-secret' });
+    // Policy-gated construction (the canary rollout: scope the broker to one channel) + tool allowlist,
+    // all from ./headless alone.
+    const policy = new Policy({ github: { defaultAllow: false, allowChannels: ['C_canary'] } }, { defaultDeny: true });
+    const channelTools = new ChannelTools(db);
+    const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: 'test-secret', policy, channelTools });
     assert.ok(server instanceof http.Server);
     // sweep lifecycle bits are reachable too (all from ./headless).
     assert.equal(await sweepExpired(vault, audit, new Consent(db)), 0);

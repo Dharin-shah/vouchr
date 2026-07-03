@@ -62,6 +62,15 @@ export type { Owner } from './core/owner';
 export { ChannelConfig, channelIneligibleReason } from './core/channelConfig';
 export type { ChannelMode } from './core/channelConfig';
 
+// ── operator authorization surface: Policy scopes the broker to a channel (canary rollout), the tool
+// allowlist gates per-channel providers, and Resolvers/EventSink wire the `resolvers`/`onEvent`
+// BrokerOptions. All core/adapters-http — no @slack in the graph. ──
+export { Policy } from './core/policy';
+export type { PolicyRule } from './core/policy';
+export { ChannelTools } from './core/tools';
+export type { ToolManifestEntry } from './core/tools';
+export type { Resolvers, EventSink, VouchrEvent } from './core/injector';
+
 // ── exported wire RESPONSE types (mirror the broker's HTTP responses) ──
 export type {
   BrokerConsentState,
