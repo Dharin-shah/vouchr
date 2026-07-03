@@ -650,10 +650,14 @@ export async function createVouchr(opts: VouchrOptions) {
   // Safe emit for the createVouchr-level paths (OAuth callback, disconnect) that aren't inside a
   // ConnectContext/ConnectionHandle. A throwing sink must never break a request.
   const emit = (e: VouchrEvent): void => safeEmit(sink, e);
-  const commandAdmin = async (client: WebClient, identity: SlackIdentity): Promise<boolean> => {
+  // Same gate as ConnectContext.requireAdmin, for the command paths that don't route through it
+  // (enable/disable tool allowlist, the configure pre-modal gate). Default: workspace admin OR the
+  // channel's creator; a custom isAdmin override fully replaces it (a thrown override fails closed).
+  const commandAdmin = async (client: WebClient, identity: SlackIdentity, channel: string): Promise<boolean> => {
     return opts.isAdmin
       ? await opts.isAdmin(client, identity.userId, identity.teamId).catch(() => false)
-      : await isSlackAdmin(client, identity.userId);
+      : (await isSlackAdmin(client, identity.userId)
+        || await isChannelAdmin(client, channel, identity.userId));
   };
 
   /**
@@ -788,9 +792,9 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!arg) return respond(`Usage: \`/vouchr ${sub} <provider>\``);
         if (!command.channel_id) return respond(`Run \`/vouchr ${sub}\` from inside the channel you want to configure.`);
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
-        if (!(await commandAdmin(client, identity))) {
+        if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond('Only a workspace admin can change channel tools.');
+          return respond('Only a workspace admin or the channel creator can change channel tools.');
         }
         const on = sub === 'enable';
         await channelTools.setEnabled(identity.teamId, command.channel_id, arg, on);
@@ -817,9 +821,9 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'configure') {
         if (!arg) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
-        if (!(await commandAdmin(client, identity))) {
+        if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond('Only a workspace admin can configure channel credentials.');
+          return respond('Only a workspace admin or the channel creator can configure channel credentials.');
         }
         await client.views.open({ trigger_id: command.trigger_id, view: configureModal(arg, command.channel_id) });
         return;

@@ -8,7 +8,7 @@ import { Consent } from '../src/core/consent';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
-import { ConnectContext } from '../src/adapters/bolt';
+import { ConnectContext, createVouchr } from '../src/adapters/bolt';
 
 // The channel-creator config gate: a channel's CREATOR — not only a workspace admin — may run the
 // admin config mutations (here `setChannelMode`). Mirrors governance.test.ts's harness, plus a
@@ -80,4 +80,50 @@ test('adminCheck override false blocks even the channel creator', async () => {
   await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /admin/);
   assert.equal(await mode(db), null);
   assert.deepEqual(await auditActions(db), ['denied']);
+});
+
+// The COMMAND paths (enable/disable tool allowlist + the configure pre-modal gate) route through
+// commandAdmin, not requireAdmin — assert they honor the same "workspace admin OR channel creator".
+async function commandHarness(creator: string) {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const lan = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  let handler: any;
+  lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+  const out: string[] = [];
+  let opened: any = null;
+  const client = {
+    users: { info: async () => ({ user: { is_admin: false } }) }, // never a workspace admin
+    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator } }) },
+    views: { open: async (a: any) => { opened = a; } },
+  };
+  const base = { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig' };
+  const run = (text: string) =>
+    handler({ command: { ...base, text }, ack: async () => {}, respond: async (m: string) => out.push(m), client });
+  return { lan, run, out, opened: () => opened };
+}
+
+// Channel creator (non-workspace-admin) can enable/disable tools and open the configure modal.
+test('channel creator can run enable/disable and pass the configure gate', async () => {
+  const h = await commandHarness(ID.userId);
+  await h.run('enable mcp');
+  assert.match(h.out[0], /Enabled/);
+  const row = await h.lan.db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
+  assert.equal(row.enabled, 1);
+
+  await h.run('disable mcp');
+  assert.match(h.out[1], /Disabled/);
+
+  await h.run('configure mcp');
+  assert.equal(h.opened()?.trigger_id, 'trig'); // modal opened → passed the pre-modal gate
+});
+
+// A non-creator non-admin is still denied on the same command paths.
+test('non-creator non-admin is denied on enable/disable/configure', async () => {
+  const h = await commandHarness('U_SOMEONE_ELSE');
+  await h.run('enable mcp');
+  assert.match(h.out[0], /admin or the channel creator/);
+  await h.run('configure mcp');
+  assert.match(h.out[1], /admin or the channel creator/);
+  assert.equal(h.opened(), null); // modal never opened
+  assert.ok((await h.lan.db.all('SELECT action FROM audit') as any[]).every((r) => r.action === 'denied'));
 });
