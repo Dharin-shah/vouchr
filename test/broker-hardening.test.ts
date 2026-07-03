@@ -158,6 +158,25 @@ test('/v1/status: one listForUser call, no per-provider vault.get decrypts', asy
   } finally { server.close(); }
 });
 
+test('/v1/status: a past-idle-TTL connection reports needs_consent, not connected', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY, { idleMs: 1000 }); // idle-expire after 1s
+  const audit = new Audit(db);
+  await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  // Age the row past the idle window (mirrors what vault.get would treat as expired → null).
+  await db.run(`UPDATE connection SET last_used_at=?, created_at=? WHERE provider='acme'`, [Date.now() - 5000, Date.now() - 5000]);
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET });
+  const port = await listen(server);
+  try {
+    const r = await post(port, '/v1/status', { identityToken: token() });
+    assert.equal(r.status, 200);
+    const acmeRow = r.json.providers.find((p: any) => p.provider === 'acme');
+    assert.deepEqual(acmeRow, { provider: 'acme', connected: false, consentState: 'needs_consent' }, 'expired connection must read needs_consent');
+    // Sanity: vault.get agrees the row is expired (null), so status matches the single-fetch path.
+    assert.equal(await vault.get(userOwner(U1), 'acme'), null);
+  } finally { server.close(); }
+});
+
 // ── (c) policy_denied metric fires on a denied fetch ──────────────────────────
 
 test('policy_denied event fires on a policy-denied fetch (parity with the Bolt path)', async () => {

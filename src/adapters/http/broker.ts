@@ -625,10 +625,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
   async function handleStatus(body: { identityToken: string }): Promise<Record<string, unknown>> {
     const claims = await verify(body.identityToken);
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    // ONE query, ZERO decryption: listForUser returns the user's connected providers (no secret,
-    // no KMS unwrap). Intersect with the brokered list in memory instead of N sequential vault.get
-    // calls, each of which would decrypt both tokens (2N KMS calls under envelope) just to test != null.
-    const connected = new Set((await opts.vault.listForUser(identity)).map((c) => c.provider));
+    // ONE query, ZERO decryption: listLiveForUser returns the user's LIVE connected providers (no
+    // secret, no KMS unwrap; TTL-expired rows dropped exactly as vault.get would). Intersect with the
+    // brokered list in memory instead of N sequential vault.get calls, each of which would decrypt
+    // both tokens (2N KMS calls under envelope) just to test != null.
+    const connected = new Set((await opts.vault.listLiveForUser(identity)).map((c) => c.provider));
     const providers = opts.providers
       .filter((p) => registry.get(p.id).identity !== 'service') // service tools aren't brokered by Vouchr
       .map((p) => {
