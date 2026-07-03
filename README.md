@@ -31,7 +31,9 @@ Vouchr gives the agent a narrower path:
 ## What Users See
 
 Vouchr's Slack surfaces are intentionally small. These are illustrative Block Kit mockups; Slack
-renders the live UI with your app's name and workspace styling.
+renders the live UI with your app's name and workspace styling. The underlying Block Kit templates are
+exported for reuse and customization: `connectedBlocks`, `consentDeniedBlocks`, `statusBlocks`,
+`disconnectConfirmBlocks`, and `homeView`.
 
 For OAuth providers, Vouchr sends a private Connect prompt:
 
@@ -89,7 +91,8 @@ Vouchr has one security boundary and multiple ways to reach it:
 - **Bolt middleware** for the simplest path: Slack prompts, OAuth callback, approvals, and
   `context.vouchr.connect()` in one app.
 - **Headless HTTP broker** when a Slack-facing service verifies the user, then separate workers call
-  Vouchr over HTTP.
+  Vouchr over HTTP. Import it from the Bolt-free `@vouchr/core/headless` entry point so a pure-headless
+  service never pulls `@slack/*` into its module graph.
 - **Local sidecar** when a Python, Go, Rust, or MCP runtime wants a tiny localhost contract. See
   [`examples/sidecar`](./examples/sidecar).
 
@@ -233,6 +236,12 @@ The full `/vouchr` slash command surface:
 | `tools` | List this channel's tool manifest: which providers an agent may use here and their mode. |
 | `enable <provider>` / `disable <provider>` | Admin: toggle a provider in this channel's tool allowlist — a per-channel governance gate `connect()` enforces. |
 
+The **Admin** commands above are workspace-admin-only by default. Set the opt-in
+`allowChannelCreatorConfig: true` (default off) on `createVouchr` to also let a channel's **creator**
+run them in their own channel — useful when channel owners self-manage their tools without a workspace
+admin. This flag is Bolt-only; the headless admin routes are governed solely by the signed `isAdmin`
+claim.
+
 Vouchr uses **your agent's Slack app**, not a separate Vouchr app. Enable these on that Slack app:
 
 - **Bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `users:read`
@@ -282,9 +291,22 @@ More examples:
 
 ## Headless HTTP Broker
 
-Use `createBroker()` when your Slack-facing service and agent worker are separate. The Slack-facing
-service verifies Slack, mints a short-lived `identityToken` with `signIdentity()`, and the worker
-calls `POST /v1/fetch`:
+Use `createBroker()` when your Slack-facing service and agent worker are separate. Import it from the
+Bolt-free entry point so no `@slack/*` package is loaded:
+
+```ts
+import { createBroker, signIdentity } from '@vouchr/core/headless';
+```
+
+`@vouchr/core/headless` re-exports exactly the headless surface — `createBroker`, `buildBrokerServer`
+(env → wired server), identity minting/verification, providers, the owner model, and the low-level
+building blocks (`openDb`, `Vault`, `Audit`, `Consent`, `SessionGrants`, `sweepExpired`, `Policy`,
+`ChannelTools`) — plus the typed wire response types (`BrokerFetchResponse`, `BrokerStatusResponse`,
+`BrokerAdminConfigResponse`, …). The root `@vouchr/core` entry still exports everything, including the
+Bolt adapter.
+
+The Slack-facing service verifies Slack, mints a short-lived `identityToken` with `signIdentity()`,
+and the worker calls `POST /v1/fetch`:
 
 ```json
 {
@@ -314,6 +336,14 @@ const broker = createBroker({
 Providers without `egressMethods` remain `GET`/`HEAD`-only even when `allowWrites` is enabled.
 Write bodies are small JSON/text payloads, capped at 64 KiB, and still go through the same identity
 verification, replay guard, policy, channel-tool, host/path/method, and HTTPS checks as reads.
+
+Channel governance is available headless too, mirroring the Bolt `/vouchr` commands: `POST /v1/admin/mode`
+sets a provider's channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool
+allowlist, and `GET /v1/admin/config` reads both back. All three are gated on the SIGNED `isAdmin`
+claim — admin authority comes only from the verified identity token, never the request body — and are
+scoped to the signed channel. What stays Bolt-only is ingesting a **raw** key/secret; the headless
+broker takes secret-manager **references** (`/v1/admin/reference`, `/v1/user/reference`) but never a
+raw key over the wire.
 
 Keep `identitySecret` with the Slack verifier and broker, not arbitrary workers. For multi-instance
 brokers, pass a shared `replayStore`; the default replay guard is process-local. If the user has not

@@ -3,7 +3,7 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
 
-## [Unreleased]
+## [0.2.0-rc.1] - 2026-07-03
 
 ### Breaking
 
@@ -19,6 +19,38 @@ All notable changes to this project are documented here. This project adheres to
   only. `ConnectContext` is effectively internal (it types `context.vouchr`), but it is publicly
   exported, so this is technically a breaking source change. `ConnectContextDeps` is now exported
   from the package root for consumers that construct it directly.
+
+### Added
+
+- Bolt-free `./headless` entry point (`@vouchr/core/headless`): re-exports exactly the headless broker
+  surface (`createBroker`, `buildBrokerServer`, identity minting/verification, providers, owner model)
+  plus the low-level building blocks (`openDb`/`Db`, `Vault`, `Audit`, `Consent`, `SessionGrants`,
+  `sweepExpired`, `Policy`, `ChannelTools`) so a pure-headless consumer can construct a broker without
+  pulling `@slack/*` into the module graph (enforced by `test/headless-boltfree.test.ts`). Typed wire
+  response types (`BrokerFetchResponse`, `BrokerStatusResponse`, `BrokerResolveResponse`, etc.) are
+  exported from both entry points.
+- Headless admin config routes — `POST /v1/admin/mode`, `POST /v1/admin/tools`, `GET /v1/admin/config`
+  — mirroring the Bolt `/vouchr` channel-governance commands, gated on the SIGNED `isAdmin` claim
+  (admin authority never comes from the request body). Adds `BrokerAdminOkResponse` /
+  `BrokerAdminConfigResponse` types. Raw-secret ingest stays Bolt-only; the headless broker remains
+  reference-only for credential ingest.
+- Bolt Block Kit template builders exported from the package root: `connectedBlocks`,
+  `consentDeniedBlocks`, `statusBlocks`, `disconnectConfirmBlocks`, and `homeView`.
+- Opt-in `allowChannelCreatorConfig` flag (default off) and `isChannelAdmin` helper: when enabled, a
+  Slack channel's creator — not only a workspace admin — may run `/vouchr` admin config commands.
+  Default off preserves workspace-admin-only behavior. Bolt-only.
+
+### Changed
+
+- `safeEmit` extraction and `toBuffer` deduplication (internal refactors, no behavior change).
+
+### Fixed
+
+- Egress-failure telemetry: a provider outage or refresh breakage now fires an `egress_error` event and
+  writes an attributable (no-secret) audit row instead of being a silent 502. Typed errors
+  `EgressBlockedError` and `NoConnectionError` replace opaque throws (mapped to `403` / `409` on the
+  broker). Credentials are verified before enumeration, and union-mode non-repudiation now records the
+  real triggerer alongside the acted-as member on the failure path too (`triggeredBy`).
 
 ## [0.1.0]: production target (pending external validation)
 
