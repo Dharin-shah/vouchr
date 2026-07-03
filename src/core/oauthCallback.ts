@@ -71,6 +71,8 @@ export async function handleOAuthCallback(
   // Provider-side denial (the user clicked "Deny" → ?error=access_denied). This is the REAL
   // consent_denied: it fires before any token exchange, attributed to the resolved identity.
   if (error) {
+    // Authoritative table copy: attribute the denial to the CONSUMED-state identity (never the request).
+    await deps.audit.record('denied', row.identity, provider.id, { reason: 'consent_denied' });
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 400);
     return { ok: false, status: 400, error: `OAuth error: ${error}` };
   }
@@ -94,6 +96,7 @@ export async function handleOAuthCallback(
     // Post-consent connection FAILURE (token exchange / account probe / vault write threw) — not a
     // user denial, but the closest action on the lossy stream. status 500 here is synthetic (the host
     // distinguishes the real user-denial above by its 400). See VouchrAuditEvent.status doc.
+    await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 500);
     return { ok: false, status: 500, error: 'Connection failed. Please try again.' };
   }
