@@ -97,24 +97,29 @@ Headless is primarily the credential **use path**, not a replacement for Slack c
 connect or approve access through the Slack app first (or through the headless OAuth flow when it is
 mounted).
 
-**One core, two front doors — but not full parity.** Both doors reach the same credential boundary,
-but *configuration* of channel governance lives only in the Bolt path today. Don't assume the headless
-broker can do everything the slash command can:
+**One core, two front doors.** Both doors reach the same credential boundary. Channel governance —
+setting modes, toggling the tool allowlist, reading the current config — is now available on the
+headless broker too, behind the SIGNED `isAdmin` admin claim, so an external agent can proxy it. The
+one thing that stays Bolt-only is ingesting a **raw** key/secret: the headless broker is
+reference-only by design.
 
 | Capability | Bolt (`/vouchr`) | Headless broker |
 | --- | --- | --- |
 | Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
 | Use a `shared` / `union` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
-| Set the channel mode (`shared`/`union`/`per-user`/`session`) | ✅ `/vouchr mode` | ⚠️ no generic route (but `/v1/admin/reference` marks a channel `shared`) |
-| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ❌ no route |
+| Set the channel mode (`shared`/`union`/`per-user`/`session`) | ✅ `/vouchr mode` | ✅ `POST /v1/admin/mode` (admin claim) |
+| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (admin claim) |
+| Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` (admin claim) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
 
-The headless broker is deliberately **reference-only** for credential ingest: `/v1/admin/reference`
+The headless broker mirrors the Bolt path's channel configuration — `POST /v1/admin/mode` sets a
+provider's mode, `POST /v1/admin/tools` toggles it in the channel's allowlist, and `GET /v1/admin/config`
+reads both back — all gated by the SIGNED `isAdmin` claim (admin-ness comes only from the verified
+token, never the request body) and scoped to the signed channel. What it deliberately does NOT do is
+accept a **raw** key/secret: for credential ingest it stays **reference-only**. `/v1/admin/reference`
 and `/v1/user/reference` accept secret-manager references (e.g. an AWS Secrets Manager ARN), never a
-raw key over the wire. There is no generic mode-setting or tool-allowlist route on the headless broker;
-it otherwise *reads* the modes a Slack admin configured. The one exception is `/v1/admin/reference`,
-which configures a shared secret-manager reference and marks that channel `shared`.
+raw key over the wire; raw-key ingest remains the Bolt private modal's job.
 
 ## Credential Modes
 
