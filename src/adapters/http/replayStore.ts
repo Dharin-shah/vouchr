@@ -17,7 +17,10 @@ export class DbReplayStore implements ReplayStore {
 
   constructor(private db: Db) {
     // exp is epoch-ms (IdentityClaims.exp). BIGINT on PG; INTEGER affinity on SQLite — both fine.
-    this.ready = db.exec(`CREATE TABLE IF NOT EXISTS broker_jti (jti TEXT PRIMARY KEY, exp BIGINT NOT NULL)`);
+    this.ready = db.exec(
+      `CREATE TABLE IF NOT EXISTS broker_jti (jti TEXT PRIMARY KEY, exp BIGINT NOT NULL);
+       CREATE INDEX IF NOT EXISTS idx_broker_jti_exp ON broker_jti (exp);`,
+    );
   }
 
   async use(jti: string, exp: number): Promise<boolean> {
