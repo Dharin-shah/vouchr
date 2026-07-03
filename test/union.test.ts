@@ -57,12 +57,12 @@ async function ctx(
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const { client, posted } = build(members, opts.info ?? ELIGIBLE, opts.isMember ?? true);
-  const c = new ConnectContext(
-    CALLER, channel, client, new ProviderRegistry([mcp, svc]), vault, audit,
-    new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db), new ChannelTools(db),
-    new Map(), () => {}, ['mcp', 'svc'],
-    undefined, opts.requireMembership ?? false,
-  );
+  const c = new ConnectContext({
+    identity: CALLER, channel, client, registry: new ProviderRegistry([mcp, svc]), vault, audit,
+    consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
+    channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),
+    providerIds: ['mcp', 'svc'], requireMembership: opts.requireMembership ?? false,
+  });
   return { c, db, vault, audit, posted, cfg: new ChannelConfig(db) };
 }
 

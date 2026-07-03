@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
 
+## [Unreleased]
+
+### Breaking
+
+- `ConnectContext`'s constructor now takes a single `ConnectContextDeps` object instead of ~20
+  positional arguments (`new ConnectContext({ identity, channel, client, ... })`). Optional fields
+  keep their previous defaults, so runtime behavior is identical — this is a source-level change
+  only. `ConnectContext` is effectively internal (it types `context.vouchr`), but it is publicly
+  exported, so this is technically a breaking source change. `ConnectContextDeps` is now exported
+  from the package root for consumers that construct it directly.
+
 ## [0.1.0]: production target (pending external validation)
 
 The 0.1.0 line is the first production-intended release. Everything below is on `main` and

@@ -33,10 +33,10 @@ async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN', convo: an
       },
     },
   } as any;
-  const c = new ConnectContext(
-    ID, channel, client, new ProviderRegistry([provider]), vault, audit,
-    new Consent(db), policy, 'http://x', {}, new ChannelConfig(db),
-  );
+  const c = new ConnectContext({
+    identity: ID, channel, client, registry: new ProviderRegistry([provider]), vault, audit,
+    consent: new Consent(db), policy, redirectUri: 'http://x', channelConfig: new ChannelConfig(db),
+  });
   return { c, db, vault, audit };
 }
 

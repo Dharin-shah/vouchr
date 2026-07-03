@@ -6,6 +6,7 @@ import type { Consent } from './consent';
 import type { SlackIdentity } from './identity';
 import { userOwner } from './owner';
 import { exchangeCode } from './tokens';
+import { safeEmit } from './safe-emit';
 
 export interface CallbackDeps {
   registry: ProviderRegistry;
@@ -38,11 +39,7 @@ function emitConsent(
     status,
     jti: randomUUID(),
   };
-  try {
-    deps.auditSink?.(e);
-  } catch {
-    // ignore: best-effort, never fatal
-  }
+  safeEmit(deps.auditSink, e);
 }
 
 export type CallbackResult =

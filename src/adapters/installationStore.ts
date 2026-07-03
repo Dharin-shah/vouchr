@@ -1,5 +1,5 @@
 import type { Db } from '../core/db';
-import { encrypt, decrypt } from '../core/crypto';
+import { encrypt, decrypt, toBuffer } from '../core/crypto';
 import type { Installation, InstallationQuery, InstallationStore, Logger } from '@slack/bolt';
 
 /**
@@ -78,9 +78,4 @@ export class DbInstallationStore implements InstallationStore {
       [DbInstallationStore.rowKey(query.enterpriseId, query.teamId, query.isEnterpriseInstall)],
     );
   }
-}
-
-/** Postgres returns BYTEA as Buffer already; no-op guard for both engines. */
-function toBuffer(v: unknown): Buffer {
-  return Buffer.isBuffer(v) ? v : Buffer.from(v as any);
 }

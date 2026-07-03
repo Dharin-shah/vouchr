@@ -35,11 +35,11 @@ async function ctx(isAdmin = true, channel: string | null = 'C_FIN', policy = ne
     users: { info: async () => ({ user: { is_admin: isAdmin } }) },
     conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }) },
   } as any;
-  const c = new ConnectContext(
-    ID, channel, client, new ProviderRegistry([mcp, other]), vault, audit,
-    new Consent(db), policy, 'http://x', {}, new ChannelConfig(db), tools,
-    new Map(), () => {}, PROVIDER_IDS,
-  );
+  const c = new ConnectContext({
+    identity: ID, channel, client, registry: new ProviderRegistry([mcp, other]), vault, audit,
+    consent: new Consent(db), policy, redirectUri: 'http://x',
+    channelConfig: new ChannelConfig(db), channelTools: tools, providerIds: PROVIDER_IDS,
+  });
   return { c, db, vault, audit, tools };
 }
 

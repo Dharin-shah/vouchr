@@ -117,6 +117,12 @@ export async function open(blob: Buffer, key: Buffer, envelope?: EnvelopeProvide
   }
 }
 
+/** Coerce a DB BYTEA/BLOB value to a Buffer. Postgres returns a Buffer already; SQLite may hand
+ *  back other shapes. A no-op guard shared by the Vault and the installation store. */
+export function toBuffer(v: unknown): Buffer {
+  return Buffer.isBuffer(v) ? v : Buffer.from(v as any);
+}
+
 /** PKCE code challenge: base64url(SHA-256(verifier)). */
 export function sha256base64url(input: string): string {
   return createHash('sha256').update(input).digest('base64url');

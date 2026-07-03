@@ -41,12 +41,11 @@ async function ctx(opts: {
       },
     },
   } as any;
-  const c = new ConnectContext(
-    ID, 'C_FIN', client, new ProviderRegistry([provider]), vault, audit,
-    new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db),
-    undefined, undefined, undefined, undefined, // channelTools, inflight, sink, providerIds → defaults
-    adminCheck, requireMembership,
-  );
+  const c = new ConnectContext({
+    identity: ID, channel: 'C_FIN', client, registry: new ProviderRegistry([provider]), vault, audit,
+    consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
+    channelConfig: new ChannelConfig(db), adminCheck, requireMembership,
+  });
   return { c, db, vault, audit };
 }
 

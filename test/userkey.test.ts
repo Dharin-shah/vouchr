@@ -26,10 +26,11 @@ async function ctx(channel: string | null = 'C1', client: any = {}) {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const c = new ConnectContext(
-    ID, channel, client, new ProviderRegistry([keyProvider]), vault, audit,
-    new Consent(db), new Policy(), 'http://x', {}, new ChannelConfig(db),
-  );
+  const c = new ConnectContext({
+    identity: ID, channel, client, registry: new ProviderRegistry([keyProvider]), vault, audit,
+    consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
+    channelConfig: new ChannelConfig(db),
+  });
   return { c, db, vault, audit };
 }
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
