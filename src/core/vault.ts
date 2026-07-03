@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
-import { seal, open, type EnvelopeProvider } from './crypto';
+import { seal, open, toBuffer, type EnvelopeProvider } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
 export interface StoredToken {
@@ -246,9 +246,4 @@ export class Vault {
       [owner.teamId, owner.kind, owner.id, provider],
     );
   }
-}
-
-/** Postgres returns BYTEA as Buffer already; this is a no-op guard for both engines. */
-function toBuffer(v: unknown): Buffer {
-  return Buffer.isBuffer(v) ? v : Buffer.from(v as any);
 }
