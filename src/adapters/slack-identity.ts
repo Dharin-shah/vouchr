@@ -51,6 +51,9 @@ export async function isSlackAdmin(
  * admin boolean). Alongside `isSlackAdmin`, this widens who may CONFIGURE channel credentials to the
  * channel creator, not just workspace admins. Fail-closed: no channel, any API error, or a missing
  * creator → not a channel admin.
+ * Caveats: for a PRIVATE channel the bot must be a member for conversations.info to return it, else
+ * this fails closed and only the workspace-admin path applies. `creator` is immutable and can point
+ * at a since-deactivated user.
  */
 export async function isChannelAdmin(
   client: { conversations: { info: (a: { channel: string }) => Promise<any> } },

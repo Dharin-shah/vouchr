@@ -39,6 +39,10 @@ function refSource(ref: string): string {
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
 const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 };
 
+/** Denial message for the config gate, accurate to whether the channel-creator path is enabled. */
+const adminOnly = (allowCreator: boolean, action: string): string =>
+  `Only a workspace admin${allowCreator ? ' or the channel creator' : ''} can ${action}.`;
+
 /** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
 export class ConsentRequiredError extends Error {
   constructor(public provider: string) {
@@ -111,6 +115,16 @@ export interface VouchrOptions {
    */
   isAdmin?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
   /**
+   * Opt in to letting a channel's CREATOR (not only a workspace admin) run the channel-credential
+   * config commands (`mode`, `configure`, `enable`, `disable`). Default false: the gate is exactly
+   * workspace-admin-only, unchanged from before this option existed. Off by default on purpose — in
+   * Slack any member can create a public channel, so `creator` is not inherently a privileged role;
+   * turn this on only where a channel owner should self-serve their own channel's config. Ignored
+   * when a custom `isAdmin` is set (the override fully decides). See `isChannelAdmin` for the private-
+   * channel / deactivated-creator caveats.
+   */
+  allowChannelCreatorConfig?: boolean;
+  /**
    * When true, using a SHARED channel credential (`connectChannel`) requires the ACTING user to be
    * a member of the channel; a non-member (or a membership check we can't verify) is refused
    * fail-closed and audited 'denied' with reason 'not-member'. Default false: membership is not
@@ -159,9 +173,10 @@ export interface ConnectContextDeps {
   sink?: EventSink;
   /** The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed. */
   providerIds?: string[];
-  /** Governance: custom admin check (overrides the default). Undefined = built-in gate (workspace
-   *  admin OR channel creator). */
+  /** Governance: custom admin check (overrides the default). Undefined = built-in gate. */
   adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
+  /** Governance: opt in to the channel-creator config path. Default false = workspace-admin-only. */
+  allowChannelCreatorConfig?: boolean;
   /** Governance: when true, connectChannel requires the acting user to be a channel member. */
   requireMembership?: boolean;
   /** The Slack thread (thread_ts) this request is in, for thread-scoped sessions. Null off-thread. */
@@ -190,6 +205,7 @@ export class ConnectContext {
   private sink: EventSink;
   private providerIds: string[];
   private adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
+  private allowChannelCreatorConfig: boolean;
   private requireMembership: boolean;
   private thread: string | null;
   private sessions?: SessionGrants;
@@ -212,6 +228,7 @@ export class ConnectContext {
     this.sink = deps.sink ?? (() => {});
     this.providerIds = deps.providerIds ?? [];
     this.adminCheck = deps.adminCheck;
+    this.allowChannelCreatorConfig = deps.allowChannelCreatorConfig ?? false;
     this.requireMembership = deps.requireMembership ?? false;
     this.thread = deps.thread ?? null;
     this.sessions = deps.sessions;
@@ -402,22 +419,22 @@ export class ConnectContext {
   // `this.channel` comes from the VERIFIED Slack event, so the channel binding cannot be
   // forged (invariant 1). teamId is always the authenticated user's (invariant 2).
 
-  /** Default-deny admin gate for config mutations (invariant 7). Audits the denial. Default allows a
-   *  workspace admin OR the channel creator (self-serve: a channel owner needn't wait for IT); a
-   *  custom `adminCheck` fully replaces that default (set it to strict workspace-only if desired). */
+  /** Default-deny admin gate for config mutations (invariant 7). Audits the denial. Default is
+   *  workspace-admin-only; when `allowChannelCreatorConfig` is opted in, the channel creator is also
+   *  allowed. A custom `adminCheck` fully replaces the built-in gate (and ignores the flag). */
   private async requireAdmin(providerId: string): Promise<void> {
     // A custom check overrides the built-in gate; a thrown override fails closed (not admin).
     const ok = this.adminCheck
       ? await this.adminCheck(this.client, this.identity.userId, this.identity.teamId).catch(() => false)
       : (await isSlackAdmin(this.client, this.identity.userId)
-        || await isChannelAdmin(this.client, this.channel ?? '', this.identity.userId));
+        || (this.allowChannelCreatorConfig && await isChannelAdmin(this.client, this.channel ?? '', this.identity.userId)));
     if (!ok) {
       await this.audit.record('denied', this.identity, providerId, {
         reason: 'not-admin',
         owner: 'channel',
         channel: this.channel,
       });
-      throw new Error(`Only a workspace admin can configure channel credentials.`);
+      throw new Error(adminOnly(this.allowChannelCreatorConfig, 'configure channel credentials'));
     }
   }
 
@@ -650,14 +667,15 @@ export async function createVouchr(opts: VouchrOptions) {
   // Safe emit for the createVouchr-level paths (OAuth callback, disconnect) that aren't inside a
   // ConnectContext/ConnectionHandle. A throwing sink must never break a request.
   const emit = (e: VouchrEvent): void => safeEmit(sink, e);
+  const allowChannelCreatorConfig = opts.allowChannelCreatorConfig ?? false;
   // Same gate as ConnectContext.requireAdmin, for the command paths that don't route through it
-  // (enable/disable tool allowlist, the configure pre-modal gate). Default: workspace admin OR the
-  // channel's creator; a custom isAdmin override fully replaces it (a thrown override fails closed).
+  // (enable/disable tool allowlist, the configure pre-modal gate). Default workspace-admin-only; the
+  // channel creator is OR-ed in only when opted in. A custom isAdmin override fully replaces it.
   const commandAdmin = async (client: WebClient, identity: SlackIdentity, channel: string): Promise<boolean> => {
     return opts.isAdmin
       ? await opts.isAdmin(client, identity.userId, identity.teamId).catch(() => false)
       : (await isSlackAdmin(client, identity.userId)
-        || await isChannelAdmin(client, channel, identity.userId));
+        || (allowChannelCreatorConfig && await isChannelAdmin(client, channel, identity.userId)));
   };
 
   /**
@@ -706,6 +724,7 @@ export async function createVouchr(opts: VouchrOptions) {
         sink,
         providerIds,
         adminCheck: opts.isAdmin,
+        allowChannelCreatorConfig,
         requireMembership: opts.requireChannelMembership ?? false,
         thread,
         sessions,
@@ -754,7 +773,8 @@ export async function createVouchr(opts: VouchrOptions) {
     return new ConnectContext({
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, sink, providerIds,
-      adminCheck: opts.isAdmin, requireMembership: opts.requireChannelMembership ?? false,
+      adminCheck: opts.isAdmin, allowChannelCreatorConfig,
+      requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, auditSink,
     });
   }
@@ -794,7 +814,7 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
         if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond('Only a workspace admin or the channel creator can change channel tools.');
+          return respond(adminOnly(allowChannelCreatorConfig, 'change channel tools'));
         }
         const on = sub === 'enable';
         await channelTools.setEnabled(identity.teamId, command.channel_id, arg, on);
@@ -823,7 +843,7 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
         if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond('Only a workspace admin or the channel creator can configure channel credentials.');
+          return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
         }
         await client.views.open({ trigger_id: command.trigger_id, view: configureModal(arg, command.channel_id) });
         return;

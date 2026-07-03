@@ -418,6 +418,10 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
   `configure <provider>` (admin channel-credential modal), `mode <provider> <shared|per-user|session|union>`
   (admin), `tools` (list the channel's tool manifest), and `enable <provider>` / `disable <provider>`
   (admin: the per-channel tool allowlist `connect()` enforces).
+- **Who may configure:** by default the `configure`/`mode`/`enable`/`disable` commands are
+  **workspace-admin-only**. Set `allowChannelCreatorConfig: true` to also let a channel's **creator**
+  self-serve their own channel's config (off by default — in Slack anyone can create a public channel,
+  so `creator` isn't a privileged role). A custom `isAdmin` still fully overrides either default.
 
 Wire the four hooks (see the README example):
 
