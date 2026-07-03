@@ -195,6 +195,23 @@ export class Vault {
   }
 
   /**
+   * A user's OWN connections that are still LIVE per the TTL policy — the batched, zero-decryption
+   * analogue of `get() != null` for a status view. Reuses the SAME `isExpired` computation `get`
+   * applies (so a past-TTL row is dropped identically), just in memory over one query instead of
+   * N decrypting `get` calls. `listForUser` stays unfiltered on purpose (offboarding must revoke
+   * expired rows too); this variant is for "what can the user actually use right now".
+   */
+  async listLiveForUser(i: SlackIdentity): Promise<{ provider: string; externalAccount: string | null }[]> {
+    const rows = (await this.db.all(
+      `SELECT provider, external_account, created_at, last_used_at FROM connection WHERE team_id=? AND owner_kind='user' AND owner_id=?`,
+      [i.teamId, i.userId],
+    )) as any[];
+    return rows
+      .filter((r) => !this.isExpired(r.created_at, r.last_used_at ?? r.created_at))
+      .map((r) => ({ provider: r.provider, externalAccount: r.external_account }));
+  }
+
+  /**
    * Every connection currently past its TTL (for the periodic sweep). Filters in SQL
    * (only expired rows cross the wire) rather than scanning the whole table in memory.
    * The predicate MUST mirror isExpired(): idle uses last_used_at (falling back to
