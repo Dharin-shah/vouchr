@@ -38,8 +38,14 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run build
-      # Honors package.json publishConfig (public, dist-tag "next"). Provenance signs the release.
-      - run: npm publish --provenance
+      # Prerelease tags (a semver `-` suffix, e.g. v0.2.0-rc.1) publish under the `rc` dist-tag so they
+      # never become the default `npm install` target; stable tags publish as `latest`. This overrides
+      # publishConfig.tag per-release. Provenance signs the release.
+      - name: npm publish
+        run: |
+          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then TAG=rc; else TAG=latest; fi
+          echo "publishing ${GITHUB_REF_NAME} under dist-tag ${TAG}"
+          npm publish --provenance --tag "${TAG}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 

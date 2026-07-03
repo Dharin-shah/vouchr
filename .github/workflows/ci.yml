@@ -34,3 +34,5 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # Catch emit-level breaks (declaration/build errors) before a release tag — part of the required `test` gate.
+      - run: npm run build
