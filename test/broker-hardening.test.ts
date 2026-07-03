@@ -200,6 +200,25 @@ test('policy_denied event fires on a policy-denied fetch (parity with the Bolt p
   } finally { up.restore(); server.close(); }
 });
 
+test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403)', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const server = createBroker({
+    providers: [acme], vault, audit, db, identitySecret: SECRET,
+    policy: new Policy({}, { defaultDeny: true }), // acme denied → emits policy_denied
+    onEvent: () => { throw new Error('sink boom'); }, // a broken sink must never affect the request
+  });
+  const port = await listen(server);
+  const up = mockUpstream();
+  try {
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
+    assert.equal(r.status, 403, 'a throwing sink must not escalate the 403 to a 500');
+    assert.equal(up.seen.length, 0);
+  } finally { up.restore(); server.close(); }
+});
+
 // ── (d) removing defaultDenyNonGet did not change write-gating ────────────────
 
 test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async () => {

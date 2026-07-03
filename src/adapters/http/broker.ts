@@ -6,7 +6,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, type Resolvers, type EventSink } from '../../core/injector';
+import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import type { ChannelConfig } from '../../core/channelConfig';
 import type { SlackIdentity } from '../../core/identity';
@@ -111,6 +111,12 @@ export interface BrokerOptions {
    * and signed the verdict. Set false ONLY if eligibility is enforced entirely upstream of the broker.
    */
   requireChannelEligibility?: boolean;
+  /**
+   * @deprecated Inert no-op, retained only for TypeScript API compatibility (the package is
+   * published; consumers still passing it must keep compiling). Superseded by `allowWrites`, which
+   * governs the write path. Setting this has NO runtime effect.
+   */
+  defaultDenyNonGet?: boolean;
   /**
    * Opt-in broker write path. Default false keeps the historical GET/HEAD-only broker behavior.
    * When true, non-GET/HEAD requests are still allowed only for providers with explicit
@@ -264,6 +270,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // cross-pod; this covers in-process concurrency (incl. the SQLite single-replica case).
   const inflight = new Map<string, Promise<string | null>>();
 
+  // Broker-local metrics emit. Fire-and-forget: a throwing sink must NEVER affect the request (else a
+  // broken metrics sink would turn an intended 403 deny into a 500). Mirrors the Bolt path's swallow;
+  // the ConnectionHandle pass-through below swallows its own internally.
+  const emit = (ev: VouchrEvent) => { try { opts.onEvent?.(ev); } catch { /* a throwing sink never affects the request */ } };
+
   // #54 lifecycle: consent + session stores for offboarding (purge pending consent + thread grants so
   // neither can resurrect access after a user is removed). #52 OAuth connect flow (mounted only when
   // baseUrl is set) reuses the same Consent: it owns the single-use state + PKCE; handleOAuthCallback
@@ -318,12 +329,12 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     if (opts.policy && !opts.policy.check(provider, channel)) {
       await opts.audit.record('denied', acting, provider, { channel });
-      opts.onEvent?.({ type: 'policy_denied', provider });
+      emit({ type: 'policy_denied', provider });
       throw new HttpError(403, { error: 'policy denies this provider in this channel' });
     }
     if (opts.channelTools && !(await opts.channelTools.isEnabled(claims.teamId, channel, provider))) {
       await opts.audit.record('denied', acting, provider, { channel, reason: 'tool-disabled' });
-      opts.onEvent?.({ type: 'policy_denied', provider });
+      emit({ type: 'policy_denied', provider });
       throw new HttpError(403, { error: 'provider is not enabled in this channel' });
     }
   }
@@ -755,10 +766,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
         send(404, { error: 'not found' });
       } catch (e) {
         if (e instanceof HttpError) return send(e.status, e.payload);
-        // Log the MESSAGE only (already no-secret here) so an unexpected 500 isn't invisible; never
-        // the stack or payload, and never echo internals to the client (could carry detail).
-        console.error('[vouchr] request failed:', (e as Error).message);
-        send(500, { error: 'internal error' });
+        // Log the error CLASS NAME only — never the message/stack/payload. An extension point (e.g. a
+        // custom provider.inject) can throw AFTER touching the secret, so the message could carry the
+        // token; logging it would break the "tokens never enter logs" invariant. The type still triages.
+        console.error('[vouchr] request failed:', (e as Error)?.constructor?.name ?? 'Error');
+        send(500, { error: 'internal error' }); // never echo internals to the client either
       }
     })();
   });
