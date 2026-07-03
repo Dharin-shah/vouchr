@@ -98,6 +98,10 @@ export class ConnectionHandle {
     // Optional audit STREAM sink (carries the raw actor id). Separate from `sink`, which is
     // deliberately actor-free. Default no-op. The authoritative copy is still the audit table.
     private auditSink: AuditSink = () => {},
+    // The human who TRIGGERED this request, when it differs from `acting` (union mode: `acting` is the
+    // borrowed member, not the caller). Added to the inject audit meta so non-repudiation records BOTH
+    // the acted-as member and the real triggerer. Default null = same as acting (nothing extra recorded).
+    private triggeredBy: string | null = null,
   ) {}
 
   /**
@@ -260,8 +264,11 @@ export class ConnectionHandle {
     // Attribute the injection to the channel when the cred is channel-owned (owner.id IS the channel
     // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
     const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
+    // Union mode audits the borrowed member as `acting`; also record the real triggerer so
+    // non-repudiation keeps BOTH. Only added when it differs (a plain userId, never a secret).
+    const triggerMeta = this.triggeredBy && this.triggeredBy !== this.acting.userId ? { triggeredBy: this.triggeredBy } : {};
     await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta })
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...triggerMeta })
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
