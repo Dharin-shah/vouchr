@@ -125,11 +125,18 @@ export interface ReplayStore {
  */
 export class ReplayGuard implements ReplayStore {
   private seen = new Map<string, number>(); // jti -> exp (epoch ms)
+  private lastPrune = 0;
 
   /** Returns true if this jti is fresh (and records it); false if it was already used. */
   use(jti: string, exp: number, now = Date.now()): boolean {
-    // Prune expired entries so the set stays bounded by the live (<=5min) token window.
-    for (const [j, e] of this.seen) if (e <= now) this.seen.delete(j);
+    // ponytail: prune cadence 60s — the check+insert below run every call (correctness), only the
+    // O(n) sweep is throttled, mirroring DbReplayStore. Between prunes an expired jti lingers in the
+    // map, but verifyIdentity rejects an expired token before the replay check so it's never accepted;
+    // memory is bounded by ~60s of traffic on top of the live (<=5min) window.
+    if (now - this.lastPrune > 60_000) {
+      this.lastPrune = now;
+      for (const [j, e] of this.seen) if (e <= now) this.seen.delete(j);
+    }
     if (this.seen.has(jti)) return false;
     this.seen.set(jti, exp);
     return true;
