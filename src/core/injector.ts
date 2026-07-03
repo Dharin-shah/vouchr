@@ -83,6 +83,22 @@ export class ConnectionHandle {
     }
   }
 
+  /**
+   * Reject an egress attempt: fire the no-secret metric, write the AUTHORITATIVE audit row (who tried
+   * to reach a non-allowlisted target), then throw. Meta carries ONLY the hostname + a static reason —
+   * NEVER the raw url or headers: for URL-embedded-credential providers the secret lives in the url
+   * userinfo, so logging the url would leak it.
+   */
+  private async denyEgress(
+    host: string,
+    reason: 'host' | 'method' | 'path' | 'validator',
+    message: string,
+  ): Promise<never> {
+    this.emit({ type: 'egress_denied', provider: this.provider.id, host, reason });
+    await this.audit.record('denied', this.acting, this.provider.id, { host, reason });
+    throw new Error(message);
+  }
+
   /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
   private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number, method?: string): void {
     try {
@@ -112,41 +128,34 @@ export class ConnectionHandle {
     const url = new URL(input);
     const method = (init.method ?? 'GET').toUpperCase();
     if (url.username || url.password) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
-      throw new Error(`Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
+      await this.denyEgress(url.hostname, 'host', `Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
     }
     // Egress allowlist first, before any secret is even read.
     if (!this.provider.egressAllow.includes(url.hostname)) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
-      throw new Error(
-        `Egress blocked: "${url.hostname}" is not in the allowlist for provider "${this.provider.id}"`,
-      );
+      await this.denyEgress(url.hostname, 'host', `Egress blocked: "${url.hostname}" is not in the allowlist for provider "${this.provider.id}"`);
+    }
+    // Allowlist matches hostname only, so an explicit port on a trusted host (e.g. api.provider.com:2375)
+    // would otherwise sail through and let the broker connect to an arbitrary port. Fail-closed: only the
+    // implicit HTTPS port is permitted (an explicit port makes url.port non-empty, even if it's 443).
+    // Loopback is exempt for local dev, mirroring the https carve-out below (dev servers bind a port).
+    if (url.port !== '' && !LOOPBACK.has(url.hostname)) {
+      await this.denyEgress(url.hostname, 'host', `Egress blocked: explicit port ":${url.port}" is not allowed for provider "${this.provider.id}"`);
     }
     // The caller (and the LLM) controls this URL. Require https so the bearer is never sent in
     // cleartext (it goes out before any http→https redirect). Loopback is exempt for local dev.
     if (url.protocol !== 'https:' && !LOOPBACK.has(url.hostname)) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'host' });
-      throw new Error(`Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
+      await this.denyEgress(url.hostname, 'host', `Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
     // never reaches the vault: the secret is read strictly after every egress check passes.
     if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'path' });
-      throw new Error(
-        `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`,
-      );
+      await this.denyEgress(url.hostname, 'path', `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`);
     }
-    if (this.provider.egressMethods) {
-      if (!this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
-        this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'method' });
-        throw new Error(
-          `Egress blocked: method "${method}" is not allowed for provider "${this.provider.id}"`,
-        );
-      }
+    if (this.provider.egressMethods && !this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
+      await this.denyEgress(url.hostname, 'method', `Egress blocked: method "${method}" is not allowed for provider "${this.provider.id}"`);
     }
     if (this.provider.egressValidate && !this.provider.egressValidate(url, init)) {
-      this.emit({ type: 'egress_denied', provider: this.provider.id, host: url.hostname, reason: 'validator' });
-      throw new Error(`Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
+      await this.denyEgress(url.hostname, 'validator', `Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
     }
 
     // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
@@ -171,7 +180,11 @@ export class ConnectionHandle {
     // Refresh-on-401 only applies to vaulted OAuth creds; referenced secrets rotate externally.
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
       const refreshed = await this.refreshAndStore();
-      if (refreshed) res = await send(refreshed);
+      if (refreshed) {
+        // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
+        res.body?.cancel().catch(() => undefined);
+        res = await send(refreshed);
+      }
     }
     const fetchMs = Date.now() - t0;
 
