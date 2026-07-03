@@ -9,6 +9,14 @@ export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
 export { SessionGrants } from './core/session';
+// Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
+// (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
+// `./headless`. SessionGrants/sweepExpired/TtlPolicy are already exported below.
+export { openDb } from './core/db';
+export type { Db, DbOptions } from './core/db';
+export { Vault } from './core/vault';
+export { Audit } from './core/audit';
+export { Consent } from './core/consent';
 export { github, google, gitlab, notion, defineProvider, ProviderRegistry } from './core/providers';
 export type { Provider, ProviderConfig, RefreshStrategy } from './core/providers';
 export { Policy } from './core/policy';

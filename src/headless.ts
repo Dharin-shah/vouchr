@@ -18,6 +18,20 @@ export type { BrokerOptions, BrokerFetchRequest, ConnectionHandleRef } from './a
 export { buildBrokerServer } from '../bin/broker-server';
 export type { BuiltBroker } from '../bin/broker-server';
 
+// ── low-level building blocks for the FLEXIBLE direct-construction path: BrokerOptions requires a
+// vault/audit/db, so a typed consumer must be able to build them with ONLY `./headless` imports
+// (openDb → new Vault → new Audit → createBroker). Consent/SessionGrants/sweepExpired/TtlPolicy are
+// the lifecycle bits a headless deploy wires for the TTL sweep. All core — no @slack in the graph. ──
+export { openDb } from './core/db';
+export type { Db, DbOptions } from './core/db';
+export { Vault } from './core/vault';
+export type { TtlPolicy } from './core/vault';
+export { Audit } from './core/audit';
+export type { AuditSink, VouchrAuditEvent } from './core/audit';
+export { Consent } from './core/consent';
+export { SessionGrants } from './core/session';
+export { sweepExpired } from './core/sweep';
+
 // ── signed identity minting/verification (the headless auth contract) ──
 export {
   signIdentity,
