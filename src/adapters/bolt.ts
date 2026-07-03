@@ -12,6 +12,7 @@ import { resolveIdentity, isSlackAdmin, isChannelMember, listChannelMembers } fr
 import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { handleOAuthCallback } from '../core/oauthCallback';
@@ -217,11 +218,7 @@ export class ConnectContext {
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
-    try {
-      this.sink(e);
-    } catch {
-      // ignore: observability is best-effort, never fatal
-    }
+    safeEmit(this.sink, e);
   }
 
   /**
@@ -647,13 +644,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const auditSink: AuditSink = opts.auditSink ?? (() => {});
   // Safe emit for the createVouchr-level paths (OAuth callback, disconnect) that aren't inside a
   // ConnectContext/ConnectionHandle. A throwing sink must never break a request.
-  const emit = (e: VouchrEvent): void => {
-    try {
-      sink(e);
-    } catch {
-      // ignore: observability is best-effort, never fatal
-    }
-  };
+  const emit = (e: VouchrEvent): void => safeEmit(sink, e);
   const commandAdmin = async (client: WebClient, identity: SlackIdentity): Promise<boolean> => {
     return opts.isAdmin
       ? await opts.isAdmin(client, identity.userId, identity.teamId).catch(() => false)
