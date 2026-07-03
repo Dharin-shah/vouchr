@@ -112,12 +112,6 @@ export interface BrokerOptions {
    */
   requireChannelEligibility?: boolean;
   /**
-   * #25 provider-level fail-closed switch. When true, a provider with UNSET `egressMethods` is
-   * treated as GET/HEAD-only (default-deny) instead of "any method". Providers that need writes
-   * opt in explicitly with `egressMethods`. Off (default) preserves the additive behavior.
-   */
-  defaultDenyNonGet?: boolean;
-  /**
    * Opt-in broker write path. Default false keeps the historical GET/HEAD-only broker behavior.
    * When true, non-GET/HEAD requests are still allowed only for providers with explicit
    * `egressMethods`; providers with no method allowlist remain GET/HEAD-only.
@@ -324,10 +318,12 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     if (opts.policy && !opts.policy.check(provider, channel)) {
       await opts.audit.record('denied', acting, provider, { channel });
+      opts.onEvent?.({ type: 'policy_denied', provider });
       throw new HttpError(403, { error: 'policy denies this provider in this channel' });
     }
     if (opts.channelTools && !(await opts.channelTools.isEnabled(claims.teamId, channel, provider))) {
       await opts.audit.record('denied', acting, provider, { channel, reason: 'tool-disabled' });
+      opts.onEvent?.({ type: 'policy_denied', provider });
       throw new HttpError(403, { error: 'provider is not enabled in this channel' });
     }
   }
@@ -346,7 +342,30 @@ export function createBroker(opts: BrokerOptions): http.Server {
   ): Promise<{ owner: Owner; acting: SlackIdentity }> {
     const ownerKind = claims.ownerKind ?? 'user';
     if (ref.owner !== ownerKind) throw new HttpError(403, { error: 'handle owner does not match verified claims' });
-    if (ownerKind === 'user') return ownerFromClaims(claims);
+    if (ownerKind === 'user') {
+      const user = ownerFromClaims(claims);
+      // SECURITY (#54): `session` mode is a user-owned credential the Bolt path gates behind a
+      // per-thread grant (bolt.ts:228). Headless callers send `owner:'user'` on the SAME db, so
+      // without this the broker would serve the plain credential with no grant check — a weaker
+      // posture on one store. Fail closed: when channelConfig is opted in AND this provider is
+      // `session` here, require a live grant for the SIGNED thread (never the body). No thread in
+      // the signed claims → we can't scope a session → refuse rather than serve unscoped.
+      // ponytail: enforced surgically in this user branch (smallest fail-closed fix); the fuller
+      // both-adapters resolveOwner/mode dedup shared with Bolt is a follow-up.
+      if (opts.channelConfig) {
+        const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
+        if (mode === 'session') {
+          const thread = claims.threadTs;
+          if (!thread || !(await sessions.isGranted(user.acting, claims.channel, thread, ref.provider))) {
+            await opts.audit.record('denied', user.acting, ref.provider, {
+              channel: claims.channel, reason: thread ? 'no-session-grant' : 'no-thread',
+            });
+            throw new HttpError(403, { error: 'provider requires a thread-scoped session approval' });
+          }
+        }
+      }
+      return user;
+    }
 
     // ── channel-owned (opt-in, fail-closed) ──
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
@@ -385,7 +404,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     }
     const claims = await verify(body.identityToken);
     await authorize(ref.provider, claims);
-    const provider = withEgressDefaults(registry.get(ref.provider), opts.defaultDenyNonGet || opts.allowWrites);
+    const provider = withEgressDefaults(registry.get(ref.provider), opts.allowWrites);
     const { owner, acting } = await resolveOwner(ref, claims);
     // The 7th arg is the createBroker-scoped SHARED inflight map, so concurrent requests for the same
     // owner+provider collapse to one token refresh (rotating-refresh providers brick on a double
@@ -605,13 +624,17 @@ export function createBroker(opts: BrokerOptions): http.Server {
    */
   async function handleStatus(body: { identityToken: string }): Promise<Record<string, unknown>> {
     const claims = await verify(body.identityToken);
-    const owner = userOwner({ enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId });
-    const providers: { provider: string; connected: boolean; consentState: string }[] = [];
-    for (const p of opts.providers) {
-      if (registry.get(p.id).identity === 'service') continue; // not brokered by Vouchr
-      const connected = (await opts.vault.get(owner, p.id)) != null;
-      providers.push({ provider: p.id, connected, consentState: connected ? 'connected' : 'needs_consent' });
-    }
+    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    // ONE query, ZERO decryption: listForUser returns the user's connected providers (no secret,
+    // no KMS unwrap). Intersect with the brokered list in memory instead of N sequential vault.get
+    // calls, each of which would decrypt both tokens (2N KMS calls under envelope) just to test != null.
+    const connected = new Set((await opts.vault.listForUser(identity)).map((c) => c.provider));
+    const providers = opts.providers
+      .filter((p) => registry.get(p.id).identity !== 'service') // service tools aren't brokered by Vouchr
+      .map((p) => {
+        const isConnected = connected.has(p.id);
+        return { provider: p.id, connected: isConnected, consentState: isConnected ? 'connected' : 'needs_consent' };
+      });
     return { providers };
   }
 
@@ -731,7 +754,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
         send(404, { error: 'not found' });
       } catch (e) {
         if (e instanceof HttpError) return send(e.status, e.payload);
-        send(500, { error: 'internal error' }); // never echo internals (could carry detail)
+        // Log the MESSAGE only (already no-secret here) so an unexpected 500 isn't invisible; never
+        // the stack or payload, and never echo internals to the client (could carry detail).
+        console.error('[vouchr] request failed:', (e as Error).message);
+        send(500, { error: 'internal error' });
       }
     })();
   });
