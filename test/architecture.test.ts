@@ -23,6 +23,28 @@ test('core is transport-agnostic (no @slack or adapter imports)', () => {
   assert.deepEqual(offenders, [], `core must not depend on the transport layer:\n${offenders.join('\n')}`);
 });
 
+// Import-based checks miss Slack KNOWLEDGE that carries no @slack import: a function that pages
+// `conversations.members` or reads `is_admin`/`is_owner` off a users.info response is just as coupled
+// to Slack as an import is. Assert core references none of those Slack-semantic tokens, so the boundary
+// is structural (what core knows), not merely which packages it imports.
+//
+// Token note: we match `conversations.members` (the paging API the moved membership helpers called),
+// NOT a bare `conversations.` — core deliberately keeps the channel-eligibility RULE + the ChannelInfo
+// field subset (see channelConfig.ts), whose doc comment mentions `conversations.info`. That RULE is
+// meant to live in core; only the Slack API-CALLING logic (members paging, admin-flag reads) is banned.
+test('core is Slack-semantics-free (no conversations.members / is_admin / is_owner)', () => {
+  const coreDir = join(process.cwd(), 'src', 'core');
+  const forbidden = ['conversations.members', '.is_admin', '.is_owner'];
+  const offenders: string[] = [];
+  for (const f of readdirSync(coreDir).filter((f) => f.endsWith('.ts'))) {
+    const src = readFileSync(join(coreDir, f), 'utf8');
+    for (const token of forbidden) {
+      if (src.includes(token)) offenders.push(`core/${f}: references "${token}"`);
+    }
+  }
+  assert.deepEqual(offenders, [], `core must not contain Slack-semantic logic:\n${offenders.join('\n')}`);
+});
+
 // The channel-eligibility RULE is core so every adapter enforces it identically.
 test('channelIneligibleReason: classifies channel classes, fails closed on unknown', () => {
   assert.equal(channelIneligibleReason({}), null); // a normal channel is eligible

@@ -7,7 +7,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { ConnectionHandle } from '../src/core/injector';
-import { resolveIdentity } from '../src/core/identity';
+import { resolveIdentity } from '../src/adapters/slack-identity';
 import { Policy } from '../src/core/policy';
 import { github, google, gitlab, notion, defineProvider, ProviderRegistry } from '../src/core/providers';
 import { exchangeCode } from '../src/core/tokens';
