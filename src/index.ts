@@ -25,6 +25,18 @@ export type { Installation, InstallationQuery, InstallationStore } from '@slack/
 export type { ChannelMode } from './core/channelConfig';
 export { ChannelTools } from './core/tools';
 export type { ToolManifestEntry } from './core/tools';
+// #64 pure Block Kit builders (strings in, Block Kit JSON out — no chat SDK). Exported so a headless
+// host can render the SAME connect prompt / credential modal with its OWN client and forward the
+// submission to the headless endpoints (/v1/connect, /v1/{admin,user}/reference), instead of
+// hand-copying the JSON (which then drifts from the Bolt path).
+export {
+  connectBlocks,
+  configureModal,
+  userKeyModal,
+  CONFIGURE_CALLBACK,
+  USER_KEY_CALLBACK,
+  SETUP_KEY_ACTION,
+} from './adapters/blocks';
 export type { TtlPolicy } from './core/vault';
 export type { EnvelopeProvider } from './core/crypto';
 // Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);

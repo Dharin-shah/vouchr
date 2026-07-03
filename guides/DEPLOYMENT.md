@@ -139,14 +139,33 @@ sketch this is drawn from.
 ## Standalone headless broker (no Slack)
 
 Run Vouchr as a plain HTTP service for non-Bolt agent runtimes. Same core (encrypted store, egress
-allowlist, refresh, audit); the front door is signed identity tokens instead of Slack. This is the
-**use** path — it injects credentials the caller already consented to. It is **not** a consent
-product: see *Provisioning* below for how credentials get into the store.
+allowlist, refresh, audit); the front door is signed identity tokens instead of Slack. It injects
+credentials at egress, and — when the OAuth flow is mounted (`VOUCHR_BASE_URL`, #52) — can also run
+per-user consent end-to-end, so a headless host needs **no Slack app** to onboard users. See
+*Provisioning* below for the other ways credentials get into the store.
 
 Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
 `POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `GET /healthz` (alias
-`/health`), and — when channel modes are enabled — `POST /v1/admin/reference` on `VOUCHR_PORT`
-(default 3000), and runs the TTL sweep on a timer (see *Lifecycle*).
+`/health`), and — when channel modes are enabled — `POST /v1/admin/reference`, on `VOUCHR_PORT`
+(default 3000), and runs the TTL sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it
+additionally serves `POST /v1/connect` and the OAuth callback (below).
+
+### OAuth connect flow (headless consent, #52)
+
+Set `VOUCHR_BASE_URL` (this broker's public HTTPS origin) to mount the consent handshake — the same
+core state/PKCE/exchange the Bolt adapter uses, no duplicated crypto:
+
+- `POST /v1/connect` — body `{ handle: { provider }, identityToken }`. Returns `{ authorizeUrl, state }`
+  for the **verified** user (state is bound to the signed identity, never the body). Your host presents
+  `authorizeUrl` to the user however it likes — the broker owns **no** chat/messaging surface.
+- `GET <callbackPath>` (default `/oauth/callback`, override with `VOUCHR_CALLBACK_PATH`) — the OAuth
+  redirect target. Consumes the single-use state, exchanges the code, vaults the token, audits, and
+  returns a minimal HTML landing page. Register `"$VOUCHR_BASE_URL$callbackPath"` as the provider's
+  redirect URI. A `?error=` denial fires the `consent_denied` audit and stores nothing.
+
+When a `/v1/resolve` returns `needs_consent`, drive the user through `POST /v1/connect`; the next
+`/v1/fetch` for that user then succeeds. The broker never handles a raw token itself — it is only ever
+written to the vault inside the callback.
 
 ### Trust model
 
@@ -224,6 +243,8 @@ POST /v1/admin/reference
 | `VOUCHR_BROKER_TOKEN` | no | static bearer for the coarse perimeter gate on `/v1/*`. |
 | `VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS` | no | credential idle / max-age TTL (#54). Default 7d / 30d (matches the Bolt path); `0` disables that dimension. |
 | `VOUCHR_SWEEP_INTERVAL_MS` | no | TTL sweep interval (#54). Default hourly; `0` defers to an external scheduler. |
+| `VOUCHR_BASE_URL` | for OAuth | public HTTPS origin of this broker; setting it mounts `POST /v1/connect` + the OAuth callback (#52). |
+| `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared/union) via signed channel-fact claims (#51). Off → user-only broker. |
 | `VOUCHR_PRODUCTION` | prod | `1` → boot fails fast unless Postgres **and** a KMS envelope are configured. |
@@ -269,9 +290,10 @@ writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the p
   ```
   Prefer `VOUCHR_SEED_ACCESS_TOKEN`: a `--access-token` flag lands in `process.argv`, visible via
   `ps`/`/proc` to any co-tenant. The flag exists only for interactive use.
-- **Per-user credentials** (each human's own account): the broker does **not** run OAuth consent.
-  Run the Bolt control-plane Vouchr against the **same Postgres database**; users connect in Slack,
-  and the headless broker reads what they consented to. One store, two front doors.
+- **Per-user credentials** (each human's own account): either mount the headless OAuth flow
+  (`VOUCHR_BASE_URL`, #52) and drive users through `POST /v1/connect` → callback directly, **or** run
+  the Bolt control-plane Vouchr against the **same Postgres database** so users connect in Slack and
+  the headless broker reads what they consented to. One store, two front doors.
 
 ### Lifecycle: disconnect, offboard, TTL sweep (#54)
 

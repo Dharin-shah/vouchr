@@ -13,6 +13,7 @@ import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
+import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
 
 /**
@@ -51,6 +52,16 @@ export interface BrokerOptions {
   db: Db;
   /** HS256 secret shared ONLY by the upstream minter and this broker. */
   identitySecret: string;
+  /**
+   * #52 public HTTPS origin of THIS broker (e.g. `https://broker.example`). Setting it MOUNTS the OAuth
+   * connect flow: `POST /v1/connect` (mint an authorize URL for the verified user) and
+   * `GET <callbackPath>` (the provider redirect target). Unset → neither route mounts (additive; the
+   * historical use-only broker is unchanged). The `redirectUri` handed to providers is
+   * `new URL(callbackPath, baseUrl)`.
+   */
+  baseUrl?: string;
+  /** #52 OAuth redirect path mounted under `baseUrl`. Default `/oauth/callback`. */
+  callbackPath?: string;
   /**
    * Single-use jti store for replay protection. Default is an in-memory per-process guard, which is
    * single-use ONLY within one process — a horizontally scaled broker fleet MUST supply a shared
@@ -168,6 +179,17 @@ function normalizeContentType(ct: string | null): string {
   return (ct ?? '').split(';')[0].trim().toLowerCase();
 }
 
+/** Escape for HTML text context — the OAuth landing page interpolates provider/account/error, and
+ *  `error`/`account` are attacker- or provider-influenced, so this is a reflected-XSS guard (#52). */
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
+}
+
+/** Minimal browser landing page for the OAuth callback (headless has no chat surface to nudge back to). */
+function landingHtml(title: string, body: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center"><h2>${title}</h2><p>${body}</p></body></html>`;
+}
+
 function responseHasNoBody(res: Response): boolean {
   const contentLength = res.headers.get('content-length');
   return res.status === 204 || res.status === 205 || (contentLength != null && Number(contentLength) === 0);
@@ -249,9 +271,13 @@ export function createBroker(opts: BrokerOptions): http.Server {
   const inflight = new Map<string, Promise<string | null>>();
 
   // #54 lifecycle: consent + session stores for offboarding (purge pending consent + thread grants so
-  // neither can resurrect access after a user is removed). Cheap Db wrappers; construct once.
+  // neither can resurrect access after a user is removed). #52 OAuth connect flow (mounted only when
+  // baseUrl is set) reuses the same Consent: it owns the single-use state + PKCE; handleOAuthCallback
+  // owns the code exchange — the broker adds no crypto/state logic itself. Cheap Db wrappers.
   const consent = new Consent(opts.db);
   const sessions = new SessionGrants(opts.db);
+  const callbackPath = opts.callbackPath ?? '/oauth/callback';
+  const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
 
   /** Perimeter check on /v1/* BEFORE identity. Prefers a pluggable `authorize` hook (e.g. serviceauth),
    *  else the static `brokerToken` bearer, else no gate. NOT identity — that's the signed token. */
@@ -531,6 +557,46 @@ export function createBroker(opts: BrokerOptions): http.Server {
     return { ok: true };
   }
 
+  /**
+   * #52 `POST /v1/connect` — mint an OAuth authorize URL for the VERIFIED user. State is bound to the
+   * identity in the signed token (never the body), so a forged body can't mint consent for someone
+   * else. The broker handles no raw token here; the token is only ever written to the vault inside the
+   * callback below. Refuses service tools (no human cred) and key providers (no OAuth handshake).
+   */
+  async function handleConnect(body: { handle?: { provider?: unknown }; identityToken: string }): Promise<Record<string, unknown>> {
+    if (!redirectUri) throw new HttpError(404, { error: 'oauth connect is not configured' });
+    const providerId = body.handle?.provider;
+    if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
+    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    const provider = registry.get(providerId);
+    if (provider.identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    if (provider.credential === 'key') throw new HttpError(400, { error: 'provider has no OAuth flow; supply a key instead' });
+    const claims = await verify(body.identityToken);
+    // Carry the signed enterpriseId so the resulting connection is discoverable by an enterprise
+    // offboard (Grid/SCIM) — else a headless-OAuth connection would be pinned to enterpriseId:null.
+    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    // Consent.begin persists the single-use state + PKCE verifier and returns the provider authorize URL.
+    return await consent.begin(identity, provider, redirectUri, claims.channel);
+  }
+
+  /**
+   * #52 `GET <callbackPath>` — the OAuth redirect target a human's browser lands on. Thin wrapper over
+   * the shared `handleOAuthCallback` (consume single-use state, exchange code, vault the token, audit),
+   * returning a minimal HTML page rather than JSON. All interpolated values are escaped (the `error`
+   * and `account` fields are attacker/provider-influenced → reflected-XSS guard).
+   */
+  async function handleCallback(url: URL): Promise<{ status: number; html: string }> {
+    const q = url.searchParams;
+    const result = await handleOAuthCallback(
+      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink },
+      q.get('code') ?? undefined,
+      q.get('state') ?? undefined,
+      q.get('error') ?? undefined,
+    );
+    if (result.ok) return { status: 200, html: landingHtml(`✅ ${escapeHtml(result.provider)} connected${result.account ? ` as ${escapeHtml(result.account)}` : ''}`, 'You can close this tab and return to your app.') };
+    return { status: result.status, html: landingHtml('Connection failed', escapeHtml(result.error)) };
+  }
+
   async function handleHealthz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     let dbReachable = false;
     try {
@@ -555,6 +621,18 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'GET' && (url === '/healthz' || url === '/health')) {
           const r = await handleHealthz();
           return send(r.status, r.payload);
+        }
+        // #52 OAuth redirect target — a human's browser lands here, so it returns HTML (not JSON) and
+        // has NO perimeter gate (the provider redirects the user's browser, which carries no bearer).
+        // Only mounted when baseUrl is configured. Match on the pathname (a callback carries a query).
+        if (req.method === 'GET' && redirectUri && new URL(url, 'http://localhost').pathname === callbackPath) {
+          const r = await handleCallback(new URL(url, 'http://localhost'));
+          res.writeHead(r.status, { 'content-type': 'text/html; charset=utf-8' });
+          return res.end(r.html);
+        }
+        if (req.method === 'POST' && url === '/v1/connect') {
+          await perimeter(req);
+          return send(200, await handleConnect(await readJson(req)));
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           await perimeter(req);
