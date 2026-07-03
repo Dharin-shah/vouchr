@@ -93,10 +93,27 @@ Vouchr has one security boundary and multiple ways to reach it:
 - **Local sidecar** when a Python, Go, Rust, or MCP runtime wants a tiny localhost contract. See
   [`examples/sidecar`](./examples/sidecar).
 
-Headless is the credential **use path**, not a replacement for Slack consent. Users still connect or
-approve access through the Slack app first. The production HTTP broker is user-owned today; shared
-channel credentials stay in the Bolt path until channel eligibility and membership checks have a
-transport-agnostic gate.
+Headless is primarily the credential **use path**, not a replacement for Slack consent. Users still
+connect or approve access through the Slack app first (or through the headless OAuth flow when it is
+mounted).
+
+**One core, two front doors — but not full parity.** Both doors reach the same credential boundary,
+but *configuration* of channel governance lives only in the Bolt path today. Don't assume the headless
+broker can do everything the slash command can:
+
+| Capability | Bolt (`/vouchr`) | Headless broker |
+| --- | --- | --- |
+| Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
+| Use a `shared` / `union` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
+| Set the channel mode (`shared`/`union`/`per-user`/`session`) | ✅ `/vouchr mode` | ❌ no route |
+| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ❌ no route |
+| Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
+| Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
+
+The headless broker is deliberately **reference-only** for credential ingest: `/v1/admin/reference`
+and `/v1/user/reference` accept secret-manager references (e.g. an AWS Secrets Manager ARN), never a
+raw key over the wire. Setting channel mode and the tool allowlist stay Bolt-only; the headless broker
+only *reads* the modes a Slack admin configured.
 
 ## Credential Modes
 
@@ -194,10 +211,21 @@ Call the pieces yourself instead:
 ```ts
 app.use(vouchr.middleware);
 vouchr.mountRoutes(receiver.router);   // /vouchr/oauth/callback
-vouchr.registerCommands(app);          // /vouchr status | disconnect | configure | mode
+vouchr.registerCommands(app);          // /vouchr status | disconnect | configure | mode | tools | enable | disable
 vouchr.registerOffboarding(app);       // revoke a user's connections when Slack deactivates them
 setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 ```
+
+The full `/vouchr` slash command surface:
+
+| Subcommand | What it does |
+| --- | --- |
+| `status` | List your connected accounts (the default when no subcommand is given). |
+| `disconnect <provider>` | Revoke your own connection for a provider. |
+| `configure <provider>` | Admin: open a private modal to set the channel's shared credential (raw key or secret-manager reference). |
+| `mode <provider> <shared\|per-user\|session\|union>` | Admin: set the channel's credential mode for a provider. |
+| `tools` | List this channel's tool manifest: which providers an agent may use here and their mode. |
+| `enable <provider>` / `disable <provider>` | Admin: toggle a provider in this channel's tool allowlist — a per-channel governance gate `connect()` enforces. |
 
 Vouchr uses **your agent's Slack app**, not a separate Vouchr app. Enable these on that Slack app:
 

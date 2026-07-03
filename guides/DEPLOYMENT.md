@@ -306,6 +306,14 @@ writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the p
   (`VOUCHR_BASE_URL`, #52) and drive users through `POST /v1/connect` → callback directly, **or** run
   the Bolt control-plane Vouchr against the **same Postgres database** so users connect in Slack and
   the headless broker reads what they consented to. One store, two front doors.
+
+  > ⚠️ **Two doors → two OAuth redirect URIs.** The two front doors default to **different** callback
+  > paths: the Bolt adapter defaults to `/vouchr/oauth/callback`, the standalone broker defaults to
+  > `/oauth/callback`. If BOTH mount the OAuth flow against the same shared DB, the same provider OAuth
+  > app must register **both** redirect URIs (`$PUBLIC_URL/vouchr/oauth/callback` **and**
+  > `$VOUCHR_BASE_URL/oauth/callback`), or a connect started on one door will fail its redirect. To
+  > avoid the mismatch, either drive consent through only one door, or align them explicitly
+  > (`callbackPath` on `createVouchr`, `VOUCHR_CALLBACK_PATH` on the broker) and register the one path.
 - **Per-user *referenced* credentials** (a user's own key for a non-OAuth provider): the user points
   their credential at an external secret-manager reference with `POST /v1/user/reference` (#58) —
   body `{ handle: { provider }, identityToken, source, secretRef, scopes? }`. Self-service (identity
@@ -406,7 +414,10 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
 - **Bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `users:read`.
 - **Events:** `app_mention`, `user_change` (the latter drives auto-revoke on deactivation).
 - **Interactivity:** enabled, and **required** for the Connect button and the key/configure modals.
-- **Slash command:** `/vouchr` (status | disconnect | configure).
+- **Slash command:** `/vouchr` — full surface: `status` (default), `disconnect <provider>`,
+  `configure <provider>` (admin channel-credential modal), `mode <provider> <shared|per-user|session|union>`
+  (admin), `tools` (list the channel's tool manifest), and `enable <provider>` / `disable <provider>`
+  (admin: the per-channel tool allowlist `connect()` enforces).
 
 Wire the four hooks (see the README example):
 
