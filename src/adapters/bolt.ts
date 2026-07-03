@@ -10,6 +10,7 @@ import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
+import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
 import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
@@ -208,34 +209,41 @@ export class ConnectContext {
       : null;
     if (mode === 'shared') return this.connectChannel(providerId);
 
-    if (!this.policy.check(providerId, this.channel)) {
+    // Authorization (Policy + per-channel tool allowlist) — the CHECK is the shared core decision; the
+    // Bolt path keeps its own audit/error mapping (and, unlike the broker, does NOT emit policy_denied on
+    // a tool-disabled deny — preserved deliberately).
+    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+    if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
       throw new Error(`Policy denies "${providerId}" in this channel.`);
     }
-
-    // Channel tool manifest: refuse a provider not enabled for this channel (backward-compat rule
-    // in ChannelTools, an unconfigured channel allows all). A null channel keeps current behavior.
-    if (this.channel && this.channelTools &&
-        !(await this.channelTools.isEnabled(this.identity.teamId, this.channel, providerId))) {
+    if (denial === 'tool-disabled') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
       throw new Error(`"${providerId}" is not enabled in this channel.`);
     }
 
-    // Thread-scoped session: when the channel sets this provider to 'session', the user's token is
-    // usable only inside the Slack thread they approved it in. No grant → post an in-thread approval
-    // button and stop the turn. Checked before the stored-connection shortcut, so being connected
-    // once still needs per-thread approval.
+    // Thread-scoped session: when the channel sets this provider to 'session', the user's token is usable
+    // only inside the Slack thread they approved it in. The fail-closed rule lives in resolveCredentialOwner
+    // (shared with the broker so the two can't drift); this branch maps the signal to Slack's surface — an
+    // in-thread approval button, or the off-thread refusal. Checked before the stored-connection shortcut,
+    // so being connected once still needs per-thread approval.
     if (mode === 'session') {
-      if (!this.channel || !this.thread) {
-        await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'no-thread' });
-        throw new Error(`"${providerId}" needs a thread-scoped session; ask me inside a thread.`);
-      }
-      if (!this.sessions || !(await this.sessions.isGranted(this.identity, this.channel, this.thread, providerId))) {
-        await this.postSessionApprovalPrompt(providerId, this.thread);
+      const hasSessionGrant = !!(this.channel && this.thread && this.sessions &&
+        (await this.sessions.isGranted(this.identity, this.channel, this.thread, providerId)));
+      const r = resolveCredentialOwner({
+        path: 'user', mode, principal: this.identity, channel: this.channel, thread: this.thread, hasSessionGrant,
+      });
+      if (r.status === 'needs_session') {
+        if (r.reason === 'no-thread') {
+          await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'no-thread' });
+          throw new Error(`"${providerId}" needs a thread-scoped session; ask me inside a thread.`);
+        }
+        await this.postSessionApprovalPrompt(providerId, this.thread!);
         await this.audit.record('session', this.identity, providerId, { channel: this.channel, thread: this.thread, event: 'prompt' });
         throw new SessionApprovalRequiredError(providerId);
       }
+      // resolved → fall through to the stored-credential / consent tail below (as before).
     }
 
     // 'union' (any connected member): resolve to WHICHEVER channel member has connected this provider
@@ -256,11 +264,16 @@ export class ConnectContext {
         await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'not-member' });
         throw new Error(`You must be a member of this channel to use a shared "${providerId}" connection.`);
       }
+      // The mode→owner mapping (union → the member's user-owned cred, audited as that member) is the shared
+      // core decision. Eligibility already re-checked above; a resolved member yields its owner + actor.
       const member = await this.resolveUnionMember(providerId);
       if (member) {
-        return new ConnectionHandle(
-          provider, userOwner(member), member, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-        );
+        const r = resolveCredentialOwner({ path: 'channel', mode, principal: this.identity, channel: this.channel, eligible: true, actingMember: member });
+        if (r.status === 'resolved') {
+          return new ConnectionHandle(
+            provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+          );
+        }
       }
     }
 
@@ -449,14 +462,15 @@ export class ConnectContext {
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
     const provider = this.brokerable(providerId);
     const { cfg, owner, channel } = this.channelTarget(providerId);
-    // Same provider/channel policy gate as connect(): a deny applies to shared channel creds too.
-    if (!this.policy.check(providerId, this.channel)) {
+    // Same authorization gate as connect() (the shared core CHECK): a deny applies to shared channel
+    // creds too. Audit meta carries owner:'channel' here; like connect(), no policy_denied on tool-disabled.
+    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+    if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
       this.emit({ type: 'policy_denied', provider: providerId });
       throw new Error(`Policy denies "${providerId}" in this channel.`);
     }
-    // Same tool-manifest gate as connect(): a disabled provider is unusable here, shared cred or not.
-    if (this.channelTools && !(await this.channelTools.isEnabled(owner.teamId, channel, providerId))) {
+    if (denial === 'tool-disabled') {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'tool-disabled' });
       throw new Error(`"${providerId}" is not enabled in this channel.`);
     }
@@ -477,7 +491,12 @@ export class ConnectContext {
     // This is one conversations.info per use; cache the class with a short TTL if a hot channel
     // throttles. Correctness first: a channel turned Slack Connect must stop now.
     await this.assertChannelEligible();
-    return new ConnectionHandle(provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink);
+    // Shared-owner mapping through the same core decision, so this direct shared-cred path can't drift
+    // from the broker's. Eligibility is verified live above and mode is asserted 'shared', so eligible:true
+    // and the helper always resolves (to channelOwner(teamId, channel) + this.identity — today's values).
+    const r = resolveCredentialOwner({ path: 'channel', mode: 'shared', principal: this.identity, channel, eligible: true });
+    if (r.status !== 'resolved') throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
+    return new ConnectionHandle(provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink);
   }
 
   /**
