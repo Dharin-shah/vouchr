@@ -18,8 +18,30 @@ const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const O1 = userOwner(ID);
 
-// ---- tiny PRNG helpers (Math.random is fine for tests) ----
-const rint = (n: number) => Math.floor(Math.random() * n);
+// ---- seeded PRNG so a CI failure is reproducible (#127) ----
+// Seed from VOUCHR_TEST_SEED (set it to replay a failing run byte-for-byte) or a fresh random seed,
+// logged below. Date.now() as the default seed is fine here — this is test code, not a workflow script.
+function mulberry32(seed: number): () => number {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6d2b79f5) | 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const SEED = Number(process.env.VOUCHR_TEST_SEED ?? (Date.now() >>> 0)) >>> 0;
+// eslint-disable-next-line no-console
+console.log(`property-test seed: ${SEED} (replay with VOUCHR_TEST_SEED=${SEED})`);
+const rnd = mulberry32(SEED);
+
+// Iteration multiplier: default 1× (per-push latency); the nightly fuzz job sets VOUCHR_TEST_ITERS
+// high to explore the deep tail (#127). Applied to every per-property loop count.
+const ITERS = Math.max(1, Number(process.env.VOUCHR_TEST_ITERS ?? 1) || 1);
+const scale = (n: number) => n * ITERS;
+
+// ---- tiny PRNG helpers (seeded via `rnd` above) ----
+const rint = (n: number) => Math.floor(rnd() * n);
 const pick = <T>(a: readonly T[]): T => a[rint(a.length)];
 const ALNUM = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 const B64 = ALNUM + '_-+/=';
@@ -68,7 +90,7 @@ test('property: random non-allowlisted hosts are ALWAYS denied, secret never rea
   globalThis.fetch = (async () => { fetched = true; return new Response('{}', { status: 200 }); }) as any;
   try {
     const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
-    const N = 300;
+    const N = scale(300);
     for (let i = 0; i < N; i++) {
       // random hostname, never the allowlisted one
       const host = `${randStr(1 + rint(8), 'abcdefghijklmnopqrstuvwxyz')}.${pick(['example', 'evil', 'test', 'internal'])}`;
@@ -93,7 +115,7 @@ test('property: allowlisted host + non-https (non-loopback) is ALWAYS denied, se
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
     const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
-    const N = 200;
+    const N = scale(200);
     for (let i = 0; i < N; i++) {
       const scheme = pick(['http', 'ftp', 'ws', 'gopher']);
       reset();
@@ -116,7 +138,7 @@ test('property: only matching path+method pass; mismatches denied with secret un
     const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
     const paths = ['/repos/x', '/repos/', '/repos', '/user', '/user/abc', '/userish', '/secrets', '/other', '/'];
     const methods = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'get', 'post'];
-    const N = 400;
+    const N = scale(400);
     for (let i = 0; i < N; i++) {
       const path = pick(paths);
       const method = pick(methods);
@@ -174,12 +196,12 @@ test('property: token-shaped values are redacted, benign values pass through unc
   const readBack = async (provider: string) =>
     JSON.parse((await db.get('SELECT meta FROM audit WHERE provider=?', [provider]) as any).meta);
 
-  const N = 250;
+  const N = scale(250);
   for (let i = 0; i < N; i++) {
     const sec = secretValue();
     const ben = benignValue();
     const smallInt = rint(1000);
-    const bool = Math.random() < 0.5;
+    const bool = rnd() < 0.5;
     const provider = `p${i}`;
     await audit.record('config', ID, provider, { sec, ben, n: smallInt, b: bool });
     const m = await readBack(provider);
@@ -195,15 +217,15 @@ test('property: token-shaped values are redacted, benign values pass through unc
 // =====================================================================================
 test('property: policy check() never throws and honors its invariants', async () => {
   const pool = ['C1', 'C2', 'C3', 'C4', 'C5'];
-  const subset = () => pool.filter(() => Math.random() < 0.4);
-  const N = 500;
+  const subset = () => pool.filter(() => rnd() < 0.4);
+  const N = scale(500);
   for (let i = 0; i < N; i++) {
-    const defaultDeny = Math.random() < 0.5;
-    const defaultAllow = Math.random() < 0.5;
+    const defaultDeny = rnd() < 0.5;
+    const defaultAllow = rnd() < 0.5;
     const allowChannels = subset();
     const denyChannels = subset();
     const rule: PolicyRule = { defaultAllow, allowChannels, denyChannels };
-    const channel = Math.random() < 0.8 ? pick(pool) : null;
+    const channel = rnd() < 0.8 ? pick(pool) : null;
 
     const ruled = new Policy({ prov: rule }, { defaultDeny });
     const empty = new Policy({}, { defaultDeny });
@@ -247,10 +269,10 @@ const consentProvider = defineProvider({
 test('property: consume() is single-use; unknown states return null', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const consent = new Consent(db);
-  const N = 200;
+  const N = scale(200);
   for (let i = 0; i < N; i++) {
     const ident: SlackIdentity = { enterpriseId: null, teamId: `T${rint(5)}`, userId: `U${rint(1000)}` };
-    const channel = Math.random() < 0.5 ? `C${randStr(6)}` : null;
+    const channel = rnd() < 0.5 ? `C${randStr(6)}` : null;
     const { state } = await consent.begin(ident, consentProvider, 'https://app/cb', channel);
 
     const first = await consent.consume(state);
@@ -272,7 +294,7 @@ test('property: consume() is single-use; unknown states return null', async () =
 test('property: rows older than the TTL are treated as expired (null)', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const consent = new Consent(db);
-  const N = 100;
+  const N = scale(100);
   for (let i = 0; i < N; i++) {
     const state = `stale-${randStr(24)}`;
     // Insert a row directly with a created_at older than the TTL (can't control the clock otherwise).
@@ -295,10 +317,10 @@ test('property: authorize URL always carries the required params; code_challenge
   const redirectUri = 'https://app.example/oauth/callback';
 
   const builtins = [github, google, gitlab, notion];
-  const N = 250;
+  const N = scale(250);
   for (let i = 0; i < N; i++) {
     let provider: Provider;
-    if (Math.random() < 0.5) {
+    if (rnd() < 0.5) {
       // a built-in with random scopes + injected client creds
       const scopes = Array.from({ length: rint(4) }, () => randStr(4 + rint(6)));
       provider = pick(builtins)({ clientId: `cid-${randStr(6)}`, clientSecret: 'sec', scopes });
@@ -311,7 +333,7 @@ test('property: authorize URL always carries the required params; code_challenge
         scopesDefault: Array.from({ length: rint(4) }, () => randStr(4 + rint(6))),
         egressAllow: ['idp.example'],
         refresh: 'none',
-        pkce: Math.random() < 0.5,
+        pkce: rnd() < 0.5,
         clientId: `cid-${randStr(6)}`,
         clientSecret: 'sec',
       });

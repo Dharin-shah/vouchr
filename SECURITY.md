@@ -60,6 +60,10 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
 - **Audit metadata is caller-supplied.** Vouchr's own code keeps secrets out of `audit.meta`
   (and tests enforce it), but a custom provider/`accountProbe` or caller could put sensitive data
   in metadata. Don't.
+- **Audit completeness is best-effort, not guaranteed.** Audit writes on the injection path are
+  swallowed on failure so a bookkeeping error can't fail or roll back a provider call that already
+  executed; wire an `EventSink` (the `injected` event is a redundant independent signal) as a durable
+  backstop. See the [threat model](./guides/THREAT-MODEL.md#audit-completeness-is-best-effort-by-design).
 - **The SQLite file is not wholly encrypted at rest.** Token columns are encrypted; the rest of the
   row and the file are not. Use disk/database encryption and access control at the infra layer
   (envelope encryption via an `EnvelopeProvider` raises the bar on the token columns).
