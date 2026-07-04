@@ -54,10 +54,11 @@ invented. Every label is an already-no-secret field copied straight off the even
 Prometheus dies on unbounded label cardinality. This mapping is safe because every label is a
 small, closed set:
 
-- **`host`** is only ever an **allowlisted** host. The egress allowlist is checked *before* any
-  event fires, so a non-allowlisted target is rejected (`egress_denied` with the requested host as
-  the label) and never becomes a per-request `injected` series. The set of hosts is your provider
-  config, not caller-controlled input.
+- **`host`** is labelled only on `injected` and `egress_error`, where it is always an **allowlisted**
+  host: the egress allowlist is checked *before* those events fire, so the set of hosts is your
+  provider config, not caller-controlled input. `egress_denied` deliberately does **not** carry a
+  `host` label — a denied target is by definition *not* allowlisted, so the requested host is
+  caller/model-controlled and unbounded. Alert on its `reason` label instead.
 - **`provider`**, **`reason`** (`host`/`method`/`path`/`validator` for denials; static strings like
   `fetch_failed`/`refresh_failed` for errors), **`owner_kind`** (`user`/`channel`), and **`ok`**
   (`true`/`false`) are all fixed enums.

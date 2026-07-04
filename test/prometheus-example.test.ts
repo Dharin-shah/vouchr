@@ -32,7 +32,9 @@ test('prometheus example: metricsSink renders the expected counters and histogra
   assert.match(text, /^vouchr_refreshed_total\{provider="github"\} 1$/m);
   assert.match(text, /^vouchr_refresh_reused_total\{provider="github"\} 1$/m);
   assert.match(text, /^vouchr_kms_decrypt_total\{provider="github"\} 2$/m); // incremented by count
-  assert.match(text, /^vouchr_egress_denied_total\{provider="github",host="evil\.example\.com",reason="host"\} 1$/m);
+  // The caller-controlled evil host from the input event must NOT appear as a label (unbounded).
+  assert.match(text, /^vouchr_egress_denied_total\{provider="github",reason="host"\} 1$/m);
+  assert.doesNotMatch(text, /evil\.example\.com/);
   assert.match(text, /^vouchr_egress_error_total\{provider="github",host="api\.github\.com",reason="fetch_failed"\} 1$/m);
   assert.match(text, /^vouchr_resolver_failed_total\{provider="aws",source="aws-sm"\} 1$/m);
   assert.match(text, /^vouchr_connect_prompted_total\{provider="github"\} 1$/m);

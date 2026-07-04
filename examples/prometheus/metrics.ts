@@ -99,7 +99,10 @@ export function metricsSink(): Metrics {
         inc('vouchr_kms_decrypt_total', { provider: e.provider }, e.count);
         break;
       case 'egress_denied':
-        inc('vouchr_egress_denied_total', { provider: e.provider, host: e.host, reason: e.reason });
+        // No `host` label: a denied target is by definition NOT allowlisted, so the requested host
+        // is caller/model-controlled and unbounded — it would blow up Prometheus cardinality. The
+        // `reason` label (host/method/path/validator) is the bounded signal you actually alert on.
+        inc('vouchr_egress_denied_total', { provider: e.provider, reason: e.reason });
         break;
       case 'egress_error':
         inc('vouchr_egress_error_total', { provider: e.provider, host: e.host, reason: e.reason });
