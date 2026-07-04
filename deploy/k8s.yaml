@@ -40,14 +40,15 @@ spec:
             # image (see Dockerfile) together. Vouchr does not enforce this — the host decides.
             # - { name: VOUCHR_KMS_KEY_ID, value: "<kms-key-arn>" }
             # - { name: VOUCHR_PROVIDERS_FILE, value: "/etc/vouchr/providers.json" }
-          # Readiness hits /healthz (checks the DB) so a pod drains from the Service when Postgres is
-          # unreachable. Liveness is process-only (TCP) — a DB blip must NOT restart the whole fleet.
+          # Readiness hits /readyz (a SELECT 1 round-trip) so a pod drains from the Service when
+          # Postgres is unreachable. Liveness hits /healthz (a bare process-serving check, no DB) — a
+          # DB blip must NOT restart the whole fleet.
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            tcpSocket: { port: http }
+            httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 10
             periodSeconds: 20
           securityContext:

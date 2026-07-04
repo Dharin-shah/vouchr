@@ -3,8 +3,9 @@
  * broker-server: the standalone headless Vouchr broker (no Slack, no Bolt).
  *
  * Reads config from env, wires the same core (openDb → Vault → Audit → createBroker) the Bolt path
- * uses, and serves /v1/fetch, /v1/resolve, /healthz. Postgres + KMS + a shared jti ReplayStore make
- * it multi-replica safe; see DEPLOYMENT.md. Run: `node dist/bin/broker-server.js`.
+ * uses, and serves /v1/fetch, /v1/resolve, and the /healthz + /readyz probes. Postgres + KMS + the
+ * default shared jti store (DbReplayStore) make it multi-replica safe; see DEPLOYMENT.md.
+ * Run: `node dist/bin/broker-server.js`.
  */
 import http from 'node:http';
 import { openDb, type Db } from '../src/core/db';
@@ -12,7 +13,6 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
 import { ChannelConfig } from '../src/core/channelConfig';
-import { DbReplayStore } from '../src/adapters/http/replayStore';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
@@ -97,9 +97,8 @@ export async function buildBrokerServer(
   const db = await openDb(backend === 'postgres' ? { databaseUrl: url } : { dbPath: env.VOUCHR_DB });
   const vault = new Vault(db, masterKey, ttl, envelope);
   const audit = new Audit(db);
-  // Multi-replica safety: a shared durable jti store on Postgres. SQLite is single-replica, so the
-  // broker's default in-memory guard is sufficient there.
-  const replayStore = backend === 'postgres' ? new DbReplayStore(db) : undefined;
+  // Multi-replica safety is now the createBroker default: with a db configured it uses DbReplayStore
+  // (shared jti table), so a scaled fleet gets cluster-wide single-use with no wiring here. #100.
 
   // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
   // default (user-only broker). The caller supplies eligibility/union facts as signed claims; the
@@ -115,7 +114,6 @@ export async function buildBrokerServer(
     identitySecret,
     allowWrites,
     brokerToken,
-    replayStore,
     channelConfig,
     baseUrl,
     callbackPath,
