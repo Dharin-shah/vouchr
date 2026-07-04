@@ -61,16 +61,16 @@
   },
   "dependencies": {
     "@slack/bolt": "^3.22.0",
-    "@slack/web-api": "^6.12.0",
-    "better-sqlite3": "^11.0.0",
+    "@slack/web-api": "^7.18.0",
+    "better-sqlite3": "^12.11.1",
     "pg": "^8.22.0"
   },
   "devDependencies": {
     "@aws-sdk/client-secrets-manager": "^3.1075.0",
     "@types/better-sqlite3": "^7.6.0",
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.1.0",
     "@types/pg": "^8.20.0",
     "tsx": "^4.0.0",
-    "typescript": "^5.5.0"
+    "typescript": "^6.0.3"
   }
 }

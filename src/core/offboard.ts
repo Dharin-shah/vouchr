@@ -98,10 +98,11 @@ export async function offboardUser(
  * uses the FULL owner key
  * (team_id + 'user' + userId), so the cross-team sweep can never reach beyond this user's own rows.
  *
- * In Enterprise Grid the Slack userId is unique org-wide, so `userId` alone is a complete span key;
- * `enterpriseId`, when given, additionally narrows discovery to that org's rows. (Caveat: vault
- * writes currently persist connection.enterprise_id as NULL (see Vault.upsert) so passing
- * enterpriseId under-matches *connections* today; consent rows do store it. Prefer userId-only.)
+ * In Enterprise Grid the Slack userId is unique org-wide, so `userId` alone is a complete span key.
+ * `enterpriseId`, when passed, further narrows connection/consent discovery to that org's rows.
+ * Prefer userId-only: Vault.upsert persists `enterprise_id` only when the owner carries one
+ * (`owner.enterpriseId ?? null`), so rows written outside Grid store NULL — passing enterpriseId
+ * adds an `enterprise_id=?` predicate that under-matches those NULL rows. userId-only spans them all.
  *
  * Best-effort and non-fatal per team: one workspace's DB/revoke failure never blocks the others.
  * Returns what was removed per team. Never logs or returns secrets.

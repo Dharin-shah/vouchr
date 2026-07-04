@@ -345,9 +345,16 @@ scoped to the signed channel. What stays Bolt-only is ingesting a **raw** key/se
 broker takes secret-manager **references** (`/v1/admin/reference`, `/v1/user/reference`) but never a
 raw key over the wire.
 
-Keep `identitySecret` with the Slack verifier and broker, not arbitrary workers. For multi-instance
-brokers, pass a shared `replayStore`; the default replay guard is process-local. If the user has not
-connected yet, route them back through the Slack connect/approval flow.
+Keep `identitySecret` with the Slack verifier and broker, not arbitrary workers. Shared replay
+protection is automatic when you use a shared database — every db-configured broker defaults to a
+durable `DbReplayStore`, so a `jti` spent on one pod is rejected on the others; you may still pass a
+custom `replayStore`. If the user has not connected yet, route them back through the Slack
+connect/approval flow.
+
+The broker also serves two unauthenticated probes for orchestrators: `GET /healthz` (liveness — a bare
+`{"ok":true}` whenever the process is serving, no db touched) and `GET /readyz` (readiness — `{"ok":true}`
+only if a `SELECT 1` round-trip succeeds within ~2s, else `503 {"ok":false}`). Both are exempt from auth,
+identity, and replay, and return a bare status with no secrets or error text.
 
 ## Production Notes
 
