@@ -37,3 +37,17 @@ jobs:
       # (e.g. the headless @slack-free module-graph check), and an emit/declaration break fails fast here.
       - run: npm run build
       - run: npm test
+
+  # Exercises the PUBLISHED artifact (pack → install into a fresh project → resolve every
+  # entrypoint/bin/type). Separate job: a packaging break is distinct from a test failure, and it
+  # needs no Postgres. ~30s.
+  pack-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run pack-smoke
