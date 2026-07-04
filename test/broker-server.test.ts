@@ -82,7 +82,7 @@ function baseEnv(extra: Record<string, string> = {}): any {
   };
 }
 
-test('buildBrokerServer: boots on SQLite and serves /healthz + /health', async () => {
+test('buildBrokerServer: boots on SQLite and serves /healthz + /health + /readyz', async () => {
   const built = await buildBrokerServer(baseEnv({ VOUCHR_PORT: '0' }));
   await new Promise<void>((r) => built.server.listen(0, r));
   const port = (built.server.address() as any).port;
@@ -91,6 +91,7 @@ test('buildBrokerServer: boots on SQLite and serves /healthz + /health', async (
     assert.deepEqual(built.providerIds, ['internal']);
     assert.equal(await get(port, '/healthz'), 200);
     assert.equal(await get(port, '/health'), 200);
+    assert.equal(await get(port, '/readyz'), 200); // readiness passes over the live sqlite db
   } finally {
     built.server.close();
     await built.db.close();

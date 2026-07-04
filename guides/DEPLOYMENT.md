@@ -146,7 +146,8 @@ per-user consent end-to-end, so a headless host needs **no Slack app** to onboar
 
 Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
 `POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `POST /v1/status`,
-`POST /v1/user/reference`, `GET /v1/manifest`, `GET /healthz` (alias `/health`), and — when channel
+`POST /v1/user/reference`, `GET /v1/manifest`, `GET /healthz` (liveness, alias `/health`),
+`GET /readyz` (readiness), and — when channel
 modes are enabled — `POST /v1/admin/reference`, on `VOUCHR_PORT` (default 3000), and runs the TTL
 sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it additionally serves
 `POST /v1/connect` and the OAuth callback (below).
@@ -344,10 +345,12 @@ package root.
 
 ### Replay (multi-replica)
 
-A signed `jti` must be single-use across the fleet. On Postgres the broker installs a shared
-`DbReplayStore` (`INSERT … ON CONFLICT DO NOTHING` on a `broker_jti` table) automatically, so a token
-replayed against a different pod is rejected. This is why `replicas > 1` is safe on Postgres and
-**not** on SQLite (the in-memory guard is per-process — run a single replica there).
+A signed `jti` must be single-use across the fleet. Shared replay protection is automatic when you use
+a shared database: every db-configured broker defaults to a durable `DbReplayStore`
+(`INSERT … ON CONFLICT DO NOTHING` on a `broker_jti` table), so a token replayed against a different
+pod is rejected. You may still pass a custom `replayStore` (e.g. Redis `SET jti 1 NX PX=<ttl>`). This is
+why `replicas > 1` is safe on Postgres — one shared table backs the whole fleet. SQLite is
+single-replica infrastructure, so run a single replica there regardless.
 
 ### Perimeter auth
 
@@ -388,10 +391,26 @@ Vouchr ships two ways; pick by how your platform builds:
 
 A [`Dockerfile`](../Dockerfile) (ARG base images so you can pin an internal mirror, `npm ci` build,
 non-root, `HEALTHCHECK` on `/healthz`) and a reference [`deploy/k8s.yaml`](../deploy/k8s.yaml)
-(multi-replica, readiness on `/healthz`, process-only TCP liveness, `envFrom` a synced Secret,
+(multi-replica, readiness on `/readyz`, liveness on `/healthz`, `envFrom` a synced Secret,
 commented ServiceAccount for IRSA) ship in the repo. Both are shapes to adapt — no registry or IAM
 ARN is hardcoded. For KMS, add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount;
 the SDK default credential chain does the rest.
+
+Health probes: `GET /healthz` is liveness (a bare `{"ok":true}` while the process serves, no DB call —
+a DB blip must never restart the fleet); `GET /readyz` is readiness (`{"ok":true}` only if a `SELECT 1`
+round-trip succeeds within ~2s, else `503 {"ok":false}` so the pod drains from the Service). Both are
+unauthenticated, exempt from identity/replay, and return a bare status with no secrets. Wire them as:
+
+```yaml
+readinessProbe:
+  httpGet: { path: /readyz, port: http }
+  initialDelaySeconds: 5
+  periodSeconds: 10
+livenessProbe:
+  httpGet: { path: /healthz, port: http }
+  initialDelaySeconds: 10
+  periodSeconds: 20
+```
 
 **SQLite in a container**: the default `vouchr.db` path is not writable under a
 non-root, read-only-root-filesystem pod. Set `VOUCHR_DB` to a mounted writable volume, or use
@@ -459,6 +478,7 @@ yours. Don't go live until each holds.
 | Envelope encryption considered for token columns (`EnvelopeProvider` + KMS) | Vouchr provides hook; operator opts in |
 | Backups of the credential store (and a restore drill) | operator |
 | Monitoring/alerting on resolver and KMS failures, and on auth/refresh errors | operator |
+| `EventSink` wired to durable metrics/logging (redundant signal for best-effort audit writes — see [SECURITY.md](../SECURITY.md#what-vouchr-does-not-protect-against)) | operator (Vouchr provides the hook) |
 | Multi-instance? Postgres + `DbInstallationStore` wired into Bolt and Vouchr | Vouchr provides; operator wires |
 
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as

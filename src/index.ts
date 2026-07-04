@@ -1,4 +1,4 @@
-export { createVouchr, ConsentRequiredError, SessionApprovalRequiredError, ConnectContext } from './adapters/bolt';
+export { createVouchr, ConsentRequiredError, SessionApprovalRequiredError, UserFacingError, ConnectContext } from './adapters/bolt';
 export type { VouchrOptions } from './adapters/bolt';
 export type { ConnectContextDeps } from './adapters/bolt';
 // Headless HTTP broker (non-Bolt agent runtimes): signed identity + fail-closed read-only egress.

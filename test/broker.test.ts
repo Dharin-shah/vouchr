@@ -493,6 +493,50 @@ test('fetch: a shared replayStore rejects a replay across DIFFERENT broker insta
   }
 });
 
+test('#100 default (no explicit replayStore) shares replay protection across instances on one db', async () => {
+  // Two brokers over ONE shared db and NO explicit replayStore: the #100 default (DbReplayStore on the
+  // shared db) must make a jti single-use CLUSTER-WIDE, so a token spent on A is refused on B.
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const a = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET });
+  const b = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET });
+  await new Promise<void>((r) => a.listen(0, r));
+  await new Promise<void>((r) => b.listen(0, r));
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const tok = signIdentity(claims(), SECRET);
+    const first = await post((a.address() as any).port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: tok, method: 'GET', path: '/x' });
+    assert.equal(first.status, 200);
+    const onOther = await post((b.address() as any).port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: tok, method: 'GET', path: '/x' });
+    assert.equal(onOther.status, 401); // replay refused cluster-wide, with NO explicit store passed
+  } finally {
+    up.restore();
+    a.close();
+    b.close();
+    await db.close();
+  }
+});
+
+test('#100 an explicit replayStore override still wins (its use() is called, the db default is not)', async () => {
+  const calls: string[] = [];
+  const replayStore = { use: (jti: string) => { calls.push(jti); return true; } };
+  const { server, port } = await makeBroker({ replayStore });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const c = claims();
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(c, SECRET), method: 'GET', path: '/x' });
+    assert.equal(r.status, 200);
+    assert.deepEqual(calls, [c.jti]); // the caller's spy store was consulted, not the DbReplayStore default
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('fetch: a service-to-service provider is refused (403), never brokered', async () => {
   const { server, port } = await makeBroker({ providers: [acme, svc] });
   try {
@@ -596,19 +640,50 @@ test('resolve: returns existence + consent state, NEVER the secret', async () =>
   }
 });
 
-// ── /healthz ─────────────────────────────────────────────────────────────────
+// ── #101 /healthz (liveness) + /readyz (readiness) ────────────────────────────
 
-test('healthz: reflects DB reachability + signing key loaded', async () => {
+test('#101 healthz: liveness is a bare 200 {ok:true}, never touches the db', async () => {
   const { server, db, port } = await makeBroker();
   try {
-    const ok = await get(port, '/healthz');
-    assert.equal(ok.status, 200);
-    assert.deepEqual(ok.json, { ok: true, dbReachable: true, signingKeyLoaded: true });
+    const up = await get(port, '/healthz');
+    assert.equal(up.status, 200);
+    assert.deepEqual(up.json, { ok: true }); // bare status only — no db field, no secrets
 
-    await db.close(); // DB now unreachable
-    const down = await get(port, '/healthz');
-    assert.equal(down.status, 503);
-    assert.equal(down.json.dbReachable, false);
+    await db.close(); // liveness must stay green even with the db down (that's readiness' job)
+    const stillUp = await get(port, '/healthz');
+    assert.equal(stillUp.status, 200);
+    assert.deepEqual(stillUp.json, { ok: true });
+  } finally {
+    server.close();
+  }
+});
+
+test('#101 readyz: 200 with a working db, 503 (bare {ok:false}) when the db is unreachable', async () => {
+  const { server, db, port } = await makeBroker();
+  try {
+    const ready = await get(port, '/readyz');
+    assert.equal(ready.status, 200);
+    assert.deepEqual(ready.json, { ok: true });
+
+    await db.close(); // db now unreachable
+    const notReady = await get(port, '/readyz');
+    assert.equal(notReady.status, 503);
+    assert.deepEqual(notReady.json, { ok: false }); // bare status: no error text / connection string
+  } finally {
+    server.close();
+  }
+});
+
+test('#101 probes need no auth and leak no secrets even behind a brokerToken gate', async () => {
+  const { server, port } = await makeBroker({ brokerToken: 'perimeter-secret' });
+  try {
+    const hz = await get(port, '/healthz'); // no Authorization header sent
+    const rz = await get(port, '/readyz');
+    assert.equal(hz.status, 200);
+    assert.equal(rz.status, 200);
+    // The bodies are exactly the minimal JSON — no token, config, or error text.
+    assert.equal(JSON.stringify(hz.json), '{"ok":true}');
+    assert.equal(JSON.stringify(rz.json), '{"ok":true}');
   } finally {
     server.close();
   }
@@ -935,16 +1010,14 @@ test('egress default-deny: unset egressMethods means GET/HEAD-only under the bro
 
 // ── standalone-broker seams (PR1) ─────────────────────────────────────────────
 
-test('health: GET /health is an alias for /healthz', async () => {
+test('health: GET /health is an alias for the /healthz liveness probe', async () => {
   const { server, port } = await makeBroker();
   try {
     const hz = await get(port, '/healthz');
     const h = await get(port, '/health');
     assert.equal(hz.status, 200);
     assert.equal(h.status, 200);
-    assert.equal(h.json.ok, true);
-    assert.equal(h.json.dbReachable, true);
-    assert.equal(h.json.signingKeyLoaded, true);
+    assert.deepEqual(h.json, { ok: true });
   } finally {
     server.close();
   }
