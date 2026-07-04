@@ -459,6 +459,7 @@ yours. Don't go live until each holds.
 | Envelope encryption considered for token columns (`EnvelopeProvider` + KMS) | Vouchr provides hook; operator opts in |
 | Backups of the credential store (and a restore drill) | operator |
 | Monitoring/alerting on resolver and KMS failures, and on auth/refresh errors | operator |
+| `EventSink` wired to durable metrics/logging (redundant signal for best-effort audit writes — see [SECURITY.md](../SECURITY.md#what-vouchr-does-not-protect-against)) | operator (Vouchr provides the hook) |
 | Multi-instance? Postgres + `DbInstallationStore` wired into Bolt and Vouchr | Vouchr provides; operator wires |
 
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as

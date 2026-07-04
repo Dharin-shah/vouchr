@@ -266,6 +266,30 @@ non-goals live in [SECURITY.md -> "What Vouchr does not protect against"](../SEC
 - Disconnect/offboard deletes locally first; upstream revocation is best-effort.
 - Audit metadata is caller-supplied; don't put secrets in it.
 - The SQLite file is not wholly encrypted at rest.
+- Audit completeness is best-effort, not guaranteed (see below).
+
+### Audit completeness is best-effort by design
+
+The authoritative audit table is written on a best-effort basis, never guaranteed-complete.
+Every audit write on the injection path — the successful-injection row and the
+failure/refresh rows — swallows its own error (`.catch(() => undefined)` in
+`injector.ts:fetch`, `egressError`, `doRefresh`).
+
+- **Why.** The audit write happens *after* the provider call has already executed. A
+  provider request is non-idempotent (a `POST` that already fired, a refresh that already
+  rotated a single-use token), so a bookkeeping failure must not roll back or fail the
+  request — the caller could otherwise retry an operation that already took effect. Recording
+  that a call happened must never be able to undo the call.
+- **The failure window.** The audit `INSERT` fails (DB down, disk full, connection dropped)
+  *after* the outbound provider call has already succeeded. The action occurred; the audit
+  row for it is missing. Nothing in the request path detects or retries this.
+- **Mitigations available today.** The `injected` (and `refreshed`) `VouchrEvent` fires on the
+  exact same path and is an **independent, redundant signal** of the same event. Wire an
+  `EventSink` to a durable external metrics/log pipeline so the record survives even when the
+  audit `INSERT` fails; monitor database health; and alert on audit-insert errors surfaced in
+  application logs. See [SECURITY.md -> "Audit completeness is best-effort"](../SECURITY.md)
+  and the deployment production-readiness checklist
+  ([DEPLOYMENT.md](./DEPLOYMENT.md#production-readiness-checklist)).
 
 Operator responsibilities (master key handling, least-privilege resolver IAM, at-rest
 encryption, understanding the workspace-wide admin gate) are likewise enumerated in
