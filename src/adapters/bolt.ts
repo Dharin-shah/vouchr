@@ -11,7 +11,7 @@ import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
-import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
@@ -32,7 +32,7 @@ const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 /** Map an external ref to its resolver source id. Add resolvers → extend this. */
 function refSource(ref: string): string {
   if (/^arn:aws:secretsmanager:/.test(ref)) return 'aws-sm';
-  throw new Error('Unsupported secret reference. Expected an AWS Secrets Manager ARN.');
+  throw new UserFacingError('Unsupported secret reference. Expected an AWS Secrets Manager ARN.');
 }
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
@@ -57,6 +57,42 @@ export class SessionApprovalRequiredError extends Error {
     super(`Session approval required for "${provider}": an approval button was posted in the thread.`);
     this.name = 'SessionApprovalRequiredError';
   }
+}
+
+/**
+ * Marker for a deliberate, Vouchr-authored, secret-free denial/validation message that IS safe to
+ * echo to the Slack user (an admin gate, a channel-eligibility or mode-lock refusal, a bad-input
+ * message). These read identically to a foreign `new Error(...)` — which could carry a provider /
+ * KMS / DB secret — so the throw site opts a message into the whitelist by using THIS class; a bare
+ * Error stays masked to its class name. See safeUserMessage.
+ */
+export class UserFacingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserFacingError';
+  }
+}
+
+/**
+ * The only text safe to echo to a Slack user from a caught error. Mirrors the headless broker's
+ * top-level catch (broker.ts), which returns the error CLASS NAME only: an extension point (a custom
+ * `provider.inject`, KMS `wrapDataKey`, a DB driver) can throw AFTER touching a secret, so a raw
+ * `e.message` could carry a token. We therefore show `e.message` ONLY for Vouchr's OWN error classes
+ * — those are the messages Vouchr deliberately authored to be user-facing and secret-free. Any other
+ * (unexpected) error is reduced to its class name; the type still triages in the logs.
+ */
+export function safeUserMessage(e: unknown): string {
+  if (
+    e instanceof ConsentRequiredError ||
+    e instanceof SessionApprovalRequiredError ||
+    e instanceof EgressBlockedError ||
+    e instanceof NoConnectionError ||
+    e instanceof UserFacingError
+  ) {
+    return e.message;
+  }
+  const name = (e as Error)?.constructor?.name ?? 'Error';
+  return `Something went wrong (${name}). Ask an admin to check the Vouchr logs.`;
 }
 
 export interface VouchrOptions {
@@ -245,7 +281,7 @@ export class ConnectContext {
   private brokerable(providerId: string): Provider {
     const provider = this.registry.get(providerId);
     if (provider.identity === 'service') {
-      throw new Error(
+      throw new UserFacingError(
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
     }
@@ -425,13 +461,13 @@ export class ConnectContext {
         owner: 'channel',
         channel: this.channel,
       });
-      throw new Error(adminOnly(this.allowChannelCreatorConfig, 'configure channel credentials'));
+      throw new UserFacingError(adminOnly(this.allowChannelCreatorConfig, 'configure channel credentials'));
     }
   }
 
   private channelTarget(providerId: string) {
-    if (!this.channelConfig) throw new Error('Channel config store not available.');
-    if (!this.channel) throw new Error('No channel in context. Run this inside a channel.');
+    if (!this.channelConfig) throw new UserFacingError('Channel config store not available.');
+    if (!this.channel) throw new UserFacingError('No channel in context. Run this inside a channel.');
     return { cfg: this.channelConfig, owner: channelOwner(this.identity.teamId, this.channel), channel: this.channel };
   }
 
@@ -452,7 +488,7 @@ export class ConnectContext {
       info = null;
     }
     const reason = channelIneligibleReason(info);
-    if (reason) throw new Error(reason);
+    if (reason) throw new UserFacingError(reason);
   }
 
   /**
@@ -468,7 +504,7 @@ export class ConnectContext {
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
     if (cm != null && cm !== 'shared') {
-      throw new Error(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
+      throw new UserFacingError(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
     }
     await this.vault.upsert(owner, providerId, {
       accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -492,7 +528,7 @@ export class ConnectContext {
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
     if (cm != null && cm !== 'shared') {
-      throw new Error(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
+      throw new UserFacingError(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
     }
     await this.vault.reference(owner, providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
     await cfg.setMode(owner.teamId, channel, providerId, 'shared');
@@ -822,7 +858,7 @@ export async function createVouchr(opts: VouchrOptions) {
         try {
           await contextFor(identity, command.channel_id, client).setChannelMode(arg, arg2);
         } catch (e) {
-          return respond((e as Error).message); // never carries a secret
+          return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
         return respond(`Set *${arg}* to *${arg2}* in <#${command.channel_id}>.`);
       }
@@ -886,8 +922,9 @@ export async function createVouchr(opts: VouchrOptions) {
           else await ctx.setUserSecret(provider, raw);
         }
       } catch (e) {
-        // The error never contains the secret (we never interpolate it); surface it inline.
-        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: (e as Error).message } });
+        // Show only Vouchr's own user-facing messages inline; any unexpected throw (KMS/DB/inject)
+        // could carry the secret, so it's reduced to its class name — never the raw message.
+        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: safeUserMessage(e) } });
       }
       await ack();
       // Private confirmation DM (no secret), just the fact it was set.
