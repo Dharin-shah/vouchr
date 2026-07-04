@@ -1,0 +1,11 @@
+{
+  "status": 200,
+  "shape": {
+    "providers": [
+      {
+        "identity": "string",
+        "provider": "string"
+      }
+    ]
+  }
+}

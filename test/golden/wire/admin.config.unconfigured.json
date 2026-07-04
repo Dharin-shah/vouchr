@@ -1,0 +1,12 @@
+{
+  "status": 200,
+  "shape": {
+    "providers": [
+      {
+        "enabled": "boolean",
+        "mode": "null",
+        "provider": "string"
+      }
+    ]
+  }
+}

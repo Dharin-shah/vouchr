@@ -1,0 +1,12 @@
+{
+  "status": 200,
+  "shape": {
+    "providers": [
+      {
+        "connected": "boolean",
+        "consentState": "string",
+        "provider": "string"
+      }
+    ]
+  }
+}
