@@ -42,8 +42,22 @@ function die(msg: string): never {
   process.exit(1);
 }
 
+const USAGE = `vouchr-seed — provision an operator/shared credential into the vault (no Slack)
+
+Usage: vouchr-seed reference --provider <id> --team <T> (--user <U>|--channel <C>) \\
+                   --source <secret-manager-id> --secret-ref <ref> [--scopes a,b]
+       vouchr-seed key --provider <id> --team <T> (--user <U>|--channel <C>) [--scopes a,b]
+                   (token from VOUCHR_SEED_ACCESS_TOKEN env; --access-token is visible in ps)
+       vouchr-seed --help
+
+Reads DB + key from env: VOUCHR_DATABASE_URL|VOUCHR_DB, VOUCHR_MASTER_KEY. See DEPLOYMENT.md.`;
+
 async function main(): Promise<void> {
   const [mode, ...rest] = process.argv.slice(2);
+  if (mode === '--help' || mode === '-h' || mode === 'help') {
+    console.log(USAGE);
+    return;
+  }
   if (mode !== 'reference' && mode !== 'key') {
     die('usage: broker-seed <reference|key> --provider <id> --team <T> (--user <U>|--channel <C>) ...');
   }
