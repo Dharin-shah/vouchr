@@ -286,8 +286,10 @@ failure/refresh rows — swallows its own error (`.catch(() => undefined)` in
 - **Mitigations available today.** The `injected` (and `refreshed`) `VouchrEvent` fires on the
   exact same path and is an **independent, redundant signal** of the same event. Wire an
   `EventSink` to a durable external metrics/log pipeline so the record survives even when the
-  audit `INSERT` fails; monitor database health; and alert on audit-insert errors surfaced in
-  application logs. See [SECURITY.md -> "Audit completeness is best-effort"](../SECURITY.md)
+  audit `INSERT` fails, and monitor database health. Note the audit-insert failure itself is
+  swallowed (`.catch(() => undefined)`) and is **not** logged today — precisely why the `EventSink`
+  is the signal to rely on, not application logs. See
+  [SECURITY.md -> "Audit completeness is best-effort"](../SECURITY.md)
   and the deployment production-readiness checklist
   ([DEPLOYMENT.md](./DEPLOYMENT.md#production-readiness-checklist)).
 
