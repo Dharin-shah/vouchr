@@ -11,7 +11,7 @@ import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
-import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
@@ -57,6 +57,27 @@ export class SessionApprovalRequiredError extends Error {
     super(`Session approval required for "${provider}": an approval button was posted in the thread.`);
     this.name = 'SessionApprovalRequiredError';
   }
+}
+
+/**
+ * The only text safe to echo to a Slack user from a caught error. Mirrors the headless broker's
+ * top-level catch (broker.ts), which returns the error CLASS NAME only: an extension point (a custom
+ * `provider.inject`, KMS `wrapDataKey`, a DB driver) can throw AFTER touching a secret, so a raw
+ * `e.message` could carry a token. We therefore show `e.message` ONLY for Vouchr's OWN error classes
+ * — those are the messages Vouchr deliberately authored to be user-facing and secret-free. Any other
+ * (unexpected) error is reduced to its class name; the type still triages in the logs.
+ */
+export function safeUserMessage(e: unknown): string {
+  if (
+    e instanceof ConsentRequiredError ||
+    e instanceof SessionApprovalRequiredError ||
+    e instanceof EgressBlockedError ||
+    e instanceof NoConnectionError
+  ) {
+    return e.message;
+  }
+  const name = (e as Error)?.constructor?.name ?? 'Error';
+  return `Something went wrong (${name}). Ask an admin to check the Vouchr logs.`;
 }
 
 export interface VouchrOptions {
@@ -822,7 +843,7 @@ export async function createVouchr(opts: VouchrOptions) {
         try {
           await contextFor(identity, command.channel_id, client).setChannelMode(arg, arg2);
         } catch (e) {
-          return respond((e as Error).message); // never carries a secret
+          return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
         return respond(`Set *${arg}* to *${arg2}* in <#${command.channel_id}>.`);
       }
@@ -886,8 +907,9 @@ export async function createVouchr(opts: VouchrOptions) {
           else await ctx.setUserSecret(provider, raw);
         }
       } catch (e) {
-        // The error never contains the secret (we never interpolate it); surface it inline.
-        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: (e as Error).message } });
+        // Show only Vouchr's own user-facing messages inline; any unexpected throw (KMS/DB/inject)
+        // could carry the secret, so it's reduced to its class name — never the raw message.
+        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: safeUserMessage(e) } });
       }
       await ack();
       // Private confirmation DM (no secret), just the fact it was set.
