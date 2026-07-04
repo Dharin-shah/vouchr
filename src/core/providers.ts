@@ -106,6 +106,13 @@ export function defineProvider(spec: Provider): Provider {
         `Provider "${spec.id}" is a public client (publicClient:true) but PKCE is disabled — a public client must use PKCE.`,
       );
     }
+    if (spec.publicClient && (spec.tokenAuth ?? 'body') === 'basic') {
+      // Basic token auth IS a client-secret credential (Basic base64(id:secret)); a public client has
+      // no secret, so it would send `Basic base64(id:)` — nonsensical. Reject rather than half-auth.
+      throw new Error(
+        `Provider "${spec.id}" is a public client but uses Basic token auth — Basic transmits a client secret a public client does not have.`,
+      );
+    }
     const needsSecret = !spec.publicClient;
     if (!spec.clientId || (needsSecret && !spec.clientSecret)) {
       throw new Error(
@@ -264,14 +271,30 @@ export interface DatabricksConfig extends ProviderConfig {
  * on plus this provider's `egressMethods` (GET+POST) for the submit path; GET alone only polls results.
  */
 export function databricks(cfg: DatabricksConfig): Provider {
-  const host = cfg.host?.replace(/\/+$/, ''); // tolerate a trailing slash; `${host}/oidc/...` must not double up
-  if (!host) throw new Error('databricks({ host }) is required (the workspace URL, e.g. https://<ws>.cloud.databricks.com)');
-  const hostname = new URL(host).hostname; // throws on a malformed host → fail fast at construction
+  if (!cfg.host) throw new Error('databricks({ host }) is required (the workspace URL, e.g. https://<ws>.cloud.databricks.com)');
+  // Parse + validate the host STRICTLY: the OAuth code + any client secret are POSTed to
+  // `${origin}/oidc/v1/token`, and that token exchange is NOT behind the egress https gate — so a
+  // http:// or userinfo-bearing host would leak the exchange in cleartext / to the wrong party.
+  // Require a clean HTTPS origin (no non-https scheme, credentials, path, query, or fragment) and build
+  // the OAuth URLs from `url.origin`, so nothing from the raw string can smuggle into them.
+  let origin: string;
+  let hostname: string;
+  try {
+    const u = new URL(cfg.host);
+    if (u.protocol !== 'https:') throw new Error('must be https');
+    if (u.username || u.password) throw new Error('must not contain credentials');
+    if (u.search || u.hash) throw new Error('must not contain a query or fragment');
+    if (u.pathname !== '/' && u.pathname !== '') throw new Error('must be a bare workspace URL with no path');
+    origin = u.origin;
+    hostname = u.hostname;
+  } catch (e) {
+    throw new Error(`databricks({ host }) must be a bare HTTPS workspace URL like https://<ws>.cloud.databricks.com (${(e as Error).message})`);
+  }
   const clientSecret = cfg.clientSecret ?? process.env.DATABRICKS_CLIENT_SECRET;
   return defineProvider({
     id: 'databricks',
-    authorizeUrl: `${host}/oidc/v1/authorize`,
-    tokenUrl: `${host}/oidc/v1/token`,
+    authorizeUrl: `${origin}/oidc/v1/authorize`,
+    tokenUrl: `${origin}/oidc/v1/token`,
     scopesDefault: cfg.scopes ?? ['all-apis', 'offline_access'],
     egressAllow: [hostname],
     // One prefix covers BOTH `POST /api/2.0/sql/statements` (submit) and `GET /api/2.0/sql/statements/<id>`

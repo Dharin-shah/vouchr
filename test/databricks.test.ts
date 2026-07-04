@@ -51,6 +51,31 @@ test('databricks: a trailing slash on host does not double up the OAuth path; ma
   assert.throws(() => databricks({ host: '', clientId: 'cid' }), /host.*required/i);
 });
 
+test('databricks: an unsafe host is rejected — the token exchange is not behind the egress https gate', () => {
+  // The OAuth code + any client secret are POSTed to `${host}/oidc/v1/token`; a http:// or
+  // userinfo/path/query host would leak or misdirect that exchange. All must fail at construction.
+  for (const bad of [
+    'http://dbc-test.cloud.databricks.com',              // cleartext
+    'http://dbc-test.cloud.databricks.com',              // non-https
+    'https://user:pass@dbc-test.cloud.databricks.com',   // embedded credentials
+    'https://dbc-test.cloud.databricks.com/some/path',   // path (would smuggle into the OAuth URL)
+    'https://dbc-test.cloud.databricks.com/?x=1',        // query
+    'https://dbc-test.cloud.databricks.com/#frag',       // fragment
+  ]) {
+    assert.throws(() => databricks({ host: bad, clientId: 'cid' }), /bare HTTPS workspace URL/i, `should reject ${bad}`);
+  }
+});
+
+test('defineProvider: a public client cannot use Basic token auth (Basic carries a secret it lacks)', () => {
+  assert.throws(
+    () => defineProvider({
+      id: 'x', authorizeUrl: 'https://h/a', tokenUrl: 'https://h/t', scopesDefault: [],
+      egressAllow: ['h'], refresh: 'none', pkce: true, clientId: 'cid', publicClient: true, tokenAuth: 'basic',
+    }),
+    /public client.*Basic/i,
+  );
+});
+
 test('databricks: callers can widen egress explicitly (jobs), overriding the statements-only default', () => {
   const p = databricks({ host: HOST, clientId: 'cid', egressPaths: ['/api/2.0/sql/statements', '/api/2.1/jobs/'] });
   assert.deepEqual(p.egressPaths, ['/api/2.0/sql/statements', '/api/2.1/jobs/']);
