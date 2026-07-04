@@ -1,0 +1,9 @@
+{
+  "status": 200,
+  "shape": {
+    "ok": "boolean",
+    "revoked": [
+      "string"
+    ]
+  }
+}

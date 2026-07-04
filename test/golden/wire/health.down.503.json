@@ -1,0 +1,8 @@
+{
+  "status": 503,
+  "shape": {
+    "dbReachable": "boolean",
+    "ok": "boolean",
+    "signingKeyLoaded": "boolean"
+  }
+}

@@ -192,6 +192,26 @@ const CASES: { name: string; run: () => Promise<{ status: number; json: unknown 
       const { server, port } = await makeBroker();
       try { return await request(port, 'POST', '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: userToken(), source: 'aws-sm', secretRef: 'arn:user' }); } finally { server.close(); }
   } },
+  { name: 'health.ok', run: async () => {
+      // /healthz and /health share one handler — freezing /healthz freezes both.
+      const { server, port } = await makeBroker();
+      try { return await request(port, 'GET', '/healthz'); } finally { server.close(); }
+  } },
+  { name: 'health.down.503', run: async () => {
+      // DB unreachable → 503 with the same body shape. Health-check consumers rely on the 503 status.
+      const { server, db, port } = await makeBroker();
+      try { await db.close(); return await request(port, 'GET', '/healthz'); } finally { server.close(); }
+  } },
+  { name: 'disconnect', run: async () => {
+      // U1 has the seeded acme credential, so `revoked` is non-empty → its element type is frozen.
+      const { server, port } = await makeBroker();
+      try { return await request(port, 'POST', '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: userToken() }); } finally { server.close(); }
+  } },
+  { name: 'admin.offboard.ok', run: async () => {
+      // Admin offboards U1 (who has acme) → revoked:[string].
+      const { server, port } = await makeBroker();
+      try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: adminToken({ userId: 'ADMIN' }), targetUserId: 'U1' }); } finally { server.close(); }
+  } },
 
   // ── error shapes (every 4xx/5xx body is `{ error: string }`; the STATUS is the contract) ──
   { name: 'error.fetch.badToken.401', run: async () => {
@@ -219,6 +239,11 @@ const CASES: { name: string; run: () => Promise<{ status: number; json: unknown 
       const { server, port } = await makeBroker();
       // Non-admin token; a forged body `isAdmin` must be ignored (authority = signed claim only).
       try { return await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: userToken(), isAdmin: true } as any); } finally { server.close(); }
+  } },
+  { name: 'error.admin.offboard.forbidden.403', run: async () => {
+      const { server, port } = await makeBroker();
+      // Non-admin token; forged body isAdmin ignored (authority = signed claim only).
+      try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: userToken(), targetUserId: 'U2', isAdmin: true } as any); } finally { server.close(); }
   } },
   { name: 'error.notFound.404', run: async () => {
       const { server, port } = await makeBroker();
