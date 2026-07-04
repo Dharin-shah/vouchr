@@ -16,6 +16,7 @@ import { SessionGrants } from '../../core/session';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
+import { DbReplayStore } from './replayStore';
 import type { BrokerAdminOkResponse, BrokerAdminConfigResponse } from '../../broker-types';
 
 /**
@@ -264,8 +265,16 @@ export function createBroker(opts: BrokerOptions): http.Server {
   const registry = new ProviderRegistry(opts.providers);
   const allowedCt = (opts.allowedContentTypes ?? DEFAULT_ALLOWED_CT).map((c) => c.toLowerCase());
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
-  // Default in-memory guard is single-process only; a multi-instance fleet passes a shared replayStore.
-  const replay: ReplayStore = opts.replayStore ?? new ReplayGuard();
+  // #100 default replay store: a jti is single-use CLUSTER-WIDE when it's backed by the shared db
+  // (DbReplayStore), which every db-configured broker now gets by default — a scaled fleet on one
+  // database no longer replays a jti once per pod. An explicit opts.replayStore always wins (including
+  // an explicit ReplayGuard). Only a genuinely db-less broker falls back to the in-memory guard, which
+  // is single-process; warn once at startup so that regression is never silent.
+  const replay: ReplayStore =
+    opts.replayStore ??
+    (opts.db
+      ? new DbReplayStore(opts.db)
+      : (console.warn('[vouchr] replay guard is process-local; run a single instance or pass a shared replayStore'), new ReplayGuard()));
   // ONE inflight map shared by every request's ConnectionHandle, so concurrent requests for the same
   // owner+provider collapse to a single token refresh (rotating-refresh providers brick on a double
   // refresh). Per-request maps would defeat that. On Postgres the advisory lock also coordinates
@@ -816,17 +825,24 @@ export function createBroker(opts: BrokerOptions): http.Server {
     return { ok: true };
   }
 
-  async function handleHealthz(): Promise<{ status: number; payload: Record<string, unknown> }> {
-    let dbReachable = false;
+  // #101 liveness: the process is up and serving. NO auth, NO db, NO secrets — a bare {ok:true} so a
+  // k8s livenessProbe never restarts a pod for a transient db blip (that's readiness' job).
+  function handleHealthz(): { status: number; payload: Record<string, unknown> } {
+    return { status: 200, payload: { ok: true } };
+  }
+
+  // #101 readiness: a trivial db round-trip (SELECT 1 through the Db seam) within ~2s. 200 when the
+  // store is reachable, else 503 — so a k8s readinessProbe pulls a pod whose db is down out of rotation
+  // without killing it. NO auth, NO vault. The body is a BARE status: never a connection string, error
+  // text, or config (the catch swallows the error rather than reflecting it).
+  async function handleReadyz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     try {
-      await opts.db.get('SELECT 1');
-      dbReachable = true;
+      const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('readyz timeout')), 2000).unref());
+      await Promise.race([opts.db.get('SELECT 1'), timeout]);
+      return { status: 200, payload: { ok: true } };
     } catch {
-      dbReachable = false;
+      return { status: 503, payload: { ok: false } };
     }
-    const signingKeyLoaded = Boolean(opts.identitySecret);
-    const ok = dbReachable && signingKeyLoaded;
-    return { status: ok ? 200 : 503, payload: { ok, dbReachable, signingKeyLoaded } };
   }
 
   return http.createServer((req, res) => {
@@ -837,8 +853,14 @@ export function createBroker(opts: BrokerOptions): http.Server {
       };
       try {
         const url = req.url ?? '/';
+        // #101 liveness + readiness probes: registered FIRST, BEFORE the perimeter/identity gate and
+        // exempt from replay — a k8s probe carries no bearer and must never touch the vault.
         if (req.method === 'GET' && (url === '/healthz' || url === '/health')) {
-          const r = await handleHealthz();
+          const r = handleHealthz();
+          return send(r.status, r.payload);
+        }
+        if (req.method === 'GET' && url === '/readyz') {
+          const r = await handleReadyz();
           return send(r.status, r.payload);
         }
         // #52 OAuth redirect target — a human's browser lands here, so it returns HTML (not JSON) and
