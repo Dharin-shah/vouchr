@@ -51,8 +51,8 @@ export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
 
 // ── provider helpers ──
-export { github, google, gitlab, notion, defineProvider, ProviderRegistry } from './core/providers';
-export type { Provider, ProviderConfig, RefreshStrategy } from './core/providers';
+export { github, google, gitlab, notion, databricks, defineProvider, ProviderRegistry } from './core/providers';
+export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy } from './core/providers';
 
 // ── owner model (user- vs channel-owned credentials) ──
 export { userOwner, channelOwner } from './core/owner';

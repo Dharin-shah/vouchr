@@ -68,6 +68,13 @@ export interface Provider {
   /** Required for `credential: 'oauth'` (the default); unused for `credential: 'key'`. */
   clientId?: string;
   clientSecret?: string;
+  /**
+   * OAuth PUBLIC client: PKCE-only, no client secret (e.g. Databricks U2M public apps). When true,
+   * defineProvider requires only clientId (not clientSecret), and the token exchange authenticates
+   * with the PKCE code_verifier alone. Requires `pkce: true` — a public client with no PKCE has no
+   * client authentication at all. Confidential clients (with a secret) leave this unset.
+   */
+  publicClient?: boolean;
   /** Optional: fetch a human-readable account label after connecting. */
   accountProbe?: (accessToken: string) => Promise<string | null>;
 }
@@ -91,11 +98,20 @@ function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egr
 }
 
 export function defineProvider(spec: Provider): Provider {
-  // Key providers carry no OAuth client; only OAuth providers need clientId/clientSecret.
-  if (spec.credential !== 'key' && (!spec.clientId || !spec.clientSecret)) {
-    throw new Error(
-      `Provider "${spec.id}" is missing clientId/clientSecret. Set them in the provider config or via env.`,
-    );
+  // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
+  // a PKCE public client (publicClient:true) authenticates with the code_verifier alone → clientId only.
+  if (spec.credential !== 'key') {
+    if (spec.publicClient && !spec.pkce) {
+      throw new Error(
+        `Provider "${spec.id}" is a public client (publicClient:true) but PKCE is disabled — a public client must use PKCE.`,
+      );
+    }
+    const needsSecret = !spec.publicClient;
+    if (!spec.clientId || (needsSecret && !spec.clientSecret)) {
+      throw new Error(
+        `Provider "${spec.id}" is missing clientId/clientSecret. Set them in the provider config or via env.`,
+      );
+    }
   }
   return spec;
 }
@@ -223,6 +239,52 @@ export function notion(cfg: ProviderConfig = {}): Provider {
       const j: any = await r.json();
       return j?.bot?.owner?.user?.name ?? j?.name ?? null;
     },
+  });
+}
+
+export interface DatabricksConfig extends ProviderConfig {
+  /** The workspace URL, e.g. `https://dbc-abc123.cloud.databricks.com`. OAuth + API are workspace-scoped. */
+  host: string;
+}
+
+/**
+ * Built-in Databricks provider (per-user OAuth U2M), egress-LOCKED to the SQL Statement Execution API
+ * by default. This is the point of the built-in: warehouse access as the connected human composes with
+ * Unity Catalog row/column governance (masks, row filters, grants apply per human), but ONLY if the
+ * agent can't reach the rest of the workspace. So the default egress allows exactly the statements API
+ * — everything else (jobs, secrets, workspace admin, DBFS, SCIM) is off-limits until a caller widens
+ * `egressPaths` explicitly.
+ *
+ * Both client shapes are supported (Databricks U2M allows either):
+ *  - PUBLIC client: `databricks({ host, clientId })` — no secret; PKCE-only (publicClient inferred).
+ *  - CONFIDENTIAL client: `databricks({ host, clientId, clientSecret })` — secret + PKCE.
+ *
+ * `all-apis` is the U2M scope for calling workspace APIs as the user; `offline_access` yields a refresh
+ * token. POST is required to SUBMIT a statement, so a broker fronting this provider needs `allowWrites`
+ * on plus this provider's `egressMethods` (GET+POST) for the submit path; GET alone only polls results.
+ */
+export function databricks(cfg: DatabricksConfig): Provider {
+  const host = cfg.host?.replace(/\/+$/, ''); // tolerate a trailing slash; `${host}/oidc/...` must not double up
+  if (!host) throw new Error('databricks({ host }) is required (the workspace URL, e.g. https://<ws>.cloud.databricks.com)');
+  const hostname = new URL(host).hostname; // throws on a malformed host → fail fast at construction
+  const clientSecret = cfg.clientSecret ?? process.env.DATABRICKS_CLIENT_SECRET;
+  return defineProvider({
+    id: 'databricks',
+    authorizeUrl: `${host}/oidc/v1/authorize`,
+    tokenUrl: `${host}/oidc/v1/token`,
+    scopesDefault: cfg.scopes ?? ['all-apis', 'offline_access'],
+    egressAllow: [hostname],
+    // One prefix covers BOTH `POST /api/2.0/sql/statements` (submit) and `GET /api/2.0/sql/statements/<id>`
+    // (poll/cancel) via the injector's prefix rule, while still rejecting /api/2.0/secrets, /api/2.1/jobs,
+    // and lookalikes like /api/2.0/sql/statements-evil. Callers widen this explicitly if they need more.
+    egressPaths: cfg.egressPaths ?? ['/api/2.0/sql/statements'],
+    egressMethods: cfg.egressMethods ?? ['GET', 'POST'],
+    egressValidate: cfg.egressValidate,
+    refresh: 'rotating', // offline_access → refresh token; Databricks rotates it (single-flight guards the swap)
+    pkce: true, // U2M requires PKCE
+    clientId: cfg.clientId ?? process.env.DATABRICKS_CLIENT_ID ?? '',
+    clientSecret,
+    publicClient: !clientSecret, // no secret → public client (PKCE-only). scopeDescriptions land with #105.
   });
 }
 

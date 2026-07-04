@@ -20,13 +20,15 @@ async function tokenRequest(
   const fields: Record<string, string> = { ...params };
   const headers: Record<string, string> = { Accept: 'application/json' };
 
-  // clientId/clientSecret are guaranteed for oauth providers (defineProvider); token paths never run for key providers.
+  // clientId is guaranteed for oauth providers (defineProvider); token paths never run for key providers.
+  // A PKCE public client (publicClient) has no secret — it authenticates with the code_verifier alone,
+  // so only send client_secret when the provider actually has one (confidential client).
   if ((provider.tokenAuth ?? 'body') === 'basic') {
-    const creds = Buffer.from(`${provider.clientId}:${provider.clientSecret}`).toString('base64');
+    const creds = Buffer.from(`${provider.clientId}:${provider.clientSecret ?? ''}`).toString('base64');
     headers.Authorization = `Basic ${creds}`;
   } else {
     fields.client_id = provider.clientId!;
-    fields.client_secret = provider.clientSecret!;
+    if (provider.clientSecret) fields.client_secret = provider.clientSecret;
   }
 
   let body: string;

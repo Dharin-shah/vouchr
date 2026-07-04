@@ -209,8 +209,19 @@ export class ConnectionHandle {
     }
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
     // never reaches the vault: the secret is read strictly after every egress check passes.
-    if (this.provider.egressPaths && !this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
-      await this.denyEgress(url.hostname, 'path', `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`);
+    if (this.provider.egressPaths) {
+      // Encoded path separators (%2f, %5c) survive WHATWG URL parsing UN-decoded, so a traversal
+      // segment like `/statements/..%2f..%2fsecrets` still matches an allowed prefix here, yet
+      // resolves to a DIFFERENT path on any upstream that later decodes %2f. When a path lock is in
+      // force it IS the security boundary, so refuse the ambiguity fail-closed — a legitimate locked
+      // path never contains an encoded separator. (Providers WITHOUT a path lock, e.g. GitLab whose
+      // project ids are `group%2Fproject`, are unaffected: this guard is gated on egressPaths.)
+      if (/%2f|%5c/i.test(url.pathname)) {
+        await this.denyEgress(url.hostname, 'path', `Egress blocked: encoded path separator is not allowed for provider "${this.provider.id}"`);
+      }
+      if (!this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
+        await this.denyEgress(url.hostname, 'path', `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`);
+      }
     }
     if (this.provider.egressMethods && !this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
       await this.denyEgress(url.hostname, 'method', `Egress blocked: method "${method}" is not allowed for provider "${this.provider.id}"`);
