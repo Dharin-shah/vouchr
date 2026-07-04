@@ -9,7 +9,14 @@ import {
 } from '../src/adapters/bolt';
 import { EgressBlockedError, NoConnectionError } from '../src/core/injector';
 import { defineProvider } from '../src/core/providers';
-import { USER_KEY_CALLBACK } from '../src/adapters/blocks';
+import { USER_KEY_CALLBACK, CONFIGURE_CALLBACK } from '../src/adapters/blocks';
+
+// A key provider that brokers (non-service) — enough to exercise the /vouchr command + channel modal.
+const acme = () => defineProvider({
+  id: 'acme', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [],
+  egressAllow: ['api.test'], refresh: 'none', pkce: false,
+  inject: (h: any, s: string) => h.set('x-api-key', s),
+});
 
 const SECRET = 'secret ghp_abc1234567890abcdef';
 
@@ -90,6 +97,64 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
   const shown = JSON.stringify(acked);
   assert.ok(!shown.includes('ghp_abc'), 'secret must not reach the modal error');
   assert.match(acked.errors.raw, /Something went wrong \(KmsWrapError\)\./);
+});
+
+// Regression (#97 issue #132): the deliberate admin-denial for `/vouchr mode` is thrown as a plain
+// refusal, NOT one of the 4 whitelisted classes. It must still reach the user verbatim — before the
+// UserFacingError marker it collapsed to "Something went wrong (Error)...".
+test('command: a non-admin /vouchr mode gets the real admin-denied message, not the generic mask', async () => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  let cmd: any;
+  vouchr.registerCommands({
+    command: (_n: string, h: any) => { cmd = h; },
+    view: () => undefined,
+    action: () => undefined,
+  });
+  const nonAdmin = { users: { info: async () => ({ user: { is_admin: false, is_owner: false } }) } };
+  let said = '';
+  await cmd({
+    command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'mode acme per-user', trigger_id: 'x' },
+    ack: async () => {}, respond: async (m: any) => { said = m; }, client: nonAdmin,
+  });
+  assert.equal(said, 'Only a workspace admin can configure channel credentials.');
+});
+
+// Regression: a mode-locked channel rejecting a STATIC key in the modal submit. This denial is a
+// plain Vouchr refusal thrown from setChannelSecret and caught at the modal's masking catch — its
+// message must survive (it did not before the marker class).
+test('modal submit: a mode-locked channel keeps the real "static keys are not allowed" message', async () => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  let cmd: any, configureView: any;
+  vouchr.registerCommands({
+    command: (_n: string, h: any) => { cmd = h; },
+    view: (id: string, h: any) => { if (id === CONFIGURE_CALLBACK) configureView = h; },
+    action: () => undefined,
+  });
+  // Admin + a normal (eligible) channel: both mutations pass the admin gate + eligibility check.
+  const admin = {
+    users: { info: async () => ({ user: { is_admin: true } }) },
+    conversations: { info: async () => ({ channel: {} }) },
+  };
+  // 1) Admin locks the channel to per-user.
+  await cmd({
+    command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'mode acme per-user', trigger_id: 'x' },
+    ack: async () => {}, respond: async () => {}, client: admin,
+  });
+  // 2) Admin then tries to save a STATIC key → refused by the mode lock; message must reach the modal.
+  let acked: any = null;
+  await configureView({
+    ack: async (a: any) => { acked = a; },
+    body: { team: { id: 'T1' }, user: { id: 'U1' } },
+    view: {
+      private_metadata: JSON.stringify({ channel: 'C1', provider: 'acme' }),
+      state: { values: { raw: { v: { value: 'my-real-key' } }, ref: { v: { value: '' } } } },
+    },
+    client: admin,
+  });
+  assert.equal(acked.response_action, 'errors');
+  assert.equal(acked.errors.raw, 'Channel is set to per-user for "acme"; static keys are not allowed.');
 });
 
 // Regression: the ConsentRequiredError path is unaffected — its user-facing message is preserved

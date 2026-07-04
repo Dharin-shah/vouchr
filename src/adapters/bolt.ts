@@ -32,7 +32,7 @@ const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 /** Map an external ref to its resolver source id. Add resolvers → extend this. */
 function refSource(ref: string): string {
   if (/^arn:aws:secretsmanager:/.test(ref)) return 'aws-sm';
-  throw new Error('Unsupported secret reference. Expected an AWS Secrets Manager ARN.');
+  throw new UserFacingError('Unsupported secret reference. Expected an AWS Secrets Manager ARN.');
 }
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
@@ -60,6 +60,20 @@ export class SessionApprovalRequiredError extends Error {
 }
 
 /**
+ * Marker for a deliberate, Vouchr-authored, secret-free denial/validation message that IS safe to
+ * echo to the Slack user (an admin gate, a channel-eligibility or mode-lock refusal, a bad-input
+ * message). These read identically to a foreign `new Error(...)` — which could carry a provider /
+ * KMS / DB secret — so the throw site opts a message into the whitelist by using THIS class; a bare
+ * Error stays masked to its class name. See safeUserMessage.
+ */
+export class UserFacingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'UserFacingError';
+  }
+}
+
+/**
  * The only text safe to echo to a Slack user from a caught error. Mirrors the headless broker's
  * top-level catch (broker.ts), which returns the error CLASS NAME only: an extension point (a custom
  * `provider.inject`, KMS `wrapDataKey`, a DB driver) can throw AFTER touching a secret, so a raw
@@ -72,7 +86,8 @@ export function safeUserMessage(e: unknown): string {
     e instanceof ConsentRequiredError ||
     e instanceof SessionApprovalRequiredError ||
     e instanceof EgressBlockedError ||
-    e instanceof NoConnectionError
+    e instanceof NoConnectionError ||
+    e instanceof UserFacingError
   ) {
     return e.message;
   }
@@ -266,7 +281,7 @@ export class ConnectContext {
   private brokerable(providerId: string): Provider {
     const provider = this.registry.get(providerId);
     if (provider.identity === 'service') {
-      throw new Error(
+      throw new UserFacingError(
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
     }
@@ -446,13 +461,13 @@ export class ConnectContext {
         owner: 'channel',
         channel: this.channel,
       });
-      throw new Error(adminOnly(this.allowChannelCreatorConfig, 'configure channel credentials'));
+      throw new UserFacingError(adminOnly(this.allowChannelCreatorConfig, 'configure channel credentials'));
     }
   }
 
   private channelTarget(providerId: string) {
-    if (!this.channelConfig) throw new Error('Channel config store not available.');
-    if (!this.channel) throw new Error('No channel in context. Run this inside a channel.');
+    if (!this.channelConfig) throw new UserFacingError('Channel config store not available.');
+    if (!this.channel) throw new UserFacingError('No channel in context. Run this inside a channel.');
     return { cfg: this.channelConfig, owner: channelOwner(this.identity.teamId, this.channel), channel: this.channel };
   }
 
@@ -473,7 +488,7 @@ export class ConnectContext {
       info = null;
     }
     const reason = channelIneligibleReason(info);
-    if (reason) throw new Error(reason);
+    if (reason) throw new UserFacingError(reason);
   }
 
   /**
@@ -489,7 +504,7 @@ export class ConnectContext {
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
     if (cm != null && cm !== 'shared') {
-      throw new Error(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
+      throw new UserFacingError(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
     }
     await this.vault.upsert(owner, providerId, {
       accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -513,7 +528,7 @@ export class ConnectContext {
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
     if (cm != null && cm !== 'shared') {
-      throw new Error(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
+      throw new UserFacingError(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
     }
     await this.vault.reference(owner, providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
     await cfg.setMode(owner.teamId, channel, providerId, 'shared');
