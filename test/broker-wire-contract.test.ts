@@ -193,14 +193,19 @@ const CASES: { name: string; run: () => Promise<{ status: number; json: unknown 
       try { return await request(port, 'POST', '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: userToken(), source: 'aws-sm', secretRef: 'arn:user' }); } finally { server.close(); }
   } },
   { name: 'health.ok', run: async () => {
-      // /healthz and /health share one handler — freezing /healthz freezes both.
+      // /healthz and /health share one handler — liveness only: a bare {ok:true}, no DB touch.
       const { server, port } = await makeBroker();
       try { return await request(port, 'GET', '/healthz'); } finally { server.close(); }
   } },
-  { name: 'health.down.503', run: async () => {
-      // DB unreachable → 503 with the same body shape. Health-check consumers rely on the 503 status.
+  { name: 'readyz.ok', run: async () => {
+      // Readiness: DB round-trip OK → 200 {ok:true}. k8s readinessProbe pulls the pod when this 503s.
+      const { server, port } = await makeBroker();
+      try { return await request(port, 'GET', '/readyz'); } finally { server.close(); }
+  } },
+  { name: 'readyz.down.503', run: async () => {
+      // DB unreachable → 503 {ok:false}. The 503 status is the contract k8s readiness relies on.
       const { server, db, port } = await makeBroker();
-      try { await db.close(); return await request(port, 'GET', '/healthz'); } finally { server.close(); }
+      try { await db.close(); return await request(port, 'GET', '/readyz'); } finally { server.close(); }
   } },
   { name: 'disconnect', run: async () => {
       // U1 has the seeded acme credential, so `revoked` is non-empty → its element type is frozen.

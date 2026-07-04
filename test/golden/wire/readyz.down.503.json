@@ -1,5 +1,5 @@
 {
-  "status": 200,
+  "status": 503,
   "shape": {
     "ok": "boolean"
   }
