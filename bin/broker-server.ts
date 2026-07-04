@@ -137,7 +137,21 @@ export async function buildBrokerServer(
   return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, sweep, sweepIntervalMs };
 }
 
+const USAGE = `vouchr-broker — standalone headless Vouchr credential broker (no Slack)
+
+Usage: vouchr-broker            start the broker, config from env
+       vouchr-broker --help     show this message
+
+Required env: VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY (base64 of 32 bytes).
+Optional env: VOUCHR_PORT (3000), VOUCHR_DATABASE_URL|VOUCHR_DB, VOUCHR_KMS_KEY_ID,
+              VOUCHR_ALLOW_WRITES, VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
+
 async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  if (argv.includes('--help') || argv.includes('-h')) {
+    console.log(USAGE);
+    return;
+  }
   const built = await buildBrokerServer();
   built.server.listen(built.port, () => {
     // One line, no secrets — startup provenance for ops.
