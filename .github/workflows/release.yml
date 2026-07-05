@@ -56,8 +56,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  docker-ghcr:
+  # Build + boot the image and prove it serves /healthz BEFORE it can be pushed to GHCR — a broken
+  # Dockerfile must never reach the registry. Same script CI runs on docker-touching PRs.
+  docker-smoke:
     needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: npm run docker-smoke
+
+  docker-ghcr:
+    needs: [verify, docker-smoke]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7

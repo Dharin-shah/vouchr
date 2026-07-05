@@ -1,0 +1,23 @@
+name: Docker smoke
+
+# Build the broker image and prove it BOOTS + serves /healthz (see test/docker-smoke.sh). Path-gated:
+# the build is ~1min and only relevant when the image's inputs change. GitHub has no per-job path
+# filter, so this is a separate workflow rather than a job in ci.yml. Release publishing gates on the
+# same script (release.yml) so a broken image can never reach GHCR.
+on:
+  push:
+    branches: [main]
+    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json]
+  pull_request:
+    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - run: npm run docker-smoke
