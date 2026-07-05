@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   connectBlocks,
   connectedBlocks,
+  connectedHtml,
   consentDeniedBlocks,
   statusBlocks,
   disconnectConfirmBlocks,
@@ -32,6 +33,14 @@ test('connectedBlocks: shows the connected account and granted scope', () => {
   const b = connectedBlocks('github', { channel: 'C123', scope: 'repo read:user', account: 'octocat' }) as any[];
   assert.match(j(b), /Connected as \*octocat\*/);
   assert.match(j(b), /repo read:user/); // granted scope from the token response
+});
+
+test('connectedHtml: the live post-connect page shows account + granted scopes', () => {
+  const html = connectedHtml('github', 'octocat', 'repo read:user');
+  assert.match(html, /github connected as octocat/);
+  assert.match(html, /repo read:user/); // granted scopes surfaced where the user actually lands
+  // No scopes → no granted line (e.g. a provider that doesn't echo scope and has none requested).
+  assert.doesNotMatch(connectedHtml('github', 'octocat', ''), /acting as you/);
 });
 
 test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
