@@ -51,8 +51,10 @@ export {
   disconnectConfirmBlocks,
   homeView,
   DISCONNECT_ACTION,
+  configModal,
+  CONFIG_CALLBACK,
 } from './adapters/blocks';
-export type { Connection } from './adapters/blocks';
+export type { Connection, ToolRow, ConfigAdminRow } from './adapters/blocks';
 export type { TtlPolicy } from './core/vault';
 export type { EnvelopeProvider } from './core/crypto';
 // Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);
