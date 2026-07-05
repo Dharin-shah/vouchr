@@ -62,9 +62,39 @@ function redact(value: unknown): unknown {
   return value; // numbers, booleans, null, undefined pass through
 }
 
+/** One audit row for the in-Slack usage view. NOTE: `meta` is deliberately NOT selected — it could
+ *  hold sensitive labels, and the Slack surface must render only these non-secret columns. */
+export interface AuditRow {
+  provider: string;
+  action: string;
+  actor: string | null; // who triggered it (union non-repudiation); null on most rows
+  channel: string | null;
+  at: number; // ms epoch
+}
+
 /** Append-only audit log. `meta` must NEVER contain token material; defense-in-depth redaction enforces it anyway. */
 export class Audit {
   constructor(private db: Db) {}
+
+  /** The caller's own audit trail: rows attributed to them as the acting/owning user, across channels.
+   *  `user_id` is always the acted-as member (the credential owner in union mode), so this scopes strictly
+   *  to the caller — never another user's rows. Excludes `meta`. */
+  async listByOwnerUser(i: SlackIdentity, limit: number): Promise<AuditRow[]> {
+    return this.db.all(
+      `SELECT provider, action, actor, channel, at FROM audit
+       WHERE team_id = ? AND user_id = ? ORDER BY at DESC LIMIT ?`,
+      [i.teamId, i.userId, limit],
+    );
+  }
+
+  /** A channel's channel-owned credential trail (admin-gated at the call site). Excludes `meta`. */
+  async listByChannel(teamId: string, channelId: string, limit: number): Promise<AuditRow[]> {
+    return this.db.all(
+      `SELECT provider, action, actor, channel, at FROM audit
+       WHERE team_id = ? AND channel = ? ORDER BY at DESC LIMIT ?`,
+      [teamId, channelId, limit],
+    );
+  }
 
   async record(
     action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'config' | 'session',

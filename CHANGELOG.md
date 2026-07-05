@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
 
+## [Unreleased]
+
+### Added
+
+- `/vouchr audit` — a self-service, in-Slack view of credential usage. A user sees the last ~20 audit
+  events attributed to them (their own credential's usage across channels, including union-mode
+  borrows); a channel admin can additionally run `/vouchr audit channel` for the current channel's
+  channel-owned usage. Strictly scoped — a non-admin never sees another user's or another channel's
+  rows — and `meta` is never rendered (the read query omits it). New `Audit.listByOwnerUser` /
+  `Audit.listByChannel` read methods and an `auditBlocks` renderer.
+
 ## [0.2.0-rc.1] - 2026-07-03
 
 ### Breaking

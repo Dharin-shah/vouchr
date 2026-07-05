@@ -1,3 +1,25 @@
+import type { AuditRow } from '../core/audit';
+
+/** `/vouchr audit`: a compact, read-only view of credential usage. Renders ONLY the non-secret
+ *  columns (provider/action/actor/channel/time) — never `meta`, which the query already omits.
+ *  Timestamps use Slack's `<!date^…>` token so each viewer sees their own locale/timezone. */
+export function auditBlocks(rows: AuditRow[], heading: string): unknown[] {
+  if (!rows.length) {
+    return [{ type: 'section', text: { type: 'mrkdwn', text: `:information_source: *${heading}*\nNothing recorded yet.` } }];
+  }
+  const lines = rows.map((r) => {
+    const secs = Math.floor(r.at / 1000);
+    const when = `<!date^${secs}^{date_short_pretty} {time}|${new Date(r.at).toISOString()}>`;
+    const who = r.actor ? ` · by <@${r.actor}>` : '';
+    const where = r.channel ? ` · <#${r.channel}>` : '';
+    return `• *${r.provider}* · ${r.action}${who}${where} · ${when}`;
+  });
+  return [
+    { type: 'header', text: { type: 'plain_text', text: heading, emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+  ];
+}
+
 /** Block Kit for the in-Slack "connect your account" prompt (ephemeral). */
 export function connectBlocks(provider: string, authorizeUrl: string): unknown[] {
   return [
