@@ -102,7 +102,8 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
     await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
 
     // Extract the single-use state from the Connect button URL.
-    const url = new URL(posts[0].blocks[1].elements[0].url);
+    const actions = posts[0].blocks.find((b: any) => b.type === 'actions');
+    const url = new URL(actions.elements[0].url);
     const state = url.searchParams.get('state')!;
     assert.ok(state && url.searchParams.get('code_challenge')); // PKCE present
 

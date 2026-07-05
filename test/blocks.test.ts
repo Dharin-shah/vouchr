@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  connectBlocks,
   connectedBlocks,
   consentDeniedBlocks,
   statusBlocks,
@@ -25,6 +26,37 @@ test('connectedBlocks: interpolates provider + channel and shows how to disconne
 test('connectedBlocks: null channel renders a DM scope', () => {
   const b = connectedBlocks('github', { channel: null }) as any[];
   assert.match(j(b), /your DMs/);
+});
+
+test('connectedBlocks: shows the connected account and granted scope', () => {
+  const b = connectedBlocks('github', { channel: 'C123', scope: 'repo read:user', account: 'octocat' }) as any[];
+  assert.match(j(b), /Connected as \*octocat\*/);
+  assert.match(j(b), /repo read:user/); // granted scope from the token response
+});
+
+test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
+  const b = connectBlocks('github', 'https://auth') as any[];
+  assert.equal(b.length, 2); // intro section + actions
+  assert.doesNotMatch(j(b), /Connecting grants/);
+});
+
+test('connectBlocks: renders human-language scope descriptions when passed', () => {
+  const b = connectBlocks('github', 'https://auth', {
+    list: ['read:user', 'repo'],
+    describe: { 'read:user': 'Read your profile', repo: 'Read and write your repositories' },
+  }) as any[];
+  assert.match(j(b), /Connecting grants the agent, acting as you/);
+  assert.match(j(b), /Read your profile/);
+  assert.match(j(b), /Read and write your repositories/);
+});
+
+test('connectBlocks: an unknown scope falls back to its raw string, never dropped', () => {
+  const b = connectBlocks('acme', 'https://auth', {
+    list: ['known', 'mystery:scope'],
+    describe: { known: 'A known thing' },
+  }) as any[];
+  assert.match(j(b), /A known thing/);
+  assert.match(j(b), /mystery:scope/); // raw fallback, not hidden
 });
 
 test('consentDeniedBlocks: states provider, default reason, and next step', () => {

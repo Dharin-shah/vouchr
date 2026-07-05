@@ -647,7 +647,11 @@ export class ConnectContext {
   }
 
   private async postConnectPrompt(providerId: string, url: string): Promise<void> {
-    const blocks = connectBlocks(providerId, url);
+    const provider = this.registry.get(providerId);
+    const blocks = connectBlocks(providerId, url, {
+      list: provider.scopesDefault,
+      describe: provider.scopeDescriptions,
+    });
     const text = `Connect your ${providerId} account`;
     if (this.channel) {
       await this.client.chat.postEphemeral({
