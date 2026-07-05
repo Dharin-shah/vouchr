@@ -465,7 +465,7 @@ export class ConnectContext {
     }
   }
 
-  private channelTarget(providerId: string) {
+  private channelTarget() {
     if (!this.channelConfig) throw new UserFacingError('Channel config store not available.');
     if (!this.channel) throw new UserFacingError('No channel in context. Run this inside a channel.');
     return { cfg: this.channelConfig, owner: channelOwner(this.identity.teamId, this.channel), channel: this.channel };
@@ -499,7 +499,7 @@ export class ConnectContext {
    */
   async setChannelSecret(providerId: string, secret: string): Promise<void> {
     this.brokerable(providerId); // validate provider exists + refuse service tools
-    const { cfg, owner, channel } = this.channelTarget(providerId);
+    const { cfg, owner, channel } = this.channelTarget();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
@@ -523,7 +523,7 @@ export class ConnectContext {
     r: { source: string; secretRef: string; scopes?: string },
   ): Promise<void> {
     this.brokerable(providerId);
-    const { cfg, owner, channel } = this.channelTarget(providerId);
+    const { cfg, owner, channel } = this.channelTarget();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
@@ -542,7 +542,7 @@ export class ConnectContext {
    */
   async setChannelMode(providerId: string, mode: ChannelMode): Promise<void> {
     this.brokerable(providerId);
-    const { cfg, owner, channel } = this.channelTarget(providerId);
+    const { cfg, owner, channel } = this.channelTarget();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
     if (mode !== 'shared') await this.vault.delete(owner, providerId); // user-owned: drop any shared cred
@@ -557,7 +557,7 @@ export class ConnectContext {
    */
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
     const provider = this.brokerable(providerId);
-    const { cfg, owner, channel } = this.channelTarget(providerId);
+    const { cfg, owner, channel } = this.channelTarget();
     // Same authorization gate as connect() (the shared core CHECK): a deny applies to shared channel
     // creds too. Audit meta carries owner:'channel' here; like connect(), no policy_denied on tool-disabled.
     const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);

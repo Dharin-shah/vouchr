@@ -270,11 +270,15 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // database no longer replays a jti once per pod. An explicit opts.replayStore always wins (including
   // an explicit ReplayGuard). Only a genuinely db-less broker falls back to the in-memory guard, which
   // is single-process; warn once at startup so that regression is never silent.
-  const replay: ReplayStore =
-    opts.replayStore ??
-    (opts.db
-      ? new DbReplayStore(opts.db)
-      : (console.warn('[vouchr] replay guard is process-local; run a single instance or pass a shared replayStore'), new ReplayGuard()));
+  let replay: ReplayStore;
+  if (opts.replayStore) {
+    replay = opts.replayStore;
+  } else if (opts.db) {
+    replay = new DbReplayStore(opts.db);
+  } else {
+    console.warn('[vouchr] replay guard is process-local; run a single instance or pass a shared replayStore');
+    replay = new ReplayGuard();
+  }
   // ONE inflight map shared by every request's ConnectionHandle, so concurrent requests for the same
   // owner+provider collapse to a single token refresh (rotating-refresh providers brick on a double
   // refresh). Per-request maps would defeat that. On Postgres the advisory lock also coordinates

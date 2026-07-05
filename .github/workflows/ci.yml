@@ -43,6 +43,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
+      - run: npm run lint
       # Build BEFORE test: the compiled dist/ must exist for tests that inspect the shipped artifact
       # (e.g. the headless @slack-free module-graph check), and an emit/declaration break fails fast here.
       - run: npm run build

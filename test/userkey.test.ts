@@ -75,7 +75,7 @@ test('referenceUserSecret: external ref under the user, no secret stored', async
 // connect() on a key provider with no cred → posts the key-setup prompt (NOT OAuth), then stops.
 test('connect: key provider, no cred → ephemeral key-setup prompt + ConsentRequiredError', async () => {
   let ephemeral: any = null;
-  const client = { chat: { postEphemeral: async (a: any) => ((ephemeral = a), {}) } };
+  const client = { chat: { postEphemeral: async (a: any) => { ephemeral = a; return {}; } } };
   const { c } = await ctx('C1', client);
   await assert.rejects(() => c.connect('customdb'), ConsentRequiredError);
   assert.equal(ephemeral.user, 'U_MAYA'); // posted to the asking user, ephemeral

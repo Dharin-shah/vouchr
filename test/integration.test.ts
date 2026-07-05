@@ -24,13 +24,13 @@ function startMockProvider(): Promise<{
         url: req.url ?? '',
         method: req.method ?? '',
         body,
-        auth: req.headers['authorization'] as string | undefined,
+        auth: req.headers.authorization as string | undefined,
       });
       if (req.url === '/token') {
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ access_token: 'AT123', token_type: 'bearer', scope: 'read' }));
       } else if ((req.url ?? '').startsWith('/api/me')) {
-        const ok = req.headers['authorization'] === 'Bearer AT123';
+        const ok = req.headers.authorization === 'Bearer AT123';
         res.writeHead(ok ? 200 : 401, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ login: 'octocat' }));
       } else if (req.url === '/redirect') {
@@ -56,9 +56,9 @@ function startMockProvider(): Promise<{
 
 function fakeRes() {
   const r: any = { statusCode: 200, body: '', headers: {} };
-  r.status = (c: number) => ((r.statusCode = c), r);
-  r.send = (b: any) => ((r.body = b), r);
-  r.set = (k: any, v?: any) => (typeof k === 'object' ? Object.assign(r.headers, k) : (r.headers[k] = v), r);
+  r.status = (c: number) => { r.statusCode = c; return r; };
+  r.send = (b: any) => { r.body = b; return r; };
+  r.set = (k: any, v?: any) => { if (typeof k === 'object') Object.assign(r.headers, k); else r.headers[k] = v; return r; };
   return r;
 }
 
