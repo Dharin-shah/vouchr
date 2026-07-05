@@ -39,8 +39,8 @@ export function statsBlocks(enabled: string[], stats: StatsRow[], windowDays: nu
   }
   const byProvider = new Map(stats.map((s) => [s.provider, s]));
   const lines = enabled.map((p) => {
-    const s = byProvider.get(p);
-    if (!s || s.uses === 0) return `• *${escapeMrkdwn(p)}* — _never used_ (idle; safe to remove)`;
+    const s = byProvider.get(p); // absent = no injections in the window (a GROUP BY row is always ≥ 1)
+    if (!s) return `• *${escapeMrkdwn(p)}* — _never used_ (idle; safe to remove)`;
     const when = `<!date^${Math.floor(s.lastUsed / 1000)}^{date_short_pretty}|recently>`;
     const people = s.distinctActors === 1 ? '1 person' : `${s.distinctActors} people`;
     return `• *${escapeMrkdwn(p)}* — ${s.uses} injection${s.uses === 1 ? '' : 's'} · ${people} · last used ${when}`;

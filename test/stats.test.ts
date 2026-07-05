@@ -4,8 +4,15 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { openDb } from '../src/core/db';
 import { Audit } from '../src/core/audit';
 import { ChannelTools } from '../src/core/tools';
+import { Vault } from '../src/core/vault';
+import { userOwner } from '../src/core/owner';
+import { ConnectionHandle } from '../src/core/injector';
 import { createVouchr } from '../src/adapters/bolt';
 import { defineProvider } from '../src/core/providers';
+
+const KEY = randomBytes(32);
+const uid = (userId: string) => ({ enterpriseId: null, teamId: 'T1', userId });
+const tok = { accessToken: 'sk-secret', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null };
 
 // #107 /vouchr stats — admin per-channel usage analytics. Core query scoping + the command's admin
 // gate and enabled-but-idle flag.
@@ -41,6 +48,45 @@ test('statsByChannel: counts injections + distinct actors in-window, scoped to c
   assert.equal(byP.gitlab.uses, 1);
   assert.equal(byP.gitlab.distinctActors, 1);
   assert.ok(rows.every((r) => typeof r.uses === 'number' && typeof r.distinctActors === 'number')); // coerced
+});
+
+test('statsByChannel attributes REAL per-user usage to the origin channel (the P1 bug)', async () => {
+  // The prior test seeded audit rows with { channel } set — masking the bug that per-user/session/union
+  // inject audits left channel NULL. This drives a genuine per-user handle.fetch() and asserts the
+  // usage is attributed to the channel it happened in (else `/vouchr stats` marks live tools "idle").
+  const db = await openDb({ dbPath: ':memory:' });
+  const audit = new Audit(db);
+  const vault = new Vault(db, KEY);
+  await vault.upsert(userOwner(uid('U1')), 'github', tok);
+  // Mirrors bolt's per-user construction: a user-owned handle carrying the origin channel (11th arg).
+  const handle = new ConnectionHandle(
+    mk('github'), userOwner(uid('U1')), uid('U1'), vault, audit, {}, new Map(), () => {}, () => {}, null, 'C_FIN',
+  );
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('ok', { status: 200 })) as any;
+  try { await handle.fetch('https://api.x/y'); } finally { globalThis.fetch = realFetch; }
+
+  const rows = await audit.statsByChannel('T1', 'C_FIN', Date.now() - DAY);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].provider, 'github');
+  assert.equal(rows[0].uses, 1);           // per-user usage now visible (was structurally 0 / "never used")
+  assert.equal(rows[0].distinctActors, 1);
+});
+
+test('statsByChannel: distinct humans counts the requester (actor) in union mode, not the member', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const audit = new Audit(db);
+  const now = Date.now();
+  const rec = (userId: string, actor: string | null, at: number) =>
+    db.run(`INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at) VALUES (?,?,?,?,?,?,?,?,?)`,
+      [randomUUID(), 'T1', userId, 'github', 'inject', actor, 'C_FIN', '{}', at]);
+  await rec('M', 'R1', now - 100); // union: member M, requester R1
+  await rec('M', 'R2', now - 200); // union: same member M, requester R2
+  await rec('U3', null, now - 300); // per-user: U3 is the requester
+
+  const [row] = await audit.statsByChannel('T1', 'C_FIN', now - DAY);
+  assert.equal(row.uses, 3);
+  assert.equal(row.distinctActors, 3); // requesters R1,R2,U3 — NOT distinct user_id (M,M,U3 = 2)
 });
 
 async function harness(opts: { isAdmin?: boolean } = {}) {

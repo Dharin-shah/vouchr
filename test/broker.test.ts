@@ -909,7 +909,9 @@ test('#51 union: resolves to and audits the SIGNED acting member (never the call
     assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
     const row = (await db.get(`SELECT user_id, channel FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`)) as any;
     assert.equal(row.user_id, 'U9');   // audited as U9 (the real member whose cred was used), not caller U1
-    assert.equal(row.channel, null);   // union uses U9's OWN (user-owned) cred, so no channel attribution
+    // Attributed to the ORIGIN channel the request came in on (so /vouchr stats sees union usage). Not
+    // owner conflation: the vault owner is still U9's user-owned cred; user_id above is the member.
+    assert.equal(row.channel, 'C1');
   } finally {
     up.restore();
     server.close();

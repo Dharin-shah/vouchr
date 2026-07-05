@@ -106,16 +106,20 @@ export class Audit {
   }
 
   /** Per-provider injection stats for a channel since `sinceEpoch` (ms epoch): total injections,
-   *  distinct acting humans (user_id — the acted-as member), and last-used time. One GROUP BY,
-   *  backend-agnostic (epoch comparison, no date functions). Admin-gated at the call site; powers
-   *  `/vouchr stats`. Postgres returns BIGINT/COUNT as strings and lowercases unquoted aliases, so we
-   *  use lowercase aliases and coerce every numeric column with Number(). */
+   *  distinct requesting humans, and last-used time. One GROUP BY, backend-agnostic (epoch comparison,
+   *  no date functions). Admin-gated at the call site; powers `/vouchr stats`.
+   *
+   *  "Distinct humans" = `COALESCE(actor, user_id)`: in union mode `user_id` is the acted-as member and
+   *  `actor` is the real requester, so we count requesters; otherwise `actor` is null and `user_id` IS
+   *  the requester. Counts are numeric on both backends (SQLite native; Postgres via the global int8
+   *  parser in db.ts) and Postgres lowercases unquoted aliases, so we alias in snake_case and coerce
+   *  with Number() defensively. */
   async statsByChannel(teamId: string, channelId: string, sinceEpoch: number): Promise<StatsRow[]> {
     const rows = await this.db.all<{ provider: string; uses: unknown; distinct_actors: unknown; last_used: unknown }>(
       `SELECT provider,
-              COUNT(*)                AS uses,
-              COUNT(DISTINCT user_id) AS distinct_actors,
-              MAX(at)                 AS last_used
+              COUNT(*)                                 AS uses,
+              COUNT(DISTINCT COALESCE(actor, user_id)) AS distinct_actors,
+              MAX(at)                                  AS last_used
          FROM audit
         WHERE team_id = ? AND channel = ? AND action = 'inject' AND at >= ?
         GROUP BY provider`,

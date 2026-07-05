@@ -375,6 +375,7 @@ export class ConnectContext {
             // requester is the caller. Pass it as triggeredBy so the inject audit records WHO borrowed
             // the credential — this is what surfaces in the owner's `/vouchr audit` view.
             this.identity.userId,
+            this.channel, // origin channel: attribute union usage to the channel it happened in (stats)
           );
         }
       }
@@ -383,6 +384,8 @@ export class ConnectContext {
     if (await this.vault.get(userOwner(this.identity), providerId)) {
       return new ConnectionHandle(
         provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+        null, // no union borrow on the direct per-user path
+        this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
       );
     }
 
