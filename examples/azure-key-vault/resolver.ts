@@ -12,7 +12,11 @@
 // Reference format: azure-kv://<vault-name>/<secret-name>[/<version>]
 import type { Resolvers } from '../../src';
 
-const REF = /^azure-kv:\/\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/;
+// Vault + secret + version are restricted to Azure's real naming charset (alphanumeric + hyphen).
+// This is SECURITY-CRITICAL, not cosmetic: `vault` is interpolated into the request AUTHORITY, and a
+// looser class like [^/]+ would let a reference such as `azure-kv://evil.com#/x` (`#`/`?`/`\` terminate
+// the authority in WHATWG URL parsing) redirect the fetch host and exfiltrate the Managed Identity token.
+const REF = /^azure-kv:\/\/([a-zA-Z0-9-]+)\/([a-zA-Z0-9-]+)(?:\/([a-zA-Z0-9-]+))?$/;
 
 export function azureKeyVault(opts: { fetch?: typeof fetch } = {}): Resolvers {
   const f = opts.fetch ?? fetch;

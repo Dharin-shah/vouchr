@@ -34,3 +34,9 @@ test('gcp resolver throws when the payload is missing (no empty-string success)'
     String(url).includes('metadata.google.internal') ? ok({ access_token: 't' }) : ok({ payload: {} })) as unknown as typeof globalThis.fetch;
   await assert.rejects(() => gcpSecretManager({ fetch })['gcp-sm'](REF), /no payload/);
 });
+
+test('gcp resolver throws when the base64 decodes to empty (truthy "=" → "")', async () => {
+  const fetch = (async (url: string) =>
+    String(url).includes('metadata.google.internal') ? ok({ access_token: 't' }) : ok({ payload: { data: '=' } })) as unknown as typeof globalThis.fetch;
+  await assert.rejects(() => gcpSecretManager({ fetch })['gcp-sm'](REF), /empty value/);
+});

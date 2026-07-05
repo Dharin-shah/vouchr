@@ -23,6 +23,17 @@ test('azure resolver throws on a malformed reference', async () => {
   await assert.rejects(() => azureKeyVault({ fetch })['azure-kv']('azure-kv://only-vault'), /Malformed/);
 });
 
+test('azure resolver rejects a host-injecting reference before any fetch (SSRF guard)', async () => {
+  // `#`/`?`/`\` terminate the URL authority; a loose vault charset would redirect the token to the
+  // attacker host. The reference must be rejected at parse time, so fetch is never even called.
+  let called = false;
+  const fetch = (async () => { called = true; return ok({ access_token: 't' }); }) as unknown as typeof globalThis.fetch;
+  for (const bad of ['azure-kv://evil.com#/github-bot', 'azure-kv://evil.com?x/github-bot', 'azure-kv://ev\\il/github-bot']) {
+    await assert.rejects(() => azureKeyVault({ fetch })['azure-kv'](bad), /Malformed/);
+  }
+  assert.equal(called, false);
+});
+
 test('azure resolver throws (never resolves empty) on a failed access', async () => {
   const fetch = (async (url: string) =>
     String(url).includes('169.254.169.254') ? ok({ access_token: 't' }) : fail(404)) as unknown as typeof globalThis.fetch;
