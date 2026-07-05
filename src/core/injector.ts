@@ -102,7 +102,18 @@ export class ConnectionHandle {
     // borrowed member, not the caller). Added to the inject audit meta so non-repudiation records BOTH
     // the acted-as member and the real triggerer. Default null = same as acting (nothing extra recorded).
     private triggeredBy: string | null = null,
+    // The Slack channel this request originated in. Recorded on the inject audit for EVERY owner kind
+    // (not just channel-owned), so `/vouchr stats` can attribute per-user / session / union usage to the
+    // channel it happened in — otherwise those (the default modes) all read as "never used". Null when
+    // there is no channel context (a DM, or a headless call whose token carries no channel).
+    private originChannel: string | null = null,
   ) {}
+
+  /** The channel an injection is attributed to in the audit log: the explicit origin channel when known,
+   *  else the owning channel for a channel-owned cred (preserves prior behavior), else null. */
+  private auditChannel(): string | null {
+    return this.originChannel ?? (this.owner.kind === 'channel' ? this.owner.id : null);
+  }
 
   /** Union non-repudiation: the real triggerer id when a union borrow makes it differ from the acted-as
    *  member; else undefined. A plain userId, never a secret. Populates the audit `actor` column so the
@@ -150,8 +161,11 @@ export class ConnectionHandle {
    */
   private async egressError(host: string, reason: string): Promise<void> {
     this.emit({ type: 'egress_error', provider: this.provider.id, host, reason });
-    // Carry the same union triggerer as the success path so a FAILED call keeps its non-repudiation.
-    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...this.triggerMeta() }, this.triggerActor()).catch(() => undefined);
+    // Carry the same union triggerer AND origin channel as the success path so a FAILED call keeps its
+    // non-repudiation and its per-channel attribution.
+    const ch = this.auditChannel();
+    const channelMeta = ch ? { channel: ch } : {};
+    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...channelMeta, ...this.triggerMeta() }, this.triggerActor()).catch(() => undefined);
   }
 
   /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502.
@@ -278,9 +292,10 @@ export class ConnectionHandle {
     // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
     // failed fetch (the caller might retry a non-idempotent request).
     await this.vault.touch(this.owner, this.provider.id).catch(() => undefined);
-    // Attribute the injection to the channel when the cred is channel-owned (owner.id IS the channel
-    // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
-    const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
+    // Attribute the injection to the channel it happened in (origin channel, or the owning channel for a
+    // channel-owned cred). Powers per-channel usage analytics across ALL modes, not just shared.
+    const ch = this.auditChannel();
+    const channelMeta = ch ? { channel: ch } : {};
     await this.audit
       .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...this.triggerMeta() }, this.triggerActor())
       .catch(() => undefined);

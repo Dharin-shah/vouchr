@@ -72,6 +72,14 @@ export interface AuditRow {
   at: number; // ms epoch
 }
 
+/** One provider's usage rollup for a channel (see `statsByChannel`). Powers `/vouchr stats`. */
+export interface StatsRow {
+  provider: string;
+  uses: number; // total injections in the window
+  distinctActors: number; // distinct acting humans
+  lastUsed: number; // ms epoch of the most recent injection
+}
+
 /** Append-only audit log. `meta` must NEVER contain token material; defense-in-depth redaction enforces it anyway. */
 export class Audit {
   constructor(private db: Db) {}
@@ -95,6 +103,34 @@ export class Audit {
        WHERE team_id = ? AND channel = ? ORDER BY at DESC LIMIT ?`,
       [teamId, channelId, limit],
     );
+  }
+
+  /** Per-provider injection stats for a channel since `sinceEpoch` (ms epoch): total injections,
+   *  distinct requesting humans, and last-used time. One GROUP BY, backend-agnostic (epoch comparison,
+   *  no date functions). Admin-gated at the call site; powers `/vouchr stats`.
+   *
+   *  "Distinct humans" = `COALESCE(actor, user_id)`: in union mode `user_id` is the acted-as member and
+   *  `actor` is the real requester, so we count requesters; otherwise `actor` is null and `user_id` IS
+   *  the requester. Counts are numeric on both backends (SQLite native; Postgres via the global int8
+   *  parser in db.ts) and Postgres lowercases unquoted aliases, so we alias in snake_case and coerce
+   *  with Number() defensively. */
+  async statsByChannel(teamId: string, channelId: string, sinceEpoch: number): Promise<StatsRow[]> {
+    const rows = await this.db.all<{ provider: string; uses: unknown; distinct_actors: unknown; last_used: unknown }>(
+      `SELECT provider,
+              COUNT(*)                                 AS uses,
+              COUNT(DISTINCT COALESCE(actor, user_id)) AS distinct_actors,
+              MAX(at)                                  AS last_used
+         FROM audit
+        WHERE team_id = ? AND channel = ? AND action = 'inject' AND at >= ?
+        GROUP BY provider`,
+      [teamId, channelId, sinceEpoch],
+    );
+    return rows.map((r) => ({
+      provider: r.provider,
+      uses: Number(r.uses),
+      distinctActors: Number(r.distinct_actors),
+      lastUsed: Number(r.last_used),
+    }));
   }
 
   async record(

@@ -455,8 +455,9 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // refresh). The 8th wires the metrics sink so the broker path stops being a black box; the 9th
     // wires the audit STREAM sink (raw actor id) for host-side ingestion. The 10th is the real
     // triggering caller (claims.userId): in union mode `acting` is the borrowed member, so passing the
-    // caller lets the inject audit record BOTH for non-repudiation (no-op when they're the same).
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId);
+    // caller lets the inject audit record BOTH for non-repudiation (no-op when they're the same). The
+    // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null);
     return { handle, provider };
   }
 

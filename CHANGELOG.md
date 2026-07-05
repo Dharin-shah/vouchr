@@ -7,6 +7,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- `/vouchr stats` — admin per-channel usage analytics (last 30 days). For each brokered tool enabled in
+  the channel: total injections, distinct acting humans, last-used time, and a `never used` flag for
+  enabled-but-idle tools (dead weight to prune), ending with a `disable` hint. Admin-gated (same gate as
+  `mode`/`enable`) + audited on refusal; ephemeral. New `Audit.statsByChannel` (one GROUP BY, backend-
+  agnostic) and a `statsBlocks` renderer. Distinct-humans counts the requester (`COALESCE(actor,
+  user_id)`), so union usage is attributed to the caller, not the borrowed member.
+
+### Changed
+
+- Inject audit rows now record the **origin channel** for every credential mode, not just channel-owned
+  (`shared`). Per-user (the default), `session`, and `union` usage previously left `channel` null, so
+  per-channel analytics (`/vouchr stats`) could not see them. The `ConnectionHandle` gains an optional
+  trailing `originChannel` argument (defaults to null → prior behavior); Bolt and the broker pass the
+  request's channel.
+
 - `/vouchr audit` — a self-service, in-Slack view of credential usage. A user sees the last ~20 audit
   events attributed to them (their own credential's usage across channels, including union-mode
   borrows); a channel admin can additionally run `/vouchr audit channel` for the current channel's

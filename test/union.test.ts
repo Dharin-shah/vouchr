@@ -92,7 +92,9 @@ test('union resolves to a connected member and audits that member (not caller, n
   const row = await injectRow(db);
   assert.equal(row.user_id, 'U_ALICE');   // audited AS the connected member (the acting actor)
   assert.notEqual(row.user_id, 'U_CALLER'); // NOT the caller who triggered it
-  assert.equal(row.channel, null);          // user-owned → not attributed to the channel (no conflation)
+  // Attributed to the ORIGIN channel where the request happened (so /vouchr stats sees union usage).
+  // This is NOT owner conflation: the vault owner is still user-keyed and user_id above is the member.
+  assert.equal(row.channel, 'C_FIN');
   assert.ok(!row.meta.includes('sk-alice-secret')); // and the secret never reaches the audit log
 });
 
