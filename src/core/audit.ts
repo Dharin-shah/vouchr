@@ -87,7 +87,8 @@ export class Audit {
     );
   }
 
-  /** A channel's channel-owned credential trail (admin-gated at the call site). Excludes `meta`. */
+  /** Every audit row tagged with this channel — channel-owned credential usage AND per-user activity
+   *  that happened in the channel (provider/action/actor/at). Admin-gated at the call site. Excludes `meta`. */
   async listByChannel(teamId: string, channelId: string, limit: number): Promise<AuditRow[]> {
     return this.db.all(
       `SELECT provider, action, actor, channel, at FROM audit

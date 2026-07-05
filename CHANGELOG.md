@@ -19,7 +19,8 @@ All notable changes to this project are documented here. This project adheres to
 
 - Headless broker audit-read parity: `POST /v1/audit` returns the caller's own last ~20 audit events
   (headless analogue of `/vouchr audit`), and `POST /v1/admin/audit` returns the signed channel's
-  channel-owned events behind the SIGNED `isAdmin` claim (analogue of `/vouchr audit channel`). Same
+  events (all activity tagged with the channel) behind the SIGNED `isAdmin` claim (analogue of
+  `/vouchr audit channel`). Same
   invariants as the Slack side: strict per-user / per-channel scoping enforced in the core read query,
   `team_id` always constrained, and NO `meta` in the response. Adds the `BrokerAuditResponse` wire type
   (exported from both entry points) and wire-contract goldens. Closes the last surface-parity gap

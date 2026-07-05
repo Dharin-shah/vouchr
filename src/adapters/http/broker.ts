@@ -801,8 +801,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
   }
 
   /**
-   * `POST /v1/admin/audit` — the current channel's last ~20 channel-owned audit events (headless
-   * analogue of `/vouchr audit channel`). Channel/team come ONLY from the signed claims (never the
+   * `POST /v1/admin/audit` — the current channel's last ~20 audit events (all activity tagged with the
+   * channel, headless analogue of `/vouchr audit channel`). Channel/team come ONLY from the signed claims (never the
    * body); admin authority is the SIGNED `isAdmin` claim via requireAdmin (fail closed + audited).
    * NO secret and NO `meta`.
    */
