@@ -264,6 +264,20 @@ npm run example:github   # then @-mention the bot in a channel
 
 Built-ins: `github()`, `google()`, `gitlab()`, `notion()`.
 
+A built-in is one credential, not one API product. A single `google()` connection covers
+Calendar, Gmail, People, … — pick the scopes and egress paths for the surfaces your agent uses,
+and the user consents once:
+
+```ts
+const gcal = google({
+  scopes: ['openid', 'email', 'https://www.googleapis.com/auth/calendar.events'],
+  egressPaths: ['/calendar/v3/'],
+});
+```
+
+Hosts outside the built-in `egressAllow` list (e.g. `docs.googleapis.com`) need a custom
+provider via `defineProvider`.
+
 Any OAuth2 provider can be declared with `defineProvider`; non-OAuth APIs can use
 `credential: 'key'` and an `inject` function.
 
