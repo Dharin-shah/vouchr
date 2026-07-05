@@ -7,7 +7,7 @@ import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
-import { selectRevocations, revokeConnection } from '../src/core/offboard';
+import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider } from '../src/core/offboard';
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -95,6 +95,48 @@ test('failing upstream revoke still deletes locally and reports upstreamOk=false
   }
   assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable'), null);
   assert.equal(JSON.parse((await db.get('SELECT meta FROM audit WHERE action=?', ['revoke']) as any).meta).ok, false);
+});
+
+test('local delete is guaranteed even with a wrong key and no registry (break-glass invariant)', async () => {
+  // P1: if the master key / provider registry are unavailable, the CLI still constructs a Vault with a
+  // throwaway key and no registry. revokeConnection must delete locally regardless — the token read
+  // fails to decrypt (swallowed) and upstream revoke is skipped, but the credential is gone.
+  const { db, audit, consent, sessions } = await seed();
+  const wrongKeyVault = new Vault(db, randomBytes(32)); // a DIFFERENT key than the data was sealed with
+  const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
+  const out = await revokeConnection(wrongKeyVault, audit, consent, sessions, undefined, row, 'revocable');
+  assert.equal(out.removed, true); // deleted despite being unable to decrypt the token
+  assert.equal(out.upstreamOk, true); // no registry → upstream revoke skipped, not failed
+  assert.equal(await wrongKeyVault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable'), null);
+});
+
+test('pending consent + grants with NO connection are counted and purged for the scope', async () => {
+  // P2: a pending "Connect" (or lingering thread grant) for the provider but no live connection must
+  // still be cleared, or it resurrects access after the break-glass run.
+  const { db } = await seed();
+  const id: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U_ORPHAN' }; // no connection row
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
+  await consent.begin(id, revocable, 'https://broker.example/cb', 'C9');
+  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000);
+  // A different provider's pending state must survive the scoped purge.
+  await consent.begin(id, { ...revocable, id: 'other' } as any, 'https://broker.example/cb', 'C9');
+
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), { consents: 1, grants: 1 });
+  const purged = await purgePendingForProvider(db, { provider: 'revocable' });
+  assert.deepEqual(purged, { consents: 1, grants: 1 });
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), { consents: 0, grants: 0 });
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'other' }), { consents: 1, grants: 0 }); // untouched
+});
+
+test('pending purge respects the team/user scope', async () => {
+  const { db } = await seed();
+  const consent = new Consent(db);
+  await consent.begin({ enterpriseId: null, teamId: 'T1', userId: 'U1' }, revocable, 'https://x/cb', null);
+  await consent.begin({ enterpriseId: null, teamId: 'T2', userId: 'U2' }, revocable, 'https://x/cb', null);
+  const purged = await purgePendingForProvider(db, { provider: 'revocable', teamId: 'T1' });
+  assert.equal(purged.consents, 1); // only T1
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable', teamId: 'T2' }), { consents: 1, grants: 0 });
 });
 
 test('revoking a user connection clears that user+provider session grants and pending consent', async () => {

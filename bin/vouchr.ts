@@ -17,7 +17,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
-import { selectRevocations, revokeConnection, type RevokeFilter } from '../src/core/offboard';
+import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
 import { loadProviders } from './providerConfig';
 
 type Flags = { values: Record<string, string>; positional: string[] };
@@ -117,9 +117,11 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * team/user/channel) during incident response. Dry-run is the DEFAULT — it prints a no-secret table
  * and mutates nothing; `--yes` is required to actually revoke. Refuses to run without `--provider`.
  *
- * Unlike the metadata-only read commands, this one DELETES and (best-effort) upstream-revokes, so it
- * constructs a Vault (master key) and the operator's provider registry. It never PRINTS a secret; the
- * only decryption is the just-read access token handed to the upstream revoke, never to stdout.
+ * Local deletion is the security-meaningful action and MUST be guaranteed: the provider registry and
+ * master key (needed only for the best-effort UPSTREAM revoke + token decrypt) are loaded defensively,
+ * so a malformed provider config or an unavailable master key disables upstream revoke but never blocks
+ * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
+ * the upstream revoke, never to stdout. Pending consent + thread grants for the scope are cleared too.
  */
 async function cmdRevoke(db: Db, f: Flags): Promise<number> {
   const provider = f.values.provider;
@@ -139,15 +141,31 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
     rows.map((r) => [r.teamId, r.ownerKind, r.ownerId, r.externalAccount ?? '-', ts(r.createdAt)]),
   );
   if (dryRun) {
-    if (rows.length) console.log('\nNo changes made. Re-run with --yes to revoke.');
+    const pending = await countPendingForProvider(db, filter);
+    if (pending.consents || pending.grants) {
+      console.log(`Would also clear ${pending.consents} pending consent + ${pending.grants} session grant(s).`);
+    }
+    if (rows.length || pending.consents || pending.grants) console.log('\nNo changes made. Re-run with --yes to revoke.');
     return 0;
   }
-  if (!rows.length) return 0;
 
-  // Real registry (same loader the broker uses) so upstream revoke uses the operator's client creds.
-  // A provider with no revokeUrl is an honest no-op; local deletion is the security-meaningful action.
-  const registry = new ProviderRegistry(loadProviders(process.env));
-  const vault = new Vault(db, loadMasterKey());
+  // Load the registry + master key BEST-EFFORT: break-glass must not die before the local delete just
+  // because provider config is malformed or the key is missing. A failure only disables upstream revoke
+  // (and token decrypt); the local delete below needs neither the key nor the registry.
+  let registry: ProviderRegistry | undefined;
+  try {
+    registry = new ProviderRegistry(loadProviders(process.env));
+  } catch (e: any) {
+    console.error(`revoke: provider config unavailable (${e?.message ?? e}); upstream revoke disabled — local deletion will proceed`);
+  }
+  let key: Buffer;
+  try {
+    key = loadMasterKey();
+  } catch (e: any) {
+    console.error(`revoke: master key unavailable (${e?.message ?? e}); token decrypt + upstream revoke disabled — local deletion will proceed`);
+    key = Buffer.alloc(32); // never used to decrypt successfully; vault.delete needs no key
+  }
+  const vault = new Vault(db, key);
   const audit = new Audit(db);
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
@@ -159,8 +177,11 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
     if (!r.removed) localFailures++;
     if (!r.upstreamOk) upstreamFailures++;
   }
+  // Clear pending consent + thread grants for the SCOPE regardless of whether any connection matched —
+  // an in-flight "Connect" or a lingering grant with no live connection would otherwise resurrect access.
+  const purged = await purgePendingForProvider(db, filter);
   const revoked = rows.length - localFailures;
-  console.log(`\nRevoked ${revoked}/${rows.length} locally; ${upstreamFailures} upstream revoke(s) failed (best-effort).`);
+  console.log(`\nRevoked ${revoked}/${rows.length} locally; ${upstreamFailures} upstream revoke(s) failed (best-effort); cleared ${purged.consents} pending consent + ${purged.grants} session grant(s).`);
   // Non-zero only when a LOCAL deletion failed (access still present); upstream failures don't fail.
   return localFailures ? 1 : 0;
 }

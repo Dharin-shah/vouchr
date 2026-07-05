@@ -136,6 +136,42 @@ export async function selectRevocations(db: Db, f: RevokeFilter): Promise<Revoke
   }));
 }
 
+/** Scoped predicate for pending consent / session grants — `provider` plus whichever of team/user/
+ *  channel the filter narrows to. Both `consent_request` and `session_grant` carry these columns. */
+function pendingWhere(f: RevokeFilter): { where: string; params: unknown[] } {
+  const where = ['provider=?'];
+  const params: unknown[] = [f.provider];
+  if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
+  if (f.userId) { where.push('user_id=?'); params.push(f.userId); }
+  if (f.channel) { where.push('channel=?'); params.push(f.channel); }
+  return { where: where.join(' AND '), params };
+}
+
+/**
+ * Pending OAuth consents + thread session grants a {@link RevokeFilter} matches — counted, NOT deleted
+ * (for the dry-run). These exist INDEPENDENTLY of a live connection row: a `/vouchr connect` click that
+ * never completed, or a thread grant that outlived its connection, both match the provider but not
+ * `selectRevocations`, so break-glass must report + clear them separately or they resurrect access.
+ */
+export async function countPendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
+  const { where, params } = pendingWhere(f);
+  const c = (await db.get(`SELECT COUNT(*) AS n FROM consent_request WHERE ${where}`, params)) as { n: number } | undefined;
+  const s = (await db.get(`SELECT COUNT(*) AS n FROM session_grant WHERE ${where}`, params)) as { n: number } | undefined;
+  return { consents: c?.n ?? 0, grants: s?.n ?? 0 };
+}
+
+/**
+ * Delete every pending consent + thread session grant matching the scope, so a pending "Connect" or a
+ * lingering thread grant can't complete after the break-glass run and resurrect the revoked provider.
+ * Runs regardless of whether any live connection matched (that's the whole point). Returns the counts.
+ */
+export async function purgePendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
+  const { where, params } = pendingWhere(f);
+  const consents = (await db.run(`DELETE FROM consent_request WHERE ${where}`, params)).changes;
+  const grants = (await db.run(`DELETE FROM session_grant WHERE ${where}`, params)).changes;
+  return { consents, grants };
+}
+
 /**
  * Revoke ONE already-selected connection row: local delete FIRST (the security-meaningful action,
  * done even if the token can't be decrypted — e.g. a KMS row with no KMS client wired into the CLI),
