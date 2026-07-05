@@ -27,13 +27,18 @@ jobs:
       # fail unless the ref is a v* tag — a workflow_dispatch from a branch would otherwise skip the
       # version logic and publish `main`. Then require a matching CHANGELOG section. A manual re-run is
       # still fine as long as it targets a tag. github-release re-extracts the same section to publish.
-      - name: Guard — release only from a v* tag, with a CHANGELOG entry
+      # Also require tag == package.json version: npm publishes whatever package.json says, so a
+      # mismatched tag would ship one version under another's name/Release notes.
+      - name: Guard — release only from a v* tag matching package.json, with a CHANGELOG entry
         run: |
           case "$GITHUB_REF" in
             refs/tags/v*) ;;
             *) echo "::error::release publishes only from a v* tag (got $GITHUB_REF); a manual dispatch must target a tag, not a branch"; exit 1 ;;
           esac
           VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p 'require("./package.json").version')"
+          [ "$PKG_VERSION" = "$VERSION" ] \
+            || { echo "::error::tag v$VERSION does not match package.json version $PKG_VERSION — bump package.json before tagging"; exit 1; }
           awk -v ver="$VERSION" 'index($0,"## ["ver"]")==1{g=1;next} g&&/^## /{g=0} g{print}' CHANGELOG.md | grep -q . \
             || { echo "::error::no CHANGELOG section for $VERSION — add a '## [$VERSION]' entry before tagging"; exit 1; }
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6

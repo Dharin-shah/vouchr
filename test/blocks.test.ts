@@ -1,7 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  connectBlocks,
   connectedBlocks,
+  connectedHtml,
   consentDeniedBlocks,
   statusBlocks,
   disconnectConfirmBlocks,
@@ -25,6 +27,53 @@ test('connectedBlocks: interpolates provider + channel and shows how to disconne
 test('connectedBlocks: null channel renders a DM scope', () => {
   const b = connectedBlocks('github', { channel: null }) as any[];
   assert.match(j(b), /your DMs/);
+});
+
+test('connectedBlocks: shows the connected account and granted scope', () => {
+  const b = connectedBlocks('github', { channel: 'C123', scope: 'repo read:user', account: 'octocat' }) as any[];
+  assert.match(j(b), /Connected as \*octocat\*/);
+  assert.match(j(b), /repo read:user/); // granted scope from the token response
+});
+
+test('connectedHtml: the live post-connect page shows account + granted scopes', () => {
+  const html = connectedHtml('github', 'octocat', 'repo read:user');
+  assert.match(html, /github connected as octocat/);
+  assert.match(html, /repo read:user/); // granted scopes surfaced where the user actually lands
+  // No scopes → no granted line (e.g. a provider that doesn't echo scope and has none requested).
+  assert.doesNotMatch(connectedHtml('github', 'octocat', ''), /acting as you/);
+});
+
+test('connectedHtml: escapes provider-controlled markup (no XSS on the callback page)', () => {
+  const html = connectedHtml('github', '</h2><script>alert(1)</script>', 'repo"><img src=x onerror=alert(1)>');
+  assert.doesNotMatch(html, /<script/i); // no raw <script> tag can form from the account
+  assert.doesNotMatch(html, /<img/i); // nor a raw <img> from the scope string (its `<` is escaped)
+  assert.match(html, /&lt;script&gt;/); // the account markup is present, but escaped (inert)
+  assert.match(html, /&lt;img/); // and so is the scope markup
+});
+
+test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
+  const b = connectBlocks('github', 'https://auth') as any[];
+  assert.equal(b.length, 2); // intro section + actions
+  assert.doesNotMatch(j(b), /Connecting grants/);
+});
+
+test('connectBlocks: renders human-language scope descriptions when passed', () => {
+  const b = connectBlocks('github', 'https://auth', {
+    list: ['read:user', 'repo'],
+    describe: { 'read:user': 'Read your profile', repo: 'Read and write your repositories' },
+  }) as any[];
+  assert.match(j(b), /Connecting grants the agent, acting as you/);
+  assert.match(j(b), /Read your profile/);
+  assert.match(j(b), /Read and write your repositories/);
+});
+
+test('connectBlocks: an unknown scope falls back to its raw string, never dropped', () => {
+  const b = connectBlocks('acme', 'https://auth', {
+    list: ['known', 'mystery:scope'],
+    describe: { known: 'A known thing' },
+  }) as any[];
+  assert.match(j(b), /A known thing/);
+  assert.match(j(b), /mystery:scope/); // raw fallback, not hidden
 });
 
 test('consentDeniedBlocks: states provider, default reason, and next step', () => {

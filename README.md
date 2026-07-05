@@ -286,6 +286,9 @@ More examples:
 - [Google user credentials](./examples/google-user)
 - [Internal API keys](./examples/internal-api-key)
 - [AWS Secrets Manager references](./examples/aws-secrets-manager)
+- [GCP Secret Manager references](./examples/gcp-secret-manager)
+- [Azure Key Vault references](./examples/azure-key-vault)
+- [HashiCorp Vault references](./examples/hashicorp-vault)
 - [Postgres + KMS deployment](./examples/postgres-kms)
 - [Sidecar broker](./examples/sidecar)
 

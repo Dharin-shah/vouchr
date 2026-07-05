@@ -43,7 +43,7 @@ function emitConsent(
 }
 
 export type CallbackResult =
-  | { ok: true; provider: string; account: string | null; identity: SlackIdentity }
+  | { ok: true; provider: string; account: string | null; scopes: string; identity: SlackIdentity }
   | { ok: false; status: number; error: string };
 
 /**
@@ -79,16 +79,19 @@ export async function handleOAuthCallback(
     const account = provider.accountProbe
       ? await provider.accountProbe(tok.accessToken).catch(() => null)
       : null;
+    // The scopes actually granted (token response), falling back to what we requested if the provider
+    // doesn't echo them — this is what the post-connect confirmation shows the user.
+    const scopes = tok.scopes ?? provider.scopesDefault.join(' ');
     await deps.vault.upsert(userOwner(row.identity), provider.id, {
       accessToken: tok.accessToken,
       refreshToken: tok.refreshToken,
-      scopes: tok.scopes ?? provider.scopesDefault.join(' '),
+      scopes,
       expiresAt: tok.expiresAt,
       externalAccount: account,
     });
     await deps.audit.record('connect', row.identity, provider.id, { account });
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_granted', 200);
-    return { ok: true, provider: provider.id, account, identity: row.identity };
+    return { ok: true, provider: provider.id, account, scopes, identity: row.identity };
   } catch {
     // Post-consent connection FAILURE (token exchange / account probe / vault write threw) — not a
     // user denial, but the closest action on the lossy stream. status 500 here is synthetic (the host
