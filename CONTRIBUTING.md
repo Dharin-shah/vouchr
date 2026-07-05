@@ -21,6 +21,9 @@ npm test           # unit + integration, fully offline
 
 - One concern per PR; keep the diff focused and match surrounding style.
 - Non-trivial logic ships with a runnable test (`node:test`); flows get an integration test.
+  CI reports per-file `src/**` coverage (`npm run test:coverage`) on the Node 22 leg — new code
+  should keep it moving up, never down. (Visibility today; a failing floor lands once the baseline
+  is established, and only ever ratchets upward.)
 - Never weaken the security invariants: tokens stay out of logs, messages, the audit
   table, and tool schemas; keep the egress allowlist and single-use OAuth `state`.
 - If the correct approach isn't feasible, raise it in the PR instead of faking it.

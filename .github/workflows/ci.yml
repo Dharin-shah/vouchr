@@ -47,7 +47,13 @@ jobs:
       # Build BEFORE test: the compiled dist/ must exist for tests that inspect the shipped artifact
       # (e.g. the headless @slack-free module-graph check), and an emit/declaration break fails fast here.
       - run: npm run build
+      # Both legs run the suite once: the 24 leg plain, the 22 leg with node:test native coverage so
+      # the per-file src/** table prints in the job log. Phase 1 = visibility only — no failing
+      # threshold yet; a ratchet (--test-coverage-lines) lands as a follow-up once the floor is known.
       - run: npm test
+        if: matrix.node != 22
+      - run: npm run test:coverage
+        if: matrix.node == 22
 
   # Exercises the PUBLISHED artifact (pack → install into a fresh project → resolve every
   # entrypoint/bin/type). Separate job: a packaging break is distinct from a test failure, and it
