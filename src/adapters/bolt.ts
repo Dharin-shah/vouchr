@@ -893,7 +893,7 @@ export async function createVouchr(opts: VouchrOptions) {
             return respond(adminOnly(allowChannelCreatorConfig, 'view channel credential usage'));
           }
           const rows = await audit.listByChannel(identity.teamId, command.channel_id, 20);
-          return respond({ text: 'Channel credential usage', blocks: auditBlocks(rows, `Credential usage in <#${command.channel_id}>`) as any });
+          return respond({ text: 'Channel credential usage', blocks: auditBlocks(rows, 'Credential usage in this channel') as any });
         }
         const rows = await audit.listByOwnerUser(identity, 20);
         return respond({ text: 'Your credential usage', blocks: auditBlocks(rows, 'Your credential usage') as any });

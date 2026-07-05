@@ -12,7 +12,10 @@ All notable changes to this project are documented here. This project adheres to
   borrows); a channel admin can additionally run `/vouchr audit channel` for the current channel's
   channel-owned usage. Strictly scoped — a non-admin never sees another user's or another channel's
   rows — and `meta` is never rendered (the read query omits it). New `Audit.listByOwnerUser` /
-  `Audit.listByChannel` read methods and an `auditBlocks` renderer.
+  `Audit.listByChannel` read methods and an `auditBlocks` renderer. In union mode the inject audit now
+  also populates the `actor` column with the real triggerer (a plain userId, already in `meta`), so the
+  owner's view shows *who* borrowed their credential; the renderer escapes Slack mrkdwn so a stored
+  value can never forge a link or mention.
 
 ## [0.2.0-rc.1] - 2026-07-03
 

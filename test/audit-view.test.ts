@@ -63,6 +63,22 @@ test('audit: meta contents are never rendered in the Slack view', async () => {
   assert.doesNotMatch(JSON.stringify(res), /TOPSECRETLABEL/);
 });
 
+test('audit: a stored value cannot forge a mrkdwn link/mention (escaped in the view)', async () => {
+  const { audit, run } = await harness();
+  // Mirrors the real vector: an unvalidated `/vouchr configure <arg>` denial writes attacker text
+  // into the provider column. It must render inert, never as a live <…|link> or <@mention>.
+  await audit.record('inject', id('U_A'), '<https://evil.com|Re-authorize Vouchr>', { host: 'x' });
+  const json = JSON.stringify(await run('audit', 'U_A'));
+  assert.doesNotMatch(json, /<https:\/\/evil\.com\|/); // no raw mrkdwn link survives
+  assert.match(json, /&lt;https:\/\/evil\.com/);        // present but escaped (inert)
+});
+
+test('audit: surfaces WHO borrowed the credential (union actor column)', async () => {
+  const { audit, run } = await harness();
+  await audit.record('inject', id('U_A'), 'github', { host: 'x' }, 'U_B'); // U_B borrowed U_A's cred
+  assert.match(JSON.stringify(await run('audit', 'U_A')), /by <@U_B>/);
+});
+
 test('audit channel: a non-admin is refused via the admin gate and the denial is audited', async () => {
   const { audit, run } = await harness(); // no isAdmin override, users.info is_admin=false, not the creator
   const res = await run('audit channel', 'U_A');

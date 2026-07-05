@@ -1,8 +1,15 @@
 import type { AuditRow } from '../core/audit';
 
+/** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
+ *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
+ *  unvalidated `/vouchr configure <arg>` denial writes `arg` there), so an admin's `audit channel`
+ *  view must not turn a stored string into a forged `<…|link>` or `<@user>` mention. */
+const escapeMrkdwn = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
 /** `/vouchr audit`: a compact, read-only view of credential usage. Renders ONLY the non-secret
  *  columns (provider/action/actor/channel/time) — never `meta`, which the query already omits.
- *  Timestamps use Slack's `<!date^…>` token so each viewer sees their own locale/timezone. */
+ *  Timestamps use Slack's `<!date^…>` token so each viewer sees their own locale/timezone.
+ *  `heading` is caller-supplied constant text, never a stored value — safe as a plain_text header. */
 export function auditBlocks(rows: AuditRow[], heading: string): unknown[] {
   if (!rows.length) {
     return [{ type: 'section', text: { type: 'mrkdwn', text: `:information_source: *${heading}*\nNothing recorded yet.` } }];
@@ -10,9 +17,11 @@ export function auditBlocks(rows: AuditRow[], heading: string): unknown[] {
   const lines = rows.map((r) => {
     const secs = Math.floor(r.at / 1000);
     const when = `<!date^${secs}^{date_short_pretty} {time}|${new Date(r.at).toISOString()}>`;
-    const who = r.actor ? ` · by <@${r.actor}>` : '';
-    const where = r.channel ? ` · <#${r.channel}>` : '';
-    return `• *${r.provider}* · ${r.action}${who}${where} · ${when}`;
+    // actor/channel are Slack ids wrapped as a mention; escape defensively in case a future record
+    // path stores a non-id string, and escape the free-text provider/action columns unconditionally.
+    const who = r.actor ? ` · by <@${escapeMrkdwn(r.actor)}>` : '';
+    const where = r.channel ? ` · <#${escapeMrkdwn(r.channel)}>` : '';
+    return `• *${escapeMrkdwn(r.provider)}* · ${escapeMrkdwn(r.action)}${who}${where} · ${when}`;
   });
   return [
     { type: 'header', text: { type: 'plain_text', text: heading, emoji: true } },

@@ -104,10 +104,17 @@ export class ConnectionHandle {
     private triggeredBy: string | null = null,
   ) {}
 
-  /** Union non-repudiation: record the real triggerer alongside the acted-as member when they differ
-   *  (a plain userId, never a secret). Empty on every non-union path. Shared by success + failure audits. */
+  /** Union non-repudiation: the real triggerer id when a union borrow makes it differ from the acted-as
+   *  member; else undefined. A plain userId, never a secret. Populates the audit `actor` column so the
+   *  owner's `/vouchr audit` view can surface WHO borrowed their credential. */
+  private triggerActor(): string | undefined {
+    return this.triggeredBy && this.triggeredBy !== this.acting.userId ? this.triggeredBy : undefined;
+  }
+
+  /** Same triggerer, in meta form for the audit-stream copy. Empty on every non-union path. */
   private triggerMeta(): Record<string, string> {
-    return this.triggeredBy && this.triggeredBy !== this.acting.userId ? { triggeredBy: this.triggeredBy } : {};
+    const a = this.triggerActor();
+    return a ? { triggeredBy: a } : {};
   }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -144,7 +151,7 @@ export class ConnectionHandle {
   private async egressError(host: string, reason: string): Promise<void> {
     this.emit({ type: 'egress_error', provider: this.provider.id, host, reason });
     // Carry the same union triggerer as the success path so a FAILED call keeps its non-repudiation.
-    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...this.triggerMeta() }).catch(() => undefined);
+    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...this.triggerMeta() }, this.triggerActor()).catch(() => undefined);
   }
 
   /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502.
@@ -275,7 +282,7 @@ export class ConnectionHandle {
     // id then). For a user-owned cred owner.id is a user id, not a channel. Leave channel unset.
     const channelMeta = this.owner.kind === 'channel' ? { channel: this.owner.id } : {};
     await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...this.triggerMeta() })
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...this.triggerMeta() }, this.triggerActor())
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
