@@ -160,6 +160,14 @@ test('untouched save with a policy-denied provider writes no channel_tool row', 
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
+test('the Disconnect button carries a confirm dialog (no accidental one-click revoke)', async () => {
+  const h = await harness({ slackAdmin: false });
+  await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const view = await h.openModal();
+  const btn = view.blocks.map((b: any) => b.accessory).find((a: any) => a?.action_id === DISCONNECT_ACTION);
+  assert.ok(btn?.confirm?.confirm?.text); // Block Kit confirm object present
+});
+
 test('disconnect button removes the user connection and refreshes the modal view', async () => {
   const h = await harness({ slackAdmin: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });

@@ -277,6 +277,15 @@ export function configModal(o: {
           action_id: DISCONNECT_ACTION,
           value: c.provider,
           style: 'danger',
+          // Destructive + one-click, so gate it behind a native confirm dialog (parity with the
+          // ephemeral `/vouchr disconnect` confirm flow) — an accidental click shouldn't revoke.
+          confirm: {
+            title: { type: 'plain_text', text: 'Disconnect?' },
+            text: { type: 'mrkdwn', text: `Vouchr will delete your stored *${escapeMrkdwn(c.provider)}* credential. The agent won't be able to act as you on ${escapeMrkdwn(c.provider)} until you connect again.` },
+            confirm: { type: 'plain_text', text: 'Disconnect' },
+            deny: { type: 'plain_text', text: 'Cancel' },
+            style: 'danger',
+          },
         },
       });
     }
