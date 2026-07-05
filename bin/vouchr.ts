@@ -3,9 +3,12 @@
  * vouchr: operator CLI for self-hosted deployments.
  *
  * Connects to the SAME credential store the app uses (SQLite via VOUCHR_DB/--db,
- * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. Read-only, metadata-only:
- * it NEVER decrypts or prints token/secret material. `secret_ref` (an external
- * manager ARN/pointer, non-secret by design) is the only ref it surfaces.
+ * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. The read commands
+ * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
+ * token/secret material. The `revoke` command is the one exception: it DELETES rows
+ * and may best-effort decrypt an access token to hand to the upstream revoke — never
+ * to stdout. `secret_ref` (an external manager ARN/pointer, non-secret by design) is
+ * the only ref any command surfaces.
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
@@ -265,7 +268,7 @@ async function cmdHealth(f: Flags): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`vouchr: operator CLI (read-only, secret-free)
+  console.log(`vouchr: operator CLI (reads are metadata-only; only \`revoke\` mutates)
 
 Usage: vouchr <command> [options]
 
@@ -294,7 +297,8 @@ Store selection (shared with the app):
   --db <path>            SQLite file (overrides VOUCHR_DB; default vouchr.db)
   VOUCHR_DB              SQLite file path
   VOUCHR_DATABASE_URL    Postgres connection string (takes precedence)
-  VOUCHR_MASTER_KEY      base64 32-byte key (only loaded/validated by doctor)`);
+  VOUCHR_MASTER_KEY      base64 32-byte key (validated by doctor; loaded by revoke
+                         for best-effort upstream token revocation)`);
 }
 
 async function main(): Promise<number> {
