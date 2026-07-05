@@ -184,6 +184,20 @@ const CASES: { name: string; run: () => Promise<{ status: number; json: unknown 
       const { server, port } = await makeBroker();
       try { return await request(port, 'GET', '/v1/admin/config', undefined, { 'x-vouchr-identity': adminToken() }); } finally { server.close(); }
   } },
+  { name: 'audit.self', run: async () => {
+      const { server, db, port } = await makeBroker();
+      try {
+        await new Audit(db).record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U1' }, 'acme', { host: 'api.acme.example' });
+        return await request(port, 'POST', '/v1/audit', { identityToken: userToken() });
+      } finally { server.close(); }
+  } },
+  { name: 'admin.audit', run: async () => {
+      const { server, db, port } = await makeBroker();
+      try {
+        await new Audit(db).record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U1' }, 'acme', { channel: 'C1' });
+        return await request(port, 'POST', '/v1/admin/audit', { identityToken: adminToken() });
+      } finally { server.close(); }
+  } },
   { name: 'admin.reference.ok', run: async () => {
       const { server, port } = await makeBroker();
       try { return await request(port, 'POST', '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz' }); } finally { server.close(); }

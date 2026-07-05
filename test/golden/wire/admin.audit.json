@@ -1,0 +1,14 @@
+{
+  "status": 200,
+  "shape": {
+    "events": [
+      {
+        "action": "string",
+        "actor": "null",
+        "at": "number",
+        "channel": "string",
+        "provider": "string"
+      }
+    ]
+  }
+}

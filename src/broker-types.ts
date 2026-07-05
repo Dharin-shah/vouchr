@@ -8,6 +8,7 @@
  */
 
 import type { ChannelMode } from './core/channelConfig';
+import type { AuditRow } from './core/audit';
 
 /** Coarse per-provider consent state — no secret, existence + state only. */
 export type BrokerConsentState = 'connected' | 'needs_consent';
@@ -55,4 +56,11 @@ export interface BrokerAdminOkResponse {
  *  of the admin config write routes). Policy bits only, NO secret. `mode` is null when unconfigured. */
 export interface BrokerAdminConfigResponse {
   providers: { provider: string; mode: ChannelMode | null; enabled: boolean }[];
+}
+
+/** `POST /v1/audit` · `POST /v1/admin/audit` — a read-only slice of the audit trail: the caller's own
+ *  usage, or (admin) the current channel's. Non-secret columns ONLY — `meta` is never included (the
+ *  core read query omits it). Headless analogue of `/vouchr audit` / `/vouchr audit channel`. */
+export interface BrokerAuditResponse {
+  events: AuditRow[];
 }

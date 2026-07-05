@@ -49,6 +49,7 @@ One core, two front doors — both reach the same credential boundary.
 | Set the channel mode (`shared`/`union`/`per-user`/`session`) | ✅ `/vouchr mode` | ✅ `POST /v1/admin/mode` (admin claim) |
 | Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (admin claim) |
 | Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` (admin claim) |
+| See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
 

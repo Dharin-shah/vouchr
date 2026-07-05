@@ -17,7 +17,7 @@ import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
 import { DbReplayStore } from './replayStore';
-import type { BrokerAdminOkResponse, BrokerAdminConfigResponse } from '../../broker-types';
+import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse } from '../../broker-types';
 
 /**
  * The opaque, NO-SECRET handle the caller holds. It names a provider; the owner is always the acting
@@ -789,6 +789,32 @@ export function createBroker(opts: BrokerOptions): http.Server {
   }
 
   /**
+   * `POST /v1/audit` — the acting user's own last ~20 audit events (headless analogue of `/vouchr
+   * audit`). Identity from the SIGNED token; strictly the caller's own rows (core filters on
+   * user_id = caller). NO secret and NO `meta` — the read query omits it. Mirrors handleStatus.
+   */
+  async function handleAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
+    const claims = await verify(body.identityToken);
+    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    const events = await opts.audit.listByOwnerUser(identity, 20);
+    return { events };
+  }
+
+  /**
+   * `POST /v1/admin/audit` — the current channel's last ~20 audit events (all activity tagged with the
+   * channel, headless analogue of `/vouchr audit channel`). Channel/team come ONLY from the signed claims (never the
+   * body); admin authority is the SIGNED `isAdmin` claim via requireAdmin (fail closed + audited).
+   * NO secret and NO `meta`.
+   */
+  async function handleAdminAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
+    const claims = await verify(body.identityToken);
+    await requireAdmin(claims, 'audit'); // non-admin → 403 + audited denial, before any read
+    if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
+    const events = await opts.audit.listByChannel(claims.teamId, claims.channel, 20);
+    return { events };
+  }
+
+  /**
    * #55 `GET /v1/manifest` — the provider manifest: each provider's id and whether the agent acts as
    * the human (Vouchr brokers it) or as a service (host wires its own auth). Purely non-secret policy
    * metadata; keeps the source of truth in one place so a host needn't re-derive it. No identity
@@ -926,6 +952,14 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'POST' && url === '/v1/status') {
           await perimeter(req);
           return send(200, await handleStatus(await readJson(req)));
+        }
+        if (req.method === 'POST' && url === '/v1/audit') {
+          await perimeter(req);
+          return send(200, { ...await handleAudit(await readJson(req)) });
+        }
+        if (req.method === 'POST' && url === '/v1/admin/audit') {
+          await perimeter(req);
+          return send(200, { ...await handleAdminAudit(await readJson(req)) });
         }
         if (req.method === 'POST' && url === '/v1/user/reference') {
           await perimeter(req);
