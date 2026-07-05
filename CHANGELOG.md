@@ -17,6 +17,13 @@ All notable changes to this project are documented here. This project adheres to
   owner's view shows *who* borrowed their credential; the renderer escapes Slack mrkdwn so a stored
   value can never forge a link or mention.
 
+### Security
+
+- Headless broker OAuth landing page: `landingHtml()` now HTML-escapes its `title`/`body` internally
+  instead of relying on every call site to pre-escape (#52 hardening). No active reflected-XSS path
+  existed — the two call sites already escaped — but the helper shape allowed a future caller to
+  reintroduce one; escaping at the choke point removes that footgun. Adds a regression test.
+
 ## [0.2.0-rc.1] - 2026-07-03
 
 ### Breaking
