@@ -5,7 +5,7 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { ProviderRegistry } from './providers';
 import { revokeToken } from './tokens';
-import { userOwner } from './owner';
+import { userOwner, type Owner } from './owner';
 import { SessionGrants } from './session';
 
 /**
@@ -85,6 +85,143 @@ export async function offboardUser(
     await audit.record('revoke', identity, provider, meta);
   }
   return providers;
+}
+
+/** Break-glass bulk revocation filter. `provider` is REQUIRED (revoking across every provider is too
+ *  blunt); team/user/channel narrow the blast radius and compose (provider+team, provider+user, …). */
+export interface RevokeFilter {
+  provider: string;
+  teamId?: string;
+  userId?: string;
+  channel?: string;
+}
+
+/** One matched connection row — METADATA ONLY, never a secret. Feeds both the dry-run table and the
+ *  execution loop. */
+export interface RevokeRow {
+  teamId: string;
+  ownerKind: 'user' | 'channel';
+  ownerId: string;
+  externalAccount: string | null;
+  createdAt: number;
+}
+
+/** {@link RevokeRow} plus the per-row outcome. `removed` is the security-meaningful local delete.
+ *  `upstreamAttempted` is true only when a real upstream revoke call was actually made (the provider
+ *  has a revoke endpoint AND a token was decryptable); when false the upstream revoke was SKIPPED, not
+ *  succeeded — don't report a skip as a success. `upstreamOk` is meaningful only when attempted. */
+export interface RevokeOutcome extends RevokeRow {
+  removed: boolean;
+  upstreamAttempted: boolean;
+  upstreamOk: boolean;
+}
+
+/**
+ * Rows a {@link RevokeFilter} matches, metadata only (no ciphertext columns selected). The dry-run
+ * prints these and exits; the execution loop iterates them. Reuses the same `connection` predicate
+ * shape as the CLI `inventory` query, extended with owner-kind-aware --user/--channel filters.
+ */
+export async function selectRevocations(db: Db, f: RevokeFilter): Promise<RevokeRow[]> {
+  const where = ['provider=?'];
+  const params: unknown[] = [f.provider];
+  if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
+  // --user/--channel select a specific owner; user and channel ids can collide, so scope by kind too.
+  if (f.userId) { where.push("owner_kind='user' AND owner_id=?"); params.push(f.userId); }
+  if (f.channel) { where.push("owner_kind='channel' AND owner_id=?"); params.push(f.channel); }
+  const rows = (await db.all(
+    `SELECT team_id, owner_kind, owner_id, external_account, created_at
+     FROM connection WHERE ${where.join(' AND ')} ORDER BY team_id, owner_kind, owner_id`,
+    params,
+  )) as any[];
+  return rows.map((r) => ({
+    teamId: r.team_id, ownerKind: r.owner_kind, ownerId: r.owner_id,
+    externalAccount: r.external_account, createdAt: r.created_at,
+  }));
+}
+
+/** Scoped predicate for pending consent / session grants — `provider` plus whichever of team/user/
+ *  channel the filter narrows to. Both `consent_request` and `session_grant` carry these columns. */
+function pendingWhere(f: RevokeFilter): { where: string; params: unknown[] } {
+  const where = ['provider=?'];
+  const params: unknown[] = [f.provider];
+  if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
+  if (f.userId) { where.push('user_id=?'); params.push(f.userId); }
+  if (f.channel) { where.push('channel=?'); params.push(f.channel); }
+  return { where: where.join(' AND '), params };
+}
+
+/**
+ * Pending OAuth consents + thread session grants a {@link RevokeFilter} matches — counted, NOT deleted
+ * (for the dry-run). These exist INDEPENDENTLY of a live connection row: a `/vouchr connect` click that
+ * never completed, or a thread grant that outlived its connection, both match the provider but not
+ * `selectRevocations`, so break-glass must report + clear them separately or they resurrect access.
+ */
+export async function countPendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
+  const { where, params } = pendingWhere(f);
+  const c = (await db.get(`SELECT COUNT(*) AS n FROM consent_request WHERE ${where}`, params)) as { n: number } | undefined;
+  const s = (await db.get(`SELECT COUNT(*) AS n FROM session_grant WHERE ${where}`, params)) as { n: number } | undefined;
+  return { consents: c?.n ?? 0, grants: s?.n ?? 0 };
+}
+
+/**
+ * Delete every pending consent + thread session grant matching the scope, so a pending "Connect" or a
+ * lingering thread grant can't complete after the break-glass run and resurrect the revoked provider.
+ * Runs regardless of whether any live connection matched (that's the whole point). Returns the counts.
+ */
+export async function purgePendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
+  const { where, params } = pendingWhere(f);
+  const consents = (await db.run(`DELETE FROM consent_request WHERE ${where}`, params)).changes;
+  const grants = (await db.run(`DELETE FROM session_grant WHERE ${where}`, params)).changes;
+  return { consents, grants };
+}
+
+/**
+ * Revoke ONE already-selected connection row: local delete FIRST (the security-meaningful action,
+ * done even if the token can't be decrypted — e.g. a KMS row with no KMS client wired into the CLI),
+ * then best-effort upstream revoke, then audit ('revoke', no token) and — for a USER owner — clear
+ * that user's pending consent + thread session grants for the provider so neither can resurrect the
+ * credential. Mirrors {@link disconnectProvider}'s order but handles BOTH user- and channel-owned rows
+ * and never throws on a decrypt/upstream failure. Channel owners have no user-scoped consent/grants.
+ */
+export async function revokeConnection(
+  vault: Vault,
+  audit: Audit,
+  consent: Consent,
+  sessions: SessionGrants,
+  registry: ProviderRegistry | undefined,
+  row: RevokeRow,
+  provider: string,
+): Promise<RevokeOutcome> {
+  const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
+  // Read the token for the upstream revoke, but a decrypt failure must NEVER block the local delete.
+  let token: string | null = null;
+  try { token = (await vault.get(owner, provider))?.accessToken ?? null; } catch { /* still delete locally */ }
+  let removed = true;
+  try { await vault.delete(owner, provider); } catch { removed = false; } // local delete FIRST
+  // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
+  // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success.
+  let upstreamAttempted = false;
+  let upstreamOk = true;
+  if (registry?.has(provider) && token) {
+    const p = registry.get(provider);
+    if (p.revoke || p.revokeUrl) {
+      upstreamAttempted = true;
+      try { await revokeToken(p, token); } catch { upstreamOk = false; }
+    }
+  }
+  // Attribute the audit row to the OWNER (team + owner id); a channel row has no Slack user actor.
+  // Everything after the local delete is BEST-EFFORT and wrapped so one row's audit/consent/session
+  // failure (e.g. a transient DB error) can never throw out of the bulk-revoke loop and strand the
+  // remaining rows. The security-meaningful delete already happened above.
+  const actor: SlackIdentity = { enterpriseId: null, teamId: row.teamId, userId: row.ownerId };
+  const meta: Record<string, unknown> = { owner: row.ownerKind, reason: 'break-glass' };
+  if (upstreamAttempted) meta.ok = upstreamOk; else meta.upstream = 'skipped';
+  try { await audit.record('revoke', actor, provider, meta); } catch { /* best-effort */ }
+  if (row.ownerKind === 'user') {
+    try { await consent.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
+    try { await sessions.clearForProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
+  }
+  return { ...row, removed, upstreamAttempted, upstreamOk };
 }
 
 /**

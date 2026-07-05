@@ -3,16 +3,25 @@
  * vouchr: operator CLI for self-hosted deployments.
  *
  * Connects to the SAME credential store the app uses (SQLite via VOUCHR_DB/--db,
- * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. Read-only, metadata-only:
- * it NEVER decrypts or prints token/secret material. `secret_ref` (an external
- * manager ARN/pointer, non-secret by design) is the only ref it surfaces.
+ * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. The read commands
+ * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
+ * token/secret material. The `revoke` command is the one exception: it DELETES rows
+ * and may best-effort decrypt an access token to hand to the upstream revoke — never
+ * to stdout. `secret_ref` (an external manager ARN/pointer, non-secret by design) is
+ * the only ref any command surfaces.
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
 import { openDb, type Db } from '../src/core/db';
 import { loadMasterKey } from '../src/core/crypto';
 import { isPostgresUrl } from '../src/core/options';
-import { github, google, gitlab, notion, type Provider } from '../src/core/providers';
+import { github, google, gitlab, notion, ProviderRegistry, type Provider } from '../src/core/providers';
+import { Vault } from '../src/core/vault';
+import { Audit } from '../src/core/audit';
+import { Consent } from '../src/core/consent';
+import { SessionGrants } from '../src/core/session';
+import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
+import { loadProviders } from './providerConfig';
 
 type Flags = { values: Record<string, string>; positional: string[] };
 
@@ -24,8 +33,11 @@ function parseFlags(argv: string[]): Flags {
     const a = argv[i];
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
-      if (eq !== -1) values[a.slice(2, eq)] = a.slice(eq + 1);
-      else values[a.slice(2)] = argv[++i] ?? '';
+      if (eq !== -1) { values[a.slice(2, eq)] = a.slice(eq + 1); continue; }
+      // Boolean flag: a `--flag` with no value (end of argv or another `--flag` next) must not swallow
+      // the following flag as its value. Ids never start with `--`, so this is unambiguous.
+      const next = argv[i + 1];
+      values[a.slice(2)] = next === undefined || next.startsWith('--') ? '' : argv[++i];
     } else positional.push(a);
   }
   return { values, positional };
@@ -101,6 +113,103 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
       r.enabled == null ? '-' : r.enabled ? 'yes' : 'no',
     ]),
   );
+}
+
+/**
+ * Break-glass bulk revocation: kill every stored credential for a provider (optionally narrowed to a
+ * team/user/channel) during incident response. Dry-run is the DEFAULT — it prints a no-secret table
+ * and mutates nothing; `--yes` is required to actually revoke. Refuses to run without `--provider`.
+ *
+ * Local deletion is the security-meaningful action and MUST be guaranteed: the provider registry and
+ * master key (needed only for the best-effort UPSTREAM revoke + token decrypt) are loaded defensively,
+ * so a malformed provider config or an unavailable master key disables upstream revoke but never blocks
+ * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
+ * the upstream revoke, never to stdout. Pending consent + thread grants for the scope are cleared too.
+ */
+async function cmdRevoke(db: Db, f: Flags): Promise<number> {
+  // A scoping flag written with NO value (e.g. the typo `--team --yes`, where `--yes` is consumed as a
+  // boolean and `--team` is left empty) must NOT silently widen the blast radius to every team. Refuse
+  // any scope flag that is PRESENT but empty rather than treating it as "unset".
+  for (const k of ['provider', 'team', 'user', 'channel'] as const) {
+    if (k in f.values && !f.values[k]) {
+      console.error(`revoke: --${k} was given with no value; refusing to run with an ambiguous scope`);
+      return 2;
+    }
+  }
+  const provider = f.values.provider;
+  if (!provider) {
+    console.error('revoke: --provider <id> is required (refusing to revoke across every provider)');
+    return 2;
+  }
+  const filter: RevokeFilter = { provider, teamId: f.values.team, userId: f.values.user, channel: f.values.channel };
+  const rows = await selectRevocations(db, filter);
+
+  // Dry-run unless --yes (and an explicit --dry-run forces it even alongside --yes). Print + exit.
+  const dryRun = 'dry-run' in f.values || !('yes' in f.values);
+  const scope = [`provider=${provider}`, f.values.team && `team=${f.values.team}`, f.values.user && `user=${f.values.user}`, f.values.channel && `channel=${f.values.channel}`].filter(Boolean).join(' ');
+  console.log(`${dryRun ? 'DRY-RUN' : 'REVOKE'} ${scope}: ${rows.length} connection(s)`);
+  printTable(
+    ['team', 'owner_kind', 'owner', 'external_account', 'created_at'],
+    rows.map((r) => [r.teamId, r.ownerKind, r.ownerId, r.externalAccount ?? '-', ts(r.createdAt)]),
+  );
+  if (dryRun) {
+    const pending = await countPendingForProvider(db, filter);
+    if (pending.consents || pending.grants) {
+      console.log(`Would also clear ${pending.consents} pending consent + ${pending.grants} session grant(s).`);
+    }
+    if (rows.length || pending.consents || pending.grants) console.log('\nNo changes made. Re-run with --yes to revoke.');
+    return 0;
+  }
+
+  // Load the registry + master key BEST-EFFORT: break-glass must not die before the local delete just
+  // because provider config is malformed or the key is missing. A failure only disables upstream revoke
+  // (and token decrypt); the local delete below needs neither the key nor the registry.
+  let registry: ProviderRegistry | undefined;
+  try {
+    registry = new ProviderRegistry(loadProviders(process.env));
+  } catch (e: any) {
+    console.error(`revoke: provider config unavailable (${e?.message ?? e}); upstream revoke disabled — local deletion will proceed`);
+  }
+  let key: Buffer;
+  try {
+    key = loadMasterKey();
+  } catch (e: any) {
+    console.error(`revoke: master key unavailable (${e?.message ?? e}); token decrypt + upstream revoke disabled — local deletion will proceed`);
+    key = Buffer.alloc(32); // never used to decrypt successfully; vault.delete needs no key
+  }
+  const vault = new Vault(db, key);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
+
+  let localFailures = 0;
+  let upstreamAttempted = 0;
+  let upstreamFailures = 0;
+  let upstreamSkipped = 0;
+  for (const row of rows) {
+    // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on one row
+    // never strands the rest of a break-glass sweep.
+    try {
+      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider);
+      if (!r.removed) localFailures++;
+      if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
+      else upstreamSkipped++;
+    } catch (e: any) {
+      localFailures++;
+      console.error(`revoke: ${row.ownerKind}:${row.ownerId} failed (${e?.message ?? e})`);
+    }
+  }
+  // Clear pending consent + thread grants for the SCOPE regardless of whether any connection matched —
+  // an in-flight "Connect" or a lingering grant with no live connection would otherwise resurrect access.
+  const purged = await purgePendingForProvider(db, filter);
+  const revoked = rows.length - localFailures;
+  console.log(`\nRevoked ${revoked}/${rows.length} locally.`);
+  // Report upstream honestly: attempted vs skipped (no revoke endpoint / no decryptable token) are NOT
+  // the same as success. A skip is not a failure, but it is not a revoke either.
+  console.log(`Upstream revoke: ${upstreamAttempted} attempted (${upstreamFailures} failed), ${upstreamSkipped} skipped (no revoke endpoint or no decryptable token).`);
+  console.log(`Cleared ${purged.consents} pending consent + ${purged.grants} session grant(s).`);
+  // Non-zero only when a LOCAL deletion failed (access still present); upstream failures don't fail.
+  return localFailures ? 1 : 0;
 }
 
 async function cmdDoctor(f: Flags): Promise<number> {
@@ -182,7 +291,7 @@ async function cmdHealth(f: Flags): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`vouchr: operator CLI (read-only, secret-free)
+  console.log(`vouchr: operator CLI (reads are metadata-only; only \`revoke\` mutates)
 
 Usage: vouchr <command> [options]
 
@@ -192,6 +301,14 @@ Commands:
                 --provider <id>  filter by provider
   channels    List per-channel config: team, channel, provider, mode, enabled.
                 --team <id>      filter by team
+  revoke      Break-glass bulk revocation for an incident (delete locally, then
+              best-effort upstream revoke; audited, no secrets printed).
+                --provider <id>  REQUIRED (refuses to run without it)
+                --team <id>      narrow to one team
+                --user <id>      narrow to one user's own credentials
+                --channel <id>   narrow to one channel's shared credentials
+                --yes            actually revoke (default is a dry-run)
+                exits non-zero if any LOCAL deletion failed
   doctor      Diagnostics (PASS/FAIL): master key, DB reachability, row counts.
                 exits non-zero if any check fails
   health [provider|host ...]
@@ -203,7 +320,8 @@ Store selection (shared with the app):
   --db <path>            SQLite file (overrides VOUCHR_DB; default vouchr.db)
   VOUCHR_DB              SQLite file path
   VOUCHR_DATABASE_URL    Postgres connection string (takes precedence)
-  VOUCHR_MASTER_KEY      base64 32-byte key (only loaded/validated by doctor)`);
+  VOUCHR_MASTER_KEY      base64 32-byte key (validated by doctor; loaded by revoke
+                         for best-effort upstream token revocation)`);
 }
 
 async function main(): Promise<number> {
@@ -221,6 +339,14 @@ async function main(): Promise<number> {
         await db.close();
       }
       return 0;
+    }
+    case 'revoke': {
+      const db = await openDb({ dbPath: f.values.db });
+      try {
+        return await cmdRevoke(db, f);
+      } finally {
+        await db.close();
+      }
     }
     case 'doctor':
       return cmdDoctor(f);
