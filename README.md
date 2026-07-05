@@ -123,6 +123,12 @@ shared credentials), `tools` (list the channel's manifest), `status`, and `disco
 commands are workspace-admin-only by default (`allowChannelCreatorConfig: true` extends them to the
 channel's creator).
 
+Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees their connected
+accounts (with a Disconnect button each) and the channel's tool manifest; admins additionally get a
+per-provider mode select and Enabled checkbox that route to the same mutations as the commands above
+(authorization is re-checked server-side on submit). The text subcommands are unchanged. The Block Kit
+builder (`configModal`) and its callback id (`CONFIG_CALLBACK`) are exported for headless hosts.
+
 Vouchr brokers credentials for tools that act **as a human**. Service-to-service tools
 (`identity: 'service'`) act as the agent itself: the host wires its own auth and Vouchr refuses
 `connect()`. `toolManifest()` reports each provider's identity — see
