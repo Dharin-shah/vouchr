@@ -80,3 +80,32 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # After the artifacts publish, cut the GitHub Release from the CHANGELOG so the notes match exactly
+  # what shipped, and attach the SBOM. Fails loudly if the tag has no CHANGELOG section (forces the
+  # changelog to be updated before a release). Prerelease tags (semver `-` suffix) are marked as such.
+  github-release:
+    needs: [npm-publish, docker-ghcr]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx -y @cyclonedx/cyclonedx-npm --output-file sbom.json
+      - name: Create GitHub Release from CHANGELOG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" 'index($0,"## ["ver"]")==1{g=1;next} g&&/^## /{g=0} g{print}' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::error::no CHANGELOG section for $VERSION — add a '## [$VERSION]' entry before tagging"; exit 1
+          fi
+          FLAGS=""
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then FLAGS="--prerelease"; fi
+          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md $FLAGS sbom.json
