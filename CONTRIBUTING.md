@@ -3,15 +3,16 @@
 Thanks for helping. Vouchr is a security-sensitive credential broker, so the bar is
 correctness and simplicity over feature volume.
 
-**Before you start, read [`AGENTS.md`](./AGENTS.md)**: it's written for both humans and
-AI agents and covers the working principles (never fake it; build the correct general
-structure; simplest thing that works; security is never simplified away), the layout, dev
-setup, and testing expectations.
+**Before you start, read [`AGENTS.md`](./AGENTS.md)**: it is the canonical contribution
+contract for both humans and AI agents — numbered SEC/STR/TEST/PROC rules, the layout,
+dev setup, testing expectations, and the exact PR sign-off template. The PROC rules
+(title style, "checks pass" statement, sign-off, agent canary) are enforced by the
+`pr-lint` CI job, so a PR that skips them fails before review.
 
 ## Quick start
 
 ```bash
-nvm use            # Node ≥ 20.6 (developed on 22)
+nvm use            # Node ≥ 22 (CI runs 22 and 24)
 npm install
 npm run typecheck  # must be clean
 npm test           # unit + integration, fully offline
