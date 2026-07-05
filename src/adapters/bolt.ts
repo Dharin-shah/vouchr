@@ -647,7 +647,11 @@ export class ConnectContext {
   }
 
   private async postConnectPrompt(providerId: string, url: string): Promise<void> {
-    const blocks = connectBlocks(providerId, url);
+    const provider = this.registry.get(providerId);
+    const blocks = connectBlocks(providerId, url, {
+      list: provider.scopesDefault,
+      describe: provider.scopeDescriptions,
+    });
     const text = `Connect your ${providerId} account`;
     if (this.channel) {
       await this.client.chat.postEphemeral({
@@ -785,7 +789,7 @@ export async function createVouchr(opts: VouchrOptions) {
             })
             .catch(() => undefined);
         }
-        res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account));
+        res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account, result.scopes));
       } catch {
         // Express doesn't catch async rejections; an unhandled one here hangs the browser.
         res.status(500).send('Connection failed. Please try again.');

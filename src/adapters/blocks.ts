@@ -1,6 +1,12 @@
-/** Block Kit for the in-Slack "connect your account" prompt (ephemeral). */
-export function connectBlocks(provider: string, authorizeUrl: string): unknown[] {
-  return [
+/** Block Kit for the in-Slack "connect your account" prompt (ephemeral).
+ *  `scopes` (optional) lists what the agent will be able to do as you; unknown scope ids
+ *  render as their raw string so nothing granted is ever hidden. */
+export function connectBlocks(
+  provider: string,
+  authorizeUrl: string,
+  scopes?: { list: string[]; describe?: Record<string, string> },
+): unknown[] {
+  const blocks: unknown[] = [
     {
       type: 'section',
       text: {
@@ -11,8 +17,20 @@ export function connectBlocks(provider: string, authorizeUrl: string): unknown[]
           `encrypted on this server and is never shown to the agent or posted in Slack.`,
       },
     },
-    {
-      type: 'actions',
+  ];
+  if (scopes && scopes.list.length) {
+    blocks.push({
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          'Connecting grants the agent, acting as you:\n' +
+          scopes.list.map((s) => `• ${scopes.describe?.[s] ?? s}`).join('\n'),
+      },
+    });
+  }
+  blocks.push({
+    type: 'actions',
       elements: [
         {
           type: 'button',
@@ -21,8 +39,8 @@ export function connectBlocks(provider: string, authorizeUrl: string): unknown[]
           style: 'primary',
         },
       ],
-    },
-  ];
+  });
+  return blocks;
 }
 
 export const CONFIGURE_CALLBACK = 'vouchr_configure';
@@ -171,9 +189,13 @@ function connectionLine(c: Connection): string {
 }
 
 /** DM shown after a user successfully connects a credential: what, where, and how to undo. */
-export function connectedBlocks(provider: string, o: { channel: string | null; scope?: string }): unknown[] {
+export function connectedBlocks(
+  provider: string,
+  o: { channel: string | null; scope?: string; account?: string },
+): unknown[] {
   const where = o.channel ? `<#${o.channel}>` : 'your DMs';
   const scope = o.scope ? ` (${o.scope})` : '';
+  const account = o.account ? `Connected as *${o.account}*.\n` : '';
   return [
     {
       type: 'section',
@@ -181,6 +203,7 @@ export function connectedBlocks(provider: string, o: { channel: string | null; s
         type: 'mrkdwn',
         text:
           `:white_check_mark: *${provider} connected*\n` +
+          account +
           `Vouchr can now act as you on ${provider} in ${where}${scope}. Your token is stored ` +
           `encrypted and is never shown to the agent or posted in Slack.`,
       },
@@ -287,11 +310,21 @@ export function homeView(o: { connections: Connection[]; providers: string[] }):
   return { type: 'home', blocks };
 }
 
+/** HTML-escape untrusted values before inlining: provider/account/scope can be provider-controlled
+ * (account + granted scope come from the OAuth token response / account probe), so a malicious or
+ * compromised provider must not be able to inject markup into this page served on the Vouchr host. */
+const escapeHtml = (s: string): string =>
+  s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
+
 /** Confirmation HTML shown in the browser tab after a successful connect. */
-export function connectedHtml(provider: string, account: string | null): string {
-  const who = account ? ` as ${account}` : '';
+export function connectedHtml(provider: string, account: string | null, scopes?: string): string {
+  const who = account ? ` as ${escapeHtml(account)}` : '';
+  const granted = scopes
+    ? `<p style="color:#555">The agent can now, acting as you: <code>${escapeHtml(scopes)}</code></p>`
+    : '';
   return `<!doctype html><html><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center">
-    <h2>✅ ${provider} connected${who}</h2>
+    <h2>✅ ${escapeHtml(provider)} connected${who}</h2>
+    ${granted}
     <p>You can close this tab and return to Slack.</p>
   </body></html>`;
 }
