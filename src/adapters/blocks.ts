@@ -1,4 +1,5 @@
 import type { AuditRow, StatsRow } from '../core/audit';
+import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -234,8 +235,6 @@ export const DISCONNECT_ACTION = 'vouchr_disconnect';
 export const CONFIG_CALLBACK = 'vouchr_config';
 
 /** The four per-channel auth modes, in the order the config modal lists them. */
-const MODES = ['per-user', 'session', 'shared', 'union'] as const;
-
 /** One connection row for the status / home views. `channel` null = a personal (DM) credential. */
 export type Connection = { provider: string; channel: string | null; mode?: string };
 
@@ -303,9 +302,10 @@ export function configModal(o: {
     blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel settings (admin)', emoji: true } });
     for (const p of o.admin) {
       // Mode select — block_id `mode:<provider>` so the submit maps it back. Optional + initial set to
-      // the current mode, so submitting unchanged writes nothing (the handler diffs against the store).
-      const modeOptions = MODES.map((m) => ({ text: { type: 'plain_text', text: m }, value: m }));
-      const initialMode = o.admin && MODES.includes(p.mode as any) ? modeOptions.find((x) => x.value === p.mode) : undefined;
+      // the current mode. The submit diffs against the OPEN-TIME value carried in private_metadata (not a
+      // re-read of the store), so an untouched select never mutates and never reverts a concurrent change.
+      const modeOptions = CHANNEL_MODES.map((m) => ({ text: { type: 'plain_text', text: m }, value: m }));
+      const initialMode = isChannelMode(p.mode) ? modeOptions.find((x) => x.value === p.mode) : undefined;
       blocks.push({
         type: 'input',
         optional: true,
@@ -334,10 +334,14 @@ export function configModal(o: {
     }
   }
 
+  // Carry the channel AND the OPEN-TIME admin state (compact keys: p/m/e) so the submit can tell a
+  // deliberately-changed control from an untouched one that merely re-submits its initial value — the
+  // basis for not reverting a concurrent admin's change and not writing spurious rows. Non-secret.
+  const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled }));
   return {
     type: 'modal',
     callback_id: CONFIG_CALLBACK,
-    private_metadata: JSON.stringify({ channel: o.channel }),
+    private_metadata: JSON.stringify({ channel: o.channel, open }),
     title: { type: 'plain_text', text: 'Vouchr' },
     ...(o.admin && o.admin.length ? { submit: { type: 'plain_text', text: 'Save' } } : {}),
     close: { type: 'plain_text', text: 'Close' },

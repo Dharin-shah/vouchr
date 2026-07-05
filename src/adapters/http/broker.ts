@@ -8,7 +8,7 @@ import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
-import type { ChannelConfig, ChannelMode } from '../../core/channelConfig';
+import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
 import { authorizeProvider, resolveCredentialOwner } from '../../core/authz';
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
@@ -661,7 +661,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
     const mode = body.mode;
-    if (mode !== 'shared' && mode !== 'union' && mode !== 'per-user' && mode !== 'session') {
+    if (!isChannelMode(mode)) {
       throw new HttpError(400, { error: 'mode must be one of shared|union|per-user|session' });
     }
     const claims = await verifyBrokerableProvider(providerId, body.identityToken);
