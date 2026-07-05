@@ -82,4 +82,5 @@ export type {
   BrokerManifestResponse,
   BrokerAdminOkResponse,
   BrokerAdminConfigResponse,
+  BrokerAuditResponse,
 } from './broker-types';
