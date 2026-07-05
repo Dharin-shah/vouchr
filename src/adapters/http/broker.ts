@@ -188,9 +188,12 @@ function escapeHtml(s: string): string {
   return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
-/** Minimal browser landing page for the OAuth callback (headless has no chat surface to nudge back to). */
-function landingHtml(title: string, body: string): string {
-  return `<!doctype html><html><head><meta charset="utf-8"></head><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center"><h2>${title}</h2><p>${body}</p></body></html>`;
+/** Minimal browser landing page for the OAuth callback (headless has no chat surface to nudge back to).
+ *  Escapes `title`/`body` INTERNALLY (reflected-XSS guard #52) so callers pass raw values and a future
+ *  caller can't reintroduce the vuln by forgetting to escape. Exported for the escaping regression test.
+ *  @internal */
+export function landingHtml(title: string, body: string): string {
+  return `<!doctype html><html><head><meta charset="utf-8"></head><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(body)}</p></body></html>`;
 }
 
 function responseHasNoBody(res: Response): boolean {
@@ -758,8 +761,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
       q.get('state') ?? undefined,
       q.get('error') ?? undefined,
     );
-    if (result.ok) return { status: 200, html: landingHtml(`✅ ${escapeHtml(result.provider)} connected${result.account ? ` as ${escapeHtml(result.account)}` : ''}`, 'You can close this tab and return to your app.') };
-    return { status: result.status, html: landingHtml('Connection failed', escapeHtml(result.error)) };
+    if (result.ok) return { status: 200, html: landingHtml(`✅ ${result.provider} connected${result.account ? ` as ${result.account}` : ''}`, 'You can close this tab and return to your app.') };
+    return { status: result.status, html: landingHtml('Connection failed', result.error) };
   }
 
   /**

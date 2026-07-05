@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
 
+## [Unreleased]
+
+### Security
+
+- Headless broker OAuth landing page: `landingHtml()` now HTML-escapes its `title`/`body` internally
+  instead of relying on every call site to pre-escape (#52 hardening). No active reflected-XSS path
+  existed — the two call sites already escaped — but the helper shape allowed a future caller to
+  reintroduce one; escaping at the choke point removes that footgun. Adds a regression test.
+
 ## [0.2.0-rc.1] - 2026-07-03
 
 ### Breaking
