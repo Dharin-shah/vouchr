@@ -1,4 +1,5 @@
 import type { AuditRow, StatsRow } from '../core/audit';
+import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -231,15 +232,139 @@ export function sessionApprovalBlocks(provider: string, thread: string): unknown
 }
 
 export const DISCONNECT_ACTION = 'vouchr_disconnect';
+export const CONFIG_CALLBACK = 'vouchr_config';
 
+/** The four per-channel auth modes, in the order the config modal lists them. */
 /** One connection row for the status / home views. `channel` null = a personal (DM) credential. */
 export type Connection = { provider: string; channel: string | null; mode?: string };
 
+/** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list. */
+export type ToolRow = { provider: string; enabled: boolean; mode?: string | null };
+
+/** One provider's admin control row: its current channel mode (null = unconfigured) + tool-enabled. */
+export type ConfigAdminRow = { provider: string; mode: string | null; enabled: boolean };
+
+/**
+ * No-arg `/vouchr` config modal (#109). Three sections:
+ *  - "Your connections" (EVERYONE): the user's own connections, each with a Disconnect button.
+ *  - "Tools in this channel" (EVERYONE): the read-only manifest (which providers are usable here).
+ *  - "Channel settings" (ADMINS ONLY, `admin` present): per-provider mode select + Enabled checkbox,
+ *    whose submit routes to the SAME mode/enable/disable mutations as the slash commands.
+ *
+ * The channel rides in `private_metadata` so the submit binds to the right channel. The admin controls'
+ * mere presence is NOT the authorization — the submit handler re-checks admin server-side, so a forged
+ * submission from a non-admin (who never saw these controls) is still rejected. A `submit` button is
+ * only added when there ARE admin controls (otherwise there is nothing to submit; disconnect is an
+ * immediate button action, not a form field).
+ */
+export function configModal(o: {
+  channel: string | null;
+  connections: Connection[];
+  tools: ToolRow[];
+  admin?: ConfigAdminRow[];
+}): unknown {
+  const blocks: unknown[] = [
+    { type: 'header', text: { type: 'plain_text', text: 'Your connections', emoji: true } },
+  ];
+  if (o.connections.length) {
+    for (const c of o.connections) {
+      blocks.push({
+        type: 'section',
+        text: { type: 'mrkdwn', text: connectionLine(c) },
+        accessory: {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Disconnect', emoji: true },
+          action_id: DISCONNECT_ACTION,
+          value: c.provider,
+          style: 'danger',
+          // Destructive + one-click, so gate it behind a native confirm dialog (parity with the
+          // ephemeral `/vouchr disconnect` confirm flow) — an accidental click shouldn't revoke.
+          confirm: {
+            title: { type: 'plain_text', text: 'Disconnect?' },
+            text: { type: 'mrkdwn', text: `Vouchr will delete your stored *${escapeMrkdwn(c.provider)}* credential. The agent won't be able to act as you on ${escapeMrkdwn(c.provider)} until you connect again.` },
+            confirm: { type: 'plain_text', text: 'Disconnect' },
+            deny: { type: 'plain_text', text: 'Cancel' },
+            style: 'danger',
+          },
+        },
+      });
+    }
+  } else {
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No connected accounts yet. They are created on demand when an agent needs one.' }] });
+  }
+
+  blocks.push({ type: 'divider' });
+  blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Tools in this channel', emoji: true } });
+  if (!o.channel) {
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Open `/vouchr` from inside a channel to see and configure its tools.' }] });
+  } else if (!o.tools.length) {
+    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No providers are registered.' }] });
+  } else {
+    blocks.push({
+      type: 'section',
+      text: { type: 'mrkdwn', text: o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}`).join('\n') },
+    });
+  }
+
+  if (o.admin && o.admin.length) {
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel settings (admin)', emoji: true } });
+    for (const p of o.admin) {
+      // Mode select — block_id `mode:<provider>` so the submit maps it back. Optional + initial set to
+      // the current mode. The submit diffs against the OPEN-TIME value carried in private_metadata (not a
+      // re-read of the store), so an untouched select never mutates and never reverts a concurrent change.
+      const modeOptions = CHANNEL_MODES.map((m) => ({ text: { type: 'plain_text', text: m }, value: m }));
+      const initialMode = isChannelMode(p.mode) ? modeOptions.find((x) => x.value === p.mode) : undefined;
+      blocks.push({
+        type: 'input',
+        optional: true,
+        block_id: `mode:${p.provider}`,
+        label: { type: 'plain_text', text: `${p.provider} — mode` },
+        element: {
+          type: 'static_select',
+          action_id: 'mode',
+          options: modeOptions,
+          ...(initialMode ? { initial_option: initialMode } : {}),
+        },
+      });
+      const enabledOption = { text: { type: 'plain_text', text: 'Enabled in this channel' }, value: 'enabled' };
+      blocks.push({
+        type: 'input',
+        optional: true,
+        block_id: `tool:${p.provider}`,
+        label: { type: 'plain_text', text: `${p.provider} — availability` },
+        element: {
+          type: 'checkboxes',
+          action_id: 'enabled',
+          options: [enabledOption],
+          ...(p.enabled ? { initial_options: [enabledOption] } : {}),
+        },
+      });
+    }
+  }
+
+  // Carry the channel AND the OPEN-TIME admin state (compact keys: p/m/e) so the submit can tell a
+  // deliberately-changed control from an untouched one that merely re-submits its initial value — the
+  // basis for not reverting a concurrent admin's change and not writing spurious rows. Non-secret.
+  const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled }));
+  return {
+    type: 'modal',
+    callback_id: CONFIG_CALLBACK,
+    private_metadata: JSON.stringify({ channel: o.channel, open }),
+    title: { type: 'plain_text', text: 'Vouchr' },
+    ...(o.admin && o.admin.length ? { submit: { type: 'plain_text', text: 'Save' } } : {}),
+    close: { type: 'plain_text', text: 'Close' },
+    blocks,
+  };
+}
+
 /** A readable line for one connection, reused by the status list and the App Home tab. */
 function connectionLine(c: Connection): string {
-  const where = c.channel ? `<#${c.channel}>` : 'your DMs';
-  const mode = c.mode ? ` — _${c.mode}_` : '';
-  return `• *${c.provider}* in ${where}${mode}`;
+  // Escape provider/channel/mode before they hit mrkdwn: a stored provider id is attacker-influenceable
+  // (see escapeMrkdwn's note), so no value here may render as a forged `<…|link>` or `<@user>` mention.
+  const where = c.channel ? `<#${escapeMrkdwn(c.channel)}>` : 'your DMs';
+  const mode = c.mode ? ` — _${escapeMrkdwn(c.mode)}_` : '';
+  return `• *${escapeMrkdwn(c.provider)}* in ${where}${mode}`;
 }
 
 /** DM shown after a user successfully connects a credential: what, where, and how to undo. */

@@ -15,7 +15,13 @@ import type { Db } from './db';
  *                 actor is the real member whose credential is used, never the channel and never the caller.
  * No row → unconfigured, treated as 'per-user' (each member uses their own; an admin may set a mode).
  */
-export type ChannelMode = 'shared' | 'per-user' | 'session' | 'union';
+export const CHANNEL_MODES = ['shared', 'per-user', 'session', 'union'] as const;
+export type ChannelMode = (typeof CHANNEL_MODES)[number];
+/** Runtime guard — the SINGLE source of truth for "is this a valid channel mode". Every caller that
+ *  takes a mode from an untrusted surface (a slash arg, a modal view_submission, a broker request body)
+ *  routes through this, so the four modes are never re-listed and can never drift out of sync. */
+export const isChannelMode = (m: unknown): m is ChannelMode =>
+  typeof m === 'string' && (CHANNEL_MODES as readonly string[]).includes(m);
 
 /** The subset of Slack's conversations.info shape that channel-credential eligibility depends on. */
 export interface ChannelInfo {
@@ -57,6 +63,9 @@ export class ChannelConfig {
   }
 
   async setMode(teamId: string, channel: string, provider: string, mode: ChannelMode): Promise<void> {
+    // Defense-in-depth at the true sink: TypeScript's `ChannelMode` is compile-time only, so a value
+    // arriving from an untrusted surface (modal/broker/slash) could still be a bogus string at runtime.
+    if (!isChannelMode(mode)) throw new Error(`invalid channel mode: ${mode}`);
     await this.db.run(
       `INSERT INTO channel_config (team_id, channel, provider, mode) VALUES (?,?,?,?)
        ON CONFLICT(team_id, channel, provider) DO UPDATE SET mode=excluded.mode`,

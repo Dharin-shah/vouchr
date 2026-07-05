@@ -56,11 +56,20 @@ export class ChannelTools {
 
   /** Whether `provider` may be used in this channel, applying the backward-compat rule:
    *  no rows at all → enabled; otherwise only an explicit enabled row counts. */
-  async isEnabled(teamId: string, channel: string, provider: string): Promise<boolean> {
-    const configured = (await this.db.get(
+  /** Whether this channel has ANY tool row — i.e. it is an explicit allowlist rather than the
+   *  backward-compat "all providers enabled" default. Callers about to write the FIRST row (which flips
+   *  the channel into allowlist mode, silently disabling every still-row-less provider) use this to
+   *  materialize the full desired allowlist instead of a single row. */
+  async isConfigured(teamId: string, channel: string): Promise<boolean> {
+    const row = (await this.db.get(
       `SELECT 1 AS x FROM channel_tool WHERE team_id=? AND channel=? LIMIT 1`,
       [teamId, channel],
     )) as { x: number } | undefined;
+    return !!row;
+  }
+
+  async isEnabled(teamId: string, channel: string, provider: string): Promise<boolean> {
+    const configured = await this.isConfigured(teamId, channel);
     if (!configured) return true; // no rows for this channel → all providers enabled (backward compat)
     const row = (await this.db.get(
       `SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?`,

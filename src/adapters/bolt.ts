@@ -13,7 +13,7 @@ import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { safeEmit } from '../core/safe-emit';
-import { ChannelConfig, channelIneligibleReason, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
+import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser, disconnectProvider } from '../core/offboard';
@@ -23,6 +23,7 @@ import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
+  configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
 } from './blocks';
 
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
@@ -838,6 +839,19 @@ export async function createVouchr(opts: VouchrOptions) {
 
       const [sub, arg, arg2] = String(command.text ?? '').trim().split(/\s+/);
 
+      // No subcommand → open the interactive config modal (#109). `/vouchr status` (and any other
+      // subcommand) keeps its text output below, so scripts and muscle memory are unaffected. A modal
+      // needs a trigger_id; without one (shouldn't happen for a slash command) fall back to the text.
+      // Building the modal makes several DB/Slack round-trips within Slack's ~3s trigger window; if the
+      // open fails (expired_trigger_id, a transient API error, a build error) DON'T return — fall through
+      // to the status text so a no-arg `/vouchr` is never silent (matches main's pre-modal behavior).
+      if (!sub && command.trigger_id) {
+        try {
+          await client.views.open({ trigger_id: command.trigger_id, view: await buildConfigModal(identity, command.channel_id ?? null, client) });
+          return;
+        } catch { /* fall through to the status text below */ }
+      }
+
       // List the channel's tool manifest (which providers an agent may use here + their mode).
       if (sub === 'tools') {
         if (!command.channel_id) return respond('Run `/vouchr tools` from inside a channel.');
@@ -883,7 +897,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant)
       // | union (any connected member, acting as that member). Admin-gated + audited in setChannelMode.
       if (sub === 'mode') {
-        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user' && arg2 !== 'session' && arg2 !== 'union')) {
+        if (!arg || !isChannelMode(arg2)) {
           return respond('Usage: `/vouchr mode <provider> <shared|per-user|session|union>`');
         }
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
@@ -989,6 +1003,132 @@ export async function createVouchr(opts: VouchrOptions) {
     };
     app.view(CONFIGURE_CALLBACK, (a: any) => handleSecretSubmit(a, 'channel'));
     app.view(USER_KEY_CALLBACK, (a: any) => handleSecretSubmit(a, 'user'));
+
+    // ── #109 no-arg config modal ────────────────────────────────────────────────────────────
+    // Build the modal for `identity` in `channelId`: everyone gets their connections + the read-only
+    // channel manifest; ADMINS additionally get per-provider mode/enable controls (admin decided
+    // server-side here, NOT trusted on submit). Shared by the initial open and the views.update after a
+    // disconnect. Service tools are shown read-only but excluded from the admin controls: Vouchr doesn't
+    // broker them, so channel-credential mode is meaningless and setChannelMode would refuse them.
+    async function buildConfigModal(identity: SlackIdentity, channelId: string | null, client: WebClient): Promise<unknown> {
+      const connections = (await vault.listForUser(identity))
+        .filter((c) => { try { return registry.get(c.provider).identity !== 'service'; } catch { return true; } })
+        .map((c) => ({ provider: c.provider, channel: null as string | null }));
+      const tools = channelId ? await contextFor(identity, channelId, client).toolManifest() : [];
+      const isAdmin = channelId ? await commandAdmin(client, identity, channelId) : false;
+      // The admin Enabled checkbox controls ONLY the tool allowlist bit, so it must render from
+      // channelTools.isEnabled — NOT the read-only manifest's `enabled`, which is (allowlist AND policy).
+      // Rendering the policy-intersected value would show a policy-denied provider unchecked and then let
+      // an untouched save look like an intentional disable (findings 3/1). The manifest keeps the
+      // policy-intersected value for its read-only "Tools in this channel" display.
+      const admin = isAdmin && channelId
+        ? await Promise.all(
+            tools.filter((t) => t.identity !== 'service').map(async (t) => ({
+              provider: t.provider,
+              mode: t.mode,
+              enabled: await channelTools.isEnabled(identity.teamId, channelId, t.provider),
+            })),
+          )
+        : undefined;
+      return configModal({ channel: channelId, connections, tools, admin });
+    }
+
+    // Config modal submit: apply the admin mode/enable changes. Authorization is RE-CHECKED here
+    // server-side (commandAdmin) — the modal only SHOWED these controls to admins, but a client can
+    // forge a view_submission, so presence of the fields is never the authority. Each mutation routes to
+    // the SAME helper the slash command uses (setChannelMode re-checks admin + eligibility itself), so
+    // audit + eligibility stay identical. A control is acted on ONLY when its submitted value differs
+    // from the OPEN-TIME value carried in private_metadata — so an untouched field never mutates, never
+    // reverts a concurrent admin's change (a stale re-submit of the open value is a no-op), and never
+    // depends on a re-read whose basis drifted from what was rendered.
+    app.view(CONFIG_CALLBACK, async ({ ack, body, view, client }: any) => {
+      const identity = resolveIdentity({ body });
+      // A view_submission always carries user/team, so identity failure is near-impossible; ack (closing
+      // the modal, no mutation) beats keying an error to a block id that may not exist.
+      if (!identity) return ack();
+      let channel = '';
+      let open: { p: string; m: string | null; e: boolean }[] = [];
+      try { ({ channel = '', open = [] } = JSON.parse(view.private_metadata)); } catch { channel = ''; }
+      if (!channel || !(await commandAdmin(client, identity, channel))) {
+        await audit.record('denied', identity, 'config', { reason: 'not-admin', owner: 'channel', channel });
+        const firstBlock = Object.keys(view.state?.values ?? {}).find((b) => b.startsWith('mode:') || b.startsWith('tool:'));
+        // Only attach the error to a REAL block id (Slack silently drops unknown keys); if there are no
+        // admin blocks (a forged submit), a bare ack still rejects the mutation — nothing was written.
+        return firstBlock
+          ? ack({ response_action: 'errors', errors: { [firstBlock]: adminOnly(allowChannelCreatorConfig, 'change channel settings') } })
+          : ack();
+      }
+      const openMode = new Map(open.map((o) => [o.p, o.m]));
+      const openEnabled = new Map(open.map((o) => [o.p, o.e]));
+
+      // Collect the submitted state per provider up front, so mode + enabled are each diffed against
+      // their OPEN-TIME value rather than the current store.
+      const values = view.state?.values ?? {};
+      const submittedMode = new Map<string, unknown>();
+      const submittedEnabled = new Map<string, boolean>();
+      for (const [blockId, v] of Object.entries<any>(values)) {
+        if (blockId.startsWith('mode:')) submittedMode.set(blockId.slice(5), v?.mode?.selected_option?.value);
+        else if (blockId.startsWith('tool:')) submittedEnabled.set(blockId.slice(5), (v?.enabled?.selected_options ?? []).some((o: any) => o.value === 'enabled'));
+      }
+
+      const ctx = contextFor(identity, channel, client);
+      const errors: Record<string, string> = {};
+
+      // ── mode: apply only where the admin actually changed the select (submitted !== open-time) ──
+      for (const [provider, mode] of submittedMode) {
+        if (!registry.has(provider) || !isChannelMode(mode)) continue; // forged/invalid → ignore
+        if (mode === (openMode.get(provider) ?? null)) continue; // untouched (or reset to the same) → skip
+        try { await ctx.setChannelMode(provider, mode); } catch (e) { errors[`mode:${provider}`] = safeUserMessage(e); }
+      }
+
+      // ── enabled: the tool allowlist. Writing the FIRST row flips the channel from "all enabled"
+      // (backward-compat) into allowlist mode, where every still-row-less provider silently becomes
+      // disabled. So when a change would create that allowlist on an as-yet-unconfigured channel,
+      // MATERIALIZE the full allowlist (every registered provider's desired state) rather than a single
+      // row — else the untouched providers vanish. Once the channel is already an allowlist, a per-
+      // provider write is local and safe. Audit only the providers whose state actually changed. ──
+      const enabledChanged = [...submittedEnabled].filter(([p]) => registry.has(p) && submittedEnabled.get(p) !== (openEnabled.get(p) ?? true));
+      if (enabledChanged.length) {
+        const alreadyAllowlist = await channelTools.isConfigured(identity.teamId, channel);
+        const willDisableSome = [...submittedEnabled].some(([p, e]) => registry.has(p) && !e);
+        if (!alreadyAllowlist && willDisableSome) {
+          for (const p of providerIds) {
+            const on = submittedEnabled.has(p) ? submittedEnabled.get(p)! : true; // unshown providers stay enabled
+            await channelTools.setEnabled(identity.teamId, channel, p, on);
+          }
+        } else {
+          for (const [p] of enabledChanged) await channelTools.setEnabled(identity.teamId, channel, p, submittedEnabled.get(p)!);
+        }
+        for (const [p, e] of enabledChanged) {
+          await audit.record('config', identity, p, { owner: 'channel', channel, tool: e ? 'enabled' : 'disabled' });
+        }
+      }
+
+      if (Object.keys(errors).length) return ack({ response_action: 'errors', errors });
+      await ack();
+      await client.chat.postMessage({ channel: identity.userId, text: `✅ Updated channel settings for <#${channel}>.` }).catch(() => undefined);
+    });
+
+    // Disconnect the acting user's own connection from a Disconnect button IN VOUCHR'S OWN config modal,
+    // then refresh the view so the row disappears. Scoped to `callback_id === CONFIG_CALLBACK`: the
+    // DISCONNECT_ACTION id is also EXPORTED for hosts who embed disconnectConfirmBlocks in their OWN
+    // surfaces and register their own listener — Bolt runs every matching listener, so acting on a
+    // foreign view/message here would double-fire disconnectProvider (duplicate audit/revoke) and clobber
+    // the host's view. When it isn't our modal we ack and defer to the host's listener.
+    app.action(DISCONNECT_ACTION, async ({ ack, body, client }: any) => {
+      await ack();
+      if (body.view?.callback_id !== CONFIG_CALLBACK) return; // not our modal → the host owns this action
+      const identity = resolveIdentity({ body });
+      const provider = body.actions?.[0]?.value;
+      // Validate against the registry before writing anything: disconnectProvider records the provider
+      // into the audit `provider` column unconditionally, so a forged/unknown value would pollute audit.
+      if (!identity || typeof provider !== 'string' || !registry.has(provider)) return;
+      const { ok } = await disconnectProvider(vault, audit, registry, identity, provider);
+      emit({ type: 'revoked', provider, ok });
+      let channel: string | null = null;
+      try { ({ channel = null } = JSON.parse(body.view.private_metadata ?? '{}')); } catch { channel = null; }
+      await client.views.update({ view_id: body.view.id, view: await buildConfigModal(identity, channel, client) }).catch(() => undefined);
+    });
 
     // Per-user key setup: ephemeral button → private modal (self-service, not admin-gated).
     app.action(SETUP_KEY_ACTION, async ({ ack, body, client }: any) => {
