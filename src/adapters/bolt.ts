@@ -371,6 +371,10 @@ export class ConnectContext {
         if (r.status === 'resolved') {
           return new ConnectionHandle(
             provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+            // Union non-repudiation: `r.acting` is the borrowed member (audited as them); the REAL
+            // requester is the caller. Pass it as triggeredBy so the inject audit records WHO borrowed
+            // the credential — this is what surfaces in the owner's `/vouchr audit` view.
+            this.identity.userId,
           );
         }
       }
@@ -876,6 +880,10 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'configure') {
         if (!arg) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
+        // Validate the provider BEFORE recording a denial or opening the modal (parity with enable/disable):
+        // otherwise an unvalidated arg — potentially a credential-shaped typo — lands raw in the audit
+        // `provider` column and could be reflected back into a `/vouchr audit` view.
+        if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
         if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
           return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));

@@ -79,6 +79,15 @@ test('audit: surfaces WHO borrowed the credential (union actor column)', async (
   assert.match(JSON.stringify(await run('audit', 'U_A')), /by <@U_B>/);
 });
 
+test('configure: an unknown (e.g. credential-shaped) provider is rejected before it is ever audited', async () => {
+  const { audit, run } = await harness(); // non-admin caller
+  const res = await run('configure ghp_looks_like_a_secret_0000', 'U_A');
+  assert.match(String(res), /Unknown provider/); // rejected before the admin gate / any record()
+  // The bogus value must NOT have been written to the audit provider column (no reflection surface).
+  const rows = await audit.listByOwnerUser(id('U_A'), 20);
+  assert.equal(rows.length, 0);
+});
+
 test('audit channel: a non-admin is refused via the admin gate and the denial is audited', async () => {
   const { audit, run } = await harness(); // no isAdmin override, users.info is_admin=false, not the creator
   const res = await run('audit channel', 'U_A');

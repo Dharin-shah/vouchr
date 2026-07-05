@@ -12,6 +12,7 @@ import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import { ConnectContext } from '../src/adapters/bolt';
 import { ConsentRequiredError } from '../src/adapters/bolt';
+import { auditBlocks } from '../src/adapters/blocks';
 
 const KEY = randomBytes(32);
 const CALLER = { enterpriseId: null, teamId: 'T1', userId: 'U_CALLER' }; // triggers the request
@@ -93,6 +94,31 @@ test('union resolves to a connected member and audits that member (not caller, n
   assert.notEqual(row.user_id, 'U_CALLER'); // NOT the caller who triggered it
   assert.equal(row.channel, null);          // user-owned → not attributed to the channel (no conflation)
   assert.ok(!row.meta.includes('sk-alice-secret')); // and the secret never reaches the audit log
+});
+
+// Real union-path attribution: the caller BORROWS Alice's cred, so the inject audit must record the
+// caller as the `actor` (not just in meta) — and that must surface in Alice's own `/vouchr audit` view.
+test('union: the borrower is recorded as actor and shows in the owner audit view', async () => {
+  const { c, db, vault, audit } = await ctx();
+  await new ChannelConfig(db).setMode('T1', 'C_FIN', 'mcp', 'union');
+  await vault.upsert(userOwner(ALICE), 'mcp', tok('alice@example.com')); // only Alice is connected
+
+  const handle = await c.connect('mcp'); // U_CALLER borrows Alice's cred
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('ok', { status: 200 })) as any;
+  try {
+    await handle.fetch('https://api.test/x');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // The borrower is written to the actor COLUMN (what the view reads), not only meta.triggeredBy.
+  const row = (await db.get(`SELECT actor FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`)) as any;
+  assert.equal(row.actor, 'U_CALLER');
+
+  // Alice (the credential owner) sees the usage AND who borrowed it, rendered in her audit view.
+  const rows = await audit.listByOwnerUser(ALICE, 20);
+  assert.match(JSON.stringify(auditBlocks(rows, 'Your credential usage')), /by <@U_CALLER>/);
 });
 
 // union with NO connected member falls through to prompting the caller (so they become a member).
