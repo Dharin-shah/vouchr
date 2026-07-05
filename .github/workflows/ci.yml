@@ -87,3 +87,20 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: node -e "require('better-sqlite3')(':memory:').exec('select 1')"
+
+  # Single required status for branch protection: green iff every CI job above succeeded. Requiring
+  # THIS one context instead of each job means matrix changes (add/drop a Node version, an OS) never
+  # strand a stale required check — the reason bare `test` got stuck when `test` became `test (22|24)`.
+  # `if: always()` so it still runs (and reports failure) when a dependency fails rather than being skipped.
+  ci-ok:
+    if: always()
+    needs: [test, pack-smoke, build-native]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all CI jobs to have succeeded
+        run: |
+          results="${{ join(needs.*.result, ' ') }}"
+          echo "CI job results: $results"
+          for r in $results; do
+            [ "$r" = "success" ] || { echo "::error::a required CI job did not succeed: $r"; exit 1; }
+          done
