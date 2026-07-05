@@ -44,11 +44,13 @@ By contributing you agree your contributions are licensed under Apache-2.0.
 
 ## Releasing
 
-Pre-1.0 and private: the package is **not published to npm**, so there is no publish step.
-Releases are just tags. To cut one:
+The package is published to npm as `@vouchr/core` by `.github/workflows/release.yml`,
+which runs only on a `v*` tag and requires the tag to match `package.json`'s version.
+To cut a release:
 
 1. Bump `version` in `package.json` (SemVer; pre-1.0 minors may carry breaking changes).
 2. Add a `## [x.y.z]` heading to `CHANGELOG.md` describing the changes.
 3. Confirm `npm run typecheck` and `npm test` are green, including the Postgres path
    (`npm run pg:up` then `npm test`).
-4. Tag the release: `git tag vX.Y.Z`.
+4. Tag the release and push the tag: `git tag vX.Y.Z && git push origin vX.Y.Z` — the
+   release workflow publishes to npm (with provenance) and pushes the GHCR broker image.
