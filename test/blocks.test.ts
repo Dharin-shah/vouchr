@@ -43,6 +43,13 @@ test('connectedHtml: the live post-connect page shows account + granted scopes',
   assert.doesNotMatch(connectedHtml('github', 'octocat', ''), /acting as you/);
 });
 
+test('connectedHtml: escapes provider-controlled markup (no XSS on the callback page)', () => {
+  const html = connectedHtml('github', '</h2><script>alert(1)</script>', 'repo"><img src=x onerror=alert(1)>');
+  assert.doesNotMatch(html, /<script>/); // raw markup from the account must not survive
+  assert.doesNotMatch(html, /onerror=/); // nor from the scope string
+  assert.match(html, /&lt;script&gt;/); // it is present, escaped
+});
+
 test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
   const b = connectBlocks('github', 'https://auth') as any[];
   assert.equal(b.length, 2); // intro section + actions
