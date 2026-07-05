@@ -143,7 +143,8 @@ const gcal = google({
 ```
 
 Any OAuth2 provider can be declared with `defineProvider` (hosts outside a built-in's egress
-allowlist need this too); non-OAuth APIs use `credential: 'key'` and an `inject` function:
+allowlist, e.g. `docs.googleapis.com`, need this too); non-OAuth APIs use `credential: 'key'` and
+an `inject` function:
 
 ```ts
 const linear = defineProvider({
