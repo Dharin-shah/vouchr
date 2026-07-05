@@ -30,9 +30,15 @@ import {
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
 /** Map an external ref to its resolver source id. Add resolvers → extend this. */
-function refSource(ref: string): string {
+export function refSource(ref: string): string {
   if (/^arn:aws:secretsmanager:/.test(ref)) return 'aws-sm';
-  throw new UserFacingError('Unsupported secret reference. Expected an AWS Secrets Manager ARN.');
+  if (/^gcp-sm:\/\//.test(ref)) return 'gcp-sm';
+  if (/^azure-kv:\/\//.test(ref)) return 'azure-kv';
+  if (/^vault:\/\//.test(ref)) return 'vault';
+  throw new UserFacingError(
+    'Unsupported secret reference. Expected one of: an AWS Secrets Manager ARN (arn:aws:secretsmanager:…), ' +
+      'gcp-sm://…, azure-kv://…, or vault://….',
+  );
 }
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
