@@ -1,10 +1,24 @@
-# Vouchr
+<div align="center">
+<h1>Vouchr: Credential Broker for Slack Agents</h1>
 
-[![CI](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml/badge.svg)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml)
-[![Security](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml/badge.svg)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](./LICENSE)
-[![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-3c873a.svg)](#quickstart)
-[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+![Status: Alpha](https://img.shields.io/badge/status-alpha-orange?style=for-the-badge) [![CI](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml) [![Security](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/security.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Security)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml) ![Coverage](https://img.shields.io/badge/coverage-97%25-brightgreen?style=for-the-badge) [![Node](https://img.shields.io/badge/node-%E2%89%A5%2022-3c873a?style=for-the-badge&logo=nodedotjs&logoColor=white)](#quickstart) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge)](./LICENSE)
+
+<p>
+  <a href="#quickstart">Quickstart</a> |
+  <a href="#how-it-works">How It Works</a> |
+  <a href="#credential-modes">Credential Modes</a> |
+  <a href="#providers">Providers</a> |
+  <a href="#headless">Headless</a> |
+  <a href="./guides/DEPLOYMENT.md">Deployment</a>
+</p>
+</div>
+
+---
+
+> [!IMPORTANT]
+> **Vouchr is in alpha** and not yet tested in a live deployment. APIs may change between
+> releases. Review the [production readiness checklist](./guides/DEPLOYMENT.md#production-readiness-checklist)
+> before adopting — feedback and issues are very welcome!
 
 **Vouchr is a self-hostable credential broker for Slack agents. Users connect or approve access in
 Slack, your agent receives a safe handle, and Vouchr injects the right credential only at the
@@ -179,8 +193,9 @@ Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
 
 ## Status
 
-**Alpha. Not yet tested in a live deployment.** CI runs the full suite (including Postgres) plus
-security checks on every push and PR. Review the
+**Alpha. Not yet tested in a live deployment.** Every push and PR runs the full suite — 366 tests
+across SQLite and Postgres at **97% line / 88% branch coverage** — plus CodeQL and dependency
+security checks. Review the
 [production readiness checklist](./guides/DEPLOYMENT.md#production-readiness-checklist) before
 adopting, and see [CONTRIBUTING.md](./CONTRIBUTING.md) to help.
 
