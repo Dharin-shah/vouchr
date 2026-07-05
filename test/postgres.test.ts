@@ -81,6 +81,18 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
     const cfg = new ChannelConfig(db);
     await cfg.setMode('T1', 'C_FIN', 'mcp', 'per-user');
     assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), 'per-user');
+
+    // #107 stats rollup on the REAL engine. Postgres returns COUNT/BIGINT as strings and lowercases
+    // unquoted aliases, so this is what actually verifies statsByChannel's Number() coercion + lowercase
+    // aliases (SQLite would pass even if both were wrong).
+    await audit.record('inject', { enterpriseId: null, teamId: 'T1', userId: 'S1' }, 'statp', { channel: 'C_STATS' });
+    await audit.record('inject', { enterpriseId: null, teamId: 'T1', userId: 'S2' }, 'statp', { channel: 'C_STATS' });
+    const stats = await audit.statsByChannel('T1', 'C_STATS', Date.now() - 24 * 60 * 60 * 1000);
+    assert.equal(stats.length, 1);
+    assert.equal(stats[0].provider, 'statp');
+    assert.equal(stats[0].uses, 2); // strictly === number 2, not "2"
+    assert.equal(stats[0].distinctActors, 2);
+    assert.equal(typeof stats[0].lastUsed, 'number');
   } finally {
     await db.close();
   }

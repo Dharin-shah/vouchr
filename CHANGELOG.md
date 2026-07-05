@@ -7,6 +7,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- `/vouchr stats` — admin per-channel usage analytics (last 30 days). For each brokered tool enabled in
+  the channel: total injections, distinct acting humans, last-used time, and a `never used` flag for
+  enabled-but-idle tools (dead weight to prune), ending with a `disable` hint. Admin-gated (same gate as
+  `mode`/`enable`) + audited on refusal; ephemeral. New `Audit.statsByChannel` (one GROUP BY, backend-
+  agnostic — coerces Postgres's string COUNT/BIGINT and lowercased aliases) and a `statsBlocks` renderer.
+
 - `/vouchr audit` — a self-service, in-Slack view of credential usage. A user sees the last ~20 audit
   events attributed to them (their own credential's usage across channels, including union-mode
   borrows); a channel admin can additionally run `/vouchr audit channel` for the current channel's

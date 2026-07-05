@@ -1,4 +1,4 @@
-import type { AuditRow } from '../core/audit';
+import type { AuditRow, StatsRow } from '../core/audit';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -26,6 +26,29 @@ export function auditBlocks(rows: AuditRow[], heading: string): unknown[] {
   return [
     { type: 'header', text: { type: 'plain_text', text: heading, emoji: true } },
     { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+  ];
+}
+
+/** `/vouchr stats`: per-provider usage for the channel over the window. Iterates the ENABLED tool list
+ *  (not just providers with rows) so an enabled-but-idle tool is surfaced as dead weight to prune. No
+ *  secret — injection counts + distinct-actor counts + last-used only. `escapeMrkdwn` guards provider
+ *  ids (attacker-controllable via a `configure`-style path) exactly as `auditBlocks` does. */
+export function statsBlocks(enabled: string[], stats: StatsRow[], windowDays: number): unknown[] {
+  if (!enabled.length) {
+    return [{ type: 'section', text: { type: 'mrkdwn', text: ':information_source: *No brokered tools are enabled in this channel.*' } }];
+  }
+  const byProvider = new Map(stats.map((s) => [s.provider, s]));
+  const lines = enabled.map((p) => {
+    const s = byProvider.get(p);
+    if (!s || s.uses === 0) return `• *${escapeMrkdwn(p)}* — _never used_ (idle; safe to remove)`;
+    const when = `<!date^${Math.floor(s.lastUsed / 1000)}^{date_short_pretty}|recently>`;
+    const people = s.distinctActors === 1 ? '1 person' : `${s.distinctActors} people`;
+    return `• *${escapeMrkdwn(p)}* — ${s.uses} injection${s.uses === 1 ? '' : 's'} · ${people} · last used ${when}`;
+  });
+  return [
+    { type: 'header', text: { type: 'plain_text', text: `Tool usage — last ${windowDays} days`, emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: 'Idle tools can be removed with `/vouchr disable <provider>`.' }] },
   ];
 }
 

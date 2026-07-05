@@ -72,6 +72,14 @@ export interface AuditRow {
   at: number; // ms epoch
 }
 
+/** One provider's usage rollup for a channel (see `statsByChannel`). Powers `/vouchr stats`. */
+export interface StatsRow {
+  provider: string;
+  uses: number; // total injections in the window
+  distinctActors: number; // distinct acting humans
+  lastUsed: number; // ms epoch of the most recent injection
+}
+
 /** Append-only audit log. `meta` must NEVER contain token material; defense-in-depth redaction enforces it anyway. */
 export class Audit {
   constructor(private db: Db) {}
@@ -95,6 +103,30 @@ export class Audit {
        WHERE team_id = ? AND channel = ? ORDER BY at DESC LIMIT ?`,
       [teamId, channelId, limit],
     );
+  }
+
+  /** Per-provider injection stats for a channel since `sinceEpoch` (ms epoch): total injections,
+   *  distinct acting humans (user_id — the acted-as member), and last-used time. One GROUP BY,
+   *  backend-agnostic (epoch comparison, no date functions). Admin-gated at the call site; powers
+   *  `/vouchr stats`. Postgres returns BIGINT/COUNT as strings and lowercases unquoted aliases, so we
+   *  use lowercase aliases and coerce every numeric column with Number(). */
+  async statsByChannel(teamId: string, channelId: string, sinceEpoch: number): Promise<StatsRow[]> {
+    const rows = await this.db.all<{ provider: string; uses: unknown; distinct_actors: unknown; last_used: unknown }>(
+      `SELECT provider,
+              COUNT(*)                AS uses,
+              COUNT(DISTINCT user_id) AS distinct_actors,
+              MAX(at)                 AS last_used
+         FROM audit
+        WHERE team_id = ? AND channel = ? AND action = 'inject' AND at >= ?
+        GROUP BY provider`,
+      [teamId, channelId, sinceEpoch],
+    );
+    return rows.map((r) => ({
+      provider: r.provider,
+      uses: Number(r.uses),
+      distinctActors: Number(r.distinct_actors),
+      lastUsed: Number(r.last_used),
+    }));
   }
 
   async record(

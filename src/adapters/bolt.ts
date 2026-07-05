@@ -22,7 +22,7 @@ import { SessionGrants } from '../core/session';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
-  sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks,
+  sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
 } from './blocks';
 
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
@@ -844,6 +844,22 @@ export async function createVouchr(opts: VouchrOptions) {
           .map((m) => `• *${m.provider}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}`)
           .join('\n');
         return respond(`Tools for <#${command.channel_id}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`);
+      }
+
+      // Admin usage analytics for THIS channel over the last 30 days: which enabled tools are actually
+      // used, by how many distinct humans, and which are idle dead-weight to prune. Admin-gated (same
+      // gate as enable/mode) + audited on refusal. Service tools aren't brokered, so they're excluded.
+      if (sub === 'stats') {
+        if (!command.channel_id) return respond('Run `/vouchr stats` from inside a channel.');
+        if (!(await commandAdmin(client, identity, command.channel_id))) {
+          await audit.record('denied', identity, 'stats', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
+          return respond(adminOnly(allowChannelCreatorConfig, 'view channel usage stats'));
+        }
+        const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
+        const enabled = manifest.filter((m) => m.enabled && m.identity !== 'service').map((m) => m.provider);
+        const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
+        const stats = await audit.statsByChannel(identity.teamId, command.channel_id, since);
+        return respond({ text: 'Channel tool usage', blocks: statsBlocks(enabled, stats, 30) as any });
       }
 
       // Enable/disable a provider in this channel. Admin-gated (default-deny) + audited as 'config'.
