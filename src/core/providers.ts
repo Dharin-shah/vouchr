@@ -22,6 +22,8 @@ export interface Provider {
   authorizeUrl: string;
   tokenUrl: string;
   scopesDefault: string[];
+  /** Optional human-language description per scope id, shown in the connect prompt. Unknown scopes fall back to the raw string. */
+  scopeDescriptions?: Record<string, string>;
   /** Hostnames this provider's tokens may be sent to (injection boundary). */
   egressAllow: string[];
   /**
@@ -130,6 +132,10 @@ export function github(cfg: ProviderConfig = {}): Provider {
     authorizeUrl: 'https://github.com/login/oauth/authorize',
     tokenUrl: 'https://github.com/login/oauth/access_token',
     scopesDefault: cfg.scopes ?? ['read:user', 'repo'],
+    scopeDescriptions: {
+      'read:user': 'Read your profile',
+      repo: 'Read and write your repositories',
+    },
     egressAllow: ['api.github.com'],
     ...egressOptions(cfg),
     refresh: 'none',
@@ -173,6 +179,11 @@ export function google(cfg: ProviderConfig = {}): Provider {
       'email',
       'https://www.googleapis.com/auth/userinfo.profile',
     ],
+    scopeDescriptions: {
+      openid: 'Sign you in with your Google identity',
+      email: 'See your Google email address',
+      'https://www.googleapis.com/auth/userinfo.profile': 'See your basic profile info (name and photo)',
+    },
     egressAllow: ['www.googleapis.com', 'gmail.googleapis.com', 'people.googleapis.com'],
     ...egressOptions(cfg),
     refresh: 'rotating',
@@ -199,6 +210,10 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     authorizeUrl: 'https://gitlab.com/oauth/authorize',
     tokenUrl: 'https://gitlab.com/oauth/token',
     scopesDefault: cfg.scopes ?? ['read_user', 'api'],
+    scopeDescriptions: {
+      read_user: 'Read your profile',
+      api: 'Full read and write access to your projects, groups, and code',
+    },
     egressAllow: ['gitlab.com'],
     ...egressOptions(cfg),
     refresh: 'rotating',
@@ -305,9 +320,13 @@ export function databricks(cfg: DatabricksConfig): Provider {
     egressValidate: cfg.egressValidate,
     refresh: 'rotating', // offline_access → refresh token; Databricks rotates it (single-flight guards the swap)
     pkce: true, // U2M requires PKCE
+    scopeDescriptions: {
+      'all-apis': 'Call the workspace APIs as you (locked to SQL statement execution by default)',
+      offline_access: 'Stay connected without re-authorizing (refresh token)',
+    },
     clientId: cfg.clientId ?? process.env.DATABRICKS_CLIENT_ID ?? '',
     clientSecret,
-    publicClient: !clientSecret, // no secret → public client (PKCE-only). scopeDescriptions land with #105.
+    publicClient: !clientSecret, // no secret → public client (PKCE-only)
   });
 }
 

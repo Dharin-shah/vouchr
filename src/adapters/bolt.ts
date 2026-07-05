@@ -30,9 +30,15 @@ import {
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
 /** Map an external ref to its resolver source id. Add resolvers → extend this. */
-function refSource(ref: string): string {
+export function refSource(ref: string): string {
   if (/^arn:aws:secretsmanager:/.test(ref)) return 'aws-sm';
-  throw new UserFacingError('Unsupported secret reference. Expected an AWS Secrets Manager ARN.');
+  if (/^gcp-sm:\/\//.test(ref)) return 'gcp-sm';
+  if (/^azure-kv:\/\//.test(ref)) return 'azure-kv';
+  if (/^vault:\/\//.test(ref)) return 'vault';
+  throw new UserFacingError(
+    'Unsupported secret reference. Expected one of: an AWS Secrets Manager ARN (arn:aws:secretsmanager:…), ' +
+      'gcp-sm://…, azure-kv://…, or vault://….',
+  );
 }
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
@@ -647,7 +653,11 @@ export class ConnectContext {
   }
 
   private async postConnectPrompt(providerId: string, url: string): Promise<void> {
-    const blocks = connectBlocks(providerId, url);
+    const provider = this.registry.get(providerId);
+    const blocks = connectBlocks(providerId, url, {
+      list: provider.scopesDefault,
+      describe: provider.scopeDescriptions,
+    });
     const text = `Connect your ${providerId} account`;
     if (this.channel) {
       await this.client.chat.postEphemeral({
@@ -785,7 +795,7 @@ export async function createVouchr(opts: VouchrOptions) {
             })
             .catch(() => undefined);
         }
-        res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account));
+        res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account, result.scopes));
       } catch {
         // Express doesn't catch async rejections; an unhandled one here hangs the browser.
         res.status(500).send('Connection failed. Please try again.');
