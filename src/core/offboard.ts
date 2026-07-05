@@ -5,7 +5,7 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { ProviderRegistry } from './providers';
 import { revokeToken } from './tokens';
-import { userOwner } from './owner';
+import { userOwner, type Owner } from './owner';
 import { SessionGrants } from './session';
 
 /**
@@ -85,6 +85,92 @@ export async function offboardUser(
     await audit.record('revoke', identity, provider, meta);
   }
   return providers;
+}
+
+/** Break-glass bulk revocation filter. `provider` is REQUIRED (revoking across every provider is too
+ *  blunt); team/user/channel narrow the blast radius and compose (provider+team, provider+user, …). */
+export interface RevokeFilter {
+  provider: string;
+  teamId?: string;
+  userId?: string;
+  channel?: string;
+}
+
+/** One matched connection row — METADATA ONLY, never a secret. Feeds both the dry-run table and the
+ *  execution loop. */
+export interface RevokeRow {
+  teamId: string;
+  ownerKind: 'user' | 'channel';
+  ownerId: string;
+  externalAccount: string | null;
+  createdAt: number;
+}
+
+/** {@link RevokeRow} plus the per-row outcome. `removed` is the security-meaningful local delete;
+ *  `upstreamOk` is the best-effort provider revoke (a no-revoke provider stays true). */
+export interface RevokeOutcome extends RevokeRow {
+  removed: boolean;
+  upstreamOk: boolean;
+}
+
+/**
+ * Rows a {@link RevokeFilter} matches, metadata only (no ciphertext columns selected). The dry-run
+ * prints these and exits; the execution loop iterates them. Reuses the same `connection` predicate
+ * shape as the CLI `inventory` query, extended with owner-kind-aware --user/--channel filters.
+ */
+export async function selectRevocations(db: Db, f: RevokeFilter): Promise<RevokeRow[]> {
+  const where = ['provider=?'];
+  const params: unknown[] = [f.provider];
+  if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
+  // --user/--channel select a specific owner; user and channel ids can collide, so scope by kind too.
+  if (f.userId) { where.push("owner_kind='user' AND owner_id=?"); params.push(f.userId); }
+  if (f.channel) { where.push("owner_kind='channel' AND owner_id=?"); params.push(f.channel); }
+  const rows = (await db.all(
+    `SELECT team_id, owner_kind, owner_id, external_account, created_at
+     FROM connection WHERE ${where.join(' AND ')} ORDER BY team_id, owner_kind, owner_id`,
+    params,
+  )) as any[];
+  return rows.map((r) => ({
+    teamId: r.team_id, ownerKind: r.owner_kind, ownerId: r.owner_id,
+    externalAccount: r.external_account, createdAt: r.created_at,
+  }));
+}
+
+/**
+ * Revoke ONE already-selected connection row: local delete FIRST (the security-meaningful action,
+ * done even if the token can't be decrypted — e.g. a KMS row with no KMS client wired into the CLI),
+ * then best-effort upstream revoke, then audit ('revoke', no token) and — for a USER owner — clear
+ * that user's pending consent + thread session grants for the provider so neither can resurrect the
+ * credential. Mirrors {@link disconnectProvider}'s order but handles BOTH user- and channel-owned rows
+ * and never throws on a decrypt/upstream failure. Channel owners have no user-scoped consent/grants.
+ */
+export async function revokeConnection(
+  vault: Vault,
+  audit: Audit,
+  consent: Consent,
+  sessions: SessionGrants,
+  registry: ProviderRegistry | undefined,
+  row: RevokeRow,
+  provider: string,
+): Promise<RevokeOutcome> {
+  const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
+  // Read the token for the upstream revoke, but a decrypt failure must NEVER block the local delete.
+  let token: string | null = null;
+  try { token = (await vault.get(owner, provider))?.accessToken ?? null; } catch { /* still delete locally */ }
+  let removed = true;
+  try { await vault.delete(owner, provider); } catch { removed = false; } // local delete FIRST
+  let upstreamOk = true;
+  if (registry?.has(provider) && token) {
+    try { await revokeToken(registry.get(provider), token); } catch { upstreamOk = false; }
+  }
+  // Attribute the audit row to the OWNER (team + owner id); a channel row has no Slack user actor.
+  const actor: SlackIdentity = { enterpriseId: null, teamId: row.teamId, userId: row.ownerId };
+  await audit.record('revoke', actor, provider, { ok: upstreamOk, owner: row.ownerKind, reason: 'break-glass' });
+  if (row.ownerKind === 'user') {
+    await consent.deleteForUserProvider(row.teamId, row.ownerId, provider);
+    await sessions.clearForProvider(row.teamId, row.ownerId, provider);
+  }
+  return { ...row, removed, upstreamOk };
 }
 
 /**

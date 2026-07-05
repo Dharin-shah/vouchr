@@ -37,6 +37,11 @@ export class SessionGrants {
     await this.db.run(`DELETE FROM session_grant WHERE team_id=? AND user_id=?`, [i.teamId, i.userId]);
   }
 
+  /** Revoke a user's grants for ONE provider (break-glass bulk revocation of that provider). */
+  async clearForProvider(teamId: string, userId: string, provider: string): Promise<void> {
+    await this.db.run(`DELETE FROM session_grant WHERE team_id=? AND user_id=? AND provider=?`, [teamId, userId, provider]);
+  }
+
   /** Delete expired grants. Run on the same timer as the connection TTL sweep. */
   async sweepExpired(): Promise<number> {
     return (await this.db.run(`DELETE FROM session_grant WHERE expires_at<?`, [Date.now()])).changes;

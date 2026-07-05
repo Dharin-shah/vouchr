@@ -59,6 +59,12 @@ export class Consent {
     await this.db.run(`DELETE FROM consent_request WHERE team_id=? AND user_id=?`, [i.teamId, i.userId]);
   }
 
+  /** Delete in-flight consent for ONE provider (break-glass bulk revocation), so a pending "Connect"
+   *  click can't resurrect the credential we just revoked. */
+  async deleteForUserProvider(teamId: string, userId: string, provider: string): Promise<void> {
+    await this.db.run(`DELETE FROM consent_request WHERE team_id=? AND user_id=? AND provider=?`, [teamId, userId, provider]);
+  }
+
   /** Delete consent requests older than the state TTL (abandoned "Connect" clicks). */
   async sweepStale(): Promise<number> {
     const cutoff = Date.now() - STATE_TTL_MS;

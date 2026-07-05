@@ -12,7 +12,13 @@
 import { openDb, type Db } from '../src/core/db';
 import { loadMasterKey } from '../src/core/crypto';
 import { isPostgresUrl } from '../src/core/options';
-import { github, google, gitlab, notion, type Provider } from '../src/core/providers';
+import { github, google, gitlab, notion, ProviderRegistry, type Provider } from '../src/core/providers';
+import { Vault } from '../src/core/vault';
+import { Audit } from '../src/core/audit';
+import { Consent } from '../src/core/consent';
+import { SessionGrants } from '../src/core/session';
+import { selectRevocations, revokeConnection, type RevokeFilter } from '../src/core/offboard';
+import { loadProviders } from './providerConfig';
 
 type Flags = { values: Record<string, string>; positional: string[] };
 
@@ -24,8 +30,11 @@ function parseFlags(argv: string[]): Flags {
     const a = argv[i];
     if (a.startsWith('--')) {
       const eq = a.indexOf('=');
-      if (eq !== -1) values[a.slice(2, eq)] = a.slice(eq + 1);
-      else values[a.slice(2)] = argv[++i] ?? '';
+      if (eq !== -1) { values[a.slice(2, eq)] = a.slice(eq + 1); continue; }
+      // Boolean flag: a `--flag` with no value (end of argv or another `--flag` next) must not swallow
+      // the following flag as its value. Ids never start with `--`, so this is unambiguous.
+      const next = argv[i + 1];
+      values[a.slice(2)] = next === undefined || next.startsWith('--') ? '' : argv[++i];
     } else positional.push(a);
   }
   return { values, positional };
@@ -101,6 +110,59 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
       r.enabled == null ? '-' : r.enabled ? 'yes' : 'no',
     ]),
   );
+}
+
+/**
+ * Break-glass bulk revocation: kill every stored credential for a provider (optionally narrowed to a
+ * team/user/channel) during incident response. Dry-run is the DEFAULT — it prints a no-secret table
+ * and mutates nothing; `--yes` is required to actually revoke. Refuses to run without `--provider`.
+ *
+ * Unlike the metadata-only read commands, this one DELETES and (best-effort) upstream-revokes, so it
+ * constructs a Vault (master key) and the operator's provider registry. It never PRINTS a secret; the
+ * only decryption is the just-read access token handed to the upstream revoke, never to stdout.
+ */
+async function cmdRevoke(db: Db, f: Flags): Promise<number> {
+  const provider = f.values.provider;
+  if (!provider) {
+    console.error('revoke: --provider <id> is required (refusing to revoke across every provider)');
+    return 2;
+  }
+  const filter: RevokeFilter = { provider, teamId: f.values.team, userId: f.values.user, channel: f.values.channel };
+  const rows = await selectRevocations(db, filter);
+
+  // Dry-run unless --yes (and an explicit --dry-run forces it even alongside --yes). Print + exit.
+  const dryRun = 'dry-run' in f.values || !('yes' in f.values);
+  const scope = [`provider=${provider}`, f.values.team && `team=${f.values.team}`, f.values.user && `user=${f.values.user}`, f.values.channel && `channel=${f.values.channel}`].filter(Boolean).join(' ');
+  console.log(`${dryRun ? 'DRY-RUN' : 'REVOKE'} ${scope}: ${rows.length} connection(s)`);
+  printTable(
+    ['team', 'owner_kind', 'owner', 'external_account', 'created_at'],
+    rows.map((r) => [r.teamId, r.ownerKind, r.ownerId, r.externalAccount ?? '-', ts(r.createdAt)]),
+  );
+  if (dryRun) {
+    if (rows.length) console.log('\nNo changes made. Re-run with --yes to revoke.');
+    return 0;
+  }
+  if (!rows.length) return 0;
+
+  // Real registry (same loader the broker uses) so upstream revoke uses the operator's client creds.
+  // A provider with no revokeUrl is an honest no-op; local deletion is the security-meaningful action.
+  const registry = new ProviderRegistry(loadProviders(process.env));
+  const vault = new Vault(db, loadMasterKey());
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
+
+  let localFailures = 0;
+  let upstreamFailures = 0;
+  for (const row of rows) {
+    const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider);
+    if (!r.removed) localFailures++;
+    if (!r.upstreamOk) upstreamFailures++;
+  }
+  const revoked = rows.length - localFailures;
+  console.log(`\nRevoked ${revoked}/${rows.length} locally; ${upstreamFailures} upstream revoke(s) failed (best-effort).`);
+  // Non-zero only when a LOCAL deletion failed (access still present); upstream failures don't fail.
+  return localFailures ? 1 : 0;
 }
 
 async function cmdDoctor(f: Flags): Promise<number> {
@@ -192,6 +254,14 @@ Commands:
                 --provider <id>  filter by provider
   channels    List per-channel config: team, channel, provider, mode, enabled.
                 --team <id>      filter by team
+  revoke      Break-glass bulk revocation for an incident (delete locally, then
+              best-effort upstream revoke; audited, no secrets printed).
+                --provider <id>  REQUIRED (refuses to run without it)
+                --team <id>      narrow to one team
+                --user <id>      narrow to one user's own credentials
+                --channel <id>   narrow to one channel's shared credentials
+                --yes            actually revoke (default is a dry-run)
+                exits non-zero if any LOCAL deletion failed
   doctor      Diagnostics (PASS/FAIL): master key, DB reachability, row counts.
                 exits non-zero if any check fails
   health [provider|host ...]
@@ -221,6 +291,14 @@ async function main(): Promise<number> {
         await db.close();
       }
       return 0;
+    }
+    case 'revoke': {
+      const db = await openDb({ dbPath: f.values.db });
+      try {
+        return await cmdRevoke(db, f);
+      } finally {
+        await db.close();
+      }
     }
     case 'doctor':
       return cmdDoctor(f);
