@@ -7,9 +7,9 @@ name: Docker smoke
 on:
   push:
     branches: [main]
-    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json]
+    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json, test/docker-smoke.sh, .github/workflows/docker-smoke.yml]
   pull_request:
-    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json]
+    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json, test/docker-smoke.sh, .github/workflows/docker-smoke.yml]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
