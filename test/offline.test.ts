@@ -13,7 +13,7 @@ import { github, google, gitlab, notion, defineProvider, ProviderRegistry } from
 import { exchangeCode } from '../src/core/tokens';
 import { offboardUser } from '../src/core/offboard';
 import { sweepExpired } from '../src/core/sweep';
-import { userOwner, channelOwner } from '../src/core/owner';
+import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 
 const KEY = randomBytes(32);

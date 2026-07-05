@@ -5,10 +5,26 @@
   "license": "Apache-2.0",
   "author": "Dharin Shah",
   "homepage": "https://github.com/Dharin-shah/vouchr#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/Dharin-shah/vouchr.git" },
-  "bugs": { "url": "https://github.com/Dharin-shah/vouchr/issues" },
-  "keywords": ["slack", "oauth", "credentials", "ai-agents", "bolt", "secrets", "security"],
-  "publishConfig": { "access": "public", "tag": "latest" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Dharin-shah/vouchr.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Dharin-shah/vouchr/issues"
+  },
+  "keywords": [
+    "slack",
+    "oauth",
+    "credentials",
+    "ai-agents",
+    "bolt",
+    "secrets",
+    "security"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "tag": "latest"
+  },
   "type": "commonjs",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -53,6 +69,7 @@
     "prepack": "npm run build",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "biome lint src bin test",
     "test": "node --import tsx --test test/*.test.ts",
     "pack-smoke": "bash test/pack-smoke.sh",
     "pg:up": "docker run --rm -d --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr -p 5433:5432 postgres:16-alpine",
@@ -67,6 +84,7 @@
   },
   "devDependencies": {
     "@aws-sdk/client-secrets-manager": "^3.1075.0",
+    "@biomejs/biome": "^2.5.2",
     "@types/better-sqlite3": "^7.6.0",
     "@types/node": "^26.1.0",
     "@types/pg": "^8.20.0",
