@@ -95,6 +95,15 @@ test('admin mode change via the modal == /vouchr mode: same channel_config + aud
   assert.deepEqual(await auditActions(viaModal.lan.db), ['config']);
 });
 
+test('forged invalid mode value is ignored server-side, never persisted', async () => {
+  const h = await harness({ slackAdmin: true }); // even a real admin can't persist a bogus mode
+  let acked = 'unset';
+  await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'evil-mode' } } } }, async (r?: any) => (acked = r ?? 'ack'));
+  assert.equal(acked, 'ack'); // accepted; the invalid field is silently ignored
+  assert.equal(await modeRow(h.lan.db), null); // nothing written
+  assert.deepEqual(await auditActions(h.lan.db), []); // no config mutation audited
+});
+
 test('admin submit with unchanged values writes nothing (no spurious audit)', async () => {
   const h = await harness({ slackAdmin: true });
   // mcp is unconfigured (mode null, tool enabled-by-default). Submit tool checked = current → no-op.

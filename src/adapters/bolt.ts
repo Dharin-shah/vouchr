@@ -26,6 +26,12 @@ import {
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
 } from './blocks';
 
+/** The four valid per-channel auth modes, plus a RUNTIME guard. The slash command validates its text
+ *  arg against these; the modal `view_submission` needs the same server-side check because a client can
+ *  forge a `selected_option.value` that the compile-time `ChannelMode` type never sees. */
+const CHANNEL_MODES = ['shared', 'per-user', 'session', 'union'] as const;
+const isChannelMode = (m: unknown): m is ChannelMode => typeof m === 'string' && (CHANNEL_MODES as readonly string[]).includes(m);
+
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
  *  how long a single approval can live before the user must re-approve in the thread. */
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
@@ -892,7 +898,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant)
       // | union (any connected member, acting as that member). Admin-gated + audited in setChannelMode.
       if (sub === 'mode') {
-        if (!arg || (arg2 !== 'shared' && arg2 !== 'per-user' && arg2 !== 'session' && arg2 !== 'union')) {
+        if (!arg || !isChannelMode(arg2)) {
           return respond('Usage: `/vouchr mode <provider> <shared|per-user|session|union>`');
         }
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
@@ -1041,7 +1047,9 @@ export async function createVouchr(opts: VouchrOptions) {
         if (blockId.startsWith('mode:')) {
           const provider = blockId.slice(5);
           const mode = v?.mode?.selected_option?.value;
-          if (!mode || !registry.has(provider)) continue;
+          // Validate the submitted mode server-side: a forged view_submission can carry any string, and
+          // ChannelConfig.setMode does not runtime-check it. An invalid value is ignored, never persisted.
+          if (!isChannelMode(mode) || !registry.has(provider)) continue;
           const current = await channelConfig.getMode(identity.teamId, channel, provider);
           if (mode === current) continue; // unchanged → no mutation, no audit
           try { await ctx.setChannelMode(provider, mode); } catch (e) { errors[blockId] = safeUserMessage(e); }

@@ -294,7 +294,7 @@ export function configModal(o: {
   } else {
     blocks.push({
       type: 'section',
-      text: { type: 'mrkdwn', text: o.tools.map((t) => `• *${t.provider}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${t.mode})` : ''}`).join('\n') },
+      text: { type: 'mrkdwn', text: o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}`).join('\n') },
     });
   }
 
@@ -347,9 +347,11 @@ export function configModal(o: {
 
 /** A readable line for one connection, reused by the status list and the App Home tab. */
 function connectionLine(c: Connection): string {
-  const where = c.channel ? `<#${c.channel}>` : 'your DMs';
-  const mode = c.mode ? ` — _${c.mode}_` : '';
-  return `• *${c.provider}* in ${where}${mode}`;
+  // Escape provider/channel/mode before they hit mrkdwn: a stored provider id is attacker-influenceable
+  // (see escapeMrkdwn's note), so no value here may render as a forged `<…|link>` or `<@user>` mention.
+  const where = c.channel ? `<#${escapeMrkdwn(c.channel)}>` : 'your DMs';
+  const mode = c.mode ? ` — _${escapeMrkdwn(c.mode)}_` : '';
+  return `• *${escapeMrkdwn(c.provider)}* in ${where}${mode}`;
 }
 
 /** DM shown after a user successfully connects a credential: what, where, and how to undo. */
