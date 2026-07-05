@@ -5,6 +5,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- `/vouchr audit` — a self-service, in-Slack view of credential usage. A user sees the last ~20 audit
+  events attributed to them (their own credential's usage across channels, including union-mode
+  borrows); a channel admin can additionally run `/vouchr audit channel` for the current channel's
+  channel-owned usage. Strictly scoped — a non-admin never sees another user's or another channel's
+  rows — and `meta` is never rendered (the read query omits it). New `Audit.listByOwnerUser` /
+  `Audit.listByChannel` read methods and an `auditBlocks` renderer. In union mode the inject audit now
+  also populates the `actor` column with the real triggerer (a plain userId, already in `meta`), so the
+  owner's view shows *who* borrowed their credential; the renderer escapes Slack mrkdwn so a stored
+  value can never forge a link or mention.
+
 ### Security
 
 - Headless broker OAuth landing page: `landingHtml()` now HTML-escapes its `title`/`body` internally

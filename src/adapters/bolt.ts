@@ -22,7 +22,7 @@ import { SessionGrants } from '../core/session';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
-  sessionApprovalBlocks, APPROVE_SESSION_ACTION,
+  sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks,
 } from './blocks';
 
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
@@ -371,6 +371,10 @@ export class ConnectContext {
         if (r.status === 'resolved') {
           return new ConnectionHandle(
             provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+            // Union non-repudiation: `r.acting` is the borrowed member (audited as them); the REAL
+            // requester is the caller. Pass it as triggeredBy so the inject audit records WHO borrowed
+            // the credential — this is what surfaces in the owner's `/vouchr audit` view.
+            this.identity.userId,
           );
         }
       }
@@ -876,6 +880,10 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'configure') {
         if (!arg) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
+        // Validate the provider BEFORE recording a denial or opening the modal (parity with enable/disable):
+        // otherwise an unvalidated arg — potentially a credential-shaped typo — lands raw in the audit
+        // `provider` column and could be reflected back into a `/vouchr audit` view.
+        if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
         if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
           return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
@@ -890,6 +898,23 @@ export async function createVouchr(opts: VouchrOptions) {
         const { ok } = await disconnectProvider(vault, audit, registry, identity, arg);
         emit({ type: 'revoked', provider: arg, ok });
         return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
+      }
+
+      // Self-service transparency: where your credential was used. `audit channel` (admin-gated) shows
+      // this channel's channel-owned usage. Strictly scoped by the SELECT — a non-admin only ever sees
+      // rows attributed to their own user id, never another user's or another channel's.
+      if (sub === 'audit') {
+        if (arg === 'channel') {
+          if (!command.channel_id) return respond('Run `/vouchr audit channel` from inside the channel.');
+          if (!(await commandAdmin(client, identity, command.channel_id))) {
+            await audit.record('denied', identity, 'audit', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
+            return respond(adminOnly(allowChannelCreatorConfig, 'view channel credential usage'));
+          }
+          const rows = await audit.listByChannel(identity.teamId, command.channel_id, 20);
+          return respond({ text: 'Channel credential usage', blocks: auditBlocks(rows, 'Credential usage in this channel') as any });
+        }
+        const rows = await audit.listByOwnerUser(identity, 20);
+        return respond({ text: 'Your credential usage', blocks: auditBlocks(rows, 'Your credential usage') as any });
       }
 
       // Never list a service-to-service tool as a "connected account": Vouchr doesn't broker those,
