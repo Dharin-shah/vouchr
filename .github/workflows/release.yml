@@ -10,7 +10,7 @@ on:
 # A publish must NEVER be cancelled mid-flight, so this group does NOT cancel-in-progress: concurrent
 # tag pushes queue and run to completion one at a time instead of racing or aborting a partial publish.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.workflow }}
   cancel-in-progress: false
 
 permissions:
