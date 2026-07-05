@@ -71,6 +71,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "lint": "biome lint --error-on-warnings src bin test",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-include='src/**' test/*.test.ts",
     "pack-smoke": "bash test/pack-smoke.sh",
     "docker-smoke": "bash test/docker-smoke.sh",
     "pg:up": "docker run --rm -d --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr -p 5433:5432 postgres:16-alpine",
