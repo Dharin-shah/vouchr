@@ -15,8 +15,11 @@
 The contribution contract for humans and AI agents. This file is **canonical**: if any
 other doc disagrees with it, this one wins. Read it fully before changing code.
 
-Rules have IDs (`SEC-1`, `STR-2`, …). Reviews cite them; `.github/workflows/pr-lint.yml`
-enforces the `PROC` rules on every PR automatically.
+Rules have IDs (`SEC-1`, `STR-2`, `PLAT-3`, …). Reviews cite them;
+`.github/workflows/pr-lint.yml` enforces the `PROC` rules on every PR automatically. The
+`SEC`/`STR` rules protect the security model, `PLAT`/`UX`/`ADOPT` protect correctness on
+the Slack platform, the user experience, and integrators — they are applied by judgment
+while coding and reviewing, not by CI.
 
 ## What this is
 
@@ -73,6 +76,65 @@ See [`SECURITY.md`](./SECURITY.md) for the security model and how to report issu
   fit, generalize the design (declarative provider knobs) rather than special-casing. No
   abstraction with one implementation, no config for a value that never changes, no
   scaffolding "for later". Shortest correct diff wins; delete before you add.
+
+## Slack platform rules (PLAT) — correctness on the Slack surface
+
+Slack's timing and payload semantics are load-bearing; code that ignores them fails only
+in production, never in tests.
+
+- **PLAT-1 — Ack fast, work after.** Slash commands, `view_submission`s, and
+  `block_actions` must be acknowledged within **3 seconds**. Do Slack API calls and slow
+  writes after `ack()`; if an inline validation error requires pre-ack work, bound it —
+  parallelize independent reads (`Promise.all`) and never do per-item Slack round-trips
+  before acking.
+- **PLAT-2 — `trigger_id`s expire in 3 seconds.** Open the modal promptly; don't chain
+  sequential DB/Slack reads before `views.open`. If building the view is slow, open a
+  cheap loading view and hydrate it with `views.update`.
+- **PLAT-3 — Untouched inputs submit their initial values.** `view.state.values` carries
+  the open-time `initial_option`/`initial_options` of inputs the user never touched.
+  Diff against what the user actually changed; a value that merely differs from the
+  *current* store may be another admin's newer write (stale-modal race) — a stale submit
+  must never trigger a destructive side effect (e.g. a credential delete).
+- **PLAT-4 — Error keys must match a real `block_id`.** `response_action: 'errors'` keys
+  that match no input block in the submitted view are silently dropped — the user sees
+  nothing. Same principle everywhere: verify the feedback you emit can actually render.
+- **PLAT-5 — Bolt runs every matching listener.** Before registering a handler for an
+  action id/callback id this package *exports*, remember consumers may have registered
+  their own — a new built-in handler double-fires alongside theirs. Handle only what you
+  own: gate view refreshes on your `callback_id`, never on "some view exists".
+
+## UX rules (UX)
+
+- **UX-1 — No silent outcomes.** Every user action ends in visible feedback: success,
+  error, or "nothing to do". A `.catch(() => undefined)` on the only feedback path is a
+  bug, not defensive coding. Contradictory or unusable input gets an error, not a silent
+  zero-match no-op.
+- **UX-2 — Existing output is an interface.** `/vouchr <subcommand>` text and CLI output
+  are scripted against and in muscle memory. Add new surfaces; keep existing invocations
+  and their output stable.
+- **UX-3 — Destructive actions are explicit and honestly reported.** Dry-run or
+  confirmation by default (`--yes`, confirm buttons); the result states exactly what
+  happened ("revoked 3/5 locally; 2 upstream failed") and never reports skipped work as
+  success.
+- **UX-4 — Unchanged submits write nothing** — no spurious mutations or audit rows. And
+  the diff basis must be the same data the UI was rendered from, or "unchanged" is a lie.
+- **UX-5 — Errors say what to do next.** ("Re-run with `--yes`.", "Run `/vouchr` from
+  inside a channel.")
+
+## Adoption rules (ADOPT) — keep the platform easy to build on
+
+- **ADOPT-1 — `src/index.ts` exports are a public contract.** Adding is cheap; changing
+  or removing behavior behind an existing export is a breaking change — call it out in
+  the PR and `CHANGELOG.md`, and prefer additive paths.
+- **ADOPT-2 — Zero-config first.** Everything must work out of the box with defaults
+  (sqlite, no env beyond secrets). Every new knob, env var, or required step must justify
+  itself against the cost it adds to "time to first working demo".
+- **ADOPT-3 — Keep "a provider is ~10 declarative lines" true.** A provider that needs
+  bespoke code is a design smell: generalize the declarative knob instead (see Notion's
+  `tokenAuth`/`bodyFormat`).
+- **ADOPT-4 — New features never silently change existing behavior.** Old invocations,
+  handlers, and integrations keep working unchanged; new behavior is additive or
+  explicitly opted into.
 
 ## Testing rules (TEST)
 
@@ -169,4 +231,8 @@ these lines to tell reviewed contributions from drive-by automation.
 5. New external values validated before persist/audit (SEC-4); new mrkdwn escaped (SEC-5).
 6. New audit writes match the existing meta shape for that action (STR-4).
 7. README/CHANGELOG updated if public API changed (PROC-5).
-8. Description has the Checks line, the sign-off, and (agents) the canary (PROC-2..4).
+8. Interactive Slack paths: acked within 3s, feedback on every outcome, stale-submit
+   safe, no handler registered for an action id consumers own (PLAT-1..5, UX-1).
+9. Existing command output, exports, and integrations unchanged unless the PR says
+   otherwise (UX-2, ADOPT-1, ADOPT-4).
+10. Description has the Checks line, the sign-off, and (agents) the canary (PROC-2..4).
