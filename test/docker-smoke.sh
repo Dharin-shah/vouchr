@@ -31,17 +31,19 @@ docker run -d --name "$NAME" \
 # In-memory sqlite keeps the smoke self-contained (the read-only rootfs / non-root USER can't create a
 # default db file). Real deployments point VOUCHR_DATABASE_URL at Postgres or VOUCHR_DB at a volume.
 
-echo "==> poll /healthz until 200 (30s timeout)"
+# Poll /readyz, not /healthz: /healthz is bare liveness (no db), so it can't tell a booted server from
+# a usable one. /readyz does a real SELECT 1 through the store, so 200 proves listening AND store-ready.
+echo "==> poll /readyz until 200 (30s timeout)"
 ok=""
 for i in $(seq 1 30); do
-  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/healthz" || true)" = "200" ]; then
-    ok=1; echo "    healthz 200 after ${i}s"; break
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/readyz" || true)" = "200" ]; then
+    ok=1; echo "    readyz 200 after ${i}s"; break
   fi
   # If the container died, fail fast with its logs instead of waiting out the timeout.
   if [ -z "$(docker ps -q -f name="$NAME")" ]; then echo "FAIL: container exited early"; docker logs "$NAME"; exit 1; fi
   sleep 1
 done
-[ -n "$ok" ] || { echo "FAIL: /healthz never returned 200"; docker logs "$NAME"; exit 1; }
+[ -n "$ok" ] || { echo "FAIL: /readyz never returned 200"; docker logs "$NAME"; exit 1; }
 
 echo "==> the startup log names providers but leaks NO secret"
 LOGS="$(docker logs "$NAME" 2>&1)"
@@ -51,4 +53,4 @@ if echo "$LOGS" | grep -qF "$SECRET" || echo "$LOGS" | grep -qF "$MASTER_KEY"; t
 fi
 echo "    logs clean of secrets"
 
-echo "==> PASS: image builds, boots, serves /healthz, logs no secrets"
+echo "==> PASS: image builds, boots, serves /readyz (store reachable), logs no secrets"
