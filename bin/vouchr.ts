@@ -127,6 +127,15 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * the upstream revoke, never to stdout. Pending consent + thread grants for the scope are cleared too.
  */
 async function cmdRevoke(db: Db, f: Flags): Promise<number> {
+  // A scoping flag written with NO value (e.g. the typo `--team --yes`, where `--yes` is consumed as a
+  // boolean and `--team` is left empty) must NOT silently widen the blast radius to every team. Refuse
+  // any scope flag that is PRESENT but empty rather than treating it as "unset".
+  for (const k of ['provider', 'team', 'user', 'channel'] as const) {
+    if (k in f.values && !f.values[k]) {
+      console.error(`revoke: --${k} was given with no value; refusing to run with an ambiguous scope`);
+      return 2;
+    }
+  }
   const provider = f.values.provider;
   if (!provider) {
     console.error('revoke: --provider <id> is required (refusing to revoke across every provider)');
@@ -174,17 +183,31 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
   const sessions = new SessionGrants(db);
 
   let localFailures = 0;
+  let upstreamAttempted = 0;
   let upstreamFailures = 0;
+  let upstreamSkipped = 0;
   for (const row of rows) {
-    const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider);
-    if (!r.removed) localFailures++;
-    if (!r.upstreamOk) upstreamFailures++;
+    // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on one row
+    // never strands the rest of a break-glass sweep.
+    try {
+      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider);
+      if (!r.removed) localFailures++;
+      if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
+      else upstreamSkipped++;
+    } catch (e: any) {
+      localFailures++;
+      console.error(`revoke: ${row.ownerKind}:${row.ownerId} failed (${e?.message ?? e})`);
+    }
   }
   // Clear pending consent + thread grants for the SCOPE regardless of whether any connection matched —
   // an in-flight "Connect" or a lingering grant with no live connection would otherwise resurrect access.
   const purged = await purgePendingForProvider(db, filter);
   const revoked = rows.length - localFailures;
-  console.log(`\nRevoked ${revoked}/${rows.length} locally; ${upstreamFailures} upstream revoke(s) failed (best-effort); cleared ${purged.consents} pending consent + ${purged.grants} session grant(s).`);
+  console.log(`\nRevoked ${revoked}/${rows.length} locally.`);
+  // Report upstream honestly: attempted vs skipped (no revoke endpoint / no decryptable token) are NOT
+  // the same as success. A skip is not a failure, but it is not a revoke either.
+  console.log(`Upstream revoke: ${upstreamAttempted} attempted (${upstreamFailures} failed), ${upstreamSkipped} skipped (no revoke endpoint or no decryptable token).`);
+  console.log(`Cleared ${purged.consents} pending consent + ${purged.grants} session grant(s).`);
   // Non-zero only when a LOCAL deletion failed (access still present); upstream failures don't fail.
   return localFailures ? 1 : 0;
 }

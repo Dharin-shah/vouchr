@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
@@ -25,6 +29,12 @@ const revocable = defineProvider({
   revokeUrl: 'https://acme.example/revoke',
   clientId: 'id',
   clientSecret: 'sec',
+});
+
+// No revoke endpoint (Notion-style): an upstream revoke is a no-op → reported SKIPPED, never success.
+const norevoke = defineProvider({
+  id: 'norevoke', authorizeUrl: 'https://no.example/a', tokenUrl: 'https://no.example/t',
+  scopesDefault: [], egressAllow: ['api.no.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
 });
 
 const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -152,4 +162,58 @@ test('revoking a user connection clears that user+provider session grants and pe
 
   assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable'), false); // grant cleared
   assert.equal((await db.get('SELECT COUNT(*) AS n FROM consent_request') as any).n, 0); // consent cleared
+});
+
+test('a provider with no revoke endpoint reports upstream SKIPPED, not success', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'norevoke', tok('TOK'));
+  const realFetch = globalThis.fetch;
+  let called = false;
+  globalThis.fetch = (async () => { called = true; return new Response('', { status: 200 }); }) as any;
+  try {
+    const [row] = await selectRevocations(db, { provider: 'norevoke', userId: 'U1' });
+    const out = await revokeConnection(vault, new Audit(db), new Consent(db), new SessionGrants(db), new ProviderRegistry([norevoke]), row, 'norevoke');
+    assert.equal(out.removed, true);
+    assert.equal(out.upstreamAttempted, false); // no revoke endpoint → not attempted
+    assert.equal(called, false); // fetch never called
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  // The audit meta records the skip, not ok:true (a skip must not read as a success).
+  const meta = JSON.parse((await db.get('SELECT meta FROM audit WHERE action=?', ['revoke']) as any).meta);
+  assert.equal(meta.ok, undefined);
+  assert.equal(meta.upstream, 'skipped');
+});
+
+test('revokeConnection swallows a post-delete audit failure (bulk sweep never strands rows)', async () => {
+  const { db, vault, consent, sessions, registry } = await seed();
+  const throwingAudit = { record: async () => { throw new Error('db down'); } } as any;
+  const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
+  // Must NOT throw — the local delete already happened and the loop must continue for the other rows.
+  const out = await revokeConnection(vault, throwingAudit, consent, sessions, registry, row, 'revocable');
+  assert.equal(out.removed, true);
+  assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable'), null);
+});
+
+test('CLI refuses an empty --team scope instead of widening to every team', async () => {
+  // The `--team --yes` typo leaves --team empty; the CLI must refuse rather than revoke all teams.
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'vouchr-revoke-'));
+  const dbPath = path.join(dir, 'v.db');
+  const keyB64 = randomBytes(32).toString('base64');
+  const db = await openDb({ dbPath });
+  const vault = new Vault(db, Buffer.from(keyB64, 'base64'));
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'gh', tok('X1'));
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T2', userId: 'U2' }), 'gh', tok('X2'));
+  await db.close();
+
+  const res = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', 'gh', '--team', '--yes'], {
+    env: { ...process.env, VOUCHR_DB: dbPath, VOUCHR_MASTER_KEY: keyB64 }, encoding: 'utf8',
+  });
+  assert.equal(res.status, 2); // refused with the usage exit code
+  assert.match(res.stderr, /ambiguous scope/);
+  const db2 = await openDb({ dbPath });
+  const n = (await db2.get('SELECT COUNT(*) AS n FROM connection')) as any;
+  await db2.close();
+  assert.equal(n.n, 2); // BOTH teams' connections survive — nothing was revoked
 });

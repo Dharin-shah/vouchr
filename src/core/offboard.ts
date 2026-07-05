@@ -106,10 +106,13 @@ export interface RevokeRow {
   createdAt: number;
 }
 
-/** {@link RevokeRow} plus the per-row outcome. `removed` is the security-meaningful local delete;
- *  `upstreamOk` is the best-effort provider revoke (a no-revoke provider stays true). */
+/** {@link RevokeRow} plus the per-row outcome. `removed` is the security-meaningful local delete.
+ *  `upstreamAttempted` is true only when a real upstream revoke call was actually made (the provider
+ *  has a revoke endpoint AND a token was decryptable); when false the upstream revoke was SKIPPED, not
+ *  succeeded — don't report a skip as a success. `upstreamOk` is meaningful only when attempted. */
 export interface RevokeOutcome extends RevokeRow {
   removed: boolean;
+  upstreamAttempted: boolean;
   upstreamOk: boolean;
 }
 
@@ -195,18 +198,30 @@ export async function revokeConnection(
   try { token = (await vault.get(owner, provider))?.accessToken ?? null; } catch { /* still delete locally */ }
   let removed = true;
   try { await vault.delete(owner, provider); } catch { removed = false; } // local delete FIRST
+  // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
+  // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success.
+  let upstreamAttempted = false;
   let upstreamOk = true;
   if (registry?.has(provider) && token) {
-    try { await revokeToken(registry.get(provider), token); } catch { upstreamOk = false; }
+    const p = registry.get(provider);
+    if (p.revoke || p.revokeUrl) {
+      upstreamAttempted = true;
+      try { await revokeToken(p, token); } catch { upstreamOk = false; }
+    }
   }
   // Attribute the audit row to the OWNER (team + owner id); a channel row has no Slack user actor.
+  // Everything after the local delete is BEST-EFFORT and wrapped so one row's audit/consent/session
+  // failure (e.g. a transient DB error) can never throw out of the bulk-revoke loop and strand the
+  // remaining rows. The security-meaningful delete already happened above.
   const actor: SlackIdentity = { enterpriseId: null, teamId: row.teamId, userId: row.ownerId };
-  await audit.record('revoke', actor, provider, { ok: upstreamOk, owner: row.ownerKind, reason: 'break-glass' });
+  const meta: Record<string, unknown> = { owner: row.ownerKind, reason: 'break-glass' };
+  if (upstreamAttempted) meta.ok = upstreamOk; else meta.upstream = 'skipped';
+  try { await audit.record('revoke', actor, provider, meta); } catch { /* best-effort */ }
   if (row.ownerKind === 'user') {
-    await consent.deleteForUserProvider(row.teamId, row.ownerId, provider);
-    await sessions.clearForProvider(row.teamId, row.ownerId, provider);
+    try { await consent.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
+    try { await sessions.clearForProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
   }
-  return { ...row, removed, upstreamOk };
+  return { ...row, removed, upstreamAttempted, upstreamOk };
 }
 
 /**
