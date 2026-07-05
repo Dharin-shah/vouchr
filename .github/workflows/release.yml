@@ -23,6 +23,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      # Gate BEFORE any publish: npm/GHCR are irreversible, so a missing CHANGELOG section must fail
+      # here (verify precedes both publish jobs) rather than after they've shipped. Tag-only — a
+      # workflow_dispatch run has no version. github-release re-extracts the same section to publish.
+      - name: CHANGELOG has this tag's section
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" 'index($0,"## ["ver"]")==1{g=1;next} g&&/^## /{g=0} g{print}' CHANGELOG.md | grep -q . \
+            || { echo "::error::no CHANGELOG section for $VERSION — add a '## [$VERSION]' entry before tagging"; exit 1; }
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 22
