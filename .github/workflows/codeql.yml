@@ -1,0 +1,37 @@
+name: CodeQL
+
+# First-party SAST for Vouchr's own TypeScript (deps/secrets/SBOM are covered by security.yml).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '47 5 * * 3' # weekly, offset from security.yml's Monday 04:27 run
+
+# Superseded PR runs auto-cancel; a scheduled scan is cheap to restart.
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (javascript-typescript)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # upload alerts to the Security tab
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      # Third-party actions SHA-pinned (matching security.yml's dependency-check pin); the comment
+      # tracks the human-readable version so Dependabot can bump both.
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@c35d1b164463ee62a100735382aaaa525c5d3496 # codeql-bundle-v2.25.6
+        with:
+          languages: javascript-typescript
+          queries: security-extended
+      # TS is interpreted — no build step needed; CodeQL extracts from source directly.
+      - name: Analyze
+        uses: github/codeql-action/analyze@c35d1b164463ee62a100735382aaaa525c5d3496 # codeql-bundle-v2.25.6
+        with:
+          category: '/language:javascript-typescript'
