@@ -1,0 +1,46 @@
+name: PR lint
+
+# Enforces the PROC rules from AGENTS.md on the PR title + description, so the
+# contribution contract is machine-checked instead of honor-system.
+# `edited` is included so fixing the description re-runs the check without a push.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+jobs:
+  pr-lint:
+    runs-on: ubuntu-latest
+    env:
+      TITLE: ${{ github.event.pull_request.title }}
+      BODY: ${{ github.event.pull_request.body }}
+    steps:
+      - name: "PROC-1: conventional-commit title"
+        run: |
+          printf '%s' "$TITLE" | grep -qE '^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)(\([a-zA-Z0-9./-]+\))?!?: .+' \
+            || { echo "::error::PR title must be conventional-commit style (AGENTS.md PROC-1), e.g. 'feat(bolt): add config modal'"; exit 1; }
+
+      - name: "PROC-2: description states that typecheck and tests pass"
+        run: |
+          { printf '%s' "$BODY" | grep -qF 'npm run typecheck' \
+            && printf '%s' "$BODY" | grep -qF 'npm test' \
+            && printf '%s' "$BODY" | grep -qiE 'pass'; } \
+            || { echo "::error::PR description must state that \`npm run typecheck\` and \`npm test\` pass (AGENTS.md PROC-2); copy the Checks line from AGENTS.md."; exit 1; }
+
+      - name: "PROC-3/PROC-4: sign-off line; agent PRs end with the canary"
+        run: |
+          AGENT_SIGNOFF='Signed-off-by: 🤖 automated-agent (operator has not certified review)'
+          CANARY='canary: vouchr-agents-md-v1 (agent-generated)'
+          HUMAN_SIGNOFF_RE='^Signed-off-by: .+ <[^&<>]+@[^&<>]+> — reviewed line-by-line[[:space:]]*$'
+          body_lines() { printf '%s\n' "$BODY" | sed -e 's/\r$//' -e '/^[[:space:]]*$/d'; }
+          last_line=$(body_lines | tail -n 1)
+          if printf '%s\n' "$BODY" | grep -qF "$AGENT_SIGNOFF"; then
+            [ "$last_line" = "$CANARY" ] \
+              || { echo "::error::agent-authored PR must end with the exact canary line (AGENTS.md PROC-4): $CANARY"; exit 1; }
+          elif printf '%s' "$last_line" | grep -qE "$HUMAN_SIGNOFF_RE"; then
+            exit 0
+          else
+            echo "::error::PR description must end with a valid sign-off line (AGENTS.md PROC-3); copy it exactly from AGENTS.md § Required sign-off."
+            exit 1
+          fi
