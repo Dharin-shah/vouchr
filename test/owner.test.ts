@@ -57,7 +57,7 @@ test('referenced secret-source: resolved JIT, injected, never persisted', async 
   const realFetch = globalThis.fetch;
   let seenAuth: string | null = null;
   let resolvedWith: string | null = null;
-  const resolvers = { 'aws-sm': async (ref: string) => ((resolvedWith = ref), 'SECRET_FROM_AWS') };
+  const resolvers = { 'aws-sm': async (ref: string) => { resolvedWith = ref; return 'SECRET_FROM_AWS'; } };
   globalThis.fetch = (async (_u: any, init: any) => {
     seenAuth = new Headers(init.headers).get('authorization');
     return new Response('ok', { status: 200 });

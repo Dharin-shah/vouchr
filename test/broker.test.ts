@@ -476,7 +476,7 @@ test('fetch: a shared replayStore rejects a replay across DIFFERENT broker insta
   // A shared store makes single-use cluster-wide, not per-process (the default in-memory guard would
   // let each instance accept the same jti once). Simulates two pods behind one Redis-backed store.
   const seen = new Map<string, number>();
-  const replayStore = { use: (jti: string, exp: number) => (seen.has(jti) ? false : (seen.set(jti, exp), true)) };
+  const replayStore = { use: (jti: string, exp: number) => { if (seen.has(jti)) return false; seen.set(jti, exp); return true; } };
   const a = await makeBroker({ replayStore });
   const b = await makeBroker({ replayStore });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -708,7 +708,7 @@ async function makeBrokerOn(build: (db: any, vault: Vault, audit: Audit) => Part
 test('fetch: a Policy that denies the provider in this channel -> 403, credential NEVER injected', async () => {
   // Policy denies acme in C1 (the channel comes from the verified claims, not the body).
   const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
-  const { server, db, audit, port } = await makeBrokerOn(() => ({ policy }));
+  const { server, db, port } = await makeBrokerOn(() => ({ policy }));
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
@@ -744,7 +744,7 @@ test('fetch: write requests still honor Policy before injection', async () => {
 });
 
 test('fetch: a ChannelTools allowlist that disables the provider here -> 403, credential NEVER injected', async () => {
-  const { server, db, audit, port } = await makeBrokerOn((db) => ({ channelTools: new ChannelTools(db) }));
+  const { server, db, port } = await makeBrokerOn((db) => ({ channelTools: new ChannelTools(db) }));
   // Configure the channel as an allowlist that does NOT include acme -> acme is disabled here.
   await new ChannelTools(db).setEnabled('T1', 'C1', 'other', true);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));

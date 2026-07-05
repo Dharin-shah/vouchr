@@ -20,7 +20,7 @@ const KEY = randomBytes(32);
 const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
 
 test('postgres backend: isolation · crypto-at-rest · reference · ttl · consent · config', async (t) => {
-  let db;
+  let db: Awaited<ReturnType<typeof openDb>> | undefined;
   try {
     db = await openDb({ databaseUrl: PG_URL });
     await db.exec('TRUNCATE connection, consent_request, channel_config, audit');
@@ -186,7 +186,7 @@ test('postgres backend: concurrent cross-process refresh => one /token call, los
 
 test('postgres backend: DbReplayStore makes a jti single-use cluster-wide', async (t) => {
   const { DbReplayStore } = await import('../src/adapters/http/replayStore');
-  let db;
+  let db: Awaited<ReturnType<typeof openDb>> | undefined;
   try {
     db = await openDb({ databaseUrl: PG_URL });
     await db.exec('CREATE TABLE IF NOT EXISTS broker_jti (jti TEXT PRIMARY KEY, exp BIGINT NOT NULL)');
