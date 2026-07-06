@@ -1,0 +1,18 @@
+# Gitleaks configuration for vouchr.
+#
+# The scheduled security scan walks the FULL git history (`git log -p --all`). Without this config it
+# flags the deliberately credential-SHAPED fixtures our tests use — e.g. the fake Slack token
+# `xoxb-…` in test/audit.test.ts that exists ONLY to assert the audit log redacts it. Those are
+# never real secrets; a credential broker's redaction/injection/crypto tests must contain
+# credential-shaped strings to be meaningful. Application code (src/), bin/, and config are still
+# scanned with the complete default ruleset.
+title = "vouchr gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures are intentionally credential-shaped fake values (redaction/injection/crypto tests), not real secrets."
+paths = [
+  '''^test/''',
+]
