@@ -5,7 +5,24 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-06
+
 ### Added
+
+- `/vouchr` with **no subcommand** now opens an interactive config modal (discoverability). Everyone
+  sees their connected accounts (each with a confirm-gated Disconnect button) and the channel's tool
+  manifest; admins additionally get a per-provider mode select + Enabled checkbox that route to the
+  same `setChannelMode` / `ChannelTools.setEnabled` mutations as the slash commands, with authorization
+  re-checked server-side on submit (a forged `view_submission` from a non-admin is rejected + audited).
+  The text subcommands (`status`, `mode`, `enable`/`disable`, …) are unchanged. New `configModal`
+  Block Kit builder + `CONFIG_CALLBACK`, exported for headless hosts. (#109)
+
+- `vouchr revoke` CLI — break-glass bulk revocation for incident response:
+  `vouchr revoke --provider <id> [--team|--user|--channel] [--yes]`. Dry-run by default (prints a
+  no-secret table, mutates nothing); `--yes` deletes each matched credential locally FIRST, then
+  best-effort upstream revoke, and clears pending consent + thread grants for the scope (even where no
+  live connection matched). Local deletion is guaranteed even if the master key / provider config is
+  unavailable; refuses to run without `--provider` or with an empty scope flag. (#103)
 
 - `/vouchr stats` — admin per-channel usage analytics (last 30 days). For each brokered tool enabled in
   the channel: total injections, distinct acting humans, last-used time, and a `never used` flag for
