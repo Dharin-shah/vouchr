@@ -52,9 +52,9 @@ export const providers = [github(), jira, payments];
 //   entry.identity === 'acting_human'  → await context.vouchr.connect(entry.provider)
 //   entry.identity === 'service'       → host's own service-to-service call
 export const exampleManifest: ToolManifestEntry[] = [
-  { provider: 'github', mode: 'per-user', enabled: true, identity: 'acting_human' },
-  { provider: 'jira', mode: 'union', enabled: true, identity: 'acting_human' },
-  { provider: 'payments', mode: null, enabled: true, identity: 'service' },
+  { provider: 'github', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'public' },
+  { provider: 'jira', mode: 'union', enabled: true, identity: 'acting_human', visibility: 'private' },
+  { provider: 'payments', mode: null, enabled: true, identity: 'service', visibility: 'public' },
 ];
 
 // Route each tool by its identity: Vouchr brokers the humans, the host runs services.

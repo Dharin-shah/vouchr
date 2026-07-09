@@ -150,6 +150,14 @@ function schema(blob: string, int: string): string {
       PRIMARY KEY (team_id, channel, provider)
     );
 
+    CREATE TABLE IF NOT EXISTS channel_preview (
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      PRIMARY KEY (team_id, channel, provider)
+    );
+
     CREATE TABLE IF NOT EXISTS channel_tool (
       team_id TEXT NOT NULL,
       channel TEXT NOT NULL,

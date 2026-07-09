@@ -10,11 +10,12 @@ import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
-import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
+import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../core/authz';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { safeEmit } from '../core/safe-emit';
-import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
+import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
+import { PendingPreviews } from '../core/preview';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser, disconnectProvider } from '../core/offboard';
 import { sweepExpired } from '../core/sweep';
@@ -24,7 +25,12 @@ import {
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
+  previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
 } from './blocks';
+
+/** How long a private preview's Share button stays claimable. Short on purpose: the human is
+ *  looking at the ephemeral message right now; a stale share re-posts stale data. */
+const PREVIEW_TTL_MS = 10 * 60_000;
 
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
  *  how long a single approval can live before the user must re-approve in the thread. */
@@ -219,6 +225,10 @@ export interface ConnectContextDeps {
   sessions?: SessionGrants;
   /** Optional audit stream sink (raw actor id). Default no-op; the audit table stays authoritative. */
   auditSink?: AuditSink;
+  /** Pending private previews awaiting Share/Dismiss. Must be the createVouchr-scoped instance so a
+   *  share click (a later request) finds the entry; a direct-constructed context gets its own (the
+   *  ephemeral still posts; the share button then reports expired unless the host wires the actions). */
+  previews?: PendingPreviews;
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -244,6 +254,7 @@ export class ConnectContext {
   private thread: string | null;
   private sessions?: SessionGrants;
   private auditSink: AuditSink;
+  private previews: PendingPreviews;
 
   constructor(deps: ConnectContextDeps) {
     this.identity = deps.identity;
@@ -267,6 +278,7 @@ export class ConnectContext {
     this.thread = deps.thread ?? null;
     this.sessions = deps.sessions;
     this.auditSink = deps.auditSink ?? (() => {});
+    this.previews = deps.previews ?? new PendingPreviews(PREVIEW_TTL_MS);
   }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -295,6 +307,25 @@ export class ConnectContext {
     return provider;
   }
 
+  /**
+   * The Bolt-side deny mapping of the shared authorizeProvider CHECK (audit row + policy_denied emit
+   * + user-safe error) — ONE mapping for connect() and preview(), so the credential path and the
+   * output path enforce and report the same decision. connectChannel keeps its own variant of this
+   * mapping because its audit meta carries owner:'channel'.
+   */
+  private async requireProviderAuthorized(providerId: string): Promise<void> {
+    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+    if (denial === 'policy') {
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
+      this.emit({ type: 'policy_denied', provider: providerId });
+      throw new Error(`Policy denies "${providerId}" in this channel.`);
+    }
+    if (denial === 'tool-disabled') {
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
+      throw new Error(`"${providerId}" is not enabled in this channel.`);
+    }
+  }
+
   async connect(providerId: string): Promise<ConnectionHandle> {
     // Refuse service-to-service tools BEFORE any consent flow — no Connect prompt, no vault lookup.
     const provider = this.brokerable(providerId);
@@ -312,16 +343,7 @@ export class ConnectContext {
     // Authorization (Policy + per-channel tool allowlist) — the CHECK is the shared core decision; the
     // Bolt path keeps its own audit/error mapping (and, unlike the broker, does NOT emit policy_denied on
     // a tool-disabled deny — preserved deliberately).
-    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
-    if (denial === 'policy') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
-      this.emit({ type: 'policy_denied', provider: providerId });
-      throw new Error(`Policy denies "${providerId}" in this channel.`);
-    }
-    if (denial === 'tool-disabled') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
-      throw new Error(`"${providerId}" is not enabled in this channel.`);
-    }
+    await this.requireProviderAuthorized(providerId);
 
     // Thread-scoped session: when the channel sets this provider to 'session', the user's token is usable
     // only inside the Slack thread they approved it in. The fail-closed rule lives in resolveCredentialOwner
@@ -565,6 +587,70 @@ export class ConnectContext {
   }
 
   /**
+   * Set the channel's preview visibility for a provider ('private' = agent output goes only to the
+   * requester, with a Share action). Admin-only, audited — the same gate as setChannelMode. A
+   * rendering policy, not a credential one, so no channel-eligibility check and no `brokerable`
+   * refusal: a service tool's output can leak in a thread exactly like a brokered one's.
+   */
+  async setChannelVisibility(providerId: string, visibility: PreviewVisibility): Promise<void> {
+    this.registry.get(providerId); // validate BEFORE persist/audit (SEC-4): throws on an unknown id
+    const { cfg, owner, channel } = this.channelTarget();
+    await this.requireAdmin(providerId);
+    await cfg.setVisibility(owner.teamId, channel, providerId, visibility);
+    await this.audit.record('config', this.identity, providerId, { owner: 'channel', channel, visibility });
+  }
+
+  /**
+   * Post provider-derived agent output ('title' + 'lines') honoring the channel's preview
+   * visibility for `providerId`:
+   *  - 'public' (default) → a normal message in the channel (threaded when in a thread).
+   *  - 'private'          → ephemeral to the requester with Share/Dismiss buttons; the rendered
+   *    content is held in memory (see PendingPreviews) so a Share click reposts exactly what the
+   *    human reviewed, publicly attributed to them.
+   * Outside a channel (a DM with the agent) there is no one to leak to: always a direct post.
+   * Returns which path ran so the host can stop its turn ('private') vs continue ('posted').
+   */
+  async preview(providerId: string, content: { title: string; lines: string[] }): Promise<'posted' | 'private'> {
+    this.registry.get(providerId); // unknown provider ids never reach a message or the preview store
+    // Output rides the SAME authorization as credential use (the shared CHECK, same audit/deny mapping
+    // as connect()): a policy-denied or tool-disabled provider must not get its output posted through
+    // Vouchr's preview surface either — otherwise the manifest's `enabled` would be a lie here.
+    await this.requireProviderAuthorized(providerId);
+    // Normalize ONCE to exactly what rendering shows (blank lines dropped, caps applied), so the
+    // pending store never retains provider text the recipient couldn't actually have reviewed.
+    const c = normalizePreviewContent(providerId, content);
+    const visibility = this.channel && this.channelConfig
+      ? await this.channelConfig.getVisibility(this.identity.teamId, this.channel, providerId)
+      : 'public';
+    if (visibility === 'private' && this.channel) {
+      const id = this.previews.put({
+        teamId: this.identity.teamId, userId: this.identity.userId, channel: this.channel,
+        thread: this.thread, provider: providerId, title: c.title, lines: c.lines,
+      });
+      await this.client.chat.postEphemeral({
+        channel: this.channel,
+        user: this.identity.userId,
+        ...(this.thread ? { thread_ts: this.thread } : {}),
+        blocks: previewBlocks({
+          provider: providerId, title: c.title, lines: c.lines, id,
+          where: this.thread ? 'thread' : 'channel', ttlMinutes: Math.round(PREVIEW_TTL_MS / 60_000),
+        }) as any,
+        text: `Private ${providerId} preview (only visible to you)`,
+      });
+      return 'private';
+    }
+    await this.client.chat.postMessage({
+      channel: this.channel ?? this.identity.userId,
+      ...(this.thread ? { thread_ts: this.thread } : {}),
+      blocks: previewPostBlocks({ provider: providerId, title: c.title, lines: c.lines }) as any,
+      // Fallback/notification text is PARSED mrkdwn, not blocks: a provider-derived title there could
+      // fire a <!channel> or forge a mention (SEC-5). Neutral constant + the registry-validated id only.
+      text: `${providerId} preview`,
+    });
+    return 'posted';
+  }
+
+  /**
    * Return a leak-safe handle for the CHANNEL's shared credential for `providerId`. The handle
    * keys the vault on the channel but audits as the acting human (invariant 9). Throws if the
    * channel is per-user-locked or has no shared cred configured.
@@ -618,22 +704,13 @@ export class ConnectContext {
    * allow-channel-only policy can still report a provider disabled.
    */
   async toolManifest(): Promise<ToolManifestEntry[]> {
-    const out: ToolManifestEntry[] = [];
-    for (const provider of this.providerIds) {
-      const toolEnabled = this.channel && this.channelTools
-        ? await this.channelTools.isEnabled(this.identity.teamId, this.channel, provider)
-        : true;
-      // Intersect with Policy so the manifest matches what connect() would actually allow: a
-      // provider the channel tool allowlist enables but Policy denies is not usable here.
-      const enabled = toolEnabled && this.policy.check(provider, this.channel);
-      const mode = this.channel && this.channelConfig
-        ? await this.channelConfig.getMode(this.identity.teamId, this.channel, provider)
-        : null;
-      // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
-      const identity = this.registry.get(provider).identity ?? 'acting_human';
-      out.push({ provider, mode, enabled, identity });
-    }
-    return out;
+    // ONE shared core builder (with the broker's POST /v1/manifest), so `enabled` here is exactly
+    // "authorizeProvider would allow it" and the two transports can't drift.
+    return buildToolManifest({
+      providerIds: this.providerIds, registry: this.registry, policy: this.policy,
+      channelTools: this.channelTools, channelConfig: this.channelConfig,
+      principal: this.identity, channel: this.channel,
+    });
   }
 
   /** Ephemeral in-thread prompt to approve a thread-scoped session. Only the acting user sees it.
@@ -704,6 +781,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
+  const previews = new PendingPreviews(PREVIEW_TTL_MS); // pending private previews (share/dismiss)
   const sink: EventSink = opts.onEvent ?? (() => {});
   // Optional audit stream sink (raw actor id). Separate from `sink`, which is deliberately actor-free.
   const auditSink: AuditSink = opts.auditSink ?? (() => {});
@@ -772,6 +850,7 @@ export async function createVouchr(opts: VouchrOptions) {
         thread,
         sessions,
         auditSink,
+        previews,
       });
     }
     await args.next();
@@ -818,7 +897,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, auditSink,
+      thread: null, sessions, auditSink, previews,
     });
   }
 
@@ -858,7 +937,7 @@ export async function createVouchr(opts: VouchrOptions) {
         const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
         if (!manifest.length) return respond('No providers are registered.');
         const lines = manifest
-          .map((m) => `• *${m.provider}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}`)
+          .map((m) => `• *${m.provider}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}${m.visibility === 'private' ? ' · :lock: private previews' : ''}`)
           .join('\n');
         return respond(`Tools for <#${command.channel_id}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`);
       }
@@ -908,6 +987,24 @@ export async function createVouchr(opts: VouchrOptions) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
         return respond(`Set *${arg}* to *${arg2}* in <#${command.channel_id}>.`);
+      }
+
+      // Per-channel preview visibility: private = agent output goes only to the requester, with an
+      // explicit Share button. Admin-gated + audited in setChannelVisibility (same gate as `mode`).
+      if (sub === 'preview') {
+        if (!arg || !isPreviewVisibility(arg2)) {
+          return respond('Usage: `/vouchr preview <provider> <public|private>`');
+        }
+        if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
+        if (!command.channel_id) return respond('Run `/vouchr preview` from inside the channel you want to configure.');
+        try {
+          await contextFor(identity, command.channel_id, client).setChannelVisibility(arg, arg2);
+        } catch (e) {
+          return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
+        }
+        return respond(arg2 === 'private'
+          ? `Set *${arg}* previews to *private* in <#${command.channel_id}>: results go only to whoever asked, with a Share button.`
+          : `Set *${arg}* previews to *public* in <#${command.channel_id}>.`);
       }
 
       if (sub === 'configure') {
@@ -1023,10 +1120,14 @@ export async function createVouchr(opts: VouchrOptions) {
       // policy-intersected value for its read-only "Tools in this channel" display.
       const admin = isAdmin && channelId
         ? await Promise.all(
+            // Preview visibility applies to ALL tools (service included — their output can leak in a
+            // thread just the same), so unlike mode/enabled it is NOT filtered to brokered providers…
+            // but the admin rows are; the service tools' knob ships when someone needs it.
             tools.filter((t) => t.identity !== 'service').map(async (t) => ({
               provider: t.provider,
               mode: t.mode,
               enabled: await channelTools.isEnabled(identity.teamId, channelId, t.provider),
+              visibility: t.visibility,
             })),
           )
         : undefined;
@@ -1047,11 +1148,11 @@ export async function createVouchr(opts: VouchrOptions) {
       // the modal, no mutation) beats keying an error to a block id that may not exist.
       if (!identity) return ack();
       let channel = '';
-      let open: { p: string; m: string | null; e: boolean }[] = [];
+      let open: { p: string; m: string | null; e: boolean; v?: string }[] = [];
       try { ({ channel = '', open = [] } = JSON.parse(view.private_metadata)); } catch { channel = ''; }
       if (!channel || !(await commandAdmin(client, identity, channel))) {
         await audit.record('denied', identity, 'config', { reason: 'not-admin', owner: 'channel', channel });
-        const firstBlock = Object.keys(view.state?.values ?? {}).find((b) => b.startsWith('mode:') || b.startsWith('tool:'));
+        const firstBlock = Object.keys(view.state?.values ?? {}).find((b) => b.startsWith('mode:') || b.startsWith('tool:') || b.startsWith('preview:'));
         // Only attach the error to a REAL block id (Slack silently drops unknown keys); if there are no
         // admin blocks (a forged submit), a bare ack still rejects the mutation — nothing was written.
         return firstBlock
@@ -1060,15 +1161,18 @@ export async function createVouchr(opts: VouchrOptions) {
       }
       const openMode = new Map(open.map((o) => [o.p, o.m]));
       const openEnabled = new Map(open.map((o) => [o.p, o.e]));
+      const openVisibility = new Map(open.map((o) => [o.p, o.v ?? 'public']));
 
       // Collect the submitted state per provider up front, so mode + enabled are each diffed against
       // their OPEN-TIME value rather than the current store.
       const values = view.state?.values ?? {};
       const submittedMode = new Map<string, unknown>();
       const submittedEnabled = new Map<string, boolean>();
+      const submittedVisibility = new Map<string, PreviewVisibility>();
       for (const [blockId, v] of Object.entries<any>(values)) {
         if (blockId.startsWith('mode:')) submittedMode.set(blockId.slice(5), v?.mode?.selected_option?.value);
         else if (blockId.startsWith('tool:')) submittedEnabled.set(blockId.slice(5), (v?.enabled?.selected_options ?? []).some((o: any) => o.value === 'enabled'));
+        else if (blockId.startsWith('preview:')) submittedVisibility.set(blockId.slice(8), (v?.visibility?.selected_options ?? []).some((o: any) => o.value === 'private') ? 'private' : 'public');
       }
 
       const ctx = contextFor(identity, channel, client);
@@ -1079,6 +1183,13 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!registry.has(provider) || !isChannelMode(mode)) continue; // forged/invalid → ignore
         if (mode === (openMode.get(provider) ?? null)) continue; // untouched (or reset to the same) → skip
         try { await ctx.setChannelMode(provider, mode); } catch (e) { errors[`mode:${provider}`] = safeUserMessage(e); }
+      }
+
+      // ── preview visibility: same open-time-diff contract as mode ──
+      for (const [provider, visibility] of submittedVisibility) {
+        if (!registry.has(provider)) continue; // forged/invalid → ignore
+        if (visibility === (openVisibility.get(provider) ?? 'public')) continue; // untouched → skip
+        try { await ctx.setChannelVisibility(provider, visibility); } catch (e) { errors[`preview:${provider}`] = safeUserMessage(e); }
       }
 
       // ── enabled: the tool allowlist. Writing the FIRST row flips the channel from "all enabled"
@@ -1151,6 +1262,46 @@ export async function createVouchr(opts: VouchrOptions) {
       await sessions.grant(identity, channel, thread, provider, sessionTtlMs);
       await audit.record('session', identity, provider, { channel, thread, event: 'grant' });
       if (respond) await respond({ replace_original: true, text: `✅ Approved *${provider}* for this thread. Ask me again.` });
+    });
+
+    // Share a private preview to the channel/thread. The button value is ONLY the claim id; the
+    // authorization is the server-side claim in PendingPreviews.take (recipient + team + channel must
+    // match what was stored at issue time — SEC-3: every field of the interaction payload is forgeable,
+    // so nothing in it is trusted as content or authority). Single-use, like an OAuth `state`.
+    app.action(PREVIEW_SHARE_ACTION, async ({ ack, body, respond, client }: any) => {
+      await ack();
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      const id = typeof body.actions?.[0]?.value === 'string' ? body.actions[0].value : '';
+      const channel: string | undefined = body.channel?.id ?? body.container?.channel_id;
+      if (!id || !channel) return;
+      const p = previews.take(id, { userId: identity.userId, teamId: identity.teamId, channel });
+      if (!p) {
+        if (respond) await respond({ replace_original: true, text: 'This preview expired. Ask the agent again.' });
+        return;
+      }
+      await client.chat.postMessage({
+        channel: p.channel,
+        ...(p.thread ? { thread_ts: p.thread } : {}),
+        blocks: previewPostBlocks({ provider: p.provider, title: p.title, lines: p.lines, sharedBy: identity.userId }) as any,
+        // Neutral fallback: the stored title is provider-derived and fallback text is parsed mrkdwn
+        // (SEC-5). p.provider was registry-validated at preview() time; the user id is authenticated.
+        text: `${p.provider} preview shared by <@${identity.userId}>`,
+      });
+      // The moment private data became public, by whose decision. p.provider is registry-validated
+      // (preview() refuses unknown ids), so nothing unvalidated reaches the audit provider column.
+      await audit.record('preview', identity, p.provider, { channel: p.channel, thread: p.thread, event: 'shared' });
+      if (respond) await respond({ delete_original: true });
+    });
+
+    app.action(PREVIEW_DISMISS_ACTION, async ({ ack, body, respond }: any) => {
+      await ack();
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      const id = typeof body.actions?.[0]?.value === 'string' ? body.actions[0].value : '';
+      const channel: string | undefined = body.channel?.id ?? body.container?.channel_id;
+      if (id && channel) previews.dismiss(id, { userId: identity.userId, teamId: identity.teamId, channel });
+      if (respond) await respond({ delete_original: true });
     });
   }
 

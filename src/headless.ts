@@ -61,6 +61,12 @@ export type { Owner } from './core/owner';
 // ── opt-in channel gate ──
 export { ChannelConfig, channelIneligibleReason } from './core/channelConfig';
 export type { ChannelMode } from './core/channelConfig';
+// Preview visibility (per-channel rendering policy) + the pending-preview claim store, so a headless
+// host can honor `visibility` from the manifest and run the same single-use share authorization.
+export { PREVIEW_VISIBILITIES, isPreviewVisibility } from './core/channelConfig';
+export type { PreviewVisibility } from './core/channelConfig';
+export { PendingPreviews } from './core/preview';
+export type { PendingPreview } from './core/preview';
 
 // ── operator authorization surface: Policy scopes the broker to a channel (canary rollout), the tool
 // allowlist gates per-channel providers, and Resolvers/EventSink wire the `resolvers`/`onEvent`
@@ -80,6 +86,7 @@ export type {
   BrokerStatusResponse,
   BrokerConnectResponse,
   BrokerManifestResponse,
+  BrokerChannelManifestResponse,
   BrokerAdminOkResponse,
   BrokerAdminConfigResponse,
   BrokerAuditResponse,

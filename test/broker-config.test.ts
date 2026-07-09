@@ -309,3 +309,37 @@ test('admin config routes reject an invalid/expired identity token (401)', async
     server.close();
   }
 });
+
+// (e) POST /v1/manifest — the CHANNEL-SCOPED manifest any member can read (the headless analogue of
+// Bolt's toolManifest, same core builder). This is how a headless host learns preview `visibility`
+// (a 'private' provider's output must go only to the requester), plus mode/enabled per channel.
+test('manifest: POST returns the channel-scoped manifest including preview visibility', async () => {
+  const { server, port, channelConfig } = await makeConfigBroker();
+  try {
+    await channelConfig.setVisibility('T1', 'C1', 'acme', 'private');
+    await channelConfig.setMode('T1', 'C1', 'acme', 'union');
+    const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json.tools.find((t: any) => t.provider === 'acme'), {
+      provider: 'acme', mode: 'union', enabled: true, identity: 'acting_human', visibility: 'private',
+    });
+    // Service tools appear (identity tells the host who runs them) with the channel's visibility bit.
+    assert.equal(r.json.tools.find((t: any) => t.provider === 'svc').identity, 'service');
+  } finally {
+    server.close();
+  }
+});
+
+test('manifest: POST requires a valid signed identity and reads only the claims channel', async () => {
+  const { server, port, channelConfig } = await makeConfigBroker();
+  try {
+    const bad = await post(port, '/v1/manifest', { identityToken: 'garbage' });
+    assert.equal(bad.status, 401);
+    // A 'private' bit on ANOTHER channel must not leak into this channel's manifest.
+    await channelConfig.setVisibility('T1', 'C_OTHER', 'acme', 'private');
+    const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) }); // channel C1
+    assert.equal(r.json.tools.find((t: any) => t.provider === 'acme').visibility, 'public');
+  } finally {
+    server.close();
+  }
+});

@@ -31,8 +31,12 @@ export type { Owner } from './core/owner';
 export { DbInstallationStore } from './adapters/installationStore';
 // Re-export Bolt's installation types so consumers can wire the store without importing @slack/bolt directly.
 export type { Installation, InstallationQuery, InstallationStore } from '@slack/bolt';
-export type { ChannelMode } from './core/channelConfig';
-export { CHANNEL_MODES, isChannelMode } from './core/channelConfig';
+export type { ChannelMode, PreviewVisibility } from './core/channelConfig';
+export { CHANNEL_MODES, isChannelMode, PREVIEW_VISIBILITIES, isPreviewVisibility } from './core/channelConfig';
+// Private-preview pending store, exported so a headless host can run the same share/dismiss claim
+// logic (single-use, recipient-bound) instead of re-implementing it. Bolt hosts get it built in.
+export { PendingPreviews } from './core/preview';
+export type { PendingPreview } from './core/preview';
 export { ChannelTools } from './core/tools';
 export type { ToolManifestEntry } from './core/tools';
 // #64 pure Block Kit builders (strings in, Block Kit JSON out — no chat SDK). Exported so a headless
@@ -54,6 +58,11 @@ export {
   DISCONNECT_ACTION,
   configModal,
   CONFIG_CALLBACK,
+  previewBlocks,
+  previewPostBlocks,
+  normalizePreviewContent,
+  PREVIEW_SHARE_ACTION,
+  PREVIEW_DISMISS_ACTION,
 } from './adapters/blocks';
 export type { Connection, ToolRow, ConfigAdminRow } from './adapters/blocks';
 export type { TtlPolicy } from './core/vault';
@@ -78,6 +87,7 @@ export type {
   BrokerStatusResponse,
   BrokerConnectResponse,
   BrokerManifestResponse,
+  BrokerChannelManifestResponse,
   BrokerAdminOkResponse,
   BrokerAdminConfigResponse,
   BrokerAuditResponse,

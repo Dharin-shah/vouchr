@@ -9,6 +9,7 @@
 
 import type { ChannelMode } from './core/channelConfig';
 import type { AuditRow } from './core/audit';
+import type { ToolManifestEntry } from './core/tools';
 
 /** Coarse per-provider consent state — no secret, existence + state only. */
 export type BrokerConsentState = 'connected' | 'needs_consent';
@@ -42,9 +43,17 @@ export interface BrokerConnectResponse {
   state: string;
 }
 
-/** `GET /v1/manifest` — each provider's id and whether Vouchr brokers a human credential for it. */
+/** `GET /v1/manifest` — each provider's id and whether Vouchr brokers a human credential for it
+ *  (channel-independent). For the channel-scoped manifest, use `POST /v1/manifest`. */
 export interface BrokerManifestResponse {
   providers: { provider: string; identity: 'service' | 'acting_human' }[];
+}
+
+/** `POST /v1/manifest` — the CHANNEL-SCOPED tool manifest for the verified identity: the same
+ *  `ToolManifestEntry` Bolt's `toolManifest()` returns (one core builder feeds both), including the
+ *  preview `visibility` the host must honor when posting output. Policy bits only, NO secret. */
+export interface BrokerChannelManifestResponse {
+  tools: ToolManifestEntry[];
 }
 
 /** `POST /v1/admin/mode` · `POST /v1/admin/tools` — admin config write acknowledgement. No secret. */
