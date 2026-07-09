@@ -249,7 +249,8 @@ POST /v1/admin/reference
 | Var | Required | Purpose |
 | --- | --- | --- |
 | `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. |
-| `VOUCHR_MASTER_KEY` | yes | base64 of 32 bytes; encrypts tokens at rest (`openssl rand -base64 32`). |
+| `VOUCHR_MASTER_KEY` | yes* | base64 of 32 bytes; encrypts tokens at rest (`openssl rand -base64 32`). *Or `VOUCHR_MASTER_KEYS`. |
+| `VOUCHR_MASTER_KEYS` | no | comma-separated `id:base64key` entries for master-key rotation; the FIRST entry encrypts new writes, every entry decrypts (see [Key rotation](#key-rotation)). |
 | `VOUCHR_DATABASE_URL` | prod | `postgres://…` → Postgres. Unset → SQLite (`VOUCHR_DB`, single replica). `DATABASE_URL` is read as a fallback, so a platform-injected one selects the backend. |
 | `VOUCHR_PROVIDERS` / `VOUCHR_PROVIDERS_FILE` | yes | provider config (inline JSON / file path); see below. |
 | `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` | per OAuth provider | client creds, kept out of the JSON. |
@@ -491,25 +492,54 @@ How rotation works depends on which at-rest mode you run (`src/core/crypto.ts`).
 
 ### Direct master-key mode (default)
 
-Token columns are encrypted *directly* under `VOUCHR_MASTER_KEY` (legacy format, no
-version byte). The same key encrypts and decrypts every vaulted row, so:
+By default token columns are encrypted under the master key directly. With the single
+`VOUCHR_MASTER_KEY` every row is sealed under that one key (the legacy format, no
+version byte), so changing the variable alone would orphan every existing ciphertext.
+Rotation is instead built in via `VOUCHR_MASTER_KEYS` (#115):
 
-- **Rotating `VOUCHR_MASTER_KEY` makes every existing encrypted row undecryptable.**
-  `open()` will fail the GCM tag check and throw; `vault.get()` then breaks for those
-  connections. A key change here is only safe if every row is re-encrypted under the
-  new key.
-- **There is no built-in re-encryption tool yet.** Re-encrypting means, for each
-  vaulted `connection` row (and each `installation` row), decrypting
-  `access_token_enc` / `refresh_token_enc` (and `bot_token` / `data`) under the old
-  key and re-sealing under the new one. External-reference rows (`source != 'vault'`)
-  hold no ciphertext and are unaffected. Until such a tool exists, plan a maintenance
-  window and write a one-off migration, or take the simpler path: have users
-  reconnect (a reconnect re-vaults under the current key via `upsert`).
-- **Compromise response in this mode** is therefore disruptive: rotate the key, and
-  either re-encrypt or force reconnect. Revoke the affected provider tokens upstream
-  regardless. A leaked master key means the ciphertext may already be decrypted.
+- `VOUCHR_MASTER_KEYS` is a comma-separated list of `id:base64key` entries (ids are
+  `[A-Za-z0-9._-]`, max 32 chars). The **first** entry is the primary: it encrypts all
+  new writes, which then carry its key id in the ciphertext. **Every** entry is a
+  decryption candidate; a row whose stored key id is not in the list fails closed with
+  an error naming the id. Old id-less rows keep decrypting via `VOUCHR_MASTER_KEY`
+  and/or the listed keys.
+- `vouchr rekey` (see [CLI.md](./CLI.md)) re-encrypts every stored ciphertext —
+  `connection.access_token_enc`/`refresh_token_enc` and `installation.bot_token`/`data` —
+  under the primary. It is idempotent, interrupt-safe (row-at-a-time writes; a crash
+  leaves a mixed but fully readable table), never clobbers a row a live refresh
+  touched mid-run, and prints counts only, never secrets. External-reference rows
+  (`source != 'vault'`) hold no ciphertext and are unaffected; envelope (KMS) rows are
+  skipped — their rotation happens in the KMS.
 
-For any deployment where you expect to rotate, **prefer envelope mode** below.
+**Rotation procedure** (no maintenance window needed; every step keeps all rows readable):
+
+1. Generate the new key and make it the primary while keeping the old key available,
+   e.g. go from `VOUCHR_MASTER_KEY=<old>` to:
+
+   ```bash
+   VOUCHR_MASTER_KEYS=k2026:$(openssl rand -base64 32),k2019:<old>
+   # (keeping VOUCHR_MASTER_KEY=<old> set instead of listing it also works)
+   ```
+
+2. Deploy. New writes now carry `k2026`; old rows still decrypt via the old key.
+3. Run `vouchr rekey` (same env as the app). Re-run freely if interrupted.
+4. Verify: `vouchr rekey --dry-run` must report **zero** blobs under the old key
+   (everything "already under primary") and zero unreadable.
+5. Remove the old key (`k2019:…` and any `VOUCHR_MASTER_KEY`) from the environment and
+   redeploy. Keep a copy of the old key in your secret manager until backups that
+   predate the rotation have aged out — restoring such a backup needs it.
+
+**Compromise response**: rotate as above, but treat the data as exposed — a leaked
+master key means the ciphertext may already be decrypted. Revoke the affected provider
+tokens upstream (`vouchr revoke`) regardless; rekeying does not un-leak them.
+
+**Direct vs envelope — which to run?** Direct multi-key mode is zero-dependency and
+fine when the DB and the env-managed key live in separate trust domains and rotations
+are occasional, operator-driven events (each rotation rewrites every row). Choose
+envelope mode when you already run a KMS, want rotation without touching rows, need
+per-secret keys/audit at the KMS level, or must satisfy "keys never appear in process
+env" requirements. For any deployment where you expect frequent rotation, prefer
+envelope mode below.
 
 ### Envelope mode (KMS-wrapped data keys): recommended for rotatable deploys
 
@@ -525,9 +555,11 @@ DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`)
 - **What rotation requires** is only that the KEK (every version any stored DEK was
   wrapped under) remains available to `unwrapDataKey`. Do not disable or schedule
   deletion of an old KEK version while rows wrapped under it still exist.
-- **`VOUCHR_MASTER_KEY` in envelope mode** still encrypts any *legacy* rows written
-  before you enabled envelope (reads dispatch on format). Don't drop it until those
-  rows are gone (re-vaulted via reconnect or a future re-encryption pass).
+- **`VOUCHR_MASTER_KEY`/`VOUCHR_MASTER_KEYS` in envelope mode** still decrypt any
+  *direct* rows written before you enabled envelope (reads dispatch on format). Don't
+  drop them until those rows are gone. Note `vouchr rekey` rotates direct rows between
+  *direct* keys; it does not convert rows to envelope — that happens as users
+  reconnect (each `upsert` re-seals in the current mode).
 
 ## Backup and restore
 
@@ -562,9 +594,12 @@ The credential store and the key that protects it must be backed up **separately
 
 1. Restore the DB (SQLite file in place, or `pg_restore` / snapshot).
 2. Make the key available to the *same* process: set `VOUCHR_MASTER_KEY` to the exact
-   key the rows were sealed under (direct mode), or grant the restored process KMS
-   access to the KEK that wraps their DEKs (envelope mode). A wrong/missing key fails
-   closed: decrypt throws, it does not silently return garbage.
+   key the rows were sealed under — or, if the backup predates a key rotation, list the
+   old key in `VOUCHR_MASTER_KEYS` under the **same id** it had when the rows were
+   written (direct mode) — or grant the restored process KMS access to the KEK that
+   wraps their DEKs (envelope mode). A wrong/missing key fails closed: decrypt throws
+   (naming the missing key id, if the row carries one), it does not silently return
+   garbage.
 3. External-reference rows need their resolver IAM/role intact for the restored
    environment; the secrets themselves are restored on the external manager's policy.
 4. Verify: a `connect()` + `handle.fetch()` against one connection per mode confirms

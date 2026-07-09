@@ -16,7 +16,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
-import type { EnvelopeProvider } from '../src/core/crypto';
+import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
 
@@ -51,11 +51,14 @@ export async function buildBrokerServer(
   if (!identitySecret || !identitySecret.trim()) {
     fail('VOUCHR_IDENTITY_SECRET is required (the HS256 secret shared with the identity-token minter)');
   }
-  // Master key: base64 → 32 bytes. Mirrors loadMasterKey() but reads the injected env for testability.
-  const b64 = env.VOUCHR_MASTER_KEY;
-  if (!b64) fail('VOUCHR_MASTER_KEY is required (base64 of 32 bytes). Generate: openssl rand -base64 32');
-  const masterKey = Buffer.from(b64, 'base64');
-  if (masterKey.length !== 32) fail('VOUCHR_MASTER_KEY must decode to exactly 32 bytes');
+  // Master key(s): VOUCHR_MASTER_KEY and/or VOUCHR_MASTER_KEYS (#115). loadKeyring reads the
+  // injected env for testability; its errors already name the variable and the 32-byte rule.
+  let masterKey: Keyring;
+  try {
+    masterKey = loadKeyring(env);
+  } catch (e: any) {
+    fail(e?.message ?? String(e));
+  }
 
   const port = Number(env.VOUCHR_PORT ?? 3000);
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`VOUCHR_PORT invalid: ${env.VOUCHR_PORT}`);

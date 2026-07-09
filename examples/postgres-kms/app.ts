@@ -1,7 +1,7 @@
 import { App, ExpressReceiver } from '@slack/bolt';
 import { createVouchr, github, google, DbInstallationStore, ConsentRequiredError, type EnvelopeProvider } from '../../src';
 import { openDb } from '../../src/core/db';
-import { loadMasterKey } from '../../src/core/crypto';
+import { loadKeyring } from '../../src/core/crypto';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PRODUCTION TEMPLATE. Fill in the KMS calls below, set the env vars, deploy.
@@ -58,7 +58,7 @@ app.event('app_mention', async ({ context, event, client }) => {
   // A db-backed installation store so ONE deployment serves MANY workspaces /
   // org-wide installs. Same Postgres + same master key as the vault; wire this
   // SAME store into Bolt's OAuth installer too.
-  const key = loadMasterKey();
+  const key = loadKeyring();
   const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL });
   const installationStore = new DbInstallationStore(db, key);
 

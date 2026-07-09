@@ -1,7 +1,7 @@
 import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb } from '../core/db';
-import { loadMasterKey, type EnvelopeProvider } from '../core/crypto';
+import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
@@ -763,7 +763,7 @@ export class ConnectContext {
 
 export async function createVouchr(opts: VouchrOptions) {
   const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
-  const key = loadMasterKey();
+  const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
   const registry = new ProviderRegistry(opts.providers);
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
   const audit = new Audit(db);

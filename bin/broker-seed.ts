@@ -19,7 +19,7 @@
  * DEPLOYMENT.md): VOUCHR_DATABASE_URL / VOUCHR_DB, VOUCHR_MASTER_KEY.
  */
 import { openDb } from '../src/core/db';
-import { loadMasterKey } from '../src/core/crypto';
+import { loadKeyring } from '../src/core/crypto';
 import { Vault } from '../src/core/vault';
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { EnvelopeProvider } from '../src/core/crypto';
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
   }
 
   const db = await openDb(backend === 'postgres' ? { databaseUrl: url } : { dbPath: process.env.VOUCHR_DB });
-  const vault = new Vault(db, loadMasterKey(), {}, envelope);
+  const vault = new Vault(db, loadKeyring(), {}, envelope);
   try {
     if (mode === 'reference') {
       if (!f.source) die('--source is required for reference mode (the secret manager id)');

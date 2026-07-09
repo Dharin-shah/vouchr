@@ -5,7 +5,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 // core/adapter split (enforced by test/architecture.test.ts) is that a sidecar can expose the
 // broker over a local protocol so non-TS agents reuse the SAME security without re-implementing it.
 import { openDb } from '../../src/core/db';
-import { loadMasterKey } from '../../src/core/crypto';
+import { loadKeyring } from '../../src/core/crypto';
 import { Vault } from '../../src/core/vault';
 import { Audit } from '../../src/core/audit';
 import { ConnectionHandle } from '../../src/core/injector';
@@ -184,7 +184,7 @@ export async function startServer(): Promise<ReturnType<typeof createServer>> {
 
   const db = await openDb(); // same VOUCHR_DB / VOUCHR_DATABASE_URL the Slack app uses
   const deps: Deps = {
-    vault: new Vault(db, loadMasterKey()),
+    vault: new Vault(db, loadKeyring()),
     audit: new Audit(db),
     registry: buildRegistry(),
     inflight: new Map(),

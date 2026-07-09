@@ -67,6 +67,11 @@ export {
 export type { Connection, ToolRow, ConfigAdminRow } from './adapters/blocks';
 export type { TtlPolicy } from './core/vault';
 export type { EnvelopeProvider } from './core/crypto';
+// #115 master-key rotation for the direct (non-KMS) path: loadKeyring reads VOUCHR_MASTER_KEY
+// and/or VOUCHR_MASTER_KEYS (first entry encrypts, all entries decrypt); every key-taking
+// constructor (Vault, DbInstallationStore) accepts a bare Buffer or a Keyring (MasterKeys).
+export { loadKeyring } from './core/crypto';
+export type { Keyring, MasterKeys } from './core/crypto';
 // Lifecycle is driven through the createVouchr() result (vouchr.offboard / vouchr.sweepExpired);
 // registerOffboarding() wires the user_change handler. No standalone re-exports: one obvious way.
 // Exception: Enterprise Grid / SCIM deprovisioning spans ALL workspaces, which createVouchr's

@@ -1,5 +1,5 @@
 import type { Db } from '../core/db';
-import { encrypt, decrypt, toBuffer } from '../core/crypto';
+import { encrypt, decrypt, toBuffer, type MasterKeys } from '../core/crypto';
 import type { Installation, InstallationQuery, InstallationStore, Logger } from '@slack/bolt';
 
 /**
@@ -12,7 +12,7 @@ import type { Installation, InstallationQuery, InstallationStore, Logger } from 
  * (enterprise_id, team_id) using the same shape Bolt's own stores use.
  */
 export class DbInstallationStore implements InstallationStore {
-  constructor(private db: Db, private key: Buffer) {}
+  constructor(private db: Db, private key: MasterKeys) {}
 
   /**
    * Deterministic row key. Mirrors Bolt's keying: an enterprise (org-wide) install is
