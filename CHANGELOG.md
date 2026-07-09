@@ -7,6 +7,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Schema version marker + downgrade guard** — `openDb()` now records a monotonic
+  `schema_version` in a new `meta` table and fails closed (with an error naming both versions and
+  the remedy) when the database was written by a NEWER vouchr, instead of running old migrations
+  against a newer schema. Fresh databases are stamped with the current version; existing
+  marker-less databases are assumed to be pre-marker (≤ v0.2.x) — safe, because every schema change
+  up to the marker's introduction is an idempotent in-place migration `openDb()` already runs —
+  and are stamped after migrating. Schema *upgrade* tests (`test/migration-upgrade.test.ts`) now
+  seed a database from a frozen v0.2.0 fixture (`test/fixtures/schema-v0.2.0.ts`) and prove, on
+  SQLite and Postgres, that migrations are lossless (every row survives, encrypted tokens still
+  decrypt, connect/egress work on the migrated store) and idempotent.
+
 - **Private previews** — a per-channel, per-provider preview-visibility bit, orthogonal to the
   credential mode. With `/vouchr preview <provider> private` (admin-gated + audited, also a checkbox
   in the no-arg `/vouchr` config modal), agent output posted through the new

@@ -108,6 +108,54 @@ class PgClientDb implements Db {
   async close() { /* lifecycle owned by withRefreshLock (BEGIN/COMMIT/release); nothing to do here */ }
 }
 
+/**
+ * Monotonic version of the schema this build writes, stamped into the `meta` table on every open.
+ * Bump it whenever the schema changes shape. Version 1 = the schema at the release that introduced
+ * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
+ */
+export const SCHEMA_VERSION = 1;
+
+// The marker table. TEXT-only, so it needs no engine type parameterization.
+const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
+
+/**
+ * Downgrade guard — runs BEFORE any migration DDL.
+ *
+ * - Marker present and newer than this build → throw, fail closed. Old code "migrating" a newer
+ *   database is the one unrecoverable failure mode: it can corrupt encrypted credential rows.
+ * - Marker present and ≤ current → proceed; the idempotent migrations bring the schema to current.
+ * - No marker → either an EMPTY database (fresh install) or an existing PRE-MARKER deployment
+ *   (tables, no `meta` row). Documented assumption: a marker-less database with tables was written
+ *   by a vouchr ≤ the release that shipped this marker (≤ v0.2.x). That is safe to proceed on,
+ *   because every schema change up to that release is an idempotent in-place migration that
+ *   openDb() runs unconditionally — after which either kind of database IS at SCHEMA_VERSION,
+ *   which is what stampSchemaVersion() then records. Newer databases always carry the marker, so
+ *   from this release on the ambiguity cannot recur.
+ */
+async function guardSchemaVersion(db: Db): Promise<void> {
+  await db.exec(META_DDL);
+  const row = await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`);
+  if (!row) return;
+  const found = Number(row.value);
+  if (!Number.isInteger(found) || found > SCHEMA_VERSION) {
+    throw new Error(
+      `vouchr: this database reports schema version ${row.value}, but this vouchr build supports up to ` +
+        `schema version ${SCHEMA_VERSION}. Refusing to open it: running older code against a newer schema ` +
+        `could corrupt encrypted credential rows. Upgrade the vouchr package to one that supports schema ` +
+        `version ${row.value}, or restore a database backup taken at schema version ${SCHEMA_VERSION} or older.`,
+    );
+  }
+}
+
+/** Record that the database is now at this build's schema version (after migrations ran). */
+async function stampSchemaVersion(db: Db): Promise<void> {
+  await db.run(
+    `INSERT INTO meta (key, value) VALUES ('schema_version', ?)
+     ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+    [String(SCHEMA_VERSION)],
+  );
+}
+
 /** Schema DDL, parameterized by the engine's blob/integer type names. */
 function schema(blob: string, int: string): string {
   return `
@@ -214,17 +262,32 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
     // throws and kills the whole process; swallow it, pg reconnects on the next query.
     pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
     const db = new PgDb(pool, url);
-    await db.exec(schema('BYTEA', 'BIGINT'));
-    // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
-    await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
+    try {
+      await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
+      await db.exec(schema('BYTEA', 'BIGINT'));
+      // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
+      await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
+      await stampSchemaVersion(db);
+    } catch (e) {
+      await db.close().catch(() => undefined);
+      throw e;
+    }
     return db;
   }
 
   const raw = new BetterSqlite3(opts.dbPath ?? process.env.VOUCHR_DB ?? 'vouchr.db');
   raw.pragma('journal_mode = WAL');
   raw.pragma('busy_timeout = 5000'); // wait, don't instantly SQLITE_BUSY, on a concurrent writer
-  migrateSqlite(raw);
-  return new SqliteDb(raw);
+  const db = new SqliteDb(raw);
+  try {
+    await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
+    migrateSqlite(raw);
+    await stampSchemaVersion(db);
+  } catch (e) {
+    await db.close().catch(() => undefined);
+    throw e;
+  }
+  return db;
 }
 
 /** SQLite schema + the legacy (pre-owner-keying) rebuild. Postgres deploys start clean. */
