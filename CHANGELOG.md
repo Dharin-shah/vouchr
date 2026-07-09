@@ -19,6 +19,12 @@ All notable changes to this project are documented here. This project adheres to
   `PREVIEW_SHARE_ACTION`, `PREVIEW_DISMISS_ACTION` (also on `./headless`). Pending previews live in
   memory with a 10-minute TTL and are never persisted (provider data stays out of the database).
 
+- `POST /v1/manifest` — the channel-scoped tool manifest for the verified identity (the headless
+  analogue of Bolt's `toolManifest()`), so non-Bolt hosts can read `visibility`/`mode`/`enabled`
+  before posting output. One shared core builder (`buildToolManifest` in `core/authz`) feeds both
+  transports, and `enabled` is exactly "`authorizeProvider` would allow it". The channel-independent
+  `GET /v1/manifest` is unchanged. New wire type `BrokerChannelManifestResponse`.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added

@@ -106,6 +106,24 @@ test('shared preview blocks attribute the human who shared', () => {
   assert.match(json, /Shared by <@U_A>/);
 });
 
+test('preview blocks: empty/blank title and lines still produce valid blocks (no empty text objects)', () => {
+  for (const blocks of [
+    previewBlocks({ provider: 'mcp', title: '', lines: [], id: 'x', where: 'channel', ttlMinutes: 10 }),
+    previewPostBlocks({ provider: 'mcp', title: '  ', lines: ['   '], sharedBy: 'U_A' }),
+  ]) {
+    // Slack rejects any empty text object; walk every nested `text` and require non-blank content.
+    const texts: string[] = [];
+    const walk = (o: any): void => {
+      if (!o || typeof o !== 'object') return;
+      if (typeof o.text === 'string') texts.push(o.text);
+      for (const v of Object.values(o)) walk(v);
+    };
+    walk(blocks);
+    assert.ok(texts.length > 0);
+    for (const t of texts) assert.ok(t.trim().length > 0, `empty text object in: ${JSON.stringify(blocks)}`);
+  }
+});
+
 // ── ConnectContext: the admin gate + posting paths ──
 
 async function ctx(opts: { isAdmin?: boolean; visibility?: 'public' | 'private'; thread?: string | null } = {}) {
@@ -175,6 +193,14 @@ test('preview(): unknown provider throws and nothing is posted or stored', async
   assert.equal(posted.length + ephemeral.length, 0);
 });
 
+test('preview(): the fallback `text` never carries the provider-derived title (SEC-5)', async () => {
+  // Slack parses top-level `text` as mrkdwn (notifications/fallback), unlike the escaped blocks — a
+  // title of `<!channel>` must not be able to ping the room from there.
+  const pub = await ctx();
+  await pub.c.preview('mcp', { title: '<!channel> pwned', lines: ['x'] });
+  assert.doesNotMatch(pub.posted[0].text, /<!channel>/);
+});
+
 // ── End-to-end through createVouchr: middleware → private preview → Share click (TEST-2) ──
 
 async function harness() {
@@ -208,7 +234,7 @@ test('e2e: private preview → only the recipient can share; the share posts pub
   const { lan, actions, client, posted, ephemeral, vouchr } = await harness();
   await new ChannelConfig(lan.db).setVisibility('T1', 'C_FIN', 'mcp', 'private');
 
-  assert.equal(await vouchr.preview('mcp', { title: 'Open PRs (2)', lines: ['#1 fix', '#2 feat'] }), 'private');
+  assert.equal(await vouchr.preview('mcp', { title: 'Open PRs (2) <!channel>', lines: ['#1 fix', '#2 feat'] }), 'private');
   assert.equal(posted.length, 0);
   const share = JSON.parse(JSON.stringify(ephemeral[0].blocks)).flatMap((b: any) => b.elements ?? [])
     .find((e: any) => e.action_id === PREVIEW_SHARE_ACTION);
@@ -229,6 +255,7 @@ test('e2e: private preview → only the recipient can share; the share posts pub
   assert.equal(posted[0].channel, 'C_FIN');
   assert.equal(posted[0].thread_ts, '111.222');
   assert.match(JSON.stringify(posted[0].blocks), /Shared by <@U_A>/);
+  assert.doesNotMatch(posted[0].text, /<!channel>/); // stored title never reaches the parsed fallback text
   const rows = (await lan.db.all(`SELECT action, provider, meta FROM audit WHERE action='preview'`)) as any[];
   assert.equal(rows.length, 1);
   assert.equal(rows[0].provider, 'mcp');

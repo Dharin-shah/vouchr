@@ -138,8 +138,9 @@ Orthogonal to the credential mode, each channel can set a provider's **preview v
 lines })` goes **ephemerally to the requester only**, with a Share button — provider data never
 reaches the rest of the thread unless the human who saw it explicitly shares it (a single-use,
 recipient-bound claim; the public post is attributed to them and audited as `preview`). `public`
-(the default) posts normally. Agents discover the bit via `toolManifest()` (`entry.visibility`);
-a host rendering with its own client is expected to honor it, and the `previewBlocks` /
+(the default) posts normally. Agents discover the bit via `toolManifest()` in Bolt or
+`POST /v1/manifest` on the headless broker — one core builder feeds both, so the two transports
+can't drift; a host rendering with its own client is expected to honor it, and the `previewBlocks` /
 `previewPostBlocks` builders are exported so that surface matches Vouchr's. Pending previews are
 held in memory with a 10-minute TTL — a restart or timeout just means "preview expired, ask again".
 

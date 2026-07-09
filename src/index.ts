@@ -86,6 +86,7 @@ export type {
   BrokerStatusResponse,
   BrokerConnectResponse,
   BrokerManifestResponse,
+  BrokerChannelManifestResponse,
   BrokerAdminOkResponse,
   BrokerAdminConfigResponse,
   BrokerAuditResponse,

@@ -9,7 +9,7 @@ import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
-import { authorizeProvider, resolveCredentialOwner } from '../../core/authz';
+import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../../core/authz';
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
@@ -17,7 +17,7 @@ import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
 import { DbReplayStore } from './replayStore';
-import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse } from '../../broker-types';
+import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse, BrokerChannelManifestResponse } from '../../broker-types';
 
 /**
  * The opaque, NO-SECRET handle the caller holds. It names a provider; the owner is always the acting
@@ -828,6 +828,26 @@ export function createBroker(opts: BrokerOptions): http.Server {
   }
 
   /**
+   * `POST /v1/manifest` — the CHANNEL-SCOPED tool manifest for the verified identity (the headless
+   * analogue of Bolt's `toolManifest()`, via the SAME core builder so the two can't drift): per
+   * provider, whether it's usable in the claims' channel, its credential mode, who the agent acts as,
+   * and the preview VISIBILITY the host must honor when posting output ('private' → requester-only
+   * with an explicit share). Channel/team come ONLY from the signed claims. Not admin-gated — the
+   * same non-secret policy bits `/vouchr tools` shows every channel member. The GET above stays: it
+   * is the channel-independent provider list; this is "what may I do HERE, and how must I post it".
+   */
+  async function handleChannelManifest(body: { identityToken: string }): Promise<BrokerChannelManifestResponse> {
+    const claims = await verify(body.identityToken);
+    const principal: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    const tools = await buildToolManifest({
+      providerIds: opts.providers.map((p) => p.id), registry,
+      policy: opts.policy, channelTools: opts.channelTools, channelConfig: opts.channelConfig,
+      principal, channel: claims.channel || null, // '' (a channel-less token) behaves like Bolt's DM context
+    });
+    return { tools };
+  }
+
+  /**
    * #58 `POST /v1/user/reference` — the acting user points their OWN credential for a provider at an
    * external secret-manager REFERENCE (the headless analogue of the Bolt key-setup modal's "reference
    * a secret manager"). Self-service (NOT admin-gated — it's the user's own credential), identity from
@@ -912,6 +932,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
         if (req.method === 'GET' && url === '/v1/manifest') {
           await perimeter(req);
           return send(200, handleManifest());
+        }
+        if (req.method === 'POST' && url === '/v1/manifest') {
+          await perimeter(req);
+          return send(200, { ...await handleChannelManifest(await readJson(req)) });
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           await perimeter(req);

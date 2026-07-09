@@ -237,9 +237,15 @@ export const PREVIEW_DISMISS_ACTION = 'vouchr_preview_dismiss';
 /** Slack caps a header at 150 chars and a section at 3000; clip instead of erroring mid-post. */
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
+/** Slack rejects an empty text object, and the agent's title/lines are host-supplied: normalize an
+ *  empty/blank title to a provider-named one so an otherwise-valid preview never fails at post time. */
+const previewTitle = (title: string, provider: string): string => clip(title.trim() || `${provider} preview`, 150);
+
 /** Escaped, length-capped preview body. Every line is provider-derived (user-influenced) text, so
- *  each goes through escapeMrkdwn — a fetched string must never render as a forged link/mention. */
-const previewBody = (lines: string[]): string => clip(lines.map((l) => escapeMrkdwn(l)).join('\n'), 2900);
+ *  each goes through escapeMrkdwn — a fetched string must never render as a forged link/mention.
+ *  '' when there are no (non-blank) lines; callers omit the section entirely (empty text is invalid). */
+const previewBody = (lines: string[]): string =>
+  clip(lines.filter((l) => l.trim()).map((l) => escapeMrkdwn(l)).join('\n'), 2900);
 
 /**
  * Ephemeral PRIVATE preview of provider-derived agent output (channel visibility 'private'): only
@@ -255,13 +261,14 @@ export function previewBlocks(o: {
   where: 'thread' | 'channel';
   ttlMinutes: number;
 }): unknown[] {
+  const body = previewBody(o.lines);
   return [
     {
       type: 'context',
       elements: [{ type: 'mrkdwn', text: `:lock: *Private preview* · ${escapeMrkdwn(o.provider)} · only visible to you` }],
     },
-    { type: 'header', text: { type: 'plain_text', text: clip(o.title, 150), emoji: true } },
-    { type: 'section', text: { type: 'mrkdwn', text: previewBody(o.lines) } },
+    { type: 'header', text: { type: 'plain_text', text: previewTitle(o.title, o.provider), emoji: true } },
+    ...(body ? [{ type: 'section', text: { type: 'mrkdwn', text: body } }] : []),
     { type: 'divider' },
     {
       type: 'actions',
@@ -292,9 +299,10 @@ export function previewPostBlocks(o: { provider: string; title: string; lines: s
   const footer = o.sharedBy
     ? `:outbox_tray: Shared by <@${escapeMrkdwn(o.sharedBy)}> from a private *${escapeMrkdwn(o.provider)}* preview`
     : `*${escapeMrkdwn(o.provider)}* · via Vouchr`;
+  const body = previewBody(o.lines);
   return [
-    { type: 'header', text: { type: 'plain_text', text: clip(o.title, 150), emoji: true } },
-    { type: 'section', text: { type: 'mrkdwn', text: previewBody(o.lines) } },
+    { type: 'header', text: { type: 'plain_text', text: previewTitle(o.title, o.provider), emoji: true } },
+    ...(body ? [{ type: 'section', text: { type: 'mrkdwn', text: body } }] : []),
     { type: 'context', elements: [{ type: 'mrkdwn', text: footer }] },
   ];
 }

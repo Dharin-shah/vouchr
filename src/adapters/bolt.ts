@@ -10,7 +10,7 @@ import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
-import { authorizeProvider, resolveCredentialOwner } from '../core/authz';
+import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../core/authz';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
@@ -626,7 +626,9 @@ export class ConnectContext {
       channel: this.channel ?? this.identity.userId,
       ...(this.thread ? { thread_ts: this.thread } : {}),
       blocks: previewPostBlocks({ provider: providerId, title: content.title, lines: content.lines }) as any,
-      text: content.title,
+      // Fallback/notification text is PARSED mrkdwn, not blocks: a provider-derived title there could
+      // fire a <!channel> or forge a mention (SEC-5). Neutral constant + the registry-validated id only.
+      text: `${providerId} preview`,
     });
     return 'posted';
   }
@@ -685,25 +687,13 @@ export class ConnectContext {
    * allow-channel-only policy can still report a provider disabled.
    */
   async toolManifest(): Promise<ToolManifestEntry[]> {
-    const out: ToolManifestEntry[] = [];
-    for (const provider of this.providerIds) {
-      const toolEnabled = this.channel && this.channelTools
-        ? await this.channelTools.isEnabled(this.identity.teamId, this.channel, provider)
-        : true;
-      // Intersect with Policy so the manifest matches what connect() would actually allow: a
-      // provider the channel tool allowlist enables but Policy denies is not usable here.
-      const enabled = toolEnabled && this.policy.check(provider, this.channel);
-      const mode = this.channel && this.channelConfig
-        ? await this.channelConfig.getMode(this.identity.teamId, this.channel, provider)
-        : null;
-      const visibility = this.channel && this.channelConfig
-        ? await this.channelConfig.getVisibility(this.identity.teamId, this.channel, provider)
-        : 'public';
-      // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
-      const identity = this.registry.get(provider).identity ?? 'acting_human';
-      out.push({ provider, mode, enabled, identity, visibility });
-    }
-    return out;
+    // ONE shared core builder (with the broker's POST /v1/manifest), so `enabled` here is exactly
+    // "authorizeProvider would allow it" and the two transports can't drift.
+    return buildToolManifest({
+      providerIds: this.providerIds, registry: this.registry, policy: this.policy,
+      channelTools: this.channelTools, channelConfig: this.channelConfig,
+      principal: this.identity, channel: this.channel,
+    });
   }
 
   /** Ephemeral in-thread prompt to approve a thread-scoped session. Only the acting user sees it.
@@ -1277,7 +1267,9 @@ export async function createVouchr(opts: VouchrOptions) {
         channel: p.channel,
         ...(p.thread ? { thread_ts: p.thread } : {}),
         blocks: previewPostBlocks({ provider: p.provider, title: p.title, lines: p.lines, sharedBy: identity.userId }) as any,
-        text: `${p.title} — shared by <@${identity.userId}>`,
+        // Neutral fallback: the stored title is provider-derived and fallback text is parsed mrkdwn
+        // (SEC-5). p.provider was registry-validated at preview() time; the user id is authenticated.
+        text: `${p.provider} preview shared by <@${identity.userId}>`,
       });
       // The moment private data became public, by whose decision. p.provider is registry-validated
       // (preview() refuses unknown ids), so nothing unvalidated reaches the audit provider column.

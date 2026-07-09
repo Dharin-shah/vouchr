@@ -1,8 +1,9 @@
 import { userOwner, channelOwner, type Owner } from './owner';
 import type { SlackIdentity } from './identity';
-import type { ChannelMode } from './channelConfig';
+import type { ChannelMode, ChannelConfig } from './channelConfig';
 import type { Policy } from './policy';
-import type { ChannelTools } from './tools';
+import type { ChannelTools, ToolManifestEntry } from './tools';
+import type { ProviderRegistry } from './providers';
 
 /**
  * The two SECURITY-CRITICAL decisions — credential-owner resolution and provider authorization —
@@ -42,6 +43,40 @@ export async function authorizeProvider(
     return 'tool-disabled';
   }
   return null;
+}
+
+/**
+ * The channel-scoped tool manifest an agent reads before planning: for every registered provider,
+ * whether it's usable here (`enabled` = exactly "authorizeProvider would allow it", so the manifest
+ * can never disagree with what connect()/fetch would do), the channel's credential mode, who the
+ * agent acts as, and the preview visibility. ONE builder for both adapters — Bolt's
+ * `toolManifest()` and the broker's `POST /v1/manifest` — so the two transports can't drift (the
+ * broker shipped without ANY channel-scoped manifest at first, which is this file's failure mode).
+ * With no channel (or no store opted in): mode null, visibility 'public', no allowlist restriction.
+ */
+export async function buildToolManifest(o: {
+  providerIds: string[];
+  registry: ProviderRegistry;
+  policy?: Policy;
+  channelTools?: ChannelTools;
+  channelConfig?: ChannelConfig;
+  principal: SlackIdentity;
+  channel: string | null;
+}): Promise<ToolManifestEntry[]> {
+  const out: ToolManifestEntry[] = [];
+  for (const provider of o.providerIds) {
+    const enabled = (await authorizeProvider(o.policy, o.channelTools, o.principal, o.channel, provider)) === null;
+    const mode = o.channel && o.channelConfig
+      ? await o.channelConfig.getMode(o.principal.teamId, o.channel, provider)
+      : null;
+    const visibility = o.channel && o.channelConfig
+      ? await o.channelConfig.getVisibility(o.principal.teamId, o.channel, provider)
+      : 'public';
+    // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
+    const identity = o.registry.get(provider).identity ?? 'acting_human';
+    out.push({ provider, mode, enabled, identity, visibility });
+  }
+  return out;
 }
 
 // ── Owner resolution ──────────────────────────────────────────────────────────────────────────────
