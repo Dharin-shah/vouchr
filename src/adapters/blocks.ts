@@ -231,6 +231,74 @@ export function sessionApprovalBlocks(provider: string, thread: string): unknown
   ];
 }
 
+export const PREVIEW_SHARE_ACTION = 'vouchr_preview_share';
+export const PREVIEW_DISMISS_ACTION = 'vouchr_preview_dismiss';
+
+/** Slack caps a header at 150 chars and a section at 3000; clip instead of erroring mid-post. */
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
+/** Escaped, length-capped preview body. Every line is provider-derived (user-influenced) text, so
+ *  each goes through escapeMrkdwn — a fetched string must never render as a forged link/mention. */
+const previewBody = (lines: string[]): string => clip(lines.map((l) => escapeMrkdwn(l)).join('\n'), 2900);
+
+/**
+ * Ephemeral PRIVATE preview of provider-derived agent output (channel visibility 'private'): only
+ * the requester sees it, with an explicit Share action. `id` is the pending-preview claim id — the
+ * ONLY thing the buttons carry (SEC-3: content or authorization in a button value would be forgeable;
+ * the handler re-authorizes the claim server-side against the stored recipient).
+ */
+export function previewBlocks(o: {
+  provider: string;
+  title: string;
+  lines: string[];
+  id: string;
+  where: 'thread' | 'channel';
+  ttlMinutes: number;
+}): unknown[] {
+  return [
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `:lock: *Private preview* · ${escapeMrkdwn(o.provider)} · only visible to you` }],
+    },
+    { type: 'header', text: { type: 'plain_text', text: clip(o.title, 150), emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: previewBody(o.lines) } },
+    { type: 'divider' },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: `Share to ${o.where}`, emoji: true },
+          action_id: PREVIEW_SHARE_ACTION,
+          value: o.id,
+          style: 'primary',
+        },
+        { type: 'button', text: { type: 'plain_text', text: 'Dismiss', emoji: true }, action_id: PREVIEW_DISMISS_ACTION, value: o.id },
+      ],
+    },
+    {
+      type: 'context',
+      elements: [{ type: 'mrkdwn', text: `Sharing posts this to the ${o.where}, attributed to you. Expires in ${o.ttlMinutes} minutes.` }],
+    },
+  ];
+}
+
+/**
+ * A preview posted PUBLICLY: either directly (channel visibility 'public') or via the requester's
+ * Share click (`sharedBy` set — the attribution footer is the transparency half of private mode:
+ * the channel always sees WHO decided the data was safe to share).
+ */
+export function previewPostBlocks(o: { provider: string; title: string; lines: string[]; sharedBy?: string }): unknown[] {
+  const footer = o.sharedBy
+    ? `:outbox_tray: Shared by <@${escapeMrkdwn(o.sharedBy)}> from a private *${escapeMrkdwn(o.provider)}* preview`
+    : `*${escapeMrkdwn(o.provider)}* · via Vouchr`;
+  return [
+    { type: 'header', text: { type: 'plain_text', text: clip(o.title, 150), emoji: true } },
+    { type: 'section', text: { type: 'mrkdwn', text: previewBody(o.lines) } },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: footer }] },
+  ];
+}
+
 export const DISCONNECT_ACTION = 'vouchr_disconnect';
 export const CONFIG_CALLBACK = 'vouchr_config';
 
@@ -239,10 +307,10 @@ export const CONFIG_CALLBACK = 'vouchr_config';
 export type Connection = { provider: string; channel: string | null; mode?: string };
 
 /** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list. */
-export type ToolRow = { provider: string; enabled: boolean; mode?: string | null };
+export type ToolRow = { provider: string; enabled: boolean; mode?: string | null; visibility?: string };
 
-/** One provider's admin control row: its current channel mode (null = unconfigured) + tool-enabled. */
-export type ConfigAdminRow = { provider: string; mode: string | null; enabled: boolean };
+/** One provider's admin control row: channel mode (null = unconfigured) + tool-enabled + preview visibility. */
+export type ConfigAdminRow = { provider: string; mode: string | null; enabled: boolean; visibility: string };
 
 /**
  * No-arg `/vouchr` config modal (#109). Three sections:
@@ -302,7 +370,7 @@ export function configModal(o: {
   } else {
     blocks.push({
       type: 'section',
-      text: { type: 'mrkdwn', text: o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}`).join('\n') },
+      text: { type: 'mrkdwn', text: o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}${t.visibility === 'private' ? ' · :lock: private previews' : ''}`).join('\n') },
     });
   }
 
@@ -340,13 +408,31 @@ export function configModal(o: {
           ...(p.enabled ? { initial_options: [enabledOption] } : {}),
         },
       });
+      // Preview visibility — same open-time-diff contract as the mode select (block_id `preview:<provider>`).
+      const privateOption = {
+        text: { type: 'plain_text', text: 'Private previews' },
+        description: { type: 'plain_text', text: 'Results go only to the requester, with a Share button.' },
+        value: 'private',
+      };
+      blocks.push({
+        type: 'input',
+        optional: true,
+        block_id: `preview:${p.provider}`,
+        label: { type: 'plain_text', text: `${p.provider} — preview visibility` },
+        element: {
+          type: 'checkboxes',
+          action_id: 'visibility',
+          options: [privateOption],
+          ...(p.visibility === 'private' ? { initial_options: [privateOption] } : {}),
+        },
+      });
     }
   }
 
   // Carry the channel AND the OPEN-TIME admin state (compact keys: p/m/e) so the submit can tell a
   // deliberately-changed control from an untouched one that merely re-submits its initial value — the
   // basis for not reverting a concurrent admin's change and not writing spurious rows. Non-secret.
-  const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled }));
+  const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled, v: p.visibility }));
   return {
     type: 'modal',
     callback_id: CONFIG_CALLBACK,

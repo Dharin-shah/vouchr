@@ -1,5 +1,5 @@
 import type { Db } from './db';
-import type { ChannelMode } from './channelConfig';
+import type { ChannelMode, PreviewVisibility } from './channelConfig';
 
 /** One row of a channel's tool manifest: a provider, its channel credential mode, and whether
  *  it's usable in this channel. This is the shape an agent / MCP gateway reads before planning. */
@@ -18,6 +18,13 @@ export interface ToolManifestEntry {
    *     the manifest only so the host can see the full tool set in one place.
    */
   identity: 'service' | 'acting_human';
+  /**
+   * How the agent should POST this tool's output in this channel (see PreviewVisibility):
+   * 'private' = ephemeral to the requester with an explicit Share action; 'public' (default) =
+   * a normal channel message. Vouchr enforces it for output posted through `context.vouchr.preview()`;
+   * a host rendering with its own client is expected to honor the flag.
+   */
+  visibility: PreviewVisibility;
 }
 
 /**

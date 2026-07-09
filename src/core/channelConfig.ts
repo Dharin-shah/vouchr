@@ -23,6 +23,22 @@ export type ChannelMode = (typeof CHANNEL_MODES)[number];
 export const isChannelMode = (m: unknown): m is ChannelMode =>
   typeof m === 'string' && (CHANNEL_MODES as readonly string[]).includes(m);
 
+/**
+ * Per-channel PREVIEW visibility for a provider: how an agent's provider-derived output should be
+ * posted in this channel.
+ *  - 'public'  (default, no row): posted to the channel/thread like any message.
+ *  - 'private': posted ephemerally to the requesting user only, with an explicit "Share to thread"
+ *               action — provider data never reaches other members unless a human shares it.
+ * A rendering policy, not a credential one — it lives beside (not inside) `channel_config` because
+ * "no mode row = unconfigured" is load-bearing for the shared-credential path.
+ */
+export const PREVIEW_VISIBILITIES = ['public', 'private'] as const;
+export type PreviewVisibility = (typeof PREVIEW_VISIBILITIES)[number];
+/** Runtime guard — the single source of truth for "is this a valid preview visibility" (see
+ *  isChannelMode's note; same rule, same reason). */
+export const isPreviewVisibility = (v: unknown): v is PreviewVisibility =>
+  typeof v === 'string' && (PREVIEW_VISIBILITIES as readonly string[]).includes(v);
+
 /** The subset of Slack's conversations.info shape that channel-credential eligibility depends on. */
 export interface ChannelInfo {
   is_ext_shared?: boolean;
@@ -70,6 +86,25 @@ export class ChannelConfig {
       `INSERT INTO channel_config (team_id, channel, provider, mode) VALUES (?,?,?,?)
        ON CONFLICT(team_id, channel, provider) DO UPDATE SET mode=excluded.mode`,
       [teamId, channel, provider, mode],
+    );
+  }
+
+  /** Preview visibility for `(team, channel, provider)`. No row → 'public' (today's behavior). */
+  async getVisibility(teamId: string, channel: string, provider: string): Promise<PreviewVisibility> {
+    const row = (await this.db.get(
+      `SELECT visibility FROM channel_preview WHERE team_id=? AND channel=? AND provider=?`,
+      [teamId, channel, provider],
+    )) as { visibility: PreviewVisibility } | undefined;
+    return row?.visibility ?? 'public';
+  }
+
+  async setVisibility(teamId: string, channel: string, provider: string, visibility: PreviewVisibility): Promise<void> {
+    // Same defense-in-depth as setMode: the value may arrive from an untrusted surface at runtime.
+    if (!isPreviewVisibility(visibility)) throw new Error(`invalid preview visibility: ${visibility}`);
+    await this.db.run(
+      `INSERT INTO channel_preview (team_id, channel, provider, visibility) VALUES (?,?,?,?)
+       ON CONFLICT(team_id, channel, provider) DO UPDATE SET visibility=excluded.visibility`,
+      [teamId, channel, provider, visibility],
     );
   }
 }

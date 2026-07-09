@@ -5,6 +5,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Private previews** — a per-channel, per-provider preview-visibility bit, orthogonal to the
+  credential mode. With `/vouchr preview <provider> private` (admin-gated + audited, also a checkbox
+  in the no-arg `/vouchr` config modal), agent output posted through the new
+  `context.vouchr.preview(provider, { title, lines })` goes ephemerally to the requester only, with
+  a Share button: a single-use, recipient-bound claim (checked server-side, like the OAuth `state`)
+  that reposts the reviewed content publicly, attributed to the sharer and audited as `preview`.
+  Default `public` posts normally — no behavior change for unconfigured channels.
+  `ToolManifestEntry` gains `visibility`; new exports: `PreviewVisibility`, `PREVIEW_VISIBILITIES`,
+  `isPreviewVisibility`, `PendingPreviews`, `previewBlocks`, `previewPostBlocks`,
+  `PREVIEW_SHARE_ACTION`, `PREVIEW_DISMISS_ACTION` (also on `./headless`). Pending previews live in
+  memory with a 10-minute TTL and are never persisted (provider data stays out of the database).
+
 ## [0.2.0] - 2026-07-06
 
 ### Added

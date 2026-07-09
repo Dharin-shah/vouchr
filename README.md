@@ -125,9 +125,23 @@ channel's creator).
 
 Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees their connected
 accounts (with a Disconnect button each) and the channel's tool manifest; admins additionally get a
-per-provider mode select and Enabled checkbox that route to the same mutations as the commands above
-(authorization is re-checked server-side on submit). The text subcommands are unchanged. The Block Kit
-builder (`configModal`) and its callback id (`CONFIG_CALLBACK`) are exported for headless hosts.
+per-provider mode select, Enabled checkbox, and Private-previews checkbox that route to the same
+mutations as the commands above (authorization is re-checked server-side on submit). The text
+subcommands are unchanged. The Block Kit builder (`configModal`) and its callback id
+(`CONFIG_CALLBACK`) are exported for headless hosts.
+
+### Private previews
+
+Orthogonal to the credential mode, each channel can set a provider's **preview visibility**
+(`/vouchr preview <provider> <public|private>`, or the checkbox in the config modal). In a
+`private` channel, output the agent posts through `context.vouchr.preview(provider, { title,
+lines })` goes **ephemerally to the requester only**, with a Share button — provider data never
+reaches the rest of the thread unless the human who saw it explicitly shares it (a single-use,
+recipient-bound claim; the public post is attributed to them and audited as `preview`). `public`
+(the default) posts normally. Agents discover the bit via `toolManifest()` (`entry.visibility`);
+a host rendering with its own client is expected to honor it, and the `previewBlocks` /
+`previewPostBlocks` builders are exported so that surface matches Vouchr's. Pending previews are
+held in memory with a 10-minute TTL — a restart or timeout just means "preview expired, ask again".
 
 Vouchr brokers credentials for tools that act **as a human**. Service-to-service tools
 (`identity: 'service'`) act as the agent itself: the host wires its own auth and Vouchr refuses
