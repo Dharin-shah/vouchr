@@ -25,6 +25,11 @@ export type { PolicyRule } from './core/policy';
 export type { SlackIdentity } from './core/identity';
 export { ConnectionHandle } from './core/injector';
 export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
+// Per-(owner, provider) rate limiting at the injection boundary (provider.rateLimit). The error is
+// exported so callers can catch/branch on a throttled fetch; the store type so a multi-instance
+// deployment can plug a shared backend via VouchrOptions/BrokerOptions.rateLimitStore.
+export { RateLimitedError } from './core/rateLimit';
+export type { RateLimitStore } from './core/rateLimit';
 export type { VouchrAuditEvent, AuditSink } from './core/audit';
 export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';

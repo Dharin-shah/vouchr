@@ -160,8 +160,16 @@ Gmail, People, … — pick scopes and egress paths, and the user consents once:
 const gcal = google({
   scopes: ['openid', 'email', 'https://www.googleapis.com/auth/calendar.events'],
   egressPaths: ['/calendar/v3/'],
+  rateLimit: { perMinute: 60 }, // optional per-user throttle at the injection boundary
 });
 ```
+
+`rateLimit: { perMinute, burst? }` bounds how fast an agent can spend each owner's credential — a
+looping (or prompt-injected) agent is refused **before the token is read**, so it can't get the
+human's account rate-banned by the provider. Past the limit, Bolt tells the user ephemerally ("Slow
+down…") and the headless broker returns 429 with a `Retry-After` header; callers can catch the
+exported `RateLimitedError`. Absent = unlimited. Buckets are per-process by default — a
+multi-replica deployment passes a shared `rateLimitStore` (same idea as the broker's `replayStore`).
 
 Any OAuth2 provider can be declared with `defineProvider` (hosts outside a built-in's egress
 allowlist, e.g. `docs.googleapis.com`, need this too); non-OAuth APIs use `credential: 'key'` and

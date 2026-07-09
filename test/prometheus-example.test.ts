@@ -16,6 +16,7 @@ test('prometheus example: metricsSink renders the expected counters and histogra
     { type: 'kms_decrypt', provider: 'github', count: 2 },
     { type: 'egress_denied', provider: 'github', host: 'evil.example.com', reason: 'host' },
     { type: 'egress_error', provider: 'github', host: 'api.github.com', reason: 'fetch_failed' },
+    { type: 'rate_limited', provider: 'github', host: 'api.github.com' },
     { type: 'resolver_failed', provider: 'aws', source: 'aws-sm' },
     { type: 'connect_prompted', provider: 'github' },
     { type: 'connected', provider: 'github' },
@@ -36,6 +37,7 @@ test('prometheus example: metricsSink renders the expected counters and histogra
   assert.match(text, /^vouchr_egress_denied_total\{provider="github",reason="host"\} 1$/m);
   assert.doesNotMatch(text, /evil\.example\.com/);
   assert.match(text, /^vouchr_egress_error_total\{provider="github",host="api\.github\.com",reason="fetch_failed"\} 1$/m);
+  assert.match(text, /^vouchr_rate_limited_total\{provider="github",host="api\.github\.com"\} 1$/m);
   assert.match(text, /^vouchr_resolver_failed_total\{provider="aws",source="aws-sm"\} 1$/m);
   assert.match(text, /^vouchr_connect_prompted_total\{provider="github"\} 1$/m);
   assert.match(text, /^vouchr_connected_total\{provider="github"\} 1$/m);

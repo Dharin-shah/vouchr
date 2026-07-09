@@ -4,6 +4,7 @@ import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import { refreshToken } from './tokens';
+import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
 import { randomUUID } from 'node:crypto';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided. */
@@ -28,6 +29,9 @@ export type VouchrEvent =
   // `reason` splits the single denial type by the gate that rejected: bad URL creds / non-allowlisted
   // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator'.
   | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' }
+  // The (owner, provider) token bucket was empty (see provider.rateLimit): the request was refused
+  // BEFORE the vault read. `host` = url.hostname only (already allowlist-checked), never the full url.
+  | { type: 'rate_limited'; provider: string; host: string }
   // No-secret UPSTREAM-FAILURE signal: a network-level throw (DNS/connection refused) or a token-refresh
   // throw. Without this a provider outage / refresh breakage is a silent black box (the broker maps it to
   // 502 with no event, no audit). `host` = url.hostname only, `reason` a static string ('fetch_failed'/
@@ -107,7 +111,17 @@ export class ConnectionHandle {
     // channel it happened in — otherwise those (the default modes) all read as "never used". Null when
     // there is no channel context (a DM, or a headless call whose token carries no channel).
     private originChannel: string | null = null,
+    // Per-(owner, provider) token buckets for provider.rateLimit. Shared across handles (like
+    // `inflight`) so the budget accumulates across requests; the adapters pass one store per
+    // createVouchr/createBroker instance. Default = per-instance, fine for direct construction in tests.
+    private rateLimits: RateLimitStore = new MemoryRateLimitStore(),
   ) {}
+
+  /** The identity key for this handle's (owner, provider) pair — the single-flight refresh map and
+   *  the rate-limit buckets key on the same fact. */
+  private ownerKey(): string {
+    return `${this.owner.teamId}:${this.owner.kind}:${this.owner.id}:${this.provider.id}`;
+  }
 
   /** The channel an injection is attributed to in the audit log: the explicit origin channel when known,
    *  else the owning channel for a channel-owned cred (preserves prior behavior), else null. */
@@ -251,6 +265,22 @@ export class ConnectionHandle {
       await this.denyEgress(url.hostname, 'validator', `Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
     }
 
+    // Per-(owner, provider) throttle (provider.rateLimit) — checked AFTER the egress gates (a denied
+    // target never spends budget) and BEFORE the vault read, so a rate-limited request never touches
+    // the secret. Absent knob = unlimited, no behavior change. Meta mirrors denyEgress: hostname +
+    // owner kind only — never the full url (a query string could carry sensitive params). Every value
+    // written here is already validated: provider from the registry, host past the allowlist above,
+    // owner kind from the typed Owner.
+    const rl = this.provider.rateLimit;
+    if (rl) {
+      const taken = await this.rateLimits.take(this.ownerKey(), 1, rl.perMinute / 60_000, rl.burst ?? rl.perMinute);
+      if (!taken.ok) {
+        this.emit({ type: 'rate_limited', provider: this.provider.id, host: url.hostname });
+        await this.audit.record('rate_limited', this.acting, this.provider.id, { host: url.hostname, owner: this.owner.kind });
+        throw new RateLimitedError(this.provider.id, rl.perMinute, taken.retryAfterMs ?? 60_000);
+      }
+    }
+
     // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
     let kms = 0;
     const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
@@ -336,7 +366,7 @@ export class ConnectionHandle {
   // Single-flight: concurrent fetches for the same owner+provider share one refresh. Without this,
   // rotating-refresh-token providers (the second refresh sees a consumed token) brick the connection.
   private async refreshAndStore(): Promise<string | null> {
-    const key = `${this.owner.teamId}:${this.owner.kind}:${this.owner.id}:${this.provider.id}`;
+    const key = this.ownerKey();
     const existing = this.inflight.get(key);
     if (existing) return existing;
     const p = this.doRefresh();

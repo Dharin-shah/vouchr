@@ -37,6 +37,7 @@ const HELP: Record<string, string> = {
   vouchr_kms_decrypt_total: 'Real KMS/envelope DEK unwraps performed reading credentials.',
   vouchr_egress_denied_total: 'Egress attempts rejected by an allowlist/policy gate.',
   vouchr_egress_error_total: 'Upstream failures (network throw or refresh throw) on an allowed target.',
+  vouchr_rate_limited_total: 'Requests refused by the per-(owner, provider) rate limit before any secret was read.',
   vouchr_resolver_failed_total: 'External secret-manager resolver failures.',
   vouchr_connect_prompted_total: 'Connect prompts shown to a user.',
   vouchr_connected_total: 'Successful provider connections.',
@@ -106,6 +107,11 @@ export function metricsSink(): Metrics {
         break;
       case 'egress_error':
         inc('vouchr_egress_error_total', { provider: e.provider, host: e.host, reason: e.reason });
+        break;
+      case 'rate_limited':
+        // `host` is safe cardinality here (unlike egress_denied): a rate_limited event only fires
+        // AFTER the allowlist gates passed, so the label space is the bounded allowlisted set.
+        inc('vouchr_rate_limited_total', { provider: e.provider, host: e.host });
         break;
       case 'resolver_failed':
         inc('vouchr_resolver_failed_total', { provider: e.provider, source: e.source });

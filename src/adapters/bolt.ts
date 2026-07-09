@@ -12,6 +12,7 @@ import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listCha
 import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../core/authz';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
@@ -26,6 +27,7 @@ import {
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
+  escapeMrkdwn,
 } from './blocks';
 
 /** How long a private preview's Share button stays claimable. Short on purpose: the human is
@@ -100,6 +102,7 @@ export function safeUserMessage(e: unknown): string {
     e instanceof SessionApprovalRequiredError ||
     e instanceof EgressBlockedError ||
     e instanceof NoConnectionError ||
+    e instanceof RateLimitedError ||
     e instanceof UserFacingError
   ) {
     return e.message;
@@ -185,6 +188,13 @@ export interface VouchrOptions {
    * (`/vouchr mode <provider> session`), not a global list; this only tunes the ceiling.
    */
   sessionTtlMs?: number;
+  /**
+   * Pluggable store for the per-(owner, provider) token buckets behind `provider.rateLimit`. The
+   * default is in-memory per-process — a multi-instance deployment multiplies the effective limit by
+   * replica count unless a shared store is supplied (same upgrade shape as the broker's replayStore).
+   * Providers without `rateLimit` are never limited, store or not.
+   */
+  rateLimitStore?: RateLimitStore;
 }
 
 /**
@@ -209,6 +219,9 @@ export interface ConnectContextDeps {
   channelTools?: ChannelTools;
   /** Shared single-flight refresh map (see ConnectionHandle). One per createVouchr instance. */
   inflight?: Map<string, Promise<string | null>>;
+  /** Shared per-(owner, provider) rate-limit buckets (see ConnectionHandle). One per createVouchr
+   *  instance — a per-request store would never accumulate budget across requests. */
+  rateLimits?: RateLimitStore;
   /** No-secret observability hook. Default no-op (zero behavior change when unset). */
   sink?: EventSink;
   /** The registered provider ids, for toolManifest(). Mirrors the registry; empty = none listed. */
@@ -246,6 +259,7 @@ export class ConnectContext {
   private channelConfig?: ChannelConfig;
   private channelTools?: ChannelTools;
   private inflight: Map<string, Promise<string | null>>;
+  private rateLimits: RateLimitStore;
   private sink: EventSink;
   private providerIds: string[];
   private adminCheck?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
@@ -270,6 +284,7 @@ export class ConnectContext {
     this.channelConfig = deps.channelConfig;
     this.channelTools = deps.channelTools;
     this.inflight = deps.inflight ?? new Map();
+    this.rateLimits = deps.rateLimits ?? new MemoryRateLimitStore();
     this.sink = deps.sink ?? (() => {});
     this.providerIds = deps.providerIds ?? [];
     this.adminCheck = deps.adminCheck;
@@ -284,6 +299,32 @@ export class ConnectContext {
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
     safeEmit(this.sink, e);
+  }
+
+  /**
+   * Slack surface for a rate-limited fetch (mirrors how connect() owns the consent prompts): tell
+   * the acting user ephemerally, then rethrow — the typed RateLimitedError still reaches the caller,
+   * so the ephemeral is extra feedback, not the only path. The post is best-effort: a Slack hiccup
+   * must never replace the typed error the agent branches on. Fields come from the error (registry
+   * provider id + numbers), and the provider id is escaped at render per SEC-5.
+   */
+  private notifyRateLimited(handle: ConnectionHandle): ConnectionHandle {
+    const fetch = handle.fetch.bind(handle);
+    handle.fetch = async (input: string, init: RequestInit = {}) => {
+      try {
+        return await fetch(input, init);
+      } catch (e) {
+        if (e instanceof RateLimitedError && this.channel) {
+          await this.client.chat.postEphemeral({
+            channel: this.channel,
+            user: this.identity.userId,
+            text: `Slow down: ${escapeMrkdwn(e.provider)} is limited to ${e.perMinute} requests/min, try again in ${Math.ceil(e.retryAfterMs / 1000)}s.`,
+          }).catch(() => undefined);
+        }
+        throw e;
+      }
+    };
+    return handle;
   }
 
   /**
@@ -392,24 +433,26 @@ export class ConnectContext {
       if (member) {
         const r = resolveCredentialOwner({ path: 'channel', mode, principal: this.identity, channel: this.channel, eligible: true, actingMember: member });
         if (r.status === 'resolved') {
-          return new ConnectionHandle(
+          return this.notifyRateLimited(new ConnectionHandle(
             provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
             // Union non-repudiation: `r.acting` is the borrowed member (audited as them); the REAL
             // requester is the caller. Pass it as triggeredBy so the inject audit records WHO borrowed
             // the credential — this is what surfaces in the owner's `/vouchr audit` view.
             this.identity.userId,
             this.channel, // origin channel: attribute union usage to the channel it happened in (stats)
-          );
+            this.rateLimits,
+          ));
         }
       }
     }
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
-      return new ConnectionHandle(
+      return this.notifyRateLimited(new ConnectionHandle(
         provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
         null, // no union borrow on the direct per-user path
         this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
-      );
+        this.rateLimits,
+      ));
     }
 
     // Key providers have no OAuth: post a self-service "set up your key" prompt instead.
@@ -692,7 +735,11 @@ export class ConnectContext {
     // and the helper always resolves (to channelOwner(teamId, channel) + this.identity — today's values).
     const r = resolveCredentialOwner({ path: 'channel', mode: 'shared', principal: this.identity, channel, eligible: true });
     if (r.status !== 'resolved') throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
-    return new ConnectionHandle(provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink);
+    // triggeredBy/originChannel keep their defaults (null): unchanged behavior on this path.
+    return this.notifyRateLimited(new ConnectionHandle(
+      provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+      null, null, this.rateLimits,
+    ));
   }
 
   /**
@@ -781,6 +828,8 @@ export async function createVouchr(opts: VouchrOptions) {
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
+  // Shared per-(owner, provider) rate-limit buckets (provider.rateLimit); per-process by default.
+  const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
   const previews = new PendingPreviews(PREVIEW_TTL_MS); // pending private previews (share/dismiss)
   const sink: EventSink = opts.onEvent ?? (() => {});
   // Optional audit stream sink (raw actor id). Separate from `sink`, which is deliberately actor-free.
@@ -842,6 +891,7 @@ export async function createVouchr(opts: VouchrOptions) {
         channelConfig,
         channelTools,
         inflight,
+        rateLimits,
         sink,
         providerIds,
         adminCheck: opts.isAdmin,
@@ -894,7 +944,7 @@ export async function createVouchr(opts: VouchrOptions) {
   function contextFor(identity: SlackIdentity, channel: string | null, client: WebClient): ConnectContext {
     return new ConnectContext({
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
-      channelConfig, channelTools, inflight, sink, providerIds,
+      channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, auditSink, previews,
