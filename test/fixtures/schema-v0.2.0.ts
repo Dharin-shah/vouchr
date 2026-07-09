@@ -8,16 +8,29 @@
 // The DDL below is copied verbatim from `git show v0.2.0:src/core/db.ts` (schema()), including its
 // blob/int type-name parameterization, so the SQLite and Postgres legs are both faithful to what
 // actually shipped: v0.2.0 had NO channel_preview table and NO meta/schema_version marker.
-// Deliberately self-contained: it must never import DDL from the current src/core/db.ts (that
-// would defeat the freeze). The one current-code import is crypto's encrypt(), per the issue —
-// the direct AES-256-GCM format (iv|tag|ct) is byte-identical to v0.2.0's, and using the current
-// module is what makes "the ciphertext a v0.2.0 deploy wrote still decrypts today" a real check.
-import { encrypt } from '../../src/core/crypto';
+// Deliberately self-contained: it imports NOTHING from current src/ (that would defeat the
+// freeze) — the DDL and encryptV020() below are both verbatim copies of what v0.2.0 shipped, so
+// a future schema OR crypto/storage-format change cannot silently alter what this fixture writes.
+// The upgrade test decrypting these bytes with the CURRENT code is the real cross-version check.
+import { createCipheriv, randomBytes } from 'node:crypto';
 
 export type FixtureEngine = 'sqlite' | 'pg';
 
 /** Fixed, obviously-fake test key (never a real secret): 32 bytes of 0x42. */
 export const FIXTURE_KEY = Buffer.alloc(32, 0x42);
+
+/**
+ * v0.2.0's encrypt(), copied verbatim from `git show v0.2.0:src/core/crypto.ts` — the frozen
+ * WRITE side of this fixture. AES-256-GCM direct under the master key, layout iv(12)|tag(16)|ct,
+ * no scheme byte. Only the random IV varies per run; the format is what the freeze protects.
+ */
+function encryptV020(plaintext: string, key: Buffer): Buffer {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv('aes-256-gcm', key, iv);
+  const ct = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, ct]);
+}
 
 /** Fixed seed epoch (ms) so every seeded timestamp is exactly assertable after migration. */
 const T = 1750000000000;
@@ -202,14 +215,14 @@ export function schemaSqlV020(engine: FixtureEngine): string {
 /**
  * Seed SQL: the SEED rows above, laid out exactly as v0.2.0 wrote them (column lists match
  * v0.2.0's Vault.upsert / Consent.begin / SessionGrants.grant / Audit.record inserts). Encrypted
- * columns are produced at call time by the current crypto against FIXTURE_KEY, emitted as
- * engine-native blob literals. Every non-blob value is a fixed, quote-free constant, so inlining
+ * columns are produced at call time by the frozen encryptV020() above against FIXTURE_KEY, emitted
+ * as engine-native blob literals. Every non-blob value is a fixed, quote-free constant, so inlining
  * literals (no placeholders) is safe and keeps the fixture runnable with a bare exec() on both
  * engines.
  */
 export function seedSqlV020(engine: FixtureEngine): string {
   const blob = (b: Buffer) => (engine === 'pg' ? `'\\x${b.toString('hex')}'` : `X'${b.toString('hex')}'`);
-  const enc = (plaintext: string) => blob(encrypt(plaintext, FIXTURE_KEY));
+  const enc = (plaintext: string) => blob(encryptV020(plaintext, FIXTURE_KEY));
   const s = (v: string | null) => (v === null ? 'NULL' : `'${v}'`);
   const n = (v: number | null) => (v === null ? 'NULL' : String(v));
 
