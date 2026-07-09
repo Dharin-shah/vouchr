@@ -248,6 +248,28 @@ const previewBody = (lines: string[]): string =>
   clip(lines.filter((l) => l.trim()).map((l) => escapeMrkdwn(l)).join('\n'), 2900);
 
 /**
+ * Normalize agent-supplied preview content to what rendering can actually show: blank lines dropped,
+ * blank title defaulted, and the SAME length caps the builders apply. Callers that HOLD content (the
+ * pending-preview store) normalize first, so nothing a human never saw is retained in memory. Kept
+ * beside the render helpers: one owner for the caps. Escaping stays at render (SEC-5), not here.
+ */
+export function normalizePreviewContent(
+  provider: string,
+  content: { title: string; lines: string[] },
+): { title: string; lines: string[] } {
+  const lines: string[] = [];
+  let budget = 2900;
+  for (const l of content.lines) {
+    if (!l.trim()) continue;
+    if (budget <= 0) break;
+    const kept = clip(l, budget);
+    lines.push(kept);
+    budget -= kept.length + 1; // +1: the '\n' previewBody joins with
+  }
+  return { title: previewTitle(content.title, provider), lines };
+}
+
+/**
  * Ephemeral PRIVATE preview of provider-derived agent output (channel visibility 'private'): only
  * the requester sees it, with an explicit Share action. `id` is the pending-preview claim id — the
  * ONLY thing the buttons carry (SEC-3: content or authorization in a button value would be forgeable;

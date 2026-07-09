@@ -7,6 +7,7 @@ import { PendingPreviews } from '../src/core/preview';
 import { previewBlocks, previewPostBlocks, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION } from '../src/adapters/blocks';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
+import { ChannelTools } from '../src/core/tools';
 import { Consent } from '../src/core/consent';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
@@ -126,11 +127,20 @@ test('preview blocks: empty/blank title and lines still produce valid blocks (no
 
 // ── ConnectContext: the admin gate + posting paths ──
 
-async function ctx(opts: { isAdmin?: boolean; visibility?: 'public' | 'private'; thread?: string | null } = {}) {
+async function ctx(opts: {
+  isAdmin?: boolean;
+  visibility?: 'public' | 'private';
+  thread?: string | null;
+  toolsOff?: boolean;    // disable 'mcp' in the channel tool allowlist
+  denyPolicy?: boolean;  // Policy denies 'mcp' everywhere
+} = {}) {
   const db = await openDb({ dbPath: ':memory:' });
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   if (opts.visibility) await channelConfig.setVisibility('T1', 'C_FIN', 'mcp', opts.visibility);
+  const channelTools = new ChannelTools(db);
+  if (opts.toolsOff) await channelTools.setEnabled('T1', 'C_FIN', 'mcp', false);
+  const policy = opts.denyPolicy ? new Policy({ mcp: { defaultAllow: false } }) : new Policy();
   const posted: any[] = [];
   const ephemeral: any[] = [];
   const client = {
@@ -144,8 +154,8 @@ async function ctx(opts: { isAdmin?: boolean; visibility?: 'public' | 'private';
   const previews = new PendingPreviews();
   const c = new ConnectContext({
     identity: ID, channel: 'C_FIN', client, registry: new ProviderRegistry([provider]),
-    vault: new Vault(db, KEY), audit, consent: new Consent(db), policy: new Policy(),
-    redirectUri: 'http://x', channelConfig, previews, thread: opts.thread ?? null,
+    vault: new Vault(db, KEY), audit, consent: new Consent(db), policy,
+    redirectUri: 'http://x', channelConfig, channelTools, previews, thread: opts.thread ?? null,
   });
   return { c, db, posted, ephemeral, previews };
 }
@@ -191,6 +201,33 @@ test('preview(): unknown provider throws and nothing is posted or stored', async
   const { c, posted, ephemeral } = await ctx({ visibility: 'private' });
   await assert.rejects(() => c.preview('nope', { title: 't', lines: [] }));
   assert.equal(posted.length + ephemeral.length, 0);
+});
+
+test('preview(): a tool-disabled or policy-denied provider posts NOTHING (same gate as connect)', async () => {
+  // Tool allowlist off → refused + audited with the connect() deny shape; nothing posted, nothing held.
+  const off = await ctx({ visibility: 'private', toolsOff: true });
+  await assert.rejects(() => off.c.preview('mcp', { title: 't', lines: ['x'] }), /not enabled/);
+  assert.equal(off.posted.length + off.ephemeral.length, 0);
+  assert.equal((off.previews as any).map.size, 0);
+  const rows = (await off.db.all(`SELECT action, meta FROM audit`)) as any[];
+  assert.equal(rows[0].action, 'denied');
+  assert.equal(JSON.parse(rows[0].meta).reason, 'tool-disabled');
+
+  // Policy deny → same refusal on the (default) public path.
+  const pol = await ctx({ denyPolicy: true });
+  await assert.rejects(() => pol.c.preview('mcp', { title: 't', lines: ['x'] }), /Policy denies/);
+  assert.equal(pol.posted.length + pol.ephemeral.length, 0);
+  assert.equal(((await pol.db.all(`SELECT action FROM audit`)) as any[])[0].action, 'denied');
+});
+
+test('preview(): the pending store holds only what was rendered (clipped, blanks dropped)', async () => {
+  const priv = await ctx({ visibility: 'private' });
+  const big = 'x'.repeat(10_000);
+  await priv.c.preview('mcp', { title: big, lines: ['', big, big] });
+  const stored = [...(priv.previews as any).map.values()][0] as { title: string; lines: string[] };
+  assert.ok(stored.title.length <= 150);
+  assert.ok(stored.lines.join('\n').length <= 2900); // the render budget, not the raw 20k
+  assert.ok(stored.lines.every((l) => l.trim().length > 0));
 });
 
 test('preview(): the fallback `text` never carries the provider-derived title (SEC-5)', async () => {

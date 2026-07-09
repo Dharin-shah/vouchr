@@ -60,6 +60,7 @@ export {
   CONFIG_CALLBACK,
   previewBlocks,
   previewPostBlocks,
+  normalizePreviewContent,
   PREVIEW_SHARE_ACTION,
   PREVIEW_DISMISS_ACTION,
 } from './adapters/blocks';

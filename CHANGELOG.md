@@ -13,7 +13,10 @@ All notable changes to this project are documented here. This project adheres to
   `context.vouchr.preview(provider, { title, lines })` goes ephemerally to the requester only, with
   a Share button: a single-use, recipient-bound claim (checked server-side, like the OAuth `state`)
   that reposts the reviewed content publicly, attributed to the sharer and audited as `preview`.
-  Default `public` posts normally — no behavior change for unconfigured channels.
+  Default `public` posts normally — no behavior change for unconfigured channels. `preview()`
+  enforces the same `authorizeProvider` decision as `connect()` (a policy-denied or tool-disabled
+  provider posts nothing, with the same audited denial), and the pending store holds only
+  render-normalized content (clipped to what the recipient could actually have reviewed).
   `ToolManifestEntry` gains `visibility`; new exports: `PreviewVisibility`, `PREVIEW_VISIBILITIES`,
   `isPreviewVisibility`, `PendingPreviews`, `previewBlocks`, `previewPostBlocks`,
   `PREVIEW_SHARE_ACTION`, `PREVIEW_DISMISS_ACTION` (also on `./headless`). Pending previews live in

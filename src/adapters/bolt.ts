@@ -25,7 +25,7 @@ import {
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
-  previewBlocks, previewPostBlocks, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
+  previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
 } from './blocks';
 
 /** How long a private preview's Share button stays claimable. Short on purpose: the human is
@@ -307,6 +307,25 @@ export class ConnectContext {
     return provider;
   }
 
+  /**
+   * The Bolt-side deny mapping of the shared authorizeProvider CHECK (audit row + policy_denied emit
+   * + user-safe error) — ONE mapping for connect() and preview(), so the credential path and the
+   * output path enforce and report the same decision. connectChannel keeps its own variant of this
+   * mapping because its audit meta carries owner:'channel'.
+   */
+  private async requireProviderAuthorized(providerId: string): Promise<void> {
+    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+    if (denial === 'policy') {
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
+      this.emit({ type: 'policy_denied', provider: providerId });
+      throw new Error(`Policy denies "${providerId}" in this channel.`);
+    }
+    if (denial === 'tool-disabled') {
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
+      throw new Error(`"${providerId}" is not enabled in this channel.`);
+    }
+  }
+
   async connect(providerId: string): Promise<ConnectionHandle> {
     // Refuse service-to-service tools BEFORE any consent flow — no Connect prompt, no vault lookup.
     const provider = this.brokerable(providerId);
@@ -324,16 +343,7 @@ export class ConnectContext {
     // Authorization (Policy + per-channel tool allowlist) — the CHECK is the shared core decision; the
     // Bolt path keeps its own audit/error mapping (and, unlike the broker, does NOT emit policy_denied on
     // a tool-disabled deny — preserved deliberately).
-    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
-    if (denial === 'policy') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
-      this.emit({ type: 'policy_denied', provider: providerId });
-      throw new Error(`Policy denies "${providerId}" in this channel.`);
-    }
-    if (denial === 'tool-disabled') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
-      throw new Error(`"${providerId}" is not enabled in this channel.`);
-    }
+    await this.requireProviderAuthorized(providerId);
 
     // Thread-scoped session: when the channel sets this provider to 'session', the user's token is usable
     // only inside the Slack thread they approved it in. The fail-closed rule lives in resolveCredentialOwner
@@ -602,20 +612,27 @@ export class ConnectContext {
    */
   async preview(providerId: string, content: { title: string; lines: string[] }): Promise<'posted' | 'private'> {
     this.registry.get(providerId); // unknown provider ids never reach a message or the preview store
+    // Output rides the SAME authorization as credential use (the shared CHECK, same audit/deny mapping
+    // as connect()): a policy-denied or tool-disabled provider must not get its output posted through
+    // Vouchr's preview surface either — otherwise the manifest's `enabled` would be a lie here.
+    await this.requireProviderAuthorized(providerId);
+    // Normalize ONCE to exactly what rendering shows (blank lines dropped, caps applied), so the
+    // pending store never retains provider text the recipient couldn't actually have reviewed.
+    const c = normalizePreviewContent(providerId, content);
     const visibility = this.channel && this.channelConfig
       ? await this.channelConfig.getVisibility(this.identity.teamId, this.channel, providerId)
       : 'public';
     if (visibility === 'private' && this.channel) {
       const id = this.previews.put({
         teamId: this.identity.teamId, userId: this.identity.userId, channel: this.channel,
-        thread: this.thread, provider: providerId, title: content.title, lines: content.lines,
+        thread: this.thread, provider: providerId, title: c.title, lines: c.lines,
       });
       await this.client.chat.postEphemeral({
         channel: this.channel,
         user: this.identity.userId,
         ...(this.thread ? { thread_ts: this.thread } : {}),
         blocks: previewBlocks({
-          provider: providerId, title: content.title, lines: content.lines, id,
+          provider: providerId, title: c.title, lines: c.lines, id,
           where: this.thread ? 'thread' : 'channel', ttlMinutes: Math.round(PREVIEW_TTL_MS / 60_000),
         }) as any,
         text: `Private ${providerId} preview (only visible to you)`,
@@ -625,7 +642,7 @@ export class ConnectContext {
     await this.client.chat.postMessage({
       channel: this.channel ?? this.identity.userId,
       ...(this.thread ? { thread_ts: this.thread } : {}),
-      blocks: previewPostBlocks({ provider: providerId, title: content.title, lines: content.lines }) as any,
+      blocks: previewPostBlocks({ provider: providerId, title: c.title, lines: c.lines }) as any,
       // Fallback/notification text is PARSED mrkdwn, not blocks: a provider-derived title there could
       // fire a <!channel> or forge a mention (SEC-5). Neutral constant + the registry-validated id only.
       text: `${providerId} preview`,
