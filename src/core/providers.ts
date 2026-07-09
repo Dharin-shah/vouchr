@@ -118,6 +118,14 @@ export function defineProvider(spec: Provider): Provider {
     if (!(Number.isFinite(perMinute) && perMinute > 0) || (burst !== undefined && !(Number.isFinite(burst) && burst > 0))) {
       throw new Error(`Provider "${spec.id}" has an invalid rateLimit: perMinute (and burst, when set) must be a finite number > 0.`);
     }
+    // The bucket's capacity is `burst ?? perMinute`, every request costs 1, and refill is capped at
+    // capacity — so an effective capacity < 1 can never accumulate a whole token and would deny
+    // every request forever. Sub-1/minute rates stay expressible via an explicit burst >= 1.
+    if ((burst ?? perMinute) < 1) {
+      throw new Error(
+        `Provider "${spec.id}" has an invalid rateLimit: burst (or perMinute, when burst is unset) must be >= 1, or no request can ever be admitted. For rates below one per minute, set burst: 1.`,
+      );
+    }
   }
   // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
   // a PKCE public client (publicClient:true) authenticates with the code_verifier alone → clientId only.

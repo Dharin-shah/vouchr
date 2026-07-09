@@ -185,10 +185,30 @@ test('rate limit: a provider without the knob is unlimited (no event, no audit, 
   }
 });
 
-test('rate limit: defineProvider rejects a zero/negative/NaN limit at definition time', () => {
-  for (const rateLimit of [{ perMinute: 0 }, { perMinute: -1 }, { perMinute: Number.NaN }, { perMinute: 60, burst: 0 }]) {
+test('rate limit: defineProvider rejects zero/negative/NaN limits and capacities below one token', () => {
+  // The last two are the permanent-deny wedge: capacity (burst ?? perMinute) < 1 with cost 1 and
+  // refill capped at capacity means no request could EVER be admitted — reject at definition time.
+  for (const rateLimit of [
+    { perMinute: 0 }, { perMinute: -1 }, { perMinute: Number.NaN }, { perMinute: 60, burst: 0 },
+    { perMinute: 0.5 }, { perMinute: 60, burst: 0.5 },
+  ]) {
     assert.throws(() => provider('bad', rateLimit), /invalid rateLimit/);
   }
+});
+
+test('rate limit: sub-1/minute rates stay expressible via an explicit burst >= 1', (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: T0 });
+  const p = provider('slow', { perMinute: 0.5, burst: 1 }); // one request per two minutes — valid
+  const store = new MemoryRateLimitStore();
+  const rl = p.rateLimit!;
+  // Same derivation the injector uses: refill per ms from perMinute, capacity burst ?? perMinute.
+  const take = () => store.take('k', 1, rl.perMinute / 60_000, rl.burst ?? rl.perMinute);
+  assert.equal(take().ok, true, 'first request admitted from the full bucket');
+  const denied = take();
+  assert.equal(denied.ok, false);
+  assert.equal(denied.retryAfterMs, 120_000, 'retry-after is exactly the two-minute refill');
+  t.mock.timers.tick(120_000);
+  assert.equal(take().ok, true, 'a whole token accumulated after the refill window');
 });
 
 test('rate limit: idle refilled buckets are pruned on the lazy 60s cadence (memory stays bounded)', (t) => {
