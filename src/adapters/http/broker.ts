@@ -7,6 +7,7 @@ import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
 import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../../core/authz';
@@ -72,6 +73,13 @@ export interface BrokerOptions {
    * its (<=5min) window. See ReplayStore / #22.
    */
   replayStore?: ReplayStore;
+  /**
+   * Pluggable store for the per-(owner, provider) token buckets behind `provider.rateLimit`. Default
+   * is in-memory per-process: a fleet of N broker replicas multiplies the effective limit by N —
+   * supply a shared store for cluster-wide limits (same upgrade shape as `replayStore`). Providers
+   * without `rateLimit` are never limited. A limited /v1/fetch maps to 429 with a Retry-After header.
+   */
+  rateLimitStore?: RateLimitStore;
   resolvers?: Resolvers;
   /**
    * No-secret observability sink (the SAME EventSink the Bolt path uses). Without it the broker is an
@@ -153,7 +161,12 @@ const WRITE_BODY_CAP = 64 * 1024;
 const WRITE_REQUEST_CAP = WRITE_BODY_CAP + READ_REQUEST_CAP;
 
 class HttpError extends Error {
-  constructor(public status: number, public payload: Record<string, unknown>) {
+  constructor(
+    public status: number,
+    public payload: Record<string, unknown>,
+    /** Extra response headers (e.g. Retry-After on a 429). Non-secret values only. */
+    public headers?: Record<string, string>,
+  ) {
     super(typeof payload.error === 'string' ? payload.error : 'error');
   }
 }
@@ -287,6 +300,9 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // refresh). Per-request maps would defeat that. On Postgres the advisory lock also coordinates
   // cross-pod; this covers in-process concurrency (incl. the SQLite single-replica case).
   const inflight = new Map<string, Promise<string | null>>();
+  // ONE rate-limit bucket store shared by every request's ConnectionHandle (provider.rateLimit);
+  // a per-request store would never accumulate budget across requests. Per-process by default.
+  const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
 
   // Broker-local metrics emit. Fire-and-forget: a throwing sink must NEVER affect the request (else a
   // broken metrics sink would turn an intended 403 deny into a 500). Mirrors the Bolt path's swallow;
@@ -457,7 +473,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // triggering caller (claims.userId): in union mode `acting` is the borrowed member, so passing the
     // caller lets the inject audit record BOTH for non-repudiation (no-op when they're the same). The
     // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null);
+    // The 12th is the createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit).
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits);
     return { handle, provider };
   }
 
@@ -502,6 +519,12 @@ export function createBroker(opts: BrokerOptions): http.Server {
       // here, so mapping to 502 doesn't swallow it.
       if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
       if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
+      // Per-(owner, provider) throttle (provider.rateLimit): 429 + Retry-After (whole seconds,
+      // rounded up). retryAfterMs also rides the payload for callers that want ms precision. The
+      // rate_limited event + audit row already fired inside the injector before the throw.
+      if (e instanceof RateLimitedError) {
+        throw new HttpError(429, { error: 'rate limited', retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
+      }
       throw new HttpError(502, { error: 'upstream fetch failed' });
     }
 
@@ -901,8 +924,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
 
   return http.createServer((req, res) => {
     void (async () => {
-      const send = (status: number, payload: Record<string, unknown>) => {
-        res.writeHead(status, { 'content-type': 'application/json' });
+      const send = (status: number, payload: Record<string, unknown>, headers?: Record<string, string>) => {
+        res.writeHead(status, { 'content-type': 'application/json', ...headers });
         res.end(JSON.stringify(payload));
       };
       try {
@@ -992,7 +1015,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         send(404, { error: 'not found' });
       } catch (e) {
-        if (e instanceof HttpError) return send(e.status, e.payload);
+        if (e instanceof HttpError) return send(e.status, e.payload, e.headers);
         // Log the error CLASS NAME only — never the message/stack/payload. An extension point (e.g. a
         // custom provider.inject) can throw AFTER touching the secret, so the message could carry the
         // token; logging it would break the "tokens never enter logs" invariant. The type still triages.

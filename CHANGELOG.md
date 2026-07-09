@@ -7,6 +7,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Per-handle rate limiting at the injection boundary** (#114) — new declarative provider knob
+  `rateLimit: { perMinute, burst? }` (absent = unlimited; nothing changes for existing providers).
+  The token bucket is keyed `(owner, provider)` and checked in the injector BEFORE the vault read,
+  so a throttled request never touches the secret — the same discipline as the egress gates. On
+  deny: the new exported `RateLimitedError` (carrying `retryAfterMs`), a no-secret `rate_limited`
+  `VouchrEvent`, and a `rate_limited` audit row (hostname + owner kind only, never the url). Bolt
+  tells the acting user ephemerally ("Slow down: … try again in Xs"); the headless broker maps it
+  to HTTP 429 with a `Retry-After` header (`BrokerError.retryAfterMs` documents the payload).
+  Buckets live in an in-memory per-process store by default; a multi-instance deployment can plug
+  a shared backend via the new `VouchrOptions.rateLimitStore` / `BrokerOptions.rateLimitStore`
+  (`RateLimitStore` interface). New exports: `RateLimitedError` and `RateLimitStore` (also on
+  `./headless`).
+
 - **Master-key rotation for the direct (non-KMS) path** (#115). New env `VOUCHR_MASTER_KEYS` =
   comma-separated `id:base64key` entries: the first entry encrypts all new writes (a new keyed
   ciphertext scheme that stores the key id), every entry is a decryption candidate, and an unknown

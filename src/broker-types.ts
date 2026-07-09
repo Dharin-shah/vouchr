@@ -17,6 +17,9 @@ export type BrokerConsentState = 'connected' | 'needs_consent';
 /** Any 4xx/5xx JSON body from the broker: `{ "error": "..." }`. */
 export interface BrokerError {
   error: string;
+  /** On a 429 (`provider.rateLimit` exceeded): ms until one request's budget refills. The same
+   *  value, in whole seconds rounded up, rides the `Retry-After` response header. */
+  retryAfterMs?: number;
 }
 
 /** `POST /v1/fetch` — the brokered upstream response (status + content-type + verbatim body). */

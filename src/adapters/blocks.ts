@@ -5,7 +5,7 @@ import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
  *  unvalidated `/vouchr configure <arg>` denial writes `arg` there), so an admin's `audit channel`
  *  view must not turn a stored string into a forged `<…|link>` or `<@user>` mention. */
-const escapeMrkdwn = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+export const escapeMrkdwn = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 /** `/vouchr audit`: a compact, read-only view of credential usage. Renders ONLY the non-secret
  *  columns (provider/action/actor/channel/time) — never `meta`, which the query already omits.

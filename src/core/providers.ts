@@ -38,6 +38,13 @@ export interface Provider {
   /** Per-provider escape-hatch validator. If set and it returns false, the request is denied. */
   egressValidate?: (url: URL, init: RequestInit) => boolean;
   /**
+   * Optional per-(owner, provider) request throttle at the injection boundary: `perMinute` sustained
+   * requests per minute PER credential owner (user or channel), with up to `burst` (default =
+   * `perMinute`) available at once. A limited request throws `RateLimitedError` BEFORE the vault is
+   * read — the secret is never touched. Absent = unlimited (unchanged behavior).
+   */
+  rateLimit?: { perMinute: number; burst?: number };
+  /**
    * How the secret is attached to the outbound request. Mutate `headers` in place.
    * Default (unset): `Authorization: Bearer <secret>`. Use for non-Bearer APIs/MCPs,
    * e.g. `(h, s) => h.set('x-api-key', s)`.
@@ -89,17 +96,37 @@ export interface ProviderConfig {
   egressPaths?: string[];
   egressMethods?: string[];
   egressValidate?: (url: URL, init: RequestInit) => boolean;
+  /** Optional per-(owner, provider) throttle at the injection boundary (see Provider). */
+  rateLimit?: { perMinute: number; burst?: number };
 }
 
-function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate'> {
+/** The per-config injection-boundary gates (egress + rate limit), passed through to a built-in. */
+function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'rateLimit'> {
   return {
     egressPaths: cfg.egressPaths,
     egressMethods: cfg.egressMethods,
     egressValidate: cfg.egressValidate,
+    rateLimit: cfg.rateLimit,
   };
 }
 
 export function defineProvider(spec: Provider): Provider {
+  // A zero/negative/NaN rate limit would build a bucket that can never refill (or never denies) —
+  // reject the misconfiguration at definition time rather than shipping a broken limiter.
+  if (spec.rateLimit) {
+    const { perMinute, burst } = spec.rateLimit;
+    if (!(Number.isFinite(perMinute) && perMinute > 0) || (burst !== undefined && !(Number.isFinite(burst) && burst > 0))) {
+      throw new Error(`Provider "${spec.id}" has an invalid rateLimit: perMinute (and burst, when set) must be a finite number > 0.`);
+    }
+    // The bucket's capacity is `burst ?? perMinute`, every request costs 1, and refill is capped at
+    // capacity — so an effective capacity < 1 can never accumulate a whole token and would deny
+    // every request forever. Sub-1/minute rates stay expressible via an explicit burst >= 1.
+    if ((burst ?? perMinute) < 1) {
+      throw new Error(
+        `Provider "${spec.id}" has an invalid rateLimit: burst (or perMinute, when burst is unset) must be >= 1, or no request can ever be admitted. For rates below one per minute, set burst: 1.`,
+      );
+    }
+  }
   // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
   // a PKCE public client (publicClient:true) authenticates with the code_verifier alone → clientId only.
   if (spec.credential !== 'key') {
@@ -322,6 +349,7 @@ export function databricks(cfg: DatabricksConfig): Provider {
     egressPaths: cfg.egressPaths ?? ['/api/2.0/sql/statements'],
     egressMethods: cfg.egressMethods ?? ['GET', 'POST'],
     egressValidate: cfg.egressValidate,
+    rateLimit: cfg.rateLimit,
     refresh: 'rotating', // offline_access → refresh token; Databricks rotates it (single-flight guards the swap)
     pkce: true, // U2M requires PKCE
     scopeDescriptions: {
