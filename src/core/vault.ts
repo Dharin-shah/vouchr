@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
-import { seal, open, toBuffer, type EnvelopeProvider } from './crypto';
+import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
 export interface StoredToken {
@@ -44,7 +44,9 @@ export interface TtlPolicy {
 export class Vault {
   constructor(
     private db: Db,
-    private key: Buffer,
+    // A bare Buffer is the single id-less master key (today's deploys); a Keyring (#115) adds
+    // named decryption keys and, when its primary is named, keyed-scheme writes for rotation.
+    private key: MasterKeys,
     private ttl: TtlPolicy = {},
     // Optional KMS envelope binding. When supplied, NEW writes use envelope encryption (scheme
     // 0x01); when absent, NEW writes use the legacy direct-to-master format (current behavior).

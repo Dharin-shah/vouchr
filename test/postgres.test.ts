@@ -220,3 +220,60 @@ test('postgres backend: DbReplayStore makes a jti single-use cluster-wide', asyn
     await db.close();
   }
 });
+
+// #115 master-key rotation on the REAL engine: the rekey pass does keyset pagination on TEXT ids
+// and a guarded UPDATE comparing BYTEA equality — both engine-specific enough that SQLite passing
+// proves nothing. Same skip contract as the tests above.
+test('postgres backend: rekey converges direct rows onto the primary key (BYTEA guard included)', async (t) => {
+  const { rekey } = await import('../src/core/rekey');
+  const { DbInstallationStore } = await import('../src/adapters/installationStore');
+  let db: Awaited<ReturnType<typeof openDb>> | undefined;
+  try {
+    db = await openDb({ databaseUrl: PG_URL });
+    await db.exec('TRUNCATE connection, installation');
+  } catch {
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
+    return;
+  }
+  try {
+    const OLD = randomBytes(32);
+    const NEW = randomBytes(32);
+    const ring = {
+      primary: { id: 'k2025' as string | null, key: NEW },
+      byId: new Map([['k2025', NEW], ['k2019', OLD]]),
+      legacy: [{ id: 'k2019' as string | null, key: OLD }, { id: 'k2025' as string | null, key: NEW }],
+    };
+    const newOnly = {
+      primary: { id: 'k2025' as string | null, key: NEW },
+      byId: new Map([['k2025', NEW]]),
+      legacy: [{ id: 'k2025' as string | null, key: NEW }],
+    };
+    const legacyVault = new Vault(db, OLD);
+    for (let i = 0; i < 5; i++) {
+      await legacyVault.upsert(userOwner({ enterpriseId: null, teamId: 'TR', userId: `U${i}` }), 'p', {
+        accessToken: `PG_TOK_${i}`, refreshToken: i % 2 ? `PG_REF_${i}` : null, scopes: '', expiresAt: null, externalAccount: null,
+      });
+    }
+    await new DbInstallationStore(db, OLD).storeInstallation({
+      team: { id: 'TR' }, enterprise: undefined, isEnterpriseInstall: false,
+      bot: { token: 'xoxb-pg-secret', scopes: [], id: 'B1', userId: 'UB' },
+    } as any);
+
+    const dry = await rekey(db, ring, { dryRun: true, batchSize: 2 }); // batch < rows → pagination runs
+    assert.equal(dry.unreadable, 0);
+    assert.equal(dry.reencrypted, 9); // 5 access + 2 refresh + bot_token + data
+    const r = await rekey(db, ring, { batchSize: 2 });
+    assert.equal(r.reencrypted, 9);
+    assert.equal(r.skippedConcurrent, 0); // the BYTEA-equality guard matched every row it read
+    assert.equal((await rekey(db, ring, { dryRun: true })).reencrypted, 0, 'idempotent');
+
+    const rotated = new Vault(db, newOnly);
+    for (let i = 0; i < 5; i++) {
+      assert.equal((await rotated.get(userOwner({ enterpriseId: null, teamId: 'TR', userId: `U${i}` }), 'p'))?.accessToken, `PG_TOK_${i}`);
+    }
+    const inst = await new DbInstallationStore(db, newOnly).fetchInstallation({ teamId: 'TR', enterpriseId: undefined, isEnterpriseInstall: false });
+    assert.equal(inst.bot?.token, 'xoxb-pg-secret');
+  } finally {
+    await db.close();
+  }
+});

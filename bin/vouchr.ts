@@ -5,15 +5,17 @@
  * Connects to the SAME credential store the app uses (SQLite via VOUCHR_DB/--db,
  * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. The read commands
  * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
- * token/secret material. The `revoke` command is the one exception: it DELETES rows
- * and may best-effort decrypt an access token to hand to the upstream revoke — never
- * to stdout. `secret_ref` (an external manager ARN/pointer, non-secret by design) is
- * the only ref any command surfaces.
+ * token/secret material. Two commands mutate: `revoke` DELETES rows and may
+ * best-effort decrypt an access token to hand to the upstream revoke — never to
+ * stdout; `rekey` re-encrypts ciphertext columns under the primary master key and
+ * prints counts only. `secret_ref` (an external manager ARN/pointer, non-secret by
+ * design) is the only ref any command surfaces.
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
 import { openDb, type Db } from '../src/core/db';
-import { loadMasterKey } from '../src/core/crypto';
+import { loadKeyring, type Keyring } from '../src/core/crypto';
+import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
 import { github, google, gitlab, notion, ProviderRegistry, type Provider } from '../src/core/providers';
 import { Vault } from '../src/core/vault';
@@ -170,9 +172,9 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
   } catch (e: any) {
     console.error(`revoke: provider config unavailable (${e?.message ?? e}); upstream revoke disabled — local deletion will proceed`);
   }
-  let key: Buffer;
+  let key: Buffer | Keyring;
   try {
-    key = loadMasterKey();
+    key = loadKeyring(); // full ring, so post-rotation rows (keyed scheme) still decrypt for upstream revoke
   } catch (e: any) {
     console.error(`revoke: master key unavailable (${e?.message ?? e}); token decrypt + upstream revoke disabled — local deletion will proceed`);
     key = Buffer.alloc(32); // never used to decrypt successfully; vault.delete needs no key
@@ -212,15 +214,57 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
   return localFailures ? 1 : 0;
 }
 
+/**
+ * Master-key rotation (#115): re-encrypt every stored ciphertext under the PRIMARY key (the first
+ * `VOUCHR_MASTER_KEYS` entry). All logic lives in core (`src/core/rekey.ts`); this prints counts
+ * only — never key material, plaintext, or ciphertext (SEC-1). `--dry-run` classifies and counts
+ * per key-id/scheme without writing, which is also the runbook's "zero old-key rows" check.
+ */
+async function cmdRekey(db: Db, f: Flags): Promise<number> {
+  let ring: Keyring;
+  try {
+    ring = loadKeyring();
+  } catch (e: any) {
+    console.error(`rekey: ${e?.message ?? e}`);
+    return 2;
+  }
+  const dryRun = 'dry-run' in f.values;
+  const primary = ring.primary.id === null ? 'id-less VOUCHR_MASTER_KEY' : `key '${ring.primary.id}'`;
+  console.log(`${dryRun ? 'REKEY DRY-RUN' : 'REKEY'}: re-encrypt under ${primary} (${ring.legacy.length} key(s) configured)`);
+  const r = await rekey(db, ring, {
+    dryRun,
+    onProgress: (table, done, total) => console.log(`  ${table}: ${done}/${total} row(s)`),
+  });
+  console.log('');
+  printTable(
+    ['decrypt source', 'blobs'],
+    Object.entries(r.bySource).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => [k, String(v)]),
+  );
+  console.log(`\nalready under primary: ${r.alreadyPrimary}`);
+  console.log(`${dryRun ? 'would re-encrypt' : 're-encrypted'}: ${r.reencrypted}`);
+  console.log(`envelope (KMS-managed, skipped): ${r.envelope}`);
+  if (r.skippedConcurrent) console.log(`skipped (written concurrently; re-run to converge): ${r.skippedConcurrent}`);
+  console.log(`unreadable under configured keys: ${r.unreadable}`);
+  if (dryRun) console.log('\nNo changes made. Re-run without --dry-run to re-encrypt.');
+  if (r.unreadable) {
+    const ids = r.unknownKeyIds.length ? ` Missing key id(s): ${r.unknownKeyIds.map((i) => `'${i}'`).join(', ')}.` : '';
+    console.error(`\nrekey: ${r.unreadable} blob(s) decrypt under NO configured key.${ids} Add the missing key(s) to VOUCHR_MASTER_KEYS and re-run.`);
+    return 1;
+  }
+  return 0;
+}
+
 async function cmdDoctor(f: Flags): Promise<number> {
   let failed = false;
   const pass = (label: string, msg = '') => console.log(`PASS ${label}${msg ? ': ' + msg : ''}`);
   const fail = (label: string, msg = '') => { failed = true; console.log(`FAIL ${label}${msg ? ': ' + msg : ''}`); };
 
-  // 1. Master key: load via loadMasterKey, never print the key itself.
+  // 1. Master key(s): load via loadKeyring, never print key material itself.
   try {
-    const len = loadMasterKey().length;
-    len === 32 ? pass('master key', '32 bytes') : fail('master key', `decoded ${len} bytes (want 32)`);
+    const ring = loadKeyring();
+    // Single id-less key → today's exact output (UX-2); a keyring reports count + primary id.
+    if (ring.primary.id === null && ring.legacy.length === 1) pass('master key', '32 bytes');
+    else pass('master key', `${ring.legacy.length} keys; new writes under '${ring.primary.id}'`);
   } catch (e: any) {
     fail('master key', e?.message ?? 'invalid');
   }
@@ -291,7 +335,7 @@ async function cmdHealth(f: Flags): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`vouchr: operator CLI (reads are metadata-only; only \`revoke\` mutates)
+  console.log(`vouchr: operator CLI (reads are metadata-only; only \`revoke\` and \`rekey\` mutate)
 
 Usage: vouchr <command> [options]
 
@@ -309,8 +353,14 @@ Commands:
                 --channel <id>   narrow to one channel's shared credentials
                 --yes            actually revoke (default is a dry-run)
                 exits non-zero if any LOCAL deletion failed
-  doctor      Diagnostics (PASS/FAIL): master key, DB reachability, row counts.
+  doctor      Diagnostics (PASS/FAIL): master key(s), DB reachability, row counts.
                 exits non-zero if any check fails
+  rekey       Re-encrypt every stored ciphertext under the PRIMARY master key
+              (the first VOUCHR_MASTER_KEYS entry). Old rows are decrypted with
+              whichever configured key matches; envelope (KMS) rows are skipped.
+              Idempotent and safe to interrupt/re-run; prints counts, never secrets.
+                --dry-run        classify + count per key id/scheme; write nothing
+                exits non-zero if any blob decrypts under NO configured key
   health [provider|host ...]
               Reachability of provider authorize/token hosts (no credentials sent).
               Defaults to built-ins: ${Object.keys(BUILTINS).join(', ')}.
@@ -321,7 +371,9 @@ Store selection (shared with the app):
   VOUCHR_DB              SQLite file path
   VOUCHR_DATABASE_URL    Postgres connection string (takes precedence)
   VOUCHR_MASTER_KEY      base64 32-byte key (validated by doctor; loaded by revoke
-                         for best-effort upstream token revocation)`);
+                         for best-effort upstream token revocation, and by rekey)
+  VOUCHR_MASTER_KEYS     comma-separated id:base64key entries; FIRST is the primary
+                         (encrypts new writes), the rest decrypt-only (rotation)`);
 }
 
 async function main(): Promise<number> {
@@ -344,6 +396,14 @@ async function main(): Promise<number> {
       const db = await openDb({ dbPath: f.values.db });
       try {
         return await cmdRevoke(db, f);
+      } finally {
+        await db.close();
+      }
+    }
+    case 'rekey': {
+      const db = await openDb({ dbPath: f.values.db });
+      try {
+        return await cmdRekey(db, f);
       } finally {
         await db.close();
       }

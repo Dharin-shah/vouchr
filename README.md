@@ -209,7 +209,9 @@ Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
 - **Consent prompts are control flow.** `ConsentRequiredError` / `SessionApprovalRequiredError` mean
   Vouchr already prompted the user — catch them and stop the turn; don't log them as failures.
 - **Protect storage and keys.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
-  database and key still need normal production controls.
+  database and key still need normal production controls. To rotate the master key without
+  orphaning rows, set `VOUCHR_MASTER_KEYS` (first entry encrypts new writes, all entries decrypt)
+  and run `vouchr rekey` — see the deployment guide's key-rotation runbook.
 - **Follow the [deployment guide](./guides/DEPLOYMENT.md)** for Postgres, multi-workspace, KMS, and
   the production readiness checklist.
 

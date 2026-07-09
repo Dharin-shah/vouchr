@@ -7,6 +7,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Master-key rotation for the direct (non-KMS) path** (#115). New env `VOUCHR_MASTER_KEYS` =
+  comma-separated `id:base64key` entries: the first entry encrypts all new writes (a new keyed
+  ciphertext scheme that stores the key id), every entry is a decryption candidate, and an unknown
+  stored key id fails closed with an error naming the id. `VOUCHR_MASTER_KEY` alone keeps working
+  bit-for-bit unchanged — no forced migration. New CLI verb `vouchr rekey [--dry-run]` re-encrypts
+  every stored ciphertext (connection token columns + installation bot token/data) under the
+  primary key: idempotent, interrupt-safe, concurrent-refresh-safe, counts-only output; `--dry-run`
+  reports blobs per key id/scheme (the runbook's "zero old-key rows" check). Envelope (KMS) rows
+  are untouched — that path rotates in the KMS. Rotation runbook + direct-vs-KMS decision note in
+  `guides/DEPLOYMENT.md` § Key rotation. New exports: `loadKeyring`, `Keyring`, `MasterKeys` (also
+  on `./headless`); `Vault` and `DbInstallationStore` now accept a `Buffer` or a `Keyring`.
+  Internal `loadMasterKey` (never exported from the package root) is superseded by `loadKeyring`.
+
 - **Schema version marker + downgrade guard** — `openDb()` now records a monotonic
   `schema_version` in a new `meta` table and fails closed (with an error naming both versions and
   the remedy) when the database was written by a NEWER vouchr, instead of running old migrations

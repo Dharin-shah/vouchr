@@ -1,6 +1,6 @@
 import { ProviderRegistry, github, google, offboardUserEverywhere } from '../../src';
 import { openDb } from '../../src/core/db';
-import { loadMasterKey } from '../../src/core/crypto';
+import { loadKeyring } from '../../src/core/crypto';
 import { Vault } from '../../src/core/vault';
 import { Audit } from '../../src/core/audit';
 import { Consent } from '../../src/core/consent';
@@ -32,7 +32,7 @@ export interface DeprovisionEvent {
  */
 async function deps() {
   const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL });
-  const key = loadMasterKey();
+  const key = loadKeyring();
   return {
     db,
     vault: new Vault(db, key),

@@ -54,6 +54,21 @@ test('envelope row whose provider throws on unwrap propagates the clear error an
   assert.equal(leaked, undefined, 'no plaintext may be produced on unwrap failure');
 });
 
+test('envelope unwrap outage error survives a multi-key keyring (probe must not mask it)', async () => {
+  // #115: with several direct keys configured, the legacy disambiguation probe tries each of
+  // them — none may authenticate a true envelope row, and the clear KMS error must still win.
+  const ring = {
+    primary: { id: 'k2025' as string | null, key: randomBytes(32) },
+    byId: new Map([['k2025', randomBytes(32)]]),
+    legacy: [{ id: null as string | null, key: KEY }, { id: 'k2025' as string | null, key: randomBytes(32) }],
+  };
+  const blob = await seal('super_secret', KEY, working);
+  await assert.rejects(() => open(blob, ring, outage), (err: Error) => {
+    assert.equal(err.message, KMS_DOWN);
+    return true;
+  });
+});
+
 test('isPostgresUrl classifies postgres/postgresql vs sqlite/undefined', () => {
   assert.equal(isPostgresUrl('postgres://u:p@h:5432/db'), true);
   assert.equal(isPostgresUrl('postgresql://u:p@h:5432/db'), true);

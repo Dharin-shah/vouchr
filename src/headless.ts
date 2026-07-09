@@ -26,6 +26,9 @@ export { openDb } from './core/db';
 export type { Db, DbOptions } from './core/db';
 export { Vault } from './core/vault';
 export type { TtlPolicy } from './core/vault';
+// #115 master keys for the direct-construction path: `new Vault(db, loadKeyring())`.
+export { loadKeyring } from './core/crypto';
+export type { Keyring, MasterKeys, EnvelopeProvider } from './core/crypto';
 export { Audit } from './core/audit';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';

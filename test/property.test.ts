@@ -351,3 +351,59 @@ test('property: authorize URL always carries the required params; code_challenge
     if (provider.pkce) assert.equal(sp.get('code_challenge_method'), 'S256', 'S256 when pkce');
   }
 });
+
+// =====================================================================================
+// 6. Master-keyring routing (#115): a ciphertext NEVER decrypts under a key it was not
+//    written with. Wrong key material fails GCM auth loudly; it never yields wrong
+//    plaintext. Random key sets, ids, and scheme mixes.
+// =====================================================================================
+test('property: random keyrings never mis-route a ciphertext to the wrong key', async () => {
+  const { encrypt, decrypt, tryDecryptDirect } = await import('../src/core/crypto');
+  const keyId = () => randStr(1 + rint(12), ALNUM + '._-');
+  const N = scale(150);
+  for (let i = 0; i < N; i++) {
+    const plaintext = `tok_${randStr(1 + rint(24), B64)}`;
+    const writeKey = randomBytes(32);
+
+    if (rnd() < 0.5) {
+      // scheme-0 writer (today's format). Readable iff the write key is among the candidates.
+      const blob = encrypt(plaintext, writeKey);
+      const others = Array.from({ length: rint(4) }, () => ({ id: keyId(), key: randomBytes(32) }));
+      const withKey = rnd() < 0.5;
+      const legacy = [...others.map((o) => ({ id: o.id as string | null, key: o.key }))];
+      if (withKey) legacy.splice(rint(legacy.length + 1), 0, { id: rnd() < 0.5 ? null : keyId(), key: writeKey });
+      const ring = {
+        primary: { id: 'p' as string | null, key: randomBytes(32) },
+        byId: new Map([['p', randomBytes(32)], ...others.map((o) => [o.id, o.key] as [string, Buffer])]),
+        legacy,
+      };
+      if (withKey) assert.equal(decrypt(blob, ring), plaintext);
+      else assert.throws(() => decrypt(blob, ring), 'a ring without the write key must fail, not fabricate');
+    } else {
+      // scheme-2 writer: routing is by EXACT id. The same id bound to different material must
+      // fail GCM; the write key under a different id must be an unknown-id hard failure.
+      const id = keyId();
+      const writer = {
+        primary: { id: id as string | null, key: writeKey },
+        byId: new Map([[id, writeKey]]),
+        legacy: [{ id: id as string | null, key: writeKey }],
+      };
+      const blob = encrypt(plaintext, writer);
+      const mode = rint(3);
+      const readerKey = mode === 0 ? writeKey : randomBytes(32);
+      const readerId = mode === 2 ? ('x' + id).slice(0, 32) : id; // one char longer → never equals id
+      const reader = {
+        primary: { id: readerId as string | null, key: readerKey },
+        byId: new Map([[readerId, readerKey]]),
+        legacy: [{ id: readerId as string | null, key: readerKey }],
+      };
+      if (mode === 0) {
+        assert.equal(decrypt(blob, reader), plaintext); // same id, same key
+      } else {
+        assert.throws(() => decrypt(blob, reader)); // wrong material or unknown id: fail closed
+        const r = tryDecryptDirect(blob, reader);
+        assert.equal(r.ok, false, 'no silent wrong plaintext, ever');
+      }
+    }
+  }
+});

@@ -92,3 +92,36 @@ test('envelope: a legacy blob whose IV starts with 0x01 still decrypts under an 
   do { blob = encrypt('collision_secret', KEY); } while (blob[0] !== 0x01); // force the 1/256 collision
   assert.equal(await open(blob, KEY, provider), 'collision_secret');
 });
+
+test('envelope: a keyring-backed vault (#115) reads envelope rows, legacy rows, and writes keyed rows', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  // Rows written by TODAY's two modes: envelope (0x01) and direct legacy (scheme-0).
+  await new Vault(db, KEY, {}, provider).upsert(O1, 'github', {
+    accessToken: 'tok_env', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const ID2: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U2' };
+  const O2 = userOwner(ID2);
+  await new Vault(db, KEY).upsert(O2, 'github', {
+    accessToken: 'tok_legacy', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  // A rotated deployment: primary key k2 (new), old master key still a legacy candidate.
+  const K2 = randomBytes(32);
+  const ring = {
+    primary: { id: 'k2' as string | null, key: K2 },
+    byId: new Map([['k2', K2]]),
+    legacy: [{ id: null as string | null, key: KEY }, { id: 'k2' as string | null, key: K2 }],
+  };
+  const rotated = new Vault(db, ring, {}, provider);
+  assert.equal((await rotated.get(O1, 'github'))?.accessToken, 'tok_env');
+  assert.equal((await rotated.get(O2, 'github'))?.accessToken, 'tok_legacy');
+
+  // And a DIRECT rotated vault (no provider) writes scheme-2 rows readable by the same ring.
+  const direct = new Vault(db, ring);
+  await direct.upsert(O2, 'github', {
+    accessToken: 'tok_keyed', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const raw = (await db.get(`SELECT access_token_enc FROM connection WHERE owner_id='U2'`)) as any;
+  assert.equal(Buffer.from(raw.access_token_enc)[0], 0x02, 'rotated direct writes carry the key id scheme');
+  assert.equal((await rotated.get(O2, 'github'))?.accessToken, 'tok_keyed');
+});
