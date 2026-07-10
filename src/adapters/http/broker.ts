@@ -6,7 +6,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
@@ -188,11 +188,6 @@ function requestBody(body: unknown): string | undefined {
     throw new HttpError(413, { error: 'request body too large' });
   }
   return body;
-}
-
-/** #26: normalize a content-type to its bare type, case-folded, charset/params dropped. */
-function normalizeContentType(ct: string | null): string {
-  return (ct ?? '').split(';')[0].trim().toLowerCase();
 }
 
 /** Escape for HTML text context — the OAuth landing page interpolates provider/account/error, and
@@ -519,6 +514,13 @@ export function createBroker(opts: BrokerOptions): http.Server {
       // here, so mapping to 502 doesn't swallow it.
       if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
       if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
+      // Provider-level response constraint (provider.egressResponse): the upstream responded, the
+      // injector withheld it. Same statuses as the broker's own #26 gates below: 413 over-cap /
+      // 502 disallowed type. The response_denied event + denied audit row already fired inside the
+      // injector; the static message never carries the offending header value or body.
+      if (e instanceof ResponseBlockedError) {
+        throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked' });
+      }
       // Per-(owner, provider) throttle (provider.rateLimit): 429 + Retry-After (whole seconds,
       // rounded up). retryAfterMs also rides the payload for callers that want ms precision. The
       // rate_limited event + audit row already fired inside the injector before the throw.

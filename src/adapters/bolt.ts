@@ -11,7 +11,7 @@ import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
 import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../core/authz';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
@@ -101,6 +101,7 @@ export function safeUserMessage(e: unknown): string {
     e instanceof ConsentRequiredError ||
     e instanceof SessionApprovalRequiredError ||
     e instanceof EgressBlockedError ||
+    e instanceof ResponseBlockedError ||
     e instanceof NoConnectionError ||
     e instanceof RateLimitedError ||
     e instanceof UserFacingError

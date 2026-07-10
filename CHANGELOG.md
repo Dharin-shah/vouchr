@@ -7,6 +7,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Structural response constraints at the injection boundary** (#110) — new declarative provider
+  knob `egressResponse: { maxBytes?, allowContentTypes?, stripHeaders? }`, enforced in the injector
+  after the fetch returns and before the Response reaches the caller, so the Bolt handle and the
+  headless broker inherit it identically. `maxBytes` caps the response body: fast-fail on a
+  declared Content-Length, then a real byte counter while streaming — an over-cap body is aborted
+  at the cap (the stream is cancelled, never buffered past it) and **never returned, not even
+  partially**. `allowContentTypes` is a case-insensitive allowlist matched exactly against the
+  bare media type (parameters ignored; a missing header fails closed), checked before any body
+  byte is read. Breaches throw (`ResponseBlockedError` internally;
+  the broker maps size → 413, content-type → 502, both as a static `response blocked`), emit a new
+  no-secret `response_denied` `VouchrEvent` (`reason: 'content_type' | 'size'`), and write a
+  `denied` audit row in the egress-denial meta shape (hostname + static reason + byte count — never
+  the header value or body content). Additionally — opt-in or not — **`Set-Cookie` is now always
+  stripped from every provider response** (3xx included): a credential-adjacent artifact the agent
+  has no business seeing. Compliant responses pass through byte-identical minus stripped headers;
+  providers without the knob are otherwise unchanged.
+
 - **Per-handle rate limiting at the injection boundary** (#114) — new declarative provider knob
   `rateLimit: { perMinute, burst? }` (absent = unlimited; nothing changes for existing providers).
   The token bucket is keyed `(owner, provider)` and checked in the injector BEFORE the vault read,

@@ -171,6 +171,19 @@ down…") and the headless broker returns 429 with a `Retry-After` header; calle
 exported `RateLimitedError`. Absent = unlimited. Buckets are per-process by default — a
 multi-replica deployment passes a shared `rateLimitStore` (same idea as the broker's `replayStore`).
 
+`egressResponse: { maxBytes?, allowContentTypes?, stripHeaders? }` adds structural constraints on
+the provider's **response** at the same boundary — shape only, deliberately no content/PII
+inspection. `maxBytes` caps the body (fast-fail on Content-Length, then enforced while streaming;
+an over-cap body is aborted at the cap, never returned even partially — a `SELECT *` gone wrong
+can't blow out the model context). `allowContentTypes` allowlists exact bare media
+types — parameters like `; charset=` ignored, so `['application/json']` admits
+`application/json; charset=utf-8` but never `application/jsonp-evil` — and an HTML login page is
+refused instead of being fed to the model as data. `stripHeaders` removes extra
+response headers — and `Set-Cookie` is **always** stripped from every provider response, opt-in or
+not, 3xx included: it's a credential-adjacent artifact the agent has no business seeing. A breach
+denies like an egress denial: a thrown error (never the body), a `response_denied` event, and an
+audit row. Absent = unchanged behavior (bar the unconditional cookie strip).
+
 Any OAuth2 provider can be declared with `defineProvider` (hosts outside a built-in's egress
 allowlist, e.g. `docs.googleapis.com`, need this too); non-OAuth APIs use `credential: 'key'` and
 an `inject` function:

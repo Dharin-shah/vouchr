@@ -29,6 +29,11 @@ export type VouchrEvent =
   // `reason` splits the single denial type by the gate that rejected: bad URL creds / non-allowlisted
   // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator'.
   | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' }
+  // The provider's RESPONSE violated a structural constraint (provider.egressResponse) and was
+  // withheld from the caller: 'content_type' = disallowed Content-Type, 'size' = body over maxBytes.
+  // Fires AFTER the outbound call (so it pairs with an 'injected' event for the same request);
+  // never carries the offending header value or any body content.
+  | { type: 'response_denied'; provider: string; host: string; reason: 'content_type' | 'size' }
   // The (owner, provider) token bucket was empty (see provider.rateLimit): the request was refused
   // BEFORE the vault read. `host` = url.hostname only (already allowlist-checked), never the full url.
   | { type: 'rate_limited'; provider: string; host: string }
@@ -80,10 +85,37 @@ export class NoConnectionError extends Error {
   }
 }
 
+/**
+ * The provider's RESPONSE violated a structural constraint (provider.egressResponse) — disallowed
+ * content-type or an over-cap body — and was withheld from the caller. Unlike EgressBlockedError
+ * this is thrown AFTER the request went out; the body is never returned, not even partially. The
+ * message is Vouchr-authored and secret-free (safe for safeUserMessage); the broker maps this to
+ * 413 (size) / 502 (content_type).
+ */
+export class ResponseBlockedError extends Error {
+  constructor(
+    message: string,
+    public reason: 'content_type' | 'size',
+  ) {
+    super(message);
+    this.name = 'ResponseBlockedError';
+  }
+}
+
 function pathAllowed(pathname: string, allowed: string): boolean {
   if (allowed === '/') return true;
   if (allowed.endsWith('/')) return pathname.startsWith(allowed);
   return pathname === allowed || pathname.startsWith(`${allowed}/`);
+}
+
+/**
+ * Normalize a content-type to its bare media type: case-folded, `; charset=`/params dropped. The
+ * ONE matcher for both response gates (provider.egressResponse here, the broker's #26 allowlist) —
+ * exact match on the bare type, so `application/json` admits `application/json; charset=utf-8`
+ * but never `application/jsonp-evil`. A missing header normalizes to '' and matches nothing.
+ */
+export function normalizeContentType(ct: string | null): string {
+  return (ct ?? '').split(';')[0].trim().toLowerCase();
 }
 
 export class ConnectionHandle {
@@ -165,6 +197,94 @@ export class ConnectionHandle {
     this.emit({ type: 'egress_denied', provider: this.provider.id, host, reason });
     await this.audit.record('denied', this.acting, this.provider.id, { host, reason });
     throw new EgressBlockedError(message);
+  }
+
+  /**
+   * Reject a provider RESPONSE that violates a structural constraint (provider.egressResponse):
+   * fire the no-secret metric, write the audit row, then throw — the body is never handed back.
+   * Mirrors denyEgress, but AFTER the outbound call: the 'inject' row for the call itself has
+   * already been written, so the trail records both the call and the withheld response. Meta
+   * carries the hostname + a static reason (+ the observed/declared byte count on a size breach) —
+   * NEVER the Content-Type header value or any body content: those are unvalidated
+   * provider-supplied strings, and an unvalidated string in an audit column is a stored-injection
+   * bug (SEC-4).
+   */
+  private async denyResponse(host: string, reason: 'content_type' | 'size', message: string, bytes?: number): Promise<never> {
+    this.emit({ type: 'response_denied', provider: this.provider.id, host, reason });
+    await this.audit.record('denied', this.acting, this.provider.id, bytes === undefined ? { host, reason } : { host, reason, bytes });
+    throw new ResponseBlockedError(message, reason);
+  }
+
+  /**
+   * Structural response constraints at the injection boundary (#110), applied AFTER the fetch and
+   * BEFORE the Response reaches the caller — so the Bolt handle and the HTTP broker inherit the
+   * same guarantees. Structural only, never content inspection:
+   *  - `set-cookie` is ALWAYS stripped (a credential-adjacent artifact the agent has no business
+   *    seeing), plus any provider-listed `stripHeaders` — on every status, 3xx included (redirects
+   *    are already `manual`, so the 3xx object itself is what the caller receives).
+   *  - `allowContentTypes`: exact, case-insensitive match on the BARE media type (parameters like
+   *    `; charset=` ignored; a missing header matches nothing — fail-closed), checked before any
+   *    body byte is read; a mismatch cancels the unread body (undici otherwise pins the socket)
+   *    and denies. Bodyless responses (res.body === null: 204/205/304, HEAD) are exempt — there
+   *    is nothing to constrain.
+   *  - `maxBytes`: fast-fail on a declared Content-Length, then enforced for real with a byte
+   *    counter while streaming (a Content-Length can lie low; chunked bodies carry none).
+   *    Buffering is bounded by the cap itself; past it the stream is cancelled — the connection is
+   *    freed and the caller never sees a partial body.
+   * A compliant response passes through byte-identical: untouched when there is nothing to strip
+   * and no cap to enforce, else reconstructed with the same status/statusText/body bytes.
+   */
+  private async guardResponse(res: Response, host: string): Promise<Response> {
+    const er = this.provider.egressResponse;
+    // Bodyless responses (204/205/304; HEAD — undici gives res.body === null) carry nothing to
+    // constrain: the content-type gate would otherwise fail-closed on their legitimately absent
+    // Content-Type. Skip it for them (the maxBytes branch below is already body-gated); the
+    // header strip still applies.
+    if (er?.allowContentTypes && res.body !== null) {
+      const ct = normalizeContentType(res.headers.get('content-type'));
+      if (!er.allowContentTypes.some((allowed) => ct === normalizeContentType(allowed))) {
+        res.body?.cancel().catch(() => undefined);
+        await this.denyResponse(host, 'content_type', `Response blocked: content-type is not allowed for provider "${this.provider.id}"`);
+      }
+    }
+    let body: BodyInit | null = res.body;
+    if (er?.maxBytes !== undefined && res.body) {
+      const cap = er.maxBytes;
+      const message = `Response blocked: response exceeds ${cap} bytes for provider "${this.provider.id}"`;
+      const declared = Number(res.headers.get('content-length'));
+      if (Number.isFinite(declared) && declared > cap) {
+        res.body.cancel().catch(() => undefined);
+        await this.denyResponse(host, 'size', message, declared);
+      }
+      const reader = res.body.getReader();
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > cap) {
+          // Abort mid-stream: never buffer past the cap; cancelling the reader frees the connection.
+          await reader.cancel().catch(() => undefined);
+          await this.denyResponse(host, 'size', message, total);
+        }
+        chunks.push(value);
+      }
+      body = Buffer.concat(chunks);
+    }
+    const strip = ['set-cookie', ...(er?.stripHeaders ?? [])];
+    // Zero-change fast path: no cap buffering and nothing to strip → the original Response, untouched.
+    if (body === res.body && !strip.some((h) => res.headers.has(h))) return res;
+    const headers = new Headers(res.headers);
+    for (const h of strip) headers.delete(h);
+    // Reconstruct with the same status/statusText/bytes. Null-body statuses must pass null (the
+    // Response constructor rejects any body on 204/205/304).
+    const bodyless = res.status === 204 || res.status === 205 || res.status === 304;
+    const out = new Response(bodyless ? null : body, { status: res.status, statusText: res.statusText, headers });
+    // The Response constructor zeroes .url; carry the original through so callers that read it
+    // (and the unconditional set-cookie strip puts ANY provider on this path) see no difference.
+    Object.defineProperty(out, 'url', { value: res.url });
+    return out;
   }
 
   /**
@@ -333,7 +453,11 @@ export class ConnectionHandle {
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
     // Audit stream copy (raw actor id, for host-side ingestion). Lossy; the audit table is authoritative.
     this.emitAudit('fetch', url.hostname, res.status, method);
-    return res;
+    // Structural response constraints (provider.egressResponse) + the unconditional set-cookie
+    // strip: enforced HERE, after the outbound call is booked (the call DID happen — its inject
+    // audit/event stay truthful) and before the Response is handed back, so both doors (Bolt
+    // handle + HTTP broker) inherit them. A breach throws; the caller never sees a partial body.
+    return this.guardResponse(res, url.hostname);
   }
 
   /** Resolve an external-ref secret JIT. Never persisted, never cached, never logged. */
