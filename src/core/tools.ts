@@ -50,6 +50,66 @@ export class ChannelTools {
     );
   }
 
+  /** One `SELECT provider, enabled UNION ALL …` table expression over `rows`, with the CASTs the
+   *  first branch needs for Postgres parameter-type inference (SQLite accepts them too), plus the
+   *  flattened parameter list. Shared by both applyEnabled statements. */
+  private static rowsSql(rows: readonly (readonly [string, boolean])[]): { sql: string; params: (string | number)[] } {
+    const sql = rows
+      .map((_, i) => (i === 0
+        ? 'SELECT CAST(? AS TEXT) AS provider, CAST(? AS INTEGER) AS enabled'
+        : 'UNION ALL SELECT ?, ?'))
+      .join(' ');
+    return { sql, params: rows.flatMap(([p, e]) => [p, e ? 1 : 0]) };
+  }
+
+  /**
+   * Atomically apply the desired enabled bits for `changes`, handling the first-write flip. Writing
+   * the FIRST row turns the channel from "all enabled" (backward-compat) into an allowlist where
+   * every row-less provider is implicitly disabled — so when the channel has no rows yet, the FULL
+   * allowlist is materialized (every provider in `allProviders` at its desired state where given,
+   * enabled otherwise) instead of a destructive partial one.
+   *
+   * Concurrency + failure safety WITHOUT client-side transactions (the shared-connection SQLite Db
+   * cannot interleave two async BEGIN…COMMIT sequences): each statement is engine-atomic, and the
+   * configured-ness decision is the `NOT EXISTS` evaluated INSIDE the materialization statement.
+   *  - Statement 1 materializes if-and-only-if no rows exist, with `DO NOTHING` on conflicts so a
+   *    concurrent materializer's explicit bits are never overwritten by our fillers.
+   *  - Statement 2 upserts the caller's own changes, so they win regardless of who materialized.
+   * Any interleaving of concurrent callers converges (each caller's own bits stick; fillers stay
+   * enabled), and a failure between the statements leaves a COMPLETE materialized allowlist already
+   * carrying this caller's bits — never a partial one that silently disables bystanders.
+   */
+  async applyEnabled(
+    teamId: string,
+    channel: string,
+    changes: readonly (readonly [string, boolean])[],
+    allProviders: readonly string[],
+  ): Promise<void> {
+    if (!changes.length) return;
+    const desired = new Map(changes);
+    const full = [...new Set([...allProviders, ...desired.keys()])]
+      .map((p) => [p, desired.get(p) ?? true] as const);
+
+    const materialize = ChannelTools.rowsSql(full);
+    await this.db.run(
+      `INSERT INTO channel_tool (team_id, channel, provider, enabled)
+       SELECT CAST(? AS TEXT), CAST(? AS TEXT), v.provider, v.enabled FROM (${materialize.sql}) AS v
+       WHERE NOT EXISTS (SELECT 1 FROM channel_tool WHERE team_id = ? AND channel = ?)
+       ON CONFLICT(team_id, channel, provider) DO NOTHING`,
+      [teamId, channel, ...materialize.params, teamId, channel],
+    );
+
+    const upsert = ChannelTools.rowsSql(changes);
+    await this.db.run(
+      // WHERE TRUE disambiguates SQLite's upsert-after-SELECT parse (harmless on Postgres).
+      `INSERT INTO channel_tool (team_id, channel, provider, enabled)
+       SELECT CAST(? AS TEXT), CAST(? AS TEXT), v.provider, v.enabled FROM (${upsert.sql}) AS v
+       WHERE TRUE
+       ON CONFLICT(team_id, channel, provider) DO UPDATE SET enabled = excluded.enabled`,
+      [teamId, channel, ...upsert.params],
+    );
+  }
+
   /** Providers explicitly enabled in this channel. Empty array means either "unconfigured"
    *  (→ all enabled, see the rule above) or "configured but everything off", callers that need
    *  to tell them apart use `isEnabled`, which applies the backward-compat rule. */

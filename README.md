@@ -66,12 +66,17 @@ browser, and asks again:
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
 Session approvals ([thread-scoped](./assets/slack-session-thread.svg)) and private credential
-modals ([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. All Block Kit surfaces
-are exported for customization (`connectedBlocks`, `statusBlocks`, `homeView`, …).
+modals ([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. The app's **App Home
+tab is a config console**: everyone manages their own connections there, and admins (plus channel
+creators when `allowChannelCreatorConfig` is on) pick a channel and set per-provider modes, tool
+availability, and shared credentials — the same server-side gates and audit rows as the `/vouchr`
+equivalents. All Block Kit surfaces are exported for customization (`connectedBlocks`,
+`statusBlocks`, `homeView`, …).
 
 To run it: Vouchr uses **your agent's Slack app** — enable bot scopes `app_mentions:read`,
-`chat:write`, `commands`, `users:read`, events `app_mention` + `user_change`, interactivity, and the
-`/vouchr` slash command (or start from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)).
+`chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`, events `app_mention` +
+`app_home_opened` + `user_change`, the App Home tab, interactivity, and the `/vouchr` slash command
+(or start from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)).
 Register each OAuth provider's app with callback `$PUBLIC_URL/vouchr/oauth/callback`. Then:
 
 ```bash

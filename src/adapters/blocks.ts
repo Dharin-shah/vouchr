@@ -1,5 +1,6 @@
 import type { AuditRow, StatsRow } from '../core/audit';
 import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
+import { isBrokeredProvider } from '../core/providers';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -336,14 +337,23 @@ export const DISCONNECT_ACTION = 'vouchr_disconnect';
 export const CONFIG_CALLBACK = 'vouchr_config';
 
 /** The four per-channel auth modes, in the order the config modal lists them. */
-/** One connection row for the status / home views. `channel` null = a personal (DM) credential. */
-export type Connection = { provider: string; channel: string | null; mode?: string };
+/** One connection row for the status / home views. `channel` null = a personal (DM) credential.
+ *  `account` is the provider-reported external account (escaped at render — provider-influenced). */
+export type Connection = { provider: string; channel: string | null; mode?: string; account?: string | null };
 
 /** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list. */
 export type ToolRow = { provider: string; enabled: boolean; mode?: string | null; visibility?: string };
 
 /** One provider's admin control row: channel mode (null = unconfigured) + tool-enabled + preview visibility. */
-export type ConfigAdminRow = { provider: string; mode: string | null; enabled: boolean; visibility: string };
+export type ConfigAdminRow = {
+  provider: string;
+  mode: string | null;
+  enabled: boolean;
+  visibility: string;
+  /** Manifest identity (see ToolManifestEntry). 'service' rows get only the tool Enable/Disable
+   *  control — mode/credential mutations are refused by core for them. Absent = 'acting_human'. */
+  identity?: 'service' | 'acting_human';
+};
 
 /**
  * No-arg `/vouchr` config modal (#109). Three sections:
@@ -368,28 +378,7 @@ export function configModal(o: {
     { type: 'header', text: { type: 'plain_text', text: 'Your connections', emoji: true } },
   ];
   if (o.connections.length) {
-    for (const c of o.connections) {
-      blocks.push({
-        type: 'section',
-        text: { type: 'mrkdwn', text: connectionLine(c) },
-        accessory: {
-          type: 'button',
-          text: { type: 'plain_text', text: 'Disconnect', emoji: true },
-          action_id: DISCONNECT_ACTION,
-          value: c.provider,
-          style: 'danger',
-          // Destructive + one-click, so gate it behind a native confirm dialog (parity with the
-          // ephemeral `/vouchr disconnect` confirm flow) — an accidental click shouldn't revoke.
-          confirm: {
-            title: { type: 'plain_text', text: 'Disconnect?' },
-            text: { type: 'mrkdwn', text: `Vouchr will delete your stored *${escapeMrkdwn(c.provider)}* credential. The agent won't be able to act as you on ${escapeMrkdwn(c.provider)} until you connect again.` },
-            confirm: { type: 'plain_text', text: 'Disconnect' },
-            deny: { type: 'plain_text', text: 'Cancel' },
-            style: 'danger',
-          },
-        },
-      });
-    }
+    for (const c of o.connections) blocks.push(connectionRow(c));
   } else {
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No connected accounts yet. They are created on demand when an agent needs one.' }] });
   }
@@ -477,13 +466,43 @@ export function configModal(o: {
   };
 }
 
-/** A readable line for one connection, reused by the status list and the App Home tab. */
-function connectionLine(c: Connection): string {
-  // Escape provider/channel/mode before they hit mrkdwn: a stored provider id is attacker-influenceable
-  // (see escapeMrkdwn's note), so no value here may render as a forged `<…|link>` or `<@user>` mention.
+/** THE readable line for one connection — the single escaped renderer for every surface that lists
+ *  a connection (`/vouchr` status text, the config modal, the App Home rows). One renderer, one
+ *  escape site (SEC-5): the provider id and the provider-reported account label must never hit
+ *  mrkdwn raw anywhere. */
+export function connectionLine(c: Connection): string {
+  // Escape provider/account/channel/mode before they hit mrkdwn: a stored provider id is attacker-
+  // influenceable (see escapeMrkdwn's note) and the external account is provider-reported, so no value
+  // here may render as a forged `<…|link>` or `<@user>` mention.
+  const account = c.account ? ` (${escapeMrkdwn(c.account)})` : '';
   const where = c.channel ? `<#${escapeMrkdwn(c.channel)}>` : 'your DMs';
   const mode = c.mode ? ` — _${escapeMrkdwn(c.mode)}_` : '';
-  return `• *${escapeMrkdwn(c.provider)}* in ${where}${mode}`;
+  return `• *${escapeMrkdwn(c.provider)}*${account} in ${where}${mode}`;
+}
+
+/** One connection row with its Disconnect button — the SAME row (and the same DISCONNECT_ACTION flow,
+ *  including the native confirm) in the config modal and the App Home, so the revoke UX can't drift. */
+function connectionRow(c: Connection): unknown {
+  return {
+    type: 'section',
+    text: { type: 'mrkdwn', text: connectionLine(c) },
+    accessory: {
+      type: 'button',
+      text: { type: 'plain_text', text: 'Disconnect', emoji: true },
+      action_id: DISCONNECT_ACTION,
+      value: c.provider,
+      style: 'danger',
+      // Destructive + one-click, so gate it behind a native confirm dialog (parity with the
+      // ephemeral `/vouchr disconnect` confirm flow) — an accidental click shouldn't revoke.
+      confirm: {
+        title: { type: 'plain_text', text: 'Disconnect?' },
+        text: { type: 'mrkdwn', text: `Vouchr will delete your stored *${escapeMrkdwn(c.provider)}* credential. The agent won't be able to act as you on ${escapeMrkdwn(c.provider)} until you connect again.` },
+        confirm: { type: 'plain_text', text: 'Disconnect' },
+        deny: { type: 'plain_text', text: 'Cancel' },
+        style: 'danger',
+      },
+    },
+  };
 }
 
 /** DM shown after a user successfully connects a credential: what, where, and how to undo. */
@@ -578,8 +597,41 @@ export function disconnectConfirmBlocks(provider: string): unknown[] {
   ];
 }
 
-/** App Home tab: a summary of the user's connections plus providers available to connect. */
-export function homeView(o: { connections: Connection[]; providers: string[] }): unknown {
+export const HOME_CALLBACK = 'vouchr_home';
+export const HOME_CHANNEL_ACTION = 'vouchr_home_channel';
+export const HOME_MODE_ACTION = 'vouchr_home_mode';
+export const HOME_TOOL_ACTION = 'vouchr_home_tool';
+export const HOME_CONFIGURE_ACTION = 'vouchr_home_configure';
+
+/** Slack hard-caps a view at 100 blocks; cap each home list well under it and point the tail at
+ *  `/vouchr` instead of paginating (#111 — a hard cap keeps the view build cheap and idempotent). */
+const HOME_MAX_ROWS = 20;
+
+/**
+ * App Home tab (#111): the config console. Everyone sees their own connections — with the SAME
+ * Disconnect row/flow as the config modal — plus the providers available to connect. `governance`
+ * (passed only for viewers the adapter authorized server-side) adds the per-channel console: a
+ * channel picker + one control row per provider (mode select, Enable/Disable, Configure). Its mere
+ * presence is UX, never the security boundary — every block action re-checks admin at the mutation
+ * (SEC-3). `note` replaces the control rows when the selected channel is ineligible/archived/deleted
+ * or not this viewer's to configure. Omitting `governance` keeps the pre-#111 connections-only view.
+ *
+ * Returns UNSTAMPED view JSON (`{ type: 'home', blocks }`, exactly the pre-#111 shape): no
+ * callback_id and no private_metadata, so a host reusing this exported helper for its OWN Home tab
+ * is never mistaken for Vouchr's. Only Bolt's internal publisher stamps HOME_CALLBACK + the
+ * selected-channel metadata (the App-Home "state machine") — that stamp is what the event and
+ * disconnect handlers treat as ownership proof.
+ */
+export function homeView(o: {
+  connections: Connection[];
+  providers: string[];
+  governance?: {
+    channel: string | null;
+    note?: string | null;
+    tools?: ConfigAdminRow[];
+  };
+}): unknown {
+  const note = (text: string): unknown => ({ type: 'context', elements: [{ type: 'mrkdwn', text }] });
   const connected = new Set(o.connections.map((c) => c.provider));
   const available = o.providers.filter((p) => !connected.has(p));
   const blocks: unknown[] = [
@@ -589,22 +641,114 @@ export function homeView(o: { connections: Connection[]; providers: string[] }):
       text: {
         type: 'mrkdwn',
         text: o.connections.length
-          ? '*Your connections*\n' + o.connections.map(connectionLine).join('\n')
+          ? '*Your connections*'
           : "*Your connections*\nNone yet — connect a provider below to let the agent act as you.",
       },
     },
   ];
+  for (const c of o.connections.slice(0, HOME_MAX_ROWS)) blocks.push(connectionRow(c));
+  if (o.connections.length > HOME_MAX_ROWS) {
+    blocks.push(note(`+${o.connections.length - HOME_MAX_ROWS} more — see \`/vouchr\` for the full list.`));
+  }
   if (available.length) {
     blocks.push({ type: 'divider' });
     blocks.push({
       type: 'section',
-      text: { type: 'mrkdwn', text: '*Available providers*\n' + available.map((p) => `• ${p}`).join('\n') },
+      text: { type: 'mrkdwn', text: '*Available providers*\n' + available.slice(0, HOME_MAX_ROWS).map((p) => `• ${escapeMrkdwn(p)}`).join('\n') },
     });
-    blocks.push({
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: 'Connect with `/vouchr connect <provider>`.' }],
-    });
+    blocks.push(note('Connections are created on demand — ask the agent and you will be prompted to connect.'));
   }
+
+  if (o.governance) {
+    const g = o.governance;
+    blocks.push({ type: 'divider' });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel governance', emoji: true } });
+    blocks.push({
+      type: 'actions',
+      block_id: 'home_channel',
+      elements: [
+        {
+          type: 'conversations_select',
+          action_id: HOME_CHANNEL_ACTION,
+          placeholder: { type: 'plain_text', text: 'Pick a channel to configure' },
+          // Mirror the shared-channel safety rules at the picker: workspace channels only, no DMs, no
+          // Slack Connect. UX filtering only — eligibility is re-checked server-side at render (the
+          // core channelIneligibleReason rule) and again inside every mutation.
+          filter: { include: ['public', 'private'], exclude_external_shared_channels: true, exclude_bot_users: true },
+          ...(g.channel ? { initial_conversation: g.channel } : {}),
+        },
+      ],
+    });
+    if (!g.channel) {
+      blocks.push(note('Pick a channel to see and configure which tools its members can use.'));
+    } else if (g.note) {
+      // g.note is Vouchr-authored constant text; the channel id came from an interaction payload,
+      // so it is escaped at render (SEC-5).
+      blocks.push(note(`<#${escapeMrkdwn(g.channel)}>: ${g.note}`));
+    } else {
+      const tools = g.tools ?? [];
+      if (!tools.length) blocks.push(note('No providers are registered.'));
+      for (const t of tools.slice(0, HOME_MAX_ROWS)) {
+        // One row per REGISTERED provider (#111): brokered tools get the full set; a 'service' tool
+        // keeps ONLY Enable/Disable — its allowlist bit is a valid channel control, while mode and
+        // channel credentials are refused by core for it (no human credential to broker).
+        const brokered = isBrokeredProvider(t);
+        // Same options + initial contract as the config modal's mode select: the modes list is the
+        // core-exported CHANNEL_MODES (STR-2), initial only when a mode is actually configured.
+        const modeOptions = CHANNEL_MODES.map((m) => ({ text: { type: 'plain_text', text: m }, value: m }));
+        const initialMode = isChannelMode(t.mode) ? modeOptions.find((x) => x.value === t.mode) : undefined;
+        blocks.push({
+          type: 'section',
+          block_id: `home_mode:${t.provider}`,
+          text: {
+            type: 'mrkdwn',
+            text: `*${escapeMrkdwn(t.provider)}* — ${t.enabled ? 'enabled' : 'disabled'} · ${
+              brokered ? `_${escapeMrkdwn(t.mode ?? 'per-user')}_` : '_service tool (host auth)_'
+            }`,
+          },
+          ...(brokered
+            ? {
+                accessory: {
+                  type: 'static_select',
+                  action_id: HOME_MODE_ACTION,
+                  placeholder: { type: 'plain_text', text: 'per-user (default)' },
+                  options: modeOptions,
+                  ...(initialMode ? { initial_option: initialMode } : {}),
+                },
+              }
+            : {}),
+        });
+        blocks.push({
+          type: 'actions',
+          block_id: `home_tool:${t.provider}`,
+          elements: [
+            {
+              type: 'button',
+              text: { type: 'plain_text', text: t.enabled ? 'Disable' : 'Enable', emoji: true },
+              action_id: HOME_TOOL_ACTION,
+              // The TARGET state rides in the value (not a read-then-toggle), so a stale click can
+              // never double-flip. Forgeable, like every interaction field — the handler re-validates
+              // the provider (SEC-4) and re-checks admin (SEC-3) before anything is written.
+              value: `${t.enabled ? 'disable' : 'enable'}:${t.provider}`,
+              ...(t.enabled ? {} : { style: 'primary' }),
+            },
+            ...(brokered
+              ? [{
+                  type: 'button',
+                  text: { type: 'plain_text', text: 'Configure credential', emoji: true },
+                  action_id: HOME_CONFIGURE_ACTION,
+                  value: t.provider,
+                }]
+              : []),
+          ],
+        });
+      }
+      if (tools.length > HOME_MAX_ROWS) {
+        blocks.push(note(`+${tools.length - HOME_MAX_ROWS} more — use \`/vouchr\` in the channel.`));
+      }
+    }
+  }
+
   return { type: 'home', blocks };
 }
 

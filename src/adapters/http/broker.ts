@@ -8,7 +8,7 @@ import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
-import { ProviderRegistry, type Provider } from '../../core/providers';
+import { ProviderRegistry, isBrokeredProvider, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, ENCODED_PATH_SEPARATOR, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { safeEmit } from '../../core/safe-emit';
@@ -636,7 +636,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
     // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
-    if (registry.get(ref.provider).identity === 'service') {
+    if (!isBrokeredProvider(registry.get(ref.provider))) {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
     await authorize(ref.provider, claims);
@@ -796,7 +796,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools are not brokered by Vouchr — don't even report their consent state
     // (else /v1/resolve would call a service tool "connected"/"needs_consent"). Refuse like /v1/fetch.
-    if (registry.get(ref.provider).identity === 'service') {
+    if (!isBrokeredProvider(registry.get(ref.provider))) {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
     const { owner } = ownerFromClaims(claims);
@@ -869,7 +869,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
-    if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
 
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // Admin authority: SIGNED claim only (the broker can't verify Slack admin). Fail closed + audited.
@@ -900,7 +900,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
   async function verifyBrokerableProvider(providerId: string, token: string): Promise<IdentityClaims> {
     const claims = await verify(token);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
-    if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     return claims;
   }
 
@@ -980,7 +980,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     await requireAdmin(claims, 'config');
     const providers = await Promise.all(
       opts.providers
-        .filter((p) => registry.get(p.id).identity !== 'service') // service tools aren't brokered by Vouchr
+        .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
         .map(async (p) => ({
           provider: p.id,
           mode: opts.channelConfig ? await opts.channelConfig.getMode(claims.teamId, claims.channel, p.id) : null,
@@ -1004,7 +1004,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     const provider = registry.get(providerId);
-    if (provider.identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     if (provider.credential === 'key') throw new HttpError(400, { error: 'provider has no OAuth flow; supply a key instead' });
     // Carry the signed enterpriseId so the resulting connection is discoverable by an enterprise
     // offboard (Grid/SCIM) — else a headless-OAuth connection would be pinned to enterpriseId:null.
@@ -1049,7 +1049,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // both tokens (2N KMS calls under envelope) just to test != null.
     const connected = new Set((await opts.vault.listLiveForUser(identity)).map((c) => c.provider));
     const providers = opts.providers
-      .filter((p) => registry.get(p.id).identity !== 'service') // service tools aren't brokered by Vouchr
+      .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
       .map((p) => {
         const isConnected = connected.has(p.id);
         return { provider: p.id, connected: isConnected, consentState: isConnected ? 'connected' : 'needs_consent' };
@@ -1138,7 +1138,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
-    if (registry.get(providerId).identity === 'service') throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     // Carry the signed enterpriseId so an enterprise offboard (Grid/SCIM) can discover this reference.
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // Owner is the VERIFIED acting user, never the body — a forged body can't reference into another's slot.

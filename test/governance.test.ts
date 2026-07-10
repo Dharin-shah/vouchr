@@ -119,6 +119,9 @@ test('/vouchr commands honor the custom isAdmin override', async () => {
   let opened: any = null;
   const client = {
     users: { info: async () => ({ user: { is_admin: false } }) },
+    // enable/configure now assert channel eligibility at the mutation (like mode always did),
+    // so the fake must serve conversations.info for an ordinary eligible channel.
+    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }) },
     views: { open: async (a: any) => { opened = a; } },
   };
   const base = { team_id: 'T1', user_id: 'U_ADMIN', channel_id: 'C_FIN', trigger_id: 'trig' };
