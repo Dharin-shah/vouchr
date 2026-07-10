@@ -38,6 +38,22 @@ export interface Provider {
   /** Per-provider escape-hatch validator. If set and it returns false, the request is denied. */
   egressValidate?: (url: URL, init: RequestInit) => boolean;
   /**
+   * OPTIONAL structural constraints on the provider's RESPONSE, enforced in the injector AFTER the
+   * fetch returns and BEFORE the Response reaches the caller — the Bolt handle and the HTTP broker
+   * inherit them identically. Structural only, never content/PII inspection:
+   *  - `maxBytes`: response body cap. Fast-fails on a declared Content-Length, then enforced with a
+   *    byte counter while streaming (a Content-Length can lie low; chunked bodies carry none). A
+   *    breach aborts the read — the caller never sees a partial body. Absent = unlimited.
+   *  - `allowContentTypes`: allowed bare media types, matched exactly and case-insensitively with
+   *    parameters ignored (['application/json'] admits 'application/json; charset=utf-8', never
+   *    'application/jsonp-evil'; a missing header matches nothing). A mismatch denies the response
+   *    with the body unread. Bodyless responses (204/205/304, HEAD) are exempt.
+   *  - `stripHeaders`: response headers to remove, on top of `set-cookie` — which is ALWAYS
+   *    stripped from every response, opt-in or not (a credential-adjacent artifact the agent has
+   *    no business seeing).
+   */
+  egressResponse?: { maxBytes?: number; allowContentTypes?: string[]; stripHeaders?: string[] };
+  /**
    * Optional per-(owner, provider) request throttle at the injection boundary: `perMinute` sustained
    * requests per minute PER credential owner (user or channel), with up to `burst` (default =
    * `perMinute`) available at once. A limited request throws `RateLimitedError` BEFORE the vault is
@@ -96,16 +112,19 @@ export interface ProviderConfig {
   egressPaths?: string[];
   egressMethods?: string[];
   egressValidate?: (url: URL, init: RequestInit) => boolean;
+  /** Optional structural response constraints at the injection boundary (see Provider). */
+  egressResponse?: Provider['egressResponse'];
   /** Optional per-(owner, provider) throttle at the injection boundary (see Provider). */
   rateLimit?: { perMinute: number; burst?: number };
 }
 
 /** The per-config injection-boundary gates (egress + rate limit), passed through to a built-in. */
-function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'rateLimit'> {
+function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit'> {
   return {
     egressPaths: cfg.egressPaths,
     egressMethods: cfg.egressMethods,
     egressValidate: cfg.egressValidate,
+    egressResponse: cfg.egressResponse,
     rateLimit: cfg.rateLimit,
   };
 }
@@ -125,6 +144,27 @@ export function defineProvider(spec: Provider): Provider {
       throw new Error(
         `Provider "${spec.id}" has an invalid rateLimit: burst (or perMinute, when burst is unset) must be >= 1, or no request can ever be admitted. For rates below one per minute, set burst: 1.`,
       );
+    }
+  }
+  // A NaN/zero/negative maxBytes would silently disable the cap (NaN comparisons are all false) or
+  // deny every response; an invalid stripHeaders NAME would throw per-request at strip time — AFTER
+  // the token was already spent. Reject both at definition time, like the rateLimit checks above.
+  if (spec.egressResponse) {
+    const { maxBytes, allowContentTypes, stripHeaders } = spec.egressResponse;
+    if (maxBytes !== undefined && !(Number.isFinite(maxBytes) && maxBytes > 0)) {
+      throw new Error(`Provider "${spec.id}" has an invalid egressResponse.maxBytes: must be a finite number > 0.`);
+    }
+    // An empty array is a silent deny-all, an empty entry a misconfigured (never-matching) type —
+    // both read as protection while doing something else entirely. Reject at definition time.
+    if (allowContentTypes !== undefined && (allowContentTypes.length === 0 || allowContentTypes.some((c) => typeof c !== 'string' || !c.trim()))) {
+      throw new Error(`Provider "${spec.id}" has an invalid egressResponse.allowContentTypes: must be a non-empty array of non-empty media types.`);
+    }
+    for (const h of stripHeaders ?? []) {
+      try {
+        new Headers().delete(h);
+      } catch {
+        throw new Error(`Provider "${spec.id}" has an invalid egressResponse.stripHeaders entry: not a valid header name.`);
+      }
     }
   }
   // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
@@ -349,6 +389,7 @@ export function databricks(cfg: DatabricksConfig): Provider {
     egressPaths: cfg.egressPaths ?? ['/api/2.0/sql/statements'],
     egressMethods: cfg.egressMethods ?? ['GET', 'POST'],
     egressValidate: cfg.egressValidate,
+    egressResponse: cfg.egressResponse,
     rateLimit: cfg.rateLimit,
     refresh: 'rotating', // offline_access → refresh token; Databricks rotates it (single-flight guards the swap)
     pkce: true, // U2M requires PKCE
