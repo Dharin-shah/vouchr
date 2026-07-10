@@ -6,6 +6,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelTools } from '../src/core/tools';
 import { sweepExpired } from '../src/core/sweep';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { github, defineProvider } from '../src/core/providers';
@@ -273,6 +274,31 @@ test('postgres backend: rekey converges direct rows onto the primary key (BYTEA 
     }
     const inst = await new DbInstallationStore(db, newOnly).fetchInstallation({ teamId: 'TR', enterpriseId: undefined, isEnterpriseInstall: false });
     assert.equal(inst.bot?.token, 'xoxb-pg-secret');
+  } finally {
+    await db.close();
+  }
+});
+
+// #111: ChannelTools.applyEnabled's atomic materialize-or-upsert statements (UNION ALL + CASTs +
+// in-statement NOT EXISTS + ON CONFLICT) on the real engine — a PG-only syntax or type-inference
+// mistake in that SQL surfaces here, not in the SQLite-backed unit tests.
+test('postgres backend: applyEnabled materializes atomically, then upserts on the configured channel', async (t) => {
+  let db: Awaited<ReturnType<typeof openDb>> | undefined;
+  try {
+    db = await openDb({ databaseUrl: PG_URL });
+    await db.exec('TRUNCATE channel_tool');
+  } catch {
+    t.skip('Postgres not reachable. Run `npm run pg:up` to exercise the PG backend');
+    return;
+  }
+  try {
+    const tools = new ChannelTools(db);
+    await tools.applyEnabled('T_PG', 'C1', [['mcp', false]], ['mcp', 'other']);
+    assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), false); // the targeted provider
+    assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // materialized, not silently disabled
+    await tools.applyEnabled('T_PG', 'C1', [['mcp', true]], ['mcp', 'other']);
+    assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), true); // configured path: plain upsert
+    assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // untouched
   } finally {
     await db.close();
   }

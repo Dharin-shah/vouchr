@@ -2,7 +2,7 @@ import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -28,8 +28,10 @@ import {
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
+  homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
   previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
   escapeMrkdwn,
+  type Connection, type ConfigAdminRow,
 } from './blocks';
 
 /** How long a private preview's Share button stays claimable. Short on purpose: the human is
@@ -118,6 +120,24 @@ export function safeUserMessage(e: unknown): string {
   }
   const name = (e as Error)?.constructor?.name ?? 'Error';
   return `Something went wrong (${name}). Ask an admin to check the Vouchr logs.`;
+}
+
+/**
+ * The adapter half of invariant 6, ONE implementation for every mutation path: fetch the channel
+ * class (null on any error → fails closed) and apply the core rule (channelIneligibleReason), so a
+ * future sidecar + thin clients enforce the same rule rather than re-implementing it. Throws a
+ * UserFacingError naming the reason — no audit row, exactly like ConnectContext.setChannelMode's
+ * eligibility refusal (the audit-on-denial convention is for authz denials, reason 'not-admin').
+ */
+async function assertChannelEligible(client: WebClient, channel: string): Promise<void> {
+  let info: ChannelInfo | null = null;
+  try {
+    info = ((await client.conversations.info({ channel })) as any)?.channel ?? null;
+  } catch {
+    info = null;
+  }
+  const reason = channelIneligibleReason(info);
+  if (reason) throw new UserFacingError(reason);
 }
 
 export interface VouchrOptions {
@@ -395,7 +415,7 @@ export class ConnectContext {
    */
   private brokerable(providerId: string): Provider {
     const provider = this.registry.get(providerId);
-    if (provider.identity === 'service') {
+    if (!isBrokeredProvider(provider)) {
       throw new UserFacingError(
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
@@ -643,7 +663,7 @@ export class ConnectContext {
   /** Whether the user already has a stored connection (no prompt side-effect). A service-to-service
    *  tool is never a Vouchr-brokered connection, so it always reports false (never "connected"). */
   async isConnected(providerId: string): Promise<boolean> {
-    if (this.registry.get(providerId).identity === 'service') return false;
+    if (!isBrokeredProvider(this.registry.get(providerId))) return false;
     return (await this.vault.get(userOwner(this.identity), providerId)) != null;
   }
 
@@ -682,18 +702,8 @@ export class ConnectContext {
    * Externally-shared/Slack-Connect is the security-critical case: a shared cred there would leak
    * cross-org. Error messages name the reason and never carry tokens.
    */
-  private async assertChannelEligible(): Promise<void> {
-    // Adapter fetches the channel info; the eligibility RULE lives in core (channelIneligibleReason)
-    // so a future sidecar + thin clients enforce the same rule rather than re-implementing it.
-    // null info => fails closed.
-    let info: ChannelInfo | null = null;
-    try {
-      info = ((await this.client.conversations.info({ channel: this.channel! })) as any)?.channel ?? null;
-    } catch {
-      info = null;
-    }
-    const reason = channelIneligibleReason(info);
-    if (reason) throw new UserFacingError(reason);
+  private assertChannelEligible(): Promise<void> {
+    return assertChannelEligible(this.client, this.channel!);
   }
 
   /**
@@ -1069,6 +1079,71 @@ export async function createVouchr(opts: VouchrOptions) {
         || (allowChannelCreatorConfig && await isChannelAdmin(client, channel, identity.userId)));
   };
 
+  /** The acting user's brokered connections, for the status / config-modal / App-Home surfaces (one
+   *  filter for all three). A service-to-service tool is never a Vouchr-brokered connection, so it
+   *  never lists as a "connected account" (defensive — storage is blocked); an unknown/stale row
+   *  still shows so nothing stored is ever hidden. */
+  const listBrokeredConnections = async (identity: SlackIdentity): Promise<Connection[]> =>
+    (await vault.listForUser(identity))
+      .filter((c) => { try { return isBrokeredProvider(registry.get(c.provider)); } catch { return true; } })
+      .map((c) => ({ provider: c.provider, channel: null, account: c.externalAccount }));
+
+  /** Best-effort DM to the acting user — the App Home has no ephemeral/inline-error surface, so
+   *  click feedback goes here (the same channel the modal-submit confirmations use). */
+  const dmActor = async (client: WebClient, identity: SlackIdentity, text: string): Promise<void> => {
+    await client.chat.postMessage({ channel: identity.userId, text }).catch(() => undefined);
+  };
+
+  /**
+   * STR-3: the mutation+audit pair for flipping a provider's tool-allowlist bit in a channel, shared
+   * by `/vouchr enable|disable` and the App Home Enable/Disable button so the admin gate, the write,
+   * and the audit row are identical by construction. The write itself — including the first-write
+   * allowlist materialization AND the configured-ness decision — is ONE atomic core mutation
+   * (ChannelTools.applyEnabled, STR-1), so concurrent admins can't interleave a partial allowlist
+   * and a failure can't leave one. Only the provider the admin actually targeted is audited.
+   * Caller contract (SEC-4): `provider` is already registry-validated and `channel` is a verified
+   * channel id (slash: Slack-supplied channel_id; App Home: verifiedHomeChannel) BEFORE this
+   * records anything.
+   */
+  const setChannelToolEnabled = async (
+    client: WebClient, identity: SlackIdentity, channel: string, provider: string, on: boolean,
+  ): Promise<'ok' | 'denied'> => {
+    if (!(await commandAdmin(client, identity, channel))) {
+      await audit.record('denied', identity, provider, { reason: 'not-admin', owner: 'channel', channel });
+      return 'denied';
+    }
+    // Channel-class eligibility at the MUTATION, not just at render (SEC-3: the render hiding
+    // controls for an archived/ext-shared channel is UI, not authorization; a forged payload — or a
+    // slash command — must hit the same wall). Ordered after the admin gate and throwing a
+    // UserFacingError with no audit row, exactly mirroring setChannelMode.
+    await assertChannelEligible(client, channel);
+    await channelTools.applyEnabled(identity.teamId, channel, [[provider, on]], providerIds);
+    await audit.record('config', identity, provider, { owner: 'channel', channel, tool: on ? 'enabled' : 'disabled' });
+    return 'ok';
+  };
+
+  /** STR-3: the admin gate + denial audit in front of the channel-credential modal, shared by
+   *  `/vouchr configure` and the App Home Configure button. Same caller contract as
+   *  setChannelToolEnabled: provider registry-validated, channel verified, BEFORE any audit write.
+   *  Also refuses ineligible channel classes up front (same rule the submit re-asserts at the
+   *  write), so a forged click can't even open the modal for an archived/ext-shared channel. */
+  const openConfigureModal = async (
+    client: WebClient, identity: SlackIdentity, channel: string, provider: string, triggerId: string,
+  ): Promise<'ok' | 'denied'> => {
+    if (!(await commandAdmin(client, identity, channel))) {
+      await audit.record('denied', identity, provider, { reason: 'not-admin', owner: 'channel', channel });
+      return 'denied';
+    }
+    await assertChannelEligible(client, channel); // throws UserFacingError, mirrors setChannelMode
+    try {
+      await client.views.open({ trigger_id: triggerId, view: configureModal(provider, channel) as any });
+    } catch {
+      // Expired trigger_id / transient Slack error: tell the actor instead of dying silently.
+      await dmActor(client, identity, `Couldn't open the ${escapeMrkdwn(provider)} credential modal (the button may have expired). Try again.`);
+    }
+    return 'ok';
+  };
+
   /**
    * The WebClient used to post the post-OAuth confirmation DM. With an installationStore,
    * resolve the connecting user's own workspace bot token via fetchInstallation; without one,
@@ -1194,13 +1269,16 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /**
    * Register the `/vouchr` slash command (`status`, `disconnect <provider>`,
-   * `configure <provider>`) and the channel-credential modal submit. `configure` opens a
-   * private modal so the admin's secret is never typed into the channel (invariant 7 / T7).
+   * `configure <provider>`), the channel-credential modal submit, and — when the app exposes
+   * `event` (Bolt does; older custom fakes may not) — the App Home console (#111) on
+   * `app_home_opened`. `configure` opens a private modal so the admin's secret is never typed
+   * into the channel (invariant 7 / T7).
    */
   function registerCommands(app: {
     command: (name: string, handler: (args: any) => Promise<void>) => void;
     view: (id: string, handler: (args: any) => Promise<void>) => void;
     action: (id: string, handler: (args: any) => Promise<void>) => void;
+    event?: (name: string, handler: (args: any) => Promise<void>) => void;
   }): void {
     app.command('/vouchr', async ({ command, ack, respond, client }: any) => {
       await ack();
@@ -1243,24 +1321,28 @@ export async function createVouchr(opts: VouchrOptions) {
           return respond(adminOnly(allowChannelCreatorConfig, 'view channel usage stats'));
         }
         const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
-        const enabled = manifest.filter((m) => m.enabled && m.identity !== 'service').map((m) => m.provider);
+        const enabled = manifest.filter((m) => m.enabled && isBrokeredProvider(m)).map((m) => m.provider);
         const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
         const stats = await audit.statsByChannel(identity.teamId, command.channel_id, since);
         return respond({ text: 'Channel tool usage', blocks: statsBlocks(enabled, stats, 30) as any });
       }
 
-      // Enable/disable a provider in this channel. Admin-gated (default-deny) + audited as 'config'.
+      // Enable/disable a provider in this channel. Admin-gated (default-deny) + audited as 'config'
+      // inside setChannelToolEnabled — the same helper the App Home button routes through (STR-3).
+      // An ineligible channel class (archived / ext-shared / DM) throws a UserFacingError inside the
+      // helper, surfaced like the `mode` branch does.
       if (sub === 'enable' || sub === 'disable') {
         if (!arg) return respond(`Usage: \`/vouchr ${sub} <provider>\``);
         if (!command.channel_id) return respond(`Run \`/vouchr ${sub}\` from inside the channel you want to configure.`);
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
-        if (!(await commandAdmin(client, identity, command.channel_id))) {
-          await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond(adminOnly(allowChannelCreatorConfig, 'change channel tools'));
-        }
         const on = sub === 'enable';
-        await channelTools.setEnabled(identity.teamId, command.channel_id, arg, on);
-        await audit.record('config', identity, arg, { owner: 'channel', channel: command.channel_id, tool: on ? 'enabled' : 'disabled' });
+        try {
+          if ((await setChannelToolEnabled(client, identity, command.channel_id, arg, on)) === 'denied') {
+            return respond(adminOnly(allowChannelCreatorConfig, 'change channel tools'));
+          }
+        } catch (e) {
+          return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
+        }
         return respond(`${on ? 'Enabled' : 'Disabled'} *${arg}* in <#${command.channel_id}>.`);
       }
 
@@ -1310,7 +1392,7 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!registry.has(arg2)) return respond(`Unknown provider "${escapeMrkdwn(arg2)}". See \`/vouchr tools\` for the registered ones.`);
         const provider = registry.get(arg2);
         const p = escapeMrkdwn(arg2);
-        if (provider.identity === 'service') {
+        if (!isBrokeredProvider(provider)) {
           return respond(`"${p}" is a service-to-service tool; Vouchr does not broker it, so there is no union pool for it.`);
         }
         if (arg === 'leave') {
@@ -1345,13 +1427,16 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
         // Validate the provider BEFORE recording a denial or opening the modal (parity with enable/disable):
         // otherwise an unvalidated arg — potentially a credential-shaped typo — lands raw in the audit
-        // `provider` column and could be reflected back into a `/vouchr audit` view.
+        // `provider` column and could be reflected back into a `/vouchr audit` view. The gate + denial
+        // audit + modal open is openConfigureModal, shared with the App Home Configure button (STR-3).
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
-        if (!(await commandAdmin(client, identity, command.channel_id))) {
-          await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
+        try {
+          if ((await openConfigureModal(client, identity, command.channel_id, arg, command.trigger_id)) === 'denied') {
+            return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
+          }
+        } catch (e) {
+          return respond(safeUserMessage(e)); // ineligible channel class → the core reason, nothing else
         }
-        await client.views.open({ trigger_id: command.trigger_id, view: configureModal(arg, command.channel_id) });
         return;
       }
       if (sub === 'disconnect') {
@@ -1383,13 +1468,11 @@ export async function createVouchr(opts: VouchrOptions) {
 
       // Never list a service-to-service tool as a "connected account": Vouchr doesn't broker those,
       // so they don't belong in the user's Vouchr connection status (defensive — storage is blocked).
-      const conns = (await vault.listForUser(identity)).filter((c) => {
-        try { return registry.get(c.provider).identity !== 'service'; } catch { return true; }
-      });
+      // Rendered through connectionLine — the ONE escaped renderer shared with the modal and the
+      // App Home (SEC-5: the account label is provider-reported and must never hit mrkdwn raw).
+      const conns = await listBrokeredConnections(identity);
       if (!conns.length) return respond('No connected accounts. They are created on demand when an agent needs one.');
-      const lines = conns
-        .map((c) => `• *${c.provider}*${c.externalAccount ? ` (${c.externalAccount})` : ''}`)
-        .join('\n');
+      const lines = conns.map(connectionLine).join('\n');
       return respond(`Your connected accounts:\n${lines}\n\nDisconnect with \`/vouchr disconnect <provider>\`.`);
     });
 
@@ -1442,30 +1525,39 @@ export async function createVouchr(opts: VouchrOptions) {
     // disconnect. Service tools are shown read-only but excluded from the admin controls: Vouchr doesn't
     // broker them, so channel-credential mode is meaningless and setChannelMode would refuse them.
     async function buildConfigModal(identity: SlackIdentity, channelId: string | null, client: WebClient): Promise<unknown> {
-      const connections = (await vault.listForUser(identity))
-        .filter((c) => { try { return registry.get(c.provider).identity !== 'service'; } catch { return true; } })
-        .map((c) => ({ provider: c.provider, channel: null as string | null }));
+      const connections = await listBrokeredConnections(identity);
       const tools = channelId ? await contextFor(identity, channelId, client).toolManifest() : [];
       const isAdmin = channelId ? await commandAdmin(client, identity, channelId) : false;
-      // The admin Enabled checkbox controls ONLY the tool allowlist bit, so it must render from
-      // channelTools.isEnabled — NOT the read-only manifest's `enabled`, which is (allowlist AND policy).
-      // Rendering the policy-intersected value would show a policy-denied provider unchecked and then let
-      // an untouched save look like an intentional disable (findings 3/1). The manifest keeps the
-      // policy-intersected value for its read-only "Tools in this channel" display.
+      // The modal keeps its pre-#111 contract: service tools are read-only there (its row shape is
+      // mode+enabled+preview checkboxes, meaningless for them). The App Home instead renders every
+      // row and per-row picks which controls a service tool gets (Enable/Disable only).
       const admin = isAdmin && channelId
-        ? await Promise.all(
-            // Preview visibility applies to ALL tools (service included — their output can leak in a
-            // thread just the same), so unlike mode/enabled it is NOT filtered to brokered providers…
-            // but the admin rows are; the service tools' knob ships when someone needs it.
-            tools.filter((t) => t.identity !== 'service').map(async (t) => ({
-              provider: t.provider,
-              mode: t.mode,
-              enabled: await channelTools.isEnabled(identity.teamId, channelId, t.provider),
-              visibility: t.visibility,
-            })),
-          )
+        ? (await adminToolRows(identity, channelId, tools)).filter((r) => isBrokeredProvider(r))
         : undefined;
       return configModal({ channel: channelId, connections, tools, admin });
+    }
+
+    /**
+     * The per-provider ADMIN control rows for a channel — ONE ROW PER REGISTERED PROVIDER (#111),
+     * service tools included (their allowlist Enable/Disable is a valid channel control; renderers
+     * use `identity` to omit the mode/credential controls core refuses for them). Shared by the App
+     * Home governance section and (brokered-filtered) the config modal, so both consoles render the
+     * same facts. The Enabled bit is channelTools.isEnabled — the raw tool-allowlist bit, NOT the
+     * manifest's policy-intersected `enabled`: rendering the intersected value would show a
+     * policy-denied provider as disabled and let an untouched save/click look like an intentional
+     * disable (config-modal findings 3/1); the manifest keeps the intersected value for the
+     * read-only displays.
+     */
+    async function adminToolRows(identity: SlackIdentity, channel: string, tools: ToolManifestEntry[]): Promise<ConfigAdminRow[]> {
+      return Promise.all(
+        tools.map(async (t) => ({
+          provider: t.provider,
+          mode: t.mode,
+          enabled: await channelTools.isEnabled(identity.teamId, channel, t.provider),
+          visibility: t.visibility,
+          identity: t.identity,
+        })),
+      );
     }
 
     // Config modal submit: apply the admin mode/enable changes. Authorization is RE-CHECKED here
@@ -1526,24 +1618,14 @@ export async function createVouchr(opts: VouchrOptions) {
         try { await ctx.setChannelVisibility(provider, visibility); } catch (e) { errors[`preview:${provider}`] = safeUserMessage(e); }
       }
 
-      // ── enabled: the tool allowlist. Writing the FIRST row flips the channel from "all enabled"
-      // (backward-compat) into allowlist mode, where every still-row-less provider silently becomes
-      // disabled. So when a change would create that allowlist on an as-yet-unconfigured channel,
-      // MATERIALIZE the full allowlist (every registered provider's desired state) rather than a single
-      // row — else the untouched providers vanish. Once the channel is already an allowlist, a per-
-      // provider write is local and safe. Audit only the providers whose state actually changed. ──
+      // ── enabled: the tool allowlist. Only the controls the admin actually changed (submitted !==
+      // open-time) are applied; the write — including the first-write allowlist materialization that
+      // keeps untouched providers from vanishing, and the configured-ness decision itself — is ONE
+      // atomic core mutation (ChannelTools.applyEnabled), so a concurrent admin or a mid-write
+      // failure can never leave a partial allowlist. Audit only the providers that actually changed. ──
       const enabledChanged = [...submittedEnabled].filter(([p]) => registry.has(p) && submittedEnabled.get(p) !== (openEnabled.get(p) ?? true));
       if (enabledChanged.length) {
-        const alreadyAllowlist = await channelTools.isConfigured(identity.teamId, channel);
-        const willDisableSome = [...submittedEnabled].some(([p, e]) => registry.has(p) && !e);
-        if (!alreadyAllowlist && willDisableSome) {
-          for (const p of providerIds) {
-            const on = submittedEnabled.has(p) ? submittedEnabled.get(p)! : true; // unshown providers stay enabled
-            await channelTools.setEnabled(identity.teamId, channel, p, on);
-          }
-        } else {
-          for (const [p] of enabledChanged) await channelTools.setEnabled(identity.teamId, channel, p, submittedEnabled.get(p)!);
-        }
+        await channelTools.applyEnabled(identity.teamId, channel, enabledChanged, providerIds);
         for (const [p, e] of enabledChanged) {
           await audit.record('config', identity, p, { owner: 'channel', channel, tool: e ? 'enabled' : 'disabled' });
         }
@@ -1554,15 +1636,207 @@ export async function createVouchr(opts: VouchrOptions) {
       await client.chat.postMessage({ channel: identity.userId, text: `✅ Updated channel settings for <#${channel}>.` }).catch(() => undefined);
     });
 
-    // Disconnect the acting user's own connection from a Disconnect button IN VOUCHR'S OWN config modal,
-    // then refresh the view so the row disappears. Scoped to `callback_id === CONFIG_CALLBACK`: the
-    // DISCONNECT_ACTION id is also EXPORTED for hosts who embed disconnectConfirmBlocks in their OWN
-    // surfaces and register their own listener — Bolt runs every matching listener, so acting on a
-    // foreign view/message here would double-fire disconnectProvider (duplicate audit/revoke) and clobber
-    // the host's view. When it isn't our modal we ack and defer to the host's listener.
+    // ── #111 App Home console ───────────────────────────────────────────────────────────────
+    // Everyone gets "Your connections" (same Disconnect flow as the modal); viewers who pass the
+    // server-side gate additionally get "Channel governance" (a channel picker + per-provider mode /
+    // enable / configure controls). RENDERING is the only thing decided here — every block action
+    // re-validates its inputs (SEC-4) and re-checks admin at the mutation (SEC-3), because a
+    // block_actions payload (private_metadata, block ids, button values) is fully forgeable.
+
+    /** The selected channel carried in the published home view (or the app_home_opened event's echo
+     *  of it). Untrusted: it only scopes rendering / is re-verified before any mutation. */
+    function homeSelectedChannel(view: any): string | null {
+      let channel: unknown = null;
+      try { ({ channel = null } = JSON.parse(view?.private_metadata || '{}')); } catch { return null; }
+      return typeof channel === 'string' && channel ? channel : null;
+    }
+
+    /**
+     * The channel a home MUTATION targets. SEC-4: unlike a slash command's Slack-verified channel_id,
+     * this comes from forgeable view metadata — so before it can reach any persist or audit write it
+     * must name a real channel (conversations.info, fail-closed on any error/mismatch). Authorization
+     * against that channel is then re-checked inside each mutation helper (SEC-3).
+     */
+    async function verifiedHomeChannel(client: WebClient, body: any): Promise<string | null> {
+      const channel = homeSelectedChannel(body?.view);
+      if (!channel) return null;
+      try {
+        const info = (await client.conversations.info({ channel })) as any;
+        return info?.channel?.id === channel ? channel : null;
+      } catch {
+        return null;
+      }
+    }
+
+    /**
+     * Build the App Home view for `identity` — cheap (one vault list + the admin gate; per-provider
+     * config reads only once a channel is selected) and idempotent, since app_home_opened fires often.
+     * Governance shows for a workspace admin (or custom-isAdmin pass) and, when the creator path is
+     * opted in, for everyone — a creator is unknowable until a channel is picked, so the PER-CHANNEL
+     * gate (commandAdmin, the same eligibility function as the slash commands) decides once one is.
+     * A selected channel that is ineligible (archived / externally shared / DM — the core
+     * channelIneligibleReason rule) or was deleted since last render degrades to a note, never an error.
+     */
+    async function buildHomeView(identity: SlackIdentity, client: WebClient, selected: string | null): Promise<unknown> {
+      const connections = await listBrokeredConnections(identity);
+      // "Available providers" advertises connect-on-demand, so it lists only providers Vouchr
+      // actually brokers a user credential for — a service tool must not be advertised as
+      // connectable. Governance rows are separate (adminToolRows, same brokered filter as the modal).
+      const connectable = providerIds.filter((p) => isBrokeredProvider(registry.get(p)));
+      const workspaceAdmin = await commandAdmin(client, identity, ''); // '' → the creator path can't match here
+      const showGovernance = workspaceAdmin || (!opts.isAdmin && allowChannelCreatorConfig);
+
+      let governance: { channel: string | null; note?: string; tools?: ConfigAdminRow[] } | undefined;
+      if (showGovernance) {
+        governance = { channel: selected };
+        if (selected) {
+          let info: ChannelInfo | null = null;
+          try { info = ((await client.conversations.info({ channel: selected })) as any)?.channel ?? null; } catch { info = null; }
+          const reason = channelIneligibleReason(info); // fail-closed: null info (deleted channel) → a reason
+          if (reason) {
+            governance = { channel: selected, note: reason };
+          } else if (!(workspaceAdmin || (await commandAdmin(client, identity, selected)))) {
+            governance = { channel: selected, note: adminOnly(allowChannelCreatorConfig, 'configure this channel') };
+          } else {
+            const tools = await contextFor(identity, selected, client).toolManifest();
+            governance = { channel: selected, tools: await adminToolRows(identity, selected, tools) };
+          }
+        }
+      }
+      // Ownership stamp: ONLY this internal publisher marks the view as Vouchr's and carries the
+      // selection state — the exported homeView stays unstamped so a host reusing it for its OWN
+      // Home tab is never mistaken for ours (the event/disconnect handlers key ownership off
+      // HOME_CALLBACK). The metadata channel is forgeable like any view field; handlers re-verify
+      // it (verifiedHomeChannel) and re-check admin before any write.
+      return {
+        ...(homeView({ connections, providers: connectable, governance }) as object),
+        callback_id: HOME_CALLBACK,
+        private_metadata: JSON.stringify({ channel: governance?.channel ?? null }),
+      };
+    }
+
+    /** views.publish for `identity`, best-effort: re-publishing is feedback, so a Slack/API hiccup
+     *  must never break the mutation (or event) that triggered it. */
+    async function publishHome(identity: SlackIdentity, client: WebClient, selected: string | null): Promise<void> {
+      try {
+        const view = await buildHomeView(identity, client, selected);
+        await client.views.publish({ user_id: identity.userId, view: view as any });
+      } catch { /* best-effort */ }
+    }
+
+    /** Feedback for a click whose metadata channel no longer verifies (deleted since render, or a
+     *  forged id): tell the actor why nothing happened and reset the view to a selection-less state
+     *  — a legitimate user in that race must not get a silent no-op. */
+    async function staleChannelFeedback(client: WebClient, identity: SlackIdentity): Promise<void> {
+      await dmActor(client, identity, 'That channel is no longer available (deleted or inaccessible). Pick another channel in the Vouchr Home tab.');
+      await publishHome(identity, client, null);
+    }
+
+    // Publish on open (and re-render with the previously selected channel, which the event echoes
+    // back in its `view`). Only the Home tab — a messages-tab open has nothing to publish.
+    app.event?.('app_home_opened', async ({ event, body, client }: any) => {
+      if (event?.tab && event.tab !== 'home') return;
+      // A host may publish its OWN Home tab (homeView is exported and hosts can run their own
+      // app_home_opened handler): when the event echoes a foreign current view, defer to the host
+      // instead of clobbering it — the same deference as DISCONNECT_ACTION. No current view (the
+      // user's very first open) is ours to publish; if the host also publishes then, last write wins
+      // once — from the next open the callback_id decides.
+      if (event?.view && event.view.callback_id !== HOME_CALLBACK) return;
+      const identity = resolveIdentity({ body, event });
+      if (!identity) return;
+      await publishHome(identity, client, homeSelectedChannel(event?.view));
+    });
+
+    // Channel picked → re-render the governance section for it. Selection is not a mutation: the
+    // render path itself re-checks eligibility + admin for the picked channel.
+    app.action(HOME_CHANNEL_ACTION, async ({ ack, body, client }: any) => {
+      await ack();
+      if (body.view?.callback_id !== HOME_CALLBACK) return;
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      const selected = body.actions?.[0]?.selected_conversation;
+      await publishHome(identity, client, typeof selected === 'string' && selected ? selected : null);
+    });
+
+    // Mode select → the SAME helper as `/vouchr mode` (ConnectContext.setChannelMode owns the admin
+    // gate, the eligibility check, the write, and the audit row — STR-3), then re-publish. Validation
+    // order matches the slash command: registry + modes list BEFORE the mutation (SEC-4) — an invalid
+    // forged mode must not even reach setChannelMode (whose shared-cred cleanup precedes its sink check).
+    app.action(HOME_MODE_ACTION, async ({ ack, body, client }: any) => {
+      await ack();
+      if (body.view?.callback_id !== HOME_CALLBACK) return;
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      const a = body.actions?.[0] ?? {};
+      const provider = typeof a.block_id === 'string' && a.block_id.startsWith('home_mode:') ? a.block_id.slice('home_mode:'.length) : '';
+      const mode = a.selected_option?.value;
+      if (!registry.has(provider) || !isChannelMode(mode)) return;
+      const channel = await verifiedHomeChannel(client, body);
+      if (!channel) return staleChannelFeedback(client, identity);
+      try {
+        await contextFor(identity, channel, client).setChannelMode(provider, mode);
+      } catch (e) {
+        // The home view has no inline-error surface; the re-publish below shows the real (unchanged)
+        // state, and the reason goes to the actor as a DM. Denials were already audited inside.
+        await dmActor(client, identity, safeUserMessage(e));
+      }
+      await publishHome(identity, client, channel);
+    });
+
+    // Enable/Disable → the SAME helper as `/vouchr enable|disable` (STR-3; a denial is audited
+    // inside), then re-publish. The button value carries the TARGET state, never trusted for authz.
+    app.action(HOME_TOOL_ACTION, async ({ ack, body, client }: any) => {
+      await ack();
+      if (body.view?.callback_id !== HOME_CALLBACK) return;
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      const m = /^(enable|disable):(.+)$/.exec(String(body.actions?.[0]?.value ?? ''));
+      if (!m || !registry.has(m[2])) return; // SEC-4: registry-validate before anything is written
+      const channel = await verifiedHomeChannel(client, body);
+      if (!channel) return staleChannelFeedback(client, identity);
+      try {
+        if ((await setChannelToolEnabled(client, identity, channel, m[2], m[1] === 'enable')) === 'denied') {
+          await dmActor(client, identity, adminOnly(allowChannelCreatorConfig, 'change channel tools'));
+        }
+      } catch (e) {
+        // Ineligible channel class (SEC-3: forged payloads reach the same wall as slash) → the
+        // core reason, as a DM; the re-publish shows the real (unchanged) state.
+        await dmActor(client, identity, safeUserMessage(e));
+      }
+      await publishHome(identity, client, channel);
+    });
+
+    // Configure → the SAME gate + modal as `/vouchr configure` (STR-3). The modal's submit is the
+    // existing CONFIGURE_CALLBACK flow, so the credential write path is untouched.
+    app.action(HOME_CONFIGURE_ACTION, async ({ ack, body, client }: any) => {
+      await ack();
+      if (body.view?.callback_id !== HOME_CALLBACK) return;
+      const identity = resolveIdentity({ body });
+      if (!identity) return;
+      const provider = body.actions?.[0]?.value;
+      if (typeof provider !== 'string' || !registry.has(provider) || !body.trigger_id) return;
+      const channel = await verifiedHomeChannel(client, body);
+      if (!channel) return staleChannelFeedback(client, identity);
+      try {
+        if ((await openConfigureModal(client, identity, channel, provider, body.trigger_id)) === 'denied') {
+          await dmActor(client, identity, adminOnly(allowChannelCreatorConfig, 'configure channel credentials')); // denial audited inside
+        }
+      } catch (e) {
+        await dmActor(client, identity, safeUserMessage(e)); // ineligible channel class → the core reason
+      }
+    });
+
+    // Disconnect the acting user's own connection from a Disconnect button IN VOUCHR'S OWN surfaces —
+    // the config modal (refresh via views.update) or the App Home (#111, refresh via views.publish).
+    // Scoped to OUR callback_ids: the DISCONNECT_ACTION id is also EXPORTED for hosts who embed
+    // disconnectConfirmBlocks in their OWN surfaces and register their own listener — Bolt runs every
+    // matching listener, so acting on a foreign view/message here would double-fire disconnectProvider
+    // (duplicate audit/revoke) and clobber the host's view. When it isn't ours we ack and defer.
     app.action(DISCONNECT_ACTION, async ({ ack, body, client }: any) => {
       await ack();
-      if (body.view?.callback_id !== CONFIG_CALLBACK) return; // not our modal → the host owns this action
+      const surface = body.view?.callback_id === CONFIG_CALLBACK ? 'modal'
+        : body.view?.callback_id === HOME_CALLBACK ? 'home' : null;
+      if (!surface) return; // not our view → the host owns this action
       const identity = resolveIdentity({ body });
       const provider = body.actions?.[0]?.value;
       // Validate against the registry before writing anything: disconnectProvider records the provider
@@ -1570,8 +1844,8 @@ export async function createVouchr(opts: VouchrOptions) {
       if (!identity || typeof provider !== 'string' || !registry.has(provider)) return;
       const { ok } = await disconnectProvider(vault, audit, registry, identity, provider, unionOptin);
       emit({ type: 'revoked', provider, ok });
-      let channel: string | null = null;
-      try { ({ channel = null } = JSON.parse(body.view.private_metadata ?? '{}')); } catch { channel = null; }
+      const channel = homeSelectedChannel(body.view);
+      if (surface === 'home') return publishHome(identity, client, channel);
       await client.views.update({ view_id: body.view.id, view: await buildConfigModal(identity, channel, client) }).catch(() => undefined);
     });
 

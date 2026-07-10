@@ -7,6 +7,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **App Home config dashboard** (#111). The app's Home tab (published on `app_home_opened`, and
+  re-published after every mutation) is now a console: everyone sees and disconnects their own
+  connections (provider + external account, same confirm + revoke flow as the config modal);
+  workspace admins — and channel creators when `allowChannelCreatorConfig` is on — additionally
+  pick a channel (public/private only; DMs and Slack Connect are filtered AND re-checked
+  server-side) and govern it per provider: credential-mode select, tool Enable/Disable, and the
+  existing channel-credential modal. Every control routes through the same helpers as the `/vouchr`
+  slash equivalents, so authorization gates, DB writes, and audit rows are identical by
+  construction; forged block actions (non-admin clicks, invalid modes, nonexistent channels smuggled
+  through view metadata) are re-validated server-side, rejected fail-closed, and audited `denied`
+  where a slash denial would be. An archived/deleted/ineligible selected channel degrades to a note.
+  Requires the `app_home_opened` bot event, the Home tab, and the `channels:read` + `groups:read`
+  scopes (see `examples/slack-manifest.yml`); `homeView()` gains an optional `governance` argument
+  (backward compatible). Vouchr's publisher defers to a foreign (host-published) Home view instead
+  of clobbering it; residual caveat: on a user's very first open there is no current view, so a
+  host with its own Home tab races Vouchr once — from the next open the `callback_id` decides.
+
+  **Behavior change:** the first `/vouchr enable|disable` (or Home Enable/Disable click) on a
+  channel with no explicit tool rows now materializes the full allowlist, so flipping one provider
+  no longer silently disables every other. Previously a first `/vouchr disable X` flipped the
+  channel into allowlist mode and knocked out all unlisted providers channel-wide while auditing
+  only X; the config modal already materialized — the shared helper now applies the same rule to
+  all surfaces. Only the provider the admin actually targeted is audited. Additionally,
+  `/vouchr enable|disable` and `/vouchr configure` (and their App Home buttons) now refuse
+  ineligible channel classes — archived, externally shared / Slack Connect, DMs — with the same
+  fail-closed rule `mode` already enforced; previously the tool-allowlist bit could be flipped and
+  the credential modal opened in an externally shared channel.
+
 - **Credential health notifications** (#117). When a token refresh fails DEFINITIVELY
   (`invalid_grant`, or a bare 400/401 from the token endpoint — classified by the new exported
   `TokenEndpointError`; transient blips never count, and neither do operator-side OAuth errors
@@ -31,6 +59,7 @@ All notable changes to this project are documented here. This project adheres to
   (`onCredentialHealth`, `onEvent`, `auditSink`) now accept async functions safely: their
   `=> void` signatures always admitted async functions, and a rejection is now swallowed exactly
   like a throw — never an unhandled rejection (which kills modern Node).
+
 
 - **MCP-aware egress proxy on the headless broker** (#65) — new route `POST /v1/mcp` for providers
   whose tool surface is an MCP server over Streamable HTTP. Same envelope style and the same
@@ -65,6 +94,7 @@ All notable changes to this project are documented here. This project adheres to
   its `VOUCHR_PROVIDERS` JSON — `"mcp": { "paths": ["/mcp"] }` is now an allowed, config-validated
   declarative field (see `guides/DEPLOYMENT.md` § Provider config). New export: `BrokerMcpRequest`
   (also on `./headless`). Docs in `guides/HEADLESS.md` § MCP servers.
+
 
 - **Union mode: explicit opt-in + owner notification** (#112). New `createVouchr` option
   `unionRequiresOptIn` — when `true`, `union` resolution only borrows channel members with an

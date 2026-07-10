@@ -118,6 +118,14 @@ export interface Provider {
   accountProbe?: (accessToken: string) => Promise<string | null>;
 }
 
+/**
+ * Whether Vouchr brokers a human credential for this provider (see Provider.identity). The ONE
+ * predicate every "is this a user-connectable / user-listed tool" check imports (STR-2): 'service'
+ * tools run on the host's own service auth — never a Vouchr connection, never a Connect prompt,
+ * never advertised as connectable. Accepts anything carrying the manifest `identity` field too.
+ */
+export const isBrokeredProvider = (p: Pick<Provider, 'identity'>): boolean => p.identity !== 'service';
+
 export interface ProviderConfig {
   clientId?: string;
   clientSecret?: string;
