@@ -215,6 +215,26 @@ not, 3xx included: it's a credential-adjacent artifact the agent has no business
 denies like an egress denial: a thrown error (never the body), a `response_denied` event, and an
 audit row. Absent = unchanged behavior (bar the unconditional cookie strip).
 
+`approval: { methods?, paths?, approver: 'self' | 'admin', ttlMs? }` adds **human-in-the-loop
+approval** for sensitive writes at the same boundary. Between "never allowed" (egress) and "always
+allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
+method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons in
+Slack — to the acting user for `'self'`, to eligible admins for `'admin'` (the same eligibility
+gate as the channel config commands) — showing the provider, method, and host+path, never the
+request body. It then throws the exported `ApprovalRequiredError` (catch and stop the turn, exactly
+like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and executes.
+A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only the exact
+(method, host, path) it was minted for — not a prefix, not the payload bytes — **and** the exact
+credential owner: a union member switch or a per-user→shared mode change re-prompts rather than
+running against a credential the human didn't approve, and disconnecting/reconnecting the credential
+purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every
+egress gate (an additional gate, never a bypass) and **before** the secret is read; every step —
+requested, approved, denied, consumed, expired — is audited with the approver as the actor. The
+headless broker enforces the same gate and returns `403 { "error": "approval_required",
+"approvalId" }`; the approval surface stays the Slack app. Enable it on a built-in via typed config
+(`github({ approval: { approver: 'admin' } })`) or on any `defineProvider`. Absent = unchanged
+behavior.
+
 Any OAuth2 provider can be declared with `defineProvider` (hosts outside a built-in's egress
 allowlist, e.g. `docs.googleapis.com`, need this too); non-OAuth APIs use `credential: 'key'` and
 an `inject` function:
@@ -262,8 +282,11 @@ local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 
 ## Production Notes
 
-- **Consent prompts are control flow.** `ConsentRequiredError` / `SessionApprovalRequiredError` mean
-  Vouchr already prompted the user — catch them and stop the turn; don't log them as failures.
+- **Consent and approval prompts are control flow.** `ConsentRequiredError` /
+  `SessionApprovalRequiredError` / `ApprovalRequiredError` mean Vouchr already prompted the user —
+  catch them and stop the turn; don't log them as failures. For `ApprovalRequiredError` the human
+  clicks Approve and asks again; the grant is single-use and covers only the exact method+host+path
+  that was prompted.
 - **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
   bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
   `invalid_client`) or a connection is within 72h of its idle/max-age TTL ceiling (dimensions

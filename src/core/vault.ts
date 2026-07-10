@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
+import { purgeApprovalsForOwner } from './approval';
 import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
@@ -91,12 +92,19 @@ export class Vault {
    * routes its connection writes/deletes through these three methods — no per-call-site purges to
    * drift (STR-3). updateTokens (silent refresh) deliberately does NOT purge: a refresh is not a
    * reconnect, and the max-age warning must survive it.
+   *
+   * #113 approval grants (`approval_request`) are satellites of a connection the SAME way, and purged
+   * on the SAME three methods for the SAME reason: a grant authorizes use of THIS owner's credential,
+   * so it must not outlive a delete (disconnect / offboard / bulk-revoke / TTL-expiry all route
+   * through delete()) nor be spent after a reconnect/reconfiguration (upsert/reference). updateTokens
+   * again does NOT purge — a silent refresh keeps the same connection, so a live grant stays valid.
    */
-  private async clearNotifyState(db: Db, owner: Owner, provider: string): Promise<void> {
+  private async clearSatellites(db: Db, owner: Owner, provider: string): Promise<void> {
     await db.run(
       `DELETE FROM notification_state WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
       [owner.teamId, owner.kind, owner.id, provider],
     );
+    await purgeApprovalsForOwner(db, owner, provider);
   }
 
   /** Connection write/delete + its notification_state purge are ONE logical mutation: run them in
@@ -132,7 +140,7 @@ export class Vault {
           t.scopes, t.expiresAt, t.externalAccount, now, now, now,
         ],
       );
-      await this.clearNotifyState(tx, owner, provider); // reconnect ⇒ fresh notification state (#117)
+      await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
     });
   }
 
@@ -165,7 +173,7 @@ export class Vault {
           r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
         ],
       );
-      await this.clearNotifyState(tx, owner, provider); // reconnect ⇒ fresh notification state (#117)
+      await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
     });
   }
 
@@ -332,7 +340,7 @@ export class Vault {
         `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
         [owner.teamId, owner.kind, owner.id, provider],
       );
-      await this.clearNotifyState(tx, owner, provider); // state rows must not outlive the connection (#117)
+      await this.clearSatellites(tx, owner, provider); // satellites must not outlive the connection: notification_state (#117) + approval grants (#113)
     });
   }
 }

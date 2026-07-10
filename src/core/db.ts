@@ -189,8 +189,9 @@ class PgClientDb implements Db {
  * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
  * Version 2 = + the `union_optin` table (#112, purely additive).
  * Version 3 = + the `notification_state` table (#117, purely additive).
+ * Version 4 = + the `approval_request` table (#113, purely additive).
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -309,6 +310,24 @@ function schema(blob: string, int: string): string {
       provider TEXT NOT NULL,
       created_at ${int} NOT NULL,
       PRIMARY KEY (team_id, channel_id, user_id, provider)
+    );
+
+    CREATE TABLE IF NOT EXISTS approval_request (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      owner_kind TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      method TEXT NOT NULL,
+      host TEXT NOT NULL,
+      path TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      thread TEXT NOT NULL,
+      status TEXT NOT NULL,
+      approved_by TEXT,
+      created_at ${int} NOT NULL,
+      expires_at ${int} NOT NULL
     );
 
     CREATE TABLE IF NOT EXISTS notification_state (

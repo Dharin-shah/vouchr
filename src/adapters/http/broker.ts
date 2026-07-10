@@ -19,6 +19,7 @@ import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '..
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
+import { Approvals, ApprovalRequiredError } from '../../core/approval';
 import { UnionOptin } from '../../core/unionOptin';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { handleOAuthCallback } from '../../core/oauthCallback';
@@ -359,6 +360,10 @@ function pickHeaders(headers: Record<string, string> | undefined, allow: string[
  * matching no-secret event + audit row already fired inside the injector before each throw, so
  * mapping here swallows nothing:
  *  - EgressBlockedError → 403 (allowlist/policy gate refused the target BEFORE any secret was read)
+ *  - ApprovalRequiredError → 403 `{ error: 'approval_required', approvalId }` (#113). The broker
+ *    cannot render Approve/Deny buttons, so the approval SURFACE stays the Bolt app: the caller's
+ *    Slack-facing service routes the human there, then retries. The id is the pending-approval
+ *    handle, not a secret and not authority (eligibility is re-checked at the click).
  *  - NoConnectionError → 409 (no stored credential for this owner+provider)
  *  - ResponseBlockedError → 413 over-cap / 502 disallowed type (provider.egressResponse withheld
  *    the response); the static message never carries the offending header value or body
@@ -368,6 +373,7 @@ function pickHeaders(headers: Record<string, string> | undefined, allow: string[
  */
 function mapUpstreamError(e: unknown): never {
   if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
+  if (e instanceof ApprovalRequiredError) throw new HttpError(403, { error: 'approval_required', approvalId: e.approvalId });
   if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
   if (e instanceof ResponseBlockedError) {
     throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked' });
@@ -487,6 +493,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // owns the code exchange — the broker adds no crypto/state logic itself. Cheap Db wrappers.
   const consent = new Consent(opts.db);
   const sessions = new SessionGrants(opts.db);
+  const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
   const unionOptin = new UnionOptin(opts.db); // #112: disconnect/offboard purge union opt-ins too
   const callbackPath = opts.callbackPath ?? '/oauth/callback';
   const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
@@ -651,7 +658,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
     // The 12th is the createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit).
     // The 13th is the #117 credential-health hook (definitive refresh death → owner identity, no tokens).
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits, opts.onCredentialHealth);
+    // The 14th/15th are the #113 approval store + the signed thread, so a provider.approval gate is
+    // enforced on this door too (the broker maps the throw to 403 approval_required; the approval
+    // SURFACE stays the Bolt app — see mapUpstreamError).
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits, opts.onCredentialHealth, approvals, claims.threadTs ?? null);
     return { handle, provider, acting };
   }
 

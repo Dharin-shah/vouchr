@@ -53,6 +53,7 @@ One core, two front doors — both reach the same credential boundary.
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
+| Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons | ⚠️ enforced (403 `approval_required`) — the approval **surface** is the Slack app |
 
 ## Writes are opt-in
 
@@ -72,6 +73,31 @@ const broker = createBroker({
 Providers without `egressMethods` remain `GET`/`HEAD`-only even when `allowWrites` is enabled.
 Write bodies are small JSON/text payloads, capped at 64 KiB, and still go through the same identity
 verification, replay guard, policy, channel-tool, host/path/method, and HTTPS checks as reads.
+
+## Human-in-the-loop approvals (#113)
+
+A provider declaring the `approval` knob (`{ methods?, paths?, approver: 'self' | 'admin',
+ttlMs? }`; default = every non-GET/HEAD method) requires a live, single-use human approval per
+matching action — enforced in the shared injector, so this door inherits it identically: strictly
+AFTER every egress gate (never a bypass) and BEFORE the credential is read. The broker **cannot
+render Approve/Deny buttons**, so the split is deliberate:
+
+- A matching `/v1/fetch` (or `/v1/mcp`) with no live grant records a pending approval, audits
+  `approval_requested`, and returns:
+
+  ```json
+  { "error": "approval_required", "approvalId": "…" }   // HTTP 403
+  ```
+
+- The approval **surface is the Bolt app** (Approve/Deny buttons, approver eligibility re-checked
+  server-side at the click): the Slack-facing service routes the human there, then the worker
+  retries with a fresh identity token. A host with no Bolt surface can drive its own approve/deny
+  with the exported `Approvals` store (`./headless`), re-checking approver eligibility itself.
+
+The grant matches ONLY the exact (method, host, path) it was minted for, expires after `ttlMs`
+(default 5 minutes), and is consumed atomically on first use — a second identical call returns a
+fresh 403 with a new `approvalId`. The `approvalId` is a lookup handle, not authority and not a
+secret. Expired prompts/grants are reclaimed by the standard TTL sweep (audited, actor `system`).
 
 ## MCP servers (Streamable HTTP): `POST /v1/mcp`
 
