@@ -27,8 +27,9 @@ export type VouchrEvent =
   // Only fires when envelope encryption is in use (count > 0); the legacy direct path makes no KMS call.
   | { type: 'kms_decrypt'; provider: string; count: number }
   // `reason` splits the single denial type by the gate that rejected: bad URL creds / non-allowlisted
-  // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator'.
-  | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' }
+  // host / non-https all map to 'host'; the finer egress gates map to 'path'/'method'/'validator';
+  // 'mcp' = the headless broker's /v1/mcp per-provider opt-in gate (provider.mcp absent).
+  | { type: 'egress_denied'; provider: string; host: string; reason: 'host' | 'method' | 'path' | 'validator' | 'mcp' }
   // The provider's RESPONSE violated a structural constraint (provider.egressResponse) and was
   // withheld from the caller: 'content_type' = disallowed Content-Type, 'size' = body over maxBytes.
   // Fires AFTER the outbound call (so it pairs with an 'injected' event for the same request);
@@ -102,11 +103,25 @@ export class ResponseBlockedError extends Error {
   }
 }
 
-function pathAllowed(pathname: string, allowed: string): boolean {
+/**
+ * Path-lock matcher, shared by the `egressPaths` gate below and the broker's `/v1/mcp`
+ * `provider.mcp.paths` gate (STR-2: one matcher, one semantics): `'/'` allows everything; a prefix
+ * ending in `/` matches by startsWith; otherwise the exact segment or any subpath of it.
+ */
+export function pathAllowed(pathname: string, allowed: string): boolean {
   if (allowed === '/') return true;
   if (allowed.endsWith('/')) return pathname.startsWith(allowed);
   return pathname === allowed || pathname.startsWith(`${allowed}/`);
 }
+
+/**
+ * Encoded path separators (%2f, %5c) survive WHATWG URL parsing UN-decoded, so a traversal segment
+ * like `..%2f` can match an allowed prefix here yet resolve to a DIFFERENT path on an upstream that
+ * later decodes it. Wherever a path lock IS the security boundary (`egressPaths` below, the
+ * broker's `mcp.paths`), the ambiguity is refused fail-closed — a legitimate locked path never
+ * contains an encoded separator. One rule, shared (STR-2).
+ */
+export const ENCODED_PATH_SEPARATOR = /%2f|%5c/i;
 
 /**
  * Normalize a content-type to its bare media type: case-folded, `; charset=`/params dropped. The
@@ -365,13 +380,10 @@ export class ConnectionHandle {
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
     // never reaches the vault: the secret is read strictly after every egress check passes.
     if (this.provider.egressPaths) {
-      // Encoded path separators (%2f, %5c) survive WHATWG URL parsing UN-decoded, so a traversal
-      // segment like `/statements/..%2f..%2fsecrets` still matches an allowed prefix here, yet
-      // resolves to a DIFFERENT path on any upstream that later decodes %2f. When a path lock is in
-      // force it IS the security boundary, so refuse the ambiguity fail-closed — a legitimate locked
-      // path never contains an encoded separator. (Providers WITHOUT a path lock, e.g. GitLab whose
-      // project ids are `group%2Fproject`, are unaffected: this guard is gated on egressPaths.)
-      if (/%2f|%5c/i.test(url.pathname)) {
+      // See ENCODED_PATH_SEPARATOR: with a path lock in force the encoded-separator ambiguity is
+      // refused fail-closed. (Providers WITHOUT a path lock, e.g. GitLab whose project ids are
+      // `group%2Fproject`, are unaffected: this guard is gated on egressPaths.)
+      if (ENCODED_PATH_SEPARATOR.test(url.pathname)) {
         await this.denyEgress(url.hostname, 'path', `Egress blocked: encoded path separator is not allowed for provider "${this.provider.id}"`);
       }
       if (!this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {

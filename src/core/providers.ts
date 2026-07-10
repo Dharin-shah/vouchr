@@ -54,6 +54,20 @@ export interface Provider {
    */
   egressResponse?: { maxBytes?: number; allowContentTypes?: string[]; stripHeaders?: string[] };
   /**
+   * OPT-IN for the headless broker's `POST /v1/mcp` route (#65). Absent = the provider is refused
+   * on /v1/mcp (403), even when POST-enabled for /v1/fetch: the raw streamed passthrough skips the
+   * broker's per-request response envelope gates, so reaching it must be a deliberate declaration
+   * with the endpoint locked down.
+   *  - `paths`: REQUIRED — the MCP endpoint path prefixes, matched with the SAME semantics as
+   *    `egressPaths` (one shared matcher; encoded path separators refused fail-closed).
+   *  - `allowContentTypes`: allowed RESPONSE media types, matched on the bare type exactly like
+   *    `egressResponse.allowContentTypes`. Default `['application/json', 'text/event-stream']`
+   *    (the two MCP Streamable-HTTP transport types); a response outside it is withheld unread.
+   * Session note: `Mcp-Session-Id` values relayed on this route are opaque and potentially
+   * sensitive — Vouchr never stores, logs, or authenticates by them.
+   */
+  mcp?: { paths: string[]; allowContentTypes?: string[] };
+  /**
    * Optional per-(owner, provider) request throttle at the injection boundary: `perMinute` sustained
    * requests per minute PER credential owner (user or channel), with up to `burst` (default =
    * `perMinute`) available at once. A limited request throws `RateLimitedError` BEFORE the vault is
@@ -165,6 +179,18 @@ export function defineProvider(spec: Provider): Provider {
       } catch {
         throw new Error(`Provider "${spec.id}" has an invalid egressResponse.stripHeaders entry: not a valid header name.`);
       }
+    }
+  }
+  // #65 /v1/mcp opt-in: an empty/invalid `paths` lock and an empty content-type list are silent
+  // misconfigurations (allow-nothing that reads as protection, or a never-matching type) — reject
+  // at definition time, in the same style as the egressResponse checks above.
+  if (spec.mcp) {
+    const { paths, allowContentTypes } = spec.mcp;
+    if (!Array.isArray(paths) || paths.length === 0 || paths.some((p) => typeof p !== 'string' || !p.trim())) {
+      throw new Error(`Provider "${spec.id}" has an invalid mcp.paths: must be a non-empty array of non-empty path prefixes.`);
+    }
+    if (allowContentTypes !== undefined && (allowContentTypes.length === 0 || allowContentTypes.some((c) => typeof c !== 'string' || !c.trim()))) {
+      throw new Error(`Provider "${spec.id}" has an invalid mcp.allowContentTypes: must be a non-empty array of non-empty media types.`);
     }
   }
   // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;

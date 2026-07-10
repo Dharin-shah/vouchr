@@ -1,12 +1,15 @@
 import http from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import type { Db } from '../../core/db';
 import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, ENCODED_PATH_SEPARATOR, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
@@ -47,6 +50,23 @@ export interface BrokerFetchRequest {
   query?: Record<string, string>;
   headers?: Record<string, string>; // allowlisted; Authorization is dropped (broker injects)
   body?: string; // optional small write payload; capped before forwarding
+}
+
+/**
+ * #65 `POST /v1/mcp` request: the /v1/fetch envelope, specialized for ONE MCP Streamable-HTTP hop.
+ * The upstream method is always POST (a JSON-RPC message), and `headers` admits only the MCP
+ * plumbing set (Accept, Content-Type, Mcp-Session-Id, MCP-Protocol-Version) — everything else,
+ * Authorization above all, is stripped exactly like /v1/fetch. Mint a FRESH `identityToken` per
+ * JSON-RPC call: each token is single-use (replay guard), so the host's MCP transport signs one
+ * per request — the broker itself holds no MCP session state.
+ */
+export interface BrokerMcpRequest {
+  handle: ConnectionHandleRef;
+  identityToken: string; // caller-minted, HS256-signed, single-use; broker verifies (see identity.ts)
+  path: string; // the provider's MCP endpoint path, appended to the host; egress-allowlisted
+  host?: string; // optional pick among a multi-host provider; defaults to egressAllow[0]
+  headers?: Record<string, string>; // MCP plumbing allowlist only; Authorization is dropped (broker injects)
+  body: string; // the JSON-RPC message, forwarded verbatim (capped like /v1/fetch write bodies)
 }
 
 export interface BrokerOptions {
@@ -140,6 +160,23 @@ export interface BrokerOptions {
   /** #26 response size cap in bytes; over-cap is rejected 413, never truncated. Default 1 MiB. */
   maxResponseBytes?: number;
   /**
+   * #65 /v1/mcp streamed-response byte ceiling. Unlike /v1/fetch's whole-body `maxResponseBytes`,
+   * an SSE stream has no end to buffer to, so this is counted WHILE relaying and the stream is
+   * TERMINATED when exceeded (upstream fetch aborted, client socket destroyed — never a clean end,
+   * so a truncation can't masquerade as a complete response). If the provider also sets
+   * `egressResponse.maxBytes` (#110), the stricter of the two effectively applies — but the injector
+   * enforces the provider cap by buffering up to it before the relay starts, so leave it unset on
+   * streaming (SSE) providers and rely on this ceiling. Default 8 MiB. Must be a finite number > 0
+   * (validated at createBroker — a NaN/Infinity cap would silently fail open).
+   */
+  maxStreamBytes?: number;
+  /**
+   * #65 /v1/mcp stream duration ceiling: a timer aborts the upstream fetch (and thereby the relay)
+   * when one request's response runs longer than this. Default 5 minutes. Must be a finite
+   * number > 0 (validated at createBroker).
+   */
+  maxStreamMs?: number;
+  /**
    * Optional coarse network gate (a shared `Authorization: Bearer <token>` on /v1/*). This is a
    * perimeter check ONLY, NOT identity — identity comes from the signed token. Documented per #22.
    */
@@ -160,6 +197,23 @@ const DEFAULT_MAX_BYTES = 1024 * 1024;
 const READ_REQUEST_CAP = 64 * 1024; // read envelopes are tiny; reject anything larger.
 const WRITE_BODY_CAP = 64 * 1024;
 const WRITE_REQUEST_CAP = WRITE_BODY_CAP + READ_REQUEST_CAP;
+// #65 /v1/mcp stream ceilings (see BrokerOptions.maxStreamBytes / maxStreamMs).
+const DEFAULT_MAX_STREAM_BYTES = 8 * 1024 * 1024;
+const DEFAULT_MAX_STREAM_MS = 5 * 60_000;
+// #65 default RESPONSE media types for /v1/mcp when `provider.mcp.allowContentTypes` is unset —
+// the two MCP Streamable-HTTP transport types. Anything else is withheld unread (see handleMcp).
+const DEFAULT_MCP_ALLOWED_CT = ['application/json', 'text/event-stream'];
+// The tiny per-route REQUEST header allowlists — everything else (Authorization above all) is
+// stripped; the broker injects the credential itself. /v1/mcp adds the two Mcp-* session-plumbing
+// headers (opaque and POTENTIALLY SENSITIVE per MCP security guidance: relayed verbatim, never
+// stored or logged, never accepted as authentication) and keeps Accept + Content-Type because MCP
+// Streamable HTTP requires `Accept: application/json, text/event-stream`.
+const FETCH_FORWARD_HEADERS = ['accept', 'accept-language', 'if-none-match', 'content-type'];
+const MCP_FORWARD_HEADERS = ['accept', 'content-type', 'mcp-session-id', 'mcp-protocol-version'];
+// RESPONSE headers /v1/mcp relays back (content-type so SSE parses; the Mcp-* plumbing so the
+// session id round-trips). Everything else is dropped; set-cookie was already stripped by the
+// injector's guardResponse before the broker ever sees the response.
+const MCP_RETURN_HEADERS = ['content-type', 'mcp-session-id', 'mcp-protocol-version'];
 
 class HttpError extends Error {
   constructor(
@@ -260,6 +314,103 @@ function traceHeaders(req: http.IncomingMessage): Record<string, string> {
   return out;
 }
 
+/** Build the outbound provider URL from the request envelope: default host = egressAllow[0]; the
+ *  injector still enforces the egress allowlist on whatever comes out. Caller input -> 4xx, not 500.
+ *  Shared by /v1/fetch and /v1/mcp (STR-3). */
+function buildTargetUrl(provider: Provider, body: { host?: string; path?: string; query?: Record<string, string> }): URL {
+  const host = body.host ?? provider.egressAllow[0];
+  let url: URL;
+  try {
+    url = new URL(`https://${host}${body.path ?? '/'}`);
+  } catch {
+    throw new HttpError(400, { error: 'invalid host or path' });
+  }
+  for (const [k, v] of Object.entries(body.query ?? {})) url.searchParams.set(k, v);
+  return url;
+}
+
+/** Forward only an allowlisted set of caller headers (case-insensitive match, original casing kept);
+ *  never the caller's Authorization — the broker injects the credential itself. */
+function pickHeaders(headers: Record<string, string> | undefined, allow: string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers ?? {})) {
+    if (allow.includes(k.toLowerCase())) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * Map a ConnectionHandle.fetch throw to its HTTP error — ONE mapping shared by /v1/fetch and
+ * /v1/mcp (STR-3), so the two egress doors can't drift. Typed classes, not a message regex. The
+ * matching no-secret event + audit row already fired inside the injector before each throw, so
+ * mapping here swallows nothing:
+ *  - EgressBlockedError → 403 (allowlist/policy gate refused the target BEFORE any secret was read)
+ *  - NoConnectionError → 409 (no stored credential for this owner+provider)
+ *  - ResponseBlockedError → 413 over-cap / 502 disallowed type (provider.egressResponse withheld
+ *    the response); the static message never carries the offending header value or body
+ *  - RateLimitedError → 429 + Retry-After (whole seconds, rounded up; retryAfterMs rides the
+ *    payload for callers that want ms precision)
+ *  - anything else → 502 upstream fetch failed
+ */
+function mapUpstreamError(e: unknown): never {
+  if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
+  if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
+  if (e instanceof ResponseBlockedError) {
+    throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked' });
+  }
+  if (e instanceof RateLimitedError) {
+    throw new HttpError(429, { error: 'rate limited', retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
+  }
+  throw new HttpError(502, { error: 'upstream fetch failed' });
+}
+
+/**
+ * #65 Relay an upstream MCP response to the caller AS-IS: upstream status, the MCP plumbing
+ * headers (MCP_RETURN_HEADERS), and the body STREAMED through — never buffered — so
+ * text/event-stream works. Every gate (identity, replay, policy, egress, write opt-ins) already ran
+ * before the first byte flows; the only enforcement left here is the byte ceiling: a counting
+ * Transform errors the pipeline past `capBytes`, which aborts upstream and DESTROYS the client
+ * socket — headers are long flushed, so a truncated stream must look like a transport failure,
+ * never a clean end. The maxStreamMs timer and a client disconnect surface here the same way: the
+ * shared AbortController rejects the read and the catch tears the stream down.
+ */
+async function relayMcpResponse(upstream: Response, res: http.ServerResponse, abort: AbortController, capBytes: number): Promise<void> {
+  const headers: Record<string, string> = {};
+  for (const h of MCP_RETURN_HEADERS) {
+    const v = upstream.headers.get(h);
+    if (v != null) headers[h] = v;
+  }
+  let total = 0;
+  const cap = new Transform({
+    transform(chunk: Buffer, _enc, cb) {
+      total += chunk.length;
+      // Over-cap: error the pipeline WITHOUT forwarding the overflowing chunk (the caller never
+      // receives a byte past the ceiling). Static message; it reaches no one.
+      if (total > capBytes) cb(new Error('stream ceiling exceeded'));
+      else cb(null, chunk);
+    },
+  });
+  try {
+    // writeHead sits INSIDE the try: a client that vanished between the upstream fetch resolving
+    // and headers flushing (or an upstream header value writeHead refuses) belongs to THIS
+    // teardown path — rethrowing to the outer catch would attempt a second writeHead.
+    res.writeHead(upstream.status, headers);
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+    // The abort signal is wired into the RELAY itself (not just the upstream fetch), so the
+    // maxStreamMs timer / client disconnect terminate the pipe even if the upstream body ignores
+    // the aborted fetch and keeps a read pending.
+    await pipeline(Readable.fromWeb(upstream.body as unknown as WebReadableStream), cap, res, { signal: abort.signal });
+  } catch {
+    // Byte ceiling, maxStreamMs abort, upstream failure, or the client hanging up — in every case
+    // the honest signal is a torn-down stream: stop the upstream read too, then drop the socket.
+    abort.abort();
+    res.destroy();
+  }
+}
+
 function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
   const acting: SlackIdentity = { enterpriseId: c.enterpriseId ?? null, teamId: c.teamId, userId: c.userId };
   // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
@@ -274,9 +425,20 @@ export function createBroker(opts: BrokerOptions): http.Server {
   if (opts.authorize && opts.brokerToken) {
     throw new Error('createBroker: set either authorize or brokerToken, not both (authorize replaces the bearer gate)');
   }
+  // #65 a NaN/Infinity/<=0 stream ceiling silently disables the cap (NaN comparisons are all
+  // false) — fail open. Reject at construction, mirroring the #110 egressResponse.maxBytes
+  // define-time check: must be a finite number > 0.
+  if (opts.maxStreamBytes !== undefined && !(Number.isFinite(opts.maxStreamBytes) && opts.maxStreamBytes > 0)) {
+    throw new Error('createBroker: invalid maxStreamBytes: must be a finite number > 0.');
+  }
+  if (opts.maxStreamMs !== undefined && !(Number.isFinite(opts.maxStreamMs) && opts.maxStreamMs > 0)) {
+    throw new Error('createBroker: invalid maxStreamMs: must be a finite number > 0.');
+  }
   const registry = new ProviderRegistry(opts.providers);
   const allowedCt = (opts.allowedContentTypes ?? DEFAULT_ALLOWED_CT).map((c) => c.toLowerCase());
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
+  const maxStreamBytes = opts.maxStreamBytes ?? DEFAULT_MAX_STREAM_BYTES; // #65 /v1/mcp ceilings
+  const maxStreamMs = opts.maxStreamMs ?? DEFAULT_MAX_STREAM_MS;
   // #100 default replay store: a jti is single-use CLUSTER-WIDE when it's backed by the shared db
   // (DbReplayStore), which every db-configured broker now gets by default — a scaled fleet on one
   // database no longer replays a jti once per pod. An explicit opts.replayStore always wins (including
@@ -446,7 +608,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
     return { owner: r.owner, acting: r.acting };
   }
 
-  async function resolveTarget(body: BrokerFetchRequest): Promise<{ handle: ConnectionHandle; provider: Provider }> {
+  // The ONE shared gate pipeline for the credential-use routes (/v1/fetch and /v1/mcp — STR-3):
+  // identity verify + replay, provider existence, service refusal, policy + channel tools, owner
+  // resolution. It needs only the envelope fields both request shapes share.
+  async function resolveTarget(body: Pick<BrokerFetchRequest, 'handle' | 'identityToken'>): Promise<{ handle: ConnectionHandle; provider: Provider; acting: SlackIdentity }> {
     const ref = body.handle;
     if (!ref || (ref.owner !== 'user' && ref.owner !== 'channel') || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
@@ -472,7 +637,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
     // The 12th is the createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit).
     const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits);
-    return { handle, provider };
+    return { handle, provider, acting };
   }
 
   async function handleFetch(body: BrokerFetchRequest, trace: Record<string, string> = {}): Promise<{ status: number; payload: Record<string, unknown> }> {
@@ -486,50 +651,20 @@ export function createBroker(opts: BrokerOptions): http.Server {
       throw new HttpError(400, { error: 'GET and HEAD requests cannot carry a body' });
     }
     const { handle, provider } = await resolveTarget(body);
-
-    const host = body.host ?? provider.egressAllow[0];
-    let url: URL;
-    try {
-      url = new URL(`https://${host}${body.path ?? '/'}`); // caller input -> 4xx, not a 500
-    } catch {
-      throw new HttpError(400, { error: 'invalid host or path' });
-    }
-    for (const [k, v] of Object.entries(body.query ?? {})) url.searchParams.set(k, v);
+    const url = buildTargetUrl(provider, body);
 
     // Forward only a tiny safe header allowlist; never the caller's Authorization (broker injects).
-    const headers: Record<string, string> = {};
-    for (const [k, v] of Object.entries(body.headers ?? {})) {
-      if (['accept', 'accept-language', 'if-none-match', 'content-type'].includes(k.toLowerCase())) headers[k] = v;
-    }
-    // W3C trace context read off the INCOMING request (not the body), forwarded verbatim onto the
-    // outbound provider fetch so a host can stitch the broker hop into the agent's trace. Non-secret
-    // (traceid/spanid/flags only); no-op when the caller sends no traceparent; no vendor dep.
+    // W3C trace context is read off the INCOMING request (not the body) and forwarded verbatim onto
+    // the outbound provider fetch so a host can stitch the broker hop into the agent's trace.
+    // Non-secret (traceid/spanid/flags only); no-op when the caller sends no traceparent.
     // ponytail: forward as-is rather than minting a child span — span management is the host's job.
-    Object.assign(headers, trace);
+    const headers = { ...pickHeaders(body.headers, FETCH_FORWARD_HEADERS), ...trace };
 
     let res: Response;
     try {
       res = await handle.fetch(url.toString(), { method, headers, body: outboundBody });
     } catch (e) {
-      // Typed classes, not a message regex (the stringly-typed contract is gone). The upstream-failure
-      // egress_error signal (metric + audit) already fired inside the injector before the throw reached
-      // here, so mapping to 502 doesn't swallow it.
-      if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
-      if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
-      // Provider-level response constraint (provider.egressResponse): the upstream responded, the
-      // injector withheld it. Same statuses as the broker's own #26 gates below: 413 over-cap /
-      // 502 disallowed type. The response_denied event + denied audit row already fired inside the
-      // injector; the static message never carries the offending header value or body.
-      if (e instanceof ResponseBlockedError) {
-        throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked' });
-      }
-      // Per-(owner, provider) throttle (provider.rateLimit): 429 + Retry-After (whole seconds,
-      // rounded up). retryAfterMs also rides the payload for callers that want ms precision. The
-      // rate_limited event + audit row already fired inside the injector before the throw.
-      if (e instanceof RateLimitedError) {
-        throw new HttpError(429, { error: 'rate limited', retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
-      }
-      throw new HttpError(502, { error: 'upstream fetch failed' });
+      mapUpstreamError(e);
     }
 
     const contentType = res.headers.get('content-type') ?? '';
@@ -546,6 +681,94 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // #26: size cap -> 413, never a truncated partial body.
     const text = await readCapped(res, maxBytes);
     return { status: 200, payload: { status: res.status, contentType, body: text } };
+  }
+
+  /**
+   * #65 `POST /v1/mcp` — MCP-aware egress proxy for providers whose tool surface is an MCP server
+   * over Streamable HTTP (which is just HTTP with a bearer). It runs the SAME pipeline as /v1/fetch
+   * — perimeter, identity from the signed token (never the body), replay guard, policy + channel
+   * tools, owner resolution (all via resolveTarget), then the injector's egress host/https/port/
+   * method gates BEFORE the credential is read — and injects the credential inside the broker; the
+   * caller never sees it. What /v1/fetch can't do, this route adds:
+   *  - the response passes through AS-IS and STREAMED (text/event-stream included, never buffered),
+   *    so listTools/callTool streaming works;
+   *  - the MCP plumbing headers (Mcp-Session-Id, MCP-Protocol-Version) pass through in BOTH
+   *    directions. Session ids are OPAQUE AND POTENTIALLY SENSITIVE (MCP security guidance treats
+   *    them as hijackable): the broker relays them verbatim and never stores, logs, or audits
+   *    them — and never accepts one as authentication; every request still needs a fresh signed
+   *    identityToken and passes every gate.
+   * The broker stays STATELESS: no MCP session table, no lifecycle handling — initialize/
+   * capabilities/session management remain the host's MCP client's job. The optional GET listening
+   * stream and DELETE session termination of the MCP spec are answered 405 + Allow: POST (see the
+   * route), never proxied.
+   *
+   * The route is a DECLARATIVE per-provider opt-in (`provider.mcp`, defineProvider-validated):
+   * the raw streamed passthrough skips the broker's /v1/fetch response envelope gates
+   * (allowedContentTypes / maxResponseBytes), so a POST-enabled /v1/fetch provider must NOT be
+   * reachable here by default. `mcp.paths` locks the endpoint (same matcher + fail-closed
+   * encoded-separator rule as egressPaths), and the response must match `mcp.allowContentTypes`
+   * (default application/json + text/event-stream) or it is withheld unread — which is what stops
+   * an allowlisted-but-hostile upstream reflecting the injected Authorization header into a
+   * text/plain error body.
+   *
+   * MCP callTool can mutate, so the whole route also sits behind the same two write opt-ins as a
+   * /v1/fetch POST: broker `allowWrites` AND the provider's `egressMethods` including POST. An open
+   * stream can't dodge the /v1/fetch size cap either: maxStreamBytes/maxStreamMs terminate it.
+   */
+  async function handleMcp(body: BrokerMcpRequest, trace: Record<string, string>, res: http.ServerResponse): Promise<void> {
+    // Fail-closed write gate BEFORE identity/vault/upstream, mirroring handleFetch's 405.
+    if (!opts.allowWrites) throw new HttpError(405, { error: 'writes are disabled; /v1/mcp requires allowWrites' });
+    const outboundBody = requestBody(body.body);
+    if (outboundBody === undefined) throw new HttpError(400, { error: 'a JSON-RPC request body is required' });
+    const { handle, provider, acting } = await resolveTarget(body);
+    const url = buildTargetUrl(provider, body);
+    // #65 the declarative opt-in gate, denied in the egress-denial shape (STR-4: same no-secret
+    // event + the same `denied` meta keys as the injector's denyEgress) BEFORE the vault is read
+    // or anything goes upstream. Runs after resolveTarget so an unauthenticated caller can't probe
+    // which providers are MCP-enabled, and so the denial is attributed to the verified actor.
+    const mcp = provider.mcp;
+    if (!mcp) {
+      emit({ type: 'egress_denied', provider: provider.id, host: url.hostname, reason: 'mcp' });
+      await opts.audit.record('denied', acting, provider.id, { host: url.hostname, reason: 'mcp-not-enabled' });
+      throw new HttpError(403, { error: 'provider is not enabled for /v1/mcp' });
+    }
+    // The declared MCP endpoint lock: the SAME matching semantics as egressPaths (shared matcher,
+    // shared fail-closed encoded-separator rule — a path lock is a security boundary).
+    if (ENCODED_PATH_SEPARATOR.test(url.pathname) || !mcp.paths.some((p) => pathAllowed(url.pathname, p))) {
+      emit({ type: 'egress_denied', provider: provider.id, host: url.hostname, reason: 'path' });
+      await opts.audit.record('denied', acting, provider.id, { host: url.hostname, reason: 'path' });
+      throw new HttpError(403, { error: 'path is not in the provider mcp.paths allowlist' });
+    }
+    const headers = { ...pickHeaders(body.headers, MCP_FORWARD_HEADERS), ...trace };
+    // ONE AbortController covers the upstream fetch AND the relay: the maxStreamMs timer fires it,
+    // a client disconnect fires it, and a byte-ceiling breach fires it — the upstream socket never
+    // outlives the request it was serving.
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), maxStreamMs);
+    res.once('close', () => abort.abort());
+    try {
+      let upstream: Response;
+      try {
+        // The injector enforces every egress gate (and provider.egressResponse, incl. the always-on
+        // set-cookie strip) before/around this call, and writes the same inject/denied audit rows +
+        // events as a /v1/fetch — the audit trail cannot tell the two doors apart (STR-4).
+        upstream = await handle.fetch(url.toString(), { method: 'POST', headers, body: outboundBody, signal: abort.signal });
+      } catch (e) {
+        mapUpstreamError(e); // denials map to the same JSON errors as /v1/fetch — no stream started yet
+      }
+      // #65 response policy: only the DECLARED transport media types stream through, compared on
+      // the bare type (charset stripped, case-folded) BEFORE any byte is relayed — so a hostile
+      // upstream reflecting request headers into e.g. a text/plain error body is withheld unread.
+      // Bodyless responses (202 on notifications, 204) are exempt, same rule as /v1/fetch's gate.
+      const ct = normalizeContentType(upstream.headers.get('content-type'));
+      if (upstream.body !== null && !responseHasNoBody(upstream) && !(mcp.allowContentTypes ?? DEFAULT_MCP_ALLOWED_CT).some((c) => normalizeContentType(c) === ct)) {
+        upstream.body.cancel().catch(() => undefined);
+        throw new HttpError(502, { error: `disallowed content-type: ${ct || 'unknown'}` });
+      }
+      await relayMcpResponse(upstream, res, abort, maxStreamBytes);
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function handleResolve(body: { handle: ConnectionHandleRef; identityToken: string }): Promise<Record<string, unknown>> {
@@ -972,6 +1195,18 @@ export function createBroker(opts: BrokerOptions): http.Server {
           const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req));
           return send(r.status, r.payload);
         }
+        if (req.method === 'POST' && url === '/v1/mcp') {
+          await perimeter(req);
+          // Streams the upstream response straight onto `res` (SSE passthrough) — no send() envelope.
+          return await handleMcp(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req), res);
+        }
+        if (url === '/v1/mcp') {
+          // #65 MCP spec: a server that doesn't offer the optional GET listening stream or
+          // client-initiated DELETE termination answers 405 — exactly this stateless proxy's
+          // posture. NOT 404: a 404 on a session-bearing GET reads as "session ended" and can loop
+          // clients into re-initialization. Static; no gates run, nothing goes upstream.
+          return send(405, { error: 'only POST is supported on /v1/mcp' }, { allow: 'POST' });
+        }
         if (req.method === 'POST' && url === '/v1/resolve') {
           await perimeter(req);
           return send(200, await handleResolve(await readJson(req)));
@@ -1022,6 +1257,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
         }
         send(404, { error: 'not found' });
       } catch (e) {
+        // A streaming route (/v1/mcp) can only fail after its headers are flushed if the relay's own
+        // catch somehow rethrew; a JSON error can no longer be written, so tear the stream down
+        // instead of crashing on a second writeHead.
+        if (res.headersSent) return res.destroy();
         if (e instanceof HttpError) return send(e.status, e.payload, e.headers);
         // Log the error CLASS NAME only — never the message/stack/payload. An extension point (e.g. a
         // custom provider.inject) can throw AFTER touching the secret, so the message could carry the
