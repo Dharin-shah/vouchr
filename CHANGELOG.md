@@ -41,6 +41,28 @@ All notable changes to this project are documented here. This project adheres to
   additive); new exports `ApprovalRequiredError` + `Approvals` (root and `./headless`). Providers
   without the knob are byte-for-byte unchanged.
 
+- **Dry-run mode** (#116). `createVouchr({ dryRun: true })` / `BrokerOptions.dryRun`
+  (`VOUCHR_DRY_RUN=1` for the packaged `vouchr-broker`): the full consent → policy → channel-tools
+  → egress → vault → audit machine runs for real, under the invariant that no real network call
+  leaves the process on any edge. The OAuth token exchange yields a synthetic credential; the
+  Connect button's authorize URL becomes a local, instantly-succeeding redirect into the real
+  callback; the outbound provider fetch — after every request gate has passed and the vaulted
+  credential was read — returns a `200 { dryRun: true, method, url, wouldInjectAs }` echo that never
+  contains the credential (the provider's inject hook runs exactly once, with a redacted
+  placeholder); and token refresh / upstream revoke are skipped for dry-run credentials.
+  Request-side denials (egress, policy, mode) throw exactly the production errors. Provenance is a
+  new system-only `dry_run` column on the connection row (schema v4, additive migration) — never
+  the user/provider-controlled account label — so a real account legitimately named "dry-run" is
+  never mistaken for synthetic and always revokes normally. Safety rails: startup hard-fails against
+  a database holding any non-dry-run credential row ("refusing dryRun against a vault with real
+  credentials"); a real row written after startup is refused per-request and never overwritten (the
+  synthetic write is an atomic conditional); an external KMS envelope is refused at startup (its
+  wrap/unwrap are real network calls); a refused broker reports `/readyz` 503 while `/healthz` stays
+  200; and every audit row written in dry-run carries `meta.dry_run: true`. New
+  `vouchr.dryRun.completeConsent(user, provider)` test helper completes a prompted consent
+  programmatically; `examples/dry-run/` is a fully offline `node:test` suite of a Bolt handler.
+  Zero behavior change when the flag is absent.
+
 - **App Home config dashboard** (#111). The app's Home tab (published on `app_home_opened`, and
   re-published after every mutation) is now a console: everyone sees and disconnects their own
   connections (provider + external account, same confirm + revoke flow as the config modal);

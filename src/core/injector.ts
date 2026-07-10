@@ -4,6 +4,7 @@ import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import { refreshToken, TokenEndpointError } from './tokens';
+import { DryRunVaultError, dryRunEcho } from './dryRun';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
 import { safeEmit } from './safe-emit';
 import type { CredentialHealthHook } from './health';
@@ -209,6 +210,11 @@ export class ConnectionHandle {
     // The Slack thread this request runs in, binding an approval grant to its exact conversation
     // context (with originChannel). Null off-thread / headless-without-thread.
     private thread: string | null = null,
+    // #116 dry-run: no real network call leaves this handle — the outbound call becomes a synthetic
+    // echo (send()), the refresh /token round-trip is skipped (doRefresh), and any credential row
+    // NOT carrying the dry-run marker is refused per-request (fetch). Every gate above the network
+    // — egress, rate limit, vault read, header injection, AND the #113 approval gate — still runs.
+    private dryRun = false,
   ) {}
 
   /** The identity key for this handle's (owner, provider) pair — the single-flight refresh map and
@@ -511,10 +517,21 @@ export class ConnectionHandle {
     const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
     if (!cred) throw new NoConnectionError(`No connection for provider "${this.provider.id}"`);
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
+    // #116 dry-run per-request rail: the startup vault check only sees rows that exist at boot —
+    // a REAL row written afterward (a seeder, a sibling production process on the same database)
+    // must never feed a dry-run request. Keyed off the trusted system-only dry_run column (never the
+    // user/provider-controlled account label), off the row already in hand: zero extra reads.
+    if (this.dryRun && !cred.dryRun) throw new DryRunVaultError();
     const vaulted = cred.source === 'vault';
 
     let token = vaulted ? await this.vaultToken(cred) : await this.resolveRef(cred);
     const send = async (t: string) => {
+      // #116 dry-run: the outbound-fetch edge, stubbed at the exact point the network call would
+      // happen — every gate above (egress, rate limit, vault read) has already run. Returned BEFORE
+      // the production inject so the provider's inject hook runs EXACTLY ONCE (inside dryRunEcho,
+      // with a <redacted> placeholder) and NEVER receives the real/synthetic token: calling it twice
+      // — or with a token — could drift a stateful hook or make a real network call. `t` is unused here.
+      if (this.dryRun) return dryRunEcho(this.provider, input, method);
       // Normalize caller headers (a Headers instance/tuple array would be dropped by a spread).
       const headers = new Headers(init.headers as HeadersInit | undefined);
       if (this.provider.inject) this.provider.inject(headers, t);
@@ -567,6 +584,11 @@ export class ConnectionHandle {
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
     // Audit stream copy (raw actor id, for host-side ingestion). Lossy; the audit table is authoritative.
     this.emitAudit('fetch', url.hostname, res.status, method);
+    // #116 dry-run: skip the RESPONSE gate — there is no real provider response to constrain, and
+    // applying provider.egressResponse to the synthetic echo would false-deny where production
+    // passes (e.g. allowContentTypes without application/json, or maxBytes below the echo size).
+    // Request-side gates all ran above; only the constraint on the synthetic body is meaningless.
+    if (this.dryRun) return res;
     // Structural response constraints (provider.egressResponse) + the unconditional set-cookie
     // strip: enforced HERE, after the outbound call is booked (the call DID happen — its inject
     // audit/event stay truthful) and before the Response is handed back, so both doors (Bolt
@@ -626,6 +648,11 @@ export class ConnectionHandle {
     // for the lock; we detect that by re-reading under the lock and comparing against this value.
     const before = await this.vault.get(this.owner, this.provider.id, onDecrypt);
     if (!before?.refreshToken) { emitKms(); return null; }
+    // #116 dry-run: the refresh edge is a REAL /token network call — never make it. All refresh
+    // triggers funnel through here (near-expiry in vaultToken, retry-on-401), so this one gate
+    // covers e.g. a seeded dry-run row carrying a refreshToken + near expiresAt. The synthetic
+    // token never truly expires; hand back the stored one unchanged, nothing rotates.
+    if (this.dryRun) { emitKms(); return before.accessToken; }
     const lockWait = this.vault.crossProcessRefresh; // only emit the wait metric when a real lock exists
     const t0 = Date.now();
     // Track whether we actually rotated so the audit/emit run AFTER the transaction commits — never
