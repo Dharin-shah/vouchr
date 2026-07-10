@@ -429,7 +429,16 @@ export class ConnectionHandle {
     let res = await send(token);
     // Refresh-on-401 only applies to vaulted OAuth creds; referenced secrets rotate externally.
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshSignalled();
+      let refreshed: string | null;
+      try {
+        refreshed = await this.refreshSignalled();
+      } catch (e) {
+        // #168: a refresh throw abandons the 401 too — drain it, or undici pins the socket to the
+        // unread body until GC. Best-effort: cancelling must never mask the refresh error. (Not a
+        // finally: when the refresh yields nothing the 401 itself is returned, body intact.)
+        res.body?.cancel().catch(() => undefined);
+        throw e;
+      }
       if (refreshed) {
         // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
         res.body?.cancel().catch(() => undefined);
