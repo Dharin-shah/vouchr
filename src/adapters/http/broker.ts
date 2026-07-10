@@ -11,6 +11,8 @@ import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, ENCODED_PATH_SEPARATOR, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
+import { safeEmit } from '../../core/safe-emit';
+import type { CredentialHealthHook } from '../../core/health';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
 import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../../core/authz';
@@ -190,6 +192,18 @@ export interface BrokerOptions {
    * remains the only source of user claims. Keeps deployer-specific auth out of `src/`.
    */
   authorize?: (req: http.IncomingMessage) => void | Promise<void>;
+  /**
+   * #117 credential-health hook: fired on a DEFINITIVELY dead refresh (`refresh_dead` — invalid_grant
+   * or a bare 400/401 from the token endpoint, never a transient blip; see TokenEndpointError for
+   * the exact classification). There is no Slack client here, so
+   * headless deployments wire their own notifier; events carry the owning principal + provider,
+   * never token material. Debounce with the exported `NotificationState`: `claim()` the 24h window
+   * atomically (one winner per (owner, provider, type), cluster-wide on a shared Postgres), send,
+   * `release()` on a failed send; reconnect and delete clear it. Pass the same hook to
+   * `sweepExpired` to also get `expiring_soon`/`expired`. Fire-and-forget; a throwing or
+   * async-rejecting hook never affects a request.
+   */
+  onCredentialHealth?: CredentialHealthHook;
 }
 
 const DEFAULT_ALLOWED_CT = ['application/json'];
@@ -462,10 +476,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // a per-request store would never accumulate budget across requests. Per-process by default.
   const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
 
-  // Broker-local metrics emit. Fire-and-forget: a throwing sink must NEVER affect the request (else a
-  // broken metrics sink would turn an intended 403 deny into a 500). Mirrors the Bolt path's swallow;
-  // the ConnectionHandle pass-through below swallows its own internally.
-  const emit = (ev: VouchrEvent) => { try { opts.onEvent?.(ev); } catch { /* a throwing sink never affects the request */ } };
+  // Broker-local metrics emit. Fire-and-forget: a throwing (or async-rejecting) sink must NEVER
+  // affect the request (else a broken metrics sink would turn an intended 403 deny into a 500).
+  // safeEmit swallows both failure shapes; the ConnectionHandle pass-through does the same.
+  const emit = (ev: VouchrEvent) => safeEmit(opts.onEvent, ev);
 
   // #54 lifecycle: consent + session stores for offboarding (purge pending consent + thread grants so
   // neither can resurrect access after a user is removed). #52 OAuth connect flow (mounted only when
@@ -636,7 +650,8 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // caller lets the inject audit record BOTH for non-repudiation (no-op when they're the same). The
     // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
     // The 12th is the createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit).
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits);
+    // The 13th is the #117 credential-health hook (definitive refresh death → owner identity, no tokens).
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits, opts.onCredentialHealth);
     return { handle, provider, acting };
   }
 

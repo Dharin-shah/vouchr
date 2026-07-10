@@ -259,6 +259,18 @@ local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 
 - **Consent prompts are control flow.** `ConsentRequiredError` / `SessionApprovalRequiredError` mean
   Vouchr already prompted the user — catch them and stop the turn; don't log them as failures.
+- **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
+  bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
+  `invalid_client`) or a connection is within 72h of its idle/max-age TTL ceiling (dimensions
+  longer than 72h only — shorter ones would always be "expiring"), Vouchr DMs the credential owner
+  (the configuring admin for a channel-owned credential): a reconnect button for a dead refresh
+  (it mints a fresh consent link on click, so it can't expire unread), a heads-up for an upcoming
+  expiry. At most one DM per (owner, provider, type) per 24h: the window is claimed atomically in
+  the `notification_state` table before sending (no duplicates across replicas; a process that
+  crashes between claim and send loses that window's DM — the next window retries), and
+  reconnecting resets it. To route these yourself instead, set
+  `createVouchr({ onCredentialHealth })` (or `BrokerOptions.onCredentialHealth` headless) — the
+  exported `CredentialHealthEvent` carries the owning principal and provider, never token material.
 - **Protect storage and keys.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
   database and key still need normal production controls. To rotate the master key without
   orphaning rows, set `VOUCHR_MASTER_KEYS` (first entry encrypts new writes, all entries decrypt)

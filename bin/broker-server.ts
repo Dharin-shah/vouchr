@@ -129,7 +129,8 @@ export async function buildBrokerServer(
   const sessions = new SessionGrants(db);
   const unionOptin = new UnionOptin(db); // #112: swept user creds drop their union opt-ins too
   const sweep = async (): Promise<number> => {
-    const n = await sweepExpired(vault, audit, consent, undefined, unionOptin);
+    // #117: the deployer's onCredentialHealth override (if any) also hears expiring_soon/expired.
+    const n = await sweepExpired(vault, audit, consent, undefined, unionOptin, overrides.onCredentialHealth);
     await sessions.sweepExpired();
     return n;
   };

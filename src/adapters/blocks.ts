@@ -102,6 +102,9 @@ export const CONFIGURE_CALLBACK = 'vouchr_configure';
 export const USER_KEY_CALLBACK = 'vouchr_user_key';
 export const SETUP_KEY_ACTION = 'vouchr_setup_key';
 export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
+/** #117 refresh_dead DM: mints a FRESH consent state on click (a baked-in authorize URL would be
+ *  dead after the 10-min state TTL, and the 24h DM debounce would leave no recovery path). */
+export const RECONNECT_ACTION = 'vouchr_reconnect';
 
 /** The two leak-safe secret-entry fields: an external reference (preferred) OR a raw key. */
 function secretFields(): unknown[] {

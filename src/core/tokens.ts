@@ -13,6 +13,24 @@ export interface TokenResponse {
   expiresAt: number | null;
 }
 
+/**
+ * Typed token-endpoint failure carrying the ONE definitive-vs-transient classification (#117).
+ * `definitive` = the grant itself is dead — HTTP 400/401 (RFC 6749 §5.2: invalid_grant /
+ * invalid_client come back as 400/401) or an explicit `invalid_grant` error body — so retrying is
+ * pointless and only reconnecting fixes it. Everything else (5xx, 429, network throw, timeout) is
+ * transient and must NEVER trigger owner-facing notifications. Message text is identical to the
+ * previous bare Errors (callers string-match it) and never carries token material.
+ */
+export class TokenEndpointError extends Error {
+  constructor(
+    message: string,
+    public definitive: boolean,
+  ) {
+    super(message);
+    this.name = 'TokenEndpointError';
+  }
+}
+
 async function tokenRequest(
   provider: Provider,
   params: Record<string, string>,
@@ -47,11 +65,36 @@ async function tokenRequest(
     signal: AbortSignal.timeout(TOKEN_FETCH_TIMEOUT_MS), // release the lock/pool if the endpoint hangs
   });
   if (!res.ok) {
-    throw new Error(`Token endpoint ${provider.tokenUrl} returned HTTP ${res.status}`);
+    // 400/401 usually means the grant is dead (RFC 6749 §5.2) — but a parseable OAuth error code
+    // that is NOT invalid_grant (e.g. invalid_client: the operator's client secret expired) is
+    // operator-side breakage no amount of user reconnecting can fix, so telling every owner to
+    // reconnect would be pure spam: classify those transient. A bare/unparseable 400/401 stays
+    // definitive. The body is only parsed here, never logged or put in the error (it's untrusted).
+    let definitive = res.status === 400 || res.status === 401;
+    if (definitive) {
+      try {
+        const err = JSON.parse(await res.text())?.error; // text() drains the body
+        if (typeof err === 'string' && err !== 'invalid_grant') definitive = false;
+      } catch {
+        // Unparseable body: keep the status-based classification. If text() itself threw the
+        // stream may be unconsumed — cancel it (harmless no-op when already drained).
+        res.body?.cancel().catch(() => undefined);
+      }
+    } else {
+      // Cancel the discarded body: undici pins the socket to an unread body until GC (#172), so
+      // hourly-sweep refresh retries against a 429/5xx-ing endpoint would accumulate pinned sockets.
+      res.body?.cancel().catch(() => undefined);
+    }
+    throw new TokenEndpointError(`Token endpoint ${provider.tokenUrl} returned HTTP ${res.status}`, definitive);
   }
   const json: any = await res.json();
   if (json.error) {
-    throw new Error('Token endpoint returned an OAuth error');
+    // Some providers return 200 with an error body; only invalid_grant is definitively dead.
+    // Boundary: a provider that reports a dead grant as 200 + a bespoke code (e.g.
+    // bad_refresh_token) never classifies definitive → no owner DM, i.e. the pre-#117 status quo.
+    // Fail-safe on purpose: a missed notification beats a false "reconnect now"; no per-provider
+    // error-code list (the built-ins all use invalid_grant).
+    throw new TokenEndpointError('Token endpoint returned an OAuth error', json.error === 'invalid_grant');
   }
   if (!json.access_token) {
     throw new Error('Token endpoint returned no access_token');
@@ -107,6 +150,9 @@ export async function revokeToken(provider: Provider, token: string): Promise<vo
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(fields).toString(),
   });
+  // Revoke responses are never read (only the status matters): cancel the body on BOTH paths, or
+  // undici pins the socket to it until GC (#172).
+  res.body?.cancel().catch(() => undefined);
   if (!res.ok) {
     throw new Error(`Revoke endpoint ${provider.revokeUrl} returned HTTP ${res.status}`); // never includes the token
   }

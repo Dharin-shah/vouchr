@@ -7,6 +7,31 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Credential health notifications** (#117). When a token refresh fails DEFINITIVELY
+  (`invalid_grant`, or a bare 400/401 from the token endpoint — classified by the new exported
+  `TokenEndpointError`; transient blips never count, and neither do operator-side OAuth errors
+  like `invalid_client` that no user reconnect can fix) the owner gets a DM whose Connect button
+  mints a fresh single-use consent state on click (so the link cannot expire before it's read);
+  the TTL sweep additionally warns owners within 72h of a connection's idle/max-age ceiling
+  (only for TTL dimensions longer than 72h — a shorter TTL would make every live connection
+  permanently "expiring" and nag daily forever) and reports actual deletions. Channel-owned
+  credentials notify the last configuring admin (skipped
+  when unknown — the channel is never spammed). DMs are debounced to one per (owner, provider,
+  type) per 24h via the new persistent `notification_state` table (additive migration; schema
+  version 3): the window is CLAIMED atomically before sending — no duplicates across replicas —
+  and released if the send fails so the next event retries (a process crashing between claim and
+  send loses that window's DM; the next window retries). Reconnect/disconnect clear the state,
+  atomically with the connection write itself. New `createVouchr`/`BrokerOptions` option
+  `onCredentialHealth` replaces the default DMs
+  with your own notifier (headless brokers have no Slack client, so they only get the hook); the
+  same hook passed to `sweepExpired` hears `expiring_soon`/`expired`. New exports:
+  `CredentialHealthEvent`, `CredentialHealthHook`, `NotificationState`,
+  `HEALTH_NOTIFY_DEBOUNCE_MS`, `TokenEndpointError` (also on `./headless`). Events carry the
+  owning principal and provider — never token material. All fire-and-forget hooks
+  (`onCredentialHealth`, `onEvent`, `auditSink`) now accept async functions safely: their
+  `=> void` signatures always admitted async functions, and a rejection is now swallowed exactly
+  like a throw — never an unhandled rejection (which kills modern Node).
+
 - **MCP-aware egress proxy on the headless broker** (#65) — new route `POST /v1/mcp` for providers
   whose tool surface is an MCP server over Streamable HTTP. Same envelope style and the same
   fail-closed pipeline as `/v1/fetch` (signed identity — never the body, single-use `jti` replay

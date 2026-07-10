@@ -83,30 +83,57 @@ export class Vault {
     };
   }
 
+  /**
+   * notification_state rows (#117 health-notification debounce) are satellites of a connection:
+   * purge them whenever the connection is (re)written or deleted — so a RECONNECT resets the
+   * debounce (fresh connection ⇒ fresh state) and a deleted connection can't leak state rows.
+   * Owned HERE, inside the vault, because every entry point (Bolt, modal, broker, CLI, sweep)
+   * routes its connection writes/deletes through these three methods — no per-call-site purges to
+   * drift (STR-3). updateTokens (silent refresh) deliberately does NOT purge: a refresh is not a
+   * reconnect, and the max-age warning must survive it.
+   */
+  private async clearNotifyState(db: Db, owner: Owner, provider: string): Promise<void> {
+    await db.run(
+      `DELETE FROM notification_state WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+      [owner.teamId, owner.kind, owner.id, provider],
+    );
+  }
+
+  /** Connection write/delete + its notification_state purge are ONE logical mutation: run them in
+   *  one transaction so a purge failure can't half-commit (a mutation that "failed" but actually
+   *  landed, or a sweep delete whose expiry audit/hook then never fires). A backend without
+   *  `transaction` (only minimal test stubs) falls back to sequential statements. */
+  private mutation<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
+    return this.db.transaction ? this.db.transaction(fn) : fn(this.db);
+  }
+
   /** Store a vaulted credential (Vouchr encrypts and owns refresh). */
   async upsert(owner: Owner, provider: string, t: StoredToken): Promise<void> {
     const now = Date.now();
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
-    await this.db.run(
-      `INSERT INTO connection
-         (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
-          access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-          external_account, created_at, updated_at, last_used_at)
-       VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-         source='vault', enterprise_id=excluded.enterprise_id,
-         access_token_enc=excluded.access_token_enc,
-         refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
-         scopes=excluded.scopes, expires_at=excluded.expires_at,
-         external_account=excluded.external_account, updated_at=excluded.updated_at,
-         created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
-      [
-        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
-        accessEnc, refreshEnc,
-        t.scopes, t.expiresAt, t.externalAccount, now, now, now,
-      ],
-    );
+    await this.mutation(async (tx) => {
+      await tx.run(
+        `INSERT INTO connection
+           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+            access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
+            external_account, created_at, updated_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
+           source='vault', enterprise_id=excluded.enterprise_id,
+           access_token_enc=excluded.access_token_enc,
+           refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
+           scopes=excluded.scopes, expires_at=excluded.expires_at,
+           external_account=excluded.external_account, updated_at=excluded.updated_at,
+           created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
+        [
+          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
+          accessEnc, refreshEnc,
+          t.scopes, t.expiresAt, t.externalAccount, now, now, now,
+        ],
+      );
+      await this.clearNotifyState(tx, owner, provider); // reconnect ⇒ fresh notification state (#117)
+    });
   }
 
   /**
@@ -120,23 +147,26 @@ export class Vault {
     r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
   ): Promise<void> {
     const now = Date.now();
-    await this.db.run(
-      `INSERT INTO connection
-         (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
-          access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-          external_account, created_at, updated_at, last_used_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)
-       ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-         source=excluded.source, enterprise_id=excluded.enterprise_id,
-         access_token_enc=NULL, refresh_token_enc=NULL,
-         secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
-         external_account=excluded.external_account, updated_at=excluded.updated_at,
-         created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
-      [
-        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider, r.source,
-        r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
-      ],
-    );
+    await this.mutation(async (tx) => {
+      await tx.run(
+        `INSERT INTO connection
+           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+            access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
+            external_account, created_at, updated_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)
+         ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
+           source=excluded.source, enterprise_id=excluded.enterprise_id,
+           access_token_enc=NULL, refresh_token_enc=NULL,
+           secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
+           external_account=excluded.external_account, updated_at=excluded.updated_at,
+           created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
+        [
+          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider, r.source,
+          r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
+        ],
+      );
+      await this.clearNotifyState(tx, owner, provider); // reconnect ⇒ fresh notification state (#117)
+    });
   }
 
   /**
@@ -242,10 +272,67 @@ export class Vault {
     }));
   }
 
+  /**
+   * Connections whose TTL ceiling falls within the next `withinMs` (#117 proactive expiry
+   * warnings). The SQL predicate MUST mirror isExpired() — idle uses last_used_at (falling back to
+   * created_at), max-age uses created_at, an empty policy expires nothing — just evaluated at
+   * `now + withinMs` instead of `now`. Rows ALREADY past their ceiling are excluded (the sweep
+   * deletes those instead of warning). `expiresAt` = the effective ceiling (the earliest applicable
+   * expiry), so callers can say when.
+   *
+   * Window guard — SELECTION only: a TTL dimension ≤ `withinMs` never SELECTS rows. With, say,
+   * idleMs = 48h against a 72h window, every live connection — used one second ago included —
+   * sits permanently "inside the window", so selecting on that dimension is a daily reconnect nag
+   * forever, not an early warning. The REPORTED `expiresAt` is different: it is the connection's
+   * real earliest death, min over ALL configured dimensions, guard or no guard — a row selected
+   * for its approaching max-age may still die of a short idle TTL first, and "expires in ~Nh"
+   * must not overstate its lifetime.
+   */
+  async listExpiringSoon(withinMs: number): Promise<{ owner: Owner; provider: string; expiresAt: number }[]> {
+    const now = Date.now();
+    const horizon = now + withinMs;
+    const warnIdle = this.ttl.idleMs != null && this.ttl.idleMs > withinMs;
+    const warnMaxAge = this.ttl.maxAgeMs != null && this.ttl.maxAgeMs > withinMs;
+    const clauses: string[] = [];
+    const params: any[] = [];
+    if (warnIdle) {
+      clauses.push('COALESCE(last_used_at, created_at) < ?');
+      params.push(horizon - this.ttl.idleMs!);
+    }
+    if (warnMaxAge) {
+      clauses.push('created_at < ?');
+      params.push(horizon - this.ttl.maxAgeMs!);
+    }
+    if (!clauses.length) return []; // no warnable dimension → nothing to warn about
+    const rows = (await this.db.all(
+      `SELECT enterprise_id, team_id, owner_kind, owner_id, provider, created_at, last_used_at
+         FROM connection WHERE ${clauses.join(' OR ')}`,
+      params,
+    )) as any[];
+    return rows.flatMap((r) => {
+      const createdAt = Number(r.created_at);
+      const lastUsedAt = r.last_used_at == null ? createdAt : Number(r.last_used_at);
+      // Real earliest ceiling: ALL configured dimensions, not just the selecting ones (see above).
+      const ceilings: number[] = [];
+      if (this.ttl.idleMs != null) ceilings.push(lastUsedAt + this.ttl.idleMs);
+      if (this.ttl.maxAgeMs != null) ceilings.push(createdAt + this.ttl.maxAgeMs);
+      const expiresAt = Math.min(...ceilings);
+      if (expiresAt <= now) return []; // already expired: swept, never warned
+      return [{
+        owner: { teamId: r.team_id, kind: r.owner_kind, id: r.owner_id, enterpriseId: r.enterprise_id ?? null } as Owner,
+        provider: r.provider,
+        expiresAt,
+      }];
+    });
+  }
+
   async delete(owner: Owner, provider: string): Promise<void> {
-    await this.db.run(
-      `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-      [owner.teamId, owner.kind, owner.id, provider],
-    );
+    await this.mutation(async (tx) => {
+      await tx.run(
+        `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+        [owner.teamId, owner.kind, owner.id, provider],
+      );
+      await this.clearNotifyState(tx, owner, provider); // state rows must not outlive the connection (#117)
+    });
   }
 }
