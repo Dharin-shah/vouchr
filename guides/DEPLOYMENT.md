@@ -389,6 +389,51 @@ Vouchr ships two ways; pick by how your platform builds:
   without a build. Best for non-GYG/self-host quick starts; the perimeter must then be enforced at
   the mesh (there's no code hook in a prebuilt image).
 
+### Verifying the GHCR image (cosign, SBOM, provenance)
+
+Every released image is keyless-signed with [cosign](https://docs.sigstore.dev/) by the release
+workflow, which also attaches a CycloneDX SBOM attestation and BuildKit SLSA provenance
+(`mode=max`). The release job runs the exact verification below against the pushed digest before it
+goes green, so an image that doesn't verify never ships. Use cosign **v3+**: the workflow signs with
+cosign v3, whose bundle format cosign v2 does not understand — a v2 client fails with a misleading
+`no matching signatures` even though the image is signed. Check the image really came from this
+repo's release CI (not merely pushed by someone with registry access):
+
+```bash
+IMAGE=ghcr.io/dharin-shah/vouchr-broker:<tag>
+
+# Signature — the certificate identity is this repo's release workflow on a v* tag:
+cosign verify "$IMAGE" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/Dharin-shah/vouchr/\.github/workflows/release\.yml@refs/tags/v'
+
+# SBOM attestation (CycloneDX) — same identity; the trailing jq prints the SBOM itself:
+cosign verify-attestation "$IMAGE" --type cyclonedx \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/Dharin-shah/vouchr/\.github/workflows/release\.yml@refs/tags/v' \
+  | jq -r '.payload' | head -n1 | base64 -d | jq '.predicate'
+```
+
+BuildKit provenance travels inside the image index itself (not as a cosign attestation); inspect it
+with `docker buildx imagetools inspect "$IMAGE" --format '{{ json .Provenance }}'`.
+
+Then deploy the **digest** you verified, never the mutable tag — a tag can be repointed after you
+verified it, a digest cannot. Resolve the tag to its (index) digest with
+`docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}'` and pin `name@digest` in
+your manifests:
+
+```yaml
+# docker-compose.yml
+services:
+  vouchr-broker:
+    image: ghcr.io/dharin-shah/vouchr-broker@sha256:<digest>
+
+# Kubernetes (the image: field in deploy/k8s.yaml)
+containers:
+  - name: vouchr-broker
+    image: ghcr.io/dharin-shah/vouchr-broker@sha256:<digest>
+```
+
 ### Container & Kubernetes
 
 A [`Dockerfile`](../Dockerfile) (ARG base images so you can pin an internal mirror, `npm ci` build,

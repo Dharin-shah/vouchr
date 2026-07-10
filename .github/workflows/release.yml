@@ -15,7 +15,7 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write   # npm provenance
+  id-token: write   # npm provenance + cosign keyless image signing (Fulcio)
   packages: write   # GHCR push
 
 jobs:
@@ -101,12 +101,49 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=sha
-      - uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+      # provenance mode=max embeds full BuildKit SLSA provenance. Enabling attestations makes the
+      # pushed artifact an OCI image index (even single-platform), so outputs.digest below is the
+      # top-level INDEX digest — if this image ever goes multi-platform, keep signing that index
+      # digest, never the per-arch manifest digests.
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+      # Everything below works on the immutable name@digest ref, never a mutable tag. The name comes
+      # from the first meta tag: registry refs must be lowercase, github.repository_owner isn't, and
+      # metadata-action already owns the lowercased image name.
+      - name: Resolve pushed image ref (name@digest)
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          echo "IMAGE_REF=$(head -n1 <<<"$TAGS" | cut -d: -f1)@$DIGEST" >> "$GITHUB_ENV"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          image: ${{ env.IMAGE_REF }}
+          format: cyclonedx-json
+          output-file: sbom-image.cdx.json
+          # the SBOM ships only as a registry attestation — not a workflow artifact or release asset
+          upload-artifact: false
+          upload-release-assets: false
+      # Keyless signing: Fulcio binds the signature to this job's OIDC identity — this repo's
+      # release.yml running on a v* tag ref (needs the workflow-level id-token: write). Then gate the
+      # release on the exact verification guides/DEPLOYMENT.md tells deployers to run: if a deployer's
+      # `cosign verify` wouldn't succeed, the release fails here instead of shipping unverifiable.
+      - name: cosign sign + attest SBOM, then verify (release gate)
+        run: |
+          cosign sign --yes "$IMAGE_REF"
+          cosign attest --yes --type cyclonedx --predicate sbom-image.cdx.json "$IMAGE_REF"
+          CERT_ID="^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v"
+          cosign verify --certificate-identity-regexp "$CERT_ID" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
+          cosign verify-attestation --type cyclonedx --certificate-identity-regexp "$CERT_ID" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
 
   # After the artifacts publish, cut the GitHub Release from the CHANGELOG so the notes match exactly
   # what shipped, and attach the SBOM. Fails loudly if the tag has no CHANGELOG section (forces the
