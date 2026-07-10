@@ -7,6 +7,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Signed GHCR images** (#131) — the release workflow now keyless-signs every published
+  `vouchr-broker` image with cosign (Sigstore), attaches a CycloneDX SBOM attestation, and embeds
+  BuildKit SLSA provenance (`mode=max`). The job then verifies the signature and the attestation
+  against the pushed digest in-job, so a release cannot go green with an unverifiable image.
+  Copy-paste verification + digest-pinning recipe in `guides/DEPLOYMENT.md`
+  § *Verifying the GHCR image (cosign, SBOM, provenance)*.
+
 - **Structural response constraints at the injection boundary** (#110) — new declarative provider
   knob `egressResponse: { maxBytes?, allowContentTypes?, stripHeaders? }`, enforced in the injector
   after the fetch returns and before the Response reaches the caller, so the Bolt handle and the
