@@ -183,6 +183,69 @@ test('observability: refreshed carries a refresh-latency ms on a 401-triggered r
   assert.ok(Number.isFinite(r.ms) && r.ms >= 0, `bad refresh latency: ${r.ms}`);
 });
 
+test('observability: a throwing refresh cancels the discarded 401 body and still propagates the error (#168)', async () => {
+  const events: VouchrEvent[] = [];
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const acme = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
+    clientId: 'c', clientSecret: 's',
+  });
+  await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
+  const handle = new ConnectionHandle(acme, O1, ID, vault, new Audit(db), {}, new Map(), (e) => events.push(e));
+  let cancelled = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: any) => {
+    if (String(url).includes('/token')) throw new Error('token endpoint down');
+    // The abandoned 401 whose unread body would pin the socket until GC if not drained.
+    const body = new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(64)); }, cancel() { cancelled = true; } });
+    return new Response(body, { status: 401 });
+  }) as any;
+  try {
+    await assert.rejects(() => handle.fetch('https://api.acme.example/data'), /token endpoint down/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.ok(cancelled, 'discarded 401 body must be cancelled when the refresh throws');
+  // The no-secret failure signal still fires against the token endpoint host.
+  const err = events.find((e) => e.type === 'egress_error') as Extract<VouchrEvent, { type: 'egress_error' }> | undefined;
+  assert.ok(err, 'egress_error must fire on a refresh throw');
+  assert.equal(err.reason, 'refresh_failed');
+});
+
+test('observability: the discarded 401 body is cancelled on a successful refresh-retry too', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const acme = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
+    clientId: 'c', clientSecret: 's',
+  });
+  await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
+  const handle = new ConnectionHandle(acme, O1, ID, vault, new Audit(db), {}, new Map(), () => {});
+  let cancelled = false;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any) => {
+    if (String(url).includes('/token')) {
+      return new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    const auth = new Headers(init?.headers).get('authorization');
+    if (auth === 'Bearer old') {
+      const body = new ReadableStream({ pull(c) { c.enqueue(new Uint8Array(64)); }, cancel() { cancelled = true; } });
+      return new Response(body, { status: 401 });
+    }
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const res = await handle.fetch('https://api.acme.example/data');
+    assert.equal(res.status, 200); // retried with the refreshed token
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.ok(cancelled, 'discarded 401 body must be cancelled on the success path');
+});
+
 test('observability: kms_decrypt also counts the refresh-path reads on a 401-triggered refresh', async () => {
   const events: VouchrEvent[] = [];
   const db = await openDb({ dbPath: ':memory:' });

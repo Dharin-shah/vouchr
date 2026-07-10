@@ -199,6 +199,14 @@ All notable changes to this project are documented here. This project adheres to
   transports, and `enabled` is exactly "`authorizeProvider` would allow it". The channel-independent
   `GET /v1/manifest` is unchanged. New wire type `BrokerChannelManifestResponse`.
 
+### Fixed
+
+- **Connection leak on refresh-signalling failure** (#168). When a provider call came back `401`
+  and the refresh signalling itself threw (vault/db error), the discarded 401 response body was
+  never read or cancelled, pinning its socket until GC. The injector now cancels the abandoned
+  body before rethrowing the refresh error; a refresh that yields no new token still returns the
+  401 with its body intact.
+
 ## [0.2.0] - 2026-07-06
 
 ### Added
