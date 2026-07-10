@@ -4,6 +4,8 @@ import type { Vault } from './vault';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import type { Consent } from './consent';
 import type { SlackIdentity } from './identity';
+import type { ChannelConfig } from './channelConfig';
+import { joinUnion, type UnionOptin } from './unionOptin';
 import { userOwner } from './owner';
 import { exchangeCode } from './tokens';
 import { safeEmit } from './safe-emit';
@@ -16,6 +18,10 @@ export interface CallbackDeps {
   redirectUri: string;
   /** Optional audit STREAM sink (raw actor id). No-op when unset; the audit table is authoritative. */
   auditSink?: AuditSink;
+  /** #112: both set → a connect prompted FROM a union-mode channel also records the union opt-in
+   *  (the consent row carries that channel). Unset → callback behavior is unchanged. */
+  channelConfig?: ChannelConfig;
+  unionOptin?: UnionOptin;
 }
 
 /** Emit a consent_granted/denied audit-stream copy. Best-effort; a throwing sink never breaks the callback. */
@@ -90,6 +96,17 @@ export async function handleOAuthCallback(
       externalAccount: account,
     });
     await deps.audit.record('connect', row.identity, provider.id, { account });
+    // #112: connecting IN RESPONSE to a union-channel prompt IS the opt-in moment. The consent row
+    // carries the channel the prompt was posted in; record the opt-in only when that channel is in
+    // union mode for this provider. Best-effort AFTER the vault write: the credential is the primary
+    // outcome, and a missed opt-in is self-serviceable via `/vouchr union join`.
+    if (deps.unionOptin && deps.channelConfig && row.channel) {
+      try {
+        if ((await deps.channelConfig.getMode(row.identity.teamId, row.channel, provider.id)) === 'union') {
+          await joinUnion(deps.unionOptin, deps.audit, row.identity, row.channel, provider.id);
+        }
+      } catch { /* the connect already succeeded; never fail the callback over the opt-in row */ }
+    }
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_granted', 200);
     return { ok: true, provider: provider.id, account, scopes, identity: row.identity };
   } catch {

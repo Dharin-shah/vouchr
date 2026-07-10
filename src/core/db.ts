@@ -112,8 +112,9 @@ class PgClientDb implements Db {
  * Monotonic version of the schema this build writes, stamped into the `meta` table on every open.
  * Bump it whenever the schema changes shape. Version 1 = the schema at the release that introduced
  * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
+ * Version 2 = + the `union_optin` table (#112, purely additive).
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -223,6 +224,15 @@ function schema(blob: string, int: string): string {
       created_at ${int} NOT NULL,
       expires_at ${int} NOT NULL,
       PRIMARY KEY (team_id, channel, thread, user_id, provider)
+    );
+
+    CREATE TABLE IF NOT EXISTS union_optin (
+      team_id TEXT NOT NULL,
+      channel_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      PRIMARY KEY (team_id, channel_id, user_id, provider)
     );
 
     CREATE TABLE IF NOT EXISTS audit (

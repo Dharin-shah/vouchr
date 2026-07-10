@@ -2,6 +2,7 @@ import type { Vault } from './vault';
 import type { Audit } from './audit';
 import type { Consent } from './consent';
 import type { EventSink } from './injector';
+import type { UnionOptin } from './unionOptin';
 
 /**
  * Proactively delete every connection past its TTL (auditing each), and clear
@@ -10,10 +11,15 @@ import type { EventSink } from './injector';
  * idle rows that would otherwise linger forever because nobody touches them again.
  * Returns the number of connections swept.
  */
-export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent, sink?: EventSink): Promise<number> {
+export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent, sink?: EventSink,
+  // Optional (#112): a swept user credential also drops that user's union opt-ins for the provider —
+  // delegation must not outlive the credential (a later reconnect must re-opt-in).
+  unionOptin?: UnionOptin,
+): Promise<number> {
   const expired = await vault.listExpired();
   for (const { owner, provider } of expired) {
     await vault.delete(owner, provider);
+    if (owner.kind === 'user') await unionOptin?.deleteForUserProvider(owner.teamId, owner.id, provider);
     // Audit as the owner. A channel has no acting human → user_id=channel id, actor='system'.
     const id = { enterpriseId: null, teamId: owner.teamId, userId: owner.id };
     await audit.record('revoke', id, provider, { reason: 'expired', owner_kind: owner.kind },
