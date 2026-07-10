@@ -35,7 +35,10 @@ export interface VouchrAuditEvent {
   jti: string;
 }
 
-/** Fire-and-forget audit stream sink. Sync; a throwing sink must never affect request behavior. */
+/** Fire-and-forget audit stream sink. May be sync or async (`=> void` admits async functions);
+ *  a throwing OR rejecting sink must never affect request behavior — every fire point routes
+ *  through safeEmit, which swallows both failure shapes. Typed `=> void`, not
+ *  `void | Promise<void>`, to keep `(e) => arr.push(e)`-style consumers compiling (see EventSink). */
 export type AuditSink = (e: VouchrAuditEvent) => void;
 
 const REDACTED = '[redacted]';
@@ -131,6 +134,18 @@ export class Audit {
       distinctActors: Number(r.distinct_actors),
       lastUsed: Number(r.last_used),
     }));
+  }
+
+  /** The last human who ran a 'config' action for (channel, provider) — the best-known "configuring
+   *  admin", used as the recipient for channel-credential health notices (#117). Null when nobody
+   *  ever configured it (the caller should skip rather than guess). */
+  async lastChannelConfigActor(teamId: string, channelId: string, provider: string): Promise<string | null> {
+    const row = await this.db.get<{ user_id: string }>(
+      `SELECT user_id FROM audit WHERE team_id=? AND channel=? AND provider=? AND action='config'
+       ORDER BY at DESC LIMIT 1`,
+      [teamId, channelId, provider],
+    );
+    return row?.user_id ?? null;
   }
 
   async record(

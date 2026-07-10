@@ -66,12 +66,17 @@ browser, and asks again:
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
 Session approvals ([thread-scoped](./assets/slack-session-thread.svg)) and private credential
-modals ([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. All Block Kit surfaces
-are exported for customization (`connectedBlocks`, `statusBlocks`, `homeView`, …).
+modals ([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. The app's **App Home
+tab is a config console**: everyone manages their own connections there, and admins (plus channel
+creators when `allowChannelCreatorConfig` is on) pick a channel and set per-provider modes, tool
+availability, and shared credentials — the same server-side gates and audit rows as the `/vouchr`
+equivalents. All Block Kit surfaces are exported for customization (`connectedBlocks`,
+`statusBlocks`, `homeView`, …).
 
 To run it: Vouchr uses **your agent's Slack app** — enable bot scopes `app_mentions:read`,
-`chat:write`, `commands`, `users:read`, events `app_mention` + `user_change`, interactivity, and the
-`/vouchr` slash command (or start from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)).
+`chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`, events `app_mention` +
+`app_home_opened` + `user_change`, the App Home tab, interactivity, and the `/vouchr` slash command
+(or start from [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)).
 Register each OAuth provider's app with callback `$PUBLIC_URL/vouchr/oauth/callback`. Then:
 
 ```bash
@@ -247,14 +252,30 @@ import { createBroker, signIdentity } from '@vouchr/core/headless'; // Bolt-free
 ```
 
 Read-only by default (writes are a double opt-in), reference-only for secrets (raw keys stay in the
-Bolt modal), with channel governance mirrored behind a signed admin claim. Full details — capability
-matrix vs Bolt, wire format, replay protection, health probes, and the local sidecar for
-Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
+Bolt modal), with channel governance mirrored behind a signed admin claim. Providers that ship as
+MCP servers over Streamable HTTP get a dedicated stateless proxy, `POST /v1/mcp` — the same gates
+and credential injection as `/v1/fetch`, plus SSE stream passthrough and `Mcp-Session-Id` relay.
+It is opt-in per provider (the declarative `mcp: { paths, allowContentTypes? }` knob locks the
+endpoint and response types) and bounded by the `maxStreamBytes`/`maxStreamMs` broker options.
+Full details — capability matrix vs Bolt, wire format, replay protection, health probes, and the
+local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
 
 ## Production Notes
 
 - **Consent prompts are control flow.** `ConsentRequiredError` / `SessionApprovalRequiredError` mean
   Vouchr already prompted the user — catch them and stop the turn; don't log them as failures.
+- **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
+  bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
+  `invalid_client`) or a connection is within 72h of its idle/max-age TTL ceiling (dimensions
+  longer than 72h only — shorter ones would always be "expiring"), Vouchr DMs the credential owner
+  (the configuring admin for a channel-owned credential): a reconnect button for a dead refresh
+  (it mints a fresh consent link on click, so it can't expire unread), a heads-up for an upcoming
+  expiry. At most one DM per (owner, provider, type) per 24h: the window is claimed atomically in
+  the `notification_state` table before sending (no duplicates across replicas; a process that
+  crashes between claim and send loses that window's DM — the next window retries), and
+  reconnecting resets it. To route these yourself instead, set
+  `createVouchr({ onCredentialHealth })` (or `BrokerOptions.onCredentialHealth` headless) — the
+  exported `CredentialHealthEvent` carries the owning principal and provider, never token material.
 - **Protect storage and keys.** Token columns are encrypted with `VOUCHR_MASTER_KEY`, but the
   database and key still need normal production controls. To rotate the master key without
   orphaning rows, set `VOUCHR_MASTER_KEYS` (first entry encrypts new writes, all entries decrypt)

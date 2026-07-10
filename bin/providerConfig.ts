@@ -11,6 +11,7 @@ import { defineProvider, type Provider } from '../src/core/providers';
 const ALLOWED = new Set([
   'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault',
   'egressAllow', 'egressPaths', 'egressMethods', 'refresh', 'pkce', 'tokenAuth', 'bodyFormat',
+  'mcp', // #65 /v1/mcp opt-in: { paths: string[], allowContentTypes?: string[] }
 ]);
 
 function envKey(id: string): string {
@@ -60,6 +61,24 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
   for (const arr of ['scopesDefault', 'egressPaths', 'egressMethods'] as const) {
     if (entry[arr] != null && !isStringArray(entry[arr])) throw new Error(`provider config: "${entry.id}" field "${arr}" must be an array of strings`);
   }
+  // #65 /v1/mcp opt-in knob. defineProvider re-validates, but the loader fails with its own
+  // config-shaped message like every other field here (fail closed, unknown keys included).
+  if (entry.mcp != null) {
+    if (typeof entry.mcp !== 'object' || Array.isArray(entry.mcp)) {
+      throw new Error(`provider config: "${entry.id}" field "mcp" must be an object like { "paths": ["/mcp"] }`);
+    }
+    for (const k of Object.keys(entry.mcp)) {
+      if (k !== 'paths' && k !== 'allowContentTypes') {
+        throw new Error(`provider config: "${entry.id}" field "mcp" has unknown key "${k}" — allowed: paths, allowContentTypes`);
+      }
+    }
+    if (!isStringArray(entry.mcp.paths) || entry.mcp.paths.length === 0 || entry.mcp.paths.some((p: string) => !p.trim())) {
+      throw new Error(`provider config: "${entry.id}" field "mcp.paths" must be a non-empty array of non-empty strings`);
+    }
+    if (entry.mcp.allowContentTypes != null && (!isStringArray(entry.mcp.allowContentTypes) || entry.mcp.allowContentTypes.length === 0 || entry.mcp.allowContentTypes.some((c: string) => !c.trim()))) {
+      throw new Error(`provider config: "${entry.id}" field "mcp.allowContentTypes" must be a non-empty array of non-empty strings`);
+    }
+  }
 
   const ek = envKey(entry.id);
   // defineProvider throws a clear error if an OAuth provider ends up without client id/secret.
@@ -73,6 +92,7 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
     egressAllow: entry.egressAllow,
     egressPaths: entry.egressPaths,
     egressMethods: entry.egressMethods,
+    mcp: entry.mcp,
     refresh: entry.refresh ?? 'none',
     pkce: entry.pkce ?? false,
     tokenAuth: entry.tokenAuth,

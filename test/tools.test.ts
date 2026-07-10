@@ -148,3 +148,84 @@ test('null channel → no tool restriction; manifest all enabled', async () => {
   assert.deepEqual(m.map((e) => e.enabled), [true, true]);
   assert.deepEqual(m.map((e) => e.mode), [null, null]);
 });
+
+// ── #111 ChannelTools.applyEnabled: atomic first-write allowlist materialization ─────────────────
+// The configured-ness decision lives INSIDE the materialization statement (NOT EXISTS), and each
+// statement is engine-atomic, so concurrent first-writers and mid-sequence failures can never leave
+// a PARTIAL allowlist that silently disables bystander providers.
+const ALL3 = ['mcp', 'other', 'third'];
+
+async function freshTools() {
+  const db = await openDb({ dbPath: ':memory:' });
+  return { db, tools: new ChannelTools(db) };
+}
+
+test('applyEnabled on an unconfigured channel materializes the full allowlist', async () => {
+  const { tools } = await freshTools();
+  await tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false); // the targeted provider
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true); // bystanders materialized enabled
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+});
+
+test('applyEnabled on a configured channel touches only the given rows', async () => {
+  const { tools } = await freshTools();
+  await tools.setEnabled('T1', 'C1', 'other', false); // channel is already an allowlist
+  await tools.applyEnabled('T1', 'C1', [['mcp', true]], ALL3);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), false); // untouched — no revert
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false); // unlisted on an allowlist stays off
+});
+
+test('applyEnabled: concurrent first writes converge — both targets land, bystanders stay enabled', async () => {
+  const { tools } = await freshTools();
+  await Promise.all([
+    tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3),
+    tools.applyEnabled('T1', 'C1', [['other', false]], ALL3),
+  ]);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), false);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true); // neither writer's fillers clobbered
+});
+
+// Failure injection at the Db seam, between/at the two statements. A mid-STATEMENT partial write
+// cannot be injected here — that atomicity is the engine's own guarantee (the reason applyEnabled
+// is single statements instead of a client-side loop); the PG execution of the same statements is
+// covered by the opt-in postgres suite (TEST-4).
+function flakyDb(db: any, failOn: () => RegExp | null) {
+  return {
+    get: db.get.bind(db),
+    all: db.all.bind(db),
+    exec: db.exec.bind(db),
+    close: db.close.bind(db),
+    run: async (sql: string, params?: any[]) => {
+      const re = failOn();
+      if (re?.test(sql)) throw new Error('injected db failure');
+      return db.run(sql, params);
+    },
+  };
+}
+
+test('applyEnabled: failing materialization writes NOTHING (channel stays all-enabled)', async () => {
+  const { db } = await freshTools();
+  let re: RegExp | null = /DO NOTHING/;
+  const tools = new ChannelTools(flakyDb(db, () => re) as any);
+  await assert.rejects(() => tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3), /injected/);
+  assert.equal(await tools.isConfigured('T1', 'C1'), false); // no partial allowlist
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true); // everything still effectively enabled
+  re = null; // db recovers → the retry lands the full change
+  await tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+});
+
+test('applyEnabled: failure after materialization still leaves a COMPLETE allowlist with the change applied', async () => {
+  const { db } = await freshTools();
+  const tools = new ChannelTools(flakyDb(db, () => /DO UPDATE/) as any);
+  await assert.rejects(() => tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3), /injected/);
+  // The materialization statement already carried the desired bit, so the intermediate state is the
+  // final state — complete, never a partial allowlist that disables bystanders.
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+});

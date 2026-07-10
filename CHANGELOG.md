@@ -7,6 +7,95 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **App Home config dashboard** (#111). The app's Home tab (published on `app_home_opened`, and
+  re-published after every mutation) is now a console: everyone sees and disconnects their own
+  connections (provider + external account, same confirm + revoke flow as the config modal);
+  workspace admins — and channel creators when `allowChannelCreatorConfig` is on — additionally
+  pick a channel (public/private only; DMs and Slack Connect are filtered AND re-checked
+  server-side) and govern it per provider: credential-mode select, tool Enable/Disable, and the
+  existing channel-credential modal. Every control routes through the same helpers as the `/vouchr`
+  slash equivalents, so authorization gates, DB writes, and audit rows are identical by
+  construction; forged block actions (non-admin clicks, invalid modes, nonexistent channels smuggled
+  through view metadata) are re-validated server-side, rejected fail-closed, and audited `denied`
+  where a slash denial would be. An archived/deleted/ineligible selected channel degrades to a note.
+  Requires the `app_home_opened` bot event, the Home tab, and the `channels:read` + `groups:read`
+  scopes (see `examples/slack-manifest.yml`); `homeView()` gains an optional `governance` argument
+  (backward compatible). Vouchr's publisher defers to a foreign (host-published) Home view instead
+  of clobbering it; residual caveat: on a user's very first open there is no current view, so a
+  host with its own Home tab races Vouchr once — from the next open the `callback_id` decides.
+
+  **Behavior change:** the first `/vouchr enable|disable` (or Home Enable/Disable click) on a
+  channel with no explicit tool rows now materializes the full allowlist, so flipping one provider
+  no longer silently disables every other. Previously a first `/vouchr disable X` flipped the
+  channel into allowlist mode and knocked out all unlisted providers channel-wide while auditing
+  only X; the config modal already materialized — the shared helper now applies the same rule to
+  all surfaces. Only the provider the admin actually targeted is audited. Additionally,
+  `/vouchr enable|disable` and `/vouchr configure` (and their App Home buttons) now refuse
+  ineligible channel classes — archived, externally shared / Slack Connect, DMs — with the same
+  fail-closed rule `mode` already enforced; previously the tool-allowlist bit could be flipped and
+  the credential modal opened in an externally shared channel.
+
+- **Credential health notifications** (#117). When a token refresh fails DEFINITIVELY
+  (`invalid_grant`, or a bare 400/401 from the token endpoint — classified by the new exported
+  `TokenEndpointError`; transient blips never count, and neither do operator-side OAuth errors
+  like `invalid_client` that no user reconnect can fix) the owner gets a DM whose Connect button
+  mints a fresh single-use consent state on click (so the link cannot expire before it's read);
+  the TTL sweep additionally warns owners within 72h of a connection's idle/max-age ceiling
+  (only for TTL dimensions longer than 72h — a shorter TTL would make every live connection
+  permanently "expiring" and nag daily forever) and reports actual deletions. Channel-owned
+  credentials notify the last configuring admin (skipped
+  when unknown — the channel is never spammed). DMs are debounced to one per (owner, provider,
+  type) per 24h via the new persistent `notification_state` table (additive migration; schema
+  version 3): the window is CLAIMED atomically before sending — no duplicates across replicas —
+  and released if the send fails so the next event retries (a process crashing between claim and
+  send loses that window's DM; the next window retries). Reconnect/disconnect clear the state,
+  atomically with the connection write itself. New `createVouchr`/`BrokerOptions` option
+  `onCredentialHealth` replaces the default DMs
+  with your own notifier (headless brokers have no Slack client, so they only get the hook); the
+  same hook passed to `sweepExpired` hears `expiring_soon`/`expired`. New exports:
+  `CredentialHealthEvent`, `CredentialHealthHook`, `NotificationState`,
+  `HEALTH_NOTIFY_DEBOUNCE_MS`, `TokenEndpointError` (also on `./headless`). Events carry the
+  owning principal and provider — never token material. All fire-and-forget hooks
+  (`onCredentialHealth`, `onEvent`, `auditSink`) now accept async functions safely: their
+  `=> void` signatures always admitted async functions, and a rejection is now swallowed exactly
+  like a throw — never an unhandled rejection (which kills modern Node).
+
+
+- **MCP-aware egress proxy on the headless broker** (#65) — new route `POST /v1/mcp` for providers
+  whose tool surface is an MCP server over Streamable HTTP. Same envelope style and the same
+  fail-closed pipeline as `/v1/fetch` (signed identity — never the body, single-use `jti` replay
+  guard, policy + channel-tool checks, egress host/https/method allowlist enforced BEFORE the
+  credential is read, same inject/denied audit rows), with the credential injected inside the
+  broker and never revealed to the caller. What `/v1/fetch` can't do, this adds: the upstream
+  response passes through **as-is and streamed** (`text/event-stream` included, never buffered),
+  and the MCP plumbing headers (`Mcp-Session-Id`, `MCP-Protocol-Version`, plus request
+  `Accept`/`Content-Type`) pass through in both directions. The route is a **declarative
+  per-provider opt-in**: the new `defineProvider` knob `mcp: { paths, allowContentTypes? }`
+  (validated at definition time) is required or `/v1/mcp` refuses the provider (403, audited like
+  an egress denial) even when it is POST-enabled for `/v1/fetch` — `paths` locks the reachable
+  endpoint with the `egressPaths` matching semantics (shared matcher; encoded separators refused),
+  and a response outside `allowContentTypes` (default `application/json` + `text/event-stream`,
+  bare-type match) is withheld unread, closing the raw-passthrough gap around `/v1/fetch`'s
+  response gates (`allowedContentTypes`/`maxResponseBytes` do not run here). Session ids are
+  opaque and potentially sensitive (MCP security guidance): relayed verbatim, never stored,
+  logged, or audited, and never accepted as authentication — the broker stays a stateless
+  credential-injecting proxy (the MCP session lifecycle remains the host's MCP client's job; mint
+  a fresh `identityToken` per JSON-RPC call). Per the MCP spec, the unsupported optional GET
+  listening stream and client-initiated DELETE termination answer `405` + `Allow: POST`. MCP
+  `callTool` can mutate, so the route sits behind the same two write opt-ins as a `/v1/fetch`
+  POST (`allowWrites` + provider `egressMethods` including POST). Open streams get ceilings: new
+  `BrokerOptions.maxStreamBytes` (default 8 MiB; a counting transform terminates the stream when
+  exceeded — upstream aborted, socket destroyed, never a clean end) and
+  `BrokerOptions.maxStreamMs` (default 5 min; a timer aborts the upstream fetch) — both validated
+  finite and > 0 at `createBroker` (a NaN/Infinity cap would silently fail open). A provider's
+  `egressResponse.maxBytes` (#110) still applies first and the stricter cap wins (413, nothing
+  relayed) — but the injector enforces it by buffering up to that cap, so leave it unset on
+  streaming providers. The standalone broker (`vouchr-broker` / GHCR image) declares the knob in
+  its `VOUCHR_PROVIDERS` JSON — `"mcp": { "paths": ["/mcp"] }` is now an allowed, config-validated
+  declarative field (see `guides/DEPLOYMENT.md` § Provider config). New export: `BrokerMcpRequest`
+  (also on `./headless`). Docs in `guides/HEADLESS.md` § MCP servers.
+
+
 - **Union mode: explicit opt-in + owner notification** (#112). New `createVouchr` option
   `unionRequiresOptIn` — when `true`, `union` resolution only borrows channel members with an
   explicit opt-in row for that (channel, provider), stored in the new `union_optin` table

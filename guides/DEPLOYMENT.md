@@ -292,6 +292,23 @@ rejected (fail closed). Secrets come from the per-provider env vars above, never
 With no `egressMethods`, the broker default-denies non-GET/HEAD — a read-only provider. Opt into
 writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the provider.
 
+To expose a provider on `POST /v1/mcp` (#65), declare the `mcp` knob too — it is a separate opt-in
+on top of the write gating above, and locks the reachable endpoint + response media types
+(`allowContentTypes` optional; default `application/json` + `text/event-stream`). See the
+[headless guide](./HEADLESS.md)'s MCP section for the route's semantics:
+
+```json
+[
+  {
+    "id": "internal-mcp",
+    "credential": "key",
+    "egressAllow": ["mcp.internal.example"],
+    "egressMethods": ["POST"],
+    "mcp": { "paths": ["/mcp"] }
+  }
+]
+```
+
 ### Provisioning (how credentials get in)
 
 - **Shared / referenced credential** (channel- or team-owned): seed it without Slack.

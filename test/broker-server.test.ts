@@ -5,11 +5,13 @@ import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { loadProviders } from '../bin/providerConfig';
 import { buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
+import { signIdentity } from '../src/adapters/http/identity';
 
 const KEY_B64 = Buffer.alloc(32, 7).toString('base64');
 const CONFLUENCE = {
@@ -70,6 +72,32 @@ test('loadProviders: a provider without egressAllow is rejected', () => {
   assert.throws(() => loadProviders(env), /egressAllow/);
 });
 
+// #65 the /v1/mcp opt-in must be env-declarable, or the SHIPPED standalone broker can never serve
+// an MCP provider (the knob would only exist for custom createBroker wrappers).
+const MCP_INTERNAL = {
+  id: 'internal', credential: 'key', egressAllow: ['mcp.internal.example'],
+  egressMethods: ['POST'], mcp: { paths: ['/mcp'] },
+};
+
+test('#65 loadProviders: the mcp knob loads and reaches the provider', () => {
+  const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([MCP_INTERNAL]) } as any);
+  assert.deepEqual(p.mcp, { paths: ['/mcp'] });
+  // allowContentTypes passes through untouched too
+  const [q] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...MCP_INTERNAL, mcp: { paths: ['/mcp'], allowContentTypes: ['application/json'] } }]) } as any);
+  assert.deepEqual(q.mcp, { paths: ['/mcp'], allowContentTypes: ['application/json'] });
+});
+
+test('#65 loadProviders: invalid mcp shapes are rejected at config load with the loader\'s message', () => {
+  const load = (mcp: unknown) => () =>
+    loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...MCP_INTERNAL, mcp }]) } as any);
+  assert.throws(load('yes'), /field "mcp" must be an object/);
+  assert.throws(load({ paths: [] }), /"mcp\.paths" must be a non-empty array/);
+  assert.throws(load({ paths: [42] }), /"mcp\.paths" must be a non-empty array/);
+  assert.throws(load({ paths: [' '] }), /"mcp\.paths" must be a non-empty array/);
+  assert.throws(load({ paths: ['/mcp'], allowContentTypes: [] }), /"mcp\.allowContentTypes" must be a non-empty array/);
+  assert.throws(load({ paths: ['/mcp'], allowContentType: ['x'] }), /unknown key "allowContentType"/); // typo fails closed
+});
+
 // ── T6: broker-server entrypoint ─────────────────────────────────────────────
 
 function baseEnv(extra: Record<string, string> = {}): any {
@@ -93,6 +121,53 @@ test('buildBrokerServer: boots on SQLite and serves /healthz + /health + /readyz
     assert.equal(await get(port, '/health'), 200);
     assert.equal(await get(port, '/readyz'), 200); // readiness passes over the live sqlite db
   } finally {
+    built.server.close();
+    await built.db.close();
+  }
+});
+
+test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp end to end', async () => {
+  // The whole distribution path in one test: documented JSON config -> loadProviders ->
+  // buildBrokerServer -> /v1/mcp, with the env-declared provider's credential injected upstream.
+  const built = await buildBrokerServer(baseEnv({
+    VOUCHR_ALLOW_WRITES: '1',
+    VOUCHR_PROVIDERS: JSON.stringify([MCP_INTERNAL]),
+  }));
+  await new Promise<void>((r) => built.server.listen(0, r));
+  const port = (built.server.address() as any).port;
+  const real = globalThis.fetch;
+  let upstreamAuth: string | null = null;
+  globalThis.fetch = (async (_u: any, init: any) => {
+    upstreamAuth = new Headers(init?.headers).get('authorization');
+    return new Response('{"jsonrpc":"2.0","id":1,"result":{}}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    await new Vault(built.db, Buffer.from(KEY_B64, 'base64')).upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
+      accessToken: 'tok_mcp_secret', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+    });
+    const identityToken = signIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID() }, 'shhh');
+    const body = JSON.stringify({
+      handle: { provider: 'internal', owner: 'user' }, identityToken, path: '/mcp',
+      body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+    });
+    const r = await new Promise<{ status: number; raw: string }>((resolve, reject) => {
+      const req = http.request(
+        { port, path: '/v1/mcp', method: 'POST', headers: { 'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (c: Buffer) => chunks.push(c));
+          res.on('end', () => resolve({ status: res.statusCode ?? 0, raw: Buffer.concat(chunks).toString('utf8') }));
+        },
+      );
+      req.on('error', reject);
+      req.end(body);
+    });
+    assert.equal(r.status, 200, `env-declared mcp config must reach /v1/mcp (got ${r.status}: ${r.raw})`);
+    assert.equal(r.raw, '{"jsonrpc":"2.0","id":1,"result":{}}');
+    assert.equal(upstreamAuth, 'Bearer tok_mcp_secret', 'the env-declared provider\'s credential was injected');
+    assert.ok(!r.raw.includes('tok_mcp_secret'), 'and never revealed to the caller');
+  } finally {
+    globalThis.fetch = real;
     built.server.close();
     await built.db.close();
   }

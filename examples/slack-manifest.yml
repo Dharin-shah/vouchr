@@ -6,6 +6,10 @@ display_information:
   name: Vouchr
   description: Connect your accounts so agents can act on your behalf, without seeing your tokens.
 features:
+  app_home:
+    home_tab_enabled: true    # the Vouchr App Home console: your connections + channel governance
+    messages_tab_enabled: false
+    messages_tab_read_only_enabled: false
   bot_user:
     display_name: vouchr
     always_online: true
@@ -22,11 +26,14 @@ oauth_config:
       - chat:write          # post Connect prompts / confirmation DMs
       - commands            # the /vouchr slash command
       - users:read          # admin gate for channel creds + offboarding (user_change)
+      - channels:read       # conversations.info: channel eligibility/creator checks (App Home + shared creds)
+      - groups:read         # same, for private channels
 settings:
   event_subscriptions:
     request_url: https://YOUR_PUBLIC_URL/slack/events
     bot_events:
       - app_mention
+      - app_home_opened     # render the App Home console
       - user_change         # auto-revoke a deactivated user's connections
   interactivity:
     is_enabled: true        # REQUIRED for the Connect button + key/configure modals
