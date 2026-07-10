@@ -7,6 +7,40 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **MCP-aware egress proxy on the headless broker** (#65) — new route `POST /v1/mcp` for providers
+  whose tool surface is an MCP server over Streamable HTTP. Same envelope style and the same
+  fail-closed pipeline as `/v1/fetch` (signed identity — never the body, single-use `jti` replay
+  guard, policy + channel-tool checks, egress host/https/method allowlist enforced BEFORE the
+  credential is read, same inject/denied audit rows), with the credential injected inside the
+  broker and never revealed to the caller. What `/v1/fetch` can't do, this adds: the upstream
+  response passes through **as-is and streamed** (`text/event-stream` included, never buffered),
+  and the MCP plumbing headers (`Mcp-Session-Id`, `MCP-Protocol-Version`, plus request
+  `Accept`/`Content-Type`) pass through in both directions. The route is a **declarative
+  per-provider opt-in**: the new `defineProvider` knob `mcp: { paths, allowContentTypes? }`
+  (validated at definition time) is required or `/v1/mcp` refuses the provider (403, audited like
+  an egress denial) even when it is POST-enabled for `/v1/fetch` — `paths` locks the reachable
+  endpoint with the `egressPaths` matching semantics (shared matcher; encoded separators refused),
+  and a response outside `allowContentTypes` (default `application/json` + `text/event-stream`,
+  bare-type match) is withheld unread, closing the raw-passthrough gap around `/v1/fetch`'s
+  response gates (`allowedContentTypes`/`maxResponseBytes` do not run here). Session ids are
+  opaque and potentially sensitive (MCP security guidance): relayed verbatim, never stored,
+  logged, or audited, and never accepted as authentication — the broker stays a stateless
+  credential-injecting proxy (the MCP session lifecycle remains the host's MCP client's job; mint
+  a fresh `identityToken` per JSON-RPC call). Per the MCP spec, the unsupported optional GET
+  listening stream and client-initiated DELETE termination answer `405` + `Allow: POST`. MCP
+  `callTool` can mutate, so the route sits behind the same two write opt-ins as a `/v1/fetch`
+  POST (`allowWrites` + provider `egressMethods` including POST). Open streams get ceilings: new
+  `BrokerOptions.maxStreamBytes` (default 8 MiB; a counting transform terminates the stream when
+  exceeded — upstream aborted, socket destroyed, never a clean end) and
+  `BrokerOptions.maxStreamMs` (default 5 min; a timer aborts the upstream fetch) — both validated
+  finite and > 0 at `createBroker` (a NaN/Infinity cap would silently fail open). A provider's
+  `egressResponse.maxBytes` (#110) still applies first and the stricter cap wins (413, nothing
+  relayed) — but the injector enforces it by buffering up to that cap, so leave it unset on
+  streaming providers. The standalone broker (`vouchr-broker` / GHCR image) declares the knob in
+  its `VOUCHR_PROVIDERS` JSON — `"mcp": { "paths": ["/mcp"] }` is now an allowed, config-validated
+  declarative field (see `guides/DEPLOYMENT.md` § Provider config). New export: `BrokerMcpRequest`
+  (also on `./headless`). Docs in `guides/HEADLESS.md` § MCP servers.
+
 - **Union mode: explicit opt-in + owner notification** (#112). New `createVouchr` option
   `unionRequiresOptIn` — when `true`, `union` resolution only borrows channel members with an
   explicit opt-in row for that (channel, provider), stored in the new `union_optin` table

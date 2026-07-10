@@ -247,9 +247,13 @@ import { createBroker, signIdentity } from '@vouchr/core/headless'; // Bolt-free
 ```
 
 Read-only by default (writes are a double opt-in), reference-only for secrets (raw keys stay in the
-Bolt modal), with channel governance mirrored behind a signed admin claim. Full details — capability
-matrix vs Bolt, wire format, replay protection, health probes, and the local sidecar for
-Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
+Bolt modal), with channel governance mirrored behind a signed admin claim. Providers that ship as
+MCP servers over Streamable HTTP get a dedicated stateless proxy, `POST /v1/mcp` — the same gates
+and credential injection as `/v1/fetch`, plus SSE stream passthrough and `Mcp-Session-Id` relay.
+It is opt-in per provider (the declarative `mcp: { paths, allowContentTypes? }` knob locks the
+endpoint and response types) and bounded by the `maxStreamBytes`/`maxStreamMs` broker options.
+Full details — capability matrix vs Bolt, wire format, replay protection, health probes, and the
+local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
 
 ## Production Notes
 

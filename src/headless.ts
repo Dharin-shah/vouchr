@@ -12,7 +12,7 @@
 
 // ── the broker + its request/option types ──
 export { createBroker } from './adapters/http/broker';
-export type { BrokerOptions, BrokerFetchRequest, ConnectionHandleRef } from './adapters/http/broker';
+export type { BrokerOptions, BrokerFetchRequest, BrokerMcpRequest, ConnectionHandleRef } from './adapters/http/broker';
 
 // ── the ready-to-run headless server (env → wired broker), same core the standalone binary uses ──
 export { buildBrokerServer } from '../bin/broker-server';

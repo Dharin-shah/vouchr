@@ -50,6 +50,7 @@ One core, two front doors — both reach the same credential boundary.
 | Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (admin claim) |
 | Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` (admin claim) |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
+| Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
 
@@ -71,6 +72,86 @@ const broker = createBroker({
 Providers without `egressMethods` remain `GET`/`HEAD`-only even when `allowWrites` is enabled.
 Write bodies are small JSON/text payloads, capped at 64 KiB, and still go through the same identity
 verification, replay guard, policy, channel-tool, host/path/method, and HTTPS checks as reads.
+
+## MCP servers (Streamable HTTP): `POST /v1/mcp`
+
+Many tools ship as MCP servers over Streamable HTTP — which is just HTTP with a bearer. `/v1/mcp`
+is the `/v1/fetch` pipeline (identical identity, replay, policy, channel-tool, and egress gates;
+identical credential injection inside the broker; identical audit rows) with the two things a
+JSON-envelope route can't carry:
+
+- the upstream response passes through **as-is and streamed** — status, `Content-Type`
+  (`text/event-stream` included), body bytes as they arrive, never buffered;
+- the MCP plumbing headers `Mcp-Session-Id` and `MCP-Protocol-Version` pass through in **both**
+  directions, and the request may carry `Accept` and `Content-Type` (Streamable HTTP requires
+  `Accept: application/json, text/event-stream`). Every other header is stripped exactly like
+  `/v1/fetch`; the caller's `Authorization` is always dropped — the broker injects the credential.
+
+The request is the same envelope style as `/v1/fetch`, with the upstream method fixed to POST (a
+JSON-RPC message) and the JSON-RPC payload in `body`:
+
+```json
+{
+  "handle": { "provider": "github", "owner": "user" },
+  "identityToken": "<signed; mint a FRESH one per JSON-RPC call — tokens are single-use>",
+  "path": "/mcp",
+  "headers": { "accept": "application/json, text/event-stream", "content-type": "application/json", "mcp-session-id": "…" },
+  "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\", …}"
+}
+```
+
+Point your MCP client's transport at the broker: wrap each outgoing JSON-RPC message in this
+envelope (minting a fresh `identityToken` — the replay guard rejects a reused one) and hand the raw
+response back to the client. `initialize` / `tools/list` / `tools/call` then work end to end with
+the broker injecting the per-user credential.
+
+Rules and limits:
+
+- **Opt-in per provider, with an endpoint + content-type lock.** `/v1/mcp` refuses (403) any
+  provider that does not declare the `mcp` knob on `defineProvider`:
+
+  ```ts
+  defineProvider({
+    // …
+    egressMethods: ['POST'],  // JSON-RPC rides POST (write gating below)
+    mcp: { paths: ['/mcp'] }, // REQUIRED to be reachable via /v1/mcp
+    // mcp.allowContentTypes defaults to ['application/json', 'text/event-stream']
+  });
+  ```
+
+  Being POST-enabled for `/v1/fetch` is NOT enough: the raw streamed passthrough skips
+  `/v1/fetch`'s broker-level response gates (the `allowedContentTypes` allowlist and the 1 MiB
+  `maxResponseBytes` cap), so reaching it must be a deliberate declaration. `mcp.paths` locks the
+  reachable endpoint with the same matching semantics as `egressPaths` (one shared matcher;
+  encoded path separators refused fail-closed), and the response's bare media type must match
+  `mcp.allowContentTypes` (default: the two MCP transport types) or the body is **withheld
+  unread** — which is what stops an allowlisted-but-hostile upstream reflecting the injected
+  `Authorization` header into a `text/plain` error body. Provider-level `egressResponse`
+  constraints additionally apply if set (enforced in the injector, at the buffering cost below).
+  On the standalone broker, declare the same `mcp` shape in the `VOUCHR_PROVIDERS` JSON — see the
+  [deployment guide](./DEPLOYMENT.md)'s provider-config section.
+- **Writes gating.** MCP `callTool` can mutate, so the route also requires the same double opt-in
+  as a `/v1/fetch` POST: `allowWrites: true` on the broker **and** the provider's `egressMethods`
+  including `'POST'`. Without either, the request is refused before any credential lookup.
+- **The session header is NOT auth — and treat it as sensitive.** `Mcp-Session-Id` is opaque
+  transport plumbing the MCP server issues and expects back, and per MCP security guidance it is
+  potentially hijackable: Vouchr relays it verbatim and never stores, logs, or audits it — and
+  never accepts one as authentication (every request still needs a fresh signed `identityToken`
+  and passes every gate). Hosts must handle session ids to the same standard: use MCP servers that
+  issue secure, non-deterministic ids, and keep them out of your own logs. The broker holds
+  **no MCP session state** (session lifecycle is your MCP client's job); the optional GET
+  listening stream and client-initiated DELETE termination are answered with `405` +
+  `Allow: POST` — the MCP-spec response of a server that doesn't offer them — never proxied.
+- **Stream ceilings.** A streamed response has no whole-body cap to buffer to, so two broker
+  options bound it: `maxStreamBytes` (default 8 MiB) counts bytes while relaying and *terminates*
+  the stream when exceeded — upstream fetch aborted, client socket destroyed, never a clean end —
+  and `maxStreamMs` (default 5 minutes) aborts the upstream fetch on a deadline. Both must be
+  finite and > 0: `createBroker` rejects NaN/Infinity/zero at construction (a NaN cap would
+  silently fail open).
+- **Interplay with `egressResponse.maxBytes` (#110).** A provider-level response cap still applies
+  and the stricter of the two wins (over-cap → `413`, nothing relayed) — but the injector enforces
+  it by buffering up to that cap before the relay starts, which defeats incremental delivery.
+  Leave `egressResponse.maxBytes` unset on streaming (SSE) providers and rely on `maxStreamBytes`.
 
 ## Channel governance over HTTP
 
