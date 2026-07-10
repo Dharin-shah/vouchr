@@ -3,6 +3,11 @@ import type { Audit } from './audit';
 import type { Consent } from './consent';
 import type { EventSink } from './injector';
 import type { UnionOptin } from './unionOptin';
+import type { CredentialHealthHook } from './health';
+import { safeEmit } from './safe-emit';
+
+/** #117: warn this far ahead of a connection's TTL ceiling (idle/max-age). */
+const EXPIRING_SOON_WINDOW_MS = 72 * 60 * 60 * 1000;
 
 /**
  * Proactively delete every connection past its TTL (auditing each), and clear
@@ -15,6 +20,11 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
   // Optional (#112): a swept user credential also drops that user's union opt-ins for the provider —
   // delegation must not outlive the credential (a later reconnect must re-opt-in).
   unionOptin?: UnionOptin,
+  // Optional (#117): credential-health hook. Fires 'expired' per deleted connection (after the
+  // delete) and 'expiring_soon' for every connection within 72h of its TTL ceiling. NOT debounced
+  // here — it re-fires each sweep pass; notifiers debounce (see NotificationState / the Bolt
+  // default wiring). safeEmit: a throwing hook never breaks the sweep.
+  health?: CredentialHealthHook,
 ): Promise<number> {
   const expired = await vault.listExpired();
   for (const { owner, provider } of expired) {
@@ -24,9 +34,14 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
     const id = { enterpriseId: null, teamId: owner.teamId, userId: owner.id };
     await audit.record('revoke', id, provider, { reason: 'expired', owner_kind: owner.kind },
       owner.kind === 'channel' ? 'system' : undefined);
+    safeEmit(health, { type: 'expired', owner, provider }); // after the delete actually happened
+  }
+  // Warn AFTER the delete pass (the two sets are disjoint: listExpiringSoon excludes expired rows).
+  for (const { owner, provider, expiresAt } of await vault.listExpiringSoon(EXPIRING_SOON_WINDOW_MS)) {
+    safeEmit(health, { type: 'expiring_soon', owner, provider, expiresAt });
   }
   await consent.sweepStale();
   // No-secret observability: just the count. Best-effort, a bad sink must never break the sweep.
-  if (sink) try { sink({ type: 'expired', count: expired.length }); } catch { /* ignore */ }
+  safeEmit(sink, { type: 'expired', count: expired.length });
   return expired.length;
 }

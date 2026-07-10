@@ -22,9 +22,10 @@ import { UnionOptin, eligibleUnionMembers, joinUnion, leaveUnion } from '../core
 import { offboardUser, disconnectProvider } from '../core/offboard';
 import { sweepExpired } from '../core/sweep';
 import { SessionGrants } from '../core/session';
+import { NotificationState, type CredentialHealthEvent, type CredentialHealthHook } from '../core/health';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
-  userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
+  userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
@@ -215,6 +216,22 @@ export interface VouchrOptions {
    * Providers without `rateLimit` are never limited, store or not.
    */
   rateLimitStore?: RateLimitStore;
+  /**
+   * #117 credential-health hook: fired when a connection needs (or is about to need) human
+   * attention — a DEFINITIVELY dead refresh token (`refresh_dead`, never on transient failures),
+   * a connection within 72h of its TTL ceiling (`expiring_soon`, per sweep pass), or a swept
+   * connection (`expired`). Events carry the owning principal + provider, never token material.
+   * When omitted, the DEFAULT wiring DMs the credential owner (the configuring admin for a
+   * channel-owned credential), with a reconnect button on `refresh_dead`, debounced to one DM per
+   * (owner, provider, type) per 24h via the persistent `notification_state` table. Setting this
+   * REPLACES the default DMs (same override contract as `isAdmin`) — debounce with the exported
+   * `NotificationState` if your notifier needs it. Note the hook is wired while createVouchr is
+   * still constructing (no `db` in hand yet), so an override must LATE-BIND its debounce store:
+   * construct `new NotificationState(vouchr.db)` after createVouchr returns (or from your own
+   * openDb handle) and reference it from inside the hook. Fire-and-forget; a throwing hook never
+   * affects a request or the sweep.
+   */
+  onCredentialHealth?: CredentialHealthHook;
 }
 
 /**
@@ -266,6 +283,8 @@ export interface ConnectContextDeps {
   unionNotified?: Map<string, number>;
   /** Optional audit stream sink (raw actor id). Default no-op; the audit table stays authoritative. */
   auditSink?: AuditSink;
+  /** #117 credential-health hook threaded to every ConnectionHandle (see VouchrOptions). Default no-op. */
+  health?: CredentialHealthHook;
   /** Pending private previews awaiting Share/Dismiss. Must be the createVouchr-scoped instance so a
    *  share click (a later request) finds the entry; a direct-constructed context gets its own (the
    *  ephemeral still posts; the share button then reports expired unless the host wires the actions). */
@@ -299,6 +318,7 @@ export class ConnectContext {
   private unionRequiresOptIn: boolean;
   private unionNotified: Map<string, number>;
   private auditSink: AuditSink;
+  private health: CredentialHealthHook;
   private previews: PendingPreviews;
 
   constructor(deps: ConnectContextDeps) {
@@ -327,6 +347,7 @@ export class ConnectContext {
     this.unionRequiresOptIn = deps.unionRequiresOptIn ?? false;
     this.unionNotified = deps.unionNotified ?? new Map();
     this.auditSink = deps.auditSink ?? (() => {});
+    this.health = deps.health ?? (() => {});
     this.previews = deps.previews ?? new PendingPreviews(PREVIEW_TTL_MS);
   }
 
@@ -478,6 +499,7 @@ export class ConnectContext {
             this.identity.userId,
             this.channel, // origin channel: attribute union usage to the channel it happened in (stats)
             this.rateLimits,
+            this.health,
           )), member, providerId);
         }
       }
@@ -489,6 +511,7 @@ export class ConnectContext {
         null, // no union borrow on the direct per-user path
         this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
         this.rateLimits,
+        this.health,
       ));
     }
 
@@ -841,7 +864,7 @@ export class ConnectContext {
     // triggeredBy/originChannel keep their defaults (null): unchanged behavior on this path.
     return this.notifyRateLimited(new ConnectionHandle(
       provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-      null, null, this.rateLimits,
+      null, null, this.rateLimits, this.health,
     ));
   }
 
@@ -922,6 +945,87 @@ export class ConnectContext {
   }
 }
 
+/**
+ * #117 default credential-health notifier: turn a {@link CredentialHealthEvent} into one owner DM.
+ * Recipient: the owner for a user-owned credential; the last configuring admin (audit-derived) for
+ * a channel-owned one — unknown admin ⇒ skip, never spam the channel. 'expired' events get no DM
+ * (the connection is gone; the next use re-prompts Connect). Debounced to one DM per (owner,
+ * provider, type) per 24h via the persistent NotificationState: the window is CLAIMED atomically
+ * right before the send (exactly one claimer wins, even across pods on a shared Postgres) and
+ * released on a send failure so the next event retries. Honest trade: a process that claims and
+ * then crashes before the send loses that window's DM (the next window retries) — accepted over
+ * the alternative, where two pods can double-DM. The provider is registry-validated before
+ * anything is rendered or
+ * persisted (SEC-4), and every interpolated value is escaped at render (SEC-5). No token material
+ * anywhere. The refresh_dead reconnect button is an ACTION (RECONNECT_ACTION), not a baked-in
+ * authorize URL: a consent state lives 10 minutes and this DM may be read hours later, so the
+ * state is minted fresh on click (see the handler in registerCommands) — otherwise the 24h
+ * debounce would leave a dead link with no recovery path. Exported for tests; createVouchr wires
+ * it with the same client resolution the post-OAuth confirmation DM uses.
+ */
+export function healthNotifier(deps: {
+  registry: ProviderRegistry;
+  audit: Audit;
+  state: NotificationState;
+  clientFor: (identity: SlackIdentity) => Promise<WebClient | null>;
+}): (e: CredentialHealthEvent) => Promise<void> {
+  return async (e) => {
+    if (e.type === 'expired') return; // deleted: nothing actionable to reconnect yet
+    if (!deps.registry.has(e.provider)) return; // stale row for an unregistered provider (SEC-4 gate)
+    const provider = deps.registry.get(e.provider);
+    const recipient = e.owner.kind === 'user'
+      ? e.owner.id
+      : await deps.audit.lastChannelConfigActor(e.owner.teamId, e.owner.id, e.provider);
+    if (!recipient) return; // channel cred with no known configuring admin: skip
+    const identity: SlackIdentity = { enterpriseId: e.owner.enterpriseId ?? null, teamId: e.owner.teamId, userId: recipient };
+    const client = await deps.clientFor(identity);
+    if (!client) return;
+    const p = escapeMrkdwn(e.provider); // SEC-5, even for a registry-validated id
+    const where = e.owner.kind === 'channel' ? ` in <#${escapeMrkdwn(e.owner.id)}>` : '';
+    let text: string;
+    let blocks: unknown[] | undefined;
+    if (e.type === 'refresh_dead') {
+      if (e.owner.kind === 'user') {
+        text = `Your ${p} connection stopped working and needs to be reconnected.`;
+        const intro = { type: 'section', text: { type: 'mrkdwn', text: `:warning: Your *${p}* connection stopped working and needs to be reconnected.` } };
+        // Key providers have no OAuth authorize URL: reuse the key-setup prompt instead. (Today only
+        // OAuth creds can refresh at all, so this branch is defensive symmetry, not a live path.)
+        blocks = provider.credential === 'key'
+          ? [intro, ...keySetupBlocks(e.provider)]
+          : [intro, {
+              type: 'actions',
+              elements: [{
+                type: 'button',
+                text: { type: 'plain_text', text: `Connect ${e.provider}`, emoji: true },
+                action_id: RECONNECT_ACTION,
+                value: e.provider, // forgeable — the click handler re-validates against the registry
+                style: 'primary',
+              }],
+            }];
+      } else {
+        text = `The shared ${p} connection${where} stopped working and needs to be reconfigured. Use \`/vouchr configure ${p}\` there.`;
+      }
+    } else {
+      const hours = Math.max(1, Math.round(((e.expiresAt ?? Date.now()) - Date.now()) / 3_600_000));
+      text = e.owner.kind === 'user'
+        ? `Your ${p} connection expires in ~${hours}h. Reconnect to keep using it.`
+        : `The shared ${p} connection${where} expires in ~${hours}h. Reconfigure it (\`/vouchr configure ${p}\`) to keep it working.`;
+    }
+    // Claim the 24h window LAST, right before the send (all skip-paths above claim nothing), so
+    // exactly one claimer — across pods too — proceeds. On a failed send, release OUR claim so the
+    // next event retries. Crash between claim and send = that window's DM is lost (next window
+    // retries): the deliberate trade against cross-pod duplicate DMs.
+    const claimedAt = Date.now();
+    if (!(await deps.state.claim(e.owner, e.provider, e.type, claimedAt))) return; // someone already notified this window
+    try {
+      await client.chat.postMessage({ channel: recipient, text, ...(blocks ? { blocks: blocks as any } : {}) });
+    } catch (err) {
+      await deps.state.release(e.owner, e.provider, e.type, claimedAt).catch(() => undefined);
+      throw err;
+    }
+  };
+}
+
 export async function createVouchr(opts: VouchrOptions) {
   const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
   const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
@@ -985,6 +1089,20 @@ export async function createVouchr(opts: VouchrOptions) {
     }
   }
 
+  // #117 credential-health wiring. Default: DM the owner (healthNotifier), via the same per-workspace
+  // client resolution as the post-OAuth confirmation DM, debounced by the persistent notification_state
+  // table. An operator-supplied onCredentialHealth REPLACES the default DMs (like `isAdmin`). Either
+  // way the hook is fire-and-forget: a throwing/failing notifier never affects what fired it.
+  const notifyState = new NotificationState(db);
+  const notifyHealth = healthNotifier({ registry, audit, state: notifyState, clientFor: confirmClientFor });
+  // Serialize deliveries through one in-process queue: shouldNotify→send→markNotified is
+  // check-then-act, so two definitive failures milliseconds apart (sequential tool calls; the
+  // single-flight map only dedupes CONCURRENT refreshes) would otherwise both pass the check and
+  // double-DM. Cross-pod remains at-least-once (the state table narrows, not eliminates, the race).
+  let healthQueue: Promise<void> = Promise.resolve();
+  const health: CredentialHealthHook = opts.onCredentialHealth
+    ?? ((e) => { healthQueue = healthQueue.then(() => notifyHealth(e)).catch(() => undefined); });
+
   /** Bolt global middleware: attach `context.vouchr` for each request with a user. */
   const middleware = async (args: any): Promise<void> => {
     const identity = resolveIdentity(args);
@@ -1020,6 +1138,7 @@ export async function createVouchr(opts: VouchrOptions) {
         unionRequiresOptIn,
         unionNotified,
         auditSink,
+        health,
         previews,
       });
     }
@@ -1069,7 +1188,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, auditSink, previews,
+      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, auditSink, health, previews,
     });
   }
 
@@ -1464,6 +1583,32 @@ export async function createVouchr(opts: VouchrOptions) {
       await client.views.open({ trigger_id: body.trigger_id, view: userKeyModal(provider) });
     });
 
+    // #117 refresh_dead DM's Connect button: mint a FRESH single-use consent state on click and
+    // swap the DM for the normal connect prompt. Late-minting is the point — a state lives 10
+    // minutes (STATE_TTL_MS) and the DM may sit unread for hours, and the 24h DM debounce means a
+    // dead baked-in link would have no recovery path. The button value is forgeable (SEC-3/SEC-4):
+    // validate it against the registry before anything, and mint for the ACTING user from the
+    // Slack-verified payload — exactly what that user could do themselves via connect(). DM
+    // context ⇒ channel=null, so the callback records no union opt-in.
+    app.action(RECONNECT_ACTION, async ({ ack, body, respond }: any) => {
+      await ack();
+      const identity = resolveIdentity({ body });
+      const providerId = body.actions?.[0]?.value;
+      if (!identity || typeof providerId !== 'string' || !registry.has(providerId)) return;
+      const provider = registry.get(providerId);
+      // No OAuth to mint for service/key tools (the DM never offers this button for them; forged-safe).
+      if (provider.identity === 'service' || provider.credential === 'key') return;
+      const { authorizeUrl } = await consent.begin(identity, provider, redirectUri, null);
+      emit({ type: 'connect_prompted', provider: providerId });
+      if (respond) {
+        await respond({
+          replace_original: true,
+          text: `Connect your ${providerId} account`,
+          blocks: connectBlocks(providerId, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions }) as any,
+        });
+      }
+    });
+
     // Thread-scoped session approval: the user clicks "Allow … here" → grant for THIS thread only.
     // provider + thread come from the (verified) button value; channel/user/team from the payload.
     app.action(APPROVE_SESSION_ACTION, async ({ ack, body, respond }: any) => {
@@ -1554,7 +1699,7 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /** Delete every connection past its TTL + clear stale consent + expired thread sessions. Run on a timer. */
   async function sweep(): Promise<number> {
-    const n = await sweepExpired(vault, audit, consent, sink, unionOptin);
+    const n = await sweepExpired(vault, audit, consent, sink, unionOptin, health);
     await sessions.sweepExpired();
     return n;
   }

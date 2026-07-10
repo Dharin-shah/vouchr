@@ -3,8 +3,10 @@ import type { Vault, StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
-import { refreshToken } from './tokens';
+import { refreshToken, TokenEndpointError } from './tokens';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
+import { safeEmit } from './safe-emit';
+import type { CredentialHealthHook } from './health';
 import { randomUUID } from 'node:crypto';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided. */
@@ -50,7 +52,11 @@ export type VouchrEvent =
   | { type: 'revoked'; provider: string; ok: boolean }
   | { type: 'expired'; count: number };
 
-/** Fire-and-forget event sink. Sync; a throwing sink must never affect request behavior. */
+/** Fire-and-forget event sink. May be sync or async (`=> void` admits async functions — TS's
+ *  void-callback rule); a throwing OR rejecting sink must never affect request behavior — every
+ *  fire point routes through safeEmit, which swallows both failure shapes. Deliberately typed
+ *  `=> void`, not `void | Promise<void>`: the union would reject the ubiquitous concise-arrow
+ *  consumer `(e) => arr.push(e)` (void-substitution only applies to a bare `void` return). */
 export type EventSink = (e: VouchrEvent) => void;
 
 /**
@@ -162,6 +168,10 @@ export class ConnectionHandle {
     // `inflight`) so the budget accumulates across requests; the adapters pass one store per
     // createVouchr/createBroker instance. Default = per-instance, fine for direct construction in tests.
     private rateLimits: RateLimitStore = new MemoryRateLimitStore(),
+    // #117 credential-health hook: fired (post-rollback, outside the refresh lock) when a refresh
+    // fails DEFINITIVELY (see doRefresh). Carries owner identity + provider, never token material —
+    // deliberately separate from `sink`, whose no-user-ids contract is load-bearing. Default no-op.
+    private health: CredentialHealthHook = () => {},
   ) {}
 
   /** The identity key for this handle's (owner, provider) pair — the single-flight refresh map and
@@ -189,13 +199,9 @@ export class ConnectionHandle {
     return a ? { triggeredBy: a } : {};
   }
 
-  /** Fire the sink, swallowing any error. A bad sink must never break a request. */
+  /** Fire the sink, swallowing any sync throw or async rejection. A bad sink must never break a request. */
   private emit(e: VouchrEvent): void {
-    try {
-      this.sink(e);
-    } catch {
-      // ignore: observability is best-effort, never fatal
-    }
+    safeEmit(this.sink, e);
   }
 
   /**
@@ -329,25 +335,22 @@ export class ConnectionHandle {
     }
   }
 
-  /** Fire the audit stream sink, swallowing any error. Lossy convenience copy; the table is authoritative. */
+  /** Fire the audit stream sink, swallowing any sync throw or async rejection (safeEmit). Lossy
+   *  convenience copy; the table is authoritative. */
   private emitAudit(action: VouchrAuditEvent['action'], egressHost: string, status: number, method?: string): void {
-    try {
-      this.auditSink({
-        ts: new Date().toISOString(),
-        teamId: this.acting.teamId,
-        userId: this.acting.userId, // raw actor id, never a token
-        provider: this.provider.id,
-        ownerKind: this.owner.kind,
-        ownerId: this.owner.id,
-        action,
-        egressHost,
-        method,
-        status,
-        jti: randomUUID(),
-      });
-    } catch {
-      // ignore: best-effort, never fatal
-    }
+    safeEmit(this.auditSink, {
+      ts: new Date().toISOString(),
+      teamId: this.acting.teamId,
+      userId: this.acting.userId, // raw actor id, never a token
+      provider: this.provider.id,
+      ownerKind: this.owner.kind,
+      ownerId: this.owner.id,
+      action,
+      egressHost,
+      method,
+      status,
+      jti: randomUUID(),
+    });
   }
 
   async account(): Promise<string | null> {
@@ -559,6 +562,19 @@ export class ConnectionHandle {
       rotated = true;
       refreshMs = Date.now() - r0;
       return refreshed.accessToken;
+    }).catch((e: unknown) => {
+      // #117: a DEFINITIVE token-endpoint failure (invalid_grant / 400/401 — the one classification,
+      // on TokenEndpointError in tokens.ts) means the stored refresh token is dead and only a
+      // reconnect fixes it. Fire the health hook HERE — after withRefreshLock has rolled back and
+      // released the advisory lock, mirroring the post-commit audit placement below: a hook must
+      // never run inside the lock. The instanceof gate also means a rollback for any OTHER reason
+      // (a DB write failure after a successful /token call, a lock timeout) never claims the token
+      // is dead, and transient failures (network throw, 5xx, timeout) never fire. safeEmit swallows
+      // a throwing hook; the original error always re-throws unchanged.
+      if (e instanceof TokenEndpointError && e.definitive) {
+        safeEmit(this.health, { type: 'refresh_dead', owner: this.owner, provider: this.provider.id });
+      }
+      throw e;
     });
     // Post-commit, best-effort: a failed audit write must not surface as a failed refresh nor undo it.
     if (rotated) {

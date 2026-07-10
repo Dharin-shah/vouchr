@@ -24,6 +24,14 @@ export interface Db {
    * both consuming a rotating refresh token.
    */
   withRefreshLock?<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T>;
+  /**
+   * Run `fn`'s statements atomically (BEGIN … COMMIT, ROLLBACK on throw), with `fn`'s Db bound to
+   * the transaction. Used where one logical mutation spans two tables (e.g. a connection write +
+   * its notification_state purge, #117) so a mid-sequence failure can't half-commit. Optional only
+   * so minimal test stubs keep compiling — BOTH shipped backends implement it; callers without it
+   * fall back to sequential statements (pre-#117 behavior).
+   */
+  transaction?<T>(fn: (txDb: Db) => Promise<T>): Promise<T>;
 }
 
 export interface DbOptions {
@@ -34,12 +42,61 @@ export interface DbOptions {
 }
 
 class SqliteDb implements Db {
+  // FIFO mutex over the ONE better-sqlite3 connection. EVERY external operation — ordinary
+  // get/all/run/exec AND whole transaction() blocks — runs through this queue in strict arrival
+  // order. Without it, a statement awaited by another handler while a transaction holds BEGIN
+  // would execute on the same connection, silently JOIN that transaction, report success — and
+  // then vanish if the transaction rolls back (reproduced data loss, not a theoretical race).
+  // A promise chain is inherently fair: each operation appends behind the current tail, so a
+  // long-running transaction can never be overtaken.
+  private queue: Promise<unknown> = Promise.resolve();
+  constructor(private db: BetterSqlite3.Database) {}
+
+  /** Append `op` to the connection queue (FIFO). A failed op must not poison the queue. */
+  private enqueue<T>(op: () => T | Promise<T>): Promise<T> {
+    const run = this.queue.then(op);
+    this.queue = run.catch(() => undefined);
+    return run;
+  }
+
+  async get(sql: string, params: any[] = []) { return this.enqueue(() => this.db.prepare(sql).get(...params) as any); }
+  async all(sql: string, params: any[] = []) { return this.enqueue(() => this.db.prepare(sql).all(...params) as any[]); }
+  async run(sql: string, params: any[] = []) { return this.enqueue(() => ({ changes: this.db.prepare(sql).run(...params).changes })); }
+  async exec(sql: string) { await this.enqueue(() => { this.db.exec(sql); }); } // migrations queue too
+
+  async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> {
+    // Holds the queue for the WHOLE transaction, so no outside statement can interleave into the
+    // open BEGIN…COMMIT. `fn` receives a BOUND CHILD Db that executes directly against the
+    // connection (reentrant — it must bypass the queue its owner already holds, or the first
+    // in-transaction statement would deadlock), mirroring PgClientDb so store code stays
+    // backend-agnostic. Nested transaction() on the child runs inline, like PgClientDb.
+    return this.enqueue(async () => {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const out = await fn(new SqliteTxDb(this.db));
+        this.db.exec('COMMIT');
+        return out;
+      } catch (e) {
+        try { this.db.exec('ROLLBACK'); } catch { /* already rolled back (e.g. by SQLite itself) */ }
+        throw e;
+      }
+    });
+  }
+
+  async close() { await this.enqueue(() => { this.db.close(); }); } // after every queued op drains
+}
+
+/** A Db bound INSIDE an open SQLite transaction: executes directly on the connection (the owning
+ *  SqliteDb.transaction already holds the queue for its whole duration). Mirrors PgClientDb. */
+class SqliteTxDb implements Db {
   constructor(private db: BetterSqlite3.Database) {}
   async get(sql: string, params: any[] = []) { return this.db.prepare(sql).get(...params) as any; }
   async all(sql: string, params: any[] = []) { return this.db.prepare(sql).all(...params) as any[]; }
   async run(sql: string, params: any[] = []) { return { changes: this.db.prepare(sql).run(...params).changes }; }
   async exec(sql: string) { this.db.exec(sql); }
-  async close() { this.db.close(); }
+  /** Already inside an open transaction: run inline, atomic with the outer tx (like PgClientDb). */
+  async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> { return fn(this); }
+  async close() { /* lifecycle owned by SqliteDb.transaction; nothing to do here */ }
 }
 
 // Positional rewrite. Our SQL never contains a literal '?', so a plain replace is safe.
@@ -92,6 +149,22 @@ class PgDb implements Db {
     }
   }
 
+  /** Plain transaction on one checked-out client (same shape as withRefreshLock, minus the lock). */
+  async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const out = await fn(new PgClientDb(client));
+      await client.query('COMMIT');
+      return out;
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
   async close() {
     await this.pool.end();
     if (this.refreshPool) await this.refreshPool.end();
@@ -105,6 +178,8 @@ class PgClientDb implements Db {
   async all(sql: string, params: any[] = []) { return (await this.client.query(toPositional(sql), params)).rows; }
   async run(sql: string, params: any[] = []) { return { changes: (await this.client.query(toPositional(sql), params)).rowCount ?? 0 }; }
   async exec(sql: string) { await this.client.query(sql); }
+  /** Already inside an open transaction (BEGIN'd by the owner): run inline, atomic with the outer tx. */
+  async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> { return fn(this); }
   async close() { /* lifecycle owned by withRefreshLock (BEGIN/COMMIT/release); nothing to do here */ }
 }
 
@@ -113,8 +188,9 @@ class PgClientDb implements Db {
  * Bump it whenever the schema changes shape. Version 1 = the schema at the release that introduced
  * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
  * Version 2 = + the `union_optin` table (#112, purely additive).
+ * Version 3 = + the `notification_state` table (#117, purely additive).
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -233,6 +309,16 @@ function schema(blob: string, int: string): string {
       provider TEXT NOT NULL,
       created_at ${int} NOT NULL,
       PRIMARY KEY (team_id, channel_id, user_id, provider)
+    );
+
+    CREATE TABLE IF NOT EXISTS notification_state (
+      team_id TEXT NOT NULL,
+      owner_kind TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      type TEXT NOT NULL,
+      last_notified_at ${int} NOT NULL,
+      PRIMARY KEY (team_id, owner_kind, owner_id, provider, type)
     );
 
     CREATE TABLE IF NOT EXISTS audit (

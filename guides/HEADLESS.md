@@ -173,6 +173,20 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
   defaults to a durable `DbReplayStore`, so a `jti` spent on one pod is rejected on the others. You
   may still pass a custom `replayStore`.
 - **Not connected yet?** Route the user back through the Slack connect/approval flow.
+- **Credential health.** There is no Slack client here, so nothing is DM'd for you: pass
+  `onCredentialHealth` (a `BrokerOptions` field, e.g. `buildBrokerServer(env, { onCredentialHealth })`)
+  to hear `refresh_dead` — a DEFINITIVELY dead refresh token (`invalid_grant`, or a bare 400/401
+  from the token endpoint; never a transient network blip, nor an operator-side error such as
+  `invalid_client` — see `TokenEndpointError`). The same hook passed to `sweepExpired` also fires
+  `expiring_soon` (within 72h of the idle/max-age TTL ceiling, for dimensions longer than the 72h
+  window; re-fired on every sweep pass) and
+  `expired` (the sweep deleted the connection). Events carry the owning principal + provider, never
+  token material. Debounce your notifier with the exported `NotificationState`: `claim()` the 24h
+  window atomically (exactly one winner per (owner, provider, type), across replicas sharing a
+  Postgres), send, and `release()` the claim if the send fails so the next event retries; reconnect
+  and disconnect clear the state. Known trade: a replica that claims and then crashes before
+  sending loses that window's notification (the next window retries) — deliberate, because the
+  alternative is cross-replica duplicates.
 - **Probes.** Two unauthenticated endpoints for orchestrators: `GET /healthz` (liveness — a bare
   `{"ok":true}` whenever the process is serving, no db touched) and `GET /readyz` (readiness —
   `{"ok":true}` only if a `SELECT 1` round-trip succeeds within ~2s, else `503 {"ok":false}`). Both

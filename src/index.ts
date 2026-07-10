@@ -35,6 +35,12 @@ export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
 // deployment can plug a shared backend via VouchrOptions/BrokerOptions.rateLimitStore.
 export { RateLimitedError } from './core/rateLimit';
 export type { RateLimitStore } from './core/rateLimit';
+// #117 credential-health notifications: the hook types for VouchrOptions/BrokerOptions
+// `onCredentialHealth`, the persistent per-(owner, provider, type) DM debounce store for custom
+// notifiers, and the typed token-endpoint error carrying the definitive-vs-transient classification.
+export { NotificationState, HEALTH_NOTIFY_DEBOUNCE_MS } from './core/health';
+export type { CredentialHealthEvent, CredentialHealthHook } from './core/health';
+export { TokenEndpointError } from './core/tokens';
 export type { VouchrAuditEvent, AuditSink } from './core/audit';
 export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';

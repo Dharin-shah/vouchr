@@ -34,6 +34,7 @@ async function assertSeedIntact(db: Db): Promise<void> {
   assert.equal(await count(db, 'audit'), 2);
   // The migration actually ran: v0.2.0 had no channel_preview table; current schema does.
   assert.equal(await count(db, 'channel_preview'), 0);
+  assert.equal(await count(db, 'notification_state'), 0); // #117 table exists post-migration, empty
   // The bootstrap assumption: a marker-less DB with existing tables is a pre-marker (≤ v0.2.x)
   // deploy; after the idempotent migrations it IS at the current version, and gets stamped so.
   const marker = (await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`)) as any;
@@ -224,7 +225,7 @@ test('sqlite: fresh DB gets the schema_version marker; a newer-schema DB is refu
 // #112 upgrade path: a database stamped exactly schema version 1 (this build's schema minus the
 // union_optin table) must open cleanly, get the additive table, and be re-stamped to the current
 // version — the exact state every pre-#112 deployment is in on its first post-upgrade boot.
-test('sqlite: a schema-version-1 database (pre-union_optin) upgrades in place: marker -> 2, union_optin usable', async () => {
+test('sqlite: a schema-version-1 database (pre-union_optin) upgrades in place: marker -> current, union_optin usable', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'vouchr-migration-'));
   const file = join(dir, 'v1.db');
   try {
@@ -244,6 +245,40 @@ test('sqlite: a schema-version-1 database (pre-union_optin) upgrades in place: m
       // The additive migration created the table and it is immediately usable.
       await db.run(`INSERT INTO union_optin (team_id, channel_id, user_id, provider, created_at) VALUES ('T1','C1','U1','github',1)`);
       const n = (await db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM union_optin`)) as any;
+      assert.equal(Number(n?.n), 1);
+    } finally {
+      await db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// #117 upgrade path: a database stamped exactly schema version 2 (this build's schema minus the
+// notification_state table) must open cleanly, get the additive table, and be re-stamped to the
+// current version — the exact state every pre-#117 deployment is in on its first post-upgrade boot.
+test('sqlite: a schema-version-2 database (pre-notification_state) upgrades in place: marker -> 3, notification_state usable', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vouchr-migration-'));
+  const file = join(dir, 'v2.db');
+  try {
+    // Fabricate the v2 state: current schema, then drop the #117 table and stamp the marker at 2
+    // (v2 == v3 minus notification_state by construction — see SCHEMA_VERSION's doc).
+    const db0 = await openDb({ dbPath: file });
+    await db0.close();
+    const raw = new BetterSqlite3(file);
+    raw.exec(`DROP TABLE notification_state`);
+    raw.prepare(`UPDATE meta SET value='2' WHERE key='schema_version'`).run();
+    raw.close();
+
+    const db = await openDb({ dbPath: file }); // 2 <= SCHEMA_VERSION -> proceeds, never refuses
+    try {
+      const marker = (await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`)) as any;
+      assert.equal(Number(marker?.value), SCHEMA_VERSION); // re-stamped to the current version
+      // The additive migration created the table and it is immediately usable.
+      await db.run(
+        `INSERT INTO notification_state (team_id, owner_kind, owner_id, provider, type, last_notified_at) VALUES ('T1','user','U1','github','refresh_dead',1)`,
+      );
+      const n = (await db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM notification_state`)) as any;
       assert.equal(Number(n?.n), 1);
     } finally {
       await db.close();
