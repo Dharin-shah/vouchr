@@ -30,7 +30,7 @@ import {
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
   previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
-  escapeMrkdwn,
+  escapeMrkdwn, connectedDmText,
   type Connection, type ConfigAdminRow,
 } from './blocks';
 
@@ -1244,7 +1244,8 @@ export async function createVouchr(opts: VouchrOptions) {
           await client.chat
             .postMessage({
               channel: result.identity.userId,
-              text: `✅ ${result.provider} connected${result.account ? ` as ${result.account}` : ''}.`,
+              // SEC-5: connectedDmText escapes the provider-reported account label.
+              text: connectedDmText(result.provider, result.account),
             })
             .catch(() => undefined);
         }

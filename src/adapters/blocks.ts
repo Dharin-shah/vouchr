@@ -510,26 +510,37 @@ export function connectedBlocks(
   provider: string,
   o: { channel: string | null; scope?: string; account?: string },
 ): unknown[] {
-  const where = o.channel ? `<#${o.channel}>` : 'your DMs';
-  const scope = o.scope ? ` (${o.scope})` : '';
-  const account = o.account ? `Connected as *${o.account}*.\n` : '';
+  // Escape like connectionLine (SEC-5): the account label comes from the provider's accountProbe
+  // and the scope string from its token response — both provider-controlled; no value here may
+  // render as a forged `<…|link>` or `<!channel>`.
+  const p = escapeMrkdwn(provider);
+  const where = o.channel ? `<#${escapeMrkdwn(o.channel)}>` : 'your DMs';
+  const scope = o.scope ? ` (${escapeMrkdwn(o.scope)})` : '';
+  const account = o.account ? `Connected as *${escapeMrkdwn(o.account)}*.\n` : '';
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text:
-          `:white_check_mark: *${provider} connected*\n` +
+          `:white_check_mark: *${p} connected*\n` +
           account +
-          `Vouchr can now act as you on ${provider} in ${where}${scope}. Your token is stored ` +
+          `Vouchr can now act as you on ${p} in ${where}${scope}. Your token is stored ` +
           `encrypted and is never shown to the agent or posted in Slack.`,
       },
     },
     {
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `Disconnect any time with \`/vouchr disconnect ${provider}\`.` }],
+      elements: [{ type: 'mrkdwn', text: `Disconnect any time with \`/vouchr disconnect ${p}\`.` }],
     },
   ];
+}
+
+/** One-line post-OAuth confirmation DM ("best-effort nudge back into Slack"). Same SEC-5 rule as
+ *  connectionLine: the account label is provider-reported (accountProbe), so `<!channel>` or
+ *  `<https://evil|click>` must render inert. One renderer, one escape site, testable. */
+export function connectedDmText(provider: string, account: string | null): string {
+  return `✅ ${escapeMrkdwn(provider)} connected${account ? ` as ${escapeMrkdwn(account)}` : ''}.`;
 }
 
 /** Message shown when a user declines consent (or consent is required and not granted). */

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   connectBlocks,
   connectedBlocks,
+  connectedDmText,
   connectedHtml,
   consentDeniedBlocks,
   statusBlocks,
@@ -33,6 +34,32 @@ test('connectedBlocks: shows the connected account and granted scope', () => {
   const b = connectedBlocks('github', { channel: 'C123', scope: 'repo read:user', account: 'octocat' }) as any[];
   assert.match(j(b), /Connected as \*octocat\*/);
   assert.match(j(b), /repo read:user/); // granted scope from the token response
+});
+
+test('connectedBlocks: escapes provider-controlled markup in account + scope (SEC-5, #176)', () => {
+  // accountProbe and the token-response scope string are provider-controlled: a hostile value like
+  // `<!channel>` or `<https://evil|click>` must render inert, never as a live mention/link.
+  const b = connectedBlocks('<https://evil|gh>', {
+    channel: 'C123',
+    scope: '<https://evil|scopes>',
+    account: '<!channel> <https://evil|click>',
+  }) as any[];
+  const s = j(b);
+  assert.ok(!s.includes('<!channel>')); // no live @channel broadcast
+  assert.ok(!s.includes('<https://evil|click>')); // no forged link from the account label
+  assert.ok(!s.includes('<https://evil|scopes>')); // nor from the scope string
+  assert.ok(!s.includes('<https://evil|gh>')); // provider id escaped too (defense in depth)
+  assert.match(s, /&lt;!channel&gt;/); // present, but escaped (inert)
+});
+
+test('connectedDmText: the post-OAuth confirmation DM escapes the account label (SEC-5, #176)', () => {
+  // This is the exact string bolt's callback route DMs to the connecting user; the DM path has no
+  // offline seam (real WebClient), so the renderer is the testable escape site.
+  const t = connectedDmText('github', '<!channel> <https://evil|click>');
+  assert.ok(!t.includes('<!channel>'));
+  assert.ok(!t.includes('<https://evil|click>'));
+  assert.match(t, /&lt;!channel&gt;/); // escaped, inert
+  assert.equal(connectedDmText('github', null), '✅ github connected.'); // no-account shape unchanged
 });
 
 test('connectedHtml: the live post-connect page shows account + granted scopes', () => {

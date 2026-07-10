@@ -201,6 +201,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Unescaped provider-controlled labels in two post-connect surfaces** (#176). The OAuth-callback
+  confirmation DM and `connectedBlocks` interpolated the provider-reported external account label
+  (and, in `connectedBlocks`, the token-response scope string) into mrkdwn raw, so a hostile
+  provider's account probe could render a live `<!channel>` broadcast or a forged
+  `<https://evil|click>` link (SEC-5). Both now escape via `escapeMrkdwn`, matching
+  `connectionLine`.
+
 - **Connection leak on refresh-signalling failure** (#168). When a provider call came back `401`
   and the refresh signalling itself threw (vault/db error), the discarded 401 response body was
   never read or cancelled, pinning its socket until GC. The injector now cancels the abandoned
