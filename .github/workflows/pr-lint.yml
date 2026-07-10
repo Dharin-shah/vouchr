@@ -23,10 +23,10 @@ jobs:
 
       - name: "PROC-2: description states that typecheck and tests pass"
         run: |
-          { printf '%s' "$BODY" | grep -qF 'npm run typecheck' \
-            && printf '%s' "$BODY" | grep -qF 'npm test' \
-            && printf '%s' "$BODY" | grep -qiE 'pass'; } \
-            || { echo "::error::PR description must state that \`npm run typecheck\` and \`npm test\` pass (AGENTS.md PROC-2); copy the Checks line from AGENTS.md."; exit 1; }
+          CHECKS_LINE='Checks: `npm run typecheck` and `npm test` pass locally.'
+          body_lines() { printf '%s\n' "$BODY" | sed -e 's/\r$//' -e '/^[[:space:]]*$/d'; }
+          body_lines | grep -Fxq "$CHECKS_LINE" \
+            || { echo "::error::PR description must include the exact Checks line from AGENTS.md PROC-2: $CHECKS_LINE"; exit 1; }
 
       - name: "PROC-3/PROC-4: sign-off line; agent PRs end with the canary"
         run: |
@@ -34,10 +34,13 @@ jobs:
           CANARY='canary: vouchr-agents-md-v1 (agent-generated)'
           HUMAN_SIGNOFF_RE='^Signed-off-by: .+ <[^&<>]+@[^&<>]+> — reviewed line-by-line[[:space:]]*$'
           body_lines() { printf '%s\n' "$BODY" | sed -e 's/\r$//' -e '/^[[:space:]]*$/d'; }
-          last_line=$(body_lines | tail -n 1)
-          if printf '%s\n' "$BODY" | grep -qF "$AGENT_SIGNOFF"; then
-            [ "$last_line" = "$CANARY" ] \
-              || { echo "::error::agent-authored PR must end with the exact canary line (AGENTS.md PROC-4): $CANARY"; exit 1; }
+          lines=$(body_lines)
+          [ -n "$lines" ] || { echo "::error::PR description must not be empty."; exit 1; }
+          last_line=$(printf '%s\n' "$lines" | tail -n 1)
+          prev_line=$(printf '%s\n' "$lines" | tail -n 2 | head -n 1)
+          if [ "$last_line" = "$CANARY" ]; then
+            [ "$prev_line" = "$AGENT_SIGNOFF" ] \
+              || { echo "::error::agent-authored PR must end with the exact sign-off line followed by the canary (AGENTS.md PROC-3/PROC-4)."; exit 1; }
           elif printf '%s' "$last_line" | grep -qE "$HUMAN_SIGNOFF_RE"; then
             exit 0
           else
