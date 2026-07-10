@@ -1256,6 +1256,38 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
   }
 });
 
+// #112: a broker-hosted connect prompted from a union-mode channel records the union opt-in at the
+// callback, exactly like the Bolt path — the consent row carries the SIGNED channel from /v1/connect.
+test('#112 broker callback from a union-mode channel records the union opt-in row', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const channelConfig = new ChannelConfig(db);
+  await channelConfig.setMode('T1', 'C_UNION', 'acme', 'union');
+  const server = createBroker({
+    providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig,
+    baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',
+  });
+  await new Promise<void>((r) => server.listen(0, r));
+  const port = (server.address() as any).port;
+  const real = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'tok_new' }),
+    { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  try {
+    const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channel: 'C_UNION' }), SECRET) });
+    const cb = await getRaw(port, `/oauth/callback?code=abc123&state=${encodeURIComponent(c.json.state)}`);
+    assert.equal(cb.status, 200);
+    const row = (await db.get(`SELECT * FROM union_optin`)) as any;
+    assert.equal(row?.team_id, 'T1');
+    assert.equal(row?.channel_id, 'C_UNION');
+    assert.equal(row?.user_id, 'U1');
+    assert.equal(row?.provider, 'acme');
+  } finally {
+    globalThis.fetch = real;
+    server.close();
+  }
+});
+
 test('#52 callback with provider denial (?error) audits consent_denied and stores no token', async () => {
   const events: any[] = [];
   const { server, port, db } = await makeOauthBroker({ auditSink: (e) => events.push(e) });

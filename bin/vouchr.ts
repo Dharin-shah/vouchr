@@ -22,6 +22,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
+import { UnionOptin } from '../src/core/unionOptin';
 import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
 import { loadProviders } from './providerConfig';
 
@@ -183,6 +184,7 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
   const audit = new Audit(db);
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
+  const unionOptin = new UnionOptin(db); // #112: break-glass also drops the owner's union opt-ins
 
   let localFailures = 0;
   let upstreamAttempted = 0;
@@ -192,7 +194,7 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
     // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on one row
     // never strands the rest of a break-glass sweep.
     try {
-      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider);
+      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider, unionOptin);
       if (!r.removed) localFailures++;
       if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
       else upstreamSkipped++;

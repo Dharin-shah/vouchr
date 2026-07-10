@@ -134,7 +134,7 @@ export class Audit {
   }
 
   async record(
-    action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'rate_limited' | 'config' | 'session' | 'preview',
+    action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'rate_limited' | 'config' | 'session' | 'preview' | 'union',
     i: SlackIdentity,
     provider: string,
     meta: AuditMeta = {},

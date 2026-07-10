@@ -14,6 +14,7 @@ import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '..
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
+import { UnionOptin } from '../../core/unionOptin';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
@@ -310,6 +311,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // owns the code exchange — the broker adds no crypto/state logic itself. Cheap Db wrappers.
   const consent = new Consent(opts.db);
   const sessions = new SessionGrants(opts.db);
+  const unionOptin = new UnionOptin(opts.db); // #112: disconnect/offboard purge union opt-ins too
   const callbackPath = opts.callbackPath ?? '/oauth/callback';
   const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
 
@@ -575,7 +577,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     const claims = await verify(body.identityToken);
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    const { removed, ok } = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId);
+    const { removed, ok } = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId, unionOptin);
     return { ok, revoked: removed ? [providerId] : [] };
   }
 
@@ -601,7 +603,7 @@ export function createBroker(opts: BrokerOptions): http.Server {
       return { ok: true, revoked: summary.flatMap((s) => s.providers) };
     }
     const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
-    const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions);
+    const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions, unionOptin);
     return { ok: true, revoked: providers };
   }
 
@@ -782,7 +784,10 @@ export function createBroker(opts: BrokerOptions): http.Server {
   async function handleCallback(url: URL): Promise<{ status: number; html: string }> {
     const q = url.searchParams;
     const result = await handleOAuthCallback(
-      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink },
+      // channelConfig + unionOptin (#112): a broker-hosted connect prompted from a union-mode channel
+      // (the consent row carries the SIGNED channel from /v1/connect) records the union opt-in exactly
+      // like the Bolt callback. Inert when channelConfig isn't opted in.
+      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink, channelConfig: opts.channelConfig, unionOptin },
       q.get('code') ?? undefined,
       q.get('state') ?? undefined,
       q.get('error') ?? undefined,

@@ -7,6 +7,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Union mode: explicit opt-in + owner notification** (#112). New `createVouchr` option
+  `unionRequiresOptIn` — when `true`, `union` resolution only borrows channel members with an
+  explicit opt-in row for that (channel, provider), stored in the new `union_optin` table
+  (additive migration; schema version 2). Opt in by completing a Connect prompted from the union
+  channel (the OAuth callback records it via the consent row's channel, only when that channel is
+  in union mode) or with the new `/vouchr union join <provider>` (requires a connected credential,
+  else you get the Connect prompt); `/vouchr union leave <provider>` is effective on the next
+  resolution, and disconnect / offboarding / break-glass revoke purge opt-ins with the credential.
+  Joins/leaves are audited as a new `union` action (`{ channel, event: 'join'|'leave' }`).
+  Separately (regardless of the flag), when a borrowed union credential actually serves a request
+  by someone other than its owner, the owner gets a courtesy DM (who/where, `/vouchr audit` to review,
+  `/vouchr union leave` to stop), debounced per-process to one per (owner, provider, channel) per
+  hour and never sent on self-use; the audit table remains the record. New exports: `UnionOptin`,
+  `eligibleUnionMembers`, `joinUnion`, `leaveUnion` (also on `./headless`) — the broker trusts
+  the host's signed `actingMemberId`, so a headless host applies the same rule itself; broker-
+  hosted OAuth callbacks record opt-ins like Bolt ones when `channelConfig` is wired.
+
+  **DEPRECATION: `unionRequiresOptIn` defaults to `false`** (any connected member is borrowable —
+  today's behavior, byte-compatible). The default **flips to `true` at the next breaking
+  release** — set it explicitly now.
+
 - **Signed GHCR images** (#131) — the release workflow now keyless-signs every published
   `vouchr-broker` image with cosign (Sigstore), attaches a CycloneDX SBOM attestation, and embeds
   BuildKit SLSA provenance (`mode=max`). The job then verifies the signature and the attestation

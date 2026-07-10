@@ -221,6 +221,38 @@ test('sqlite: fresh DB gets the schema_version marker; a newer-schema DB is refu
   }
 });
 
+// #112 upgrade path: a database stamped exactly schema version 1 (this build's schema minus the
+// union_optin table) must open cleanly, get the additive table, and be re-stamped to the current
+// version — the exact state every pre-#112 deployment is in on its first post-upgrade boot.
+test('sqlite: a schema-version-1 database (pre-union_optin) upgrades in place: marker -> 2, union_optin usable', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vouchr-migration-'));
+  const file = join(dir, 'v1.db');
+  try {
+    // Fabricate the v1 state: current schema, then drop the #112 table and stamp the marker at 1
+    // (v1 == v2 minus union_optin by construction — see SCHEMA_VERSION's doc).
+    const db0 = await openDb({ dbPath: file });
+    await db0.close();
+    const raw = new BetterSqlite3(file);
+    raw.exec(`DROP TABLE union_optin`);
+    raw.prepare(`UPDATE meta SET value='1' WHERE key='schema_version'`).run();
+    raw.close();
+
+    const db = await openDb({ dbPath: file }); // 1 <= SCHEMA_VERSION -> proceeds, never refuses
+    try {
+      const marker = (await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`)) as any;
+      assert.equal(Number(marker?.value), SCHEMA_VERSION); // re-stamped to the current version
+      // The additive migration created the table and it is immediately usable.
+      await db.run(`INSERT INTO union_optin (team_id, channel_id, user_id, provider, created_at) VALUES ('T1','C1','U1','github',1)`);
+      const n = (await db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM union_optin`)) as any;
+      assert.equal(Number(n?.n), 1);
+    } finally {
+      await db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // -------------------------------------------------------------------------------------- postgres
 
 // Same invariants against a REAL Postgres, in a dedicated pg schema (search_path) so this leg

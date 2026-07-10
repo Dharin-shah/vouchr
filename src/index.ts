@@ -10,6 +10,11 @@ export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
 export { SessionGrants } from './core/session';
+// #112 union-mode explicit opt-in, exported (like SessionGrants) so a headless host can wire the
+// same opt-in purge into its own disconnect/offboard paths AND — since the broker trusts the host's
+// signed actingMemberId — apply the same candidate rule (eligibleUnionMembers) when it resolves
+// acting members itself. joinUnion/leaveUnion are the audited lifecycle pair. Also on `./headless`.
+export { UnionOptin, eligibleUnionMembers, joinUnion, leaveUnion } from './core/unionOptin';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
 // (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
 // `./headless`. SessionGrants/sweepExpired/TtlPolicy are already exported below.

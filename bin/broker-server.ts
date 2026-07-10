@@ -16,6 +16,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
+import { UnionOptin } from '../src/core/unionOptin';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
@@ -126,8 +127,9 @@ export async function buildBrokerServer(
   // #54 TTL sweep, wired the same way the Bolt path does (core sweepExpired + session-grant sweep).
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
+  const unionOptin = new UnionOptin(db); // #112: swept user creds drop their union opt-ins too
   const sweep = async (): Promise<number> => {
-    const n = await sweepExpired(vault, audit, consent);
+    const n = await sweepExpired(vault, audit, consent, undefined, unionOptin);
     await sessions.sweepExpired();
     return n;
   };
