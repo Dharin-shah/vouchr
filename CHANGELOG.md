@@ -273,7 +273,13 @@ All notable changes to this project are documented here. This project adheres to
   best-effort — a reconnect still purges fail-closed inside `upsert`), consent/session/opt-in
   cleanup failures no longer abort offboarding before the deletes, and enterprise-scoped
   `offboardUserEverywhere` discovery now includes rows stored with a NULL `enterprise_id`
-  (written outside Grid) instead of skipping those teams.
+  (written outside Grid) instead of skipping those teams. Offboarding also writes a durable
+  tombstone FIRST (new `offboard_tombstone` table, schema version 5, purely additive):
+  `Consent.consume` refuses any state minted at or before the user's offboarding, so a pending
+  "Connect" can never resurrect a credential even when the consent row-purge transiently fails
+  (a consent begun after offboarding — legitimate re-onboarding — still works). If both the
+  tombstone write and the purge fail, `offboardUser` throws after attempting every delete instead
+  of reporting success.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

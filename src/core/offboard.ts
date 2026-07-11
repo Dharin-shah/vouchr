@@ -100,11 +100,16 @@ export async function offboardUser(
   // credentials are gone, so their delegation rows must not linger.
   unionOptin?: UnionOptin,
 ): Promise<string[]> {
-  // Auxiliary cleanup, each isolated (GHSA-25m2 review): a consent/session/opt-in failure must
-  // never prevent the credential deletes below — they are the security-meaningful action. A missed
-  // purge here is bounded: consent states are single-use and expire in minutes, and session grants
-  // are TTL-bound; both are also reclaimed by the periodic sweep.
-  try { await consent.deleteForUser(identity); } catch { /* pending OAuth dies by its own TTL */ }
+  // The durable fail-closed gate FIRST (GHSA-25m2): once the tombstone is written, no consent
+  // minted at or before this instant can ever complete (Consent.consume checks it), so a pending
+  // "Connect" cannot resurrect a credential even if the row purge below transiently fails.
+  let gated = true;
+  try { await consent.markOffboarded(identity); } catch { gated = false; }
+  // Auxiliary cleanup, each isolated (GHSA-25m2 review): a cleanup failure must never prevent the
+  // credential deletes below — they are the security-meaningful action. Session grants are
+  // TTL-bound and swept; opt-ins are inert once the credentials below are gone.
+  let purged = true;
+  try { await consent.deleteForUser(identity); } catch { purged = false; }
   try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
   try { await unionOptin?.deleteForUser(identity); } catch { /* opt-ins are inert once the credentials below are gone */ }
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
@@ -122,6 +127,11 @@ export async function offboardUser(
     } catch {
       // this row's delete or audit failed (e.g. transient DB error): continue to the next row
     }
+  }
+  // Every delete above was attempted regardless — but if BOTH the tombstone and the row purge
+  // failed, the consent-resurrection gate is open and this offboarding must not report success.
+  if (!gated && !purged) {
+    throw new Error('offboarding incomplete: pending consent could not be invalidated; retry offboarding'); // no ids/secrets
   }
   return removed;
 }

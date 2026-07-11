@@ -192,8 +192,11 @@ class PgClientDb implements Db {
  * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
  *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
  *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
+ * Version 5 = + the `offboard_tombstone` table (GHSA-25m2, purely additive): the durable
+ *   fail-closed gate that keeps a pending consent from resurrecting an offboarded user's
+ *   credential even when the offboarding row-purge transiently fails.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -341,6 +344,13 @@ function schema(blob: string, int: string): string {
       type TEXT NOT NULL,
       last_notified_at ${int} NOT NULL,
       PRIMARY KEY (team_id, owner_kind, owner_id, provider, type)
+    );
+
+    CREATE TABLE IF NOT EXISTS offboard_tombstone (
+      team_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      PRIMARY KEY (team_id, user_id)
     );
 
     CREATE TABLE IF NOT EXISTS audit (

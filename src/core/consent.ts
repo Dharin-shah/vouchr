@@ -76,6 +76,22 @@ export class Consent {
     await this.db.run(`DELETE FROM consent_request WHERE team_id=? AND user_id=?`, [i.teamId, i.userId]);
   }
 
+  /**
+   * Durable fail-closed offboarding gate (GHSA-25m2): record that this user was offboarded NOW.
+   * `consume()` refuses any consent state minted at or before this instant, so even if the row
+   * purge in {@link deleteForUser} transiently fails, a pending pre-offboarding "Connect" can
+   * never complete and resurrect a credential. Tombstones are permanent and tiny (one row per
+   * offboarded user); a legitimately re-onboarded user starts a NEW consent, which is newer than
+   * the tombstone and passes. Re-offboarding refreshes the timestamp.
+   */
+  async markOffboarded(i: SlackIdentity): Promise<void> {
+    await this.db.run(
+      `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,?)
+       ON CONFLICT(team_id, user_id) DO UPDATE SET created_at=excluded.created_at`,
+      [i.teamId, i.userId, Date.now()],
+    );
+  }
+
   /** Delete in-flight consent for ONE provider (break-glass bulk revocation), so a pending "Connect"
    *  click can't resurrect the credential we just revoked. */
   async deleteForUserProvider(teamId: string, userId: string, provider: string): Promise<void> {
@@ -99,13 +115,22 @@ export class Consent {
     return row?.state ?? null;
   }
 
-  /** Look up and consume (single-use) a consent request. Returns null if absent/expired. */
+  /** Look up and consume (single-use) a consent request. Returns null if absent/expired — or if
+   *  the user was offboarded at/after the state was minted (the tombstone gate, GHSA-25m2). */
   async consume(state: string): Promise<ConsentRow | null> {
     // Atomic single-use: DELETE ... RETURNING so two concurrent callbacks can't both pass the
     // check (a get-then-delete has a TOCTOU window on multi-instance Postgres). Both engines support it.
     const row = (await this.db.get(`DELETE FROM consent_request WHERE state=? RETURNING *`, [state])) as any;
     if (!row) return null;
     if (Date.now() - row.created_at > STATE_TTL_MS) return null;
+    // Offboarding tombstone (GHSA-25m2): a consent minted at or before the user's offboarding can
+    // never complete, even when the offboarding row-purge transiently failed. Checked AFTER the
+    // single-use delete, so the state is spent either way.
+    const tomb = (await this.db.get(
+      `SELECT created_at FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
+      [row.team_id, row.user_id],
+    )) as any;
+    if (tomb && tomb.created_at >= row.created_at) return null;
     return {
       state: row.state,
       identity: {

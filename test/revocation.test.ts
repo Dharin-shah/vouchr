@@ -7,6 +7,7 @@ import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { defineProvider, github, ProviderRegistry } from '../src/core/providers';
 import { revokeToken } from '../src/core/tokens';
+import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { offboardUser, offboardUserEverywhere, disconnectProvider } from '../src/core/offboard';
 import { userOwner } from '../src/core/owner';
 import type { EnvelopeProvider } from '../src/core/crypto';
@@ -307,13 +308,15 @@ test('offboardUser: a hung custom revoke on the first provider does not strand t
   assert.deepEqual(new Map(metas).get('revocable2'), true);
 });
 
-// GHSA-25m2 review: auxiliary cleanup failures must not prevent the credential deletes.
+// GHSA-25m2 review: auxiliary cleanup failures must not prevent the credential deletes (the
+// tombstone gate still landed, so the failed purge stays fail-closed — see the callback test).
 test('offboardUser deletes credentials even when the consent cleanup throws', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const badConsent = { deleteForUser: async () => { throw new Error('consent table down'); } } as unknown as Consent;
-  const removed = await offboardUser(vault, new Audit(db), badConsent, ID);
+  const consent = new Consent(db);
+  (consent as any).deleteForUser = async () => { throw new Error('consent table down'); };
+  const removed = await offboardUser(vault, new Audit(db), consent, ID);
   assert.deepEqual(removed, ['revocable']);
   assert.equal(await countConnections(db), 0);
 });
@@ -334,6 +337,59 @@ test('vault.delete removes the credential even when the satellite purge fails', 
   const vault = new Vault(failingDb, KEY);
   assert.equal(await vault.delete(O1, 'revocable'), true); // truthful, and it did not throw
   assert.equal(await countConnections(db), 0); // the delete committed despite the failed purge
+});
+
+// GHSA-25m2 round 2: a pending consent must not be able to resurrect an offboarded user's
+// credential EVEN WHEN the offboarding consent purge transiently fails — the durable tombstone
+// written first makes the saved callback fail closed.
+test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot recreate the credential', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const registry = new ProviderRegistry([revocable]);
+  await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  // A pending "Connect" exists when the user is offboarded…
+  const { state } = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  // …and the offboarding row-purge FAILS (transient DB error) while everything else works.
+  const realPurge = consent.deleteForUser.bind(consent);
+  (consent as any).deleteForUser = async () => { throw new Error('consent table down'); };
+  const removed = await offboardUser(vault, audit, consent, ID);
+  assert.deepEqual(removed, ['revocable']); // the credential deletes still ran
+  (consent as any).deleteForUser = realPurge;
+  // The consent row survived the failed purge — but the callback must still fail closed.
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'NEW_TOK' }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  try {
+    const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://cb.example/x' }, 'CODE', state);
+    assert.equal(res.ok, false); // invalid/expired state — the tombstone gate refused it
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(await countConnections(db), 0, 'no credential was resurrected');
+
+  // A NEW consent begun AFTER offboarding (legitimate re-onboarding) still works.
+  await new Promise((r) => setTimeout(r, 5)); // strictly newer than the tombstone
+  const again = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'NEW_TOK' }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  try {
+    const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://cb.example/x' }, 'CODE', again.state);
+    assert.equal(res.ok, true);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(await countConnections(db), 1); // re-onboarding is not bricked
+});
+
+test('offboardUser throws (after attempting every delete) only when BOTH the tombstone and the purge fail', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const consent = new Consent(db);
+  (consent as any).markOffboarded = async () => { throw new Error('tombstone write failed'); };
+  (consent as any).deleteForUser = async () => { throw new Error('consent table down'); };
+  await assert.rejects(offboardUser(vault, new Audit(db), consent, ID), /offboarding incomplete/);
+  assert.equal(await countConnections(db), 0, 'the credential deletes were still attempted first');
 });
 
 // GHSA-25m2: rows written outside Grid store enterprise_id=NULL; an enterprise-scoped sweep must
