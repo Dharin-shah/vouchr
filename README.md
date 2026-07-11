@@ -262,6 +262,54 @@ More examples: [Google user credentials](./examples/google-user) ·
 [Postgres + KMS](./examples/postgres-kms) ·
 [sidecar broker](./examples/sidecar)
 
+## Test Your Integration
+
+`dryRun: true` runs the whole machine — consent state, channel modes, policy, tool allowlists,
+egress gates, vault, audit — under one invariant: **no real network call leaves the process on any
+edge** (outbound fetch, OAuth token exchange, token refresh, upstream revoke). Your app's test
+suite exercises its real Vouchr wiring fully offline, with zero Slack or provider OAuth apps
+configured:
+
+- `connect()` posts the real Connect prompt, but the authorize URL is a local,
+  instantly-succeeding redirect into the real OAuth callback. Complete it by "clicking" it, or from
+  a test with `vouchr.dryRun.completeConsent(user, provider)` — either way the real callback writes
+  a synthetic credential marked `external_account: 'dry-run'` through the real vault path.
+- `handle.fetch()` passes every request gate (policy, tool allowlist, host/path/method/https, rate
+  limits), reads the (synthetic) credential from the vault, and then returns a synthetic
+  `200 { dryRun: true, method, url, wouldInjectAs }` echo instead of calling the provider. The
+  credential value never appears in the echo; token refresh and upstream revoke are likewise
+  skipped for dry-run credentials.
+- Request-side denials are real: a host missing from `egressAllow` or a policy-denied channel
+  throws exactly the production error — that is the point: validate your allowlists and consent
+  handling in CI.
+- Safety rails: provenance is a system-only `dry_run` column on the credential row (never the
+  user/provider-controlled account label), so a real account legitimately named "dry-run" is never
+  mistaken for synthetic. Startup hard-fails if the database already holds any non-dry-run
+  credential ("refusing dryRun against a vault with real credentials"), so the flag can't be flipped
+  on non-empty production state; a real row written *after* startup is refused per-request and never
+  overwritten (the synthetic write is an atomic conditional). Dry-run also requires a **local master
+  key** — an external KMS envelope is refused at startup (its wrap/unwrap are real network calls).
+  Audit rows written in dry-run carry a `dry_run: true` marker in `meta`.
+
+```ts
+const vouchr = await createVouchr({
+  dryRun: true, // the only change vs production wiring
+  providers: [github({ clientId: 'dry-run', clientSecret: 'dry-run' })], // dummies, no OAuth app
+  baseUrl: 'https://my-app.test', // never contacted
+  dbPath: ':memory:',
+});
+
+await assert.rejects(() => ctx.vouchr.connect('github'), ConsentRequiredError); // real prompt
+await vouchr.dryRun!.completeConsent('U1', 'github'); // "click Connect" programmatically
+const res = await (await ctx.vouchr.connect('github')).fetch('https://api.github.com/user');
+await res.json(); // { dryRun: true, method: 'GET', url: …, wouldInjectAs: 'authorization: Bearer <redacted>' }
+```
+
+The headless broker takes the same flag (`BrokerOptions.dryRun`, or `VOUCHR_DRY_RUN=1` for the
+packaged `vouchr-broker`): `/v1/connect` mints a URL pointing at the broker's own callback —
+GETting it completes consent — and `/v1/fetch` returns the echo. A complete offline `node:test`
+suite of a Bolt handler lives in [`examples/dry-run/`](./examples/dry-run).
+
 ## Headless
 
 Slack-facing service and agent workers in separate processes? The same core exposes an HTTP broker:

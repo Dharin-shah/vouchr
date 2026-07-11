@@ -22,6 +22,7 @@ import { SessionGrants } from '../../core/session';
 import { Approvals, ApprovalRequiredError } from '../../core/approval';
 import { UnionOptin } from '../../core/unionOptin';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
+import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
 import { handleOAuthCallback } from '../../core/oauthCallback';
 import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
 import { DbReplayStore } from './replayStore';
@@ -205,6 +206,22 @@ export interface BrokerOptions {
    * async-rejecting hook never affects a request.
    */
   onCredentialHealth?: CredentialHealthHook;
+  /**
+   * #116 dry-run: identical semantics to `VouchrOptions.dryRun` — every gate runs for real, and NO
+   * real network call leaves the process (outbound fetch, token exchange, refresh, and upstream
+   * revoke are all stubbed or skipped). `/v1/connect` mints an authorize URL that points at THIS
+   * broker's own callback (requires `baseUrl`), so a test client completes consent by simply
+   * GETting it — the callback consumes the single-use state and writes a synthetic credential
+   * marked `external_account: 'dry-run'`. `/v1/fetch` then runs policy, tool, owner, and egress
+   * gates, reads the (synthetic) credential from the vault, and returns a
+   * `200 { dryRun, method, url, wouldInjectAs }` echo instead of calling the provider; request-side
+   * denials map to the same errors as production. The vault safety check runs asynchronously
+   * (createBroker is sync): every request fails closed until it passes, the packaged broker
+   * (`vouchr-broker`, `VOUCHR_DRY_RUN=1`) additionally hard-fails at boot, and a real row written
+   * AFTER boot is refused per-request (never injected, never overwritten). Audit rows carry
+   * `meta.dry_run: true`. Default false: zero behavior change.
+   */
+  dryRun?: boolean;
 }
 
 const DEFAULT_ALLOWED_CT = ['application/json'];
@@ -438,7 +455,15 @@ function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdenti
   return { owner: userOwner(acting), acting };
 }
 
-export function createBroker(opts: BrokerOptions): http.Server {
+export function createBroker(rawOpts: BrokerOptions): http.Server {
+  // #116 dryRun: SEC-4 fail-closed flag validation before anything is wired; when on, EVERY audit
+  // row written through this broker carries meta.dry_run (the wrapped audit replaces the caller's).
+  const dryRun = assertDryRunFlag(rawOpts.dryRun, 'createBroker');
+  // #116: external KMS makes real wrap/unwrap network calls — refuse it fail-closed at construction
+  // so the "no real network on any edge" guarantee stays literally true (the vault safety check is
+  // async below; this one is synchronous — the envelope is known now).
+  if (dryRun) assertDryRunLocalKey(rawOpts.vault.usesEnvelope);
+  const opts: BrokerOptions = dryRun ? { ...rawOpts, audit: dryRunAudit(rawOpts.audit) } : rawOpts;
   if (!opts.identitySecret) throw new Error('createBroker: identitySecret is required');
   // authorize REPLACES the static brokerToken gate (not AND). Setting both means the bearer is never
   // checked — reject it so nobody wires both expecting defense-in-depth.
@@ -491,12 +516,30 @@ export function createBroker(opts: BrokerOptions): http.Server {
   // neither can resurrect access after a user is removed). #52 OAuth connect flow (mounted only when
   // baseUrl is set) reuses the same Consent: it owns the single-use state + PKCE; handleOAuthCallback
   // owns the code exchange — the broker adds no crypto/state logic itself. Cheap Db wrappers.
-  const consent = new Consent(opts.db);
+  const consent = new Consent(opts.db, dryRun); // #116: dry-run mints local instantly-succeeding authorize URLs
   const sessions = new SessionGrants(opts.db);
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
   const unionOptin = new UnionOptin(opts.db); // #112: disconnect/offboard purge union opt-ins too
   const callbackPath = opts.callbackPath ?? '/oauth/callback';
   const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
+
+  // #116 safety rail: dry-run must never serve against a vault holding REAL credential rows.
+  // createBroker is sync, so the async check starts here and every request (health probes excepted)
+  // awaits it FAIL-CLOSED below; the packaged broker (bin/broker-server) additionally awaits the
+  // same check at boot for a true startup hard-fail. The refusal is remembered (never swallowed) —
+  // the .catch only prevents an unhandled rejection from killing a host process before its first
+  // request. Only DryRunVaultError's static message is printed; any other failure (a db driver
+  // error could carry paths/hosts) is reduced to its class name, the same convention as the
+  // request-level catch below. ponytail: a transient db error here wedges dry-run fail-closed with
+  // no retry (while /readyz separately reports the db) — acceptable for a construction-time check;
+  // restarting the process is the recovery, a retry loop belongs to the host's readiness probe.
+  let dryRunRefusal: Error | undefined;
+  const dryRunReady = dryRun
+    ? assertDryRunVault(opts.db).catch((e: Error) => {
+        dryRunRefusal = e;
+        console.error(`[vouchr] ${e instanceof DryRunVaultError ? e.message : `dry-run vault check failed: ${e?.constructor?.name ?? 'Error'}`}`);
+      })
+    : undefined;
 
   /** Perimeter check on /v1/* BEFORE identity. Prefers a pluggable `authorize` hook (e.g. serviceauth),
    *  else the static `brokerToken` bearer, else no gate. NOT identity — that's the signed token. */
@@ -658,10 +701,11 @@ export function createBroker(opts: BrokerOptions): http.Server {
     // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
     // The 12th is the createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit).
     // The 13th is the #117 credential-health hook (definitive refresh death → owner identity, no tokens).
-    // The 14th/15th are the #113 approval store + the signed thread, so a provider.approval gate is
-    // enforced on this door too (the broker maps the throw to 403 approval_required; the approval
-    // SURFACE stays the Bolt app — see mapUpstreamError).
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits, opts.onCredentialHealth, approvals, claims.threadTs ?? null);
+    // The 14th/15th are the #113 approval store + the signed thread (a provider.approval gate is
+    // enforced on this door too; the broker maps the throw to 403 approval_required, approval SURFACE
+    // stays the Bolt app — see mapUpstreamError). The 16th flags dry-run (#116): the injector stubs
+    // ONLY the final network call, after every gate — the approval gate included.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits, opts.onCredentialHealth, approvals, claims.threadTs ?? null, dryRun);
     return { handle, provider, acting };
   }
 
@@ -1034,8 +1078,9 @@ export function createBroker(opts: BrokerOptions): http.Server {
     const result = await handleOAuthCallback(
       // channelConfig + unionOptin (#112): a broker-hosted connect prompted from a union-mode channel
       // (the consent row carries the SIGNED channel from /v1/connect) records the union opt-in exactly
-      // like the Bolt callback. Inert when channelConfig isn't opted in.
-      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink, channelConfig: opts.channelConfig, unionOptin },
+      // like the Bolt callback. Inert when channelConfig isn't opted in. dryRun (#116) stubs only the
+      // token-exchange edge inside the shared callback.
+      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink, channelConfig: opts.channelConfig, unionOptin, dryRun },
       q.get('code') ?? undefined,
       q.get('state') ?? undefined,
       q.get('error') ?? undefined,
@@ -1192,8 +1237,20 @@ export function createBroker(opts: BrokerOptions): http.Server {
           return send(r.status, r.payload);
         }
         if (req.method === 'GET' && url === '/readyz') {
+          // #116: a dry-run broker refused against real state is UP (liveness) but must NOT report
+          // ready — every functional route 500s, so readiness is 503 (k8s pulls it from rotation).
+          if (dryRunReady) {
+            await dryRunReady;
+            if (dryRunRefusal) return send(503, { ok: false });
+          }
           const r = await handleReadyz();
           return send(r.status, r.payload);
+        }
+        // #116 dry-run safety rail: every route below can touch credentials or consent, so nothing
+        // is served until the vault check passed — a refusal fails every request closed (500).
+        if (dryRunReady) {
+          await dryRunReady;
+          if (dryRunRefusal) throw dryRunRefusal;
         }
         // #52 OAuth redirect target — a human's browser lands here, so it returns HTML (not JSON) and
         // has NO perimeter gate (the provider redirects the user's browser, which carries no bearer).

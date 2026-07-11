@@ -7,7 +7,8 @@ import type { SlackIdentity } from './identity';
 import type { ChannelConfig } from './channelConfig';
 import { joinUnion, type UnionOptin } from './unionOptin';
 import { userOwner } from './owner';
-import { exchangeCode } from './tokens';
+import { exchangeCode, type TokenResponse } from './tokens';
+import { DRY_RUN_ACCOUNT, DRY_RUN_CODE, DryRunVaultError, dryRunTokenResponse } from './dryRun';
 import { safeEmit } from './safe-emit';
 
 export interface CallbackDeps {
@@ -22,6 +23,10 @@ export interface CallbackDeps {
    *  (the consent row carries that channel). Unset → callback behavior is unchanged. */
   channelConfig?: ChannelConfig;
   unionOptin?: UnionOptin;
+  /** #116 dry-run: replace the token-exchange network edge with a synthetic credential (marked
+   *  `external_account: 'dry-run'`). State consumption, vault write, audit, and the union opt-in
+   *  around it run for real. Default false: unchanged behavior. */
+  dryRun?: boolean;
 }
 
 /** Emit a consent_granted/denied audit-stream copy. Best-effort; a throwing sink never breaks the callback. */
@@ -81,20 +86,36 @@ export async function handleOAuthCallback(
   }
   if (!code) return { ok: false, status: 400, error: 'Missing code/state.' };
   try {
-    const tok = await exchangeCode(provider, code, deps.redirectUri, row.pkceVerifier);
-    const account = provider.accountProbe
-      ? await provider.accountProbe(tok.accessToken).catch(() => null)
-      : null;
+    // #116 dry-run: the token-exchange edge. The single-use state was already consumed by the real
+    // machinery above; only the provider round-trips (code exchange + account probe) are replaced —
+    // with a random token and the canonical 'dry-run' account marker.
+    let tok: TokenResponse;
+    let account: string | null;
+    if (deps.dryRun) {
+      // Code-provenance rail: a code the local stub didn't mint is a REAL provider redirect — refuse
+      // it loudly rather than silently swallowing a real authorization into a synthetic row. Throws
+      // into the catch below: audited 'denied', nothing written.
+      if (code !== DRY_RUN_CODE) throw new DryRunVaultError();
+      tok = dryRunTokenResponse();
+      account = DRY_RUN_ACCOUNT;
+    } else {
+      tok = await exchangeCode(provider, code, deps.redirectUri, row.pkceVerifier);
+      account = provider.accountProbe
+        ? await provider.accountProbe(tok.accessToken).catch(() => null)
+        : null;
+    }
     // The scopes actually granted (token response), falling back to what we requested if the provider
     // doesn't echo them — this is what the post-connect confirmation shows the user.
     const scopes = tok.scopes ?? provider.scopesDefault.join(' ');
-    await deps.vault.upsert(userOwner(row.identity), provider.id, {
-      accessToken: tok.accessToken,
-      refreshToken: tok.refreshToken,
-      scopes,
-      expiresAt: tok.expiresAt,
-      externalAccount: account,
-    });
+    const token = { accessToken: tok.accessToken, refreshToken: tok.refreshToken, scopes, expiresAt: tok.expiresAt, externalAccount: account };
+    if (deps.dryRun) {
+      // ATOMIC no-clobber: one conditional statement that only overwrites an existing SYNTHETIC row,
+      // so a REAL credential a sibling process wrote — even between boot and now — survives untouched.
+      // No get()-then-upsert, so there is no TOCTOU window. false → a real row blocked it: refuse.
+      if (!(await deps.vault.upsertDryRun(userOwner(row.identity), provider.id, token))) throw new DryRunVaultError();
+    } else {
+      await deps.vault.upsert(userOwner(row.identity), provider.id, token);
+    }
     await deps.audit.record('connect', row.identity, provider.id, { account });
     // #112: connecting IN RESPONSE to a union-channel prompt IS the opt-in moment. The consent row
     // carries the channel the prompt was posted in; record the opt-in only when that channel is in

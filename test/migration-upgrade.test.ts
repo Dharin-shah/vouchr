@@ -288,6 +288,39 @@ test('sqlite: a schema-version-2 database (pre-notification_state) upgrades in p
   }
 });
 
+// #116 v3 -> v4: a pre-dry-run database (connection table without the `dry_run` column) must open
+// cleanly, get the additive column defaulting to 0 (existing rows classify as REAL), and re-stamp.
+test('sqlite: a schema-version-3 database (pre-dry_run) upgrades in place: connection.dry_run added, existing rows default 0', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'vouchr-migration-'));
+  const file = join(dir, 'v3.db');
+  try {
+    // Fabricate the v3 state: current schema, drop the #116 column, seed a row, stamp the marker at 3.
+    const db0 = await openDb({ dbPath: file });
+    await db0.run(
+      `INSERT INTO connection (id, team_id, owner_kind, owner_id, provider, source, scopes, created_at, updated_at)
+       VALUES ('c1','T1','user','U1','github','vault','',1,1)`,
+    );
+    await db0.close();
+    const raw = new BetterSqlite3(file);
+    raw.exec(`ALTER TABLE connection DROP COLUMN dry_run`); // back to the pre-#116 shape
+    raw.prepare(`UPDATE meta SET value='3' WHERE key='schema_version'`).run();
+    raw.close();
+
+    const db = await openDb({ dbPath: file }); // 3 <= SCHEMA_VERSION -> proceeds, never refuses
+    try {
+      const marker = (await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`)) as any;
+      assert.equal(Number(marker?.value), SCHEMA_VERSION); // re-stamped to the current version
+      // The additive column exists and the PRE-EXISTING row defaults to 0 (a real credential).
+      const row = (await db.get<{ dry_run: number }>(`SELECT dry_run FROM connection WHERE id='c1'`)) as any;
+      assert.equal(Number(row?.dry_run), 0);
+    } finally {
+      await db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // -------------------------------------------------------------------------------------- postgres
 
 // Same invariants against a REAL Postgres, in a dedicated pg schema (search_path) so this leg

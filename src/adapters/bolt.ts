@@ -20,6 +20,7 @@ import { PendingPreviews } from '../core/preview';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { UnionOptin, eligibleUnionMembers, joinUnion, leaveUnion } from '../core/unionOptin';
 import { offboardUser, disconnectProvider } from '../core/offboard';
+import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
 import { sweepExpired } from '../core/sweep';
 import { SessionGrants } from '../core/session';
 import { Approvals, ApprovalRequiredError, DEFAULT_APPROVAL_TTL_MS } from '../core/approval';
@@ -274,6 +275,22 @@ export interface VouchrOptions {
    * affects a request or the sweep.
    */
   onCredentialHealth?: CredentialHealthHook;
+  /**
+   * #116 dry-run: run the REAL consent state machine, channel modes, policy, tool allowlists,
+   * egress gates, vault, and audit — under the invariant that NO real network call leaves the
+   * process. The OAuth exchange yields a synthetic credential (marked `external_account:
+   * 'dry-run'`; the Connect button's authorize URL becomes a local, instantly-succeeding redirect
+   * into the real callback); `handle.fetch()` returns a `200 { dryRun, method, url, wouldInjectAs }`
+   * echo instead of calling the provider — AFTER every request gate has run and the (synthetic)
+   * credential was read from the vault; token refresh and upstream revoke are likewise skipped for
+   * dry-run rows. The credential never appears in the echo. Request-side denials throw exactly as
+   * in production. Safety rails: startup hard-fails if the database already holds non-dry-run
+   * credential rows, a request refuses (and the dry-run callback never overwrites) a real row
+   * written later, and every audit row written in dry-run carries `meta.dry_run: true`. Complete a
+   * prompted consent programmatically in tests via `vouchr.dryRun.completeConsent(user, provider)`.
+   * Default false: zero behavior change.
+   */
+  dryRun?: boolean;
 }
 
 /**
@@ -334,6 +351,9 @@ export interface ConnectContextDeps {
    *  share click (a later request) finds the entry; a direct-constructed context gets its own (the
    *  ephemeral still posts; the share button then reports expired unless the host wires the actions). */
   previews?: PendingPreviews;
+  /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
+   *  VouchrOptions.dryRun). Default false: unchanged behavior. */
+  dryRun?: boolean;
 }
 
 /** Per-request handle attached to Bolt's `context.vouchr`. */
@@ -366,6 +386,7 @@ export class ConnectContext {
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
   private previews: PendingPreviews;
+  private dryRun: boolean;
 
   constructor(deps: ConnectContextDeps) {
     this.identity = deps.identity;
@@ -396,6 +417,7 @@ export class ConnectContext {
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
     this.previews = deps.previews ?? new PendingPreviews(PREVIEW_TTL_MS);
+    this.dryRun = deps.dryRun ?? false;
   }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -627,6 +649,7 @@ export class ConnectContext {
             this.health,
             this.approvals,
             this.thread,
+            this.dryRun,
           ))), member, providerId);
         }
       }
@@ -641,6 +664,7 @@ export class ConnectContext {
         this.health,
         this.approvals,
         this.thread,
+        this.dryRun,
       )));
     }
 
@@ -980,7 +1004,7 @@ export class ConnectContext {
     // triggeredBy/originChannel keep their defaults (null): unchanged behavior on this path.
     return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
       provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-      null, null, this.rateLimits, this.health, this.approvals, this.thread,
+      null, null, this.rateLimits, this.health, this.approvals, this.thread, this.dryRun,
     )));
   }
 
@@ -1143,12 +1167,19 @@ export function healthNotifier(deps: {
 }
 
 export async function createVouchr(opts: VouchrOptions) {
+  const dryRun = assertDryRunFlag(opts.dryRun, 'createVouchr'); // SEC-4: fail closed before any wiring
+  // #116: external KMS makes real wrap/unwrap network calls — refuse fail-closed before opening the
+  // db, so the "no real network on any edge" guarantee holds. Local master key only in dry-run.
+  if (dryRun) assertDryRunLocalKey(!!opts.envelope);
   const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
+  // #116 safety rail: dry-run hard-fails at startup against a vault holding real credential rows.
+  if (dryRun) await assertDryRunVault(db);
   const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
   const registry = new ProviderRegistry(opts.providers);
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
-  const audit = new Audit(db);
-  const consent = new Consent(db);
+  // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
+  const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
+  const consent = new Consent(db, dryRun);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
@@ -1320,6 +1351,7 @@ export async function createVouchr(opts: VouchrOptions) {
         auditSink,
         health,
         previews,
+        dryRun,
       });
     }
     await args.next();
@@ -1327,7 +1359,27 @@ export async function createVouchr(opts: VouchrOptions) {
 
   // channelConfig + unionOptin let the callback record the union opt-in for a connect prompted
   // from a union-mode channel (the consent row carries that channel). See handleOAuthCallback.
-  const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, channelConfig, unionOptin };
+  const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, channelConfig, unionOptin, dryRun };
+
+  /**
+   * #116 dry-run test helper: complete the NEWEST pending consent for (user, provider) through the
+   * REAL callback path — single-use state consumption, synthetic token exchange, vault write, audit
+   * row, union opt-in — exactly as if the user had clicked Connect. Accepts a bare userId or a
+   * `{ teamId, userId }` identity (to disambiguate multi-workspace tests). Throws when nothing is
+   * pending (call `connect()` first — it posts the prompt and records the consent state) or when
+   * the callback reports a failure.
+   */
+  const completeConsent = async (user: string | Pick<SlackIdentity, 'teamId' | 'userId'>, providerId: string) => {
+    registry.get(providerId); // SEC-4: validate before any lookup; throws on an unknown id
+    const userId = typeof user === 'string' ? user : user.userId;
+    const state = await consent.latestStateFor(userId, providerId, typeof user === 'string' ? undefined : user.teamId);
+    if (!state) {
+      throw new Error(`No pending consent for "${providerId}" — call connect() first so the prompt records one.`);
+    }
+    const result = await handleOAuthCallback(callbackDeps, DRY_RUN_CODE, state);
+    if (!result.ok) throw new Error(result.error);
+    return result;
+  };
 
   /** Mount the OAuth callback on the receiver's Express router. */
   function mountRoutes(router: any): void {
@@ -1369,7 +1421,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, approvals, auditSink, health, previews,
+      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, approvals, auditSink, health, previews, dryRun,
     });
   }
 
@@ -2194,6 +2246,8 @@ export async function createVouchr(opts: VouchrOptions) {
     vault,
     audit,
     db,
+    /** #116 dry-run helpers (see VouchrOptions.dryRun); undefined unless `dryRun: true`. */
+    dryRun: dryRun ? { completeConsent } : undefined,
   };
 }
 
