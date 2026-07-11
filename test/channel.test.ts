@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -20,8 +20,8 @@ const provider = defineProvider({
 });
 
 // `convo` shapes the mocked conversations.info: a class object (default normal), or a thrower.
-async function ctx(isAdmin: boolean, channel: string | null = 'C_FIN', convo: any = {}, policy = new Policy()) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function ctx(t: TestContext, isAdmin: boolean, channel: string | null = 'C_FIN', convo: any = {}, policy = new Policy()) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const client = {
@@ -44,13 +44,13 @@ const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audi
 const connCount = async (db: any) => ((await db.get('SELECT COUNT(*) n FROM connection')) as any).n;
 
 // T6: non-admin denied+audited; admin allowed+audited; overwrite is atomic.
-test('T6 setChannelSecret: admin-gated, audited, atomic overwrite', async () => {
-  const deny = await ctx(false);
+test('T6 setChannelSecret: admin-gated, audited, atomic overwrite', async (t) => {
+  const deny = await ctx(t, false);
   await assert.rejects(() => deny.c.setChannelSecret('mcp', SECRET), /admin/);
   assert.equal(await deny.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null); // nothing stored
   assert.deepEqual((await auditRows(deny.db)).map((r) => r.action), ['denied']);
 
-  const ok = await ctx(true);
+  const ok = await ctx(t, true);
   await ok.c.setChannelSecret('mcp', SECRET);
   assert.equal((await ok.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
   await ok.c.setChannelSecret('mcp', 'second-value'); // overwrite
@@ -60,8 +60,8 @@ test('T6 setChannelSecret: admin-gated, audited, atomic overwrite', async () => 
 });
 
 // T7: the secret appears in NO audit meta, NO error string, and is not returned.
-test('T7 setChannelSecret: secret never leaks to audit/return/error', async () => {
-  const ok = await ctx(true);
+test('T7 setChannelSecret: secret never leaks to audit/return/error', async (t) => {
+  const ok = await ctx(t, true);
   const ret = await ok.c.setChannelSecret('mcp', SECRET);
   assert.equal(ret, undefined); // method returns nothing
   for (const r of await auditRows(ok.db)) assert.ok(!r.meta.includes(SECRET), 'secret in audit meta');
@@ -69,7 +69,7 @@ test('T7 setChannelSecret: secret never leaks to audit/return/error', async () =
   // Non-admin path's error must not echo the secret either.
   let msg = '';
   try {
-    await (await ctx(false)).c.setChannelSecret('mcp', SECRET);
+    await (await ctx(t, false)).c.setChannelSecret('mcp', SECRET);
   } catch (e) {
     msg = (e as Error).message;
   }
@@ -77,8 +77,8 @@ test('T7 setChannelSecret: secret never leaks to audit/return/error', async () =
 });
 
 // invariant 7: a per-user-locked channel refuses static keys and references.
-test('per-user lock refuses shared creds (invariant 7)', async () => {
-  const { c } = await ctx(true);
+test('per-user lock refuses shared creds (invariant 7)', async (t) => {
+  const { c } = await ctx(t, true);
   await c.setChannelMode('mcp', 'per-user');
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /per-user/);
   await assert.rejects(
@@ -88,8 +88,8 @@ test('per-user lock refuses shared creds (invariant 7)', async () => {
 });
 
 // referenceChannelSecret stores only the non-secret ref + source; rotation stays external.
-test('referenceChannelSecret stores the ARN pointer, not a secret', async () => {
-  const { c, db, vault } = await ctx(true);
+test('referenceChannelSecret stores the ARN pointer, not a secret', async (t) => {
+  const { c, db, vault } = await ctx(t, true);
   await c.referenceChannelSecret('mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:r:k' });
   const cred = await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp');
   assert.equal(cred?.source, 'aws-sm');
@@ -100,8 +100,8 @@ test('referenceChannelSecret stores the ARN pointer, not a secret', async () => 
 });
 
 // connectChannel returns a handle for the shared cred; per-user lock & missing cred both refuse.
-test('connectChannel: handle on shared cred, refuses per-user and unconfigured', async () => {
-  const ok = await ctx(true);
+test('connectChannel: handle on shared cred, refuses per-user and unconfigured', async (t) => {
+  const ok = await ctx(t, true);
   await assert.rejects(async () => ok.c.connectChannel('mcp'), /No channel credential/); // unconfigured
   await ok.c.setChannelSecret('mcp', SECRET);
   assert.ok(await ok.c.connectChannel('mcp')); // shared cred → handle
@@ -113,22 +113,22 @@ test('connectChannel: handle on shared cred, refuses per-user and unconfigured',
 });
 
 // Policy denial applies to shared channel creds, not just per-user connect().
-test('connectChannel: refused + audited when policy denies the provider in this channel', async () => {
+test('connectChannel: refused + audited when policy denies the provider in this channel', async (t) => {
   const deny = new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } });
-  const ok = await ctx(true, 'C_FIN', {}, deny);
+  const ok = await ctx(t, true, 'C_FIN', {}, deny);
   await ok.c.setChannelSecret('mcp', SECRET); // config is admin-gated, not policy-gated
   await assert.rejects(async () => ok.c.connectChannel('mcp'), /Policy denies/);
   assert.ok((await auditRows(ok.db)).some((r) => r.action === 'denied'));
 });
 
 // A null channel (e.g. a DM-less context) cannot configure a channel credential.
-test('no channel in context → refuse', async () => {
-  const { c } = await ctx(true, null);
+test('no channel in context → refuse', async (t) => {
+  const { c } = await ctx(t, true, null);
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /No channel/);
 });
 
 // T2 invariant 6: shared creds are refused on channel classes whose membership ≠ workspace members.
-test('T2 channel-class restriction: disallowed classes refuse config (invariant 6)', async () => {
+test('T2 channel-class restriction: disallowed classes refuse config (invariant 6)', async (t) => {
   const cases: Array<[any, RegExp]> = [
     [{ is_ext_shared: true }, /externally shared/],
     [{ is_shared: true }, /externally shared/],
@@ -138,7 +138,7 @@ test('T2 channel-class restriction: disallowed classes refuse config (invariant 
     [{ is_archived: true }, /archived/],
   ];
   for (const [convo, reason] of cases) {
-    const { c, vault } = await ctx(true, 'C_FIN', convo);
+    const { c, vault } = await ctx(t, true, 'C_FIN', convo);
     await assert.rejects(() => c.setChannelSecret('mcp', SECRET), reason);
     await assert.rejects(
       () => c.referenceChannelSecret('mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:x' }),
@@ -150,14 +150,14 @@ test('T2 channel-class restriction: disallowed classes refuse config (invariant 
 });
 
 // T2 fail-closed: if we can't read the channel class, deny.
-test('T2 channel-class restriction: fails closed when conversations.info throws', async () => {
-  const { c } = await ctx(true, 'C_FIN', 'throw');
+test('T2 channel-class restriction: fails closed when conversations.info throws', async (t) => {
+  const { c } = await ctx(t, true, 'C_FIN', 'throw');
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /verify the channel type/);
 });
 
 // T2 normal channel is allowed (the happy path keeps working).
-test('T2 channel-class restriction: a normal channel is allowed', async () => {
-  const { c, vault } = await ctx(true, 'C_FIN', { is_channel: true });
+test('T2 channel-class restriction: a normal channel is allowed', async (t) => {
+  const { c, vault } = await ctx(t, true, 'C_FIN', { is_channel: true });
   await c.setChannelSecret('mcp', SECRET);
   assert.equal((await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
 });

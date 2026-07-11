@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -93,8 +93,8 @@ test('defineProvider: a public client with PKCE disabled is refused (no client a
 
 // ── authorize URL ─────────────────────────────────────────────────────────────
 
-test('databricks: authorize URL carries client_id, PKCE challenge, and the U2M scopes', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('databricks: authorize URL carries client_id, PKCE challenge, and the U2M scopes', async (t) => {
+  const db = await openTestDb(t);
   const consent = new Consent(db);
   const p = databricks({ host: HOST, clientId: 'cid' });
   const { authorizeUrl } = await consent.begin(ID, p, 'https://app/cb', null);
@@ -151,8 +151,8 @@ test('databricks: confidential-client token exchange includes the client_secret'
 
 // ── egress lock (the point of the built-in) ───────────────────────────────────
 
-async function makeHandle() {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeHandle(t: TestContext) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const p = databricks({ host: HOST, clientId: 'cid' });
   let calls = 0;
@@ -164,11 +164,11 @@ async function makeHandle() {
   return { handle, getCalls: () => calls, reset: () => { calls = 0; } };
 }
 
-test('databricks egress: statement submit (POST) and status poll (GET) are allowed', async () => {
+test('databricks egress: statement submit (POST) and status poll (GET) are allowed', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{"ok":1}', { status: 200 })) as any;
   try {
-    const { handle, getCalls, reset } = await makeHandle();
+    const { handle, getCalls, reset } = await makeHandle(t);
     // POST submit
     reset();
     const submit = await handle.fetch(`${HOST}/api/2.0/sql/statements`, { method: 'POST', body: '{"statement":"select 1"}' });
@@ -184,12 +184,12 @@ test('databricks egress: statement submit (POST) and status poll (GET) are allow
   }
 });
 
-test('databricks egress: everything outside statement execution is DENIED, secret never read', async () => {
+test('databricks egress: everything outside statement execution is DENIED, secret never read', async (t) => {
   const realFetch = globalThis.fetch;
   let wentOut = false;
   globalThis.fetch = (async () => { wentOut = true; return new Response('{}', { status: 200 }); }) as any;
   try {
-    const { handle, getCalls, reset } = await makeHandle();
+    const { handle, getCalls, reset } = await makeHandle(t);
     const denied: [string, string][] = [
       [`${HOST}/api/2.0/secrets/acls/get`, 'GET'],   // secrets API — off limits
       [`${HOST}/api/2.1/jobs/list`, 'GET'],          // jobs API — off limits

@@ -9,6 +9,7 @@ import http from 'node:http';
 // This is also the compile-level proof (tsc --noEmit in the gate type-checks this file).
 import { openDb, Vault, Audit, createBroker, github, sweepExpired, Consent, Policy, ChannelTools } from '../src/headless';
 import type { Db, TtlPolicy } from '../src/headless';
+import { testDbUrl } from './support/pg';
 
 /**
  * Proves the Bolt-free claim (Product H2): the `./headless` entry's RESOLVED CommonJS module graph must
@@ -40,8 +41,8 @@ test('headless entry: compiled module graph is @slack-free', { skip: existsSync(
   );
 });
 
-test('headless entry: createBroker is constructible end-to-end from ./headless alone', async () => {
-  const db: Db = await openDb(); // sqlite in-memory default
+test('headless entry: createBroker is constructible end-to-end from ./headless alone', async (t) => {
+  const db: Db = await openDb({ databaseUrl: await testDbUrl(t) }); // headless's own openDb, against a throwaway PG schema
   try {
     const ttl: TtlPolicy = { idleMs: 1000 };
     const vault = new Vault(db, Buffer.alloc(32), ttl);

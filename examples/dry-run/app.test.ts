@@ -10,6 +10,7 @@
  * Run: npm run example:dry-run   (or: node --import tsx --test examples/dry-run/app.test.ts)
  */
 import { test } from 'node:test';
+import { testDbUrl } from '../../test/support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { createVouchr, github, ConsentRequiredError } from '../../src';
@@ -30,12 +31,12 @@ async function handleMention({ context, event, client }: any): Promise<void> {
   }
 }
 
-test('dry-run example: consent prompt, programmatic connect, real egress gates, echo response', async () => {
+test('dry-run example: consent prompt, programmatic connect, real egress gates, echo response', async (t) => {
   const vouchr = await createVouchr({
     dryRun: true, // ← the only change vs production wiring
     providers: [github({ clientId: 'dry-run', clientSecret: 'dry-run' })], // dummies — no OAuth app
     baseUrl: 'https://my-app.test', // never contacted in dry-run
-    dbPath: ':memory:',
+    databaseUrl: await testDbUrl(t),
   });
 
   // Drive the middleware exactly as Bolt would, with a capturing fake client.

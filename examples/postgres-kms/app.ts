@@ -55,9 +55,12 @@ app.event('app_mention', async ({ context, event, client }) => {
 });
 
 (async () => {
-  // A db-backed installation store so ONE deployment serves MANY workspaces /
-  // org-wide installs. Same Postgres + same master key as the vault; wire this
-  // SAME store into Bolt's OAuth installer too.
+  // Run `vouchr migrate` once (schema-owner role) before starting — the runtime connects with a
+  // DML-only role and never creates tables (it fails closed on an unmigrated database).
+  //
+  // Open ONE pool and share it: the installation store and Vouchr both use this `db`, so the
+  // deployment opens a single Postgres pool instead of two. We own its lifecycle, so we close it on
+  // shutdown (an injected `db` is the caller's to close — createVouchr won't close what it didn't open).
   const key = loadKeyring();
   const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL });
   const installationStore = new DbInstallationStore(db, key);
@@ -65,7 +68,7 @@ app.event('app_mention', async ({ context, event, client }) => {
   const vouchr = await createVouchr({
     providers: [github(), google()],
     baseUrl: process.env.PUBLIC_URL!,
-    databaseUrl: process.env.VOUCHR_DATABASE_URL, // Postgres → stateless, multi-instance
+    db,                                           // share one pool (Postgres → stateless, multi-instance)
     envelope: kmsEnvelope,                        // at-rest secrets wrapped by KMS
     installationStore,                            // multi-workspace token source
   });
@@ -74,6 +77,11 @@ app.event('app_mention', async ({ context, event, client }) => {
   vouchr.registerCommands(app);
   vouchr.registerOffboarding(app);
   setInterval(() => vouchr.sweepExpired(), 60 * 60 * 1000);
+
+  // We opened the shared pool, so we close it on shutdown (createVouchr won't — the db is injected).
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.once(sig, () => { void db.close().finally(() => process.exit(0)); });
+  }
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.start(port);

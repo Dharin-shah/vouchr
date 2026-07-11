@@ -4,11 +4,11 @@
  * human is acting. The broker verifies the token and injects the real credential; your agent never
  * sees it.
  *
- * Run against a local broker. The seed and the broker must share the SAME db file AND master key
- * (a file DB, not :memory: — that's per-process; a random key per process wouldn't decrypt either):
+ * Run against a local broker. The seed and the broker must share the SAME PostgreSQL database AND
+ * master key (a random key per process wouldn't decrypt what the seed wrote):
  *
  *   export VOUCHR_MASTER_KEY=$(openssl rand -base64 32)
- *   export VOUCHR_DB=/tmp/vouchr-demo.db
+ *   export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
  *   export VOUCHR_IDENTITY_SECRET=dev-secret
  *
  *   # terminal A — seed a credential for user T1/U1, then start the broker:

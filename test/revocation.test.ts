@@ -1,7 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -120,8 +120,8 @@ test('built-in GitHub revoke uses the non-standard DELETE + Basic + JSON shape',
   }
 });
 
-test('offboardUser deletes locally even when upstream revoke throws, and audits ok:false', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser deletes locally even when upstream revoke throws, and audits ok:false', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -148,8 +148,8 @@ test('offboardUser deletes locally even when upstream revoke throws, and audits 
   assert.ok(!rows[0].meta.includes('SECRET_TOK'));
 });
 
-test('offboardUser records ok:true when upstream revoke succeeds; no token in meta', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser records ok:true when upstream revoke succeeds; no token in meta', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -184,12 +184,12 @@ async function countConnections(db: any): Promise<number> {
 
 // GHSA-25m2: a decrypt/KMS failure must only skip the upstream revoke — every local delete
 // still happens, for every provider, and nothing is stranded until "KMS recovers".
-test('offboardUser deletes ALL rows even when the KMS envelope unwrap fails', async () => {
+test('offboardUser deletes ALL rows even when the KMS envelope unwrap fails', async (t) => {
   const kmsDown: EnvelopeProvider = {
     async wrapDataKey(dek) { return Buffer.from(dek); }, // sealing works…
     async unwrapDataKey() { throw new Error('kms endpoint unreachable'); }, // …decrypting never does
   };
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, {}, kmsDown);
   const registry = new ProviderRegistry([revocable, revocable2]);
   for (const p of ['revocable', 'revocable2']) {
@@ -216,8 +216,8 @@ test('offboardUser deletes ALL rows even when the KMS envelope unwrap fails', as
 });
 
 // Review r3: a failed credential DELETE must surface as incomplete, never as partial success.
-test('offboardUser throws when a credential deletion fails, after attempting the other rows', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser throws when a credential deletion fails, after attempting the other rows', async (t) => {
+  const db = await openTestDb(t);
   const seeder = new Vault(db, KEY);
   for (const p of ['revocable', 'revocable2']) {
     await seeder.upsert(O1, p, { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -245,8 +245,8 @@ test('offboardUser throws when a credential deletion fails, after attempting the
 });
 
 // GHSA-25m2: an audit failure on one row must not abort the deletes for the remaining rows.
-test('offboardUser deletes every row even when audit.record throws mid-loop', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser deletes every row even when audit.record throws mid-loop', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   for (const p of ['revocable', 'revocable2']) {
     await vault.upsert(O1, p, { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -259,8 +259,8 @@ test('offboardUser deletes every row even when audit.record throws mid-loop', as
 
 // GHSA-25m2: a row past its LOCAL TTL may still be live upstream — disconnect must still revoke
 // it there, and `removed` reflects the actual delete (the row existed), not the TTL-gated read.
-test('disconnectProvider revokes an expired-here token upstream and reports removed:true', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('disconnectProvider revokes an expired-here token upstream and reports removed:true', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { maxAgeMs: 1 }); // everything expires ~immediately
   const registry = new ProviderRegistry([revocable]);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -314,19 +314,21 @@ test('revokeToken bounds the standard RFC 7009 revoke when the endpoint hangs', 
   }
 });
 
-test('offboardUser: a hung custom revoke on the first provider does not strand the second (GHSA-25m2)', async () => {
+test('offboardUser: a hung custom revoke on the first provider does not strand the second (GHSA-25m2)', async (t) => {
   const hangp = defineProvider({ ...revocable, id: 'hangp', revoke: () => new Promise(() => {}) });
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const registry = new ProviderRegistry([hangp, revocable2]);
   await vault.upsert(O1, 'hangp', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await vault.upsert(O1, 'revocable2', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
 
   // Shrink the revoke deadline so the test doesn't wait the production 10s: clamp only LONG timer
-  // delays (the deadline is the only multi-second timer in this path); restored in finally.
+  // delays (the deadline is the only multi-second timer in this path); restored in finally. 250ms
+  // (not ~20ms) leaves slack so the deadline still fires + audits reliably when the full parallel
+  // suite saturates the CPU — a tighter clamp flakes into a missing revoke-audit row under load.
   const realSetTimeout = globalThis.setTimeout;
   (globalThis as any).setTimeout = (fn: any, ms?: number, ...rest: any[]) =>
-    realSetTimeout(fn, ms != null && ms > 1000 ? 20 : ms, ...rest);
+    realSetTimeout(fn, ms != null && ms > 1000 ? 250 : ms, ...rest);
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('', { status: 200 })) as any; // revocable2's revoke succeeds
   try {
@@ -345,8 +347,8 @@ test('offboardUser: a hung custom revoke on the first provider does not strand t
 
 // GHSA-25m2 review: auxiliary cleanup failures must not prevent the credential deletes (the
 // tombstone gate still landed, so the failed purge stays fail-closed — see the callback test).
-test('offboardUser deletes credentials even when the consent cleanup throws', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser deletes credentials even when the consent cleanup throws', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const consent = new Consent(db);
@@ -357,8 +359,8 @@ test('offboardUser deletes credentials even when the consent cleanup throws', as
 });
 
 // GHSA-25m2 review: a satellite-purge failure must not roll back (or block) the credential delete.
-test('vault.delete removes the credential even when the satellite purge fails', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('vault.delete removes the credential even when the satellite purge fails', async (t) => {
+  const db = await openTestDb(t);
   const seeder = new Vault(db, KEY);
   await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const failingDb = {
@@ -376,8 +378,8 @@ test('vault.delete removes the credential even when the satellite purge fails', 
 
 // GHSA-25m2 r3: if the purge fails AND the credential DELETE cannot be re-committed, that is a
 // genuinely stranded credential — delete() must reject, never report the strand as a success.
-test('vault.delete propagates when both the purge and the delete re-run fail', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('vault.delete propagates when both the purge and the delete re-run fail', async (t) => {
+  const db = await openTestDb(t);
   const seeder = new Vault(db, KEY);
   await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   let deletes = 0;
@@ -399,8 +401,8 @@ test('vault.delete propagates when both the purge and the delete re-run fail', a
 // GHSA-25m2 round 2: a pending consent must not be able to resurrect an offboarded user's
 // credential EVEN WHEN the offboarding consent purge transiently fails — the durable tombstone
 // written first makes the saved callback fail closed.
-test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot recreate the credential', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot recreate the credential', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -455,8 +457,8 @@ test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot 
 // every credential deleted) DURING token exchange, then the write runs. The atomic write-gate must
 // refuse the resurrection — the saved-state test starts the callback after offboarding and misses
 // this ordering (the credential write racing a tombstone written after consume).
-test('offboarding during token exchange cannot resurrect the credential (atomic write-gate)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboarding during token exchange cannot resurrect the credential (atomic write-gate)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -479,8 +481,8 @@ test('offboarding during token exchange cannot resurrect the credential (atomic 
 
 // GHSA-25m2 r3: the tombstone is the load-bearing fence, so a tombstone-write failure makes the
 // offboarding incomplete ON ITS OWN — even when the (best-effort) consent-row purge succeeds.
-test('offboardUser throws when the tombstone write fails, even if the consent purge succeeds', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser throws when the tombstone write fails, even if the consent purge succeeds', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const consent = new Consent(db);
@@ -492,8 +494,8 @@ test('offboardUser throws when the tombstone write fails, even if the consent pu
 
 // A purge-only failure with the tombstone intact is NOT incomplete: the fence holds and the stale
 // consent rows are TTL-swept.
-test('offboardUser succeeds when only the consent-row purge fails but the tombstone landed', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser succeeds when only the consent-row purge fails but the tombstone landed', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const consent = new Consent(db);
@@ -504,8 +506,8 @@ test('offboardUser succeeds when only the consent-row purge fails but the tombst
 
 // GHSA-25m2: rows written outside Grid store enterprise_id=NULL; an enterprise-scoped sweep must
 // still discover a team whose only artifact is such a row (userId is org-unique in Grid).
-test('offboardUserEverywhere with enterpriseId still finds NULL-enterprise rows', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUserEverywhere with enterpriseId still finds NULL-enterprise rows', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null }); // O1 carries no enterpriseId → NULL row
   const summary = await offboardUserEverywhere(db, vault, new Audit(db), new Consent(db), { enterpriseId: 'E1', userId: ID.userId });
@@ -515,8 +517,8 @@ test('offboardUserEverywhere with enterpriseId still finds NULL-enterprise rows'
 
 // GHSA-25m2 r3: one workspace's delete failure must be SURFACED (ok:false for that team), never
 // buried as a blanket success, while the other workspaces still offboard.
-test('offboardUserEverywhere surfaces a per-team failure and still offboards the others', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUserEverywhere surfaces a per-team failure and still offboards the others', async (t) => {
+  const db = await openTestDb(t);
   const seeder = new Vault(db, KEY);
   const T2 = userOwner({ enterpriseId: null, teamId: 'T2', userId: ID.userId });
   await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });

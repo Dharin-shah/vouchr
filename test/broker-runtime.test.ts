@@ -1,7 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
 import { DbReplayStore } from '../src/adapters/http/replayStore';
@@ -9,8 +9,8 @@ import { kmsEnvelope, type KmsClientLike } from '../src/adapters/kms';
 
 // ── T4: DbReplayStore (cluster-wide single-use jti) ──────────────────────────
 
-test('DbReplayStore: a jti is single-use across two stores sharing the DB (multi-replica)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('DbReplayStore: a jti is single-use across two stores sharing the DB (multi-replica)', async (t) => {
+  const db = await openTestDb(t);
   const a = new DbReplayStore(db); // simulate two broker replicas...
   const b = new DbReplayStore(db); // ...backed by one shared table
   const exp = Date.now() + 60_000;
@@ -21,8 +21,8 @@ test('DbReplayStore: a jti is single-use across two stores sharing the DB (multi
   assert.equal(await b.use('jti-2', exp), true);   // a distinct jti is independent
 });
 
-test('DbReplayStore: concurrent use of the same jti admits exactly one', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('DbReplayStore: concurrent use of the same jti admits exactly one', async (t) => {
+  const db = await openTestDb(t);
   const store = new DbReplayStore(db);
   const exp = Date.now() + 60_000;
   const results = await Promise.all(Array.from({ length: 8 }, () => store.use('race', exp)));
@@ -47,8 +47,8 @@ test('kmsEnvelope: wraps and unwraps a data key', async () => {
   assert.deepEqual(await env.unwrapDataKey(wrapped), dek);
 });
 
-test('kmsEnvelope: a Vault write round-trips through envelope encryption (scheme 0x01)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('kmsEnvelope: a Vault write round-trips through envelope encryption (scheme 0x01)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32), {}, kmsEnvelope('key-1', fakeKms()));
   const owner = userOwner({ enterpriseId: null, teamId: 'T', userId: 'U' });
   await vault.upsert(owner, 'confluence', { accessToken: 'sk-secret', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });

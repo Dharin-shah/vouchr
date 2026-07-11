@@ -2,8 +2,8 @@
 /**
  * vouchr: operator CLI for self-hosted deployments.
  *
- * Connects to the SAME credential store the app uses (SQLite via VOUCHR_DB/--db,
- * or Postgres via VOUCHR_DATABASE_URL) through `openDb`. The read commands
+ * Connects to the SAME credential store the app uses (PostgreSQL via
+ * VOUCHR_DATABASE_URL or --db) through `openDb`. The read commands
  * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
  * token/secret material. Two commands mutate: `revoke` DELETES rows and may
  * best-effort decrypt an access token to hand to the upstream revoke — never to
@@ -13,7 +13,7 @@
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
-import { openDb, type Db } from '../src/core/db';
+import { openDb, migrate, type Db } from '../src/core/db';
 import { loadKeyring, type Keyring } from '../src/core/crypto';
 import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
@@ -62,10 +62,9 @@ function printTable(headers: string[], rows: string[][]): void {
 }
 
 /** Mirror openDb's backend resolution so `doctor` can report it without opening twice. */
-function describeBackend(dbPath?: string): string {
-  const url = process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
-  if (isPostgresUrl(url)) return 'Postgres (VOUCHR_DATABASE_URL)';
-  return `SQLite path=${dbPath ?? process.env.VOUCHR_DB ?? 'vouchr.db'}`;
+function describeBackend(dbUrl?: string): string {
+  const url = dbUrl ?? process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
+  return isPostgresUrl(url) ? 'PostgreSQL' : 'PostgreSQL (not configured — set VOUCHR_DATABASE_URL)';
 }
 
 async function cmdInventory(db: Db, f: Flags): Promise<void> {
@@ -91,7 +90,6 @@ async function cmdInventory(db: Db, f: Flags): Promise<void> {
 
 async function cmdChannels(db: Db, f: Flags): Promise<void> {
   // FULL OUTER JOIN: a channel may have a config row, a tool row, or both.
-  // Supported by Postgres and by the SQLite bundled with better-sqlite3 (>=3.39).
   const where = f.values.team ? 'WHERE COALESCE(c.team_id, t.team_id)=?' : '';
   const params = f.values.team ? [f.values.team] : [];
   const rows = await db.all<any>(
@@ -275,7 +273,7 @@ async function cmdDoctor(f: Flags): Promise<number> {
   // 3. DB reachable + counts.
   let db: Db | undefined;
   try {
-    db = await openDb({ dbPath: f.values.db });
+    db = await openDb({ databaseUrl: f.values.db });
     await db.get('SELECT 1 AS x');
     pass('db reachable');
     const conns = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM connection');
@@ -340,6 +338,11 @@ function usage(): void {
 Usage: vouchr <command> [options]
 
 Commands:
+  migrate     Create/upgrade the PostgreSQL schema to this build's version. Run
+              ONCE per deploy/upgrade with a role that can create tables; the
+              runtime then connects with a DML-only role. Idempotent and safe to
+              run concurrently. Prefer VOUCHR_DATABASE_URL over --db (keeps the
+              credential URL out of shell history / process args).
   inventory   List stored connections (metadata only; never tokens).
                 --team <id>      filter by team
                 --provider <id>  filter by provider
@@ -367,9 +370,8 @@ Commands:
   help        This message.
 
 Store selection (shared with the app):
-  --db <path>            SQLite file (overrides VOUCHR_DB; default vouchr.db)
-  VOUCHR_DB              SQLite file path
-  VOUCHR_DATABASE_URL    Postgres connection string (takes precedence)
+  --db <url>             PostgreSQL connection string (overrides VOUCHR_DATABASE_URL)
+  VOUCHR_DATABASE_URL    PostgreSQL connection string (required; no embedded mode)
   VOUCHR_MASTER_KEY      base64 32-byte key (validated by doctor; loaded by revoke
                          for best-effort upstream token revocation, and by rekey)
   VOUCHR_MASTER_KEYS     comma-separated id:base64key entries; FIRST is the primary
@@ -381,9 +383,18 @@ async function main(): Promise<number> {
   const f = parseFlags(rest);
 
   switch (cmd) {
+    case 'migrate': {
+      // The ONLY command that creates/alters tables. Run it once per deploy/upgrade with a
+      // schema-owner role; the runtime then connects with a DML-only role. Idempotent and safe to
+      // run concurrently (advisory-locked). Prefer VOUCHR_DATABASE_URL over --db so a credential URL
+      // stays out of shell history / process args.
+      const { version } = await migrate({ databaseUrl: f.values.db });
+      console.log(`OK schema migrated to version ${version}`);
+      return 0;
+    }
     case 'inventory':
     case 'channels': {
-      const db = await openDb({ dbPath: f.values.db });
+      const db = await openDb({ databaseUrl: f.values.db });
       try {
         if (cmd === 'inventory') await cmdInventory(db, f);
         else await cmdChannels(db, f);
@@ -393,7 +404,7 @@ async function main(): Promise<number> {
       return 0;
     }
     case 'revoke': {
-      const db = await openDb({ dbPath: f.values.db });
+      const db = await openDb({ databaseUrl: f.values.db });
       try {
         return await cmdRevoke(db, f);
       } finally {
@@ -401,7 +412,7 @@ async function main(): Promise<number> {
       }
     }
     case 'rekey': {
-      const db = await openDb({ dbPath: f.values.db });
+      const db = await openDb({ databaseUrl: f.values.db });
       try {
         return await cmdRekey(db, f);
       } finally {

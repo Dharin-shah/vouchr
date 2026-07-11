@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -20,8 +20,8 @@ import { signIdentity } from '../src/adapters/http/identity';
 // #113 human-in-the-loop approval for sensitive writes: the full state machine (prompt → approve →
 // consume → re-prompt; deny; TTL expiry; the double-consume race), gate ordering (egress beats
 // approval), the admin/self approver matrices with forged clicks, the broker's 403 shape, the sweep,
-// and the no-knob zero-change guarantee. Fully offline: outbound fetch is stubbed (restored in
-// finally), Slack is a fake client, and both DB backends' shared SQL runs on in-memory SQLite.
+// and the no-knob zero-change guarantee. No network: outbound fetch is stubbed (restored in
+// finally), Slack is a fake client, and the SQL runs on a throwaway PostgreSQL schema.
 
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const BODY_SENTINEL = 'SECRET_BODY_PAYLOAD_never_rendered';
@@ -77,10 +77,10 @@ async function expectApprovalRequired(p: Promise<unknown>): Promise<ApprovalRequ
  * Integration harness through the PUBLIC API (TEST-2): a real createVouchr, its real middleware
  * building context.vouchr, and the real registered Approve/Deny action handlers — Slack faked.
  */
-async function harness(o: { provider?: Provider; slackAdmins?: string[]; members?: string[]; sharedChannel?: boolean } = {}) {
+async function harness(t: TestContext, o: { provider?: Provider; slackAdmins?: string[]; members?: string[]; sharedChannel?: boolean } = {}) {
   process.env.VOUCHR_MASTER_KEY = randomBytes(32).toString('base64');
   const provider = o.provider ?? approvalProvider();
-  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   const actions: Record<string, any> = {};
   vouchr.registerCommands({
     command: () => undefined,
@@ -171,10 +171,10 @@ test('defineProvider: non-canonical approval paths/methods are rejected; methods
   assert.equal(approvalNeeded(p.approval!, 'DELETE', '/x'), true);
 });
 
-test('P2-C: the approval knob threads through built-in provider configs (github) and enforces', async () => {
+test('P2-C: the approval knob threads through built-in provider configs (github) and enforces', async (t) => {
   const gh = github({ clientId: 'c', clientSecret: 's', approval: { approver: 'self' } });
   assert.deepEqual(gh.approval, { approver: 'self' }, 'ProviderConfig → egressOptions → defineProvider');
-  const { ctx } = await harness({ provider: gh });
+  const { ctx } = await harness(t, { provider: gh });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('github');
     await handle.fetch('https://api.github.com/user'); // GET: no approval
@@ -186,8 +186,8 @@ test('P2-C: the approval knob threads through built-in provider configs (github)
 
 // ── the full state machine, through the public Bolt API ──────────────────────────────────────────
 
-test('state machine: prompt → approve → consume exactly once → re-prompt', async () => {
-  const { ctx, ephemerals, click, auditRows } = await harness();
+test('state machine: prompt → approve → consume exactly once → re-prompt', async (t) => {
+  const { ctx, ephemerals, click, auditRows } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
 
@@ -240,9 +240,9 @@ test('state machine: prompt → approve → consume exactly once → re-prompt',
   });
 });
 
-test('exact matching: a grant never covers a different method, path, or query', async () => {
+test('exact matching: a grant never covers a different method, path, or query', async (t) => {
   // PUT is egress-allowed here so the mismatch reaches the APPROVAL gate (not the egress one).
-  const { ctx, click } = await harness({ provider: approvalProvider({ egressMethods: ['GET', 'POST', 'PUT'] }) });
+  const { ctx, click } = await harness(t, { provider: approvalProvider({ egressMethods: ['GET', 'POST', 'PUT'] }) });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -276,8 +276,8 @@ test('queryDigest: byte-exact — ANY textual change (order, duplicates, encodin
   assert.notEqual(queryDigest('?a=1'), 'pre-v5'); // and can never equal the migration sentinel
 });
 
-test('GHSA-pg84: an approval binds the exact query — tampered, reordered, or duplicate-shuffled retries re-prompt', async () => {
-  const { ctx, click, ephemerals, approvalRows, auditRows } = await harness();
+test('GHSA-pg84: an approval binds the exact query — tampered, reordered, or duplicate-shuffled retries re-prompt', async (t) => {
+  const { ctx, click, ephemerals, approvalRows, auditRows } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const QUERY_SENTINEL = 'alice-PII-payee'; // a query VALUE that must never leave the process
@@ -312,8 +312,8 @@ test('GHSA-pg84: an approval binds the exact query — tampered, reordered, or d
   });
 });
 
-test('GHSA-pg84: a secret in a parameter NAME never reaches the prompt or the error serialization', async () => {
-  const { ctx, ephemerals } = await harness();
+test('GHSA-pg84: a secret in a parameter NAME never reaches the prompt or the error serialization', async (t) => {
+  const { ctx, ephemerals } = await harness(t);
   await withFetch(async () => {
     const handle = await ctx.connect('acme');
     const NAME_SENTINEL = 'ghp_name_sentinel_token'; // a query KEY that must never leave the process
@@ -327,8 +327,8 @@ test('GHSA-pg84: a secret in a parameter NAME never reaches the prompt or the er
   });
 });
 
-test('GHSA-pg84: duplicate-key reordering cannot spend a grant (first-wins vs last-wins upstreams)', async () => {
-  const { ctx, click } = await harness();
+test('GHSA-pg84: duplicate-key reordering cannot spend a grant (first-wins vs last-wins upstreams)', async (t) => {
+  const { ctx, click } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(
@@ -345,59 +345,11 @@ test('GHSA-pg84: duplicate-key reordering cannot spend a grant (first-wins vs la
   });
 });
 
-// GHSA-pg84 v5 migration is crash-safe fail-closed: legacy approval rows (minutes-lived
-// prompts/grants) are PURGED whenever the stored version is < 5, and the ALTER's DEFAULT marks
-// anything a lingering pre-v5 writer creates as 'pre-v5' (matches no live digest). Two scenarios:
-// a clean v4 upgrade, and the partial crash state (column already added, '' rows, stamp never
-// landed) — both must leave no legacy grant consumable by a queryless request.
-test('GHSA-pg84: v4→v5 migration purges legacy approval rows (no queryless spend)', async () => {
-  const { mkdtempSync, rmSync } = await import('node:fs');
-  const { tmpdir } = await import('node:os');
-  const { join } = await import('node:path');
-  const dir = mkdtempSync(join(tmpdir(), 'vouchr-v4-'));
-  const seedLegacyGrant = async (db: any, queryHash?: string) => {
-    const cols = queryHash == null ? '' : ', query_hash';
-    const vals = queryHash == null ? '' : `,'${queryHash}'`;
-    await db.run(
-      `INSERT INTO approval_request (id, team_id, user_id, owner_kind, owner_id, provider, method, host, path, channel, thread, status, approved_by, created_at, expires_at${cols})
-       VALUES ('L1','T1','U1','user','U1','acme','POST','api.acme.test','/transfer','C1','','granted','U9',?,?${vals})`,
-      [Date.now(), Date.now() + 3_600_000],
-    );
-  };
-  const queryless = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/transfer', queryHash: '', channel: 'C1', thread: null };
-  try {
-    // (a) clean v4 shape: no query_hash column at all.
-    const fileA = join(dir, 'v4.db');
-    const a4 = await openDb({ dbPath: fileA });
-    await a4.exec(`ALTER TABLE approval_request DROP COLUMN query_hash`);
-    await seedLegacyGrant(a4);
-    await a4.run(`UPDATE meta SET value='4' WHERE key='schema_version'`, []);
-    await a4.close();
-    const a5 = await openDb({ dbPath: fileA });
-    assert.equal(((await a5.all(`SELECT * FROM approval_request`)) as any[]).length, 0, 'legacy rows purged');
-    assert.equal(await new Approvals(a5).consume(queryless), null);
-    await a5.close();
-
-    // (b) partial crash state: column exists (old buggy '' default), '' row, version still 4.
-    const fileB = join(dir, 'partial.db');
-    const b4 = await openDb({ dbPath: fileB });
-    await seedLegacyGrant(b4, ''); // the dangerous state: '' equals the live queryless digest
-    await b4.run(`UPDATE meta SET value='4' WHERE key='schema_version'`, []);
-    await b4.close();
-    const b5 = await openDb({ dbPath: fileB });
-    assert.equal(((await b5.all(`SELECT * FROM approval_request`)) as any[]).length, 0, 'partial-migration rows healed by purge');
-    assert.equal(await new Approvals(b5).consume(queryless), null);
-    await b5.close();
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test('P1-B: an encoded path separator cannot slip past an approval.paths lock (fail closed)', async () => {
+test('P1-B: an encoded path separator cannot slip past an approval.paths lock (fail closed)', async (t) => {
   // approval.paths WITHOUT an independent egressPaths: `/payments%2Fsend` does not prefix-match
   // `/payments`, but an upstream that decodes %2F routes it as `/payments/send`. Before the guard it
   // needed NO approval and ran; now it REQUIRES approval. Fail-before (executes, no throw) / pass-after.
-  const { ctx, approvalRows } = await harness({ provider: approvalProvider({ approval: { approver: 'self', paths: ['/payments'] } }) });
+  const { ctx, approvalRows } = await harness(t, { provider: approvalProvider({ approval: { approver: 'self', paths: ['/payments'] } }) });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     await expectApprovalRequired(handle.fetch('https://api.acme.test/payments%2Fsend', { method: 'POST' }));
@@ -411,12 +363,12 @@ test('P1-B: an encoded path separator cannot slip past an approval.paths lock (f
 
 // ── P1-A: grants are bound to the credential OWNER (mode change) and to its lifecycle ──
 
-test('P1-A(a): a grant minted for one credential owner cannot be consumed for another (owner change)', async () => {
+test('P1-A(a): a grant minted for one credential owner cannot be consumed for another (owner change)', async (t) => {
   // Models a mode/owner change between prompt and retry (e.g. per-user → shared): the grant is keyed
   // to owner A, so a consume that resolves to owner B must MISS (the write would otherwise run against
   // a DIFFERENT credential than was approved). Store-level, deterministic. Fail-before: without the
   // owner clause in consume(), the B-owner consume would wrongly succeed.
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const approvals = new Approvals(db);
   const forOwner = (ownerId: string) => ({
     teamId: 'T1', userId: 'U_CALLER', ownerKind: 'user' as const, ownerId,
@@ -430,12 +382,12 @@ test('P1-A(a): a grant minted for one credential owner cannot be consumed for an
   assert.ok(await approvals.consume(forOwner('U_OWNER_A')));
 });
 
-test('P1-A(b): disconnect purges live grants, so a reconnect cannot spend the old approval', async () => {
+test('P1-A(b): disconnect purges live grants, so a reconnect cannot spend the old approval', async (t) => {
   // Mint + approve a grant, then disconnect (vault.delete — the shared disconnect/offboard/revoke/
   // expiry primitive) and reconnect (vault.upsert). The old grant must be gone. Fail-before: without
   // the vault-side purge the grant survives the delete and, since the reconnect restores the SAME
   // owner, the retry would consume it and run the write with NO fresh human approval.
-  const { ctx, vouchr, click, approvalRows } = await harness();
+  const { ctx, vouchr, click, approvalRows } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -453,8 +405,8 @@ test('P1-A(b): disconnect purges live grants, so a reconnect cannot spend the ol
   });
 });
 
-test('deny: audited with the approver as actor, requester notified, no grant minted', async () => {
-  const { ctx, click, auditRows } = await harness();
+test('deny: audited with the approver as actor, requester notified, no grant minted', async (t) => {
+  const { ctx, click, auditRows } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -472,8 +424,8 @@ test('deny: audited with the approver as actor, requester notified, no grant min
   });
 });
 
-test('TTL expiry (fake clock): an unspent grant dies after ttlMs and the next fetch re-prompts', async () => {
-  const { ctx, click } = await harness({ provider: approvalProvider({ approval: { approver: 'self', ttlMs: 60_000 } }) });
+test('TTL expiry (fake clock): an unspent grant dies after ttlMs and the next fetch re-prompts', async (t) => {
+  const { ctx, click } = await harness(t, { provider: approvalProvider({ approval: { approver: 'self', ttlMs: 60_000 } }) });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -486,8 +438,8 @@ test('TTL expiry (fake clock): an unspent grant dies after ttlMs and the next fe
   });
 });
 
-test('race: two concurrent identical fetches cannot both spend one grant (DELETE…RETURNING)', async () => {
-  const { ctx, click } = await harness();
+test('race: two concurrent identical fetches cannot both spend one grant (DELETE…RETURNING)', async (t) => {
+  const { ctx, click } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -505,8 +457,8 @@ test('race: two concurrent identical fetches cannot both spend one grant (DELETE
   });
 });
 
-test('race: two concurrent store-level consumes yield exactly one winner (consent-consume pattern)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('race: two concurrent store-level consumes yield exactly one winner (consent-consume pattern)', async (t) => {
+  const db = await openTestDb(t);
   const approvals = new Approvals(db);
   const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: null };
   const id = await approvals.request(key);
@@ -517,8 +469,8 @@ test('race: two concurrent store-level consumes yield exactly one winner (consen
   assert.equal((a ?? b)!.approvedBy, 'U9');
 });
 
-test('concurrent decisions: approve and deny on one pending request — exactly one wins', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('concurrent decisions: approve and deny on one pending request — exactly one wins', async (t) => {
+  const db = await openTestDb(t);
   const approvals = new Approvals(db);
   const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: null, thread: null };
   const id = await approvals.request(key);
@@ -528,8 +480,8 @@ test('concurrent decisions: approve and deny on one pending request — exactly 
 
 // ── gate ordering: approval is an ADDITIONAL gate, never a bypass ─────────────────────────────────
 
-test('ordering: an egress-denied target throws EgressBlockedError and never mints a prompt', async () => {
-  const { ctx, ephemerals, auditRows, approvalRows } = await harness();
+test('ordering: an egress-denied target throws EgressBlockedError and never mints a prompt', async (t) => {
+  const { ctx, ephemerals, auditRows, approvalRows } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     // Host off the allowlist: egress wins.
@@ -545,8 +497,8 @@ test('ordering: an egress-denied target throws EgressBlockedError and never mint
 
 // ── approver matrices ─────────────────────────────────────────────────────────────────────────────
 
-test("admin approver: prompts go to eligible admins; forged/ineligible clicks are rejected AND audited; an admin's approval works", async () => {
-  const { ctx, ephemerals, dms, click, auditRows } = await harness({
+test("admin approver: prompts go to eligible admins; forged/ineligible clicks are rejected AND audited; an admin's approval works", async (t) => {
+  const { ctx, ephemerals, dms, click, auditRows } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'admin' } }),
     slackAdmins: ['U_ADM'],
     members: ['U1', 'U_ADM', 'U_RANDO'],
@@ -583,8 +535,8 @@ test("admin approver: prompts go to eligible admins; forged/ineligible clicks ar
   });
 });
 
-test('admin approver: deny notifies the requester ephemerally and audits the admin as actor', async () => {
-  const { ctx, ephemerals, click, auditRows } = await harness({
+test('admin approver: deny notifies the requester ephemerally and audits the admin as actor', async (t) => {
+  const { ctx, ephemerals, click, auditRows } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'admin' } }),
     slackAdmins: ['U_ADM'],
     members: ['U1', 'U_ADM'],
@@ -602,8 +554,8 @@ test('admin approver: deny notifies the requester ephemerally and audits the adm
   });
 });
 
-test("self approver: another user's click is rejected and audited; nothing is granted", async () => {
-  const { ctx, click, auditRows } = await harness();
+test("self approver: another user's click is rejected and audited; nothing is granted", async (t) => {
+  const { ctx, click, auditRows } = await harness(t);
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -616,8 +568,8 @@ test("self approver: another user's click is rejected and audited; nothing is gr
   });
 });
 
-test('forged approval id / cross-team id decides nothing', async () => {
-  const { ctx, click, approvalRows } = await harness();
+test('forged approval id / cross-team id decides nothing', async (t) => {
+  const { ctx, click, approvalRows } = await harness(t);
   await withFetch(async () => {
     const handle = await ctx.connect('acme');
     await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -632,8 +584,8 @@ test('forged approval id / cross-team id decides nothing', async () => {
 
 // ── zero behavior change without the knob ─────────────────────────────────────────────────────────
 
-test('providers without the approval knob: writes pass untouched, no approval rows anywhere', async () => {
-  const { ctx, ephemerals, auditRows, approvalRows } = await harness({
+test('providers without the approval knob: writes pass untouched, no approval rows anywhere', async (t) => {
+  const { ctx, ephemerals, auditRows, approvalRows } = await harness(t, {
     provider: approvalProvider({ approval: undefined }),
   });
   await withFetch(async (calls) => {
@@ -649,11 +601,11 @@ test('providers without the approval knob: writes pass untouched, no approval ro
 
 // ── shared channel-owned credential: the grant binds to owner_kind=channel ────────────────────────
 
-test('shared mode: a write on a channel-owned credential prompts, binds to the channel owner, and consumes once', async () => {
+test('shared mode: a write on a channel-owned credential prompts, binds to the channel owner, and consumes once', async (t) => {
   // connect() in shared mode borrows the CHANNEL's credential (owner_kind=channel/owner_id=C1),
   // audited as the acting human. Closes owner-binding coverage for the channel owner kind (the
   // per-user kind is covered above). Approver 'self' = the caller confirms their own action.
-  const { ctx, ephemerals, click, approvalRows, auditRows } = await harness({ sharedChannel: true });
+  const { ctx, ephemerals, click, approvalRows, auditRows } = await harness(t, { sharedChannel: true });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme'); // shared mode → connectChannel, channel-owned cred
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
@@ -699,9 +651,9 @@ function post(port: number, path: string, body: unknown): Promise<{ status: numb
   });
 }
 
-test('broker: unapproved write → 403 { error: "approval_required", approvalId }; approved retry executes once', async () => {
+test('broker: unapproved write → 403 { error: "approval_required", approvalId }; approved retry executes once', async (t) => {
   const SECRET = 'broker-signing-secret';
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   const audit = new Audit(db);
   const provider = approvalProvider();
@@ -740,8 +692,8 @@ test('broker: unapproved write → 403 { error: "approval_required", approvalId 
 
 // ── sweep ─────────────────────────────────────────────────────────────────────────────────────────
 
-test('sweep: expired prompts and unspent grants are deleted and audited (actor: system)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('sweep: expired prompts and unspent grants are deleted and audited (actor: system)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   const audit = new Audit(db);
   const consent = new Consent(db);

@@ -1,8 +1,8 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { encrypt, open, type EnvelopeProvider } from '../src/core/crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
@@ -52,8 +52,8 @@ const provider: EnvelopeProvider = {
   async unwrapDataKey(w) { unwraps++; return aesUnwrap(w); },
 };
 
-test('envelope: round-trips through Vault, stores scheme 0x01, invokes unwrap on read', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('envelope: round-trips through Vault, stores scheme 0x01, invokes unwrap on read', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, {}, provider);
   await vault.upsert(O1, 'github', {
     accessToken: 'tok_env', refreshToken: 'ref_env', scopes: 'repo', expiresAt: null, externalAccount: 'octo',
@@ -72,8 +72,8 @@ test('envelope: round-trips through Vault, stores scheme 0x01, invokes unwrap on
   assert.ok(!buf.toString('utf8').includes('tok_env'), 'ciphertext must not contain the plaintext');
 });
 
-test('envelope: local-path rows (no provider) still decrypt under both a local and an envelope vault', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('envelope: local-path rows (no provider) still decrypt under both a local and an envelope vault', async (t) => {
+  const db = await openTestDb(t);
   const local = new Vault(db, KEY); // no provider → current behavior
   await local.upsert(O1, 'github', {
     accessToken: 'tok_legacy', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -93,8 +93,8 @@ test('envelope: a legacy blob whose IV starts with 0x01 still decrypts under an 
   assert.equal(await open(blob, KEY, provider), 'collision_secret');
 });
 
-test('envelope: a keyring-backed vault (#115) reads envelope rows, legacy rows, and writes keyed rows', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('envelope: a keyring-backed vault (#115) reads envelope rows, legacy rows, and writes keyed rows', async (t) => {
+  const db = await openTestDb(t);
   // Rows written by TODAY's two modes: envelope (0x01) and direct legacy (scheme-0).
   await new Vault(db, KEY, {}, provider).upsert(O1, 'github', {
     accessToken: 'tok_env', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,

@@ -7,43 +7,107 @@ Vouchr does *not* protect against, see [SECURITY.md](../SECURITY.md), which is n
 Common to every deploy: a 32-byte `VOUCHR_MASTER_KEY` (`openssl rand -base64 32`) and a public
 HTTPS `baseUrl` reachable at the OAuth callback (`$baseUrl/vouchr/oauth/callback`).
 
-## SQLite (local / single instance): the default
+## PostgreSQL (required)
 
-Zero config. With no `databaseUrl`, Vouchr opens a SQLite file (`vouchr.db` by default).
-
-```ts
-const vouchr = await createVouchr({
-  providers: [github()],
-  baseUrl: process.env.PUBLIC_URL!,
-  // dbPath: '/data/vouchr.db',   // or set VOUCHR_DB; defaults to ./vouchr.db
-});
-```
-
-Path resolution: `dbPath` option → `VOUCHR_DB` env → `vouchr.db`. Fine for a single instance
-(the file is local). The file is **not** fully encrypted at rest (only token columns are), so put
-it on an encrypted, access-controlled volume.
-
-## Postgres (multi-instance / stateless)
-
-For more than one instance, use Postgres so any instance can serve any request. `databaseUrl`
-(or `VOUCHR_DATABASE_URL`) takes precedence over `dbPath`.
+Vouchr is PostgreSQL-only: it stores credentials in Postgres and nothing else. A connection
+string is **required** — supply it as the `databaseUrl` option, the `VOUCHR_DATABASE_URL` env var,
+or the CLI `--db` flag. Vouchr **fails closed at boot** if the value is missing or is not a
+`postgres://` URL. There is **no** embedded/SQLite mode and **no** generic `DATABASE_URL` fallback:
+only `VOUCHR_DATABASE_URL` (or the explicit option/flag) is read.
 
 ```ts
 const vouchr = await createVouchr({
   providers: [github()],
   baseUrl: process.env.PUBLIC_URL!,
-  databaseUrl: process.env.VOUCHR_DATABASE_URL!, // postgres://user:pass@host:5432/vouchr
+  databaseUrl: process.env.VOUCHR_DATABASE_URL!, // postgres://user:pass@host:5432/vouchr?sslmode=require
 });
 ```
+
+**Migrate first.** The schema is created by the `vouchr migrate` command, not by the runtime — see
+[Migrations](#migrations) below. The runtime connects with a DML-only role and **never** creates
+tables; it verifies the schema version at boot and **fails closed** if the database has not been
+migrated (or is on a different schema version).
+
+**Connection config:**
+
+- **TLS is native.** There is no separate TLS knob — put `sslmode=require` (or stricter, e.g.
+  `verify-full` with `sslrootcert=`) in the connection string and the `pg` driver negotiates it.
+- **Pool size** is `VOUCHR_PG_POOL_MAX` (a validated positive integer; the driver's default of 10
+  applies when unset). Size it to your `max_connections` and replica count. The pool sets
+  `application_name=vouchr`, so it's identifiable in `pg_stat_activity`.
+- **Pool shutdown.** `createVouchr(...).close()` and the async `install(...).stop()` close the pool
+  **Vouchr opened**. If you inject your own `db` (see below), Vouchr does **not** close it — its
+  lifecycle is yours.
+
+**One pool across workspaces.** `createVouchr` accepts an injected `db` (from `openDb`) so a
+deployment that also builds a `DbInstallationStore` (or otherwise wants its own pool) shares **one**
+Postgres pool instead of opening two — e.g. the [Postgres + KMS template](../examples/postgres-kms).
+Open it once, pass it as `db`, and close it on shutdown.
+
+Postgres is stateless: one migrated database backs the whole fleet, so any instance can serve any
+request and `replicas > 1` is safe (the cluster-wide replay table is part of the schema — see
+*Replay*). Concurrent `vouchr migrate` runs are serialized by an advisory lock. The database is
+**not** fully encrypted at rest (only token columns are), so run it on encrypted, access-controlled
+storage.
 
 Local Postgres for development (throwaway Docker container on port 5433):
 
 ```bash
 npm run pg:up   # postgres:16-alpine, db/user/pass all "vouchr"
-export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5433/vouchr
-npm test        # exercises the Postgres backend
+export VOUCHR_TEST_PG_URL=postgres://vouchr:vouchr@localhost:5433/vouchr
+npm test        # the suite migrates a throwaway schema and exercises the Postgres backend
 npm run pg:down # tear it down
 ```
+
+## Migrations
+
+The schema is owned by the `vouchr migrate` command, and the runtime is DML-only — a deliberate
+split so the long-running process holds no DDL privileges.
+
+- **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
+  deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
+  and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
+
+  ```bash
+  VOUCHR_DATABASE_URL=postgres://vouchr_owner:...@host:5432/vouchr npx vouchr migrate
+  # or, from a checkout: node bin/vouchr.ts migrate
+  # in the container image: node dist/bin/vouchr.js migrate
+  ```
+
+- **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
+  `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
+  if the database isn't migrated. Run the migrate step (a Job / initContainer) to completion
+  **before** the runtime rolls out.
+
+Example roles and grants (adjust names to taste):
+
+```sql
+-- Schema-owner role: runs `vouchr migrate` only.
+CREATE ROLE vouchr_owner LOGIN PASSWORD '...';
+GRANT ALL ON SCHEMA public TO vouchr_owner;
+
+-- DML-only runtime role: what createVouchr / the broker connect as. No CREATE.
+CREATE ROLE vouchr_app LOGIN PASSWORD '...';
+GRANT USAGE ON SCHEMA public TO vouchr_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO vouchr_app;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO vouchr_app;
+-- so a later `vouchr migrate` (as vouchr_owner) auto-grants DML on tables it creates:
+ALTER DEFAULT PRIVILEGES FOR ROLE vouchr_owner IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO vouchr_app;
+ALTER DEFAULT PRIVILEGES FOR ROLE vouchr_owner IN SCHEMA public
+  GRANT USAGE, SELECT ON SEQUENCES TO vouchr_app;
+```
+
+Point the migrate step at `vouchr_owner` and the runtime at `vouchr_app`. The `/readyz` probe
+reflects schema readiness: it returns `503` until the database has been migrated to the current
+version, and `200` once the runtime can reach a current schema.
+
+### Breaking upgrade — no SQLite import
+
+Vouchr is greenfield/pre-1.0 and PostgreSQL-only. There is **no** SQLite importer and **no** data
+migration from any prior embedded store: the upgrade path is a **fresh PostgreSQL database** that
+you `vouchr migrate`. Any data in a previous SQLite file is not imported — re-connect accounts in
+the new Postgres-backed deployment.
 
 Multi-instance notes:
 - All instances share one Postgres; credentials are isolated by `team_id`, so multiple workspaces
@@ -248,7 +312,8 @@ POST /v1/admin/reference
 | `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. |
 | `VOUCHR_MASTER_KEY` | yes* | base64 of 32 bytes; encrypts tokens at rest (`openssl rand -base64 32`). *Or `VOUCHR_MASTER_KEYS`. |
 | `VOUCHR_MASTER_KEYS` | no | comma-separated `id:base64key` entries for master-key rotation; the FIRST entry encrypts new writes, every entry decrypts (see [Key rotation](#key-rotation)). |
-| `VOUCHR_DATABASE_URL` | prod | `postgres://…` → Postgres. Unset → SQLite (`VOUCHR_DB`, single replica). `DATABASE_URL` is read as a fallback, so a platform-injected one selects the backend. |
+| `VOUCHR_DATABASE_URL` | yes | `postgres://…` connection string. Required — boot fails closed if unset or non-`postgres://`. No `DATABASE_URL` fallback. Put `sslmode=require` (or stricter) in the URL for TLS. Migrate first with `vouchr migrate` (schema-owner role); the runtime connects DML-only. |
+| `VOUCHR_PG_POOL_MAX` | no | pool size (validated positive integer; `pg`'s default of 10 when unset). The pool sets `application_name=vouchr`. |
 | `VOUCHR_PROVIDERS` / `VOUCHR_PROVIDERS_FILE` | yes | provider config (inline JSON / file path); see below. |
 | `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` | per OAuth provider | client creds, kept out of the JSON. |
 | `VOUCHR_KMS_KEY_ID` | prod | enables the KMS envelope (KEK). Needs `@aws-sdk/client-kms` in the image. |
@@ -381,12 +446,11 @@ package root.
 
 ### Replay (multi-replica)
 
-A signed `jti` must be single-use across the fleet. Shared replay protection is automatic when you use
-a shared database: every db-configured broker defaults to a durable `DbReplayStore`
-(`INSERT … ON CONFLICT DO NOTHING` on a `broker_jti` table), so a token replayed against a different
-pod is rejected. You may still pass a custom `replayStore` (e.g. Redis `SET jti 1 NX PX=<ttl>`). This is
-why `replicas > 1` is safe on Postgres — one shared table backs the whole fleet. SQLite is
-single-replica infrastructure, so run a single replica there regardless.
+A signed `jti` must be single-use across the fleet. Shared replay protection is automatic: every
+broker defaults to a durable `DbReplayStore` (`INSERT … ON CONFLICT DO NOTHING` on the baseline
+`broker_jti` table), so a token replayed against a different pod is rejected. You may still pass a
+custom `replayStore` (e.g. Redis `SET jti 1 NX PX=<ttl>`). This is why `replicas > 1` is safe —
+one shared Postgres table backs the whole fleet.
 
 ### Perimeter auth
 
@@ -478,9 +542,12 @@ ARN is hardcoded. For KMS, add `@aws-sdk/client-kms` to the image and bind an IR
 the SDK default credential chain does the rest.
 
 Health probes: `GET /healthz` is liveness (a bare `{"ok":true}` while the process serves, no DB call —
-a DB blip must never restart the fleet); `GET /readyz` is readiness (`{"ok":true}` only if a `SELECT 1`
-round-trip succeeds within ~2s, else `503 {"ok":false}` so the pod drains from the Service). Both are
-unauthenticated, exempt from identity/replay, and return a bare status with no secrets. Wire them as:
+a DB blip must never restart the fleet); `GET /readyz` is readiness (`{"ok":true}` only if a schema-version
+round-trip against a **migrated** database succeeds within ~2s, else `503 {"ok":false}` so the pod drains
+from the Service). Because readiness reflects schema readiness, a pod stays `503` until `vouchr migrate`
+has brought the database to the current version — run the migrate step before the runtime rolls out. Both
+probes are unauthenticated, exempt from identity/replay, and return a bare status with no secrets. Wire
+them as:
 
 ```yaml
 readinessProbe:
@@ -493,24 +560,22 @@ livenessProbe:
   periodSeconds: 20
 ```
 
-**SQLite in a container**: the default `vouchr.db` path is not writable under a
-non-root, read-only-root-filesystem pod. Set `VOUCHR_DB` to a mounted writable volume, or use
-`:memory:` for ephemeral tests. SQLite is single-replica; for a multi-instance deployment use
-Postgres (see the recommendation below).
+**Read-only rootfs / non-root container**: nothing is written to the container filesystem —
+Vouchr's only store is Postgres. Point `VOUCHR_DATABASE_URL` at an external Postgres and the pod
+needs no writable volume for the database.
 
 ### Recommended production configuration
 
-Vouchr does not self-gate its configuration — it boots with whatever backend it is given, and the
-hosting/integrating system decides its own infra requirements. For a **multi-instance / production**
-deployment we recommend:
+Postgres (`VOUCHR_DATABASE_URL`) is **required** — Vouchr fails closed at boot without it — and is
+stateless, so `replicas > 1` is safe out of the box. Beyond that, for a **production** deployment we
+recommend:
 
-- **Postgres** (`VOUCHR_DATABASE_URL`) — SQLite is a single-file lock with no cross-instance story.
 - **A KMS envelope** (`VOUCHR_KMS_KEY_ID`) — per-secret KMS-wrapped data keys, not just
   storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount.
 
-These are recommendations, not enforced preconditions: Vouchr will not refuse to boot on SQLite or
-without an envelope. Enabling KMS in the reference manifest means uncommenting `VOUCHR_KMS_KEY_ID`
-and adding `@aws-sdk/client-kms` to the image together.
+The KMS envelope is a recommendation, not an enforced precondition: Vouchr will boot without it.
+Enabling KMS in the reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding
+`@aws-sdk/client-kms` to the image together.
 
 ## Slack app + OAuth install flow
 
@@ -550,7 +615,7 @@ yours. Don't go live until each holds.
 | Item | Owner |
 |---|---|
 | Strong `VOUCHR_MASTER_KEY` (32 random bytes) in a secret manager, never in source control | operator |
-| Credential store (SQLite file or Postgres) encrypted at rest and access-controlled at the infra layer | operator (Vouchr encrypts only token columns) |
+| PostgreSQL credential store encrypted at rest and access-controlled at the infra layer | operator (Vouchr encrypts only token columns) |
 | Public URL is HTTPS. Egress also requires https, loopback exempt | operator (Vouchr enforces https egress) |
 | Least-privilege IAM for any resolver (read-only on the specific secrets) | operator (example policy provided) |
 | Slack scopes / events / interactivity applied from the manifest | operator (manifest provided) |
@@ -646,7 +711,7 @@ The credential store and the key that protects it must be backed up **separately
 
 ### What to back up, and the cardinal rule
 
-- **Direct mode:** the DB (SQLite file or Postgres dump) holds only ciphertext for
+- **Direct mode:** the Postgres dump holds only ciphertext for
   token columns; the master key (`VOUCHR_MASTER_KEY`) is what makes it readable.
   Back up the key separately, in your secret manager, **never alongside the DB
   backup.** A backup that contains both the ciphertext and the key is a single point
@@ -664,14 +729,12 @@ The credential store and the key that protects it must be backed up **separately
 
 ### Backing up
 
-- **SQLite:** stop writers or use SQLite's online backup / `VACUUM INTO` to get a
-  consistent copy (the DB runs in WAL mode, so copying the bare `.db` file mid-write can
-  miss the `-wal`/`-shm` sidecars). Store the copy encrypted at rest.
 - **Postgres:** `pg_dump` (or your managed-DB snapshot mechanism) on its own schedule.
+  Store the copy encrypted at rest.
 
 ### Restoring
 
-1. Restore the DB (SQLite file in place, or `pg_restore` / snapshot).
+1. Restore the DB (`pg_restore` / snapshot).
 2. Make the key available to the *same* process: set `VOUCHR_MASTER_KEY` to the exact
    key the rows were sealed under — or, if the backup predates a key rotation, list the
    old key in `VOUCHR_MASTER_KEYS` under the **same id** it had when the rows were

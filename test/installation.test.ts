@@ -1,8 +1,8 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import type { Installation } from '@slack/bolt';
-import { openDb } from '../src/core/db';
 import { DbInstallationStore } from '../src/adapters/installationStore';
 
 const KEY = randomBytes(32);
@@ -29,8 +29,8 @@ const orgInstall = (enterpriseId: string, botToken: string): Installation => ({
   authVersion: 'v2',
 });
 
-test('team install: store → fetch → delete round-trip', async () => {
-  const store = new DbInstallationStore(await openDb({ dbPath: ':memory:' }), KEY);
+test('team install: store → fetch → delete round-trip', async (t) => {
+  const store = new DbInstallationStore(await openTestDb(t), KEY);
   await store.storeInstallation(teamInstall('T1', 'xoxb-T1'));
 
   const got = await store.fetchInstallation({ teamId: 'T1', enterpriseId: undefined, isEnterpriseInstall: false });
@@ -44,8 +44,8 @@ test('team install: store → fetch → delete round-trip', async () => {
   );
 });
 
-test('org-wide install: store → fetch → delete; team queries in the org fall back to it', async () => {
-  const store = new DbInstallationStore(await openDb({ dbPath: ':memory:' }), KEY);
+test('org-wide install: store → fetch → delete; team queries in the org fall back to it', async (t) => {
+  const store = new DbInstallationStore(await openTestDb(t), KEY);
   await store.storeInstallation(orgInstall('E1', 'xoxb-E1'));
 
   const got = await store.fetchInstallation({ teamId: undefined, enterpriseId: 'E1', isEnterpriseInstall: true });
@@ -69,8 +69,8 @@ test('org-wide install: store → fetch → delete; team queries in the org fall
   );
 });
 
-test('per-team token resolution returns the right workspace token', async () => {
-  const store = new DbInstallationStore(await openDb({ dbPath: ':memory:' }), KEY);
+test('per-team token resolution returns the right workspace token', async (t) => {
+  const store = new DbInstallationStore(await openTestDb(t), KEY);
   await store.storeInstallation(teamInstall('T1', 'xoxb-T1'));
   await store.storeInstallation(teamInstall('T2', 'xoxb-T2'));
 
@@ -87,8 +87,8 @@ test('per-team token resolution returns the right workspace token', async () => 
   );
 });
 
-test('secrets are encrypted at rest (no plaintext token in the row)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('secrets are encrypted at rest (no plaintext token in the row)', async (t) => {
+  const db = await openTestDb(t);
   const store = new DbInstallationStore(db, KEY);
   await store.storeInstallation(teamInstall('T1', 'xoxb-SECRET'));
 

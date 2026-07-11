@@ -1,9 +1,9 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
 import { createVouchr, defineProvider, github, ConsentRequiredError } from '../src';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -62,7 +62,7 @@ function fakeRes() {
   return r;
 }
 
-test('integration: middleware → connect prompt → OAuth callback → vault → leak-safe fetch', async () => {
+test('integration: middleware → connect prompt → OAuth callback → vault → leak-safe fetch', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const mock = await startMockProvider();
   try {
@@ -81,7 +81,7 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
         return r.ok ? (await r.json()).login : null;
       },
     });
-    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, dbPath: ':memory:' });
+    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
 
     // Capture the OAuth callback handler that mountRoutes registers on the router.
     let callback: any;
@@ -131,7 +131,7 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
   }
 });
 
-test('integration: OAuth callback error is served as inert text/plain, not text/html (#177)', async () => {
+test('integration: OAuth callback error is served as inert text/plain, not text/html (#177)', async (t) => {
   // A hostile provider can redirect the victim back with ?error=<markup> holding a valid in-flight
   // state; the callback echoes it into `OAuth error: <x>`. Express would default a string send to
   // text/html and execute the markup on the Vouchr host origin. The route must serve it as text/plain.
@@ -143,7 +143,7 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
       scopesDefault: ['read'], egressAllow: ['127.0.0.1'], refresh: 'none', pkce: true,
       clientId: 'cid', clientSecret: 'csec',
     });
-    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, dbPath: ':memory:' });
+    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
     let callback: any;
     lan.mountRoutes({ get: (_p: string, h: any) => (callback = h) });
 
@@ -168,10 +168,10 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
   }
 });
 
-test('integration: handle.fetch does not follow a redirect off the allowlisted path', async () => {
+test('integration: handle.fetch does not follow a redirect off the allowlisted path', async (t) => {
   const mock = await startMockProvider();
   try {
-    const db = await openDb({ dbPath: ':memory:' });
+    const db = await openTestDb(t);
     const vault = new Vault(db, randomBytes(32));
     const audit = new Audit(db);
     const id = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -202,12 +202,12 @@ test('integration: handle.fetch does not follow a redirect off the allowlisted p
   }
 });
 
-test('integration: Slack deactivation auto-revokes the user\'s connections (user_change)', async () => {
+test('integration: Slack deactivation auto-revokes the user\'s connections (user_change)', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [github({ clientId: 'a', clientSecret: 'b' })],
     baseUrl: 'http://127.0.0.1:1',
-    dbPath: ':memory:',
+    db: await openTestDb(t),
     ttl: {}, // disable expiry so the seeded rows survive
   });
   let handler: any;
@@ -228,12 +228,12 @@ test('integration: Slack deactivation auto-revokes the user\'s connections (user
   assert.equal((await lan.vault.listForUser({ ...id, userId: 'U2' })).length, 1);
 });
 
-test('integration: /vouchr status lists connections and disconnect revokes', async () => {
+test('integration: /vouchr status lists connections and disconnect revokes', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [github({ clientId: 'a', clientSecret: 'b' })],
     baseUrl: 'http://127.0.0.1:1',
-    dbPath: ':memory:',
+    db: await openTestDb(t),
   });
   let handler: any;
   lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
@@ -259,12 +259,12 @@ test('integration: /vouchr status lists connections and disconnect revokes', asy
   assert.equal((await lan.vault.listForUser(id)).length, 0); // revoked
 });
 
-test('integration: install() wires middleware, routes, commands, offboarding in one call', async () => {
+test('integration: install() wires middleware, routes, commands, offboarding in one call', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [github({ clientId: 'a', clientSecret: 'b' })],
     baseUrl: 'http://127.0.0.1:1',
-    dbPath: ':memory:',
+    db: await openTestDb(t),
   });
 
   const wired = { middleware: false, route: false, command: false, event: false };

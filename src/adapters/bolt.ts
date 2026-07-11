@@ -1,6 +1,6 @@
 import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
-import { openDb } from '../core/db';
+import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, isBrokeredProvider, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
@@ -161,10 +161,13 @@ export interface VouchrOptions {
   /** Public origin where the callback is reachable, e.g. https://abc.ngrok.io */
   baseUrl: string;
   callbackPath?: string;
-  /** SQLite file path (the zero-config default). */
-  dbPath?: string;
-  /** Postgres connection string, for stateless / multi-instance infra. Overrides dbPath. */
+  /** PostgreSQL connection string. Falls back to VOUCHR_DATABASE_URL. Vouchr is PostgreSQL-only
+   *  (#204) — no embedded/SQLite mode, no generic DATABASE_URL fallback. Ignored when `db` is given. */
   databaseUrl?: string;
+  /** A pre-opened, caller-managed store (see `openDb`). Inject one to share a single pool across a
+   *  multi-workspace host (or a test), instead of Vouchr opening its own from `databaseUrl`. When
+   *  injected, the caller owns its lifecycle — `install().stop()` will NOT close it. */
+  db?: Db;
   policy?: Policy;
   /** Bot token used only to post the "connected" confirmation back to Slack. */
   botToken?: string;
@@ -994,7 +997,9 @@ export async function createVouchr(opts: VouchrOptions) {
   // #116: external KMS makes real wrap/unwrap network calls — refuse fail-closed before opening the
   // db, so the "no real network on any edge" guarantee holds. Local master key only in dry-run.
   if (dryRun) assertDryRunLocalKey(!!opts.envelope);
-  const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
+  // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
+  const ownsDb = !opts.db;
+  const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
   // #116 safety rail: dry-run hard-fails at startup against a vault holding real credential rows.
   if (dryRun) await assertDryRunVault(db);
   const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
@@ -2002,7 +2007,7 @@ export async function createVouchr(opts: VouchrOptions) {
     },
     receiver: { router: any },
     opts: { sweepIntervalMs?: number } = {},
-  ): { stop: () => void } {
+  ): { stop: () => Promise<void> } {
     app.use(middleware);
     mountRoutes(receiver.router);
     registerCommands(app);
@@ -2014,11 +2019,20 @@ export async function createVouchr(opts: VouchrOptions) {
       timer = setInterval(() => void sweep().catch(() => undefined), intervalMs);
       timer.unref(); // never keep the process alive for the sweep alone
     }
-    return { stop: () => { if (timer) clearInterval(timer); } };
+    // stop() tears down what install() started: the sweep timer, and (only if Vouchr opened it) the
+    // db pool. An injected db is the caller's to close.
+    return { stop: async () => { if (timer) clearInterval(timer); if (ownsDb) await db.close(); } };
+  }
+
+  /** Close the store pool if Vouchr opened it (a no-op for an injected db, which the caller owns).
+   *  For hosts that wire the granular methods instead of install(); install().stop() calls this too. */
+  async function close(): Promise<void> {
+    if (ownsDb) await db.close();
   }
 
   return {
     install,
+    close,
     middleware,
     mountRoutes,
     registerCommands,

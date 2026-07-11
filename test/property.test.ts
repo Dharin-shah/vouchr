@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -74,8 +74,8 @@ function pathAllowed(pathname: string, allowed: string): boolean {
 
 // One handle, reused across iterations; the resolver counter is reset per case. A referenced cred
 // means the ONLY way to read the secret is the resolver, and count 0 proves the secret was never read.
-async function makeEgressHandle(provider: Provider) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeEgressHandle(t: TestContext, provider: Provider) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   let calls = 0;
   await vault.reference(O1, provider.id, { source: 'ext', secretRef: 'arn:secret' });
@@ -84,12 +84,12 @@ async function makeEgressHandle(provider: Provider) {
   return { handle, getCalls: () => calls, reset: () => { calls = 0; } };
 }
 
-test('property: random non-allowlisted hosts are ALWAYS denied, secret never read', async () => {
+test('property: random non-allowlisted hosts are ALWAYS denied, secret never read', async (t) => {
   const realFetch = globalThis.fetch;
   let fetched = false;
   globalThis.fetch = (async () => { fetched = true; return new Response('{}', { status: 200 }); }) as any;
   try {
-    const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
+    const { handle, getCalls, reset } = await makeEgressHandle(t, egProvider);
     const N = scale(300);
     for (let i = 0; i < N; i++) {
       // random hostname, never the allowlisted one
@@ -110,11 +110,11 @@ test('property: random non-allowlisted hosts are ALWAYS denied, secret never rea
   }
 });
 
-test('property: allowlisted host + non-https (non-loopback) is ALWAYS denied, secret never read', async () => {
+test('property: allowlisted host + non-https (non-loopback) is ALWAYS denied, secret never read', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
-    const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
+    const { handle, getCalls, reset } = await makeEgressHandle(t, egProvider);
     const N = scale(200);
     for (let i = 0; i < N; i++) {
       const scheme = pick(['http', 'ftp', 'ws', 'gopher']);
@@ -131,11 +131,11 @@ test('property: allowlisted host + non-https (non-loopback) is ALWAYS denied, se
   }
 });
 
-test('property: only matching path+method pass; mismatches denied with secret unread', async () => {
+test('property: only matching path+method pass; mismatches denied with secret unread', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
-    const { handle, getCalls, reset } = await makeEgressHandle(egProvider);
+    const { handle, getCalls, reset } = await makeEgressHandle(t, egProvider);
     const paths = ['/repos/x', '/repos/', '/repos', '/user', '/user/abc', '/userish', '/secrets', '/other', '/'];
     const methods = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'get', 'post'];
     const N = scale(400);
@@ -188,8 +188,8 @@ function benignValue(): string {
   }
 }
 
-test('property: token-shaped values are redacted, benign values pass through unchanged', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('property: token-shaped values are redacted, benign values pass through unchanged', async (t) => {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   // Query by a per-iteration unique provider id. `at` is a ms timestamp and collides in a tight loop,
   // so ORDER BY at would read back the wrong row.
@@ -266,8 +266,8 @@ const consentProvider = defineProvider({
   clientSecret: 'csec',
 });
 
-test('property: consume() is single-use; unknown states return null', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('property: consume() is single-use; unknown states return null', async (t) => {
+  const db = await openTestDb(t);
   const consent = new Consent(db);
   const N = scale(200);
   for (let i = 0; i < N; i++) {
@@ -291,8 +291,8 @@ test('property: consume() is single-use; unknown states return null', async () =
   }
 });
 
-test('property: rows older than the TTL are treated as expired (null)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('property: rows older than the TTL are treated as expired (null)', async (t) => {
+  const db = await openTestDb(t);
   const consent = new Consent(db);
   const N = scale(100);
   for (let i = 0; i < N; i++) {
@@ -311,8 +311,8 @@ test('property: rows older than the TTL are treated as expired (null)', async ()
 // =====================================================================================
 // 5. Provider URL building: required params always present; code_challenge iff provider.pkce.
 // =====================================================================================
-test('property: authorize URL always carries the required params; code_challenge iff pkce', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('property: authorize URL always carries the required params; code_challenge iff pkce', async (t) => {
+  const db = await openTestDb(t);
   const consent = new Consent(db);
   const redirectUri = 'https://app.example/oauth/callback';
 

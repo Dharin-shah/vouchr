@@ -64,8 +64,8 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   swallowed on failure so a bookkeeping error can't fail or roll back a provider call that already
   executed; wire an `EventSink` (the `injected` event is a redundant independent signal) as a durable
   backstop. See the [threat model](./guides/THREAT-MODEL.md#audit-completeness-is-best-effort-by-design).
-- **The SQLite file is not wholly encrypted at rest.** Token columns are encrypted; the rest of the
-  row and the file are not. Use disk/database encryption and access control at the infra layer
+- **The Postgres database is not wholly encrypted at rest.** Token columns are encrypted; the rest of
+  the row and the database are not. Use disk/database encryption and access control at the infra layer
   (envelope encryption via an `EnvelopeProvider` raises the bar on the token columns).
 
 ## Operator responsibilities
@@ -76,7 +76,7 @@ Vouchr is self-hosted; some of the security posture is yours to own:
   in source control.
 - Scope the IAM/role used by any external-secret resolver to least privilege (read-only on the
   specific secrets it resolves).
-- Keep the credential store (SQLite file or Postgres) encrypted at rest and access-controlled
+- Keep the PostgreSQL credential store encrypted at rest and access-controlled
   at the infrastructure layer.
 - Understand the admin gate's trust boundary: channel-credential configuration is gated on
   Slack **workspace** admin/owner status (`users.info` `is_admin`/`is_owner`), which is

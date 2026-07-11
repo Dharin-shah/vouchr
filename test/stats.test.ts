@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Audit } from '../src/core/audit';
 import { ChannelTools } from '../src/core/tools';
 import { Vault } from '../src/core/vault';
@@ -24,8 +24,8 @@ const mk = (id: string) => defineProvider({
 
 const DAY = 24 * 60 * 60 * 1000;
 
-test('statsByChannel: counts injections + distinct actors in-window, scoped to channel + action', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('statsByChannel: counts injections + distinct actors in-window, scoped to channel + action', async (t) => {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   const now = Date.now();
   const rec = (provider: string, userId: string, channel: string, action: string, at: number) =>
@@ -50,11 +50,11 @@ test('statsByChannel: counts injections + distinct actors in-window, scoped to c
   assert.ok(rows.every((r) => typeof r.uses === 'number' && typeof r.distinctActors === 'number')); // coerced
 });
 
-test('statsByChannel attributes REAL per-user usage to the origin channel (the P1 bug)', async () => {
+test('statsByChannel attributes REAL per-user usage to the origin channel (the P1 bug)', async (t) => {
   // The prior test seeded audit rows with { channel } set — masking the bug that per-user/session
   // inject audits left channel NULL. This drives a genuine per-user handle.fetch() and asserts the
   // usage is attributed to the channel it happened in (else `/vouchr stats` marks live tools "idle").
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   const vault = new Vault(db, KEY);
   await vault.upsert(userOwner(uid('U1')), 'github', tok);
@@ -73,10 +73,10 @@ test('statsByChannel attributes REAL per-user usage to the origin channel (the P
   assert.equal(rows[0].distinctActors, 1);
 });
 
-async function harness(opts: { isAdmin?: boolean } = {}) {
+async function harness(t: TestContext, opts: { isAdmin?: boolean } = {}) {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
-    providers: [mk('github'), mk('gitlab'), mk('idle')], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:',
+    providers: [mk('github'), mk('gitlab'), mk('idle')], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t),
     ...(opts.isAdmin !== undefined ? { isAdmin: async () => opts.isAdmin! } : {}),
   });
   let handler: any;
@@ -93,8 +93,8 @@ async function harness(opts: { isAdmin?: boolean } = {}) {
   return { lan, audit, run };
 }
 
-test('/vouchr stats (admin): shows used providers with counts and flags an enabled-but-idle tool', async () => {
-  const { lan, audit, run } = await harness({ isAdmin: true });
+test('/vouchr stats (admin): shows used providers with counts and flags an enabled-but-idle tool', async (t) => {
+  const { lan, audit, run } = await harness(t, { isAdmin: true });
   const tools = new ChannelTools(lan.db);
   for (const p of ['github', 'gitlab', 'idle']) await tools.setEnabled('T1', 'C_FIN', p, true);
   // github used by 2 people, gitlab by 1; 'idle' is enabled but never used.
@@ -109,8 +109,8 @@ test('/vouchr stats (admin): shows used providers with counts and flags an enabl
   assert.match(json, /disable <provider>/);            // prune hint present
 });
 
-test('/vouchr stats: a non-admin is refused via the admin gate and the denial is audited', async () => {
-  const { audit, run } = await harness(); // no isAdmin override; users.info is_admin=false, not creator
+test('/vouchr stats: a non-admin is refused via the admin gate and the denial is audited', async (t) => {
+  const { audit, run } = await harness(t); // no isAdmin override; users.info is_admin=false, not creator
   assert.match(String(await run('stats')), /Only a workspace admin/);
   const rows = await audit.listByChannel('T1', 'C_FIN', 20);
   assert.ok(rows.some((r) => r.action === 'denied' && r.provider === 'stats'));

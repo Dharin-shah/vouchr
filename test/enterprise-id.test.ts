@@ -1,7 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner, channelOwner } from '../src/core/owner';
 
@@ -10,8 +10,8 @@ const tok = { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null,
 
 // enterprise_id is persisted for user-owned creds (so enterprise-scoped offboarding can match),
 // but it is NOT part of the isolation key.
-test('vault persists enterprise_id for user owner, null for channel owner', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('vault persists enterprise_id for user owner, null for channel owner', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const id = { enterpriseId: 'E1', teamId: 'T1', userId: 'U1' };
 

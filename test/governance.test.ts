@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -21,14 +21,14 @@ const provider = defineProvider({
 
 // Mirrors channel.test.ts's ctx() but exposes the two governance knobs. `members` shapes the
 // mocked conversations.members: a member-id list, or 'throw' to fail the membership check.
-async function ctx(opts: {
+async function ctx(t: TestContext, opts: {
   adminCheck?: (client: any, userId: string, teamId: string) => Promise<boolean>;
   requireMembership?: boolean;
   members?: string[] | 'throw';
   slackAdmin?: boolean; // what the built-in users.info gate reports
 } = {}) {
   const { adminCheck, requireMembership = false, members = [ID.userId], slackAdmin = true } = opts;
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const client = {
@@ -53,63 +53,63 @@ const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audi
 
 // isAdmin override: a custom check overrides the built-in Slack gate. slackAdmin:false proves the
 // override (not users.info) decides: a non-Slack-admin can configure when the override says yes.
-test('isAdmin override: custom true lets a non-Slack-admin configure', async () => {
-  const { c, vault, db } = await ctx({ adminCheck: async () => true, slackAdmin: false });
+test('isAdmin override: custom true lets a non-Slack-admin configure', async (t) => {
+  const { c, vault, db } = await ctx(t, { adminCheck: async () => true, slackAdmin: false });
   await c.setChannelSecret('mcp', SECRET);
   assert.equal((await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
   assert.deepEqual((await auditRows(db)).map((r) => r.action), ['config']);
 });
 
 // Override false blocks even a real Slack admin. Default-deny + audited denial stays intact.
-test('isAdmin override: custom false blocks and audits denied', async () => {
-  const { c, vault, db } = await ctx({ adminCheck: async () => false, slackAdmin: true });
+test('isAdmin override: custom false blocks and audits denied', async (t) => {
+  const { c, vault, db } = await ctx(t, { adminCheck: async () => false, slackAdmin: true });
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /admin/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
   assert.deepEqual((await auditRows(db)).map((r) => r.action), ['denied']);
 });
 
 // A throwing override fails closed (treated as not-admin), denial still audited.
-test('isAdmin override: a throwing override fails closed', async () => {
-  const { c, db } = await ctx({ adminCheck: async () => { throw new Error('rbac down'); } });
+test('isAdmin override: a throwing override fails closed', async (t) => {
+  const { c, db } = await ctx(t, { adminCheck: async () => { throw new Error('rbac down'); } });
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /admin/);
   assert.deepEqual((await auditRows(db)).map((r) => r.action), ['denied']);
 });
 
 // requireChannelMembership ON: a configured shared cred is refused for a non-member, audited
 // 'not-member', and allowed for a member.
-test('requireChannelMembership: non-member refused + audited, member allowed', async () => {
-  const deny = await ctx({ requireMembership: true, members: ['U_OTHER'] });
+test('requireChannelMembership: non-member refused + audited, member allowed', async (t) => {
+  const deny = await ctx(t, { requireMembership: true, members: ['U_OTHER'] });
   await deny.c.setChannelSecret('mcp', SECRET); // admin config is not membership-gated
   await assert.rejects(() => deny.c.connectChannel('mcp'), /member of this channel/);
   assert.ok((await auditRows(deny.db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
 
-  const ok = await ctx({ requireMembership: true, members: [ID.userId] });
+  const ok = await ctx(t, { requireMembership: true, members: [ID.userId] });
   await ok.c.setChannelSecret('mcp', SECRET);
   assert.ok(await ok.c.connectChannel('mcp')); // member → handle
 });
 
 // requireChannelMembership OFF (default): membership is never checked, a non-member still gets the
 // shared cred, exactly as before this feature.
-test('requireChannelMembership: off → membership not checked', async () => {
-  const { c } = await ctx({ requireMembership: false, members: 'throw' });
+test('requireChannelMembership: off → membership not checked', async (t) => {
+  const { c } = await ctx(t, { requireMembership: false, members: 'throw' });
   await c.setChannelSecret('mcp', SECRET);
   assert.ok(await c.connectChannel('mcp')); // would throw if membership were consulted
 });
 
 // Fail-closed: when membership can't be verified (conversations.members throws), refuse.
-test('requireChannelMembership: membership check errors → refused', async () => {
-  const { c, db } = await ctx({ requireMembership: true, members: 'throw' });
+test('requireChannelMembership: membership check errors → refused', async (t) => {
+  const { c, db } = await ctx(t, { requireMembership: true, members: 'throw' });
   await c.setChannelSecret('mcp', SECRET);
   await assert.rejects(() => c.connectChannel('mcp'), /member of this channel/);
   assert.ok((await auditRows(db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
 });
 
-test('/vouchr commands honor the custom isAdmin override', async () => {
+test('/vouchr commands honor the custom isAdmin override', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [provider],
     baseUrl: 'http://127.0.0.1:1',
-    dbPath: ':memory:',
+    db: await openTestDb(t),
     isAdmin: async () => true, // overrides the mocked Slack users.info=false below
   });
   let handler: any;

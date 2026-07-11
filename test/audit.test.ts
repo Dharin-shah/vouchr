@@ -1,6 +1,6 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
-import { openDb } from '../src/core/db';
 import { Audit } from '../src/core/audit';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -11,8 +11,8 @@ async function lastMeta(db: any): Promise<any> {
   return JSON.parse(row.meta);
 }
 
-test('audit: redacts credential-shaped values, keeps legitimate metadata intact', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('audit: redacts credential-shaped values, keeps legitimate metadata intact', async (t) => {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   const blob = 'A'.repeat(60); // 60-char high-entropy base64 blob
 
@@ -48,8 +48,8 @@ test('audit: redacts credential-shaped values, keeps legitimate metadata intact'
   assert.equal(meta.secret, blob);
 });
 
-test('audit: redaction walks nested objects and arrays', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('audit: redaction walks nested objects and arrays', async (t) => {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
 
   const meta = {

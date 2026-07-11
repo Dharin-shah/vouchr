@@ -23,8 +23,8 @@ export function kmsEnvelope(keyId: string, client: KmsClientLike): EnvelopeProvi
 
 /**
  * Lazily construct an AWS-KMS-backed {@link KmsClientLike}. `@aws-sdk/client-kms` is an OPTIONAL
- * dependency, imported only here and only when KMS is configured — the minimal SQLite self-hoster
- * never installs it. Credentials come from the SDK's default provider chain, so IRSA / workload
+ * dependency, imported only here and only when KMS is configured — a minimal self-hoster using
+ * plain at-rest encryption never installs it. Credentials come from the SDK's default provider chain, so IRSA / workload
  * identity "just works" with zero AWS code in `src/core`. Install `@aws-sdk/client-kms` in the image
  * when running with `VOUCHR_KMS_KEY_ID`.
  */

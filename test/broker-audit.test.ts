@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ChannelConfig } from '../src/core/channelConfig';
@@ -30,8 +30,8 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
 const userToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims(over), SECRET);
 const adminToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, ...over }), SECRET);
 
-async function harness() {
-  const db = await openDb({ dbPath: ':memory:' });
+async function harness(t: TestContext) {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   const server = createBroker({
     providers: [acme], vault: new Vault(db, KEY), audit, db, identitySecret: SECRET,
@@ -63,8 +63,8 @@ function request(port: number, method: string, urlPath: string, body?: unknown):
   });
 }
 
-test('POST /v1/audit: a caller sees only their own rows, never another user\'s', async () => {
-  const { audit, server, port } = await harness();
+test('POST /v1/audit: a caller sees only their own rows, never another user\'s', async (t) => {
+  const { audit, server, port } = await harness(t);
   try {
     await audit.record('inject', uid('U1'), 'gh-owned-by-u1', { host: 'api.x' });
     await audit.record('inject', uid('U2'), 'gh-owned-by-u2', { host: 'api.x' });
@@ -77,8 +77,8 @@ test('POST /v1/audit: a caller sees only their own rows, never another user\'s',
   } finally { server.close(); }
 });
 
-test('POST /v1/audit: empty events when the caller has no rows; no meta key anywhere', async () => {
-  const { audit, server, port } = await harness();
+test('POST /v1/audit: empty events when the caller has no rows; no meta key anywhere', async (t) => {
+  const { audit, server, port } = await harness(t);
   try {
     await audit.record('inject', uid('U1'), 'gh', { host: 'api.x', label: 'TOPSECRETLABEL' });
     const empty = await request(port, 'POST', '/v1/audit', { identityToken: userToken({ userId: 'U_NEW' }) });
@@ -90,8 +90,8 @@ test('POST /v1/audit: empty events when the caller has no rows; no meta key anyw
   } finally { server.close(); }
 });
 
-test('POST /v1/admin/audit: signed admin sees only THIS channel\'s rows', async () => {
-  const { audit, server, port } = await harness();
+test('POST /v1/admin/audit: signed admin sees only THIS channel\'s rows', async (t) => {
+  const { audit, server, port } = await harness(t);
   try {
     await audit.record('inject', uid('U1'), 'gh-in-c1', { channel: 'C1' });
     await audit.record('inject', uid('U1'), 'gh-in-c2', { channel: 'C2' });
@@ -104,8 +104,8 @@ test('POST /v1/admin/audit: signed admin sees only THIS channel\'s rows', async 
   } finally { server.close(); }
 });
 
-test('POST /v1/admin/audit: a non-admin token is refused (authority is the signed claim, not the body)', async () => {
-  const { server, port } = await harness();
+test('POST /v1/admin/audit: a non-admin token is refused (authority is the signed claim, not the body)', async (t) => {
+  const { server, port } = await harness(t);
   try {
     // A forged body isAdmin must be ignored — only the signed claim counts.
     const res = await request(port, 'POST', '/v1/admin/audit', { identityToken: userToken(), isAdmin: true } as any);

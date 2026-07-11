@@ -1,10 +1,10 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
@@ -53,8 +53,8 @@ const userToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims(ov
 const adminToken = (over: Partial<IdentityClaims> = {}) =>
   signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
 
-async function makeBroker(opts: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   // Seed U1's acme credential so /v1/fetch, /v1/resolve, /v1/status have something to report.
@@ -138,141 +138,141 @@ function checkGolden(name: string, status: number, json: unknown): void {
 }
 
 /** One canonical request per endpoint/outcome. Each drives a real broker, then freezes {status, shape}. */
-const CASES: { name: string; run: () => Promise<{ status: number; json: unknown }> }[] = [
+const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; json: unknown }> }[] = [
   // ── success shapes ──
-  { name: 'fetch.success', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'fetch.success', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       const real = globalThis.fetch;
       globalThis.fetch = (async () => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'GET', path: '/data' }); }
       finally { globalThis.fetch = real; server.close(); }
   } },
-  { name: 'status', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'status', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/status', { identityToken: userToken() }); } finally { server.close(); }
   } },
-  { name: 'resolve.connected', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'resolve.connected', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken() }); } finally { server.close(); }
   } },
-  { name: 'connect', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'connect', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/connect', { handle: { provider: 'acme' }, identityToken: userToken() }); } finally { server.close(); }
   } },
-  { name: 'manifest', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'manifest', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/v1/manifest'); } finally { server.close(); }
   } },
-  { name: 'admin.mode.ok', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'admin.mode.ok', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: adminToken() }); } finally { server.close(); }
   } },
-  { name: 'admin.tools.ok', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'admin.tools.ok', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: adminToken() }); } finally { server.close(); }
   } },
-  { name: 'admin.config', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'admin.config', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try {
         await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: adminToken() }); // configure so mode reads back non-null
         return await request(port, 'GET', '/v1/admin/config', undefined, { 'x-vouchr-identity': adminToken() });
       } finally { server.close(); }
   } },
-  { name: 'admin.config.unconfigured', run: async () => {
+  { name: 'admin.config.unconfigured', run: async (t) => {
       // The read side before any mode is set: `mode` is null (ChannelMode | null). Freezes that the
       // null branch is part of the contract, alongside admin.config's configured (mode:string) shape.
-      const { server, port } = await makeBroker();
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/v1/admin/config', undefined, { 'x-vouchr-identity': adminToken() }); } finally { server.close(); }
   } },
-  { name: 'audit.self', run: async () => {
-      const { server, db, port } = await makeBroker();
+  { name: 'audit.self', run: async (t) => {
+      const { server, db, port } = await makeBroker(t);
       try {
         await new Audit(db).record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U1' }, 'acme', { host: 'api.acme.example' });
         return await request(port, 'POST', '/v1/audit', { identityToken: userToken() });
       } finally { server.close(); }
   } },
-  { name: 'admin.audit', run: async () => {
-      const { server, db, port } = await makeBroker();
+  { name: 'admin.audit', run: async (t) => {
+      const { server, db, port } = await makeBroker(t);
       try {
         await new Audit(db).record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U1' }, 'acme', { channel: 'C1' });
         return await request(port, 'POST', '/v1/admin/audit', { identityToken: adminToken() });
       } finally { server.close(); }
   } },
-  { name: 'admin.reference.ok', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'admin.reference.ok', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz' }); } finally { server.close(); }
   } },
-  { name: 'user.reference.ok', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'user.reference.ok', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: userToken(), source: 'aws-sm', secretRef: 'arn:user' }); } finally { server.close(); }
   } },
-  { name: 'health.ok', run: async () => {
+  { name: 'health.ok', run: async (t) => {
       // /healthz and /health share one handler — liveness only: a bare {ok:true}, no DB touch.
-      const { server, port } = await makeBroker();
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/healthz'); } finally { server.close(); }
   } },
-  { name: 'readyz.ok', run: async () => {
+  { name: 'readyz.ok', run: async (t) => {
       // Readiness: DB round-trip OK → 200 {ok:true}. k8s readinessProbe pulls the pod when this 503s.
-      const { server, port } = await makeBroker();
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/readyz'); } finally { server.close(); }
   } },
-  { name: 'readyz.down.503', run: async () => {
+  { name: 'readyz.down.503', run: async (t) => {
       // DB unreachable → 503 {ok:false}. The 503 status is the contract k8s readiness relies on.
-      const { server, db, port } = await makeBroker();
+      const { server, db, port } = await makeBroker(t);
       try { await db.close(); return await request(port, 'GET', '/readyz'); } finally { server.close(); }
   } },
-  { name: 'disconnect', run: async () => {
+  { name: 'disconnect', run: async (t) => {
       // U1 has the seeded acme credential, so `revoked` is non-empty → its element type is frozen.
-      const { server, port } = await makeBroker();
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: userToken() }); } finally { server.close(); }
   } },
-  { name: 'admin.offboard.ok', run: async () => {
+  { name: 'admin.offboard.ok', run: async (t) => {
       // Admin offboards U1 (who has acme) → revoked:[string].
-      const { server, port } = await makeBroker();
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: adminToken({ userId: 'ADMIN' }), targetUserId: 'U1' }); } finally { server.close(); }
   } },
 
   // ── error shapes (every 4xx/5xx body is `{ error: string }`; the STATUS is the contract) ──
-  { name: 'error.fetch.badToken.401', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.fetch.badToken.401', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: 'not-a-real-token', method: 'GET', path: '/data' }); } finally { server.close(); }
   } },
-  { name: 'error.fetch.methodNotAllowed.405', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.fetch.methodNotAllowed.405', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'POST', path: '/data', body: '{}' }); } finally { server.close(); }
   } },
-  { name: 'error.fetch.egressDenied.403', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.fetch.egressDenied.403', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'GET', path: '/data', host: 'evil.example.com' }); } finally { server.close(); }
   } },
-  { name: 'error.fetch.policyDenied.403', run: async () => {
-      const { server, port } = await makeBroker({ policy: new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } }) });
+  { name: 'error.fetch.policyDenied.403', run: async (t) => {
+      const { server, port } = await makeBroker(t, { policy: new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } }) });
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'GET', path: '/data' }); } finally { server.close(); }
   } },
-  { name: 'error.fetch.notConnected.409', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.fetch.notConnected.409', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       // U2 has no seeded acme credential → resolves owner, injector 409s (not connected).
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken({ userId: 'U2' }), method: 'GET', path: '/data' }); } finally { server.close(); }
   } },
-  { name: 'error.admin.mode.forbidden.403', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.admin.mode.forbidden.403', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       // Non-admin token; a forged body `isAdmin` must be ignored (authority = signed claim only).
       try { return await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: userToken(), isAdmin: true } as any); } finally { server.close(); }
   } },
-  { name: 'error.admin.offboard.forbidden.403', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.admin.offboard.forbidden.403', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       // Non-admin token; forged body isAdmin ignored (authority = signed claim only).
       try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: userToken(), targetUserId: 'U2', isAdmin: true } as any); } finally { server.close(); }
   } },
-  { name: 'error.notFound.404', run: async () => {
-      const { server, port } = await makeBroker();
+  { name: 'error.notFound.404', run: async (t) => {
+      const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/v1/does-not-exist'); } finally { server.close(); }
   } },
 ];
 
 for (const c of CASES) {
-  test(`wire-contract: ${c.name}`, async () => {
-    const { status, json } = await c.run();
+  test(`wire-contract: ${c.name}`, async (t) => {
+    const { status, json } = await c.run(t);
     checkGolden(c.name, status, json);
   });
 }

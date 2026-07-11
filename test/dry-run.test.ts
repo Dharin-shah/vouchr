@@ -1,13 +1,10 @@
 import { test } from 'node:test';
+import { openTestDb, testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import http from 'node:http';
 import { createVouchr, createBroker, ConsentRequiredError } from '../src';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
-import { openDb } from '../src/core/db';
 import { Vault, type StoredToken } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
@@ -89,10 +86,10 @@ async function errOf(fn: () => Promise<unknown>): Promise<Error> {
   throw new Error('expected a throw');
 }
 
-test('dry-run: connect prompt → completeConsent → real gates → synthetic echo, fully offline', async () => {
+test('dry-run: connect prompt → completeConsent → real gates → synthetic echo, fully offline', async (t) => {
   const restore = banNetwork();
   try {
-    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     const { ctx, posts } = await boltContext(vouchr);
 
     // The REAL consent machinery posts the prompt; only the authorize URL is replaced by the local
@@ -160,7 +157,7 @@ test('dry-run: connect prompt → completeConsent → real gates → synthetic e
   }
 });
 
-test('dry-run: the echo never contains the stored token, and honors a custom inject shape', async () => {
+test('dry-run: the echo never contains the stored token, and honors a custom inject shape', async (t) => {
   const restore = banNetwork();
   try {
     const KNOWN = randomBytes(24).toString('hex'); // a seeded, known-random secret
@@ -176,7 +173,7 @@ test('dry-run: the echo never contains the stored token, and honors a custom inj
       clientSecret: 'run',
       inject: (h, s) => h.set('x-api-key', s),
     });
-    const vouchr = await createVouchr({ providers: [custom], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [custom], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     // Seed directly through the synthetic provenance column, to make the secret's value known.
     await seedDry(vouchr.vault, ID, 'custom', { accessToken: KNOWN });
 
@@ -194,17 +191,17 @@ test('dry-run: the echo never contains the stored token, and honors a custom inj
   }
 });
 
-test('dry-run: egress and policy denials are exactly the production error class + message', async () => {
+test('dry-run: egress and policy denials are exactly the production error class + message', async (t) => {
   const restore = banNetwork();
   try {
     const denied = () => defineProvider({ ...acme(), id: 'denied' });
     const policy = () => new Policy({ denied: { defaultAllow: false } });
 
-    const prod = await createVouchr({ providers: [acme(), denied()], baseUrl: 'https://app.test', dbPath: ':memory:', policy: policy() });
+    const prod = await createVouchr({ providers: [acme(), denied()], baseUrl: 'https://app.test', db: await openTestDb(t), policy: policy() });
     await prod.vault.upsert(userOwner(ID), 'acme', FRESH);
     const { ctx: prodCtx } = await boltContext(prod);
 
-    const dry = await createVouchr({ providers: [acme(), denied()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true, policy: policy() });
+    const dry = await createVouchr({ providers: [acme(), denied()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true, policy: policy() });
     await seedDry(dry.vault, ID, 'acme');
     const { ctx: dryCtx } = await boltContext(dry);
 
@@ -226,11 +223,10 @@ test('dry-run: egress and policy denials are exactly the production error class 
   }
 });
 
-test('dry-run: startup hard-fails against a vault with real credentials; all-dry-run rows pass', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'vouchr-dry-'));
-  const dbPath = join(dir, 'real.db');
+test('dry-run: startup hard-fails against a vault with real credentials; all-dry-run rows pass', async (t) => {
+  const dbPath = await testDbUrl(t);
   const mk = (extra: object = {}) =>
-    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath, ...extra });
+    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', databaseUrl: dbPath, ...extra });
 
   // A production instance stores a real (account-labeled) row.
   const prod = await mk();
@@ -245,39 +241,39 @@ test('dry-run: startup hard-fails against a vault with real credentials; all-dry
   // P1-A: provenance is the dry_run COLUMN, never external_account. A REAL row (production upsert,
   // dry_run=0) whose account label is LITERALLY 'dry-run' must STILL be treated as real and refuse
   // startup — key off the label and this passes (bug); key off the column and it refuses.
-  const labelPath = join(dir, 'label.db');
-  const labelProd = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: labelPath });
+  const labelPath = await testDbUrl(t);
+  const labelProd = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', databaseUrl: labelPath });
   await labelProd.vault.upsert(userOwner(ID), 'acme', { ...FRESH, externalAccount: 'dry-run' }); // real
   await labelProd.db.close();
   await assert.rejects(
-    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: labelPath, dryRun: true }),
+    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', databaseUrl: labelPath, dryRun: true }),
     /refusing dryRun/,
   );
 
   // An empty vault, then a vault holding ONLY dry-run rows (a re-run), both pass.
-  const cleanPath = join(dir, 'clean.db');
-  const first = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: cleanPath, dryRun: true });
+  const cleanPath = await testDbUrl(t);
+  const first = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', databaseUrl: cleanPath, dryRun: true });
   await seedDry(first.vault, ID, 'acme');
   await first.db.close();
-  const second = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: cleanPath, dryRun: true });
+  const second = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', databaseUrl: cleanPath, dryRun: true });
   assert.ok(second.dryRun); // constructed fine, helpers exposed
   await second.db.close();
 });
 
-test('dry-run: a non-boolean flag fails closed at construction (SEC-4)', async () => {
+test('dry-run: a non-boolean flag fails closed at construction (SEC-4)', async (t) => {
   await assert.rejects(
-    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: 'yes' as any }),
+    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: 'yes' as any }),
     /createVouchr: dryRun must be a boolean/,
   );
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   assert.throws(
     () => createBroker({ providers: [acme()], vault: new Vault(db, randomBytes(32)), audit: new Audit(db), db, identitySecret: 's', dryRun: 1 as any }),
     /createBroker: dryRun must be a boolean/,
   );
 });
 
-test('dry-run: absent flag → zero behavior change (real authorize URL, real fetch, no markers)', async () => {
-  const prod = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:' });
+test('dry-run: absent flag → zero behavior change (real authorize URL, real fetch, no markers)', async (t) => {
+  const prod = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t) });
   assert.equal(prod.dryRun, undefined); // no dry-run surface
 
   const { ctx, posts } = await boltContext(prod);
@@ -306,7 +302,7 @@ test('dry-run: absent flag → zero behavior change (real authorize URL, real fe
   for (const r of rows) assert.ok(!('dry_run' in JSON.parse(r.meta)));
 });
 
-test('dry-run: a near-expiry credential with a refresh token never hits the token endpoint', async () => {
+test('dry-run: a near-expiry credential with a refresh token never hits the token endpoint', async (t) => {
   const realFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = (async () => {
@@ -314,7 +310,7 @@ test('dry-run: a near-expiry credential with a refresh token never hits the toke
     return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
   try {
-    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     // A synthetic row INSIDE the 30s refresh window WITH a refresh token — production would POST /token
     // here before the outbound call (acme is refresh:'rotating', so it would also consume the token).
     await seedDry(vouchr.vault, ID, 'acme', { accessToken: 'synthetic-token', refreshToken: 'r1', expiresAt: Date.now() + 10_000 });
@@ -330,7 +326,7 @@ test('dry-run: a near-expiry credential with a refresh token never hits the toke
   }
 });
 
-test('dry-run: disconnecting a dry-run credential skips the upstream revoke call', async () => {
+test('dry-run: disconnecting a dry-run credential skips the upstream revoke call', async (t) => {
   const realFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = (async () => {
@@ -344,7 +340,7 @@ test('dry-run: disconnecting a dry-run credential skips the upstream revoke call
       clientId: 'dry', clientSecret: 'run',
       revokeUrl: 'https://acme.example/oauth/revoke', // production disconnect would POST the token here
     });
-    const vouchr = await createVouchr({ providers: [revocable], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [revocable], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     await seedDry(vouchr.vault, ID, 'rev');
     let handler: any;
     vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
@@ -361,14 +357,14 @@ test('dry-run: disconnecting a dry-run credential skips the upstream revoke call
   }
 });
 
-test('dry-run: a real row written AFTER boot is refused per-request, never injected', async () => {
+test('dry-run: a real row written AFTER boot is refused per-request, never injected', async (t) => {
   const restore = banNetwork();
   try {
     // Boot against an empty vault (the startup check passes) — then a REAL row lands, e.g. a seeder
     // or a sibling production process sharing the database. Label it literally 'dry-run' (the P1-A
     // adversarial case): the per-request rail must key off the trusted dry_run COLUMN (dry_run=0 →
     // refuse), never the forgeable label — a label-based rail would inject this real token.
-    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     await vouchr.vault.upsert(userOwner(ID), 'acme', { ...FRESH, accessToken: 'real', externalAccount: 'dry-run' });
     assert.equal((await vouchr.vault.get(userOwner(ID), 'acme'))?.dryRun, false); // real despite the label
     const { ctx } = await boltContext(vouchr);
@@ -379,7 +375,7 @@ test('dry-run: a real row written AFTER boot is refused per-request, never injec
   }
 });
 
-test('dry-run: provider response constraints never false-deny the synthetic echo', async () => {
+test('dry-run: provider response constraints never false-deny the synthetic echo', async (t) => {
   const restore = banNetwork();
   try {
     // A production-passing config that would REJECT the echo if the response gate ran on it:
@@ -390,7 +386,7 @@ test('dry-run: provider response constraints never false-deny the synthetic echo
       clientId: 'dry', clientSecret: 'run',
       egressResponse: { allowContentTypes: ['text/csv'], maxBytes: 16 },
     });
-    const vouchr = await createVouchr({ providers: [csv], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [csv], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     await seedDry(vouchr.vault, ID, 'csv');
     const { ctx } = await boltContext(vouchr);
     const res = await (await ctx.connect('csv')).fetch('https://api.acme.example/report');
@@ -401,7 +397,7 @@ test('dry-run: provider response constraints never false-deny the synthetic echo
   }
 });
 
-test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream normally', async () => {
+test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream normally', async (t) => {
   // The core defect: external_account is provider/user data, not provenance. A real account whose
   // label is literally "dry-run" must behave EXACTLY like any other real credential — zero behavior
   // change. Keyed off the label, disconnect would skip the revoke; keyed off the column, it revokes.
@@ -418,7 +414,7 @@ test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream norm
       clientId: 'c', clientSecret: 's', revokeUrl: 'https://acme.example/oauth/revoke',
     });
     // NO dryRun flag — ordinary production wiring.
-    const vouchr = await createVouchr({ providers: [revocable], baseUrl: 'https://app.test', dbPath: ':memory:' });
+    const vouchr = await createVouchr({ providers: [revocable], baseUrl: 'https://app.test', db: await openTestDb(t) });
     // A REAL row (production upsert → dry_run=0) whose account label happens to be 'dry-run'.
     await vouchr.vault.upsert(userOwner(ID), 'rev', { ...FRESH, accessToken: 'real-token', externalAccount: 'dry-run' });
     assert.equal((await vouchr.vault.get(userOwner(ID), 'rev'))?.dryRun, false); // real, despite the label
@@ -449,19 +445,19 @@ function countRevokes(): { restore: () => void; get: () => number } {
   return { restore: () => { globalThis.fetch = realFetch; }, get: () => n };
 }
 
-test('P1-A: offboardUser skips a dry-run cred upstream, but revokes a real "dry-run"-labelled one', async () => {
+test('P1-A: offboardUser skips a dry-run cred upstream, but revokes a real "dry-run"-labelled one', async (t) => {
   // Covers offboard.ts offboardUser (sibling of the disconnect path). The revoke-skip keys off the
   // trusted dry_run column: revert it to the label check and the second (flag-OFF) half fails.
   const rev = countRevokes();
   try {
     // dry-run instance: a synthetic cred → offboard must NOT POST the synthetic token upstream.
-    const dry = await createVouchr({ providers: [revProvider()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const dry = await createVouchr({ providers: [revProvider()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     await seedDry(dry.vault, ID, 'rev');
     await dry.offboard(ID);
     assert.equal(rev.get(), 0); // synthetic token never left the process
 
     // flag-OFF instance: a REAL cred whose label is literally 'dry-run' → offboard MUST revoke.
-    const prod = await createVouchr({ providers: [revProvider()], baseUrl: 'https://app.test', dbPath: ':memory:' });
+    const prod = await createVouchr({ providers: [revProvider()], baseUrl: 'https://app.test', db: await openTestDb(t) });
     await prod.vault.upsert(userOwner(ID), 'rev', { ...FRESH, accessToken: 'real', externalAccount: 'dry-run' });
     await prod.offboard(ID);
     assert.equal(rev.get(), 1); // real token revoked — the label is not load-bearing
@@ -470,11 +466,11 @@ test('P1-A: offboardUser skips a dry-run cred upstream, but revokes a real "dry-
   }
 });
 
-test('P1-A: bulk revokeConnection skips a dry-run row upstream, but revokes a real "dry-run"-labelled one', async () => {
+test('P1-A: bulk revokeConnection skips a dry-run row upstream, but revokes a real "dry-run"-labelled one', async (t) => {
   // Covers offboard.ts revokeConnection (break-glass). selectRevocations carries the dry_run column;
   // the skip keys off row.dryRun. Revert it to the label check and the second (real) half fails.
   const rev = countRevokes();
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -500,14 +496,14 @@ test('P1-A: bulk revokeConnection skips a dry-run row upstream, but revokes a re
   }
 });
 
-test('P1-B: a concurrent real write is never clobbered by a synthetic consent (atomic)', async () => {
+test('P1-B: a concurrent real write is never clobbered by a synthetic consent (atomic)', async (t) => {
   const restore = banNetwork();
   try {
     // The old callback did vault.get() then a separate vault.upsert() — a sibling REAL write between
     // them was clobbered. upsertDryRun is ONE conditional statement (overwrite only an existing
     // dry_run=1 row), so across EVERY interleaving the real row survives. Race the two writes on a
     // SHARED db handle (a sibling "production process") through a barrier, many times.
-    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     const sibling = new Vault(vouchr.db, MASTER); // same db handle = same store, like another process
     const { ctx } = await boltContext(vouchr);
 
@@ -528,7 +524,7 @@ test('P1-B: a concurrent real write is never clobbered by a synthetic consent (a
   }
 });
 
-test('P2-C: the provider inject hook runs exactly once, with a redacted placeholder', async () => {
+test('P2-C: the provider inject hook runs exactly once, with a redacted placeholder', async (t) => {
   const restore = banNetwork();
   try {
     const seen: string[] = [];
@@ -538,7 +534,7 @@ test('P2-C: the provider inject hook runs exactly once, with a redacted placehol
       clientId: 'c', clientSecret: 's',
       inject: (h, secret) => { seen.push(secret); h.set('x-api-key', secret); },
     });
-    const vouchr = await createVouchr({ providers: [counting], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true });
+    const vouchr = await createVouchr({ providers: [counting], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     await seedDry(vouchr.vault, ID, 'ct', { accessToken: 'synthetic-secret' });
     const { ctx } = await boltContext(vouchr);
     const res = await (await ctx.connect('ct')).fetch('https://api.acme.example/x');
@@ -549,14 +545,14 @@ test('P2-C: the provider inject hook runs exactly once, with a redacted placehol
   }
 });
 
-test('P2-E: dry-run refuses an external KMS envelope at startup (both factories)', async () => {
+test('P2-E: dry-run refuses an external KMS envelope at startup (both factories)', async (t) => {
   // KMS wrap/unwrap are real network calls the fetch-stub tests would miss, so the offline guarantee
   // would be a lie. Refuse fail-closed at construction.
   await assert.rejects(
-    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', dbPath: ':memory:', dryRun: true, envelope: fakeEnvelope }),
+    createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true, envelope: fakeEnvelope }),
     /dryRun requires a local master key/,
   );
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   assert.throws(
     () => createBroker({
       providers: [acme()], vault: new Vault(db, MASTER, {}, fakeEnvelope), audit: new Audit(db), db,
@@ -600,9 +596,9 @@ function get(port: number, path: string): Promise<{ status: number; body: string
 const tok = (secret: string) =>
   signIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID() }, secret);
 
-test('dry-run broker: /v1/connect → local callback → /v1/fetch echo, fully offline', async () => {
+test('dry-run broker: /v1/connect → local callback → /v1/fetch echo, fully offline', async (t) => {
   const restore = banNetwork();
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   const server = createBroker({
     providers: [acme()], vault, audit: new Audit(db), db,
@@ -652,9 +648,9 @@ test('dry-run broker: /v1/connect → local callback → /v1/fetch echo, fully o
   }
 });
 
-test('dry-run broker: callback refuses a foreign code and never clobbers a real row', async () => {
+test('dry-run broker: callback refuses a foreign code and never clobbers a real row', async (t) => {
   const restore = banNetwork();
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   const server = createBroker({
     providers: [acme()], vault, audit: new Audit(db), db,
@@ -686,8 +682,8 @@ test('dry-run broker: callback refuses a foreign code and never clobbers a real 
   }
 });
 
-test('dry-run broker: fails every request closed against a vault with real credentials', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('dry-run broker: fails every request closed against a vault with real credentials', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   await vault.upsert(userOwner(ID), 'acme', { ...FRESH, externalAccount: 'octocat' }); // a REAL row
   const server = createBroker({ providers: [acme()], vault, audit: new Audit(db), db, identitySecret: 'shh', dryRun: true });

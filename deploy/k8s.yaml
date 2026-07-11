@@ -2,15 +2,47 @@
 # platform (Helm/Kustomize/meta-chart), not a drop-in — replace the image, the Secret source, and
 # the ServiceAccount with your own. No registry, IAM ARN, or vendor annotation is hardcoded.
 #
-# Multi-replica is safe here ONLY because the broker runs on Postgres with the shared DbReplayStore
-# (identity-token jti is single-use cluster-wide). On SQLite, run a single replica.
+# Vouchr is PostgreSQL-only. Two DB credentials are used:
+#   - the migrate Job (below) runs `vouchr migrate` ONCE per deploy/upgrade with a SCHEMA-OWNER role
+#     (can CREATE/ALTER tables) to create/converge the schema;
+#   - the Deployment runtime connects with a DML-only role (SELECT/INSERT/UPDATE/DELETE only, no
+#     CREATE) and never creates tables — it fails closed if the DB has not been migrated.
+# See guides/DEPLOYMENT.md § Migrations for the two roles and the GRANT statements.
+#
+# Multi-replica is safe because the broker runs on Postgres with the shared DbReplayStore
+# (identity-token jti is single-use cluster-wide) and all replicas share one migrated database.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vouchr-migrate
+  labels: { app: vouchr-broker }
+  # Run this to completion BEFORE the Deployment rolls out (a Helm pre-upgrade/pre-install hook, an
+  # Argo PreSync hook, or `kubectl apply` this Job first). `vouchr migrate` is idempotent and
+  # advisory-locked, so re-running it or racing concurrent runs is safe.
+  # annotations: { "helm.sh/hook": pre-install,pre-upgrade, "helm.sh/hook-weight": "-1" }
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels: { app: vouchr-broker }
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: REPLACE_ME/vouchr-broker:latest # SAME image/tag as the Deployment below
+          command: ["node", "dist/bin/vouchr.js", "migrate"]
+          # This env carries the SCHEMA-OWNER VOUCHR_DATABASE_URL (a role that can CREATE tables) —
+          # a DIFFERENT Secret from the runtime's DML-only credential below.
+          envFrom:
+            - secretRef: { name: vouchr-migrate }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: vouchr-broker
   labels: { app: vouchr-broker }
 spec:
-  replicas: 2 # requires Postgres (shared jti replay). Use 1 replica on SQLite.
+  replicas: 2 # safe on Postgres: all replicas share one migrated DB + the shared jti replay table
   selector:
     matchLabels: { app: vouchr-broker }
   template:
@@ -31,6 +63,9 @@ spec:
           # Secrets (VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, provider client
           # secrets, optional VOUCHR_BROKER_TOKEN) come from a Secret your secret manager syncs
           # (e.g. externalSecrets → this Secret). Non-secret config can go in a ConfigMap envFrom.
+          # This VOUCHR_DATABASE_URL is the DML-only runtime credential (no CREATE) — distinct from
+          # the schema-owner URL the vouchr-migrate Job uses. Put sslmode=require in the URL for TLS;
+          # size the pool with VOUCHR_PG_POOL_MAX (a positive integer) if pg's default doesn't fit.
           envFrom:
             - secretRef: { name: vouchr-broker }
           env:

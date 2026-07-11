@@ -1,4 +1,5 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import {
@@ -59,7 +60,7 @@ test('safeUserMessage: handles a non-Error throw', () => {
 
 // Integration: the modal-submit path. A KMS envelope that throws AFTER touching the secret (the exact
 // "extension can throw with the token" case) must NOT leak into the ephemeral modal error.
-test('modal submit: a throwing KMS envelope never leaks the secret to the user', async () => {
+test('modal submit: a throwing KMS envelope never leaks the secret to the user', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const provider = defineProvider({
     id: 'customdb', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [],
@@ -70,7 +71,7 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
   const vouchr = await createVouchr({
     providers: [provider],
     baseUrl: 'http://127.0.0.1:1',
-    dbPath: ':memory:',
+    db: await openTestDb(t),
     // wrapDataKey runs inside vault.upsert, after the raw secret is in hand — a realistic leak vector.
     envelope: {
       wrapDataKey: async () => { throw new KmsWrapError(`kms failed for ${SECRET}`); },
@@ -103,9 +104,9 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
 // Regression (#97 issue #132): the deliberate admin-denial for `/vouchr mode` is thrown as a plain
 // refusal, NOT one of the 4 whitelisted classes. It must still reach the user verbatim — before the
 // UserFacingError marker it collapsed to "Something went wrong (Error)...".
-test('command: a non-admin /vouchr mode gets the real admin-denied message, not the generic mask', async () => {
+test('command: a non-admin /vouchr mode gets the real admin-denied message, not the generic mask', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
-  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   let cmd: any;
   vouchr.registerCommands({
     command: (_n: string, h: any) => { cmd = h; },
@@ -124,9 +125,9 @@ test('command: a non-admin /vouchr mode gets the real admin-denied message, not 
 // Regression: a mode-locked channel rejecting a STATIC key in the modal submit. This denial is a
 // plain Vouchr refusal thrown from setChannelSecret and caught at the modal's masking catch — its
 // message must survive (it did not before the marker class).
-test('modal submit: a mode-locked channel keeps the real "static keys are not allowed" message', async () => {
+test('modal submit: a mode-locked channel keeps the real "static keys are not allowed" message', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
-  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   let cmd: any, configureView: any;
   vouchr.registerCommands({
     command: (_n: string, h: any) => { cmd = h; },

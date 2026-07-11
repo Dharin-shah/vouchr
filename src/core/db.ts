@@ -1,11 +1,11 @@
-import BetterSqlite3 from 'better-sqlite3';
 import { Pool, types, type PoolClient } from 'pg';
 import { isPostgresUrl } from './options';
 
 /**
- * Minimal async data handle: the seam that lets the same store code run on SQLite
- * (embedded, the zero-config default) or Postgres (for stateless / multi-instance infra).
- * Not a public extension point: just the two backends this project ships.
+ * Minimal async data handle over the store. Vouchr is PostgreSQL-only (#204): multi-replica
+ * Postgres is the one supported production shape, so there is a single backend and no embedded
+ * mode. The interface stays because the injector/vault/etc. are written against it, and test
+ * support opens the same real Postgres in an isolated throwaway schema (see test/support/pg).
  *
  * All store SQL uses `?` placeholders; the Postgres driver rewrites them to `$1..$n`.
  */
@@ -16,87 +16,27 @@ export interface Db {
   exec(sql: string): Promise<void>;
   close(): Promise<void>;
   /**
-   * Postgres only: run `fn` inside a transaction holding a cross-process advisory lock for `key`,
-   * with `fn`'s Db bound to that locked transaction (so its reads/writes see the same tx, and a
-   * concurrent caller blocks until COMMIT). Absent on SQLite — a single process is already
-   * serialized by the in-process single-flight map in the injector, so callers fall back to
-   * running `fn` directly. Used by refresh coordination to re-read-under-lock and avoid two pods
-   * both consuming a rotating refresh token.
+   * Run `fn` inside a transaction holding a cross-process advisory lock for `key`, with `fn`'s Db
+   * bound to that locked transaction (so its reads/writes see the same tx, and a concurrent caller
+   * blocks until COMMIT). Used by refresh coordination to re-read-under-lock and avoid two pods
+   * both consuming a rotating refresh token. Optional only so minimal test stubs keep compiling.
    */
   withRefreshLock?<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T>;
   /**
    * Run `fn`'s statements atomically (BEGIN … COMMIT, ROLLBACK on throw), with `fn`'s Db bound to
    * the transaction. Used where one logical mutation spans two tables (e.g. a connection write +
    * its notification_state purge, #117) so a mid-sequence failure can't half-commit. Optional only
-   * so minimal test stubs keep compiling — BOTH shipped backends implement it; callers without it
-   * fall back to sequential statements (pre-#117 behavior).
+   * so minimal test stubs keep compiling — the shipped backend implements it; callers without it
+   * fall back to sequential statements.
    */
   transaction?<T>(fn: (txDb: Db) => Promise<T>): Promise<T>;
 }
 
 export interface DbOptions {
-  /** SQLite file path (default). `:memory:` for tests. */
-  dbPath?: string;
-  /** Postgres connection string. Takes precedence over dbPath when set. */
+  /** Postgres connection string. Falls back to `VOUCHR_DATABASE_URL`. There is deliberately NO
+   *  generic `DATABASE_URL` fallback (#204): a platform-injected app database must never be selected
+   *  by accident and have Vouchr tables created in it. */
   databaseUrl?: string;
-}
-
-class SqliteDb implements Db {
-  // FIFO mutex over the ONE better-sqlite3 connection. EVERY external operation — ordinary
-  // get/all/run/exec AND whole transaction() blocks — runs through this queue in strict arrival
-  // order. Without it, a statement awaited by another handler while a transaction holds BEGIN
-  // would execute on the same connection, silently JOIN that transaction, report success — and
-  // then vanish if the transaction rolls back (reproduced data loss, not a theoretical race).
-  // A promise chain is inherently fair: each operation appends behind the current tail, so a
-  // long-running transaction can never be overtaken.
-  private queue: Promise<unknown> = Promise.resolve();
-  constructor(private db: BetterSqlite3.Database) {}
-
-  /** Append `op` to the connection queue (FIFO). A failed op must not poison the queue. */
-  private enqueue<T>(op: () => T | Promise<T>): Promise<T> {
-    const run = this.queue.then(op);
-    this.queue = run.catch(() => undefined);
-    return run;
-  }
-
-  async get(sql: string, params: any[] = []) { return this.enqueue(() => this.db.prepare(sql).get(...params) as any); }
-  async all(sql: string, params: any[] = []) { return this.enqueue(() => this.db.prepare(sql).all(...params) as any[]); }
-  async run(sql: string, params: any[] = []) { return this.enqueue(() => ({ changes: this.db.prepare(sql).run(...params).changes })); }
-  async exec(sql: string) { await this.enqueue(() => { this.db.exec(sql); }); } // migrations queue too
-
-  async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> {
-    // Holds the queue for the WHOLE transaction, so no outside statement can interleave into the
-    // open BEGIN…COMMIT. `fn` receives a BOUND CHILD Db that executes directly against the
-    // connection (reentrant — it must bypass the queue its owner already holds, or the first
-    // in-transaction statement would deadlock), mirroring PgClientDb so store code stays
-    // backend-agnostic. Nested transaction() on the child runs inline, like PgClientDb.
-    return this.enqueue(async () => {
-      this.db.exec('BEGIN IMMEDIATE');
-      try {
-        const out = await fn(new SqliteTxDb(this.db));
-        this.db.exec('COMMIT');
-        return out;
-      } catch (e) {
-        try { this.db.exec('ROLLBACK'); } catch { /* already rolled back (e.g. by SQLite itself) */ }
-        throw e;
-      }
-    });
-  }
-
-  async close() { await this.enqueue(() => { this.db.close(); }); } // after every queued op drains
-}
-
-/** A Db bound INSIDE an open SQLite transaction: executes directly on the connection (the owning
- *  SqliteDb.transaction already holds the queue for its whole duration). Mirrors PgClientDb. */
-class SqliteTxDb implements Db {
-  constructor(private db: BetterSqlite3.Database) {}
-  async get(sql: string, params: any[] = []) { return this.db.prepare(sql).get(...params) as any; }
-  async all(sql: string, params: any[] = []) { return this.db.prepare(sql).all(...params) as any[]; }
-  async run(sql: string, params: any[] = []) { return { changes: this.db.prepare(sql).run(...params).changes }; }
-  async exec(sql: string) { this.db.exec(sql); }
-  /** Already inside an open transaction: run inline, atomic with the outer tx (like PgClientDb). */
-  async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> { return fn(this); }
-  async close() { /* lifecycle owned by SqliteDb.transaction; nothing to do here */ }
 }
 
 // Positional rewrite. Our SQL never contains a literal '?', so a plain replace is safe.
@@ -184,49 +124,28 @@ class PgClientDb implements Db {
 }
 
 /**
- * Monotonic version of the schema this build writes, stamped into the `meta` table on every open.
- * Bump it whenever the schema changes shape. Version 1 = the schema at the release that introduced
- * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
- * Version 2 = (removed) the `union_optin` table — union credential-borrowing was removed in #196
- *   before any deploy, so this build never creates it.
- * Version 3 = + the `notification_state` table (#117, purely additive).
- * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
- *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
- *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
- * Version 5 = + the `approval_request.query_hash` column (GHSA-pg84, purely additive). The column
- *   DEFAULTs to `'pre-v5'` — a value no live digest can equal ('' or 64-char hex) — so any row a
- *   pre-v5 writer creates matches NOTHING and re-prompts ('' as a default would let a grant minted
- *   for a query-bearing action authorize a queryless request). The migration additionally PURGES
- *   all approval rows when the stored version is < 5 (healApprovalRowsPreV5): they are
- *   minutes-lived prompts/grants, so deleting them is the crash-safe fail-closed upgrade — the
- *   purge is version-gated, and the version stamp lands only after it succeeds.
- * Version 6 = + the `offboard_tombstone` table (GHSA-25m2, purely additive): the durable
- *   fail-closed gate that keeps a pending consent from resurrecting an offboarded user's
- *   credential even when the offboarding row-purge transiently fails.
+ * Version of the schema this build writes, stamped into the `meta` table by the migration command.
+ * Vouchr is PostgreSQL-only and greenfield (#204): there are no deployed databases to migrate
+ * through the old incremental v1..v6 history, so the schema is defined once at its final shape in
+ * {@link schema} and this is the single baseline. Bump it — and add a real migration step — only
+ * when a shipped release's schema must change. The `meta` marker still exists so a downgrade (old
+ * code against a newer DB) fails closed rather than corrupting encrypted rows.
  */
-export const SCHEMA_VERSION = 6;
+export const SCHEMA_VERSION = 1;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
- * Downgrade guard — runs BEFORE any migration DDL.
- *
- * - Marker present and newer than this build → throw, fail closed. Old code "migrating" a newer
- *   database is the one unrecoverable failure mode: it can corrupt encrypted credential rows.
- * - Marker present and ≤ current → proceed; the idempotent migrations bring the schema to current.
- * - No marker → either an EMPTY database (fresh install) or an existing PRE-MARKER deployment
- *   (tables, no `meta` row). Documented assumption: a marker-less database with tables was written
- *   by a vouchr ≤ the release that shipped this marker (≤ v0.2.x). That is safe to proceed on,
- *   because every schema change up to that release is an idempotent in-place migration that
- *   openDb() runs unconditionally — after which either kind of database IS at SCHEMA_VERSION,
- *   which is what stampSchemaVersion() then records. Newer databases always carry the marker, so
- *   from this release on the ambiguity cannot recur.
+ * Downgrade guard — runs BEFORE the schema DDL. If the DB carries a marker NEWER than this build,
+ * throw and fail closed: old code writing a newer schema is the one unrecoverable failure mode (it
+ * can corrupt encrypted credential rows). A missing marker means a fresh database (greenfield), and
+ * an equal-or-older marker proceeds to the idempotent baseline DDL.
  */
-async function guardSchemaVersion(db: Db): Promise<number | null> {
+async function guardSchemaVersion(db: Db): Promise<void> {
   await db.exec(META_DDL);
   const row = await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`);
-  if (!row) return null;
+  if (!row) return;
   const found = Number(row.value);
   if (!Number.isInteger(found) || found > SCHEMA_VERSION) {
     throw new Error(
@@ -236,19 +155,6 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
         `version ${row.value}, or restore a database backup taken at schema version ${SCHEMA_VERSION} or older.`,
     );
   }
-  return found;
-}
-
-/**
- * GHSA-pg84 v5 healing, keyed on the STORED version (crash-safe: the stamp is written only after
- * this succeeds, so a crash anywhere re-runs it on the next open). Approval rows are minutes-lived
- * prompts/grants, so the fail-closed migration is simply to purge them: any query-binding
- * ambiguity a pre-v5 row could carry (including rows written by a still-running v4 process during
- * a rolling deploy — the ALTER's DEFAULT 'pre-v5' covers those going forward) dies here, and the
- * agent re-prompts. `from === null` covers fresh/pre-marker DBs, whose table is empty anyway.
- */
-async function healApprovalRowsPreV5(db: Db, from: number | null): Promise<void> {
-  if (from == null || from < 5) await db.run(`DELETE FROM approval_request`, []);
 }
 
 /** Record that the database is now at this build's schema version (after migrations ran). */
@@ -260,8 +166,12 @@ async function stampSchemaVersion(db: Db): Promise<void> {
   );
 }
 
-/** Schema DDL, parameterized by the engine's blob/integer type names. */
-function schema(blob: string, int: string): string {
+/** The single baseline schema DDL (PostgreSQL). Defined once at its final shape (#204) — no
+ *  incremental migration history, because greenfield means there are no deployed databases to
+ *  migrate. Idempotent (CREATE TABLE IF NOT EXISTS) so the boot path can run it unconditionally. */
+function schema(): string {
+  const blob = 'BYTEA';
+  const int = 'BIGINT';
   return `
     CREATE TABLE IF NOT EXISTS connection (
       id TEXT PRIMARY KEY,
@@ -340,7 +250,7 @@ function schema(blob: string, int: string): string {
       method TEXT NOT NULL,
       host TEXT NOT NULL,
       path TEXT NOT NULL,
-      query_hash TEXT NOT NULL DEFAULT 'pre-v5',
+      query_hash TEXT NOT NULL DEFAULT '',
       channel TEXT NOT NULL,
       thread TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -385,52 +295,127 @@ function schema(blob: string, int: string): string {
       bot_token ${blob},
       data ${blob} NOT NULL,
       updated_at ${int} NOT NULL
-    );`;
+    );
+
+    -- Cluster-wide single-use identity jti (DbReplayStore). Part of the baseline so no adapter runs
+    -- its own CREATE TABLE: two broker replicas constructing a store on one DB would otherwise race
+    -- the DDL (pg_type 23505). exp is epoch-ms.
+    CREATE TABLE IF NOT EXISTS broker_jti (jti TEXT PRIMARY KEY, exp ${int} NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_broker_jti_exp ON broker_jti (exp);`;
 }
 
-/** Open (and migrate) the credential store. Postgres if a connection string is set, else SQLite. */
-export async function openDb(opts: DbOptions = {}): Promise<Db> {
-  const url = opts.databaseUrl ?? process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
-  if (isPostgresUrl(url)) {
-    types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
-    const pool = new Pool({
-      connectionString: url,
-      connectionTimeoutMillis: 5_000,
-      idleTimeoutMillis: 30_000,
-      statement_timeout: 10_000, // fail a request fast instead of hanging the Bolt handler
-    });
-    // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
-    // throws and kills the whole process; swallow it, pg reconnects on the next query.
-    pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
-    const db = new PgDb(pool, url);
-    try {
-      const from = await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
-      await db.exec(schema('BYTEA', 'BIGINT'));
-      // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
-      await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
-      // #116 v4: system-only dry-run provenance on the credential row (never user/provider data).
-      await db.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS dry_run BIGINT NOT NULL DEFAULT 0`);
-      // GHSA-pg84 v5: query digest on approval rows — ONE atomic statement (no crash window between
-      // adding the column and marking legacy rows: the DEFAULT does the marking).
-      await db.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS query_hash TEXT NOT NULL DEFAULT 'pre-v5'`);
-      await healApprovalRowsPreV5(db, from); // crash-safe fail-closed purge, version-gated
-      await stampSchemaVersion(db);
-    } catch (e) {
-      await db.close().catch(() => undefined);
-      throw e;
-    }
-    return db;
+/** Validated pool size from `VOUCHR_PG_POOL_MAX` (pg's default when unset). A non-integer or < 1
+ *  value fails closed rather than silently becoming NaN/0 and starving the pool. */
+function poolMax(): number | undefined {
+  const raw = process.env.VOUCHR_PG_POOL_MAX;
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) {
+    throw new Error(`vouchr: VOUCHR_PG_POOL_MAX must be a positive integer, got "${raw}".`);
   }
+  return n;
+}
 
-  const raw = new BetterSqlite3(opts.dbPath ?? process.env.VOUCHR_DB ?? 'vouchr.db');
-  raw.pragma('journal_mode = WAL');
-  raw.pragma('busy_timeout = 5000'); // wait, don't instantly SQLITE_BUSY, on a concurrent writer
-  const db = new SqliteDb(raw);
+/** Resolve + validate the connection string and build a pool. No DDL, no schema check — the shared
+ *  guts of {@link openDb} and {@link migrate}. TLS is native: put `sslmode=require` (or stricter) in
+ *  the connection string and the pg driver negotiates it; there is no separate TLS knob to drift. */
+function connectDb(opts: DbOptions): PgDb {
+  const url = opts.databaseUrl ?? process.env.VOUCHR_DATABASE_URL;
+  if (!isPostgresUrl(url)) {
+    throw new Error(
+      'vouchr: a PostgreSQL connection string is required (VOUCHR_DATABASE_URL, or the databaseUrl ' +
+        'option). Vouchr is PostgreSQL-only; there is no embedded/SQLite mode and no generic ' +
+        'DATABASE_URL fallback.',
+    );
+  }
+  types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
+  const pool = new Pool({
+    connectionString: url,
+    application_name: 'vouchr', // names the backend in pg_stat_activity for operators
+    // Explicit pool size (VOUCHR_PG_POOL_MAX; pg's default 10 otherwise). Deployments size this to
+    // their `max_connections` / replica count.
+    max: poolMax(),
+    connectionTimeoutMillis: 5_000,
+    idleTimeoutMillis: 30_000,
+    maxLifetimeSeconds: 3600, // recycle a backend after an hour so a long-lived pod doesn't pin aging connections
+    statement_timeout: 10_000, // fail a request fast instead of hanging the Bolt handler
+  });
+  // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
+  // throws and kills the whole process; swallow it, pg reconnects on the next query.
+  pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
+  return new PgDb(pool, url);
+}
+
+/**
+ * Verify the database has been migrated to EXACTLY this build's schema version. Does NO DDL, so the
+ * runtime can connect with a DML-only role (no CREATE/ALTER grants). Fail closed:
+ *  - meta table / marker absent → the database was never migrated (`vouchr migrate` first);
+ *  - older version → an unmigrated/older database (`vouchr migrate` to converge);
+ *  - newer version → the downgrade guard: old code against a newer schema can corrupt encrypted rows.
+ */
+export async function assertSchemaCurrent(db: Db): Promise<void> {
+  let row: { value: string } | undefined;
   try {
-    const from = await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
-    migrateSqlite(raw);
-    await healApprovalRowsPreV5(db, from); // GHSA-pg84 v5: crash-safe fail-closed purge, version-gated
-    await stampSchemaVersion(db);
+    row = await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`);
+  } catch (e: any) {
+    if (e?.code === '42P01') row = undefined; // relation "meta" does not exist → never migrated
+    else throw e;
+  }
+  if (!row) {
+    throw new Error(
+      'vouchr: this database has not been initialized. Run `vouchr migrate` (with a role that can ' +
+        'create tables) before starting the runtime.',
+    );
+  }
+  const found = Number(row.value);
+  if (!Number.isInteger(found)) throw new Error(`vouchr: unreadable schema_version "${row.value}".`);
+  if (found < SCHEMA_VERSION) {
+    throw new Error(
+      `vouchr: this database is at schema version ${found}, but this build needs ${SCHEMA_VERSION}. ` +
+        'Run `vouchr migrate` to converge it.',
+    );
+  }
+  if (found > SCHEMA_VERSION) {
+    throw new Error(
+      `vouchr: this database reports schema version ${found}, newer than this build (${SCHEMA_VERSION}). ` +
+        'Refusing to open it: old code against a newer schema could corrupt encrypted credential rows. ' +
+        'Upgrade the vouchr package.',
+    );
+  }
+}
+
+/**
+ * Create/converge the schema to this build's version. Run by the `vouchr migrate` command (and the
+ * test harness) with a role that can CREATE — NOT the DML-only runtime role. Idempotent and safe to
+ * run concurrently: an xact advisory lock keyed by the target schema serializes replicas so they
+ * can't race `CREATE TABLE` (which is not atomic against the internal pg_type row → 23505). Opens a
+ * short-lived connection and closes it before returning.
+ */
+export async function migrate(opts: DbOptions = {}): Promise<{ version: number }> {
+  const db = connectDb(opts);
+  try {
+    await db.transaction(async (tx) => {
+      await tx.get('SELECT pg_advisory_xact_lock(hashtext(current_schema()))'); // released at COMMIT
+      await guardSchemaVersion(tx); // fail closed on a newer-schema DB, before any DDL
+      await tx.exec(schema()); // single idempotent baseline; no incremental migrations (greenfield)
+      await stampSchemaVersion(tx);
+    });
+    return { version: SCHEMA_VERSION };
+  } finally {
+    await db.close();
+  }
+}
+
+/**
+ * Open the credential store for the RUNTIME. PostgreSQL only (#204): a valid `postgres://` URL is
+ * required (via `databaseUrl` or `VOUCHR_DATABASE_URL`) and boot fails closed on a missing or
+ * non-Postgres value. Runs NO DDL — it only verifies the schema is at this build's version (see
+ * {@link assertSchemaCurrent}), so a DML-only role can run it. Migrate first with `vouchr migrate`.
+ */
+export async function openDb(opts: DbOptions = {}): Promise<Db> {
+  const db = connectDb(opts);
+  try {
+    await assertSchemaCurrent(db);
   } catch (e) {
     await db.close().catch(() => undefined);
     throw e;
@@ -438,52 +423,3 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
   return db;
 }
 
-/** SQLite schema + the legacy (pre-owner-keying) rebuild. Postgres deploys start clean. */
-function migrateSqlite(db: BetterSqlite3.Database): void {
-  db.exec(schema('BLOB', 'INTEGER'));
-
-  // Forward-migrate a pre-owner-keying DB (had user_id, no owner_kind) by rebuilding the table:
-  // SQLite can't ALTER a UNIQUE constraint. Each old per-user row becomes an owner_kind='user' row;
-  // ciphertext, enterprise_id and timestamps are preserved verbatim.
-  const cols = (db.prepare(`PRAGMA table_info(connection)`).all() as any[]).map((c) => c.name);
-  if (cols.includes('user_id') && !cols.includes('owner_kind')) {
-    const lastUsed = cols.includes('last_used_at') ? 'last_used_at' : 'NULL';
-    const connectionNew = schema('BLOB', 'INTEGER')
-      .split(';')[0]
-      .replace('connection', 'connection_new');
-    db.exec(`
-      ${connectionNew};
-      INSERT INTO connection_new
-        (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
-         access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-         external_account, created_at, updated_at, last_used_at)
-      SELECT id, enterprise_id, team_id, 'user', user_id, provider, 'vault',
-             access_token_enc, refresh_token_enc, NULL, scopes, expires_at,
-             external_account, created_at, updated_at, ${lastUsed}
-      FROM connection;
-      DROP TABLE connection;
-      ALTER TABLE connection_new RENAME TO connection;
-    `);
-  }
-
-  // Add the `channel` audit column to a pre-existing audit table (plain ADD COLUMN, no UNIQUE rebuild).
-  const auditCols = (db.prepare(`PRAGMA table_info(audit)`).all() as any[]).map((c) => c.name);
-  if (!auditCols.includes('channel')) {
-    db.exec(`ALTER TABLE audit ADD COLUMN channel TEXT`);
-  }
-
-  // #116 v4: system-only dry-run provenance on a pre-existing connection table (plain ADD COLUMN).
-  // Re-read: the table may have just been rebuilt above.
-  const connCols = (db.prepare(`PRAGMA table_info(connection)`).all() as any[]).map((c) => c.name);
-  if (!connCols.includes('dry_run')) {
-    db.exec(`ALTER TABLE connection ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0`);
-  }
-
-  // GHSA-pg84 v5: query digest on a pre-existing approval_request table — ONE atomic ALTER whose
-  // DEFAULT marks legacy rows 'pre-v5' (no crash window between adding and marking; no live digest
-  // — '' or hex — can equal the sentinel, so pre-v5 writers' rows match nothing and re-prompt).
-  const apCols = (db.prepare(`PRAGMA table_info(approval_request)`).all() as any[]).map((c) => c.name);
-  if (!apCols.includes('query_hash')) {
-    db.exec(`ALTER TABLE approval_request ADD COLUMN query_hash TEXT NOT NULL DEFAULT 'pre-v5'`);
-  }
-}

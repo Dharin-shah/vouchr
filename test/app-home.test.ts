@@ -1,4 +1,5 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { defineProvider, type Provider } from '../src/core/providers';
@@ -23,14 +24,14 @@ const mkProvider = (id: string): Provider => defineProvider({
 const provider = mkProvider('mcp');
 const CRED = { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'octo' };
 
-async function harness(opts: {
+async function harness(t: TestContext, opts: {
   slackAdmin?: boolean; allowCreator?: boolean; creator?: string;
   channelInfo?: Record<string, unknown>; infoThrows?: boolean; providers?: Provider[];
 } = {}) {
   const { slackAdmin = false, allowCreator = false, creator = 'U_OTHER', providers = [provider] } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
-    providers, baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:', allowChannelCreatorConfig: allowCreator,
+    providers, baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t), allowChannelCreatorConfig: allowCreator,
   });
   let command: any;
   const actions: Record<string, any> = {};
@@ -98,8 +99,8 @@ const modeRow = async (db: any, channel = 'C_FIN') =>
 const toolBit = async (db: any) =>
   ((await db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp'])) as any)?.enabled;
 
-test('app_home_opened: non-admin sees connections only; admin gets the governance selector', async () => {
-  const nonAdmin = await harness({ slackAdmin: false });
+test('app_home_opened: non-admin sees connections only; admin gets the governance selector', async (t) => {
+  const nonAdmin = await harness(t, { slackAdmin: false });
   await nonAdmin.lan.vault.upsert(userOwner(ID), 'mcp', CRED);
   await nonAdmin.openHome();
   const pub = nonAdmin.published();
@@ -112,20 +113,20 @@ test('app_home_opened: non-admin sees connections only; admin gets the governanc
   assert.ok(s.includes(DISCONNECT_ACTION)); // per-row Disconnect (same flow as the modal)
   assert.ok(!s.includes(HOME_CHANNEL_ACTION)); // no governance section for non-admins
 
-  const admin = await harness({ slackAdmin: true });
+  const admin = await harness(t, { slackAdmin: true });
   await admin.openHome();
   s = JSON.stringify(admin.published().view.blocks);
   assert.ok(s.includes(HOME_CHANNEL_ACTION)); // channel picker present
   assert.ok(!s.includes(HOME_MODE_ACTION)); // no control rows until a channel is picked
 });
 
-test('creator flag: creator gets rows for their channel; a foreign channel degrades to a note', async () => {
-  const mine = await harness({ slackAdmin: false, allowCreator: true, creator: ID.userId });
+test('creator flag: creator gets rows for their channel; a foreign channel degrades to a note', async (t) => {
+  const mine = await harness(t, { slackAdmin: false, allowCreator: true, creator: ID.userId });
   await mine.openHome('C_FIN');
   let s = JSON.stringify(mine.published().view.blocks);
   assert.ok(s.includes(HOME_MODE_ACTION)); // the existing eligibility function admitted the creator
 
-  const foreign = await harness({ slackAdmin: false, allowCreator: true, creator: 'U_OTHER' });
+  const foreign = await harness(t, { slackAdmin: false, allowCreator: true, creator: 'U_OTHER' });
   await foreign.openHome('C_FIN');
   s = JSON.stringify(foreign.published().view.blocks);
   assert.ok(s.includes(HOME_CHANNEL_ACTION)); // still offered the picker
@@ -133,8 +134,8 @@ test('creator flag: creator gets rows for their channel; a foreign channel degra
   assert.match(s, /Only a workspace admin or the channel creator/);
 });
 
-test('selecting a channel re-renders rows reflecting the stored mode + enablement', async () => {
-  const h = await harness({ slackAdmin: true });
+test('selecting a channel re-renders rows reflecting the stored mode + enablement', async (t) => {
+  const h = await harness(t, { slackAdmin: true });
   await new ChannelConfig(h.lan.db).setMode('T1', 'C_FIN', 'mcp', 'session');
   await new ChannelTools(h.lan.db).setEnabled('T1', 'C_FIN', 'mcp', false);
   await h.selectChannel('C_FIN');
@@ -148,18 +149,18 @@ test('selecting a channel re-renders rows reflecting the stored mode + enablemen
   assert.ok(toolBlock.elements.some((e: any) => e.action_id === HOME_CONFIGURE_ACTION));
 });
 
-test('home mode select == /vouchr mode: identical channel_config row and audit row', async () => {
-  const viaCommand = await harness({ slackAdmin: true });
+test('home mode select == /vouchr mode: identical channel_config row and audit row', async (t) => {
+  const viaCommand = await harness(t, { slackAdmin: true });
   await viaCommand.runCommand('mode mcp session');
-  const viaHome = await harness({ slackAdmin: true });
+  const viaHome = await harness(t, { slackAdmin: true });
   await viaHome.setMode('mcp', 'session');
   assert.equal(await modeRow(viaHome.lan.db), 'session');
   assert.deepEqual(await auditRows(viaHome.lan.db), await auditRows(viaCommand.lan.db)); // STR-4 parity
   assert.ok(viaHome.published()); // re-published after the mutation
 });
 
-test('forged home mode action from a non-admin: no write, audited denied', async () => {
-  const h = await harness({ slackAdmin: false });
+test('forged home mode action from a non-admin: no write, audited denied', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
   await h.setMode('mcp', 'shared');
   assert.equal(await modeRow(h.lan.db), null);
   const rows = await auditRows(h.lan.db);
@@ -167,8 +168,8 @@ test('forged home mode action from a non-admin: no write, audited denied', async
   assert.match(rows[0].meta, /not-admin/);
 });
 
-test('forged invalid mode value never reaches state: shared cred survives, nothing audited', async () => {
-  const h = await harness({ slackAdmin: true });
+test('forged invalid mode value never reaches state: shared cred survives, nothing audited', async (t) => {
+  const h = await harness(t, { slackAdmin: true });
   const owner = channelOwner('T1', 'C_FIN');
   await new ChannelConfig(h.lan.db).setMode('T1', 'C_FIN', 'mcp', 'shared');
   await h.lan.vault.upsert(owner, 'mcp', CRED);
@@ -178,38 +179,38 @@ test('forged invalid mode value never reaches state: shared cred survives, nothi
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
-test('home Enable/Disable == /vouchr enable|disable: identical channel_tool row and audit rows', async () => {
-  const viaCommand = await harness({ slackAdmin: true });
+test('home Enable/Disable == /vouchr enable|disable: identical channel_tool row and audit rows', async (t) => {
+  const viaCommand = await harness(t, { slackAdmin: true });
   await viaCommand.runCommand('disable mcp');
-  const viaHome = await harness({ slackAdmin: true });
+  const viaHome = await harness(t, { slackAdmin: true });
   await viaHome.toggleTool('disable:mcp');
   assert.equal(await toolBit(viaHome.lan.db), 0);
   assert.equal(await toolBit(viaHome.lan.db), await toolBit(viaCommand.lan.db));
   assert.deepEqual(await auditRows(viaHome.lan.db), await auditRows(viaCommand.lan.db)); // STR-4 parity
 });
 
-test('forged home tool action from a non-admin: no write, audited denied', async () => {
-  const h = await harness({ slackAdmin: false });
+test('forged home tool action from a non-admin: no write, audited denied', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
   await h.toggleTool('disable:mcp');
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false); // no allowlist row
   assert.deepEqual(await auditActions(h.lan.db), ['denied']);
 });
 
-test('home Configure opens the existing configureModal for an admin; a forged non-admin click is denied', async () => {
-  const admin = await harness({ slackAdmin: true });
+test('home Configure opens the existing configureModal for an admin; a forged non-admin click is denied', async (t) => {
+  const admin = await harness(t, { slackAdmin: true });
   await admin.configure('mcp');
   assert.equal(admin.opened()?.trigger_id, 'trig');
   assert.equal(admin.opened()?.view?.callback_id, CONFIGURE_CALLBACK); // the EXISTING modal, not a new one
   assert.deepEqual(JSON.parse(admin.opened().view.private_metadata), { channel: 'C_FIN', provider: 'mcp' });
 
-  const nonAdmin = await harness({ slackAdmin: false });
+  const nonAdmin = await harness(t, { slackAdmin: false });
   await nonAdmin.configure('mcp');
   assert.equal(nonAdmin.opened(), null); // no modal
   assert.deepEqual(await auditActions(nonAdmin.lan.db), ['denied']);
 });
 
-test('forged nonexistent channel in view metadata: fail-closed, nothing written or audited', async () => {
-  const h = await harness({ slackAdmin: true });
+test('forged nonexistent channel in view metadata: fail-closed, nothing written or audited', async (t) => {
+  const h = await harness(t, { slackAdmin: true });
   await h.setMode('mcp', 'shared', 'C_GHOST');
   await h.toggleTool('disable:mcp', 'C_GHOST');
   await h.configure('mcp', 'C_GHOST');
@@ -218,16 +219,16 @@ test('forged nonexistent channel in view metadata: fail-closed, nothing written 
   assert.deepEqual(await auditActions(h.lan.db), []); // SEC-4: the unverified channel never reached audit
 });
 
-test('archived selected channel renders a fail-closed note instead of controls', async () => {
-  const h = await harness({ slackAdmin: true, channelInfo: { is_archived: true } });
+test('archived selected channel renders a fail-closed note instead of controls', async (t) => {
+  const h = await harness(t, { slackAdmin: true, channelInfo: { is_archived: true } });
   await h.openHome('C_FIN');
   const s = JSON.stringify(h.published().view.blocks);
   assert.ok(!s.includes(HOME_MODE_ACTION));
   assert.match(s, /archived/);
 });
 
-test('deleted selected channel (conversations.info fails) still publishes, with no controls', async () => {
-  const h = await harness({ slackAdmin: true, infoThrows: true });
+test('deleted selected channel (conversations.info fails) still publishes, with no controls', async (t) => {
+  const h = await harness(t, { slackAdmin: true, infoThrows: true });
   await h.openHome('C_FIN');
   const view = h.published()?.view;
   assert.ok(view); // rendered gracefully, not crashed
@@ -236,16 +237,16 @@ test('deleted selected channel (conversations.info fails) still publishes, with 
   assert.ok(!s.includes(HOME_MODE_ACTION));
 });
 
-test('home Disconnect removes the connection and re-publishes the view without the row', async () => {
-  const h = await harness({ slackAdmin: false });
+test('home Disconnect removes the connection and re-publishes the view without the row', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', CRED);
   await h.disconnect('mcp');
   assert.equal(await h.lan.vault.get(userOwner(ID), 'mcp'), null);
   assert.match(JSON.stringify(h.published().view.blocks), /None yet/); // the re-published home reflects it
 });
 
-test('app_home_opened defers to a foreign (host-published) Home view; first open still publishes', async () => {
-  const h = await harness({ slackAdmin: false });
+test('app_home_opened defers to a foreign (host-published) Home view; first open still publishes', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
   // The host runs its own Home tab: the event echoes the host's view → Vouchr must not clobber it.
   await h.fireHomeOpened({ user: ID.userId, tab: 'home', view: { callback_id: 'hosts_own_home' } });
   assert.equal(h.published(), null);
@@ -257,8 +258,8 @@ test('app_home_opened defers to a foreign (host-published) Home view; first open
   assert.equal(h.published().view.type, 'home');
 });
 
-test('first Disable on an unconfigured channel materializes the allowlist: others stay enabled, one audit row', async () => {
-  const h = await harness({ slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
+test('first Disable on an unconfigured channel materializes the allowlist: others stay enabled, one audit row', async (t) => {
+  const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
   await h.toggleTool('disable:a');
   const tools = new ChannelTools(h.lan.db);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // the one the admin targeted
@@ -268,10 +269,10 @@ test('first Disable on an unconfigured channel materializes the allowlist: other
   assert.deepEqual(rows.map((r) => [r.action, r.provider]), [['config', 'a']]); // only the real change audited
 });
 
-test('slash and home agree on the unconfigured-channel Disable: same rows, same audit', async () => {
-  const slash = await harness({ slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
+test('slash and home agree on the unconfigured-channel Disable: same rows, same audit', async (t) => {
+  const slash = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
   await slash.runCommand('disable a');
-  const home = await harness({ slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
+  const home = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
   await home.toggleTool('disable:a');
   for (const h of [slash, home]) {
     const tools = new ChannelTools(h.lan.db);
@@ -281,24 +282,24 @@ test('slash and home agree on the unconfigured-channel Disable: same rows, same 
   assert.deepEqual(await auditRows(home.lan.db), await auditRows(slash.lan.db));
 });
 
-test('first Enable on an unconfigured channel does not disable the other providers', async () => {
-  const h = await harness({ slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
+test('first Enable on an unconfigured channel does not disable the other providers', async (t) => {
+  const h = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
   await h.runCommand('enable a'); // via slash — previously flipped the channel into a one-row allowlist
   const tools = new ChannelTools(h.lan.db);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), true);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // previously: silently disabled
 });
 
-test('a stale/deleted metadata channel on a click DMs the actor and resets the view', async () => {
-  const h = await harness({ slackAdmin: true });
+test('a stale/deleted metadata channel on a click DMs the actor and resets the view', async (t) => {
+  const h = await harness(t, { slackAdmin: true });
   await h.setMode('mcp', 'shared', 'C_GHOST');
   assert.ok(h.dms.some((t) => /no longer available/.test(t))); // feedback, not a silent no-op
   assert.ok(h.published()); // view reset to a selection-less state
   assert.deepEqual(await auditActions(h.lan.db), []); // still nothing persisted or audited
 });
 
-test('exported homeView is unstamped; a host Home tab built from it is deferred to (open + disconnect)', async () => {
-  const h = await harness({ slackAdmin: false });
+test('exported homeView is unstamped; a host Home tab built from it is deferred to (open + disconnect)', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
   const hostView: any = homeView({ connections: [], providers: ['mcp'] });
   assert.equal(hostView.callback_id, undefined); // pre-#111 exported shape: no ownership stamp
   assert.equal(hostView.private_metadata, undefined);
@@ -316,8 +317,8 @@ test('exported homeView is unstamped; a host Home tab built from it is deferred 
   assert.equal(h.published(), null); // and no view was clobbered
 });
 
-test('concurrent first Disables on an unconfigured channel both land; bystanders stay enabled', async () => {
-  const h = await harness({ slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
+test('concurrent first Disables on an unconfigured channel both land; bystanders stay enabled', async (t) => {
+  const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
   await Promise.all([h.toggleTool('disable:a'), h.toggleTool('disable:b')]);
   const tools = new ChannelTools(h.lan.db);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false);
@@ -325,12 +326,12 @@ test('concurrent first Disables on an unconfigured channel both land; bystanders
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), true); // no interleaving re-enabled or dropped it
 });
 
-test('service tools: not advertised as connectable; governed via Enable/Disable only', async () => {
+test('service tools: not advertised as connectable; governed via Enable/Disable only', async (t) => {
   const mkSvc = () => defineProvider({
     id: 'svc', identity: 'service', credential: 'key', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t',
     scopesDefault: [], egressAllow: ['api.test'], refresh: 'none', pkce: false,
   });
-  const h = await harness({ slackAdmin: true, providers: [mkProvider('oauth1'), mkSvc()] });
+  const h = await harness(t, { slackAdmin: true, providers: [mkProvider('oauth1'), mkSvc()] });
   await h.openHome('C_FIN');
   const view = h.published().view;
   const avail = view.blocks.find((b: any) => b.type === 'section' && /Available providers/.test(b.text?.text ?? ''));
@@ -349,13 +350,13 @@ test('service tools: not advertised as connectable; governed via Enable/Disable 
   // Enable/Disable on the service tool works end-to-end, identical to the slash equivalent.
   await h.toggleTool('disable:svc');
   assert.equal(await new ChannelTools(h.lan.db).isEnabled('T1', 'C_FIN', 'svc'), false);
-  const viaSlash = await harness({ slackAdmin: true, providers: [mkProvider('oauth1'), mkSvc()] });
+  const viaSlash = await harness(t, { slackAdmin: true, providers: [mkProvider('oauth1'), mkSvc()] });
   await viaSlash.runCommand('disable svc');
   assert.deepEqual(await auditRows(h.lan.db), await auditRows(viaSlash.lan.db)); // STR-4 parity
 });
 
-test('provider-reported account labels are escaped everywhere they render (SEC-5)', async () => {
-  const h = await harness({ slackAdmin: false });
+test('provider-reported account labels are escaped everywhere they render (SEC-5)', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { ...CRED, externalAccount: '<!channel> <https://evil|click>' });
   let out: any = null;
   await h.runCommand('status', async (m: any) => { out = m; });
@@ -369,9 +370,9 @@ test('provider-reported account labels are escaped everywhere they render (SEC-5
   assert.ok(!s.includes('<!channel>'));
 });
 
-test('forged tool action on an archived or ext-shared channel: no write, refused at the mutation', async () => {
+test('forged tool action on an archived or ext-shared channel: no write, refused at the mutation', async (t) => {
   for (const channelInfo of [{ is_archived: true }, { is_ext_shared: true }]) {
-    const h = await harness({ slackAdmin: true, channelInfo });
+    const h = await harness(t, { slackAdmin: true, channelInfo });
     await h.toggleTool('disable:mcp'); // render never showed the button; the payload is forged
     assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false); // nothing written
     assert.deepEqual(await auditActions(h.lan.db), []); // mirrors setChannelMode: eligibility refusals aren't authz denials
@@ -381,8 +382,8 @@ test('forged tool action on an archived or ext-shared channel: no write, refused
   }
 });
 
-test('slash enable and configure refuse an ineligible channel class (parity with mode)', async () => {
-  const h = await harness({ slackAdmin: true, channelInfo: { is_ext_shared: true } });
+test('slash enable and configure refuse an ineligible channel class (parity with mode)', async (t) => {
+  const h = await harness(t, { slackAdmin: true, channelInfo: { is_ext_shared: true } });
   const out: string[] = [];
   await h.runCommand('enable mcp', async (m: any) => { out.push(String(m)); });
   assert.match(out[0], /externally shared/);

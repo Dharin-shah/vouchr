@@ -182,7 +182,7 @@ export async function startServer(): Promise<ReturnType<typeof createServer>> {
   const token = process.env.VOUCHR_SIDECAR_TOKEN;
   if (!token) throw new Error('VOUCHR_SIDECAR_TOKEN is required (shared bearer the trusted caller presents)');
 
-  const db = await openDb(); // same VOUCHR_DB / VOUCHR_DATABASE_URL the Slack app uses
+  const db = await openDb(); // same VOUCHR_DATABASE_URL (Postgres) the Slack app uses
   const deps: Deps = {
     vault: new Vault(db, loadKeyring()),
     audit: new Audit(db),

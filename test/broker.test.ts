@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
@@ -41,8 +41,8 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
 }
 
-async function makeBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   // Seed U1's acme credential so /v1/fetch has a token to (privately) inject.
@@ -131,8 +131,8 @@ test('identity: jti is single-use within the replay guard', () => {
 
 // ── /v1/fetch ────────────────────────────────────────────────────────────────
 
-test('fetch: token is NEVER present in the response body', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: token is NEVER present in the response body', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -149,9 +149,9 @@ test('fetch: token is NEVER present in the response body', async () => {
   }
 });
 
-test('fetch: the broker forwards metrics events to onEvent (no longer a black box), no secret', async () => {
+test('fetch: the broker forwards metrics events to onEvent (no longer a black box), no secret', async (t) => {
   const events: VouchrEvent[] = [];
-  const { server, port } = await makeBroker({ onEvent: (e) => events.push(e) });
+  const { server, port } = await makeBroker(t, { onEvent: (e) => events.push(e) });
   const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -171,9 +171,9 @@ test('fetch: the broker forwards metrics events to onEvent (no longer a black bo
   for (const e of events) assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'metric event leaked the token');
 });
 
-test('fetch: the broker emits an audit-STREAM event (raw verified actor id) to auditSink, no secret', async () => {
+test('fetch: the broker emits an audit-STREAM event (raw verified actor id) to auditSink, no secret', async (t) => {
   const events: any[] = [];
-  const { server, port } = await makeBroker({ auditSink: (e) => events.push(e) });
+  const { server, port } = await makeBroker(t, { auditSink: (e) => events.push(e) });
   const up = mockUpstream(() => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -198,8 +198,8 @@ test('fetch: the broker emits an audit-STREAM event (raw verified actor id) to a
   assert.ok(!JSON.stringify(e).includes(SECRET_TOKEN), 'audit-stream event leaked the token');
 });
 
-test('fetch: an incoming traceparent is propagated onto the outbound provider fetch', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: an incoming traceparent is propagated onto the outbound provider fetch', async (t) => {
+  const { server, port } = await makeBroker(t);
   const real = globalThis.fetch;
   let outbound: Headers | null = null;
   globalThis.fetch = (async (_u: any, init: any) => {
@@ -228,8 +228,8 @@ test('fetch: an incoming traceparent is propagated onto the outbound provider fe
   }
 });
 
-test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -244,10 +244,10 @@ test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async ()
   }
 });
 
-test('fetch: allowWrites + provider egressMethods lets a POST body reach upstream, with audit method', async () => {
+test('fetch: allowWrites + provider egressMethods lets a POST body reach upstream, with audit method', async (t) => {
   const events: any[] = [];
   const writeAcme = { ...acme, egressMethods: ['GET', 'POST'] } as Provider;
-  const { server, db, port } = await makeBroker({ providers: [writeAcme], allowWrites: true, auditSink: (e) => events.push(e) });
+  const { server, db, port } = await makeBroker(t, { providers: [writeAcme], allowWrites: true, auditSink: (e) => events.push(e) });
   const up = mockUpstream(() => new Response('{"created":true}', { status: 201, headers: { 'content-type': 'application/json' } }));
   try {
     const payload = JSON.stringify({ title: 'from broker' });
@@ -278,9 +278,9 @@ test('fetch: allowWrites + provider egressMethods lets a POST body reach upstrea
   }
 });
 
-test('fetch: write no-content responses pass through as empty successful bodies', async () => {
+test('fetch: write no-content responses pass through as empty successful bodies', async (t) => {
   const writeAcme = { ...acme, egressMethods: ['PUT', 'DELETE', 'PATCH'] } as Provider;
-  const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
+  const { server, port } = await makeBroker(t, { providers: [writeAcme], allowWrites: true });
   const responses = [
     () => new Response(null, { status: 204 }),
     () => new Response(null, { status: 205 }),
@@ -326,8 +326,8 @@ test('fetch: write no-content responses pass through as empty successful bodies'
   }
 });
 
-test('fetch: allowWrites still requires per-provider egressMethods', async () => {
-  const { server, port } = await makeBroker({ allowWrites: true }); // acme has no egressMethods
+test('fetch: allowWrites still requires per-provider egressMethods', async (t) => {
+  const { server, port } = await makeBroker(t, { allowWrites: true }); // acme has no egressMethods
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -345,9 +345,9 @@ test('fetch: allowWrites still requires per-provider egressMethods', async () =>
   }
 });
 
-test('fetch: allowWrites denies methods not listed by the provider', async () => {
+test('fetch: allowWrites denies methods not listed by the provider', async (t) => {
   const writeAcme = { ...acme, egressMethods: ['GET', 'POST'] } as Provider;
-  const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
+  const { server, port } = await makeBroker(t, { providers: [writeAcme], allowWrites: true });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -365,9 +365,9 @@ test('fetch: allowWrites denies methods not listed by the provider', async () =>
   }
 });
 
-test('fetch: write body over the broker cap is rejected, never truncated or forwarded', async () => {
+test('fetch: write body over the broker cap is rejected, never truncated or forwarded', async (t) => {
   const writeAcme = { ...acme, egressMethods: ['POST'] } as Provider;
-  const { server, port } = await makeBroker({ providers: [writeAcme], allowWrites: true });
+  const { server, port } = await makeBroker(t, { providers: [writeAcme], allowWrites: true });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const maxBody = 'x'.repeat(64 * 1024);
@@ -396,14 +396,14 @@ test('fetch: write body over the broker cap is rejected, never truncated or forw
   }
 });
 
-test('fetch: write requests still enforce host, path, validator, and replay checks', async () => {
+test('fetch: write requests still enforce host, path, validator, and replay checks', async (t) => {
   const guarded = {
     ...acme,
     egressMethods: ['POST'],
     egressPaths: ['/allowed'],
     egressValidate: (url: URL) => url.searchParams.get('ok') === '1',
   } as Provider;
-  const { server, port } = await makeBroker({ providers: [guarded], allowWrites: true });
+  const { server, port } = await makeBroker(t, { providers: [guarded], allowWrites: true });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const blockedHost = await post(port, '/v1/fetch', {
@@ -443,8 +443,8 @@ test('fetch: write requests still enforce host, path, validator, and replay chec
   }
 });
 
-test('fetch: unsigned/expired identity -> 401', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: unsigned/expired identity -> 401', async (t) => {
+  const { server, port } = await makeBroker(t);
   try {
     const bad = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: 'not.a.real.token', method: 'GET', path: '/x' });
     assert.equal(bad.status, 401);
@@ -457,8 +457,8 @@ test('fetch: unsigned/expired identity -> 401', async () => {
   }
 });
 
-test('fetch: a replayed jti is rejected on the second call', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: a replayed jti is rejected on the second call', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const token = signIdentity(claims(), SECRET);
@@ -472,13 +472,13 @@ test('fetch: a replayed jti is rejected on the second call', async () => {
   }
 });
 
-test('fetch: a shared replayStore rejects a replay across DIFFERENT broker instances (multi-pod)', async () => {
+test('fetch: a shared replayStore rejects a replay across DIFFERENT broker instances (multi-pod)', async (t) => {
   // A shared store makes single-use cluster-wide, not per-process (the default in-memory guard would
   // let each instance accept the same jti once). Simulates two pods behind one Redis-backed store.
   const seen = new Map<string, number>();
   const replayStore = { use: (jti: string, exp: number) => { if (seen.has(jti)) return false; seen.set(jti, exp); return true; } };
-  const a = await makeBroker({ replayStore });
-  const b = await makeBroker({ replayStore });
+  const a = await makeBroker(t, { replayStore });
+  const b = await makeBroker(t, { replayStore });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const token = signIdentity(claims(), SECRET);
@@ -493,10 +493,10 @@ test('fetch: a shared replayStore rejects a replay across DIFFERENT broker insta
   }
 });
 
-test('#100 default (no explicit replayStore) shares replay protection across instances on one db', async () => {
+test('#100 default (no explicit replayStore) shares replay protection across instances on one db', async (t) => {
   // Two brokers over ONE shared db and NO explicit replayStore: the #100 default (DbReplayStore on the
   // shared db) must make a jti single-use CLUSTER-WIDE, so a token spent on A is refused on B.
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
@@ -521,10 +521,10 @@ test('#100 default (no explicit replayStore) shares replay protection across ins
   }
 });
 
-test('#100 an explicit replayStore override still wins (its use() is called, the db default is not)', async () => {
+test('#100 an explicit replayStore override still wins (its use() is called, the db default is not)', async (t) => {
   const calls: string[] = [];
   const replayStore = { use: (jti: string) => { calls.push(jti); return true; } };
-  const { server, port } = await makeBroker({ replayStore });
+  const { server, port } = await makeBroker(t, { replayStore });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const c = claims();
@@ -537,8 +537,8 @@ test('#100 an explicit replayStore override still wins (its use() is called, the
   }
 });
 
-test('fetch: a service-to-service provider is refused (403), never brokered', async () => {
-  const { server, port } = await makeBroker({ providers: [acme, svc] });
+test('fetch: a service-to-service provider is refused (403), never brokered', async (t) => {
+  const { server, port } = await makeBroker(t, { providers: [acme, svc] });
   try {
     const token = signIdentity(claims(), SECRET);
     const r = await post(port, '/v1/fetch', { handle: { provider: 'svc', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
@@ -549,8 +549,8 @@ test('fetch: a service-to-service provider is refused (403), never brokered', as
   }
 });
 
-test('resolve: a service-to-service provider is refused (403), never reported connected', async () => {
-  const { server, port } = await makeBroker({ providers: [acme, svc] });
+test('resolve: a service-to-service provider is refused (403), never reported connected', async (t) => {
+  const { server, port } = await makeBroker(t, { providers: [acme, svc] });
   try {
     const token = signIdentity(claims(), SECRET);
     const r = await post(port, '/v1/resolve', { handle: { provider: 'svc', owner: 'user' }, identityToken: token });
@@ -560,8 +560,8 @@ test('resolve: a service-to-service provider is refused (403), never reported co
   }
 });
 
-test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the attacker their OWN (empty) owner', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the attacker their OWN (empty) owner', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     // Attacker is U2 (no credential). They sign their own valid token but stuff U1's id in the body.
@@ -581,8 +581,8 @@ test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the atta
   }
 });
 
-test('fetch: over-cap response -> 413, never a truncated partial body', async () => {
-  const { server, port } = await makeBroker({ maxResponseBytes: 64 });
+test('fetch: over-cap response -> 413, never a truncated partial body', async (t) => {
+  const { server, port } = await makeBroker(t, { maxResponseBytes: 64 });
   const big = JSON.stringify({ blob: 'x'.repeat(500) });
   const up = mockUpstream(() => new Response(big, { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
@@ -595,8 +595,8 @@ test('fetch: over-cap response -> 413, never a truncated partial body', async ()
   }
 });
 
-test('fetch: disallowed content-type is rejected before the body is returned', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: disallowed content-type is rejected before the body is returned', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('<html>injection</html>', { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }));
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
@@ -608,8 +608,8 @@ test('fetch: disallowed content-type is rejected before the body is returned', a
   }
 });
 
-test('fetch: content-type allowlist ignores ;charset and is case-insensitive', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: content-type allowlist ignores ;charset and is case-insensitive', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{"ok":1}', { status: 200, headers: { 'content-type': 'APPLICATION/JSON; charset=UTF-8' } }));
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
@@ -623,8 +623,8 @@ test('fetch: content-type allowlist ignores ;charset and is case-insensitive', a
 
 // ── /v1/resolve ──────────────────────────────────────────────────────────────
 
-test('resolve: returns existence + consent state, NEVER the secret', async () => {
-  const { server, port } = await makeBroker();
+test('resolve: returns existence + consent state, NEVER the secret', async (t) => {
+  const { server, port } = await makeBroker(t);
   try {
     const connected = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(connected.status, 200);
@@ -642,8 +642,8 @@ test('resolve: returns existence + consent state, NEVER the secret', async () =>
 
 // ── #101 /healthz (liveness) + /readyz (readiness) ────────────────────────────
 
-test('#101 healthz: liveness is a bare 200 {ok:true}, never touches the db', async () => {
-  const { server, db, port } = await makeBroker();
+test('#101 healthz: liveness is a bare 200 {ok:true}, never touches the db', async (t) => {
+  const { server, db, port } = await makeBroker(t);
   try {
     const up = await get(port, '/healthz');
     assert.equal(up.status, 200);
@@ -658,8 +658,8 @@ test('#101 healthz: liveness is a bare 200 {ok:true}, never touches the db', asy
   }
 });
 
-test('#101 readyz: 200 with a working db, 503 (bare {ok:false}) when the db is unreachable', async () => {
-  const { server, db, port } = await makeBroker();
+test('#101 readyz: 200 with a working db, 503 (bare {ok:false}) when the db is unreachable', async (t) => {
+  const { server, db, port } = await makeBroker(t);
   try {
     const ready = await get(port, '/readyz');
     assert.equal(ready.status, 200);
@@ -674,8 +674,8 @@ test('#101 readyz: 200 with a working db, 503 (bare {ok:false}) when the db is u
   }
 });
 
-test('#101 probes need no auth and leak no secrets even behind a brokerToken gate', async () => {
-  const { server, port } = await makeBroker({ brokerToken: 'perimeter-secret' });
+test('#101 probes need no auth and leak no secrets even behind a brokerToken gate', async (t) => {
+  const { server, port } = await makeBroker(t, { brokerToken: 'perimeter-secret' });
   try {
     const hz = await get(port, '/healthz'); // no Authorization header sent
     const rz = await get(port, '/readyz');
@@ -693,8 +693,8 @@ test('#101 probes need no auth and leak no secrets even behind a brokerToken gat
 
 /** Build a broker over a fresh in-memory db with U1's acme credential seeded, returning the db so a
  *  test can wire a Policy / ChannelTools backed by the SAME store the broker reads. */
-async function makeBrokerOn(build: (db: any, vault: Vault, audit: Audit) => Partial<Parameters<typeof createBroker>[0]>) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeBrokerOn(t: TestContext, build: (db: any, vault: Vault, audit: Audit) => Partial<Parameters<typeof createBroker>[0]>) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
@@ -705,10 +705,10 @@ async function makeBrokerOn(build: (db: any, vault: Vault, audit: Audit) => Part
   return { server, db, audit, port: (server.address() as any).port };
 }
 
-test('fetch: a Policy that denies the provider in this channel -> 403, credential NEVER injected', async () => {
+test('fetch: a Policy that denies the provider in this channel -> 403, credential NEVER injected', async (t) => {
   // Policy denies acme in C1 (the channel comes from the verified claims, not the body).
   const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
-  const { server, db, port } = await makeBrokerOn(() => ({ policy }));
+  const { server, db, port } = await makeBrokerOn(t, () => ({ policy }));
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
@@ -722,10 +722,10 @@ test('fetch: a Policy that denies the provider in this channel -> 403, credentia
   }
 });
 
-test('fetch: write requests still honor Policy before injection', async () => {
+test('fetch: write requests still honor Policy before injection', async (t) => {
   const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
   const writeAcme = { ...acme, egressMethods: ['POST'] } as Provider;
-  const { server, port } = await makeBrokerOn(() => ({ providers: [writeAcme], allowWrites: true, policy }));
+  const { server, port } = await makeBrokerOn(t, () => ({ providers: [writeAcme], allowWrites: true, policy }));
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -743,8 +743,8 @@ test('fetch: write requests still honor Policy before injection', async () => {
   }
 });
 
-test('fetch: a ChannelTools allowlist that disables the provider here -> 403, credential NEVER injected', async () => {
-  const { server, db, port } = await makeBrokerOn((db) => ({ channelTools: new ChannelTools(db) }));
+test('fetch: a ChannelTools allowlist that disables the provider here -> 403, credential NEVER injected', async (t) => {
+  const { server, db, port } = await makeBrokerOn(t, (db) => ({ channelTools: new ChannelTools(db) }));
   // Configure the channel as an allowlist that does NOT include acme -> acme is disabled here.
   await new ChannelTools(db).setEnabled('T1', 'C1', 'other', true);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -758,9 +758,9 @@ test('fetch: a ChannelTools allowlist that disables the provider here -> 403, cr
   }
 });
 
-test('fetch: write requests still honor ChannelTools before injection', async () => {
+test('fetch: write requests still honor ChannelTools before injection', async (t) => {
   const writeAcme = { ...acme, egressMethods: ['POST'] } as Provider;
-  const { server, db, port } = await makeBrokerOn((db) => ({
+  const { server, db, port } = await makeBrokerOn(t, (db) => ({
     providers: [writeAcme],
     allowWrites: true,
     channelTools: new ChannelTools(db),
@@ -783,8 +783,8 @@ test('fetch: write requests still honor ChannelTools before injection', async ()
   }
 });
 
-test('fetch: a caller-supplied Authorization header is DROPPED; only the broker-injected Bearer reaches upstream', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: a caller-supplied Authorization header is DROPPED; only the broker-injected Bearer reaches upstream', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -800,8 +800,8 @@ test('fetch: a caller-supplied Authorization header is DROPPED; only the broker-
   }
 });
 
-test('fetch: brokerToken network gate — wrong/absent token 401, correct token passes', async () => {
-  const { server, port } = await makeBroker({ brokerToken: 'perimeter-secret' });
+test('fetch: brokerToken network gate — wrong/absent token 401, correct token passes', async (t) => {
+  const { server, port } = await makeBroker(t, { brokerToken: 'perimeter-secret' });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const body = { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' };
@@ -817,8 +817,8 @@ test('fetch: brokerToken network gate — wrong/absent token 401, correct token 
   }
 });
 
-test('fetch: a malformed host -> clean 400, not a 500', async () => {
-  const { server, port } = await makeBroker();
+test('fetch: a malformed host -> clean 400, not a 500', async (t) => {
+  const { server, port } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -832,8 +832,8 @@ test('fetch: a malformed host -> clean 400, not a 500', async () => {
   }
 });
 
-test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; forged body can\'t reach a channel cred)', async () => {
-  const { server, port } = await makeBroker();
+test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; forged body can\'t reach a channel cred)', async (t) => {
+  const { server, port } = await makeBroker(t);
   try {
     // #51: a forged body owner:'channel' on a PLAIN user token (no signed ownerKind) is refused — the
     // signed claim defaults to 'user' and must match the handle. 403, never a channel-credential read.
@@ -850,8 +850,8 @@ test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; f
 // ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
 
 /** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
-async function makeChannelBroker(mode: 'shared' | 'per-user') {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user') {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
@@ -872,8 +872,8 @@ function channelToken(over: Partial<IdentityClaims> = {}): string {
   return signIdentity(claims({ ownerKind: 'channel', channelEligible: true, ...over }), SECRET);
 }
 
-test('#51 shared: owner:"channel" resolves to the channel credential and injects it', async () => {
-  const { server, db, port } = await makeChannelBroker('shared');
+test('#51 shared: owner:"channel" resolves to the channel credential and injects it', async (t) => {
+  const { server, db, port } = await makeChannelBroker(t, 'shared');
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -891,8 +891,8 @@ test('#51 shared: owner:"channel" resolves to the channel credential and injects
   }
 });
 
-test('#51 ineligible signed claim -> refused (fail closed, cred never read)', async () => {
-  const { server, port } = await makeChannelBroker('shared');
+test('#51 ineligible signed claim -> refused (fail closed, cred never read)', async (t) => {
+  const { server, port } = await makeChannelBroker(t, 'shared');
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     // channelEligible:false (the caller computed channelIneligibleReason() != null) -> 403.
@@ -912,8 +912,8 @@ test('#51 ineligible signed claim -> refused (fail closed, cred never read)', as
   }
 });
 
-test('#51 a per-user channel is not reachable via owner:"channel"', async () => {
-  const { server, port } = await makeChannelBroker('per-user');
+test('#51 a per-user channel is not reachable via owner:"channel"', async (t) => {
+  const { server, port } = await makeChannelBroker(t, 'per-user');
   try {
     const r = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
@@ -924,8 +924,8 @@ test('#51 a per-user channel is not reachable via owner:"channel"', async () => 
   }
 });
 
-test('#51 forged signed ownerKind mismatch: body owner:"user" but claim says "channel" -> refused', async () => {
-  const { server, port } = await makeChannelBroker('shared');
+test('#51 forged signed ownerKind mismatch: body owner:"user" but claim says "channel" -> refused', async (t) => {
+  const { server, port } = await makeChannelBroker(t, 'shared');
   try {
     // The handle must match the SIGNED ownerKind; a user handle with a channel claim is refused.
     const r = await post(port, '/v1/fetch', {
@@ -939,10 +939,10 @@ test('#51 forged signed ownerKind mismatch: body owner:"user" but claim says "ch
 
 // ── #25 default-deny at the provider level (injector enforces it; core unchanged) ──
 
-test('egress default-deny: unset egressMethods means GET/HEAD-only under the broker switch', async () => {
+test('egress default-deny: unset egressMethods means GET/HEAD-only under the broker switch', async (t) => {
   // The broker clones the provider with egressMethods=['GET','HEAD'] when defaultDenyNonGet is on,
   // and the EXISTING injector enforcement (injector.ts) denies POST. Without the switch, POST passes.
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
@@ -973,8 +973,8 @@ test('egress default-deny: unset egressMethods means GET/HEAD-only under the bro
 
 // ── standalone-broker seams (PR1) ─────────────────────────────────────────────
 
-test('health: GET /health is an alias for the /healthz liveness probe', async () => {
-  const { server, port } = await makeBroker();
+test('health: GET /health is an alias for the /healthz liveness probe', async (t) => {
+  const { server, port } = await makeBroker(t);
   try {
     const hz = await get(port, '/healthz');
     const h = await get(port, '/health');
@@ -986,9 +986,9 @@ test('health: GET /health is an alias for the /healthz liveness probe', async ()
   }
 });
 
-test('perimeter: a custom authorize hook replaces the brokerToken gate (reject then accept)', async () => {
+test('perimeter: a custom authorize hook replaces the brokerToken gate (reject then accept)', async (t) => {
   const authorize = (req: any) => { if (req.headers['x-svc'] !== 'ok') throw new Error('nope'); };
-  const { server, port } = await makeBroker({ authorize });
+  const { server, port } = await makeBroker(t, { authorize });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const denied = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
@@ -1003,8 +1003,8 @@ test('perimeter: a custom authorize hook replaces the brokerToken gate (reject t
   }
 });
 
-test('refresh single-flight: concurrent broker requests collapse to ONE /token call (shared inflight map)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('refresh single-flight: concurrent broker requests collapse to ONE /token call (shared inflight map)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const refreshing = defineProvider({
@@ -1041,8 +1041,8 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
 
 // ── #54 lifecycle: disconnect / admin offboard ───────────────────────────────
 
-test('#54 /v1/disconnect removes the acting user\'s connection; resolve then needs_consent', async () => {
-  const { server, port, vault } = await makeBroker(); // seeds U1's acme cred
+test('#54 /v1/disconnect removes the acting user\'s connection; resolve then needs_consent', async (t) => {
+  const { server, port, vault } = await makeBroker(t); // seeds U1's acme cred
   try {
     const d = await post(port, '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(d.status, 200);
@@ -1055,8 +1055,8 @@ test('#54 /v1/disconnect removes the acting user\'s connection; resolve then nee
   }
 });
 
-test('#54 /v1/disconnect acts only on the token identity (a different user is untouched)', async () => {
-  const { server, port, vault } = await makeBroker();
+test('#54 /v1/disconnect acts only on the token identity (a different user is untouched)', async (t) => {
+  const { server, port, vault } = await makeBroker(t);
   // Seed a second user U2 whose cred must survive U1 disconnecting.
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -1070,8 +1070,8 @@ test('#54 /v1/disconnect acts only on the token identity (a different user is un
   }
 });
 
-test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user', async () => {
-  const { server, port, vault } = await makeBroker();
+test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user', async (t) => {
+  const { server, port, vault } = await makeBroker(t);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
@@ -1085,8 +1085,8 @@ test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user'
   }
 });
 
-test('#54 /v1/admin/offboard without the signed isAdmin claim -> 403 (forged body can\'t assert admin)', async () => {
-  const { server, port, vault } = await makeBroker();
+test('#54 /v1/admin/offboard without the signed isAdmin claim -> 403 (forged body can\'t assert admin)', async (t) => {
+  const { server, port, vault } = await makeBroker(t);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
@@ -1100,8 +1100,8 @@ test('#54 /v1/admin/offboard without the signed isAdmin claim -> 403 (forged bod
   }
 });
 
-test('#54 /v1/admin/offboard requires a targetUserId', async () => {
-  const { server, port } = await makeBroker();
+test('#54 /v1/admin/offboard requires a targetUserId', async (t) => {
+  const { server, port } = await makeBroker(t);
   try {
     const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ isAdmin: true }), SECRET) });
     assert.equal(r.status, 400);
@@ -1113,8 +1113,8 @@ test('#54 /v1/admin/offboard requires a targetUserId', async () => {
 // ── #52 OAuth connect + callback routes ──────────────────────────────────────
 
 /** A broker with the OAuth connect flow mounted (baseUrl set), starting with NO stored cred. */
-async function makeOauthBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeOauthBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const server = createBroker({
@@ -1136,8 +1136,8 @@ function getRaw(port: number, path: string): Promise<{ status: number; raw: stri
   });
 }
 
-test('#52 /v1/connect mints an authorizeUrl + single-use state bound to the verified user', async () => {
-  const { server, port, db } = await makeOauthBroker();
+test('#52 /v1/connect mints an authorizeUrl + single-use state bound to the verified user', async (t) => {
+  const { server, port, db } = await makeOauthBroker(t);
   try {
     const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 200);
@@ -1153,8 +1153,8 @@ test('#52 /v1/connect mints an authorizeUrl + single-use state bound to the veri
   }
 });
 
-test('#52 /v1/connect refuses a tampered identity token (identity only from the signed token)', async () => {
-  const { server, port } = await makeOauthBroker();
+test('#52 /v1/connect refuses a tampered identity token (identity only from the signed token)', async (t) => {
+  const { server, port } = await makeOauthBroker(t);
   try {
     const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: 'not-a-real-token' });
     assert.equal(r.status, 401);
@@ -1163,8 +1163,8 @@ test('#52 /v1/connect refuses a tampered identity token (identity only from the 
   }
 });
 
-test('#52 /v1/connect refuses a service tool (no human credential / OAuth handshake)', async () => {
-  const { server, port } = await makeOauthBroker();
+test('#52 /v1/connect refuses a service tool (no human credential / OAuth handshake)', async (t) => {
+  const { server, port } = await makeOauthBroker(t);
   try {
     const r = await post(port, '/v1/connect', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 403);
@@ -1173,8 +1173,8 @@ test('#52 /v1/connect refuses a service tool (no human credential / OAuth handsh
   }
 });
 
-test('#52 /v1/connect is 404 when baseUrl is unset (use-only broker unchanged)', async () => {
-  const { server, port } = await makeBroker(); // no baseUrl
+test('#52 /v1/connect is 404 when baseUrl is unset (use-only broker unchanged)', async (t) => {
+  const { server, port } = await makeBroker(t); // no baseUrl
   try {
     const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 404);
@@ -1183,8 +1183,8 @@ test('#52 /v1/connect is 404 when baseUrl is unset (use-only broker unchanged)',
   }
 });
 
-test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds', async () => {
-  const { server, port } = await makeOauthBroker();
+test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds', async (t) => {
+  const { server, port } = await makeOauthBroker(t);
   const NEW = 'NEW_ACCESS_TOKEN_from_oauth';
   const real = globalThis.fetch;
   let upstreamAuth: string | null = null; // what the provider API received on the wire
@@ -1217,9 +1217,9 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
   }
 });
 
-test('#52 callback with provider denial (?error) audits consent_denied and stores no token', async () => {
+test('#52 callback with provider denial (?error) audits consent_denied and stores no token', async (t) => {
   const events: any[] = [];
-  const { server, port, db } = await makeOauthBroker({ auditSink: (e) => events.push(e) });
+  const { server, port, db } = await makeOauthBroker(t, { auditSink: (e) => events.push(e) });
   try {
     const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
     const cb = await getRaw(port, `/oauth/callback?error=access_denied&state=${encodeURIComponent(c.json.state)}`);
@@ -1232,8 +1232,8 @@ test('#52 callback with provider denial (?error) audits consent_denied and store
   }
 });
 
-test('#52 callback state is single-use: replaying it fails (no second connection)', async () => {
-  const { server, port } = await makeOauthBroker();
+test('#52 callback state is single-use: replaying it fails (no second connection)', async (t) => {
+  const { server, port } = await makeOauthBroker(t);
   const real = globalThis.fetch;
   globalThis.fetch = (async (u: any) =>
     String(u).startsWith('https://acme.example/token')
@@ -1253,8 +1253,8 @@ test('#52 callback state is single-use: replaying it fails (no second connection
 
 // ── #53 admin channel-credential reference (POST /v1/admin/reference) ─────────
 
-async function makeAdminBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeAdminBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
@@ -1267,9 +1267,9 @@ function adminToken(over: Partial<IdentityClaims> = {}): string {
   return signIdentity(claims({ userId: 'ADMIN', isAdmin: true, channelEligible: true, ...over }), SECRET);
 }
 
-test('#53 admin reference stores a channel ref, flips to shared; a member fetch resolves it at egress', async () => {
+test('#53 admin reference stores a channel ref, flips to shared; a member fetch resolves it at egress', async (t) => {
   const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:xyz' ? SECRET_TOKEN : 'WRONG') };
-  const { server, port, channelConfig } = await makeAdminBroker({ resolvers });
+  const { server, port, channelConfig } = await makeAdminBroker(t, { resolvers });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/admin/reference', {
@@ -1288,8 +1288,8 @@ test('#53 admin reference stores a channel ref, flips to shared; a member fetch 
   }
 });
 
-test('#53 non-admin signed token -> refused (nothing configured)', async () => {
-  const { server, port, channelConfig } = await makeAdminBroker();
+test('#53 non-admin signed token -> refused (nothing configured)', async (t) => {
+  const { server, port, channelConfig } = await makeAdminBroker(t);
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET), source: 'aws-sm', secretRef: 'arn:xyz',
@@ -1301,8 +1301,8 @@ test('#53 non-admin signed token -> refused (nothing configured)', async () => {
   }
 });
 
-test('#53 forged body admin flag (no signed isAdmin claim) -> refused', async () => {
-  const { server, port } = await makeAdminBroker();
+test('#53 forged body admin flag (no signed isAdmin claim) -> refused', async (t) => {
+  const { server, port } = await makeAdminBroker(t);
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET),
@@ -1314,8 +1314,8 @@ test('#53 forged body admin flag (no signed isAdmin claim) -> refused', async ()
   }
 });
 
-test('#53 ineligible channel (signed eligibility false) -> refused', async () => {
-  const { server, port, channelConfig } = await makeAdminBroker();
+test('#53 ineligible channel (signed eligibility false) -> refused', async (t) => {
+  const { server, port, channelConfig } = await makeAdminBroker(t);
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: adminToken({ channelEligible: false }), source: 'aws-sm', secretRef: 'arn:xyz',
@@ -1327,8 +1327,8 @@ test('#53 ineligible channel (signed eligibility false) -> refused', async () =>
   }
 });
 
-test('#53 refused when channel modes are not enabled (no channelConfig)', async () => {
-  const { server, port } = await makeBroker(); // no channelConfig
+test('#53 refused when channel modes are not enabled (no channelConfig)', async (t) => {
+  const { server, port } = await makeBroker(t); // no channelConfig
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
@@ -1339,8 +1339,8 @@ test('#53 refused when channel modes are not enabled (no channelConfig)', async 
   }
 });
 
-test('#53 no raw secret is accepted (source + secretRef are required, not a token)', async () => {
-  const { server, port } = await makeAdminBroker();
+test('#53 no raw secret is accepted (source + secretRef are required, not a token)', async (t) => {
+  const { server, port } = await makeAdminBroker(t);
   try {
     const r = await post(port, '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken() } as any);
     assert.equal(r.status, 400);
@@ -1349,8 +1349,8 @@ test('#53 no raw secret is accepted (source + secretRef are required, not a toke
   }
 });
 
-test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async () => {
-  const { server, port, channelConfig } = await makeAdminBroker();
+test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async (t) => {
+  const { server, port, channelConfig } = await makeAdminBroker(t);
   await channelConfig.setMode('T1', 'C1', 'acme', 'per-user');
   try {
     const r = await post(port, '/v1/admin/reference', {
@@ -1369,8 +1369,8 @@ const other = defineProvider({
   scopesDefault: ['x'], egressAllow: ['api.other.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
 });
 
-async function makeMultiBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeMultiBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   // Only acme is connected for U1; `other` is not; `svc` is a service tool (never brokered).
@@ -1382,8 +1382,8 @@ async function makeMultiBroker(extra: Partial<Parameters<typeof createBroker>[0]
   return { server, db, port: (server.address() as any).port };
 }
 
-test('#55 /v1/status batches connection state across brokered providers (service omitted)', async () => {
-  const { server, port } = await makeMultiBroker();
+test('#55 /v1/status batches connection state across brokered providers (service omitted)', async (t) => {
+  const { server, port } = await makeMultiBroker(t);
   try {
     const r = await post(port, '/v1/status', { identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 200);
@@ -1397,8 +1397,8 @@ test('#55 /v1/status batches connection state across brokered providers (service
   }
 });
 
-test('#55 /v1/status rejects a tampered identity token', async () => {
-  const { server, port } = await makeMultiBroker();
+test('#55 /v1/status rejects a tampered identity token', async (t) => {
+  const { server, port } = await makeMultiBroker(t);
   try {
     const r = await post(port, '/v1/status', { identityToken: 'nope' });
     assert.equal(r.status, 401);
@@ -1407,8 +1407,8 @@ test('#55 /v1/status rejects a tampered identity token', async () => {
   }
 });
 
-test('#55 /v1/manifest lists providers with their acting_human/service identity', async () => {
-  const { server, port } = await makeMultiBroker();
+test('#55 /v1/manifest lists providers with their acting_human/service identity', async (t) => {
+  const { server, port } = await makeMultiBroker(t);
   try {
     const r = await get(port, '/v1/manifest');
     assert.equal(r.status, 200);
@@ -1421,8 +1421,8 @@ test('#55 /v1/manifest lists providers with their acting_human/service identity'
   }
 });
 
-test('#55 /v1/manifest sits behind the perimeter gate', async () => {
-  const { server, port } = await makeMultiBroker({ brokerToken: 'sekret' });
+test('#55 /v1/manifest sits behind the perimeter gate', async (t) => {
+  const { server, port } = await makeMultiBroker(t, { brokerToken: 'sekret' });
   try {
     const missing = await get(port, '/v1/manifest'); // no bearer
     assert.equal(missing.status, 401);
@@ -1433,8 +1433,8 @@ test('#55 /v1/manifest sits behind the perimeter gate', async () => {
 
 // ── #58 per-user reference-only config (POST /v1/user/reference) ──────────────
 
-async function makeRefBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeRefBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, ...extra });
@@ -1442,9 +1442,9 @@ async function makeRefBroker(extra: Partial<Parameters<typeof createBroker>[0]> 
   return { server, vault, db, port: (server.address() as any).port };
 }
 
-test('#58 user reference stores the acting user\'s ref; their fetch resolves it at egress', async () => {
+test('#58 user reference stores the acting user\'s ref; their fetch resolves it at egress', async (t) => {
   const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:user' ? SECRET_TOKEN : 'WRONG') };
-  const { server, port, vault } = await makeRefBroker({ resolvers });
+  const { server, port, vault } = await makeRefBroker(t, { resolvers });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/user/reference', {
@@ -1464,8 +1464,8 @@ test('#58 user reference stores the acting user\'s ref; their fetch resolves it 
   }
 });
 
-test('#58 user reference is bound to the token identity (a forged body can\'t reference into another slot)', async () => {
-  const { server, port, vault } = await makeRefBroker();
+test('#58 user reference is bound to the token identity (a forged body can\'t reference into another slot)', async (t) => {
+  const { server, port, vault } = await makeRefBroker(t);
   try {
     await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET), source: 'aws-sm', secretRef: 'arn:user' });
     assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), 'stored for the token user U1');
@@ -1475,8 +1475,8 @@ test('#58 user reference is bound to the token identity (a forged body can\'t re
   }
 });
 
-test('#58 user reference rejects a tampered token, service tools, and a missing secretRef', async () => {
-  const { server, port } = await makeRefBroker();
+test('#58 user reference rejects a tampered token, service tools, and a missing secretRef', async (t) => {
+  const { server, port } = await makeRefBroker(t);
   try {
     assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: 'nope', source: 'aws-sm', secretRef: 'arn' })).status, 401);
     assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn' })).status, 403);

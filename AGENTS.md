@@ -126,9 +126,10 @@ in production, never in tests.
 - **ADOPT-1 — `src/index.ts` exports are a public contract.** Adding is cheap; changing
   or removing behavior behind an existing export is a breaking change — call it out in
   the PR and `CHANGELOG.md`, and prefer additive paths.
-- **ADOPT-2 — Zero-config first.** Everything must work out of the box with defaults
-  (sqlite, no env beyond secrets). Every new knob, env var, or required step must justify
-  itself against the cost it adds to "time to first working demo".
+- **ADOPT-2 — Minimal-config first.** Everything must work with the smallest possible
+  setup: a PostgreSQL connection string (`VOUCHR_DATABASE_URL`) plus the secrets, nothing
+  more. Every new knob, env var, or required step beyond that must justify itself against
+  the cost it adds to "time to first working demo".
 - **ADOPT-3 — Keep "a provider is ~10 declarative lines" true.** A provider that needs
   bespoke code is a design smell: generalize the declarative knob instead (see Notion's
   `tokenAuth`/`bodyFormat`).
@@ -139,12 +140,14 @@ in production, never in tests.
 ## Testing rules (TEST)
 
 - **TEST-1** — Any non-trivial logic ships with a runnable check: `node:test` +
-  `node:assert`. No new test frameworks. `npm test` must stay fully offline.
+  `node:assert`. No new test frameworks. `npm test` needs a local PostgreSQL (Vouchr is
+  PostgreSQL-only, #204) — bring it up with `npm run pg:up` (a Docker container, no network
+  egress). CI runs the same container as a service. No cloud, no external credentials.
 - **TEST-2** — New behaviour that spans modules (consent → callback → vault → injector)
   gets an integration test driven through the public API against the mock server, not a
   mock-everything unit test.
 - **TEST-3** — Stub `fetch` for outbound HTTP in unit tests; restore it in `finally`.
-- **TEST-4** — A change that can't be tested offline explains why in the PR.
+- **TEST-4** — A change that can't be tested against the local Postgres explains why in the PR.
 
 ## Commands (exact)
 
@@ -153,13 +156,15 @@ Requires Node ≥ 22 (see `.nvmrc`; CI runs 22 and 24).
 ```bash
 nvm use
 npm install
+npm run pg:up       # start the local PostgreSQL container (Docker) — required for tests
 npm run typecheck   # must be clean
 npm run lint        # biome, warnings are errors
-npm test            # unit + integration, fully offline
+npm test            # unit + integration, against the local Postgres (no network)
 ```
 
-Optional: `npm run pg:up && npm test` exercises the real Postgres backend
-(otherwise the suite skips PG). `npm run example:github` runs the live demo by hand.
+Vouchr is PostgreSQL-only (#204): `npm test` needs the container from `npm run pg:up`. Tests
+that can reach it run; if it is unreachable the PG-backed cases skip loudly. `npm run
+example:github` runs the live demo by hand.
 
 ## Layout
 

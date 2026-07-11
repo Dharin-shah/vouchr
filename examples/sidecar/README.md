@@ -56,7 +56,7 @@ with the already-stored credential), which is the part other-language agents act
 ```bash
 # Same env the Slack app uses (so they share one vault DB):
 export VOUCHR_MASTER_KEY=$(openssl rand -base64 32)   # must match the app's key
-export VOUCHR_DB=vouchr.db                              # or VOUCHR_DATABASE_URL=postgres://...
+export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr  # the shared vault DB
 export VOUCHR_SIDECAR_TOKEN=$(openssl rand -hex 32)    # shared bearer for trusted callers
 # Provider OAuth client envs the app already sets, e.g. GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET
 # (built-ins without configured client env are simply not registered).

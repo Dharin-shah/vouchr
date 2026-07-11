@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -26,8 +26,8 @@ const other = defineProvider({
 const PROVIDER_IDS = ['mcp', 'other'];
 
 // Mirrors test/channel.test.ts: builds a ConnectContext over an in-memory DB + a mocked Slack client.
-async function ctx(isAdmin = true, channel: string | null = 'C_FIN', policy = new Policy()) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function ctx(t: TestContext, isAdmin = true, channel: string | null = 'C_FIN', policy = new Policy()) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const tools = new ChannelTools(db);
@@ -47,16 +47,16 @@ const auditRows = async (db: any) => (await db.all('SELECT action, meta FROM aud
 const chOwner = { teamId: 'T1', kind: 'channel', id: 'C_FIN' } as const;
 
 // Backward compat: a channel with no tool rows treats every provider as enabled.
-test('no rows => all providers enabled (backward compat)', async () => {
-  const { tools } = await ctx();
+test('no rows => all providers enabled (backward compat)', async (t) => {
+  const { tools } = await ctx(t);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'mcp'), true);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'other'), true);
   assert.deepEqual(await tools.listEnabled('T1', 'C_FIN'), []);
 });
 
 // Once any provider is set, the channel becomes an allowlist: only enabled ones are allowed.
-test('enabling A disables B in that channel; isEnabled/listEnabled correctness', async () => {
-  const { tools } = await ctx();
+test('enabling A disables B in that channel; isEnabled/listEnabled correctness', async (t) => {
+  const { tools } = await ctx(t);
   await tools.setEnabled('T1', 'C_FIN', 'mcp', true);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'mcp'), true);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'other'), false); // unlisted → disabled
@@ -73,8 +73,8 @@ test('enabling A disables B in that channel; isEnabled/listEnabled correctness',
 
 // connect(): a disabled provider is refused + audited 'denied' reason 'tool-disabled'; an enabled
 // one (with a stored user cred) returns a handle.
-test("connect() refuses a disabled provider (audited 'tool-disabled') and allows an enabled one", async () => {
-  const { c, db, vault, tools } = await ctx();
+test("connect() refuses a disabled provider (audited 'tool-disabled') and allows an enabled one", async (t) => {
+  const { c, db, vault, tools } = await ctx(t);
   await tools.setEnabled('T1', 'C_FIN', 'mcp', true); // mcp on → other off (allowlist)
 
   await assert.rejects(() => c.connect('other'), /not enabled/);
@@ -90,8 +90,8 @@ test("connect() refuses a disabled provider (audited 'tool-disabled') and allows
 });
 
 // connectChannel(): same gate. Disabled refused, enabled (with a shared cred) returns a handle.
-test('connectChannel() refuses a disabled provider and allows an enabled one', async () => {
-  const { c, vault, tools } = await ctx(true);
+test('connectChannel() refuses a disabled provider and allows an enabled one', async (t) => {
+  const { c, vault, tools } = await ctx(t, true);
   await tools.setEnabled('T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, other off
   await c.setChannelSecret('mcp', 'sk-shared'); // admin config (not tool-gated)
 
@@ -101,8 +101,8 @@ test('connectChannel() refuses a disabled provider and allows an enabled one', a
 });
 
 // toolManifest(): one entry per registered provider, with enabled flag + channel mode.
-test('toolManifest returns the expected shape', async () => {
-  const { c, tools } = await ctx();
+test('toolManifest returns the expected shape', async (t) => {
+  const { c, tools } = await ctx(t);
 
   // Unconfigured channel → every provider enabled, mode null.
   let m = await c.toolManifest();
@@ -123,9 +123,9 @@ test('toolManifest returns the expected shape', async () => {
 
 // toolManifest() must reflect Policy too, not just the channel tool allowlist: a provider the
 // channel enables but Policy denies is reported disabled, matching what connect() would do.
-test('toolManifest reflects a Policy deny (intersects channel tools and policy)', async () => {
+test('toolManifest reflects a Policy deny (intersects channel tools and policy)', async (t) => {
   const deny = new Policy({ other: { defaultAllow: false, allowChannels: [] } });
-  const { c, tools } = await ctx(true, 'C_FIN', deny);
+  const { c, tools } = await ctx(t, true, 'C_FIN', deny);
 
   // Channel allowlist enables both, but policy denies 'other' in this channel.
   await tools.setEnabled('T1', 'C_FIN', 'mcp', true);
@@ -142,8 +142,8 @@ test('toolManifest reflects a Policy deny (intersects channel tools and policy)'
 });
 
 // A null channel (DM-less) keeps current behavior: no tool restriction, manifest all-enabled.
-test('null channel → no tool restriction; manifest all enabled', async () => {
-  const { c } = await ctx(true, null);
+test('null channel → no tool restriction; manifest all enabled', async (t) => {
+  const { c } = await ctx(t, true, null);
   const m = await c.toolManifest();
   assert.deepEqual(m.map((e) => e.enabled), [true, true]);
   assert.deepEqual(m.map((e) => e.mode), [null, null]);
@@ -155,21 +155,21 @@ test('null channel → no tool restriction; manifest all enabled', async () => {
 // a PARTIAL allowlist that silently disables bystander providers.
 const ALL3 = ['mcp', 'other', 'third'];
 
-async function freshTools() {
-  const db = await openDb({ dbPath: ':memory:' });
+async function freshTools(t: TestContext) {
+  const db = await openTestDb(t);
   return { db, tools: new ChannelTools(db) };
 }
 
-test('applyEnabled on an unconfigured channel materializes the full allowlist', async () => {
-  const { tools } = await freshTools();
+test('applyEnabled on an unconfigured channel materializes the full allowlist', async (t) => {
+  const { tools } = await freshTools(t);
   await tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3);
   assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false); // the targeted provider
   assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true); // bystanders materialized enabled
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
 });
 
-test('applyEnabled on a configured channel touches only the given rows', async () => {
-  const { tools } = await freshTools();
+test('applyEnabled on a configured channel touches only the given rows', async (t) => {
+  const { tools } = await freshTools(t);
   await tools.setEnabled('T1', 'C1', 'other', false); // channel is already an allowlist
   await tools.applyEnabled('T1', 'C1', [['mcp', true]], ALL3);
   assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true);
@@ -177,8 +177,8 @@ test('applyEnabled on a configured channel touches only the given rows', async (
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false); // unlisted on an allowlist stays off
 });
 
-test('applyEnabled: concurrent first writes converge — both targets land, bystanders stay enabled', async () => {
-  const { tools } = await freshTools();
+test('applyEnabled: concurrent first writes converge — both targets land, bystanders stay enabled', async (t) => {
+  const { tools } = await freshTools(t);
   await Promise.all([
     tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3),
     tools.applyEnabled('T1', 'C1', [['other', false]], ALL3),
@@ -206,8 +206,8 @@ function flakyDb(db: any, failOn: () => RegExp | null) {
   };
 }
 
-test('applyEnabled: failing materialization writes NOTHING (channel stays all-enabled)', async () => {
-  const { db } = await freshTools();
+test('applyEnabled: failing materialization writes NOTHING (channel stays all-enabled)', async (t) => {
+  const { db } = await freshTools(t);
   let re: RegExp | null = /DO NOTHING/;
   const tools = new ChannelTools(flakyDb(db, () => re) as any);
   await assert.rejects(() => tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3), /injected/);
@@ -219,8 +219,8 @@ test('applyEnabled: failing materialization writes NOTHING (channel stays all-en
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
 });
 
-test('applyEnabled: failure after materialization still leaves a COMPLETE allowlist with the change applied', async () => {
-  const { db } = await freshTools();
+test('applyEnabled: failure after materialization still leaves a COMPLETE allowlist with the change applied', async (t) => {
+  const { db } = await freshTools(t);
   const tools = new ChannelTools(flakyDb(db, () => /DO UPDATE/) as any);
   await assert.rejects(() => tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3), /injected/);
   // The materialization statement already carried the desired bit, so the intermediate state is the

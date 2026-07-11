@@ -16,14 +16,13 @@
  * PER-USER credentials are NOT this tool's job: run the Bolt control-plane Vouchr against the SAME
  * Postgres DB and let users connect via Slack; the broker then reads what they consented to. This
  * CLI covers only operator-provisioned shared/referenced creds. Reads DB + key from env (see
- * DEPLOYMENT.md): VOUCHR_DATABASE_URL / VOUCHR_DB, VOUCHR_MASTER_KEY.
+ * DEPLOYMENT.md): VOUCHR_DATABASE_URL (PostgreSQL), VOUCHR_MASTER_KEY.
  */
 import { openDb } from '../src/core/db';
 import { loadKeyring } from '../src/core/crypto';
 import { Vault } from '../src/core/vault';
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { EnvelopeProvider } from '../src/core/crypto';
-import { isPostgresUrl } from '../src/core/options';
 
 function parseFlags(argv: string[]): Record<string, string> {
   const out: Record<string, string> = {};
@@ -50,7 +49,7 @@ Usage: vouchr-seed reference --provider <id> --team <T> (--user <U>|--channel <C
                    (token from VOUCHR_SEED_ACCESS_TOKEN env; --access-token is visible in ps)
        vouchr-seed --help
 
-Reads DB + key from env: VOUCHR_DATABASE_URL|VOUCHR_DB, VOUCHR_MASTER_KEY. See DEPLOYMENT.md.`;
+Reads DB + key from env: VOUCHR_DATABASE_URL (PostgreSQL), VOUCHR_MASTER_KEY. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {
   const [mode, ...rest] = process.argv.slice(2);
@@ -74,14 +73,13 @@ async function main(): Promise<void> {
   const scopes = f.scopes ? f.scopes.split(',').map((s) => s.trim()).filter(Boolean).join(' ') : undefined;
 
   const url = process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
-  const backend = isPostgresUrl(url) ? 'postgres' : 'sqlite';
   let envelope: EnvelopeProvider | undefined;
   if (process.env.VOUCHR_KMS_KEY_ID) {
     const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms.js');
     envelope = kmsEnvelope(process.env.VOUCHR_KMS_KEY_ID, await awsKmsClient({ region: process.env.AWS_REGION }));
   }
 
-  const db = await openDb(backend === 'postgres' ? { databaseUrl: url } : { dbPath: process.env.VOUCHR_DB });
+  const db = await openDb({ databaseUrl: url }); // PostgreSQL-only; openDb fails closed if unset/non-PG
   const vault = new Vault(db, loadKeyring(), {}, envelope);
   try {
     if (mode === 'reference') {

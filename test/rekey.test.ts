@@ -1,10 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb, testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { openDb, type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { rekey } from '../src/core/rekey';
@@ -55,8 +53,8 @@ const envelope: EnvelopeProvider = {
 
 /** Mixed-history store: scheme-0 rows (old code), a keyed non-primary row, an envelope row, a
  *  secret-free reference row, and an installation row — every case rekey must discriminate. */
-async function seed(): Promise<Db> {
-  const db = await openDb({ dbPath: ':memory:' });
+async function seed(t: TestContext): Promise<Db> {
+  const db = await openTestDb(t);
   const legacyVault = new Vault(db, OLD); // today's direct writer → scheme-0
   await legacyVault.upsert(userOwner(ident('U1')), 'github', tok('TOK_U1', 'REF_U1'));
   await legacyVault.upsert(userOwner(ident('U2')), 'github', tok('TOK_U2'));
@@ -83,8 +81,8 @@ async function allBlobs(db: Db): Promise<Buffer[]> {
   ].filter((b) => b != null).map(toBuffer);
 }
 
-test('rekey: dry-run classifies per key/scheme and writes nothing', async () => {
-  const db = await seed();
+test('rekey: dry-run classifies per key/scheme and writes nothing', async (t) => {
+  const db = await seed(t);
   const before = (await allBlobs(db)).map((b) => b.toString('hex')).sort();
 
   const r = await rekey(db, ROTATION, { dryRun: true });
@@ -103,8 +101,8 @@ test('rekey: dry-run classifies per key/scheme and writes nothing', async () => 
   await db.close();
 });
 
-test('rekey: converges the store onto the primary, skips envelope rows, stays idempotent', async () => {
-  const db = await seed();
+test('rekey: converges the store onto the primary, skips envelope rows, stays idempotent', async (t) => {
+  const db = await seed(t);
   const envBefore = toBuffer((await db.get<any>(`SELECT access_token_enc AS b FROM connection WHERE owner_id='U4'`)).b);
 
   const r = await rekey(db, ROTATION);
@@ -145,8 +143,8 @@ test('rekey: converges the store onto the primary, skips envelope rows, stays id
   await db.close();
 });
 
-test('rekey: interrupted mid-run leaves a mixed but fully readable store; a re-run converges', async () => {
-  const db = await seed();
+test('rekey: interrupted mid-run leaves a mixed but fully readable store; a re-run converges', async (t) => {
+  const db = await seed(t);
   // Abort partway through the connection table (rows stream in random-UUID order; after 3 of the
   // 5 rows at least one direct row was rewritten, and the installation table was never reached).
   await assert.rejects(
@@ -173,8 +171,8 @@ test('rekey: interrupted mid-run leaves a mixed but fully readable store; a re-r
   await db.close();
 });
 
-test('rekey: a concurrent token refresh mid-run is never clobbered (guarded write, re-run converges)', async () => {
-  const db = await seed();
+test('rekey: a concurrent token refresh mid-run is never clobbered (guarded write, re-run converges)', async (t) => {
+  const db = await seed(t);
   const legacyVault = new Vault(db, OLD);
   const u1RowId = ((await db.get<any>(`SELECT id FROM connection WHERE owner_id='U1'`)) as any).id as string;
   // Interleave via the Db seam: just before rekey's guarded UPDATE on U1's row lands, that row's
@@ -209,10 +207,10 @@ test('rekey: a concurrent token refresh mid-run is never clobbered (guarded writ
   await db.close();
 });
 
-test('vouchr rekey CLI: dry-run → rekey → clean dry-run; counts only, never key material or tokens', async () => {
-  const dbPath = path.join(mkdtempSync(path.join(os.tmpdir(), 'vouchr-rekey-')), 'v.db');
+test('vouchr rekey CLI: dry-run → rekey → clean dry-run; counts only, never key material or tokens', async (t) => {
+  const dbPath = await testDbUrl(t);
   {
-    const db = await openDb({ dbPath });
+    const db = await openDb({ databaseUrl: dbPath });
     const vault = new Vault(db, OLD);
     await vault.upsert(userOwner(ident('U1')), 'github', tok('TOK_CLI_SECRET'));
     await vault.upsert(userOwner(ident('U2')), 'github', tok('TOK_CLI_SECRET2'));
@@ -220,7 +218,7 @@ test('vouchr rekey CLI: dry-run → rekey → clean dry-run; counts only, never 
   }
   const env = {
     ...process.env,
-    VOUCHR_DB: dbPath,
+    VOUCHR_DATABASE_URL: dbPath,
     VOUCHR_MASTER_KEY: OLD.toString('base64'), // the id-less legacy key, still deployed
     VOUCHR_MASTER_KEYS: `k2025:${NEW.toString('base64')}`,
   };
@@ -233,7 +231,7 @@ test('vouchr rekey CLI: dry-run → rekey → clean dry-run; counts only, never 
   assert.match(dry.stdout, /would re-encrypt: 2/);
   {
     // dry-run really wrote nothing: rows still decrypt under the OLD key alone
-    const db = await openDb({ dbPath });
+    const db = await openDb({ databaseUrl: dbPath });
     assert.equal((await new Vault(db, OLD).get(userOwner(ident('U1')), 'github'))?.accessToken, 'TOK_CLI_SECRET');
     await db.close();
   }
@@ -252,14 +250,14 @@ test('vouchr rekey CLI: dry-run → rekey → clean dry-run; counts only, never 
     assert.ok(!out.includes('TOK_CLI_SECRET'), 'no token plaintext in output');
   }
   {
-    const db = await openDb({ dbPath });
+    const db = await openDb({ databaseUrl: dbPath });
     assert.equal((await new Vault(db, NEW_ONLY).get(userOwner(ident('U2')), 'github'))?.accessToken, 'TOK_CLI_SECRET2');
     await db.close();
   }
 
   // Fail-closed CLI path: a key removed too early → non-zero exit + actionable error (UX-5).
   const gone = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'rekey', '--dry-run'], {
-    env: { ...process.env, VOUCHR_DB: dbPath, VOUCHR_MASTER_KEYS: `k2026:${randomBytes(32).toString('base64')}` },
+    env: { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEYS: `k2026:${randomBytes(32).toString('base64')}` },
     encoding: 'utf8',
   });
   assert.equal(gone.status, 1);
@@ -268,8 +266,8 @@ test('vouchr rekey CLI: dry-run → rekey → clean dry-run; counts only, never 
   assert.match(gone.stderr, /VOUCHR_MASTER_KEYS/, 'says how to fix it');
 });
 
-test('rekey: blobs under a missing key are reported (with the unknown id), never dropped or rewritten', async () => {
-  const db = await seed();
+test('rekey: blobs under a missing key are reported (with the unknown id), never dropped or rewritten', async (t) => {
+  const db = await seed(t);
   const GONE = randomBytes(32);
   await new Vault(db, ring({ id: 'retired', key: GONE })).upsert(userOwner(ident('U9')), 'github', tok('TOK_U9'));
   const strandedBefore = toBuffer((await db.get<any>(`SELECT access_token_enc AS b FROM connection WHERE owner_id='U9'`)).b);
