@@ -192,8 +192,13 @@ into many actions, or to skip the approval entirely.
   secret is read. A grant is SINGLE-USE — consumed with the same atomic
   `DELETE ... RETURNING` as the OAuth `state`, so two concurrent retries cannot both
   spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
-  (method, host, path) it was minted for: not a prefix, not a pattern, never a class of
-  actions. When `approval.paths` is set it inherits the egress path lock's fail-closed
+  (method, host, path, query) it was minted for: not a prefix, not a pattern, never a
+  class of actions. The query is bound as a canonical digest (parameters sorted, then
+  hashed — raw values may carry PII/secrets and are never persisted or audited), so a
+  replanning or prompt-injected agent cannot spend an approval of
+  `POST /transfer?to=alice&amount=10` on `?to=attacker&amount=1000000`; the prompt shows
+  the human the exact parameters being approved. When `approval.paths` is set it
+  inherits the egress path lock's fail-closed
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential
   owner** it was minted against (user vs channel, and which user), so a later resolution
@@ -207,12 +212,16 @@ into many actions, or to skip the approval entirely.
   clicks are rejected and audited) — nothing in the interaction payload is trusted.
 - **Accepted tradeoff:** the request BODY is not hashed into the grant key. Bodies are
   legitimately rebuilt on retry (fresh timestamps, idempotency keys), so binding to the
-  payload bytes would break the approve-then-retry flow outright. An approval therefore
-  covers the endpoint + method, not the payload: a compromised host process could swap
-  the body between the prompt and the retry — but that process already holds the handle
-  and is trusted code (same boundary as the rogue-provider section above). This is why
-  approval prompts show the method and host+path and deliberately never render the body
-  (which may carry user content).
+  payload bytes would break the approve-then-retry flow outright. Be explicit about what
+  that means: for an API whose write target or amount lives in the BODY (JSON/RPC), an
+  approval pins the endpoint + method + query but NOT the body parameters — an agent
+  that rebuilds the body differently between the prompt and the retry spends the grant
+  on the rebuilt payload. Do not treat approval as covering the exact action for such
+  endpoints; scope `approval.paths` tightly and prefer APIs that carry the
+  action-defining parameters in the URL. (A digest over declared-stable body fields, or
+  a provider-supplied action fingerprint, would close this; no built-in provider ships
+  one today.) This is also why approval prompts show the method, host+path, and query,
+  and deliberately never render the body (which may carry user content).
 
 ### Replayed OAuth callback / state
 

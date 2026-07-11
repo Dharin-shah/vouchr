@@ -476,7 +476,7 @@ export class ConnectContext {
   /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
   private async postApprovalPrompt(e: ApprovalRequiredError): Promise<void> {
     const blocks = approvalBlocks({
-      provider: e.provider, method: e.method, host: e.host, path: e.path,
+      provider: e.provider, method: e.method, host: e.host, path: e.path, query: e.query,
       requester: this.identity.userId, id: e.approvalId, approver: e.approver,
     }) as any;
     const text = `Approval needed for a ${e.provider} action`; // registry-validated id; neutral fallback
@@ -2100,7 +2100,9 @@ export async function createVouchr(opts: VouchrOptions) {
       // body or query value. Row values were egress-validated before they were ever stored (SEC-4).
       const meta = { host: pending.host, method: pending.method, path: pending.path, ...(pending.channel ? { channel: pending.channel } : {}) };
       const p = escapeMrkdwn(pending.provider); // SEC-5, even for a registry-validated id
-      const what = `\`${escapeMrkdwn(pending.method)} ${escapeMrkdwn(pending.host)}${escapeMrkdwn(pending.path)}\``;
+      // Raw query values are never stored (GHSA-pg84: only their digest is) — the receipt marks
+      // that parameters are bound with '?…'; the prompt the decision was made on showed them fully.
+      const what = `\`${escapeMrkdwn(pending.method)} ${escapeMrkdwn(pending.host)}${escapeMrkdwn(pending.path)}${pending.queryHash ? '?…' : ''}\``;
       // Requester notification: ephemeral in the request's channel, or a DM when there was none.
       const tellRequester = async (text: string) => {
         if (pending.channel) {

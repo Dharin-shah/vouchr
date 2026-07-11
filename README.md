@@ -220,11 +220,12 @@ approval** for sensitive writes at the same boundary. Between "never allowed" (e
 allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
 method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons in
 Slack — to the acting user for `'self'`, to eligible admins for `'admin'` (the same eligibility
-gate as the channel config commands) — showing the provider, method, and host+path, never the
-request body. It then throws the exported `ApprovalRequiredError` (catch and stop the turn, exactly
-like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and executes.
-A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only the exact
-(method, host, path) it was minted for — not a prefix, not the payload bytes — **and** the exact
+gate as the channel config commands) — showing the provider, method, host+path, and the exact
+query parameters, never the request body. It then throws the exported `ApprovalRequiredError`
+(catch and stop the turn, exactly like `ConsentRequiredError`); on Approve the retried call finds
+the grant, spends it, and executes. A grant is **single-use**, expires after `ttlMs` (default 5
+minutes), and matches only the exact (method, host, path, query) it was minted for — the query as
+a canonical digest, so raw values are never persisted; not a prefix, not the payload bytes — **and** the exact
 credential owner: a union member switch or a per-user→shared mode change re-prompts rather than
 running against a credential the human didn't approve, and disconnecting/reconnecting the credential
 purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every
@@ -333,8 +334,8 @@ local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 - **Consent and approval prompts are control flow.** `ConsentRequiredError` /
   `SessionApprovalRequiredError` / `ApprovalRequiredError` mean Vouchr already prompted the user —
   catch them and stop the turn; don't log them as failures. For `ApprovalRequiredError` the human
-  clicks Approve and asks again; the grant is single-use and covers only the exact method+host+path
-  that was prompted.
+  clicks Approve and asks again; the grant is single-use and covers only the exact
+  method+host+path+query that was prompted (the request body is not inspected).
 - **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
   bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
   `invalid_client`) or a connection is within 72h of its idle/max-age TTL ceiling (dimensions

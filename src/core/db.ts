@@ -192,8 +192,10 @@ class PgClientDb implements Db {
  * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
  *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
  *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
+ * Version 5 = + the `approval_request.query_hash` column (GHSA-pg84, purely additive). The DEFAULT
+ *   '' means a pre-v5 grant matches only query-less requests after the upgrade — fail closed.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -325,6 +327,7 @@ function schema(blob: string, int: string): string {
       method TEXT NOT NULL,
       host TEXT NOT NULL,
       path TEXT NOT NULL,
+      query_hash TEXT NOT NULL DEFAULT '',
       channel TEXT NOT NULL,
       thread TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -387,6 +390,8 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
       await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
       // #116 v4: system-only dry-run provenance on the credential row (never user/provider data).
       await db.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS dry_run BIGINT NOT NULL DEFAULT 0`);
+      // GHSA-pg84 v5: canonical query digest on approval rows (a digest, never raw query values).
+      await db.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS query_hash TEXT NOT NULL DEFAULT ''`);
       await stampSchemaVersion(db);
     } catch (e) {
       await db.close().catch(() => undefined);
@@ -449,5 +454,11 @@ function migrateSqlite(db: BetterSqlite3.Database): void {
   const connCols = (db.prepare(`PRAGMA table_info(connection)`).all() as any[]).map((c) => c.name);
   if (!connCols.includes('dry_run')) {
     db.exec(`ALTER TABLE connection ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  // GHSA-pg84 v5: canonical query digest on a pre-existing approval_request table.
+  const apCols = (db.prepare(`PRAGMA table_info(approval_request)`).all() as any[]).map((c) => c.name);
+  if (!apCols.includes('query_hash')) {
+    db.exec(`ALTER TABLE approval_request ADD COLUMN query_hash TEXT NOT NULL DEFAULT ''`);
   }
 }

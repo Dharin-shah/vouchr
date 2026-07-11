@@ -1,6 +1,24 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { Owner } from './owner';
+
+/**
+ * Canonical digest of a request's query string, bound into the approval key (GHSA-pg84): a grant
+ * for `POST /transfer?to=alice&amount=10` must never be spendable on
+ * `POST /transfer?to=attacker&amount=1000000`. A DIGEST, never the raw values — query values can
+ * carry PII or secrets, so they are never persisted or audited (SEC-1); the human-facing prompt
+ * renders the live query from the in-memory error instead. Canonical = URLSearchParams entries
+ * sorted by key then value and re-serialized, so parameter order and encoding variants of the SAME
+ * parameters match while any changed key or value re-prompts. '' (no parameters) stays '', which
+ * also makes pre-migration rows (DEFAULT '') behave correctly: an old grant still matches a
+ * query-less request and fails closed (re-prompts) for any query-carrying one.
+ */
+export function queryDigest(search: string): string {
+  const entries = [...new URLSearchParams(search)];
+  if (!entries.length) return '';
+  entries.sort(([ak, av], [bk, bv]) => (ak < bk ? -1 : ak > bk ? 1 : av < bv ? -1 : av > bv ? 1 : 0));
+  return createHash('sha256').update(new URLSearchParams(entries).toString()).digest('hex');
+}
 
 /** Default validity of an approval once granted (#113): 5 minutes, unless the provider sets ttlMs. */
 export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
@@ -25,6 +43,13 @@ export class ApprovalRequiredError extends Error {
     public path: string,
     /** The pending approval-request id the Approve/Deny surface decides on. */
     public approvalId: string,
+    /**
+     * The raw query string (`url.search`, '' when none) — DISPLAY ONLY, so the Approve/Deny prompt
+     * can show the human exactly what they are approving (GHSA-pg84). Carried in memory on the
+     * typed error, never in the message (host apps log messages), never persisted, never audited:
+     * the store binds the canonical digest instead (see queryDigest).
+     */
+    public query: string = '',
   ) {
     super(
       `Approval required: ${method} ${host}${path} on provider "${provider}" needs ` +
@@ -36,10 +61,11 @@ export class ApprovalRequiredError extends Error {
 
 /**
  * The exact action a grant covers. Matching is EXACT on every field — not a prefix, not a pattern:
- * the human approved one action, not a class of actions. The request BODY is deliberately not part
- * of the key (bodies are legitimately rebuilt on retry); see the threat model — approval covers the
- * endpoint + method, not the payload bytes. `channel`/`thread` bind the grant to the conversation
- * context it was requested from (null = none, stored as '').
+ * the human approved one action, not a class of actions. `queryHash` binds the exact (canonical)
+ * query parameters (GHSA-pg84, see queryDigest) — as a digest, never raw values. The request BODY
+ * remains outside the key; see the threat model — for body-parameterized APIs approval covers the
+ * endpoint + method + query, NOT the payload bytes. `channel`/`thread` bind the grant to the
+ * conversation context it was requested from (null = none, stored as '').
  *
  * Two identities are carried SEPARATELY (never conflated):
  *  - `userId`: the REQUESTER (the human driving the agent — the caller, not the borrowed union
@@ -58,6 +84,8 @@ export interface ApprovalKey {
   method: string;
   host: string;
   path: string;
+  /** queryDigest(url.search): canonical query digest, '' when the request has no parameters. */
+  queryHash: string;
   channel: string | null;
   thread: string | null;
 }
@@ -82,6 +110,7 @@ function toRow(r: any): ApprovalRow {
     method: r.method,
     host: r.host,
     path: r.path,
+    queryHash: r.query_hash ?? '',
     channel: r.channel || null,
     thread: r.thread || null,
     status: r.status,
@@ -108,9 +137,9 @@ export class Approvals {
     const now = Date.now();
     await this.db.run(
       `INSERT INTO approval_request
-         (id, team_id, user_id, owner_kind, owner_id, provider, method, host, path, channel, thread, status, approved_by, created_at, expires_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,?,?)`,
-      [id, k.teamId, k.userId, k.ownerKind, k.ownerId, k.provider, k.method, k.host, k.path, k.channel ?? '', k.thread ?? '', now, now + PENDING_TTL_MS],
+         (id, team_id, user_id, owner_kind, owner_id, provider, method, host, path, query_hash, channel, thread, status, approved_by, created_at, expires_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,?,?)`,
+      [id, k.teamId, k.userId, k.ownerKind, k.ownerId, k.provider, k.method, k.host, k.path, k.queryHash, k.channel ?? '', k.thread ?? '', now, now + PENDING_TTL_MS],
     );
     return id;
   }
@@ -158,11 +187,11 @@ export class Approvals {
     const row = await this.db.get<any>(
       `DELETE FROM approval_request WHERE id = (
          SELECT id FROM approval_request
-          WHERE team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND provider=? AND method=? AND host=? AND path=?
+          WHERE team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND provider=? AND method=? AND host=? AND path=? AND query_hash=?
             AND channel=? AND thread=? AND status='granted' AND expires_at>?
           LIMIT 1
        ) RETURNING approved_by`,
-      [k.teamId, k.userId, k.ownerKind, k.ownerId, k.provider, k.method, k.host, k.path, k.channel ?? '', k.thread ?? '', Date.now()],
+      [k.teamId, k.userId, k.ownerKind, k.ownerId, k.provider, k.method, k.host, k.path, k.queryHash, k.channel ?? '', k.thread ?? '', Date.now()],
     );
     return row ? { approvedBy: row.approved_by ?? null } : null;
   }

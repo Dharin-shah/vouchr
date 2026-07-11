@@ -238,25 +238,32 @@ export function sessionApprovalBlocks(provider: string, thread: string): unknown
 export const APPROVAL_APPROVE_ACTION = 'vouchr_approval_approve';
 export const APPROVAL_DENY_ACTION = 'vouchr_approval_deny';
 
+/** Slack caps a header at 150 chars and a section at 3000; clip instead of erroring mid-post. */
+const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
 /**
  * Approve/Deny prompt for ONE sensitive write (#113), the per-action sibling of
- * sessionApprovalBlocks. Shows provider, method, and host+path — NEVER the request body (it may
- * carry user content; SEC-1). The buttons carry ONLY the pending-approval id: content or authority
- * in a button value would be forgeable (SEC-3) — the click handler re-validates the provider
- * against the registry and re-checks approver eligibility server-side. Every interpolated value is
- * escaped at render (SEC-5); `requester` is an authenticated Slack user id, rendered as a mention.
+ * sessionApprovalBlocks. Shows provider, method, host+path AND the exact query parameters
+ * (GHSA-pg84 — the grant binds them, so the human must see them; rendered from the in-memory
+ * error, never from storage) — but NEVER the request body (it may carry user content; SEC-1).
+ * The buttons carry ONLY the pending-approval id: content or authority in a button value would be
+ * forgeable (SEC-3) — the click handler re-validates the provider against the registry and
+ * re-checks approver eligibility server-side. Every interpolated value is escaped at render
+ * (SEC-5); `requester` is an authenticated Slack user id, rendered as a mention.
  */
 export function approvalBlocks(o: {
   provider: string;
   method: string;
   host: string;
   path: string;
+  /** Raw query string (`url.search`, '' when none) — display only, clipped, escaped. */
+  query: string;
   requester: string;
   id: string;
   approver: 'self' | 'admin';
 }): unknown[] {
   const p = escapeMrkdwn(o.provider);
-  const action = `\`${escapeMrkdwn(o.method)} ${escapeMrkdwn(o.host)}${escapeMrkdwn(o.path)}\``;
+  const action = `\`${escapeMrkdwn(o.method)} ${escapeMrkdwn(o.host)}${escapeMrkdwn(o.path)}${escapeMrkdwn(clip(o.query, 500))}\``;
   const intro = o.approver === 'admin'
     ? `The agent wants to run ${action} on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`
     : `The agent wants to run ${action} as you on ${p}.`;
@@ -265,7 +272,7 @@ export function approvalBlocks(o: {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `:lock: *Approve this ${p} action?*\n${intro}\nApproval covers exactly this method and endpoint, once, and expires if unused.`,
+        text: `:lock: *Approve this ${p} action?*\n${intro}\nApproval covers exactly this method, endpoint, and query — once — and expires if unused. The request body is not inspected.`,
       },
     },
     {
@@ -292,9 +299,6 @@ export function approvalBlocks(o: {
 
 export const PREVIEW_SHARE_ACTION = 'vouchr_preview_share';
 export const PREVIEW_DISMISS_ACTION = 'vouchr_preview_dismiss';
-
-/** Slack caps a header at 150 chars and a section at 3000; clip instead of erroring mid-post. */
-const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
 /** Slack rejects an empty text object, and the agent's title/lines are host-supplied: normalize an
  *  empty/blank title to a provider-named one so an otherwise-valid preview never fails at post time. */

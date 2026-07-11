@@ -6,7 +6,7 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { Approvals, ApprovalRequiredError } from '../src/core/approval';
+import { Approvals, ApprovalRequiredError, queryDigest } from '../src/core/approval';
 import { approvalNeeded, EgressBlockedError } from '../src/core/injector';
 import { defineProvider, github, type Provider } from '../src/core/providers';
 import { ChannelConfig } from '../src/core/channelConfig';
@@ -247,7 +247,7 @@ test('state machine: prompt → approve → consume exactly once → re-prompt',
   });
 });
 
-test('exact matching: a grant never covers a different method or path', async () => {
+test('exact matching: a grant never covers a different method, path, or query', async () => {
   // PUT is egress-allowed here so the mismatch reaches the APPROVAL gate (not the egress one).
   const { ctx, click } = await harness({ provider: approvalProvider({ egressMethods: ['GET', 'POST', 'PUT'] }) });
   await withFetch(async (calls) => {
@@ -256,12 +256,56 @@ test('exact matching: a grant never covers a different method or path', async ()
     await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
     // Approved POST /repos does NOT authorize POST /repos/evil (exact path, not a prefix)…
     await expectApprovalRequired(handle.fetch('https://api.acme.test/repos/evil', { method: 'POST' }));
-    // …nor PUT /repos (exact method).
+    // …nor PUT /repos (exact method)…
     await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'PUT' }));
+    // …nor POST /repos?x=1 (GHSA-pg84: added query parameters are a DIFFERENT action).
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos?x=1', { method: 'POST' }));
     assert.equal(calls.length, 0, 'nothing reached the wire');
     // The original approved tuple still works (the grant was not burned by the mismatches).
-    const res = await handle.fetch('https://api.acme.test/repos?x=1', { method: 'POST' });
-    assert.equal(res.status, 200); // query is not part of the key (pathname match); body/query never audited
+    const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST' });
+    assert.equal(res.status, 200);
+  });
+});
+
+// ── GHSA-pg84: the grant binds the exact (canonical) query parameters ──────────────────────────────
+
+test('queryDigest: order-insensitive, value/key-sensitive, encoding-normalized, \'\' for no params', () => {
+  assert.equal(queryDigest(''), '');
+  assert.equal(queryDigest('?'), '');
+  assert.equal(queryDigest('?a=1&b=2'), queryDigest('?b=2&a=1')); // same params, any order
+  assert.equal(queryDigest('?a=%31'), queryDigest('?a=1')); // encoding variants of the same value
+  assert.notEqual(queryDigest('?a=1'), queryDigest('?a=2')); // changed value
+  assert.notEqual(queryDigest('?a=1'), queryDigest('?b=1')); // changed key
+  assert.notEqual(queryDigest('?a=1'), queryDigest('?a=1&a=1')); // repeated param is different
+  assert.notEqual(queryDigest('?a=1'), ''); // params never collapse to the no-query sentinel
+});
+
+test('GHSA-pg84: an approval cannot be spent on changed query parameters; canonical reorder still can', async () => {
+  const { ctx, click, ephemerals, approvalRows, auditRows } = await harness();
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const QUERY_SENTINEL = 'alice-PII-payee'; // a query VALUE that must never be persisted or audited
+    const e = await expectApprovalRequired(
+      handle.fetch(`https://api.acme.test/transfer?to=${QUERY_SENTINEL}&amount=10`, { method: 'POST' }),
+    );
+    // The human sees exactly which parameters they are approving (display from the in-memory error)…
+    assert.equal(e.query, `?to=${QUERY_SENTINEL}&amount=10`);
+    assert.match(JSON.stringify(ephemerals[0].blocks), new RegExp(QUERY_SENTINEL));
+    // …but raw query values are NEVER stored (only the canonical digest is) and NEVER audited (SEC-1).
+    assert.ok(!JSON.stringify(await approvalRows()).includes(QUERY_SENTINEL), 'no raw query in the approval row');
+    assert.ok(!JSON.stringify(await auditRows()).includes(QUERY_SENTINEL), 'no raw query in audit');
+
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
+    // A retry with materially different parameters is a DIFFERENT action: re-prompts, grant intact.
+    await expectApprovalRequired(
+      handle.fetch('https://api.acme.test/transfer?to=attacker&amount=1000000', { method: 'POST' }),
+    );
+    assert.equal(calls.length, 0, 'the tampered retry never reached the wire');
+    // Semantically identical canonical input (same params, different order) still consumes the grant.
+    const res = await handle.fetch(`https://api.acme.test/transfer?amount=10&to=${QUERY_SENTINEL}`, { method: 'POST' });
+    assert.equal(res.status, 200);
+    assert.equal(calls.length, 1, 'the faithful retry executed exactly once');
+    assert.ok(!JSON.stringify(await auditRows()).includes(QUERY_SENTINEL), 'consumption audit carries no raw query');
   });
 });
 
@@ -292,7 +336,7 @@ test('P1-A(a): a grant minted for one credential owner cannot be consumed for an
   const approvals = new Approvals(db);
   const forOwner = (ownerId: string) => ({
     teamId: 'T1', userId: 'U_CALLER', ownerKind: 'user' as const, ownerId,
-    provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', channel: 'C1', thread: 'TH1',
+    provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
   });
   const id = await approvals.request(forOwner('U_MEMBER_A'));
   assert.ok(await approvals.approve(id, 'U_CALLER', 60_000));
@@ -380,7 +424,7 @@ test('race: two concurrent identical fetches cannot both spend one grant (DELETE
 test('race: two concurrent store-level consumes yield exactly one winner (consent-consume pattern)', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const approvals = new Approvals(db);
-  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', channel: 'C1', thread: null };
+  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: null };
   const id = await approvals.request(key);
   assert.ok(await approvals.approve(id, 'U9', 60_000));
   const [a, b] = await Promise.all([approvals.consume(key), approvals.consume(key)]);
@@ -392,7 +436,7 @@ test('race: two concurrent store-level consumes yield exactly one winner (consen
 test('concurrent decisions: approve and deny on one pending request — exactly one wins', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const approvals = new Approvals(db);
-  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', channel: null, thread: null };
+  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: null, thread: null };
   const id = await approvals.request(key);
   const [approved, denied] = await Promise.all([approvals.approve(id, 'U9', 60_000), approvals.deny(id)]);
   assert.equal([approved !== false && approved !== null, denied !== null].filter(Boolean).length, 1);
@@ -676,7 +720,7 @@ test('sweep: expired prompts and unspent grants are deleted and audited (actor: 
   const audit = new Audit(db);
   const consent = new Consent(db);
   const approvals = new Approvals(db);
-  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', channel: 'C1', thread: 'TH1' };
+  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1' };
   await approvals.request(key); // pending, 10-minute prompt lifetime
   const granted = await approvals.request({ ...key, path: '/other' });
   await approvals.approve(granted, 'U_ADM', 1_000); // grant, 1s TTL

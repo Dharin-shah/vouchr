@@ -257,6 +257,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Approval grants could be spent on changed query parameters** (GHSA-pg84-mp83-2p82). The
+  human-in-the-loop approval key bound only (method, host, path), so an approval of
+  `POST /transfer?to=alice&amount=10` was indistinguishable from — and spendable by —
+  `POST /transfer?to=attacker&amount=1000000`. The grant now also binds the exact query as a
+  canonical digest (parameters sorted then hashed; raw values may carry PII/secrets and are never
+  persisted or audited): a retry with any changed parameter re-prompts, while the same parameters
+  in a different order still consume the grant. The Approve/Deny prompt now renders the exact
+  query being approved (from the in-memory error, escaped and clipped — never from storage), and
+  the threat model / README now state explicitly that the request body remains outside the key,
+  so approval must not be treated as covering the exact action for body-parameterized endpoints.
+  New `approval_request.query_hash` column (schema version 5, purely additive; pre-upgrade grants
+  fail closed for query-carrying requests). `ApprovalRequiredError` gains a display-only `query`
+  field and `approvalBlocks` a required `query` input.
+
 - **Reflected HTML injection on the OAuth callback error path** (#177). A hostile provider holding a
   valid in-flight `state` could redirect the victim back with `?error=<markup>`; the callback echoes
   it into `OAuth error: <x>` and the Bolt route served it with Express's default `text/html`,
