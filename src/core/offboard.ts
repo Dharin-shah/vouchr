@@ -350,7 +350,7 @@ export async function offboardUserEverywhere(
   user: { enterpriseId?: string | null; userId: string },
   registry?: ProviderRegistry,
   reason = 'offboarded',
-): Promise<{ teamId: string; providers: string[] }[]> {
+): Promise<{ teamId: string; providers: string[]; ok: boolean }[]> {
   const ent = user.enterpriseId != null;
   const sessions = new SessionGrants(db);
   const unionOptin = new UnionOptin(db); // #112: opt-ins are purged per team alongside sessions
@@ -371,18 +371,19 @@ export async function offboardUserEverywhere(
       : [user.userId, user.userId, user.userId, user.userId],
   )) as { team_id: string }[];
 
-  const summary: { teamId: string; providers: string[] }[] = [];
+  const summary: { teamId: string; providers: string[]; ok: boolean }[] = [];
   for (const { team_id: teamId } of rows) {
     // Full owner key per team, never a partial key. offboardUser does the local delete first, then
     // best-effort upstream revoke + audit, and purges this team's pending consent + session grants.
     const identity: SlackIdentity = { enterpriseId: user.enterpriseId ?? null, teamId, userId: user.userId };
     try {
-      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason, sessions, unionOptin) });
+      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason, sessions, unionOptin), ok: true });
     } catch {
-      // Non-fatal per team; local deletes were already attempted inside offboardUser. Record the
-      // team with no providers rather than aborting the whole sweep. Never surface the error (it
-      // could carry connection detail). Secrets stay out of logs/returns.
-      summary.push({ teamId, providers: [] });
+      // Non-fatal per team so later teams still run — but the failure must be SURFACED, not buried
+      // (GHSA-25m2 r3): mark this team ok:false so the caller can report the enterprise offboard as
+      // incomplete rather than a blanket success. Never surface the error itself (it could carry
+      // connection detail); secrets stay out of logs/returns.
+      summary.push({ teamId, providers: [], ok: false });
     }
   }
   return summary;

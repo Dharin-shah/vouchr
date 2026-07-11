@@ -5,7 +5,20 @@ import type { Provider } from './providers';
 import { sha256base64url } from './crypto';
 import { DRY_RUN_CODE } from './dryRun';
 
-const STATE_TTL_MS = 10 * 60 * 1000;
+export const STATE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * The ONE offboarding-tombstone rule (GHSA-25m2): does a tombstone disqualify a consent minted at
+ * `mintedAt`? Refuse everything up to tombstone+TTL, because both stamps are APPLICATION clocks on
+ * possibly-different replicas — a pre-offboarding consent is at most STATE_TTL_MS old when it could
+ * still be used, so the margin blocks it under clock skew as large as the TTL. Shared by
+ * {@link Consent.consume} (single-use gate) and the callback write-gate (`Vault.upsert`'s `gate`) so
+ * the rule lives in exactly one place. ponytail: app-clock compare with a TTL-sized margin; the
+ * PG-only direction (#204/#192) can move both stamps to database time / an epoch and drop the margin.
+ */
+export function tombstoneBlocks(tombCreatedAt: number | null | undefined, mintedAt: number): boolean {
+  return tombCreatedAt != null && tombCreatedAt + STATE_TTL_MS >= mintedAt;
+}
 
 export interface ConsentRow {
   state: string;
@@ -13,6 +26,8 @@ export interface ConsentRow {
   provider: string;
   channel: string | null;
   pkceVerifier: string;
+  /** When the consent state was minted — the callback write-gate compares it to the tombstone. */
+  createdAt: number;
 }
 
 /** Manages the single-use OAuth `state` + PKCE for a consent round-trip. */
@@ -126,19 +141,14 @@ export class Consent {
     if (Date.now() - row.created_at > STATE_TTL_MS) return null;
     // Offboarding tombstone (GHSA-25m2): a consent minted at or before the user's offboarding can
     // never complete, even when the offboarding row-purge transiently failed. Checked AFTER the
-    // single-use delete, so the state is spent either way. The comparison carries a full
-    // state-lifetime margin because both stamps come from APPLICATION clocks on possibly different
-    // replicas: any pre-offboarding consent is at most STATE_TTL_MS old when it could still be
-    // consumed, so refusing everything up to tombstone+TTL blocks it under clock skew as large as
-    // the TTL itself (skew beyond that already breaks state expiry). Cost: a re-onboarded user can
-    // reconnect ~10 minutes after offboarding, not instantly.
-    // ponytail: app-clock compare with a TTL-sized skew margin; the PG-only direction (#204) can
-    // move both stamps to database time and drop the margin.
+    // single-use delete, so the state is spent either way. This is the FIRST gate; the callback's
+    // credential write is gated a SECOND time, atomically, against a tombstone written AFTER this
+    // consume but BEFORE the write (see Vault.upsert's `gate`). See {@link tombstoneBlocks}.
     const tomb = (await this.db.get(
       `SELECT created_at FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
       [row.team_id, row.user_id],
     )) as any;
-    if (tomb && tomb.created_at + STATE_TTL_MS >= row.created_at) return null;
+    if (tombstoneBlocks(tomb?.created_at, row.created_at)) return null;
     return {
       state: row.state,
       identity: {
@@ -149,6 +159,7 @@ export class Consent {
       provider: row.provider,
       channel: row.channel,
       pkceVerifier: row.pkce_verifier,
+      createdAt: row.created_at,
     };
   }
 }

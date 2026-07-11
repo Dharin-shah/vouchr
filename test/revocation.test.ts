@@ -451,6 +451,32 @@ test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot 
   }
 });
 
+// GHSA-25m2 r3 barrier: the callback consumes its state, then offboarding COMPLETES (tombstone +
+// every credential deleted) DURING token exchange, then the write runs. The atomic write-gate must
+// refuse the resurrection — the saved-state test starts the callback after offboarding and misses
+// this ordering (the credential write racing a tombstone written after consume).
+test('offboarding during token exchange cannot resurrect the credential (atomic write-gate)', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const registry = new ProviderRegistry([revocable]);
+  await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const { state } = await consent.begin(ID, revocable, 'https://cb.example/x', null); // consumed at callback start, BEFORE any tombstone
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    await offboardUser(vault, audit, consent, ID); // offboard fully completes mid-exchange: tombstone written + credential deleted
+    return new Response(JSON.stringify({ access_token: 'NEW_TOK' }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+  try {
+    const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://cb.example/x' }, 'CODE', state);
+    assert.equal(res.ok, false); // the tombstone written after consume() still blocks the write, atomically
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(await countConnections(db), 0, 'no credential resurrected by a callback that raced offboarding');
+});
+
 test('offboardUser throws (after attempting every delete) only when BOTH the tombstone and the purge fail', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
@@ -469,6 +495,30 @@ test('offboardUserEverywhere with enterpriseId still finds NULL-enterprise rows'
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null }); // O1 carries no enterpriseId → NULL row
   const summary = await offboardUserEverywhere(db, vault, new Audit(db), new Consent(db), { enterpriseId: 'E1', userId: ID.userId });
-  assert.deepEqual(summary, [{ teamId: 'T1', providers: ['revocable'] }]);
+  assert.deepEqual(summary, [{ teamId: 'T1', providers: ['revocable'], ok: true }]);
   assert.equal(await countConnections(db), 0);
+});
+
+// GHSA-25m2 r3: one workspace's delete failure must be SURFACED (ok:false for that team), never
+// buried as a blanket success, while the other workspaces still offboard.
+test('offboardUserEverywhere surfaces a per-team failure and still offboards the others', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const seeder = new Vault(db, KEY);
+  const T2 = userOwner({ enterpriseId: null, teamId: 'T2', userId: ID.userId });
+  await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  await seeder.upsert(T2, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  // DELETEs against T1's connection fail; T2's succeed.
+  const flakyDb = {
+    get: db.get.bind(db), all: db.all.bind(db), exec: db.exec.bind(db), close: db.close.bind(db),
+    run: (sql: string, params?: unknown[]) =>
+      sql.includes('DELETE FROM connection') && (params as any[])?.includes('T1')
+        ? Promise.reject(new Error('T1 connection table down'))
+        : db.run(sql, params as any[]),
+  } as any;
+  const vault = new Vault(flakyDb, KEY);
+  const summary = await offboardUserEverywhere(db, vault, new Audit(db), new Consent(db), { userId: ID.userId });
+  const byTeam = new Map(summary.map((s) => [s.teamId, s.ok]));
+  assert.equal(byTeam.get('T1'), false); // failure surfaced, not buried
+  assert.equal(byTeam.get('T2'), true); // the other workspace still offboarded
+  assert.equal(await countConnections(db), 1); // only T1's row remains (its delete failed)
 });

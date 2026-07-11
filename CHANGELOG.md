@@ -268,18 +268,25 @@ All notable changes to this project are documented here. This project adheres to
   TTL-independent `Vault.getForRevoke` (injection still uses the TTL-gated `get`). EVERY revoke
   implementation is now time-bounded (10s): the standard RFC 7009 POST, and custom `revoke` hooks
   (which now receive an `AbortSignal` and are raced against the deadline even if they ignore it),
-  so a hung endpoint can't stall offboarding. A satellite-purge failure can no longer roll back a
-  credential delete (writes stay atomic with their purge; `delete` commits first and purges
-  best-effort — a reconnect still purges fail-closed inside `upsert`), consent/session/opt-in
-  cleanup failures no longer abort offboarding before the deletes, and enterprise-scoped
-  `offboardUserEverywhere` discovery now includes rows stored with a NULL `enterprise_id`
-  (written outside Grid) instead of skipping those teams. Offboarding also writes a durable
-  tombstone FIRST (new `offboard_tombstone` table, schema version 5, purely additive):
-  `Consent.consume` refuses any state minted at or before the user's offboarding, so a pending
-  "Connect" can never resurrect a credential even when the consent row-purge transiently fails
-  (a consent begun after offboarding — legitimate re-onboarding — still works). If both the
-  tombstone write and the purge fail, `offboardUser` throws after attempting every delete instead
-  of reporting success.
+  so a hung endpoint can't stall offboarding. A due-but-unreadable revoke (decrypt/KMS failure on a
+  revocable provider) is now reported truthfully — `ok:false` with `upstream:'skipped'` meta —
+  instead of logging a revoke that never happened as success. A satellite-purge failure can no
+  longer roll back a credential delete (`Vault.delete` keeps the delete+purge atomic on the happy
+  path, but a purge-only failure re-runs the delete alone and a DELETE that genuinely can't commit
+  now PROPAGATES — a stranded credential is never reported as removed; a reconnect still purges
+  fail-closed inside `upsert`). Any credential-deletion failure makes `offboardUser` throw
+  `offboarding incomplete` after still attempting every other row, and enterprise-scoped
+  `offboardUserEverywhere` now marks each incomplete workspace `ok:false` so the broker returns
+  `ok:false` (never a blanket success that hides a credential left in one workspace); discovery also
+  includes rows stored with a NULL `enterprise_id` (written outside Grid) instead of skipping those
+  teams. Offboarding writes a durable tombstone FIRST (new `offboard_tombstone` table, schema
+  version 6, purely additive): `Consent.consume` refuses any state minted at or before the user's
+  offboarding, and the OAuth callback's credential write is gated a SECOND time — ATOMICALLY, as one
+  conditional statement — against a tombstone written *after* `consume` but *before* the write, so a
+  callback that paused in token exchange while the user was offboarded can never resurrect the
+  credential (a consent begun after offboarding — legitimate re-onboarding — still works). If both
+  the tombstone write and the purge fail, `offboardUser` throws after attempting every delete
+  instead of reporting success.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

@@ -3,6 +3,7 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
+import { STATE_TTL_MS } from './consent';
 import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
@@ -143,18 +144,39 @@ export class Vault {
 
   /** Store a vaulted credential (Vouchr encrypts and owns refresh). A production write is always
    *  REAL: `dry_run=0` on insert AND on conflict, so overwriting a dry-run row re-marks it real
-   *  (zero-behavior-change — production ignores dry-run provenance entirely). */
-  async upsert(owner: Owner, provider: string, t: StoredToken): Promise<void> {
+   *  (zero-behavior-change — production ignores dry-run provenance entirely).
+   *
+   *  `gate` (GHSA-25m2, callback path only): the OAuth callback already consumed its single-use
+   *  state, then paused in token exchange; offboarding can write the tombstone and delete every
+   *  credential during that pause. Gating the write ATOMICALLY against the tombstone — one
+   *  conditional statement, not a recheck-then-write (which leaves a check/write race) — makes the
+   *  final credential write refuse to resurrect an offboarded user. Same rule as
+   *  {@link tombstoneBlocks}, expressed in SQL because it must be atomic with the INSERT. Returns
+   *  true when the credential was written; false only when the gate refused it (offboarded). */
+  async upsert(owner: Owner, provider: string, t: StoredToken, gate?: { mintedAt: number }): Promise<boolean> {
     const now = Date.now();
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
-    await this.mutation(async (tx) => {
-      await tx.run(
-        `INSERT INTO connection
-           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+    const cols = `(id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
             access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, dry_run, created_at, updated_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?)
+            external_account, dry_run, created_at, updated_at, last_used_at)`;
+    const row = `?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?`;
+    const params: unknown[] = [
+      randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
+      accessEnc, refreshEnc,
+      t.scopes, t.expiresAt, t.externalAccount, now, now, now,
+    ];
+    // Gated write: INSERT … SELECT … WHERE NOT EXISTS(tombstone) — the tombstone is re-evaluated
+    // atomically at INSERT time, so a tombstone written after consume() but before this write blocks
+    // the resurrection (0 rows → returns false). Ungated writes keep the plain VALUES form.
+    const src = gate
+      ? `SELECT ${row} WHERE NOT EXISTS (
+           SELECT 1 FROM offboard_tombstone WHERE team_id=? AND user_id=? AND created_at + ? >= ?)`
+      : `VALUES (${row})`;
+    if (gate) params.push(owner.teamId, owner.id, STATE_TTL_MS, gate.mintedAt);
+    return this.mutation(async (tx) => {
+      const { changes } = await tx.run(
+        `INSERT INTO connection ${cols} ${src}
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
            source='vault', enterprise_id=excluded.enterprise_id,
            access_token_enc=excluded.access_token_enc,
@@ -162,13 +184,11 @@ export class Vault {
            scopes=excluded.scopes, expires_at=excluded.expires_at,
            external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
            created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
-        [
-          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
-          accessEnc, refreshEnc,
-          t.scopes, t.expiresAt, t.externalAccount, now, now, now,
-        ],
+        params,
       );
+      if (gate && changes === 0) return false; // the tombstone gate refused the write — nothing landed
       await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
+      return true;
     });
   }
 
