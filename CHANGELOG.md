@@ -257,6 +257,39 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Offboarding could strand credentials** (GHSA-25m2-c458-8gmw). `offboardUser` read (and
+  decrypted) each token before deleting it, so a KMS/envelope decrypt failure — or an audit-write
+  failure mid-loop — aborted the loop and left that row and every later provider's credential in
+  place, usable again once the dependency recovered. Each row is now processed in isolation: the
+  local delete always runs (decrypt failures only skip the best-effort upstream revoke; audit/DB
+  failures on one row never block the next), and the return value / `disconnectProvider.removed`
+  now reflect what was actually deleted (`Vault.delete` reports whether a row existed). A row past
+  its LOCAL TTL is still revoked upstream on disconnect/offboard/bulk-revoke via the new
+  TTL-independent `Vault.getForRevoke` (injection still uses the TTL-gated `get`). EVERY revoke
+  implementation is now time-bounded (10s): the standard RFC 7009 POST, and custom `revoke` hooks
+  (which now receive an `AbortSignal` and are raced against the deadline even if they ignore it),
+  so a hung endpoint can't stall offboarding. A due-but-unreadable revoke (decrypt/KMS failure on a
+  revocable provider) is now reported truthfully — `ok:false` with `upstream:'skipped'` meta —
+  instead of logging a revoke that never happened as success. A satellite-purge failure can no
+  longer roll back a credential delete (`Vault.delete` keeps the delete+purge atomic on the happy
+  path, but a purge-only failure re-runs the delete alone and a DELETE that genuinely can't commit
+  now PROPAGATES — a stranded credential is never reported as removed; a reconnect still purges
+  fail-closed inside `upsert`). Any credential-deletion failure makes `offboardUser` throw
+  `offboarding incomplete` after still attempting every other row, and enterprise-scoped
+  `offboardUserEverywhere` now marks each incomplete workspace `ok:false` so the broker returns
+  `ok:false` (never a blanket success that hides a credential left in one workspace); discovery also
+  includes rows stored with a NULL `enterprise_id` (written outside Grid) instead of skipping those
+  teams. Offboarding writes a durable tombstone FIRST (new `offboard_tombstone` table, schema
+  version 6, purely additive): `Consent.consume` refuses any state minted at or before the user's
+  offboarding, and the OAuth callback's credential write is gated a SECOND time — ATOMICALLY, as one
+  conditional statement — against a tombstone written *after* `consume` but *before* the write, so a
+  callback that paused in token exchange while the user was offboarded can never resurrect the
+  credential (a consent begun after offboarding — legitimate re-onboarding — still works). The
+  tombstone is the load-bearing fence, so if it cannot be written `offboardUser` throws
+  `offboarding incomplete` on its own — after still attempting every delete — regardless of the
+  best-effort consent-row purge (which the TTL sweep reclaims); reporting success with the fence
+  down is the exact resurrection this path prevents.
+
 - **TTL sweep could delete a just-reconnected credential** (#192). `sweepExpired` snapshotted
   expired rows and then deleted by owner/provider key only, so a reconnect landing between the
   snapshot and the delete was destroyed — and audited/notified as 'expired' — despite being fresh.

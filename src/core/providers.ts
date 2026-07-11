@@ -119,8 +119,10 @@ export interface Provider {
   revokeUrl?: string;
   /** Client auth at the revoke endpoint. Default 'none'. 'body' = client_id/client_secret in the body. */
   revokeAuth?: 'none' | 'body';
-  /** Escape hatch for non-standard revoke endpoints; takes precedence over `revokeUrl`. */
-  revoke?: (provider: Provider, token: string) => Promise<void>;
+  /** Escape hatch for non-standard revoke endpoints; takes precedence over `revokeUrl`.
+   *  `signal` (GHSA-25m2) aborts at the revoke deadline — pass it to your fetch: the caller races
+   *  the deadline regardless, but honoring the signal releases the socket instead of leaking it. */
+  revoke?: (provider: Provider, token: string, signal?: AbortSignal) => Promise<void>;
   /** Required for `credential: 'oauth'` (the default); unused for `credential: 'key'`. */
   clientId?: string;
   clientSecret?: string;
@@ -325,7 +327,7 @@ export function github(cfg: ProviderConfig = {}): Provider {
     clientId: cfg.clientId ?? process.env.GITHUB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITHUB_CLIENT_SECRET ?? '',
     // Non-standard shape (DELETE + Basic + JSON + client_id in the path) → function escape hatch.
-    revoke: async (p, token) => {
+    revoke: async (p, token, signal) => {
       const creds = Buffer.from(`${p.clientId}:${p.clientSecret}`).toString('base64');
       const r = await fetch(`https://api.github.com/applications/${p.clientId}/token`, {
         method: 'DELETE',
@@ -336,6 +338,7 @@ export function github(cfg: ProviderConfig = {}): Provider {
           'User-Agent': 'vouchr',
         },
         body: JSON.stringify({ access_token: token }),
+        signal, // GHSA-25m2: a hung revoke endpoint must not stall offboarding
       });
       if (!r.ok && r.status !== 404) throw new Error(`GitHub token revoke returned HTTP ${r.status}`); // 404 = already gone
     },

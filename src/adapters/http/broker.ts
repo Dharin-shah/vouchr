@@ -892,7 +892,10 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     // Enterprise/Grid: span every workspace the target touches; else this one workspace.
     if (claims.enterpriseId) {
       const summary = await offboardUserEverywhere(opts.db, opts.vault, opts.audit, consent, { enterpriseId: claims.enterpriseId, userId: targetUserId }, registry);
-      return { ok: true, revoked: summary.flatMap((s) => s.providers) };
+      // Truthful completeness (GHSA-25m2 r3): ok:true ONLY when every touched workspace fully
+      // offboarded. A credential left in one workspace must never read as a successful sweep.
+      const incompleteTeams = summary.filter((s) => !s.ok).length;
+      return { ok: incompleteTeams === 0, revoked: summary.flatMap((s) => s.providers), ...(incompleteTeams ? { incompleteTeams } : {}) };
     }
     const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
     const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions, unionOptin);

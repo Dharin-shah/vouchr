@@ -199,8 +199,11 @@ class PgClientDb implements Db {
  *   all approval rows when the stored version is < 5 (healApprovalRowsPreV5): they are
  *   minutes-lived prompts/grants, so deleting them is the crash-safe fail-closed upgrade — the
  *   purge is version-gated, and the version stamp lands only after it succeeds.
+ * Version 6 = + the `offboard_tombstone` table (GHSA-25m2, purely additive): the durable
+ *   fail-closed gate that keeps a pending consent from resurrecting an offboarded user's
+ *   credential even when the offboarding row-purge transiently fails.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -362,6 +365,13 @@ function schema(blob: string, int: string): string {
       type TEXT NOT NULL,
       last_notified_at ${int} NOT NULL,
       PRIMARY KEY (team_id, owner_kind, owner_id, provider, type)
+    );
+
+    CREATE TABLE IF NOT EXISTS offboard_tombstone (
+      team_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      PRIMARY KEY (team_id, user_id)
     );
 
     CREATE TABLE IF NOT EXISTS audit (

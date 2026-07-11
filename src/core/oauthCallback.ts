@@ -113,8 +113,13 @@ export async function handleOAuthCallback(
       // so a REAL credential a sibling process wrote — even between boot and now — survives untouched.
       // No get()-then-upsert, so there is no TOCTOU window. false → a real row blocked it: refuse.
       if (!(await deps.vault.upsertDryRun(userOwner(row.identity), provider.id, token))) throw new DryRunVaultError();
-    } else {
-      await deps.vault.upsert(userOwner(row.identity), provider.id, token);
+    } else if (!(await deps.vault.upsert(userOwner(row.identity), provider.id, token, { mintedAt: row.createdAt }))) {
+      // GHSA-25m2: offboarding won the race between consume() and this write — it wrote the
+      // tombstone and deleted every credential while we were in token exchange. The atomic gate
+      // refused to resurrect the credential (nothing landed). Audit as denied; write nothing.
+      await deps.audit.record('denied', row.identity, provider.id, { reason: 'offboarded' });
+      emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 403);
+      return { ok: false, status: 403, error: 'This account is no longer active. Reconnect is unavailable.' };
     }
     await deps.audit.record('connect', row.identity, provider.id, { account });
     // #112: connecting IN RESPONSE to a union-channel prompt IS the opt-in moment. The consent row

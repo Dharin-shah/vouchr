@@ -135,20 +135,48 @@ export async function refreshToken(
  * non-standard endpoints, otherwise POSTs `token=<token>` (form, RFC 7009) to `revokeUrl`,
  * adding client_id/client_secret when `revokeAuth === 'body'`. NEVER logs the token or puts
  * it in an error; MAY throw on network/HTTP failure (callers wrap it best-effort).
+ *
+ * EVERY implementation is time-bounded (GHSA-25m2): a hung revoke endpoint must not stall
+ * disconnect/offboarding for minutes. The abort signal is handed to the custom `revoke` hook so a
+ * well-behaved implementation cancels its own fetch, and the call is ALSO raced against the same
+ * deadline so a hook that ignores the signal still cannot hang the caller (the abandoned promise
+ * is fine: revocation is best-effort by contract, local deletion already happened or follows).
+ * `timeoutMs` is parameterizable for tests only; production callers use the default.
  */
-export async function revokeToken(provider: Provider, token: string): Promise<void> {
-  if (provider.revoke) return provider.revoke(provider, token);
-  if (!provider.revokeUrl) return; // no documented revoke (e.g. Notion): honest no-op
+export async function revokeToken(provider: Provider, token: string, timeoutMs = TOKEN_FETCH_TIMEOUT_MS): Promise<void> {
+  if (!provider.revoke && !provider.revokeUrl) return; // no documented revoke (e.g. Notion): honest no-op
+  const controller = new AbortController();
+  const work = provider.revoke
+    ? provider.revoke(provider, token, controller.signal)
+    : standardRevoke(provider, token, controller.signal);
+  // A REAL (ref'd) timer, deliberately not AbortSignal.timeout: its unref'd timer lets a one-shot
+  // process (e.g. a CLI offboard) drain the event loop and exit before the deadline ever fires.
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Revoke for provider "${provider.id}" timed out after ${timeoutMs}ms`)); // never includes the token
+    }, timeoutMs);
+  });
+  try {
+    await Promise.race([work, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
+/** The default RFC 7009 revoke (form POST of `token=` to `revokeUrl`). */
+async function standardRevoke(provider: Provider, token: string, signal: AbortSignal): Promise<void> {
   const fields: Record<string, string> = { token };
   if (provider.revokeAuth === 'body') {
     fields.client_id = provider.clientId!;
     fields.client_secret = provider.clientSecret!;
   }
-  const res = await fetch(provider.revokeUrl, {
+  const res = await fetch(provider.revokeUrl!, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(fields).toString(),
+    signal,
   });
   // Revoke responses are never read (only the status matters): cancel the body on BOTH paths, or
   // undici pins the socket to it until GC (#172).

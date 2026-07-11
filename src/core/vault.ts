@@ -3,6 +3,7 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
+import { STATE_TTL_MS } from './consent';
 import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
@@ -71,12 +72,31 @@ export class Vault {
    * decrypt volume without the vault holding an event sink. No-op on the legacy direct path.
    */
   async get(owner: Owner, provider: string, onDecrypt?: () => void): Promise<StoredCredential | null> {
-    const row = (await this.db.get(
-      `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-      [owner.teamId, owner.kind, owner.id, provider],
-    )) as any;
+    const row = await this.fetchRow(owner, provider);
     if (!row) return null;
     if (this.isExpired(row.created_at, row.last_used_at ?? row.created_at)) return null;
+    return this.decode(row, onDecrypt);
+  }
+
+  /**
+   * TTL-independent decrypting read, for best-effort upstream REVOCATION only (GHSA-25m2): a row
+   * past its local TTL may still be live at the provider, so disconnect/offboard must still hand
+   * its token to the revoke endpoint. Never use this for injection — `get` stays the only read
+   * gated on the TTL policy.
+   */
+  async getForRevoke(owner: Owner, provider: string): Promise<StoredCredential | null> {
+    const row = await this.fetchRow(owner, provider);
+    return row ? this.decode(row) : null;
+  }
+
+  private async fetchRow(owner: Owner, provider: string): Promise<any> {
+    return this.db.get(
+      `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+      [owner.teamId, owner.kind, owner.id, provider],
+    );
+  }
+
+  private async decode(row: any, onDecrypt?: () => void): Promise<StoredCredential> {
     return {
       source: row.source,
       accessToken: row.access_token_enc ? await open(toBuffer(row.access_token_enc), this.key, this.envelope, onDecrypt) : null,
@@ -112,28 +132,51 @@ export class Vault {
     await purgeApprovalsForOwner(db, owner, provider);
   }
 
-  /** Connection write/delete + its notification_state purge are ONE logical mutation: run them in
-   *  one transaction so a purge failure can't half-commit (a mutation that "failed" but actually
-   *  landed, or a sweep delete whose expiry audit/hook then never fires). A backend without
-   *  `transaction` (only minimal test stubs) falls back to sequential statements. */
+  /** Connection write/delete + its satellite purge are ONE logical mutation: run them in one
+   *  transaction so a purge failure can't half-commit a write, and a delete's purge can never
+   *  touch a newer credential generation. delete() additionally retries WITHOUT the purge when
+   *  the transaction fails — a satellite failure must never roll back a credential delete
+   *  (GHSA-25m2 review; see delete()). A backend without `transaction` (only minimal test stubs)
+   *  falls back to sequential statements. */
   private mutation<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
     return this.db.transaction ? this.db.transaction(fn) : fn(this.db);
   }
 
   /** Store a vaulted credential (Vouchr encrypts and owns refresh). A production write is always
    *  REAL: `dry_run=0` on insert AND on conflict, so overwriting a dry-run row re-marks it real
-   *  (zero-behavior-change — production ignores dry-run provenance entirely). */
-  async upsert(owner: Owner, provider: string, t: StoredToken): Promise<void> {
+   *  (zero-behavior-change — production ignores dry-run provenance entirely).
+   *
+   *  `gate` (GHSA-25m2, callback path only): the OAuth callback already consumed its single-use
+   *  state, then paused in token exchange; offboarding can write the tombstone and delete every
+   *  credential during that pause. Gating the write ATOMICALLY against the tombstone — one
+   *  conditional statement, not a recheck-then-write (which leaves a check/write race) — makes the
+   *  final credential write refuse to resurrect an offboarded user. Same rule as
+   *  {@link tombstoneBlocks}, expressed in SQL because it must be atomic with the INSERT. Returns
+   *  true when the credential was written; false only when the gate refused it (offboarded). */
+  async upsert(owner: Owner, provider: string, t: StoredToken, gate?: { mintedAt: number }): Promise<boolean> {
     const now = Date.now();
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
-    await this.mutation(async (tx) => {
-      await tx.run(
-        `INSERT INTO connection
-           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+    const cols = `(id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
             access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, dry_run, created_at, updated_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?)
+            external_account, dry_run, created_at, updated_at, last_used_at)`;
+    const row = `?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?`;
+    const params: unknown[] = [
+      randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
+      accessEnc, refreshEnc,
+      t.scopes, t.expiresAt, t.externalAccount, now, now, now,
+    ];
+    // Gated write: INSERT … SELECT … WHERE NOT EXISTS(tombstone) — the tombstone is re-evaluated
+    // atomically at INSERT time, so a tombstone written after consume() but before this write blocks
+    // the resurrection (0 rows → returns false). Ungated writes keep the plain VALUES form.
+    const src = gate
+      ? `SELECT ${row} WHERE NOT EXISTS (
+           SELECT 1 FROM offboard_tombstone WHERE team_id=? AND user_id=? AND created_at + ? >= ?)`
+      : `VALUES (${row})`;
+    if (gate) params.push(owner.teamId, owner.id, STATE_TTL_MS, gate.mintedAt);
+    return this.mutation(async (tx) => {
+      const { changes } = await tx.run(
+        `INSERT INTO connection ${cols} ${src}
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
            source='vault', enterprise_id=excluded.enterprise_id,
            access_token_enc=excluded.access_token_enc,
@@ -141,13 +184,11 @@ export class Vault {
            scopes=excluded.scopes, expires_at=excluded.expires_at,
            external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
            created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
-        [
-          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
-          accessEnc, refreshEnc,
-          t.scopes, t.expiresAt, t.externalAccount, now, now, now,
-        ],
+        params,
       );
+      if (gate && changes === 0) return false; // the tombstone gate refused the write — nothing landed
       await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
+      return true;
     });
   }
 
@@ -411,13 +452,44 @@ export class Vault {
     });
   }
 
-  async delete(owner: Owner, provider: string): Promise<void> {
-    await this.mutation(async (tx) => {
-      await tx.run(
-        `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-        [owner.teamId, owner.kind, owner.id, provider],
-      );
-      await this.clearSatellites(tx, owner, provider); // satellites must not outlive the connection: notification_state (#117) + approval grants (#113)
-    });
+  /**
+   * Returns whether a row actually existed, so callers derive a truthful `removed` from the
+   * delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2).
+   *
+   * Satellite handling differs from the WRITE paths (upsert/reference, where a satellite-purge
+   * failure correctly rolls the whole write back — no new credential lands without its satellites
+   * cleared). Here the delete+purge run in ONE transaction on the happy path — atomic, so a purge
+   * can never touch a NEWER credential generation written after the delete commits. On failure the
+   * two modes are told apart (GHSA-25m2 review): if the DELETE statement itself never ran the
+   * credential is genuinely stranded, so the error PROPAGATES (offboardUser reports the offboarding
+   * incomplete, never as success); if only the satellite purge failed after a successful DELETE the
+   * credential delete is re-run alone and the delete result stands. A missed purge in that fallback
+   * is fail-closed anyway: a grant without its connection cannot reach a secret (consume precedes
+   * the vault read, which then throws NoConnectionError), a reconnect purges satellites inside
+   * upsert/reference BEFORE the new credential is usable, and the TTL sweep reclaims expired rows.
+   */
+  async delete(owner: Owner, provider: string): Promise<boolean> {
+    const sql = `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`;
+    const params = [owner.teamId, owner.kind, owner.id, provider];
+    let removed: boolean | undefined; // set once the DELETE statement itself succeeds
+    try {
+      return await this.mutation(async (tx) => {
+        removed = (await tx.run(sql, params)).changes > 0; // DELETE first; its own failure leaves `removed` unset
+        await this.clearSatellites(tx, owner, provider); // notification_state (#117) + approval grants (#113)
+        return removed;
+      });
+    } catch (e) {
+      // Distinguish the two failure modes (GHSA-25m2 review r3): a DELETE that never ran means the
+      // credential is genuinely stranded — surface it so offboardUser reports the offboarding
+      // incomplete, never as success. `removed` is still unset in that case.
+      if (removed === undefined) throw e;
+      // Only the satellite purge failed after a successful DELETE. On a transactional backend the
+      // txn rolled the DELETE back, so re-run it — and let ITS failure PROPAGATE: if the credential
+      // delete cannot be re-committed the credential is genuinely stranded (never report that as
+      // success, GHSA-25m2 r3). On a minimal non-transactional stub the row is already gone and this
+      // re-run is a harmless 0-row no-op. A missed purge is fail-closed (see the doc comment).
+      await this.db.run(sql, params);
+      return removed;
+    }
   }
 }

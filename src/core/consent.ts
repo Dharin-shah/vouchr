@@ -5,7 +5,20 @@ import type { Provider } from './providers';
 import { sha256base64url } from './crypto';
 import { DRY_RUN_CODE } from './dryRun';
 
-const STATE_TTL_MS = 10 * 60 * 1000;
+export const STATE_TTL_MS = 10 * 60 * 1000;
+
+/**
+ * The ONE offboarding-tombstone rule (GHSA-25m2): does a tombstone disqualify a consent minted at
+ * `mintedAt`? Refuse everything up to tombstone+TTL, because both stamps are APPLICATION clocks on
+ * possibly-different replicas — a pre-offboarding consent is at most STATE_TTL_MS old when it could
+ * still be used, so the margin blocks it under clock skew as large as the TTL. Shared by
+ * {@link Consent.consume} (single-use gate) and the callback write-gate (`Vault.upsert`'s `gate`) so
+ * the rule lives in exactly one place. ponytail: app-clock compare with a TTL-sized margin; the
+ * PG-only direction (#204/#192) can move both stamps to database time / an epoch and drop the margin.
+ */
+export function tombstoneBlocks(tombCreatedAt: number | null | undefined, mintedAt: number): boolean {
+  return tombCreatedAt != null && tombCreatedAt + STATE_TTL_MS >= mintedAt;
+}
 
 export interface ConsentRow {
   state: string;
@@ -13,6 +26,8 @@ export interface ConsentRow {
   provider: string;
   channel: string | null;
   pkceVerifier: string;
+  /** When the consent state was minted — the callback write-gate compares it to the tombstone. */
+  createdAt: number;
 }
 
 /** Manages the single-use OAuth `state` + PKCE for a consent round-trip. */
@@ -76,6 +91,23 @@ export class Consent {
     await this.db.run(`DELETE FROM consent_request WHERE team_id=? AND user_id=?`, [i.teamId, i.userId]);
   }
 
+  /**
+   * Durable fail-closed offboarding gate (GHSA-25m2): record that this user was offboarded NOW.
+   * `consume()` refuses any consent state minted at or before this instant (plus a state-lifetime
+   * skew margin — see consume), so even if the row purge in {@link deleteForUser} transiently
+   * fails, a pending pre-offboarding "Connect" can never complete and resurrect a credential.
+   * Tombstones are permanent and tiny (one row per offboarded user); a legitimately re-onboarded
+   * user starts a NEW consent, which clears the tombstone+margin window (~10 minutes after
+   * offboarding) and passes. Re-offboarding refreshes the timestamp.
+   */
+  async markOffboarded(i: SlackIdentity): Promise<void> {
+    await this.db.run(
+      `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,?)
+       ON CONFLICT(team_id, user_id) DO UPDATE SET created_at=excluded.created_at`,
+      [i.teamId, i.userId, Date.now()],
+    );
+  }
+
   /** Delete in-flight consent for ONE provider (break-glass bulk revocation), so a pending "Connect"
    *  click can't resurrect the credential we just revoked. */
   async deleteForUserProvider(teamId: string, userId: string, provider: string): Promise<void> {
@@ -99,13 +131,24 @@ export class Consent {
     return row?.state ?? null;
   }
 
-  /** Look up and consume (single-use) a consent request. Returns null if absent/expired. */
+  /** Look up and consume (single-use) a consent request. Returns null if absent/expired — or if
+   *  the user was offboarded at/after the state was minted (the tombstone gate, GHSA-25m2). */
   async consume(state: string): Promise<ConsentRow | null> {
     // Atomic single-use: DELETE ... RETURNING so two concurrent callbacks can't both pass the
     // check (a get-then-delete has a TOCTOU window on multi-instance Postgres). Both engines support it.
     const row = (await this.db.get(`DELETE FROM consent_request WHERE state=? RETURNING *`, [state])) as any;
     if (!row) return null;
     if (Date.now() - row.created_at > STATE_TTL_MS) return null;
+    // Offboarding tombstone (GHSA-25m2): a consent minted at or before the user's offboarding can
+    // never complete, even when the offboarding row-purge transiently failed. Checked AFTER the
+    // single-use delete, so the state is spent either way. This is the FIRST gate; the callback's
+    // credential write is gated a SECOND time, atomically, against a tombstone written AFTER this
+    // consume but BEFORE the write (see Vault.upsert's `gate`). See {@link tombstoneBlocks}.
+    const tomb = (await this.db.get(
+      `SELECT created_at FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
+      [row.team_id, row.user_id],
+    )) as any;
+    if (tombstoneBlocks(tomb?.created_at, row.created_at)) return null;
     return {
       state: row.state,
       identity: {
@@ -116,6 +159,7 @@ export class Consent {
       provider: row.provider,
       channel: row.channel,
       pkceVerifier: row.pkce_verifier,
+      createdAt: row.created_at,
     };
   }
 }
