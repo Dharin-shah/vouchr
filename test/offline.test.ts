@@ -13,7 +13,6 @@ import { github, google, gitlab, notion, defineProvider, ProviderRegistry } from
 import { exchangeCode } from '../src/core/tokens';
 import { offboardUser } from '../src/core/offboard';
 import { sweepExpired } from '../src/core/sweep';
-import { UnionOptin } from '../src/core/unionOptin';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -439,60 +438,6 @@ test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no
   assert.notEqual(await vault.get(O1, 'github'), null); // and is live, satellites untouched
   assert.equal(((await db.all(`SELECT * FROM audit WHERE action='revoke'`)) as any[]).length, 0, 'no expired audit row');
   assert.equal(events.filter((e) => e.type === 'expired').length, 0, 'no expired health event');
-});
-
-// #192 review r1: a union-channel reconnect (upsert + joinUnion) racing the sweep keeps its FRESH
-// opt-in — the opt-in postdates the purge inside deleteExpired's satellite boundary.
-test('sweepExpired: a reconnect + re-opt-in after the atomic delete keeps its fresh union opt-in', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
-  const vault = new Vault(db, KEY, { idleMs: 1000 });
-  const optin = new UnionOptin(db);
-  await vault.upsert(O1, 'github', FRESH);
-  await optin.join(ID, 'C1', 'github'); // an OLD opt-in exists on the expiring credential
-  await db.run('UPDATE connection SET last_used_at=?, created_at=? WHERE provider=?', [Date.now() - 5000, Date.now() - 5000, 'github']);
-  // Barrier: interpose on deleteExpired so the reconnect + fresh opt-in land right after it.
-  const realDelete = vault.deleteExpired.bind(vault);
-  (vault as any).deleteExpired = async (owner: any, provider: string) => {
-    const deleted = await realDelete(owner, provider);
-    await vault.upsert(O1, 'github', FRESH); // the OAuth reconnect (union channel)…
-    await optin.join(ID, 'C1', 'github'); // …and its auto re-opt-in (joinUnion path)
-    return deleted;
-  };
-  assert.equal(await sweepExpired(vault, new Audit(db), new Consent(db)), 1); // the stale row WAS swept
-  assert.ok((await optin.optedIn(ID.teamId, 'C1', 'github')).has(ID.userId), 'fresh opt-in survived the stale sweep');
-  assert.notEqual(await vault.get(O1, 'github'), null); // fresh credential intact
-});
-
-// #192 review r2: a DM/non-union reconnect racing the sweep does NOT resurrect the OLD opt-in —
-// delegation consent belongs to one credential generation, and the fresh credential has none.
-test('sweepExpired: a DM reconnect (no re-opt-in) does not inherit the pre-expiry union opt-in', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
-  const vault = new Vault(db, KEY, { idleMs: 1000 });
-  const optin = new UnionOptin(db);
-  await vault.upsert(O1, 'github', FRESH);
-  await optin.join(ID, 'C1', 'github'); // the OLD delegation consent
-  await db.run('UPDATE connection SET last_used_at=?, created_at=? WHERE provider=?', [Date.now() - 5000, Date.now() - 5000, 'github']);
-  const realDelete = vault.deleteExpired.bind(vault);
-  (vault as any).deleteExpired = async (owner: any, provider: string) => {
-    const deleted = await realDelete(owner, provider);
-    await vault.upsert(O1, 'github', FRESH); // DM reconnect: no union channel, no joinUnion
-    return deleted;
-  };
-  assert.equal(await sweepExpired(vault, new Audit(db), new Consent(db)), 1);
-  assert.equal((await optin.optedIn(ID.teamId, 'C1', 'github')).size, 0, 'old opt-in did not survive into the new generation');
-  assert.notEqual(await vault.get(O1, 'github'), null); // the fresh credential itself is intact
-});
-
-// #192 review r2: the satellite boundary also covers plain reconnects — an upsert purges the old
-// generation's opt-ins (the union-channel callback re-adds one immediately via joinUnion).
-test('vault.upsert purges the previous generation\'s union opt-ins', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
-  const vault = new Vault(db, KEY);
-  const optin = new UnionOptin(db);
-  await vault.upsert(O1, 'github', FRESH);
-  await optin.join(ID, 'C1', 'github');
-  await vault.upsert(O1, 'github', FRESH); // reconnect
-  assert.equal((await optin.optedIn(ID.teamId, 'C1', 'github')).size, 0, 'delegation requires fresh opt-in after reconnect');
 });
 
 test('sweepExpired also clears abandoned consent requests', async () => {

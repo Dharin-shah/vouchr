@@ -1,7 +1,6 @@
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Audit } from './audit';
-import type { Owner } from './owner';
 
 /**
  * Explicit union-mode opt-in (#112). A row says: "I allow my connected `provider` credential to
@@ -56,25 +55,6 @@ export class UnionOptin {
       [teamId, userId, provider],
     );
   }
-
-}
-
-/**
- * Union opt-ins are SATELLITES of a user's connection (#192 review): purged inside the vault's
- * connection write/delete boundary (`clearSatellites`, same pattern as `purgeApprovalsForOwner`),
- * so delegation consent is always exactly as old as the credential generation it was given for.
- * A reconnect prompted from a union channel re-adds the opt-in via `joinUnion` right after the
- * upsert; a DM/non-union reconnect leaves none — a pre-expiry opt-in can never silently re-enable
- * delegation for a fresh credential. Runs on the passed Db so it joins the caller's transaction.
- * Channel-owned connections have no opt-ins. The DELETE SQL for this lifecycle lives HERE, once
- * (STR-2).
- */
-export async function purgeUnionOptinsForOwner(db: Db, owner: Owner, provider: string): Promise<void> {
-  if (owner.kind !== 'user') return;
-  await db.run(
-    `DELETE FROM union_optin WHERE team_id=? AND user_id=? AND provider=?`,
-    [owner.teamId, owner.id, provider],
-  );
 }
 
 /**

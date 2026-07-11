@@ -3,7 +3,6 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
-import { purgeUnionOptinsForOwner } from './unionOptin';
 import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
@@ -104,11 +103,6 @@ export class Vault {
    * so it must not outlive a delete (disconnect / offboard / bulk-revoke / TTL-expiry all route
    * through delete()) nor be spent after a reconnect/reconfiguration (upsert/reference). updateTokens
    * again does NOT purge — a silent refresh keeps the same connection, so a live grant stays valid.
-   *
-   * #112 union opt-ins are satellites too (#192 review): delegation consent belongs to ONE
-   * credential generation. Purging here — atomically with the connection write/delete — means a
-   * TTL-swept or reconnected credential can never inherit a pre-expiry opt-in; a union-channel
-   * reconnect re-adds it via joinUnion immediately after the upsert, a DM reconnect leaves none.
    */
   private async clearSatellites(db: Db, owner: Owner, provider: string): Promise<void> {
     await db.run(
@@ -116,7 +110,6 @@ export class Vault {
       [owner.teamId, owner.kind, owner.id, provider],
     );
     await purgeApprovalsForOwner(db, owner, provider);
-    await purgeUnionOptinsForOwner(db, owner, provider);
   }
 
   /** Connection write/delete + its notification_state purge are ONE logical mutation: run them in
