@@ -358,7 +358,7 @@ test('property: authorize URL always carries the required params; code_challenge
 //    plaintext. Random key sets, ids, and scheme mixes.
 // =====================================================================================
 test('property: random keyrings never mis-route a ciphertext to the wrong key', async () => {
-  const { encrypt, decrypt, tryDecryptDirect } = await import('../src/core/crypto');
+  const { encrypt, decrypt, tryDecryptDirect } = await import('../src/core/crypto.js');
   const keyId = () => randStr(1 + rint(12), ALNUM + '._-');
   const N = scale(150);
   for (let i = 0; i < N; i++) {

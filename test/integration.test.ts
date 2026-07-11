@@ -131,6 +131,43 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
   }
 });
 
+test('integration: OAuth callback error is served as inert text/plain, not text/html (#177)', async () => {
+  // A hostile provider can redirect the victim back with ?error=<markup> holding a valid in-flight
+  // state; the callback echoes it into `OAuth error: <x>`. Express would default a string send to
+  // text/html and execute the markup on the Vouchr host origin. The route must serve it as text/plain.
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const mock = await startMockProvider();
+  try {
+    const provider = defineProvider({
+      id: 'mock', authorizeUrl: `${mock.base}/authorize`, tokenUrl: `${mock.base}/token`,
+      scopesDefault: ['read'], egressAllow: ['127.0.0.1'], refresh: 'none', pkce: true,
+      clientId: 'cid', clientSecret: 'csec',
+    });
+    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, dbPath: ':memory:' });
+    let callback: any;
+    lan.mountRoutes({ get: (_p: string, h: any) => (callback = h) });
+
+    // Drive one consent to mint a real, valid state (the error path consumes it, reaching the echo).
+    const posts: any[] = [];
+    const client = { chat: { postEphemeral: async (a: any) => posts.push(a), postMessage: async (a: any) => posts.push(a) } };
+    const ctx: any = {};
+    await lan.middleware({ context: ctx, client, event: { channel: 'C1', user: 'U1', team: 'T1' }, next: async () => {} });
+    await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
+    const state = new URL(posts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+
+    const evil = '<img src=x onerror=alert(1)>';
+    const res = fakeRes();
+    await callback({ query: { state, error: evil } }, res);
+
+    assert.equal(res.statusCode, 400);
+    assert.match(String(res.headers['content-type']), /text\/plain/); // never text/html
+    assert.equal(res.headers['x-content-type-options'], 'nosniff'); // and no content sniffing back to html
+    assert.ok(res.body.includes(evil)); // the value is present, but as inert text under text/plain
+  } finally {
+    await mock.close();
+  }
+});
+
 test('integration: handle.fetch does not follow a redirect off the allowlisted path', async () => {
   const mock = await startMockProvider();
   try {
