@@ -257,6 +257,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Approval grants could be spent on changed query parameters** (GHSA-pg84-mp83-2p82). The
+  human-in-the-loop approval key bound only (method, host, path), so an approval of
+  `POST /transfer?to=alice&amount=10` was indistinguishable from — and spendable by —
+  `POST /transfer?to=attacker&amount=1000000`. The grant now also binds the query BYTE-EXACT, as
+  a digest of the exact query string sent upstream (no sorting/normalization — upstream parsers
+  treat reordered or duplicated parameters differently, so any textual change re-prompts). Query
+  parameter names and values are BOTH caller-controlled and may carry PII/secrets, so neither is
+  ever persisted, audited, or rendered: the Approve/Deny prompt shows only the parameter COUNT
+  and states the exact query string is bound byte-for-byte; the threat model / README now state
+  explicitly that the request body remains outside the key, so approval must not be treated as
+  covering the exact action for body-parameterized endpoints. New `approval_request.query_hash`
+  column (schema version 5, purely additive) lands as ONE atomic ALTER whose `DEFAULT 'pre-v5'`
+  marks anything a pre-v5 writer creates as unmatchable, and the migration purges all existing
+  (minutes-lived) approval rows whenever the stored schema version is below 5 — crash-safe: the
+  version stamp lands only after the purge, so an interrupted upgrade re-heals on the next open.
+  `ApprovalRequiredError` gains a display-only `queryParamCount` field and `approvalBlocks` a
+  required `queryParamCount` input. **Rolling-deploy note:** pods running code older than this
+  change consume grants WITHOUT the query binding — drain pre-upgrade pods promptly; the
+  protection is complete only once every replica enforces `query_hash`.
+
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The
   id is registry-validated, so this was defense-in-depth, but SEC-5 takes no exception; the connect

@@ -8,7 +8,7 @@ import { DryRunVaultError, dryRunEcho } from './dryRun';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
 import { safeEmit } from './safe-emit';
 import type { CredentialHealthHook } from './health';
-import { ApprovalRequiredError, type Approvals } from './approval';
+import { ApprovalRequiredError, queryDigest, type Approvals } from './approval';
 import { randomUUID } from 'node:crypto';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided. */
@@ -493,7 +493,10 @@ export class ConnectionHandle {
       const key = {
         teamId: this.acting.teamId, userId: this.triggeredBy ?? this.acting.userId,
         ownerKind: this.owner.kind, ownerId: this.owner.id, provider: this.provider.id,
-        method, host: url.hostname, path: url.pathname,
+        // queryHash (GHSA-pg84): the grant binds the exact query string sent upstream, as a
+        // digest — a retry with ANY textual change to the query re-prompts instead of spending
+        // the human's approval.
+        method, host: url.hostname, path: url.pathname, queryHash: queryDigest(url.search),
         channel: this.auditChannel(), thread: this.thread,
       };
       const grant = await this.approvals.consume(key);
@@ -505,7 +508,11 @@ export class ConnectionHandle {
         const approvalId = await this.approvals.request(key);
         this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
         await this.audit.record('approval_requested', this.acting, this.provider.id, apMeta);
-        throw new ApprovalRequiredError(this.provider.id, ap.approver, method, url.hostname, url.pathname, approvalId);
+        // Only the parameter COUNT rides the error for the prompt display (GHSA-pg84): names are
+        // as caller-controlled as values and must not reach Slack or logs (SEC-1). The exact
+        // query is bound via the digest in the key above.
+        throw new ApprovalRequiredError(this.provider.id, ap.approver, method, url.hostname, url.pathname, approvalId,
+          [...url.searchParams.keys()].length);
       }
       // The grant is spent exactly once, right here — so the trail records the consumption even if
       // the upstream call later fails. The approver's identity rides the actor column (STR-4).
