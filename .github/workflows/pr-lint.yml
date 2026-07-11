@@ -3,6 +3,10 @@ name: PR lint
 # Enforces the PROC rules from AGENTS.md on the PR title + description, so the
 # contribution contract is machine-checked instead of honor-system.
 # `edited` is included so fixing the description re-runs the check without a push.
+# Automated dependency PRs (Dependabot) are exempt from PROC-2..4 — the Checks
+# line, sign-off, and canary attest human/agent code review, which a bot bump
+# cannot make; PROC-1 (conventional title) still applies (Dependabot complies).
+# The gate is on the PR *author* login (stable if a maintainer re-runs the job).
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
@@ -22,6 +26,7 @@ jobs:
             || { echo "::error::PR title must be conventional-commit style (AGENTS.md PROC-1), e.g. 'feat(bolt): add config modal'"; exit 1; }
 
       - name: "PROC-2: description states that typecheck and tests pass"
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           CHECKS_LINE='Checks: `npm run typecheck` and `npm test` pass locally.'
           body_lines() { printf '%s\n' "$BODY" | sed -e 's/\r$//' -e '/^[[:space:]]*$/d'; }
@@ -29,6 +34,7 @@ jobs:
             || { echo "::error::PR description must include the exact Checks line from AGENTS.md PROC-2: $CHECKS_LINE"; exit 1; }
 
       - name: "PROC-3/PROC-4: sign-off line; agent PRs end with the canary"
+        if: github.event.pull_request.user.login != 'dependabot[bot]'
         run: |
           AGENT_SIGNOFF='Signed-off-by: 🤖 automated-agent (operator has not certified review)'
           CANARY='canary: vouchr-agents-md-v1 (agent-generated)'
