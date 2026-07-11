@@ -32,9 +32,13 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
   // channel-owned expiry above (STR-4).
   approvals?: Approvals,
 ): Promise<number> {
-  const expired = await vault.listExpired();
-  for (const { owner, provider } of expired) {
-    await vault.delete(owner, provider);
+  let swept = 0;
+  for (const { owner, provider } of await vault.listExpired()) {
+    // Conditional delete (#192): a reconnect that landed after the snapshot above makes this row
+    // live again — deleteExpired re-checks the TTL atomically, and a fresh credential must not be
+    // deleted, audited, or notified as 'expired'.
+    if (!(await vault.deleteExpired(owner, provider))) continue;
+    swept++;
     if (owner.kind === 'user') await unionOptin?.deleteForUserProvider(owner.teamId, owner.id, provider);
     // Audit as the owner. A channel has no acting human → user_id=channel id, actor='system'.
     const id = { enterpriseId: null, teamId: owner.teamId, userId: owner.id };
@@ -57,7 +61,7 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
         { host: row.host, method: row.method, path: row.path, reason: 'approval-expired', ...channelMeta }, 'system');
     }
   }
-  // No-secret observability: just the count. Best-effort, a bad sink must never break the sweep.
-  safeEmit(sink, { type: 'expired', count: expired.length });
-  return expired.length;
+  // No-secret observability: just the count — of rows actually deleted, not merely snapshotted.
+  safeEmit(sink, { type: 'expired', count: swept });
+  return swept;
 }
