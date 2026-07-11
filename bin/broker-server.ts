@@ -142,7 +142,7 @@ export async function buildBrokerServer(
   const approvals = new Approvals(db); // #113: expired approval prompts/grants are reclaimed (and audited) too
   const sweep = async (): Promise<number> => {
     // #117: the deployer's onCredentialHealth override (if any) also hears expiring_soon/expired.
-    const n = await sweepExpired(vault, audit, consent, undefined, overrides.onCredentialHealth, approvals);
+    const n = await sweepExpired(vault, audit, consent, undefined, undefined, overrides.onCredentialHealth, approvals);
     await sessions.sweepExpired();
     return n;
   };

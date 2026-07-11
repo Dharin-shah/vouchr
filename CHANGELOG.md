@@ -270,8 +270,10 @@ All notable changes to this project are documented here. This project adheres to
   consent belongs to exactly one credential generation. A reconnect prompted from a union channel
   re-adds the opt-in immediately (the OAuth callback's `joinUnion`); a DM/non-union reconnect
   leaves none, so a pre-expiry opt-in can never silently re-enable delegation for a fresh
-  credential. `sweepExpired` drops its `unionOptin` parameter (the satellite purge covers it); new
-  export `purgeUnionOptinsForOwner`.
+  credential. `sweepExpired`'s `unionOptin` parameter is now deprecated and ignored — the slot is
+  kept so existing positional callers' `health`/`approvals` arguments stay aligned; the purge
+  lives in the core `purgeUnionOptinsForOwner` helper (module-internal, like
+  `purgeApprovalsForOwner`), run by the vault.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

@@ -337,7 +337,7 @@ test('sweep: expiring_soon carries the EARLIEST ceiling (idle vs max-age) and on
   await vault.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db, 'U1', 'user', 'acme', now - 30 * H, now - 30 * H);
   const events: CredentialHealthEvent[] = [];
-  await sweepExpired(vault, audit, consent, undefined, (e) => events.push(e));
+  await sweepExpired(vault, audit, consent, undefined, undefined, (e) => events.push(e));
   assert.equal(events.length, 1);
   assert.equal(events[0].type, 'expiring_soon');
   const drift = Math.abs((events[0].expiresAt ?? 0) - (now - 30 * H + 80 * H));
@@ -348,13 +348,13 @@ test('sweep: expiring_soon carries the EARLIEST ceiling (idle vs max-age) and on
   const vault2 = new Vault(db2, KEY, { idleMs: 200 * H, maxAgeMs: 300 * H });
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events2: CredentialHealthEvent[] = [];
-  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, (e) => events2.push(e));
+  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, undefined, (e) => events2.push(e));
   assert.equal(events2.length, 0);
 
   // Past the ceiling → 'expired' fires (after the delete), never 'expiring_soon'.
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db2, 'U1', 'user', 'acme', now - 301 * H, now - 301 * H);
-  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, (e) => events2.push(e));
+  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, undefined, (e) => events2.push(e));
   assert.deepEqual(events2.map((e) => e.type), ['expired']);
   assert.equal(await vault2.get(O1, 'acme'), null);
 });
@@ -368,9 +368,9 @@ test('window guard: a TTL dimension <= the 72h window never warns (no perpetual 
   const vault = new Vault(db, KEY, { idleMs: 48 * H });
   await vault.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events: CredentialHealthEvent[] = [];
-  await sweepExpired(vault, new Audit(db), new Consent(db), undefined, (e) => events.push(e)); // used just now
+  await sweepExpired(vault, new Audit(db), new Consent(db), undefined, undefined, (e) => events.push(e)); // used just now
   await ageRow(db, 'U1', 'user', 'acme', now - 47 * H, now - 47 * H); // 1h from idle death
-  await sweepExpired(vault, new Audit(db), new Consent(db), undefined, (e) => events.push(e));
+  await sweepExpired(vault, new Audit(db), new Consent(db), undefined, undefined, (e) => events.push(e));
   assert.equal(events.length, 0, 'a <=window TTL dimension must never fire expiring_soon');
 
   // The shipped defaults (idle 7d / max-age 30d) both exceed the window: a fresh connection is
@@ -379,10 +379,10 @@ test('window guard: a TTL dimension <= the 72h window never warns (no perpetual 
   const vault2 = new Vault(db2, KEY, { idleMs: 7 * 24 * H, maxAgeMs: 30 * 24 * H });
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events2: CredentialHealthEvent[] = [];
-  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, (e) => events2.push(e)); // fresh: silent
+  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, undefined, (e) => events2.push(e)); // fresh: silent
   assert.equal(events2.length, 0);
   await ageRow(db2, 'U1', 'user', 'acme', now - 5 * 24 * H, now - 5 * 24 * H); // idle ceiling in 2d
-  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, (e) => events2.push(e));
+  await sweepExpired(vault2, new Audit(db2), new Consent(db2), undefined, undefined, (e) => events2.push(e));
   assert.equal(events2.length, 1);
   assert.equal(events2[0].type, 'expiring_soon');
   const drift = Math.abs((events2[0].expiresAt ?? 0) - (now - 5 * 24 * H + 7 * 24 * H));
@@ -397,7 +397,7 @@ test('window guard: a TTL dimension <= the 72h window never warns (no perpetual 
   await vault3.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db3, 'U1', 'user', 'acme', now - 30 * H, now); // created 30h ago, used now
   const events3: CredentialHealthEvent[] = [];
-  await sweepExpired(vault3, new Audit(db3), new Consent(db3), undefined, (e) => events3.push(e));
+  await sweepExpired(vault3, new Audit(db3), new Consent(db3), undefined, undefined, (e) => events3.push(e));
   assert.equal(events3.length, 1);
   assert.equal(events3[0].type, 'expiring_soon');
   const drift3 = Math.abs((events3[0].expiresAt ?? 0) - (now + 48 * H));
@@ -421,7 +421,7 @@ test('sweep 3x in a row still sends ONE expiring-soon DM (persistent debounce th
   const pending: Promise<void>[] = [];
   const hook = (e: CredentialHealthEvent) => { pending.push(notify(e)); };
   for (let i = 0; i < 3; i++) {
-    await sweepExpired(vault, audit, consent, undefined, hook);
+    await sweepExpired(vault, audit, consent, undefined, undefined, hook);
     await Promise.all(pending.splice(0));
   }
   assert.equal(dms.length, 1);
@@ -452,7 +452,7 @@ test('channel-owned credential: the expiring-soon DM goes to the configuring adm
     clientFor: async () => fakeClient(dms),
   });
   const pending: Promise<void>[] = [];
-  await sweepExpired(vault, audit, consent, undefined, (e) => { pending.push(notify(e)); });
+  await sweepExpired(vault, audit, consent, undefined, undefined, (e) => { pending.push(notify(e)); });
   await Promise.all(pending);
 
   assert.equal(dms.length, 1);

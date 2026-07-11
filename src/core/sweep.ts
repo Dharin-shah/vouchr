@@ -18,6 +18,10 @@ const EXPIRING_SOON_WINDOW_MS = 72 * 60 * 60 * 1000;
  * Returns the number of connections swept.
  */
 export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent, sink?: EventSink,
+  // DEPRECATED and ignored (#192 — kept so existing positional callers' health/approvals arguments
+  // stay aligned): union opt-ins are connection satellites now, purged atomically inside
+  // deleteExpired; passing a store here does nothing.
+  _unionOptin?: unknown,
   // Optional (#117): credential-health hook. Fires 'expired' per deleted connection (after the
   // delete) and 'expiring_soon' for every connection within 72h of its TTL ceiling. NOT debounced
   // here — it re-fires each sweep pass; notifiers debounce (see NotificationState / the Bolt

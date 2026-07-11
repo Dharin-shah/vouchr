@@ -434,7 +434,7 @@ test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no
     return rows;
   };
   const events: any[] = [];
-  assert.equal(await sweepExpired(vault, audit, consent, undefined, (e) => events.push(e)), 0);
+  assert.equal(await sweepExpired(vault, audit, consent, undefined, undefined, (e) => events.push(e)), 0);
   assert.deepEqual((await vault.listForUser(ID)).map((c) => c.provider), ['github']); // fresh row survived
   assert.notEqual(await vault.get(O1, 'github'), null); // and is live, satellites untouched
   assert.equal(((await db.all(`SELECT * FROM audit WHERE action='revoke'`)) as any[]).length, 0, 'no expired audit row');
