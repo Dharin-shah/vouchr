@@ -257,6 +257,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **TTL sweep could delete a just-reconnected credential** (#192). `sweepExpired` snapshotted
+  expired rows and then deleted by owner/provider key only, so a reconnect landing between the
+  snapshot and the delete was destroyed — and audited/notified as 'expired' — despite being fresh.
+  The sweep now uses the new `Vault.deleteExpired`, a conditional delete that re-evaluates the same
+  TTL predicate as the snapshot (one shared SQL builder, so list/delete semantics cannot drift)
+  inside the vault's mutation transaction; audit rows, health events, and the returned/emitted
+  count now reflect only rows actually deleted while still expired. Union opt-in cleanup on sweep is
+  unchanged from before (the swept user's opt-ins are dropped alongside the credential).
 - **Approval grants could be spent on changed query parameters** (GHSA-pg84-mp83-2p82). The
   human-in-the-loop approval key bound only (method, host, path), so an approval of
   `POST /transfer?to=alice&amount=10` was indistinguishable from — and spendable by —

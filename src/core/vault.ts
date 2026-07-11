@@ -302,14 +302,10 @@ export class Vault {
       .map((r) => ({ provider: r.provider, externalAccount: r.external_account }));
   }
 
-  /**
-   * Every connection currently past its TTL (for the periodic sweep). Filters in SQL
-   * (only expired rows cross the wire) rather than scanning the whole table in memory.
-   * The predicate MUST mirror isExpired(): idle uses last_used_at (falling back to
-   * created_at), max-age uses created_at; an empty policy expires nothing.
-   */
-  async listExpired(): Promise<{ owner: Owner; provider: string }[]> {
-    const now = Date.now();
+  /** The ONE SQL form of isExpired() at time `now`, shared by listExpired and deleteExpired
+   *  (STR-2 — list/delete semantics must not drift): idle uses last_used_at (falling back to
+   *  created_at), max-age uses created_at; an empty policy yields no clauses (nothing expires). */
+  private expiredPredicate(now: number): { clauses: string[]; params: any[] } {
     const clauses: string[] = [];
     const params: any[] = [];
     if (this.ttl.idleMs != null) {
@@ -320,6 +316,15 @@ export class Vault {
       clauses.push('created_at < ?');
       params.push(now - this.ttl.maxAgeMs);
     }
+    return { clauses, params };
+  }
+
+  /**
+   * Every connection currently past its TTL (for the periodic sweep). Filters in SQL
+   * (only expired rows cross the wire) rather than scanning the whole table in memory.
+   */
+  async listExpired(): Promise<{ owner: Owner; provider: string }[]> {
+    const { clauses, params } = this.expiredPredicate(Date.now());
     if (!clauses.length) return []; // empty policy → nothing expires
     const rows = (await this.db.all(
       `SELECT team_id, owner_kind, owner_id, provider FROM connection WHERE ${clauses.join(' OR ')}`,
@@ -329,6 +334,27 @@ export class Vault {
       owner: { teamId: r.team_id, kind: r.owner_kind, id: r.owner_id } as Owner,
       provider: r.provider,
     }));
+  }
+
+  /**
+   * Atomic, self-guarding expiry delete (#192): removes the row ONLY if it is still past its TTL
+   * at delete time, so a reconnect that lands between the sweep's listExpired() snapshot and this
+   * call survives — the conditional DELETE re-evaluates the same predicate the snapshot used (one
+   * source of truth, expiredPredicate). Returns whether a still-expired row was actually deleted;
+   * satellites are purged (and the caller audits/notifies) only in that case, so a fresh
+   * reconnect's notification state and grants are never clobbered by a stale sweep.
+   */
+  async deleteExpired(owner: Owner, provider: string): Promise<boolean> {
+    const { clauses, params } = this.expiredPredicate(Date.now());
+    if (!clauses.length) return false; // empty policy → nothing expires
+    return this.mutation(async (tx) => {
+      const { changes } = await tx.run(
+        `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND (${clauses.join(' OR ')})`,
+        [owner.teamId, owner.kind, owner.id, provider, ...params],
+      );
+      if (changes > 0) await this.clearSatellites(tx, owner, provider);
+      return changes > 0;
+    });
   }
 
   /**
