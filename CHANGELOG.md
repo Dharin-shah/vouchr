@@ -262,8 +262,16 @@ All notable changes to this project are documented here. This project adheres to
   snapshot and the delete was destroyed — and audited/notified as 'expired' — despite being fresh.
   The sweep now uses the new `Vault.deleteExpired`, a conditional delete that re-evaluates the same
   TTL predicate as the snapshot (one shared SQL builder, so list/delete semantics cannot drift)
-  inside the vault's mutation transaction; audit rows, union-optin cleanup, health events, and the
-  returned/emitted count now reflect only rows actually deleted while still expired.
+  inside the vault's mutation transaction; audit rows, health events, and the returned/emitted
+  count now reflect only rows actually deleted while still expired.
+
+  **Behavior change:** union opt-ins (#112) are now connection SATELLITES, purged atomically
+  inside every vault connection write/delete (upsert/reference/delete/deleteExpired) — delegation
+  consent belongs to exactly one credential generation. A reconnect prompted from a union channel
+  re-adds the opt-in immediately (the OAuth callback's `joinUnion`); a DM/non-union reconnect
+  leaves none, so a pre-expiry opt-in can never silently re-enable delegation for a fresh
+  credential. `sweepExpired` drops its `unionOptin` parameter (the satellite purge covers it); new
+  export `purgeUnionOptinsForOwner`.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

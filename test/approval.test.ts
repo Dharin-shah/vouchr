@@ -681,11 +681,11 @@ test('sweep: expired prompts and unspent grants are deleted and audited (actor: 
   const granted = await approvals.request({ ...key, path: '/other' });
   await approvals.approve(granted, 'U_ADM', 1_000); // grant, 1s TTL
   // A live grant survives the sweep.
-  await sweepExpired(vault, audit, consent, undefined, undefined, undefined, approvals);
+  await sweepExpired(vault, audit, consent, undefined, undefined, approvals);
   assert.equal(((await db.all(`SELECT * FROM approval_request`)) as any[]).length, 2);
   // Past both TTLs everything is reclaimed, each expiry audited with the non-human actor.
   await withClockOffset(11 * 60_000, async () => {
-    await sweepExpired(vault, audit, consent, undefined, undefined, undefined, approvals);
+    await sweepExpired(vault, audit, consent, undefined, undefined, approvals);
   });
   assert.equal(((await db.all(`SELECT * FROM approval_request`)) as any[]).length, 0);
   const rows = (await db.all(`SELECT action, user_id, actor, meta FROM audit WHERE action='denied'`)) as any[];

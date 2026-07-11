@@ -2,7 +2,7 @@ import type { Vault } from './vault';
 import type { Audit } from './audit';
 import type { Consent } from './consent';
 import type { EventSink } from './injector';
-import type { UnionOptin } from './unionOptin';
+
 import type { CredentialHealthHook } from './health';
 import type { Approvals } from './approval';
 import { safeEmit } from './safe-emit';
@@ -18,9 +18,6 @@ const EXPIRING_SOON_WINDOW_MS = 72 * 60 * 60 * 1000;
  * Returns the number of connections swept.
  */
 export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent, sink?: EventSink,
-  // Optional (#112): a swept user credential also drops that user's union opt-ins for the provider —
-  // delegation must not outlive the credential (a later reconnect must re-opt-in).
-  unionOptin?: UnionOptin,
   // Optional (#117): credential-health hook. Fires 'expired' per deleted connection (after the
   // delete) and 'expiring_soon' for every connection within 72h of its TTL ceiling. NOT debounced
   // here — it re-fires each sweep pass; notifiers debounce (see NotificationState / the Bolt
@@ -39,9 +36,8 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
     // deleted, audited, or notified as 'expired'.
     if (!(await vault.deleteExpired(owner, provider))) continue;
     swept++;
-    // Guarded variant (#192 review): a reconnect landing after deleteExpired above may have
-    // already re-created the opt-in — only purge opt-ins with no live connection behind them.
-    if (owner.kind === 'user') await unionOptin?.deleteForUserProviderIfDisconnected(owner.teamId, owner.id, provider);
+    // Union opt-ins (#112) need no separate cleanup here: they are vault satellites (#192 review),
+    // purged atomically inside deleteExpired — a reconnect's fresh opt-in postdates that delete.
     // Audit as the owner. A channel has no acting human → user_id=channel id, actor='system'.
     const id = { enterpriseId: null, teamId: owner.teamId, userId: owner.id };
     await audit.record('revoke', id, provider, { reason: 'expired', owner_kind: owner.kind },

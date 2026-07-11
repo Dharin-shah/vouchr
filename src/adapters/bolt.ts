@@ -2207,7 +2207,7 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Delete every connection past its TTL + clear stale consent + expired thread sessions +
    *  expired approval prompts/grants (#113, audited inside core sweepExpired). Run on a timer. */
   async function sweep(): Promise<number> {
-    const n = await sweepExpired(vault, audit, consent, sink, unionOptin, health, approvals);
+    const n = await sweepExpired(vault, audit, consent, sink, health, approvals);
     await sessions.sweepExpired();
     return n;
   }

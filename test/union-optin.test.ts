@@ -311,7 +311,7 @@ test('TTL sweep: an expired user credential takes its union opt-ins with it', as
   await vault.upsert(userOwner(ALICE), 'mcp', tok());
   await optin.join(ALICE, 'C_FIN', 'mcp');
   await db.run('UPDATE connection SET last_used_at=? WHERE provider=?', [Date.now() - 5000, 'mcp']);
-  assert.equal(await sweepExpired(vault, audit, consent, undefined, optin), 1);
+  assert.equal(await sweepExpired(vault, audit, consent), 1);
   assert.equal(await optinCount(db), 0); // delegation did not outlive the credential
 });
 
