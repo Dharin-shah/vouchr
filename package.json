@@ -80,7 +80,7 @@
     "example:dry-run": "node --import tsx --test examples/dry-run/app.test.ts"
   },
   "dependencies": {
-    "@slack/bolt": "^3.22.0",
+    "@slack/bolt": "^4.7.3",
     "@slack/web-api": "^7.18.0",
     "better-sqlite3": "^12.11.1",
     "pg": "^8.22.0"
