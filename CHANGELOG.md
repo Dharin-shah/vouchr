@@ -276,7 +276,6 @@ All notable changes to this project are documented here. This project adheres to
   executing the markup on the Vouchr host origin. Error responses are now served as
   `text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`, so any echoed value is inert.
   (The headless broker route already routed these through the escaping `landingHtml`.)
->>>>>>> origin/main
 
 - **Unescaped provider-controlled labels in two post-connect surfaces** (#176). The OAuth-callback
   confirmation DM and `connectedBlocks` interpolated the provider-reported external account label
