@@ -192,8 +192,10 @@ class PgClientDb implements Db {
  * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
  *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
  *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
- * Version 5 = + the `approval_request.query_hash` column (GHSA-pg84, purely additive). The DEFAULT
- *   '' means a pre-v5 grant matches only query-less requests after the upgrade — fail closed.
+ * Version 5 = + the `approval_request.query_hash` column (GHSA-pg84, purely additive). Rows that
+ *   existed before the migration are stamped `'pre-v5'` — a value no live digest can equal ('' or
+ *   64-char hex) — so a legacy grant matches NOTHING and simply re-prompts: '' as a default would
+ *   let a grant originally minted for a query-bearing action authorize a queryless request.
  */
 export const SCHEMA_VERSION = 5;
 
@@ -390,8 +392,16 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
       await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
       // #116 v4: system-only dry-run provenance on the credential row (never user/provider data).
       await db.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS dry_run BIGINT NOT NULL DEFAULT 0`);
-      // GHSA-pg84 v5: canonical query digest on approval rows (a digest, never raw query values).
-      await db.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS query_hash TEXT NOT NULL DEFAULT ''`);
+      // GHSA-pg84 v5: query digest on approval rows (a digest, never raw query values). Detect the
+      // column FIRST so pre-existing rows can be stamped with the fail-closed 'pre-v5' sentinel —
+      // a bare ADD COLUMN IF NOT EXISTS couldn't tell "just added" from "already there".
+      const hasQueryHash = await db.get(
+        `SELECT 1 AS x FROM information_schema.columns WHERE table_name='approval_request' AND column_name='query_hash'`,
+      );
+      if (!hasQueryHash) {
+        await db.exec(`ALTER TABLE approval_request ADD COLUMN query_hash TEXT NOT NULL DEFAULT ''`);
+        await db.run(`UPDATE approval_request SET query_hash='pre-v5'`, []); // legacy grants match nothing (fail closed)
+      }
       await stampSchemaVersion(db);
     } catch (e) {
       await db.close().catch(() => undefined);
@@ -456,9 +466,13 @@ function migrateSqlite(db: BetterSqlite3.Database): void {
     db.exec(`ALTER TABLE connection ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0`);
   }
 
-  // GHSA-pg84 v5: canonical query digest on a pre-existing approval_request table.
+  // GHSA-pg84 v5: query digest on a pre-existing approval_request table. Existing rows get the
+  // 'pre-v5' sentinel — no live digest ('' or hex) can equal it, so legacy grants match nothing
+  // and re-prompt (fail closed) instead of '' letting an old query-bearing grant authorize a
+  // queryless request.
   const apCols = (db.prepare(`PRAGMA table_info(approval_request)`).all() as any[]).map((c) => c.name);
   if (!apCols.includes('query_hash')) {
     db.exec(`ALTER TABLE approval_request ADD COLUMN query_hash TEXT NOT NULL DEFAULT ''`);
+    db.exec(`UPDATE approval_request SET query_hash='pre-v5'`);
   }
 }

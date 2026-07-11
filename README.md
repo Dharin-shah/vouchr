@@ -220,12 +220,14 @@ approval** for sensitive writes at the same boundary. Between "never allowed" (e
 allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
 method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons in
 Slack — to the acting user for `'self'`, to eligible admins for `'admin'` (the same eligibility
-gate as the channel config commands) — showing the provider, method, host+path, and the exact
-query parameters, never the request body. It then throws the exported `ApprovalRequiredError`
-(catch and stop the turn, exactly like `ConsentRequiredError`); on Approve the retried call finds
-the grant, spends it, and executes. A grant is **single-use**, expires after `ttlMs` (default 5
-minutes), and matches only the exact (method, host, path, query) it was minted for — the query as
-a canonical digest, so raw values are never persisted; not a prefix, not the payload bytes — **and** the exact
+gate as the channel config commands) — showing the provider, method, host+path, and the query
+parameter names (values are bound but never displayed: they can carry secrets/PII), never the
+request body. It then throws the exported `ApprovalRequiredError` (catch and stop the turn,
+exactly like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and
+executes. A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only
+the exact (method, host, path, query) it was minted for — the query byte-exact as a digest, so
+raw values are never persisted and any reordering re-prompts; not a prefix, not the payload
+bytes — **and** the exact
 credential owner: a union member switch or a per-user→shared mode change re-prompts rather than
 running against a credential the human didn't approve, and disconnecting/reconnecting the credential
 purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every

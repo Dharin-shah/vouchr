@@ -193,11 +193,14 @@ into many actions, or to skip the approval entirely.
   `DELETE ... RETURNING` as the OAuth `state`, so two concurrent retries cannot both
   spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
   (method, host, path, query) it was minted for: not a prefix, not a pattern, never a
-  class of actions. The query is bound as a canonical digest (parameters sorted, then
-  hashed — raw values may carry PII/secrets and are never persisted or audited), so a
-  replanning or prompt-injected agent cannot spend an approval of
-  `POST /transfer?to=alice&amount=10` on `?to=attacker&amount=1000000`; the prompt shows
-  the human the exact parameters being approved. When `approval.paths` is set it
+  class of actions. The query is bound BYTE-EXACT, as a digest of the exact query string
+  sent upstream — no sorting or normalization, since upstream parsers legitimately treat
+  reordered or duplicated parameters differently — so a replanning or prompt-injected
+  agent cannot spend an approval of `POST /transfer?to=alice&amount=10` on
+  `?to=attacker&amount=1000000` (or on any reordering); any textual change re-prompts.
+  Raw query values may carry tokens, signed-URL signatures, or PII, so they are never
+  persisted, audited, logged, or rendered: the prompt lists the parameter NAMES and
+  states that their exact values are bound. When `approval.paths` is set it
   inherits the egress path lock's fail-closed
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential

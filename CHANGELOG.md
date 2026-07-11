@@ -260,16 +260,18 @@ All notable changes to this project are documented here. This project adheres to
 - **Approval grants could be spent on changed query parameters** (GHSA-pg84-mp83-2p82). The
   human-in-the-loop approval key bound only (method, host, path), so an approval of
   `POST /transfer?to=alice&amount=10` was indistinguishable from — and spendable by —
-  `POST /transfer?to=attacker&amount=1000000`. The grant now also binds the exact query as a
-  canonical digest (parameters sorted then hashed; raw values may carry PII/secrets and are never
-  persisted or audited): a retry with any changed parameter re-prompts, while the same parameters
-  in a different order still consume the grant. The Approve/Deny prompt now renders the exact
-  query being approved (from the in-memory error, escaped and clipped — never from storage), and
-  the threat model / README now state explicitly that the request body remains outside the key,
-  so approval must not be treated as covering the exact action for body-parameterized endpoints.
-  New `approval_request.query_hash` column (schema version 5, purely additive; pre-upgrade grants
-  fail closed for query-carrying requests). `ApprovalRequiredError` gains a display-only `query`
-  field and `approvalBlocks` a required `query` input.
+  `POST /transfer?to=attacker&amount=1000000`. The grant now also binds the query BYTE-EXACT, as
+  a digest of the exact query string sent upstream (no sorting/normalization — upstream parsers
+  treat reordered or duplicated parameters differently, so any textual change re-prompts; raw
+  values may carry PII/secrets and are never persisted, audited, or rendered). The Approve/Deny
+  prompt lists the query parameter NAMES (with an explicit `+N more` overflow, never silent
+  truncation) and states that their exact values are bound; the threat model / README now state
+  explicitly that the request body remains outside the key, so approval must not be treated as
+  covering the exact action for body-parameterized endpoints. New `approval_request.query_hash`
+  column (schema version 5, purely additive; pre-existing rows are stamped a `'pre-v5'` sentinel
+  that matches no live digest, so every legacy grant fails closed and re-prompts).
+  `ApprovalRequiredError` gains a display-only `queryParams` (names) field and `approvalBlocks` a
+  required `queryParams` input.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

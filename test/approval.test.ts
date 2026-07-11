@@ -269,44 +269,102 @@ test('exact matching: a grant never covers a different method, path, or query', 
 
 // ── GHSA-pg84: the grant binds the exact (canonical) query parameters ──────────────────────────────
 
-test('queryDigest: order-insensitive, value/key-sensitive, encoding-normalized, \'\' for no params', () => {
+test('queryDigest: byte-exact — ANY textual change (order, duplicates, encoding) is a different action', () => {
   assert.equal(queryDigest(''), '');
   assert.equal(queryDigest('?'), '');
-  assert.equal(queryDigest('?a=1&b=2'), queryDigest('?b=2&a=1')); // same params, any order
-  assert.equal(queryDigest('?a=%31'), queryDigest('?a=1')); // encoding variants of the same value
+  assert.equal(queryDigest('?a=1&b=2'), queryDigest('?a=1&b=2')); // identical bytes match
+  assert.notEqual(queryDigest('?a=1&b=2'), queryDigest('?b=2&a=1')); // reordering re-prompts (fail closed)
+  assert.notEqual(queryDigest('?amount=10&amount=1000000'), queryDigest('?amount=1000000&amount=10')); // duplicate order matters upstream
+  assert.notEqual(queryDigest('?a=%31'), queryDigest('?a=1')); // different bytes upstream = different action
   assert.notEqual(queryDigest('?a=1'), queryDigest('?a=2')); // changed value
   assert.notEqual(queryDigest('?a=1'), queryDigest('?b=1')); // changed key
   assert.notEqual(queryDigest('?a=1'), queryDigest('?a=1&a=1')); // repeated param is different
-  assert.notEqual(queryDigest('?a=1'), ''); // params never collapse to the no-query sentinel
+  assert.notEqual(queryDigest('?a=1'), ''); // params never collapse to the no-query value
+  assert.notEqual(queryDigest('?a=1'), 'pre-v5'); // and can never equal the migration sentinel
 });
 
-test('GHSA-pg84: an approval cannot be spent on changed query parameters; canonical reorder still can', async () => {
+test('GHSA-pg84: an approval binds the exact query — tampered, reordered, or duplicate-shuffled retries re-prompt', async () => {
   const { ctx, click, ephemerals, approvalRows, auditRows } = await harness();
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
-    const QUERY_SENTINEL = 'alice-PII-payee'; // a query VALUE that must never be persisted or audited
+    const QUERY_SENTINEL = 'alice-PII-payee'; // a query VALUE that must never leave the process
     const e = await expectApprovalRequired(
       handle.fetch(`https://api.acme.test/transfer?to=${QUERY_SENTINEL}&amount=10`, { method: 'POST' }),
     );
-    // The human sees exactly which parameters they are approving (display from the in-memory error)…
-    assert.equal(e.query, `?to=${QUERY_SENTINEL}&amount=10`);
-    assert.match(JSON.stringify(ephemerals[0].blocks), new RegExp(QUERY_SENTINEL));
-    // …but raw query values are NEVER stored (only the canonical digest is) and NEVER audited (SEC-1).
+    // The human sees WHICH parameters are bound (names only, from the in-memory error)…
+    assert.deepEqual(e.queryParams, ['to', 'amount']);
+    const rendered = JSON.stringify(ephemerals[0].blocks);
+    assert.match(rendered, /to=…&amount=…/);
+    // …but the VALUE never reaches Slack, the store, or audit (SEC-1).
+    assert.ok(!rendered.includes(QUERY_SENTINEL), 'no query value in the prompt');
     assert.ok(!JSON.stringify(await approvalRows()).includes(QUERY_SENTINEL), 'no raw query in the approval row');
     assert.ok(!JSON.stringify(await auditRows()).includes(QUERY_SENTINEL), 'no raw query in audit');
 
     await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
-    // A retry with materially different parameters is a DIFFERENT action: re-prompts, grant intact.
+    // ANY textual change to the query is a different action: re-prompts, grant intact.
     await expectApprovalRequired(
       handle.fetch('https://api.acme.test/transfer?to=attacker&amount=1000000', { method: 'POST' }),
     );
-    assert.equal(calls.length, 0, 'the tampered retry never reached the wire');
-    // Semantically identical canonical input (same params, different order) still consumes the grant.
-    const res = await handle.fetch(`https://api.acme.test/transfer?amount=10&to=${QUERY_SENTINEL}`, { method: 'POST' });
+    await expectApprovalRequired( // reordered params — upstream may parse differently, fail closed
+      handle.fetch(`https://api.acme.test/transfer?amount=10&to=${QUERY_SENTINEL}`, { method: 'POST' }),
+    );
+    assert.equal(calls.length, 0, 'no mismatched retry reached the wire');
+    // The byte-identical retry consumes the grant exactly once.
+    const res = await handle.fetch(`https://api.acme.test/transfer?to=${QUERY_SENTINEL}&amount=10`, { method: 'POST' });
     assert.equal(res.status, 200);
     assert.equal(calls.length, 1, 'the faithful retry executed exactly once');
     assert.ok(!JSON.stringify(await auditRows()).includes(QUERY_SENTINEL), 'consumption audit carries no raw query');
   });
+});
+
+test('GHSA-pg84: duplicate-key reordering cannot spend a grant (first-wins vs last-wins upstreams)', async () => {
+  const { ctx, click } = await harness();
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(
+      handle.fetch('https://api.acme.test/transfer?amount=10&amount=1000000', { method: 'POST' }),
+    );
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
+    // Same multiset of parameters, different order — a first-wins upstream now reads 1000000.
+    await expectApprovalRequired(
+      handle.fetch('https://api.acme.test/transfer?amount=1000000&amount=10', { method: 'POST' }),
+    );
+    assert.equal(calls.length, 0);
+    const res = await handle.fetch('https://api.acme.test/transfer?amount=10&amount=1000000', { method: 'POST' });
+    assert.equal(res.status, 200); // the exact approved bytes still work
+  });
+});
+
+test('GHSA-pg84: v4→v5 migration stamps legacy approval rows fail-closed (no queryless spend)', async () => {
+  const { mkdtempSync, rmSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'vouchr-v4-'));
+  const file = join(dir, 'v4.db');
+  try {
+    // Build a "v4" database: current schema minus query_hash, holding one GRANTED approval row.
+    const db4 = await openDb({ dbPath: file });
+    await db4.run(
+      `INSERT INTO approval_request (id, team_id, user_id, owner_kind, owner_id, provider, method, host, path, query_hash, channel, thread, status, approved_by, created_at, expires_at)
+       VALUES ('L1','T1','U1','user','U1','acme','POST','api.acme.test','/transfer','SHOULD-BE-RESTAMPED','C1','','granted','U9',?,?)`,
+      [Date.now(), Date.now() + 3_600_000],
+    );
+    await db4.exec(`ALTER TABLE approval_request DROP COLUMN query_hash`);
+    await db4.run(`UPDATE meta SET value='4' WHERE key='schema_version'`, []);
+    await db4.close();
+
+    // Re-open: the v5 migration adds the column and stamps existing rows with the sentinel.
+    const db5 = await openDb({ dbPath: file });
+    const row = (await db5.get(`SELECT query_hash FROM approval_request WHERE id='L1'`)) as any;
+    assert.equal(row.query_hash, 'pre-v5');
+    // A queryless request (live digest '') can NOT consume the legacy grant.
+    const approvals = new Approvals(db5);
+    const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/transfer', queryHash: '', channel: 'C1', thread: null };
+    assert.equal(await approvals.consume(key), null);
+    await db5.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('P1-B: an encoded path separator cannot slip past an approval.paths lock (fail closed)', async () => {

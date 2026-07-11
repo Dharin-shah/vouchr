@@ -3,21 +3,25 @@ import type { Db } from './db';
 import type { Owner } from './owner';
 
 /**
- * Canonical digest of a request's query string, bound into the approval key (GHSA-pg84): a grant
+ * Digest of the EXACT query string sent upstream, bound into the approval key (GHSA-pg84): a grant
  * for `POST /transfer?to=alice&amount=10` must never be spendable on
  * `POST /transfer?to=attacker&amount=1000000`. A DIGEST, never the raw values — query values can
- * carry PII or secrets, so they are never persisted or audited (SEC-1); the human-facing prompt
- * renders the live query from the in-memory error instead. Canonical = URLSearchParams entries
- * sorted by key then value and re-serialized, so parameter order and encoding variants of the SAME
- * parameters match while any changed key or value re-prompts. '' (no parameters) stays '', which
- * also makes pre-migration rows (DEFAULT '') behave correctly: an old grant still matches a
- * query-less request and fails closed (re-prompts) for any query-carrying one.
+ * carry PII or secrets, so they are never persisted or audited (SEC-1).
+ *
+ * Byte-exact on purpose — no parsing, no sorting, no normalization: upstream parsers legitimately
+ * treat reordered or duplicated parameters differently (`?amount=10&amount=1000000` vs its
+ * reverse picks a different amount on first-wins vs last-wins servers), so ANY textual change is a
+ * different action and must re-prompt. Fail-closed beats convenient: a semantically-identical
+ * reordered retry re-prompts. Mint and consume both read `url.search` off the same WHATWG-parsed
+ * URL the injector sends, so the hashed representation is exactly what goes upstream.
+ *
+ * '' (no query) stays '' — and pre-v5 rows are stamped with a `'pre-v5'` sentinel (see db.ts)
+ * that no live digest can equal, so a legacy query-bearing grant can never authorize a queryless
+ * request.
  */
 export function queryDigest(search: string): string {
-  const entries = [...new URLSearchParams(search)];
-  if (!entries.length) return '';
-  entries.sort(([ak, av], [bk, bv]) => (ak < bk ? -1 : ak > bk ? 1 : av < bv ? -1 : av > bv ? 1 : 0));
-  return createHash('sha256').update(new URLSearchParams(entries).toString()).digest('hex');
+  if (!search || search === '?') return '';
+  return createHash('sha256').update(search).digest('hex');
 }
 
 /** Default validity of an approval once granted (#113): 5 minutes, unless the provider sets ttlMs. */
@@ -44,12 +48,13 @@ export class ApprovalRequiredError extends Error {
     /** The pending approval-request id the Approve/Deny surface decides on. */
     public approvalId: string,
     /**
-     * The raw query string (`url.search`, '' when none) — DISPLAY ONLY, so the Approve/Deny prompt
-     * can show the human exactly what they are approving (GHSA-pg84). Carried in memory on the
-     * typed error, never in the message (host apps log messages), never persisted, never audited:
-     * the store binds the canonical digest instead (see queryDigest).
+     * Query parameter NAMES (deduped, request order) — display only, so the Approve/Deny prompt
+     * can show WHICH parameters are bound (GHSA-pg84). Never the values: they can carry tokens,
+     * signed-URL signatures, or PII, so they must not reach Slack, logs, storage, or audit
+     * (SEC-1) — the store binds their digest instead (see queryDigest), and error serializers
+     * that walk enumerable properties see only structural names here.
      */
-    public query: string = '',
+    public queryParams: string[] = [],
   ) {
     super(
       `Approval required: ${method} ${host}${path} on provider "${provider}" needs ` +
