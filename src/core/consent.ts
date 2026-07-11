@@ -78,11 +78,12 @@ export class Consent {
 
   /**
    * Durable fail-closed offboarding gate (GHSA-25m2): record that this user was offboarded NOW.
-   * `consume()` refuses any consent state minted at or before this instant, so even if the row
-   * purge in {@link deleteForUser} transiently fails, a pending pre-offboarding "Connect" can
-   * never complete and resurrect a credential. Tombstones are permanent and tiny (one row per
-   * offboarded user); a legitimately re-onboarded user starts a NEW consent, which is newer than
-   * the tombstone and passes. Re-offboarding refreshes the timestamp.
+   * `consume()` refuses any consent state minted at or before this instant (plus a state-lifetime
+   * skew margin — see consume), so even if the row purge in {@link deleteForUser} transiently
+   * fails, a pending pre-offboarding "Connect" can never complete and resurrect a credential.
+   * Tombstones are permanent and tiny (one row per offboarded user); a legitimately re-onboarded
+   * user starts a NEW consent, which clears the tombstone+margin window (~10 minutes after
+   * offboarding) and passes. Re-offboarding refreshes the timestamp.
    */
   async markOffboarded(i: SlackIdentity): Promise<void> {
     await this.db.run(
@@ -125,12 +126,19 @@ export class Consent {
     if (Date.now() - row.created_at > STATE_TTL_MS) return null;
     // Offboarding tombstone (GHSA-25m2): a consent minted at or before the user's offboarding can
     // never complete, even when the offboarding row-purge transiently failed. Checked AFTER the
-    // single-use delete, so the state is spent either way.
+    // single-use delete, so the state is spent either way. The comparison carries a full
+    // state-lifetime margin because both stamps come from APPLICATION clocks on possibly different
+    // replicas: any pre-offboarding consent is at most STATE_TTL_MS old when it could still be
+    // consumed, so refusing everything up to tombstone+TTL blocks it under clock skew as large as
+    // the TTL itself (skew beyond that already breaks state expiry). Cost: a re-onboarded user can
+    // reconnect ~10 minutes after offboarding, not instantly.
+    // ponytail: app-clock compare with a TTL-sized skew margin; the PG-only direction (#204) can
+    // move both stamps to database time and drop the margin.
     const tomb = (await this.db.get(
       `SELECT created_at FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
       [row.team_id, row.user_id],
     )) as any;
-    if (tomb && tomb.created_at >= row.created_at) return null;
+    if (tomb && tomb.created_at + STATE_TTL_MS >= row.created_at) return null;
     return {
       state: row.state,
       identity: {

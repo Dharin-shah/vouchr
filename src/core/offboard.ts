@@ -22,31 +22,42 @@ async function removeUserConnection(
   registry: ProviderRegistry | undefined,
   identity: SlackIdentity,
   provider: string,
-): Promise<{ removed: boolean; ok: boolean }> {
+): Promise<{ removed: boolean; ok: boolean; attempted: boolean }> {
   const owner = userOwner(identity);
   let cred: { accessToken: string | null; dryRun: boolean } | null = null;
+  let readFailed = false;
   if (registry?.has(provider)) {
     try {
       cred = await vault.getForRevoke(owner, provider);
     } catch {
-      // decrypt/KMS failure: the upstream revoke is skipped, the local delete below still happens
+      readFailed = true; // decrypt/KMS failure: the revoke is skipped, the local delete still happens
     }
   }
   const removed = await vault.delete(owner, provider); // local delete FIRST
+  // `ok` = "no upstream revocation debt was left behind"; `attempted` = a real revoke call was made.
+  // A revocation that was DUE (revocable provider, row existed) but couldn't run because the token
+  // was unreadable is ok:false — the upstream token may still be live, and reporting ok:true for a
+  // revoke that never happened would be a lie (GHSA-25m2 review r3).
   let ok = true;
+  let attempted = false;
   if (registry?.has(provider)) {
-    try {
-      // #116: a dry-run credential is synthetic — an upstream revoke would be a REAL network call
-      // POSTing it to the provider. Keyed off the trusted dry_run column (no flag here), so the CLI
-      // is covered too, and a REAL account labelled "dry-run" still revokes normally.
-      if (cred?.accessToken && !cred.dryRun) {
-        await revokeToken(registry.get(provider), cred.accessToken);
+    const p = registry.get(provider);
+    const revocable = !!(p.revoke || p.revokeUrl);
+    // #116: a dry-run credential is synthetic — an upstream revoke would be a REAL network call
+    // POSTing it to the provider. Keyed off the trusted dry_run column (no flag here), so the CLI
+    // is covered too, and a REAL account labelled "dry-run" still revokes normally.
+    if (revocable && cred?.accessToken && !cred.dryRun) {
+      attempted = true;
+      try {
+        await revokeToken(p, cred.accessToken);
+      } catch {
+        ok = false; // network/HTTP failure: local access is already gone; nothing is faked
       }
-    } catch {
-      ok = false; // network/HTTP failure: local access is already gone; nothing is faked
+    } else if (revocable && removed && readFailed) {
+      ok = false; // revocation was due, but the token could not be read to hand upstream
     }
   }
-  return { removed, ok };
+  return { removed, ok, attempted };
 }
 
 /**
@@ -66,9 +77,11 @@ export async function disconnectProvider(
   // (e.g. from a DM) can't silently resurrect delegation they walked away from.
   unionOptin?: UnionOptin,
 ): Promise<{ removed: boolean; ok: boolean }> {
-  const { removed, ok } = await removeUserConnection(vault, registry, identity, provider);
+  const { removed, ok, attempted } = await removeUserConnection(vault, registry, identity, provider);
   await unionOptin?.deleteForUserProvider(identity.teamId, identity.userId, provider);
-  await audit.record('revoke', identity, provider, { ok }); // never the token
+  // meta.ok keeps its shape; upstream:'skipped' (same key as revokeConnection, STR-4) marks that no
+  // real revoke call was made — so ok:false + skipped is legible as "token unreadable, revoke due".
+  await audit.record('revoke', identity, provider, { ok, ...(attempted ? {} : { upstream: 'skipped' }) }); // never the token
   return { removed, ok };
 }
 
@@ -114,24 +127,37 @@ export async function offboardUser(
   try { await unionOptin?.deleteForUser(identity); } catch { /* opt-ins are inert once the credentials below are gone */ }
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
   const removed: string[] = [];
+  let deleteFailures = 0;
   for (const provider of providers) {
     // Per-row isolation (GHSA-25m2): one row's decrypt/delete/audit failure must never strand the
     // remaining credentials — every row gets its own delete attempt, and the return value only
     // claims what was actually removed.
+    let outcome: { removed: boolean; ok: boolean; attempted: boolean };
     try {
-      const { removed: gone, ok } = await removeUserConnection(vault, registry, identity, provider);
-      if (gone) removed.push(provider);
-      const meta: Record<string, unknown> = { reason };
-      if (registry) meta.ok = ok; // never the token, just whether the upstream call succeeded
+      outcome = await removeUserConnection(vault, registry, identity, provider);
+    } catch {
+      deleteFailures++; // this row's DELETE failed (transient DB error): keep going, surface below
+      continue;
+    }
+    if (outcome.removed) removed.push(provider);
+    const meta: Record<string, unknown> = { reason };
+    if (registry) {
+      meta.ok = outcome.ok; // never the token, just whether upstream revocation debt remains
+      if (!outcome.attempted) meta.upstream = 'skipped'; // same key as revokeConnection (STR-4)
+    }
+    try {
       await audit.record('revoke', identity, provider, meta);
     } catch {
-      // this row's delete or audit failed (e.g. transient DB error): continue to the next row
+      // audit is best-effort per row here: the delete already happened and later rows must run
     }
   }
-  // Every delete above was attempted regardless — but if BOTH the tombstone and the row purge
-  // failed, the consent-resurrection gate is open and this offboarding must not report success.
+  // Every delete above was attempted regardless — but a failure that left state behind must not
+  // read as success (GHSA-25m2 review r3): surface it so the caller retries.
   if (!gated && !purged) {
     throw new Error('offboarding incomplete: pending consent could not be invalidated; retry offboarding'); // no ids/secrets
+  }
+  if (deleteFailures > 0) {
+    throw new Error(`offboarding incomplete: ${deleteFailures} credential deletion(s) failed; retry offboarding`); // no ids/secrets
   }
   return removed;
 }

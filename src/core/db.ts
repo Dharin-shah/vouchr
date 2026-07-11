@@ -192,11 +192,14 @@ class PgClientDb implements Db {
  * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
  *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
  *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
- * Version 5 = + the `offboard_tombstone` table (GHSA-25m2, purely additive): the durable
+ * Version 5 = + the `approval_request.query_hash` column (GHSA-pg84, purely additive; lands with
+ *   the approval query-binding fix — the DDL here is shared and idempotent, so either merge order
+ *   converges).
+ * Version 6 = + the `offboard_tombstone` table (GHSA-25m2, purely additive): the durable
  *   fail-closed gate that keeps a pending consent from resurrecting an offboarded user's
  *   credential even when the offboarding row-purge transiently fails.
  */
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;

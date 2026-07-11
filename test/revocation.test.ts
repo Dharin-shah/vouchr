@@ -207,6 +207,41 @@ test('offboardUser deletes ALL rows even when the KMS envelope unwrap fails', as
   }
   assert.equal(await countConnections(db), 0); // no stranded credential rows
   assert.equal(fetched, false); // no token was readable, so no upstream revoke was attempted
+  // Truthful audit (review r3): revocation was DUE but couldn't run — never reported as ok:true.
+  for (const r of (await db.all(`SELECT meta FROM audit WHERE action='revoke'`)) as any[]) {
+    const meta = JSON.parse(r.meta);
+    assert.equal(meta.ok, false);
+    assert.equal(meta.upstream, 'skipped');
+  }
+});
+
+// Review r3: a failed credential DELETE must surface as incomplete, never as partial success.
+test('offboardUser throws when a credential deletion fails, after attempting the other rows', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const seeder = new Vault(db, KEY);
+  for (const p of ['revocable', 'revocable2']) {
+    await seeder.upsert(O1, p, { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  }
+  // DELETEs against the connection table fail for the FIRST provider only.
+  let failed = 0;
+  const flakyDb = {
+    get: db.get.bind(db),
+    all: db.all.bind(db),
+    exec: db.exec.bind(db),
+    close: db.close.bind(db),
+    run: (sql: string, params?: unknown[]) => {
+      if (sql.includes('DELETE FROM connection') && (params as any[])?.includes('revocable') && failed === 0) {
+        failed++;
+        return Promise.reject(new Error('connection table down'));
+      }
+      return db.run(sql, params as any[]);
+    },
+  } as any;
+  const vault = new Vault(flakyDb, KEY);
+  await assert.rejects(offboardUser(vault, new Audit(db), new Consent(db), ID), /credential deletion\(s\) failed/);
+  // The OTHER provider's delete was still attempted and succeeded before the throw.
+  const left = (await db.all(`SELECT provider FROM connection`)) as any[];
+  assert.deepEqual(left.map((r) => r.provider), ['revocable']);
 });
 
 // GHSA-25m2: an audit failure on one row must not abort the deletes for the remaining rows.
@@ -368,17 +403,30 @@ test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot 
   }
   assert.equal(await countConnections(db), 0, 'no credential was resurrected');
 
-  // A NEW consent begun AFTER offboarding (legitimate re-onboarding) still works.
-  await new Promise((r) => setTimeout(r, 5)); // strictly newer than the tombstone
-  const again = await consent.begin(ID, revocable, 'https://cb.example/x', null);
-  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'NEW_TOK' }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
+  // A NEW consent begun AFTER offboarding + the skew margin (legitimate re-onboarding) still
+  // works. Fake clock: the margin is a full state lifetime (~10 min), so jump past it.
+  const realNow = Date.now;
+  const base = realNow();
+  Date.now = () => base + 11 * 60_000;
   try {
+    const again = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+    globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'NEW_TOK' }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
     const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://cb.example/x' }, 'CODE', again.state);
     assert.equal(res.ok, true);
   } finally {
+    Date.now = realNow;
     globalThis.fetch = realFetch;
   }
   assert.equal(await countConnections(db), 1); // re-onboarding is not bricked
+
+  // Inside the margin window a consent is still refused — the skew tolerance is fail-closed.
+  Date.now = () => base + 5 * 60_000;
+  try {
+    const tooSoon = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+    assert.equal(await consent.consume(tooSoon.state), null);
+  } finally {
+    Date.now = realNow;
+  }
 });
 
 test('offboardUser throws (after attempting every delete) only when BOTH the tombstone and the purge fail', async () => {

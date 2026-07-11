@@ -131,11 +131,12 @@ export class Vault {
     await purgeApprovalsForOwner(db, owner, provider);
   }
 
-  /** Connection WRITE + its satellite purge are ONE logical mutation: run them in one transaction
-   *  so a purge failure can't half-commit a write (a "failed" upsert that actually landed). Used by
-   *  the write paths only — delete() deliberately is NOT transactional over the purge, so a
-   *  satellite failure can never roll back a credential delete (GHSA-25m2 review; see delete()).
-   *  A backend without `transaction` (only minimal test stubs) falls back to sequential statements. */
+  /** Connection write/delete + its satellite purge are ONE logical mutation: run them in one
+   *  transaction so a purge failure can't half-commit a write, and a delete's purge can never
+   *  touch a newer credential generation. delete() additionally retries WITHOUT the purge when
+   *  the transaction fails — a satellite failure must never roll back a credential delete
+   *  (GHSA-25m2 review; see delete()). A backend without `transaction` (only minimal test stubs)
+   *  falls back to sequential statements. */
   private mutation<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
     return this.db.transaction ? this.db.transaction(fn) : fn(this.db);
   }
@@ -409,22 +410,39 @@ export class Vault {
    * Returns whether a row actually existed, so callers derive a truthful `removed` from the
    * delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2).
    *
-   * Unlike the WRITE paths (upsert/reference, where a satellite-purge failure correctly rolls the
-   * whole write back — no new credential lands without its satellites cleared), the satellite
-   * purge here runs AFTER the delete and BEST-EFFORT: a notification/approval cleanup failure must
-   * never roll back or block the credential delete (GHSA-25m2 review). A missed purge is
-   * fail-closed anyway: a grant without its connection cannot reach a secret (consume precedes the
-   * vault read, which then throws NoConnectionError), a reconnect purges satellites inside
+   * Satellite handling differs from the WRITE paths (upsert/reference, where a satellite-purge
+   * failure correctly rolls the whole write back — no new credential lands without its satellites
+   * cleared). Here the delete+purge run in ONE transaction on the happy path — atomic, so a purge
+   * can never touch a NEWER credential generation written after the delete commits. On failure the
+   * two modes are told apart (GHSA-25m2 review): if the DELETE statement itself never ran the
+   * credential is genuinely stranded, so the error PROPAGATES (offboardUser reports the offboarding
+   * incomplete, never as success); if only the satellite purge failed after a successful DELETE the
+   * credential delete is re-run alone and the delete result stands. A missed purge in that fallback
+   * is fail-closed anyway: a grant without its connection cannot reach a secret (consume precedes
+   * the vault read, which then throws NoConnectionError), a reconnect purges satellites inside
    * upsert/reference BEFORE the new credential is usable, and the TTL sweep reclaims expired rows.
    */
   async delete(owner: Owner, provider: string): Promise<boolean> {
-    const { changes } = await this.db.run(
-      `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-      [owner.teamId, owner.kind, owner.id, provider],
-    );
+    const sql = `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`;
+    const params = [owner.teamId, owner.kind, owner.id, provider];
+    let removed: boolean | undefined; // set once the DELETE statement itself succeeds
     try {
-      await this.clearSatellites(this.db, owner, provider); // notification_state (#117) + approval grants (#113)
-    } catch { /* best-effort; see above */ }
-    return changes > 0;
+      return await this.mutation(async (tx) => {
+        removed = (await tx.run(sql, params)).changes > 0; // DELETE first; its own failure leaves `removed` unset
+        await this.clearSatellites(tx, owner, provider); // notification_state (#117) + approval grants (#113)
+        return removed;
+      });
+    } catch (e) {
+      // Distinguish the two failure modes (GHSA-25m2 review r3): a DELETE that never ran means the
+      // credential is genuinely stranded — surface it so offboardUser reports the offboarding
+      // incomplete, never as success. `removed` is still unset in that case.
+      if (removed === undefined) throw e;
+      // Only the satellite purge failed after a successful DELETE. On a transactional backend the
+      // txn rolled the DELETE back, so re-run it; on a minimal non-transactional stub it already
+      // committed and this re-run is a no-op. Either way the credential is gone — a missed purge is
+      // fail-closed (see the doc comment) — so report the known-good delete result.
+      await this.db.run(sql, params).catch(() => {});
+      return removed;
+    }
   }
 }
