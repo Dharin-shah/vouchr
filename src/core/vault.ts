@@ -131,10 +131,11 @@ export class Vault {
     await purgeApprovalsForOwner(db, owner, provider);
   }
 
-  /** Connection write/delete + its notification_state purge are ONE logical mutation: run them in
-   *  one transaction so a purge failure can't half-commit (a mutation that "failed" but actually
-   *  landed, or a sweep delete whose expiry audit/hook then never fires). A backend without
-   *  `transaction` (only minimal test stubs) falls back to sequential statements. */
+  /** Connection WRITE + its satellite purge are ONE logical mutation: run them in one transaction
+   *  so a purge failure can't half-commit a write (a "failed" upsert that actually landed). Used by
+   *  the write paths only — delete() deliberately is NOT transactional over the purge, so a
+   *  satellite failure can never roll back a credential delete (GHSA-25m2 review; see delete()).
+   *  A backend without `transaction` (only minimal test stubs) falls back to sequential statements. */
   private mutation<T>(fn: (tx: Db) => Promise<T>): Promise<T> {
     return this.db.transaction ? this.db.transaction(fn) : fn(this.db);
   }
@@ -404,16 +405,26 @@ export class Vault {
     });
   }
 
-  /** Returns whether a row actually existed, so callers derive a truthful `removed` from the
-   *  delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2). */
+  /**
+   * Returns whether a row actually existed, so callers derive a truthful `removed` from the
+   * delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2).
+   *
+   * Unlike the WRITE paths (upsert/reference, where a satellite-purge failure correctly rolls the
+   * whole write back — no new credential lands without its satellites cleared), the satellite
+   * purge here runs AFTER the delete and BEST-EFFORT: a notification/approval cleanup failure must
+   * never roll back or block the credential delete (GHSA-25m2 review). A missed purge is
+   * fail-closed anyway: a grant without its connection cannot reach a secret (consume precedes the
+   * vault read, which then throws NoConnectionError), a reconnect purges satellites inside
+   * upsert/reference BEFORE the new credential is usable, and the TTL sweep reclaims expired rows.
+   */
   async delete(owner: Owner, provider: string): Promise<boolean> {
-    return this.mutation(async (tx) => {
-      const { changes } = await tx.run(
-        `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-        [owner.teamId, owner.kind, owner.id, provider],
-      );
-      await this.clearSatellites(tx, owner, provider); // satellites must not outlive the connection: notification_state (#117) + approval grants (#113)
-      return changes > 0;
-    });
+    const { changes } = await this.db.run(
+      `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+      [owner.teamId, owner.kind, owner.id, provider],
+    );
+    try {
+      await this.clearSatellites(this.db, owner, provider); // notification_state (#117) + approval grants (#113)
+    } catch { /* best-effort; see above */ }
+    return changes > 0;
   }
 }

@@ -521,8 +521,9 @@ test('transient token-endpoint and revoke responses cancel their unread bodies (
   }
 });
 
-test('vault mutations are ATOMIC with the notification-state purge: a purge failure rolls the whole mutation back', async () => {
-  // upsert: hostile db (notification_state dropped) → the INSERT must not survive the failed purge.
+test('vault WRITES are ATOMIC with the notification-state purge; a DELETE survives a purge failure', async () => {
+  // upsert: hostile db (notification_state dropped) → the INSERT must not survive the failed purge
+  // (fail-closed: no new credential lands without its satellites cleared).
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   await db.exec(`DROP TABLE notification_state`);
@@ -531,13 +532,12 @@ test('vault mutations are ATOMIC with the notification-state purge: a purge fail
   ); // the caller sees the failure…
   assert.equal(Number(((await db.get(`SELECT COUNT(*) AS n FROM connection`)) as any).n), 0); // …and nothing half-committed
 
-  // delete: seed a connection first, then break the purge → the row must still be there afterwards
-  // (so a sweep that fails here fails BEFORE the delete, never suppressing the expiry audit/hook
-  // for a delete that silently happened).
+  // delete is the OPPOSITE contract (GHSA-25m2 review): the credential delete is the
+  // security-meaningful action, so a satellite-purge failure must never roll it back or throw.
   const db2 = await openDb({ dbPath: ':memory:' });
   const vault2 = new Vault(db2, KEY);
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await db2.exec(`DROP TABLE notification_state`);
-  await assert.rejects(vault2.delete(O1, 'acme'));
-  assert.equal(Number(((await db2.get(`SELECT COUNT(*) AS n FROM connection`)) as any).n), 1); // delete rolled back
+  assert.equal(await vault2.delete(O1, 'acme'), true); // no throw, truthful result
+  assert.equal(Number(((await db2.get(`SELECT COUNT(*) AS n FROM connection`)) as any).n), 0); // delete committed
 });

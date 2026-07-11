@@ -265,10 +265,15 @@ All notable changes to this project are documented here. This project adheres to
   failures on one row never block the next), and the return value / `disconnectProvider.removed`
   now reflect what was actually deleted (`Vault.delete` reports whether a row existed). A row past
   its LOCAL TTL is still revoked upstream on disconnect/offboard/bulk-revoke via the new
-  TTL-independent `Vault.getForRevoke` (injection still uses the TTL-gated `get`). The RFC 7009
-  revoke call is now time-bounded (10s) so a hung endpoint can't stall offboarding, and
-  enterprise-scoped `offboardUserEverywhere` discovery now includes rows stored with a NULL
-  `enterprise_id` (written outside Grid) instead of skipping those teams.
+  TTL-independent `Vault.getForRevoke` (injection still uses the TTL-gated `get`). EVERY revoke
+  implementation is now time-bounded (10s): the standard RFC 7009 POST, and custom `revoke` hooks
+  (which now receive an `AbortSignal` and are raced against the deadline even if they ignore it),
+  so a hung endpoint can't stall offboarding. A satellite-purge failure can no longer roll back a
+  credential delete (writes stay atomic with their purge; `delete` commits first and purges
+  best-effort — a reconnect still purges fail-closed inside `upsert`), consent/session/opt-in
+  cleanup failures no longer abort offboarding before the deletes, and enterprise-scoped
+  `offboardUserEverywhere` discovery now includes rows stored with a NULL `enterprise_id`
+  (written outside Grid) instead of skipping those teams.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

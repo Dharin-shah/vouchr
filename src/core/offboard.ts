@@ -100,9 +100,13 @@ export async function offboardUser(
   // credentials are gone, so their delegation rows must not linger.
   unionOptin?: UnionOptin,
 ): Promise<string[]> {
-  await consent.deleteForUser(identity); // kill pending OAuth so it can't resurrect a connection
-  await sessions?.revokeForUser(identity); // thread grants must not outlive the user
-  await unionOptin?.deleteForUser(identity); // union delegation must not outlive the user either
+  // Auxiliary cleanup, each isolated (GHSA-25m2 review): a consent/session/opt-in failure must
+  // never prevent the credential deletes below — they are the security-meaningful action. A missed
+  // purge here is bounded: consent states are single-use and expire in minutes, and session grants
+  // are TTL-bound; both are also reclaimed by the periodic sweep.
+  try { await consent.deleteForUser(identity); } catch { /* pending OAuth dies by its own TTL */ }
+  try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
+  try { await unionOptin?.deleteForUser(identity); } catch { /* opt-ins are inert once the credentials below are gone */ }
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
   const removed: string[] = [];
   for (const provider of providers) {

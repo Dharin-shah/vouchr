@@ -248,6 +248,94 @@ test('disconnectProvider revokes an expired-here token upstream and reports remo
   assert.equal(await countConnections(db), 0);
 });
 
+// GHSA-25m2 review: EVERY revoke implementation is bounded — including a custom hook that never
+// settles and ignores the abort signal — so one hung endpoint cannot stall the offboarding loop.
+test('revokeToken bounds a never-settling custom revoke and hands the hook an abort signal', async () => {
+  let seenSignal: unknown;
+  const hang = defineProvider({
+    ...revocable,
+    id: 'hang',
+    revoke: (_p, _t, signal) => {
+      seenSignal = signal;
+      return new Promise(() => {}); // never settles, ignores the signal
+    },
+  });
+  await assert.rejects(revokeToken(hang, 'SECRET_TOK', 25), (e: Error) => {
+    assert.match(e.message, /timed out/);
+    assert.ok(!e.message.includes('SECRET_TOK')); // never the token
+    return true;
+  });
+  assert.ok(seenSignal instanceof AbortSignal); // well-behaved hooks can cancel their own fetch
+});
+
+test('revokeToken bounds the standard RFC 7009 revoke when the endpoint hangs', async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (() => new Promise(() => {})) as any; // endpoint never responds
+  try {
+    await assert.rejects(revokeToken(revocable, 'TOK', 25), /timed out/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('offboardUser: a hung custom revoke on the first provider does not strand the second (GHSA-25m2)', async () => {
+  const hangp = defineProvider({ ...revocable, id: 'hangp', revoke: () => new Promise(() => {}) });
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  const registry = new ProviderRegistry([hangp, revocable2]);
+  await vault.upsert(O1, 'hangp', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  await vault.upsert(O1, 'revocable2', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+
+  // Shrink the revoke deadline so the test doesn't wait the production 10s: clamp only LONG timer
+  // delays (the deadline is the only multi-second timer in this path); restored in finally.
+  const realSetTimeout = globalThis.setTimeout;
+  (globalThis as any).setTimeout = (fn: any, ms?: number, ...rest: any[]) =>
+    realSetTimeout(fn, ms != null && ms > 1000 ? 20 : ms, ...rest);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('', { status: 200 })) as any; // revocable2's revoke succeeds
+  try {
+    const removed = await offboardUser(vault, new Audit(db), new Consent(db), ID, registry);
+    assert.deepEqual(removed.sort(), ['hangp', 'revocable2']);
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(await countConnections(db), 0); // the hang deleted nothing extra and stranded nothing
+  const metas = ((await db.all(`SELECT provider, meta FROM audit WHERE action='revoke'`)) as any[])
+    .map((r) => [r.provider, JSON.parse(r.meta).ok] as [string, boolean]);
+  assert.deepEqual(new Map(metas).get('hangp'), false); // the timeout is reported truthfully
+  assert.deepEqual(new Map(metas).get('revocable2'), true);
+});
+
+// GHSA-25m2 review: auxiliary cleanup failures must not prevent the credential deletes.
+test('offboardUser deletes credentials even when the consent cleanup throws', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const badConsent = { deleteForUser: async () => { throw new Error('consent table down'); } } as unknown as Consent;
+  const removed = await offboardUser(vault, new Audit(db), badConsent, ID);
+  assert.deepEqual(removed, ['revocable']);
+  assert.equal(await countConnections(db), 0);
+});
+
+// GHSA-25m2 review: a satellite-purge failure must not roll back (or block) the credential delete.
+test('vault.delete removes the credential even when the satellite purge fails', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const seeder = new Vault(db, KEY);
+  await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const failingDb = {
+    get: db.get.bind(db),
+    all: db.all.bind(db),
+    exec: db.exec.bind(db),
+    close: db.close.bind(db),
+    run: (sql: string, params?: unknown[]) =>
+      sql.includes('notification_state') ? Promise.reject(new Error('satellite table down')) : db.run(sql, params as any[]),
+  } as any;
+  const vault = new Vault(failingDb, KEY);
+  assert.equal(await vault.delete(O1, 'revocable'), true); // truthful, and it did not throw
+  assert.equal(await countConnections(db), 0); // the delete committed despite the failed purge
+});
+
 // GHSA-25m2: rows written outside Grid store enterprise_id=NULL; an enterprise-scoped sweep must
 // still discover a team whose only artifact is such a row (userId is org-unique in Grid).
 test('offboardUserEverywhere with enterpriseId still finds NULL-enterprise rows', async () => {
