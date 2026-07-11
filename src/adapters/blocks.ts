@@ -235,6 +235,61 @@ export function sessionApprovalBlocks(provider: string, thread: string): unknown
   ];
 }
 
+export const APPROVAL_APPROVE_ACTION = 'vouchr_approval_approve';
+export const APPROVAL_DENY_ACTION = 'vouchr_approval_deny';
+
+/**
+ * Approve/Deny prompt for ONE sensitive write (#113), the per-action sibling of
+ * sessionApprovalBlocks. Shows provider, method, and host+path — NEVER the request body (it may
+ * carry user content; SEC-1). The buttons carry ONLY the pending-approval id: content or authority
+ * in a button value would be forgeable (SEC-3) — the click handler re-validates the provider
+ * against the registry and re-checks approver eligibility server-side. Every interpolated value is
+ * escaped at render (SEC-5); `requester` is an authenticated Slack user id, rendered as a mention.
+ */
+export function approvalBlocks(o: {
+  provider: string;
+  method: string;
+  host: string;
+  path: string;
+  requester: string;
+  id: string;
+  approver: 'self' | 'admin';
+}): unknown[] {
+  const p = escapeMrkdwn(o.provider);
+  const action = `\`${escapeMrkdwn(o.method)} ${escapeMrkdwn(o.host)}${escapeMrkdwn(o.path)}\``;
+  const intro = o.approver === 'admin'
+    ? `The agent wants to run ${action} on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`
+    : `The agent wants to run ${action} as you on ${p}.`;
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `:lock: *Approve this ${p} action?*\n${intro}\nApproval covers exactly this method and endpoint, once, and expires if unused.`,
+      },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Approve', emoji: true },
+          action_id: APPROVAL_APPROVE_ACTION,
+          value: o.id,
+          style: 'primary',
+        },
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Deny', emoji: true },
+          action_id: APPROVAL_DENY_ACTION,
+          value: o.id,
+          style: 'danger',
+        },
+      ],
+    },
+  ];
+}
+
 export const PREVIEW_SHARE_ACTION = 'vouchr_preview_share';
 export const PREVIEW_DISMISS_ACTION = 'vouchr_preview_dismiss';
 

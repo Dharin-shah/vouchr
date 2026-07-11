@@ -215,6 +215,26 @@ not, 3xx included: it's a credential-adjacent artifact the agent has no business
 denies like an egress denial: a thrown error (never the body), a `response_denied` event, and an
 audit row. Absent = unchanged behavior (bar the unconditional cookie strip).
 
+`approval: { methods?, paths?, approver: 'self' | 'admin', ttlMs? }` adds **human-in-the-loop
+approval** for sensitive writes at the same boundary. Between "never allowed" (egress) and "always
+allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
+method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons in
+Slack — to the acting user for `'self'`, to eligible admins for `'admin'` (the same eligibility
+gate as the channel config commands) — showing the provider, method, and host+path, never the
+request body. It then throws the exported `ApprovalRequiredError` (catch and stop the turn, exactly
+like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and executes.
+A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only the exact
+(method, host, path) it was minted for — not a prefix, not the payload bytes — **and** the exact
+credential owner: a union member switch or a per-user→shared mode change re-prompts rather than
+running against a credential the human didn't approve, and disconnecting/reconnecting the credential
+purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every
+egress gate (an additional gate, never a bypass) and **before** the secret is read; every step —
+requested, approved, denied, consumed, expired — is audited with the approver as the actor. The
+headless broker enforces the same gate and returns `403 { "error": "approval_required",
+"approvalId" }`; the approval surface stays the Slack app. Enable it on a built-in via typed config
+(`github({ approval: { approver: 'admin' } })`) or on any `defineProvider`. Absent = unchanged
+behavior.
+
 Any OAuth2 provider can be declared with `defineProvider` (hosts outside a built-in's egress
 allowlist, e.g. `docs.googleapis.com`, need this too); non-OAuth APIs use `credential: 'key'` and
 an `inject` function:
@@ -242,6 +262,54 @@ More examples: [Google user credentials](./examples/google-user) ·
 [Postgres + KMS](./examples/postgres-kms) ·
 [sidecar broker](./examples/sidecar)
 
+## Test Your Integration
+
+`dryRun: true` runs the whole machine — consent state, channel modes, policy, tool allowlists,
+egress gates, vault, audit — under one invariant: **no real network call leaves the process on any
+edge** (outbound fetch, OAuth token exchange, token refresh, upstream revoke). Your app's test
+suite exercises its real Vouchr wiring fully offline, with zero Slack or provider OAuth apps
+configured:
+
+- `connect()` posts the real Connect prompt, but the authorize URL is a local,
+  instantly-succeeding redirect into the real OAuth callback. Complete it by "clicking" it, or from
+  a test with `vouchr.dryRun.completeConsent(user, provider)` — either way the real callback writes
+  a synthetic credential marked `external_account: 'dry-run'` through the real vault path.
+- `handle.fetch()` passes every request gate (policy, tool allowlist, host/path/method/https, rate
+  limits), reads the (synthetic) credential from the vault, and then returns a synthetic
+  `200 { dryRun: true, method, url, wouldInjectAs }` echo instead of calling the provider. The
+  credential value never appears in the echo; token refresh and upstream revoke are likewise
+  skipped for dry-run credentials.
+- Request-side denials are real: a host missing from `egressAllow` or a policy-denied channel
+  throws exactly the production error — that is the point: validate your allowlists and consent
+  handling in CI.
+- Safety rails: provenance is a system-only `dry_run` column on the credential row (never the
+  user/provider-controlled account label), so a real account legitimately named "dry-run" is never
+  mistaken for synthetic. Startup hard-fails if the database already holds any non-dry-run
+  credential ("refusing dryRun against a vault with real credentials"), so the flag can't be flipped
+  on non-empty production state; a real row written *after* startup is refused per-request and never
+  overwritten (the synthetic write is an atomic conditional). Dry-run also requires a **local master
+  key** — an external KMS envelope is refused at startup (its wrap/unwrap are real network calls).
+  Audit rows written in dry-run carry a `dry_run: true` marker in `meta`.
+
+```ts
+const vouchr = await createVouchr({
+  dryRun: true, // the only change vs production wiring
+  providers: [github({ clientId: 'dry-run', clientSecret: 'dry-run' })], // dummies, no OAuth app
+  baseUrl: 'https://my-app.test', // never contacted
+  dbPath: ':memory:',
+});
+
+await assert.rejects(() => ctx.vouchr.connect('github'), ConsentRequiredError); // real prompt
+await vouchr.dryRun!.completeConsent('U1', 'github'); // "click Connect" programmatically
+const res = await (await ctx.vouchr.connect('github')).fetch('https://api.github.com/user');
+await res.json(); // { dryRun: true, method: 'GET', url: …, wouldInjectAs: 'authorization: Bearer <redacted>' }
+```
+
+The headless broker takes the same flag (`BrokerOptions.dryRun`, or `VOUCHR_DRY_RUN=1` for the
+packaged `vouchr-broker`): `/v1/connect` mints a URL pointing at the broker's own callback —
+GETting it completes consent — and `/v1/fetch` returns the echo. A complete offline `node:test`
+suite of a Bolt handler lives in [`examples/dry-run/`](./examples/dry-run).
+
 ## Headless
 
 Slack-facing service and agent workers in separate processes? The same core exposes an HTTP broker:
@@ -262,8 +330,11 @@ local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 
 ## Production Notes
 
-- **Consent prompts are control flow.** `ConsentRequiredError` / `SessionApprovalRequiredError` mean
-  Vouchr already prompted the user — catch them and stop the turn; don't log them as failures.
+- **Consent and approval prompts are control flow.** `ConsentRequiredError` /
+  `SessionApprovalRequiredError` / `ApprovalRequiredError` mean Vouchr already prompted the user —
+  catch them and stop the turn; don't log them as failures. For `ApprovalRequiredError` the human
+  clicks Approve and asks again; the grant is single-use and covers only the exact method+host+path
+  that was prompted.
 - **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
   bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
   `invalid_client`) or a connection is within 72h of its idle/max-age TTL ceiling (dimensions

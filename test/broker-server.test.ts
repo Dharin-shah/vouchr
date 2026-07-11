@@ -98,6 +98,47 @@ test('#65 loadProviders: invalid mcp shapes are rejected at config load with the
   assert.throws(load({ paths: ['/mcp'], allowContentType: ['x'] }), /unknown key "allowContentType"/); // typo fails closed
 });
 
+// #113 the approval knob must be env-declarable too, or the SHIPPED standalone broker could never
+// enforce human-in-the-loop approval for a declaratively configured provider.
+const APPROVAL_INTERNAL = {
+  id: 'internal', credential: 'key', egressAllow: ['api.internal.example'],
+  egressMethods: ['GET', 'POST'], approval: { approver: 'admin' },
+};
+
+test('#113 loadProviders: the approval knob loads and reaches the provider', () => {
+  const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([APPROVAL_INTERNAL]) } as any);
+  assert.deepEqual(p.approval, { approver: 'admin' });
+  // every optional field passes through untouched too
+  const full = { methods: ['POST'], paths: ['/repos'], approver: 'self', ttlMs: 60_000 };
+  const [q] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: full }]) } as any);
+  assert.deepEqual(q.approval, full);
+});
+
+test("#113 loadProviders: invalid approval shapes are rejected at config load with the loader's message", () => {
+  const load = (approval: unknown) => () =>
+    loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval }]) } as any);
+  assert.throws(load('yes'), /field "approval" must be an object/);
+  assert.throws(load({}), /"approval\.approver" must be "self" or "admin"/);
+  assert.throws(load({ approver: 'anyone' }), /"approval\.approver" must be "self" or "admin"/);
+  assert.throws(load({ approver: 'self', methods: [] }), /"approval\.methods" must be a non-empty array/);
+  assert.throws(load({ approver: 'self', methods: [42] }), /"approval\.methods" must be a non-empty array/);
+  assert.throws(load({ approver: 'self', ttlMs: 0 }), /"approval\.ttlMs" must be a finite number > 0/);
+  assert.throws(load({ approver: 'self', ttlMs: '5m' }), /"approval\.ttlMs" must be a finite number > 0/);
+  assert.throws(load({ approver: 'self', ttl: 5 }), /unknown key "ttl"/); // typo fails closed
+  // P2-D fail-OPEN forms: non-empty but non-canonical → they'd never match at runtime, so reject.
+  assert.throws(load({ approver: 'self', paths: [' '] }), /"approval\.paths" entries must be absolute paths/);
+  assert.throws(load({ approver: 'self', paths: ['repos'] }), /"approval\.paths" entries must be absolute paths/); // no leading slash
+  assert.throws(load({ approver: 'self', paths: [' /repos'] }), /"approval\.paths" entries must be absolute paths/); // leading space
+  assert.throws(load({ approver: 'self', methods: ['PO ST'] }), /"approval\.methods" entries must be bare HTTP method names/);
+});
+
+test('#113 loadProviders: canonicalizable approval methods are normalized (trim + upper-case)', () => {
+  // 'post ' would never match the upper-cased request method — the loader accepts it and
+  // defineProvider normalizes it to 'POST' so it actually enforces (fail-closed, not fail-open).
+  const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: { approver: 'self', methods: ['post '] } }]) } as any);
+  assert.deepEqual(p.approval!.methods, ['POST']);
+});
+
 // ── T6: broker-server entrypoint ─────────────────────────────────────────────
 
 function baseEnv(extra: Record<string, string> = {}): any {
@@ -198,6 +239,45 @@ test('#54 sweep interval: default is hourly; VOUCHR_SWEEP_INTERVAL_MS=0 disables
   assert.equal(off.sweepIntervalMs, 0);
   await off.db.close();
   await assert.rejects(buildBrokerServer(baseEnv({ VOUCHR_SWEEP_INTERVAL_MS: 'nope' })), /VOUCHR_SWEEP_INTERVAL_MS/);
+});
+
+test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot on a real vault', async () => {
+  // Parse + wire-through: 1/true → on, absent/anything else → off (production behavior).
+  const on = await buildBrokerServer(baseEnv({ VOUCHR_DRY_RUN: '1' }));
+  try {
+    assert.equal(on.dryRun, true);
+    // The bin's SWEEP shares the marked audit instance, so its revoke rows carry meta.dry_run too
+    // (createBroker only wraps its own copy — the bin must wrap the one the sweep closure holds).
+    const vault = new Vault(on.db, Buffer.from(KEY_B64, 'base64'));
+    await vault.upsertDryRun(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
+      accessToken: 'x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'dry-run',
+    });
+    await on.db.run(`UPDATE connection SET last_used_at=0, created_at=0 WHERE owner_id='U1'`);
+    assert.equal(await on.sweep(), 1);
+    const swept = (await on.db.all(`SELECT meta FROM audit WHERE action='revoke'`)) as any[];
+    assert.equal(swept.length, 1);
+    assert.equal(JSON.parse(swept[0].meta).dry_run, true);
+  } finally {
+    await on.db.close();
+  }
+  const off = await buildBrokerServer(baseEnv());
+  assert.equal(off.dryRun, false);
+  await off.db.close();
+
+  // Boot-time refusal: a vault holding a non-dry-run row must stop the server before it listens.
+  const dir = mkdtempSync(join(tmpdir(), 'vouchr-dryrun-'));
+  const dbPath = join(dir, 'real.db');
+  const db = await openDb({ dbPath });
+  await new Vault(db, Buffer.from(KEY_B64, 'base64')).upsert(
+    userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+    'internal',
+    { accessToken: 't', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null },
+  );
+  await db.close();
+  await assert.rejects(
+    buildBrokerServer(baseEnv({ VOUCHR_DRY_RUN: 'true', VOUCHR_DB: dbPath })),
+    /refusing dryRun against a vault with real credentials/,
+  );
 });
 
 test('buildBrokerServer: fails fast naming the missing secret', async () => {
