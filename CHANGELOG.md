@@ -257,6 +257,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
+  fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The
+  id is registry-validated, so this was defense-in-depth, but SEC-5 takes no exception; the connect
+  prompt now escapes it like `connectionLine`/`connectedBlocks`. (The button label is Slack
+  `plain_text`, which renders literally, so it is intentionally left raw.) Remaining mrkdwn sites
+  that still interpolate a provider id or raw slash argument are tracked in a follow-up.
+
 - **Unescaped provider-controlled labels in two post-connect surfaces** (#176). The OAuth-callback
   confirmation DM and `connectedBlocks` interpolated the provider-reported external account label
   (and, in `connectedBlocks`, the token-response scope string) into mrkdwn raw, so a hostile

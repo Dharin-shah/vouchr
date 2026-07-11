@@ -84,6 +84,17 @@ test('connectBlocks: no scopes renders exactly the intro + button (no scope bloc
   assert.doesNotMatch(j(b), /Connecting grants/);
 });
 
+test('connectBlocks: escapes the provider id in mrkdwn (SEC-5, #178)', () => {
+  // The provider id is registry-validated, but SEC-5 takes no exception — every mrkdwn renderer
+  // escapes it, so a `<…|link>`-shaped id must render inert. Scope the assertion to the mrkdwn
+  // sections: the button's `plain_text` is rendered literally by Slack (safe, and MUST stay raw —
+  // escaping it would surface literal `&lt;` to the user).
+  const b = connectBlocks('<https://evil|gh>', 'https://auth') as any[];
+  const mrkdwn = b.filter((x: any) => x.text?.type === 'mrkdwn').map((x: any) => x.text.text).join('\n');
+  assert.ok(!mrkdwn.includes('<https://evil|gh>')); // no forged link in the mrkdwn body
+  assert.match(mrkdwn, /&lt;https/); // present, but escaped
+});
+
 test('connectBlocks: renders human-language scope descriptions when passed', () => {
   const b = connectBlocks('github', 'https://auth', {
     list: ['read:user', 'repo'],

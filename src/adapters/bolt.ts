@@ -1067,7 +1067,7 @@ export class ConnectContext {
         }],
       });
     }
-    const text = `Connect your ${providerId} account`;
+    const text = `Connect your ${escapeMrkdwn(providerId)} account`; // SEC-5 #178: fallback notification text is mrkdwn too
     if (this.channel) {
       await this.client.chat.postEphemeral({
         channel: this.channel,
@@ -1568,7 +1568,7 @@ export async function createVouchr(opts: VouchrOptions) {
           }
           const { authorizeUrl } = await consent.begin(identity, provider, redirectUri, command.channel_id);
           return respond({
-            text: `Connect your ${arg2} account first`,
+            text: `Connect your ${escapeMrkdwn(arg2)} account first`,
             blocks: connectBlocks(arg2, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions }) as any,
           });
         }
@@ -2035,7 +2035,7 @@ export async function createVouchr(opts: VouchrOptions) {
       if (respond) {
         await respond({
           replace_original: true,
-          text: `Connect your ${providerId} account`,
+          text: `Connect your ${escapeMrkdwn(providerId)} account`,
           blocks: connectBlocks(providerId, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions }) as any,
         });
       }
