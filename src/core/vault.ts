@@ -71,12 +71,31 @@ export class Vault {
    * decrypt volume without the vault holding an event sink. No-op on the legacy direct path.
    */
   async get(owner: Owner, provider: string, onDecrypt?: () => void): Promise<StoredCredential | null> {
-    const row = (await this.db.get(
-      `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-      [owner.teamId, owner.kind, owner.id, provider],
-    )) as any;
+    const row = await this.fetchRow(owner, provider);
     if (!row) return null;
     if (this.isExpired(row.created_at, row.last_used_at ?? row.created_at)) return null;
+    return this.decode(row, onDecrypt);
+  }
+
+  /**
+   * TTL-independent decrypting read, for best-effort upstream REVOCATION only (GHSA-25m2): a row
+   * past its local TTL may still be live at the provider, so disconnect/offboard must still hand
+   * its token to the revoke endpoint. Never use this for injection — `get` stays the only read
+   * gated on the TTL policy.
+   */
+  async getForRevoke(owner: Owner, provider: string): Promise<StoredCredential | null> {
+    const row = await this.fetchRow(owner, provider);
+    return row ? this.decode(row) : null;
+  }
+
+  private async fetchRow(owner: Owner, provider: string): Promise<any> {
+    return this.db.get(
+      `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+      [owner.teamId, owner.kind, owner.id, provider],
+    );
+  }
+
+  private async decode(row: any, onDecrypt?: () => void): Promise<StoredCredential> {
     return {
       source: row.source,
       accessToken: row.access_token_enc ? await open(toBuffer(row.access_token_enc), this.key, this.envelope, onDecrypt) : null,
@@ -385,13 +404,16 @@ export class Vault {
     });
   }
 
-  async delete(owner: Owner, provider: string): Promise<void> {
-    await this.mutation(async (tx) => {
-      await tx.run(
+  /** Returns whether a row actually existed, so callers derive a truthful `removed` from the
+   *  delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2). */
+  async delete(owner: Owner, provider: string): Promise<boolean> {
+    return this.mutation(async (tx) => {
+      const { changes } = await tx.run(
         `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
         [owner.teamId, owner.kind, owner.id, provider],
       );
       await this.clearSatellites(tx, owner, provider); // satellites must not outlive the connection: notification_state (#117) + approval grants (#113)
+      return changes > 0;
     });
   }
 }

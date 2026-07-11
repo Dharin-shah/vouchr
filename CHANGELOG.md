@@ -257,6 +257,19 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Offboarding could strand credentials** (GHSA-25m2-c458-8gmw). `offboardUser` read (and
+  decrypted) each token before deleting it, so a KMS/envelope decrypt failure — or an audit-write
+  failure mid-loop — aborted the loop and left that row and every later provider's credential in
+  place, usable again once the dependency recovered. Each row is now processed in isolation: the
+  local delete always runs (decrypt failures only skip the best-effort upstream revoke; audit/DB
+  failures on one row never block the next), and the return value / `disconnectProvider.removed`
+  now reflect what was actually deleted (`Vault.delete` reports whether a row existed). A row past
+  its LOCAL TTL is still revoked upstream on disconnect/offboard/bulk-revoke via the new
+  TTL-independent `Vault.getForRevoke` (injection still uses the TTL-gated `get`). The RFC 7009
+  revoke call is now time-bounded (10s) so a hung endpoint can't stall offboarding, and
+  enterprise-scoped `offboardUserEverywhere` discovery now includes rows stored with a NULL
+  `enterprise_id` (written outside Grid) instead of skipping those teams.
+
 - **Unescaped provider-controlled labels in two post-connect surfaces** (#176). The OAuth-callback
   confirmation DM and `connectedBlocks` interpolated the provider-reported external account label
   (and, in `connectedBlocks`, the token-response scope string) into mrkdwn raw, so a hostile

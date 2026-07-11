@@ -149,6 +149,8 @@ export async function revokeToken(provider: Provider, token: string): Promise<vo
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(fields).toString(),
+    // GHSA-25m2: a hung revoke endpoint must not stall disconnect/offboarding for minutes.
+    signal: AbortSignal.timeout(TOKEN_FETCH_TIMEOUT_MS),
   });
   // Revoke responses are never read (only the status matters): cancel the body on BOTH paths, or
   // undici pins the socket to it until GC (#172).

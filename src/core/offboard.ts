@@ -10,27 +10,29 @@ import { SessionGrants } from './session';
 import { UnionOptin } from './unionOptin';
 
 /**
- * Disconnect ONE provider for a user: delete the local credential (the security-meaningful action)
- * FIRST, then best-effort upstream token revocation. A revoke failure is non-fatal — local access is
- * already gone. Audited as 'revoke' (never the token). Transport-agnostic, so the Bolt `/vouchr
- * disconnect` command and the headless broker's `/v1/disconnect` route share ONE implementation.
- * Returns whether a credential existed and whether the upstream revoke succeeded.
+ * The ONE read → local-delete → upstream-revoke sequence for a user-owned credential, shared by
+ * {@link disconnectProvider} and {@link offboardUser} (STR-3). Hardened per GHSA-25m2 so the local
+ * delete — the security-meaningful action — always runs:
+ *  - the token read is TTL-independent (a row expired here may still be live upstream) and a
+ *    decrypt/KMS failure only skips the upstream revoke, never the delete;
+ *  - `removed` comes from the delete result, not from whether the token was readable.
  */
-export async function disconnectProvider(
+async function removeUserConnection(
   vault: Vault,
-  audit: Audit,
   registry: ProviderRegistry | undefined,
   identity: SlackIdentity,
   provider: string,
-  // Optional (#112): also drop the user's union opt-ins for this provider, so a later reconnect
-  // (e.g. from a DM) can't silently resurrect delegation they walked away from.
-  unionOptin?: UnionOptin,
 ): Promise<{ removed: boolean; ok: boolean }> {
   const owner = userOwner(identity);
-  // Read the token BEFORE deleting: needed both to detect existence and to hand to the upstream revoke.
-  const cred = await vault.get(owner, provider);
-  await vault.delete(owner, provider); // local delete FIRST
-  await unionOptin?.deleteForUserProvider(identity.teamId, identity.userId, provider);
+  let cred: { accessToken: string | null; dryRun: boolean } | null = null;
+  if (registry?.has(provider)) {
+    try {
+      cred = await vault.getForRevoke(owner, provider);
+    } catch {
+      // decrypt/KMS failure: the upstream revoke is skipped, the local delete below still happens
+    }
+  }
+  const removed = await vault.delete(owner, provider); // local delete FIRST
   let ok = true;
   if (registry?.has(provider)) {
     try {
@@ -44,8 +46,30 @@ export async function disconnectProvider(
       ok = false; // network/HTTP failure: local access is already gone; nothing is faked
     }
   }
+  return { removed, ok };
+}
+
+/**
+ * Disconnect ONE provider for a user: delete the local credential (the security-meaningful action)
+ * FIRST, then best-effort upstream token revocation. A revoke failure is non-fatal — local access is
+ * already gone. Audited as 'revoke' (never the token). Transport-agnostic, so the Bolt `/vouchr
+ * disconnect` command and the headless broker's `/v1/disconnect` route share ONE implementation.
+ * Returns whether a credential row was actually deleted and whether the upstream revoke succeeded.
+ */
+export async function disconnectProvider(
+  vault: Vault,
+  audit: Audit,
+  registry: ProviderRegistry | undefined,
+  identity: SlackIdentity,
+  provider: string,
+  // Optional (#112): also drop the user's union opt-ins for this provider, so a later reconnect
+  // (e.g. from a DM) can't silently resurrect delegation they walked away from.
+  unionOptin?: UnionOptin,
+): Promise<{ removed: boolean; ok: boolean }> {
+  const { removed, ok } = await removeUserConnection(vault, registry, identity, provider);
+  await unionOptin?.deleteForUserProvider(identity.teamId, identity.userId, provider);
   await audit.record('revoke', identity, provider, { ok }); // never the token
-  return { removed: cred != null, ok };
+  return { removed, ok };
 }
 
 /**
@@ -79,30 +103,23 @@ export async function offboardUser(
   await consent.deleteForUser(identity); // kill pending OAuth so it can't resurrect a connection
   await sessions?.revokeForUser(identity); // thread grants must not outlive the user
   await unionOptin?.deleteForUser(identity); // union delegation must not outlive the user either
-  const owner = userOwner(identity);
-  const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only
+  const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
+  const removed: string[] = [];
   for (const provider of providers) {
-    // Read the token BEFORE deleting so we can hand it to the upstream revoke.
-    const cred = registry?.has(provider) ? await vault.get(owner, provider) : null;
-    await vault.delete(owner, provider); // local delete FIRST (the security-meaningful action)
-    // Best-effort upstream revocation: swallow per-connection errors so offboarding always completes.
-    const meta: Record<string, unknown> = { reason };
-    if (registry) {
-      let ok = true;
-      try {
-        // #116: never POST a synthetic (dry-run) token to a real revoke endpoint. Keyed off the
-        // trusted dry_run column, so a REAL "dry-run"-labelled account still revokes normally.
-        if (cred?.accessToken && !cred.dryRun) {
-          await revokeToken(registry.get(provider), cred.accessToken);
-        }
-      } catch {
-        ok = false; // network/HTTP failure: local access is already gone; nothing is faked
-      }
-      meta.ok = ok; // never the token, just whether the upstream call succeeded
+    // Per-row isolation (GHSA-25m2): one row's decrypt/delete/audit failure must never strand the
+    // remaining credentials — every row gets its own delete attempt, and the return value only
+    // claims what was actually removed.
+    try {
+      const { removed: gone, ok } = await removeUserConnection(vault, registry, identity, provider);
+      if (gone) removed.push(provider);
+      const meta: Record<string, unknown> = { reason };
+      if (registry) meta.ok = ok; // never the token, just whether the upstream call succeeded
+      await audit.record('revoke', identity, provider, meta);
+    } catch {
+      // this row's delete or audit failed (e.g. transient DB error): continue to the next row
     }
-    await audit.record('revoke', identity, provider, meta);
   }
-  return providers;
+  return removed;
 }
 
 /** Break-glass bulk revocation filter. `provider` is REQUIRED (revoking across every provider is too
@@ -231,11 +248,12 @@ export async function revokeConnection(
   unionOptin?: UnionOptin,
 ): Promise<RevokeOutcome> {
   const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
-  // Read the token for the upstream revoke, but a decrypt failure must NEVER block the local delete.
+  // Read the token for the upstream revoke — TTL-independent (GHSA-25m2: an expired-here row may
+  // still be live upstream) — but a decrypt failure must NEVER block the local delete.
   let token: string | null = null;
-  try { token = (await vault.get(owner, provider))?.accessToken ?? null; } catch { /* still delete locally */ }
-  let removed = true;
-  try { await vault.delete(owner, provider); } catch { removed = false; } // local delete FIRST
+  try { token = (await vault.getForRevoke(owner, provider))?.accessToken ?? null; } catch { /* still delete locally */ }
+  let removed = false;
+  try { removed = await vault.delete(owner, provider); } catch { /* removed stays false */ } // local delete FIRST
   // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
   // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success. A dry-run
   // row (#116) is always SKIPPED: its token is synthetic and must never be POSTed to a real endpoint.
@@ -276,10 +294,10 @@ export async function revokeConnection(
  * (team_id + 'user' + userId), so the cross-team sweep can never reach beyond this user's own rows.
  *
  * In Enterprise Grid the Slack userId is unique org-wide, so `userId` alone is a complete span key.
- * `enterpriseId`, when passed, further narrows connection/consent discovery to that org's rows.
- * Prefer userId-only: Vault.upsert persists `enterprise_id` only when the owner carries one
- * (`owner.enterpriseId ?? null`), so rows written outside Grid store NULL — passing enterpriseId
- * adds an `enterprise_id=?` predicate that under-matches those NULL rows. userId-only spans them all.
+ * `enterpriseId`, when passed, narrows connection/consent discovery to that org's rows PLUS rows
+ * with a NULL enterprise_id: Vault.upsert persists `enterprise_id` only when the owner carries one
+ * (`owner.enterpriseId ?? null`), so rows written outside Grid store NULL — excluding them would
+ * skip a team whose only artifact is such a row and strand its credential (GHSA-25m2).
  *
  * Best-effort and non-fatal per team: one workspace's DB/revoke failure never blocks the others.
  * Returns what was removed per team. Never logs or returns secrets.
@@ -301,9 +319,9 @@ export async function offboardUserEverywhere(
   // purged. session_grant and union_optin have no enterprise_id column, so they are always matched by
   // user_id alone (userId is org-unique).
   const rows = (await db.all(
-    `SELECT team_id FROM connection WHERE owner_kind='user' AND owner_id=?${ent ? ' AND enterprise_id=?' : ''}
+    `SELECT team_id FROM connection WHERE owner_kind='user' AND owner_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
-     SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND enterprise_id=?' : ''}
+     SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
      SELECT team_id FROM session_grant WHERE user_id=?
      UNION
