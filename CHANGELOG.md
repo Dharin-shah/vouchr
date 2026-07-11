@@ -273,7 +273,9 @@ All notable changes to this project are documented here. This project adheres to
   (minutes-lived) approval rows whenever the stored schema version is below 5 — crash-safe: the
   version stamp lands only after the purge, so an interrupted upgrade re-heals on the next open.
   `ApprovalRequiredError` gains a display-only `queryParamCount` field and `approvalBlocks` a
-  required `queryParamCount` input.
+  required `queryParamCount` input. **Rolling-deploy note:** pods running code older than this
+  change consume grants WITHOUT the query binding — drain pre-upgrade pods promptly; the
+  protection is complete only once every replica enforces `query_hash`.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The
