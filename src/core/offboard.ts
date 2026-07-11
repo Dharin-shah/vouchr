@@ -153,8 +153,13 @@ export async function offboardUser(
   }
   // Every delete above was attempted regardless — but a failure that left state behind must not
   // read as success (GHSA-25m2 review r3): surface it so the caller retries.
-  if (!gated && !purged) {
-    throw new Error('offboarding incomplete: pending consent could not be invalidated; retry offboarding'); // no ids/secrets
+  // The durable tombstone is the LOAD-BEARING fence: if it could not be written, a pending consent
+  // (or a callback still in token exchange) is not blocked and could resurrect this user after we
+  // return — so a tombstone failure makes the offboarding incomplete ON ITS OWN, regardless of the
+  // best-effort consent-row purge (which the TTL sweep reclaims anyway). Reporting success with the
+  // fence down is the exact resurrection this whole path exists to prevent.
+  if (!gated) {
+    throw new Error('offboarding incomplete: offboard fence could not be established; retry offboarding'); // no ids/secrets
   }
   if (deleteFailures > 0) {
     throw new Error(`offboarding incomplete: ${deleteFailures} credential deletion(s) failed; retry offboarding`); // no ids/secrets

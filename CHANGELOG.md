@@ -284,9 +284,11 @@ All notable changes to this project are documented here. This project adheres to
   offboarding, and the OAuth callback's credential write is gated a SECOND time — ATOMICALLY, as one
   conditional statement — against a tombstone written *after* `consume` but *before* the write, so a
   callback that paused in token exchange while the user was offboarded can never resurrect the
-  credential (a consent begun after offboarding — legitimate re-onboarding — still works). If both
-  the tombstone write and the purge fail, `offboardUser` throws after attempting every delete
-  instead of reporting success.
+  credential (a consent begun after offboarding — legitimate re-onboarding — still works). The
+  tombstone is the load-bearing fence, so if it cannot be written `offboardUser` throws
+  `offboarding incomplete` on its own — after still attempting every delete — regardless of the
+  best-effort consent-row purge (which the TTL sweep reclaims); reporting success with the fence
+  down is the exact resurrection this path prevents.
 
 - **TTL sweep could delete a just-reconnected credential** (#192). `sweepExpired` snapshotted
   expired rows and then deleted by owner/provider key only, so a reconnect landing between the

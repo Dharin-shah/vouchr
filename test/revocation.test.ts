@@ -477,15 +477,29 @@ test('offboarding during token exchange cannot resurrect the credential (atomic 
   assert.equal(await countConnections(db), 0, 'no credential resurrected by a callback that raced offboarding');
 });
 
-test('offboardUser throws (after attempting every delete) only when BOTH the tombstone and the purge fail', async () => {
+// GHSA-25m2 r3: the tombstone is the load-bearing fence, so a tombstone-write failure makes the
+// offboarding incomplete ON ITS OWN — even when the (best-effort) consent-row purge succeeds.
+test('offboardUser throws when the tombstone write fails, even if the consent purge succeeds', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const consent = new Consent(db);
-  (consent as any).markOffboarded = async () => { throw new Error('tombstone write failed'); };
-  (consent as any).deleteForUser = async () => { throw new Error('consent table down'); };
+  (consent as any).markOffboarded = async () => { throw new Error('tombstone write failed'); }; // fence down…
+  // …but deleteForUser (the consent-row purge) is left REAL and succeeds.
   await assert.rejects(offboardUser(vault, new Audit(db), consent, ID), /offboarding incomplete/);
   assert.equal(await countConnections(db), 0, 'the credential deletes were still attempted first');
+});
+
+// A purge-only failure with the tombstone intact is NOT incomplete: the fence holds and the stale
+// consent rows are TTL-swept.
+test('offboardUser succeeds when only the consent-row purge fails but the tombstone landed', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const consent = new Consent(db);
+  (consent as any).deleteForUser = async () => { throw new Error('consent table down'); }; // purge fails, tombstone still written
+  assert.deepEqual(await offboardUser(vault, new Audit(db), consent, ID), ['revocable']);
+  assert.equal(await countConnections(db), 0);
 });
 
 // GHSA-25m2: rows written outside Grid store enterprise_id=NULL; an enterprise-scoped sweep must
