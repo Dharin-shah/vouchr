@@ -183,7 +183,11 @@ and/or `bodyFormat: 'json'` (see `notion()`). Do not add a new dependency for a 
 
 ## Pull requests
 
-Process rules — `pr-lint` CI checks PROC-1..4 and blocks the PR if they fail:
+Process rules — `pr-lint` CI checks PROC-1..4 and blocks the PR if they fail. Automated
+dependency PRs (Dependabot) are exempt from PROC-2..4 — the Checks line, sign-off, and canary
+attest a human/agent review a bot bump can't make; PROC-1 still applies (Dependabot's titles
+already comply). Review the bump yourself before merging; the exemption is about the contract's
+sign-off ritual, not about skipping scrutiny.
 
 - **PROC-1** — Title is conventional-commit style: `feat(bolt): …`, `fix(core): …`,
   `docs: …`. One concern per PR; keep the diff focused; no reformatting churn.
