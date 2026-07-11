@@ -62,14 +62,17 @@ export function connectBlocks(
   authorizeUrl: string,
   scopes?: { list: string[]; describe?: Record<string, string> },
 ): unknown[] {
+  // SEC-5 (#178): escape the provider id like every other mrkdwn renderer — no exception for a
+  // registry-validated id. One escape site, used everywhere `provider` hits mrkdwn below.
+  const p = escapeMrkdwn(provider);
   const blocks: unknown[] = [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text:
-          `:link: *Connect your ${provider} account*\n` +
-          `I need to act as you on ${provider} for this. Your token is stored ` +
+          `:link: *Connect your ${p} account*\n` +
+          `I need to act as you on ${p} for this. Your token is stored ` +
           `encrypted on this server and is never shown to the agent or posted in Slack.`,
       },
     },
