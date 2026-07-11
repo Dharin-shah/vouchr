@@ -244,40 +244,35 @@ export const APPROVAL_DENY_ACTION = 'vouchr_approval_deny';
 /** Slack caps a header at 150 chars and a section at 3000; clip instead of erroring mid-post. */
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 
-/** How many query-parameter names the approval prompt lists before an explicit "+N more" —
- *  overflow is always announced, never silently truncated (an agent must not be able to hide an
- *  action-defining parameter past a display limit). */
-const MAX_PROMPT_QUERY_PARAMS = 20;
-
 /**
  * Approve/Deny prompt for ONE sensitive write (#113), the per-action sibling of
  * sessionApprovalBlocks. Shows provider, method, host+path and — for a query-bearing request —
- * the query parameter NAMES (GHSA-pg84). Parameter VALUES are never rendered: they can carry
- * tokens, signed-URL signatures, or PII (SEC-1) — the copy tells the human values are bound
- * byte-for-byte instead. The request body is likewise never shown. The buttons carry ONLY the
- * pending-approval id: content or authority in a button value would be forgeable (SEC-3) — the
- * click handler re-validates the provider against the registry and re-checks approver eligibility
- * server-side. Every interpolated value is escaped at render (SEC-5); `requester` is an
- * authenticated Slack user id, rendered as a mention.
+ * only the COUNT of query parameters (GHSA-pg84). Parameter names and values are BOTH
+ * caller-controlled and can carry tokens, signed-URL material, or PII, so neither is ever
+ * rendered (SEC-1); the copy tells the human the exact query is bound byte-for-byte. The request
+ * body is likewise never shown. The buttons carry ONLY the pending-approval id: content or
+ * authority in a button value would be forgeable (SEC-3) — the click handler re-validates the
+ * provider against the registry and re-checks approver eligibility server-side. Every
+ * interpolated value is escaped at render (SEC-5); `requester` is an authenticated Slack user id,
+ * rendered as a mention.
  */
 export function approvalBlocks(o: {
   provider: string;
   method: string;
   host: string;
   path: string;
-  /** Query parameter NAMES (deduped, request order) — '' values are implied, never shown. */
-  queryParams: string[];
+  /** How many query parameters the request carries (0 = none). Names/values are never shown. */
+  queryParamCount: number;
   requester: string;
   id: string;
   approver: 'self' | 'admin';
 }): unknown[] {
   const p = escapeMrkdwn(o.provider);
-  const shown = o.queryParams.slice(0, MAX_PROMPT_QUERY_PARAMS).map((k) => `${escapeMrkdwn(k)}=…`).join('&');
-  const more = o.queryParams.length > MAX_PROMPT_QUERY_PARAMS ? ` (+${o.queryParams.length - MAX_PROMPT_QUERY_PARAMS} more)` : '';
-  const query = o.queryParams.length ? `?${shown}${more}` : '';
-  const action = `\`${escapeMrkdwn(o.method)} ${escapeMrkdwn(o.host)}${escapeMrkdwn(o.path)}${query}\``;
-  const bound = o.queryParams.length
-    ? ' The shown parameters are bound to their exact requested values (not displayed here); any change re-prompts.'
+  const n = o.queryParamCount;
+  const query = n ? `?… (${n} parameter${n === 1 ? '' : 's'})` : '';
+  const action = `\`${escapeMrkdwn(o.method)} ${escapeMrkdwn(o.host)}${escapeMrkdwn(o.path)}\`${query ? ` ${query}` : ''}`;
+  const bound = n
+    ? ' The exact query string is bound byte-for-byte (its parameters are not displayed); any change re-prompts.'
     : '';
   const intro = o.approver === 'admin'
     ? `The agent wants to run ${action} on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`

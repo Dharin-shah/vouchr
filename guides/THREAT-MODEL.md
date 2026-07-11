@@ -198,9 +198,11 @@ into many actions, or to skip the approval entirely.
   reordered or duplicated parameters differently — so a replanning or prompt-injected
   agent cannot spend an approval of `POST /transfer?to=alice&amount=10` on
   `?to=attacker&amount=1000000` (or on any reordering); any textual change re-prompts.
-  Raw query values may carry tokens, signed-URL signatures, or PII, so they are never
-  persisted, audited, logged, or rendered: the prompt lists the parameter NAMES and
-  states that their exact values are bound. When `approval.paths` is set it
+  Query parameter names and values are BOTH caller-controlled and may carry tokens,
+  signed-URL material, or PII, so neither is ever persisted, audited, logged, or
+  rendered: the prompt shows only the parameter COUNT and states the exact query string
+  is bound byte-for-byte. (A provider-declared safe action renderer is the future shape
+  if humans must inspect action-defining fields.) When `approval.paths` is set it
   inherits the egress path lock's fail-closed
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential

@@ -48,13 +48,14 @@ export class ApprovalRequiredError extends Error {
     /** The pending approval-request id the Approve/Deny surface decides on. */
     public approvalId: string,
     /**
-     * Query parameter NAMES (deduped, request order) — display only, so the Approve/Deny prompt
-     * can show WHICH parameters are bound (GHSA-pg84). Never the values: they can carry tokens,
-     * signed-URL signatures, or PII, so they must not reach Slack, logs, storage, or audit
-     * (SEC-1) — the store binds their digest instead (see queryDigest), and error serializers
-     * that walk enumerable properties see only structural names here.
+     * How many query parameters the request carries — the ONLY query-derived thing the error (and
+     * thus the Slack prompt and any error serializer) exposes. Parameter names are as
+     * caller-controlled as values (`?ghp_token…=`, `?john@example.com=`), so neither may reach
+     * Slack, logs, storage, or audit (SEC-1); the store binds the byte-exact digest instead (see
+     * queryDigest). A provider-declared safe action renderer is the future shape if humans must
+     * inspect action-defining fields.
      */
-    public queryParams: string[] = [],
+    public queryParamCount: number = 0,
   ) {
     super(
       `Approval required: ${method} ${host}${path} on provider "${provider}" needs ` +

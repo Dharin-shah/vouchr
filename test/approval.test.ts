@@ -291,12 +291,14 @@ test('GHSA-pg84: an approval binds the exact query — tampered, reordered, or d
     const e = await expectApprovalRequired(
       handle.fetch(`https://api.acme.test/transfer?to=${QUERY_SENTINEL}&amount=10`, { method: 'POST' }),
     );
-    // The human sees WHICH parameters are bound (names only, from the in-memory error)…
-    assert.deepEqual(e.queryParams, ['to', 'amount']);
+    // The human sees only the parameter COUNT (names are as caller-controlled as values, SEC-1)…
+    assert.equal(e.queryParamCount, 2);
     const rendered = JSON.stringify(ephemerals[0].blocks);
-    assert.match(rendered, /to=…&amount=…/);
-    // …but the VALUE never reaches Slack, the store, or audit (SEC-1).
+    assert.match(rendered, /\(2 parameters\)/);
+    // …and neither values nor names reach Slack, the error serialization, the store, or audit.
     assert.ok(!rendered.includes(QUERY_SENTINEL), 'no query value in the prompt');
+    assert.ok(!rendered.includes('to='), 'no parameter names in the prompt');
+    assert.ok(!JSON.stringify({ ...e }).includes(QUERY_SENTINEL), 'no query data on enumerable error properties');
     assert.ok(!JSON.stringify(await approvalRows()).includes(QUERY_SENTINEL), 'no raw query in the approval row');
     assert.ok(!JSON.stringify(await auditRows()).includes(QUERY_SENTINEL), 'no raw query in audit');
 
@@ -314,6 +316,21 @@ test('GHSA-pg84: an approval binds the exact query — tampered, reordered, or d
     assert.equal(res.status, 200);
     assert.equal(calls.length, 1, 'the faithful retry executed exactly once');
     assert.ok(!JSON.stringify(await auditRows()).includes(QUERY_SENTINEL), 'consumption audit carries no raw query');
+  });
+});
+
+test('GHSA-pg84: a secret in a parameter NAME never reaches the prompt or the error serialization', async () => {
+  const { ctx, ephemerals } = await harness();
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const NAME_SENTINEL = 'ghp_name_sentinel_token'; // a query KEY that must never leave the process
+    const e = await expectApprovalRequired(
+      handle.fetch(`https://api.acme.test/transfer?${NAME_SENTINEL}=1`, { method: 'POST' }),
+    );
+    assert.equal(e.queryParamCount, 1);
+    assert.ok(!JSON.stringify({ ...e }).includes(NAME_SENTINEL), 'no name on enumerable error properties');
+    assert.ok(!e.message.includes(NAME_SENTINEL), 'no name in the error message');
+    assert.ok(!JSON.stringify(ephemerals[0].blocks).includes(NAME_SENTINEL), 'no name in the Slack prompt');
   });
 });
 
@@ -335,33 +352,49 @@ test('GHSA-pg84: duplicate-key reordering cannot spend a grant (first-wins vs la
   });
 });
 
-test('GHSA-pg84: v4→v5 migration stamps legacy approval rows fail-closed (no queryless spend)', async () => {
+// GHSA-pg84 v5 migration is crash-safe fail-closed: legacy approval rows (minutes-lived
+// prompts/grants) are PURGED whenever the stored version is < 5, and the ALTER's DEFAULT marks
+// anything a lingering pre-v5 writer creates as 'pre-v5' (matches no live digest). Two scenarios:
+// a clean v4 upgrade, and the partial crash state (column already added, '' rows, stamp never
+// landed) — both must leave no legacy grant consumable by a queryless request.
+test('GHSA-pg84: v4→v5 migration purges legacy approval rows (no queryless spend)', async () => {
   const { mkdtempSync, rmSync } = await import('node:fs');
   const { tmpdir } = await import('node:os');
   const { join } = await import('node:path');
   const dir = mkdtempSync(join(tmpdir(), 'vouchr-v4-'));
-  const file = join(dir, 'v4.db');
-  try {
-    // Build a "v4" database: current schema minus query_hash, holding one GRANTED approval row.
-    const db4 = await openDb({ dbPath: file });
-    await db4.run(
-      `INSERT INTO approval_request (id, team_id, user_id, owner_kind, owner_id, provider, method, host, path, query_hash, channel, thread, status, approved_by, created_at, expires_at)
-       VALUES ('L1','T1','U1','user','U1','acme','POST','api.acme.test','/transfer','SHOULD-BE-RESTAMPED','C1','','granted','U9',?,?)`,
+  const seedLegacyGrant = async (db: any, queryHash?: string) => {
+    const cols = queryHash == null ? '' : ', query_hash';
+    const vals = queryHash == null ? '' : `,'${queryHash}'`;
+    await db.run(
+      `INSERT INTO approval_request (id, team_id, user_id, owner_kind, owner_id, provider, method, host, path, channel, thread, status, approved_by, created_at, expires_at${cols})
+       VALUES ('L1','T1','U1','user','U1','acme','POST','api.acme.test','/transfer','C1','','granted','U9',?,?${vals})`,
       [Date.now(), Date.now() + 3_600_000],
     );
-    await db4.exec(`ALTER TABLE approval_request DROP COLUMN query_hash`);
-    await db4.run(`UPDATE meta SET value='4' WHERE key='schema_version'`, []);
-    await db4.close();
+  };
+  const queryless = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/transfer', queryHash: '', channel: 'C1', thread: null };
+  try {
+    // (a) clean v4 shape: no query_hash column at all.
+    const fileA = join(dir, 'v4.db');
+    const a4 = await openDb({ dbPath: fileA });
+    await a4.exec(`ALTER TABLE approval_request DROP COLUMN query_hash`);
+    await seedLegacyGrant(a4);
+    await a4.run(`UPDATE meta SET value='4' WHERE key='schema_version'`, []);
+    await a4.close();
+    const a5 = await openDb({ dbPath: fileA });
+    assert.equal(((await a5.all(`SELECT * FROM approval_request`)) as any[]).length, 0, 'legacy rows purged');
+    assert.equal(await new Approvals(a5).consume(queryless), null);
+    await a5.close();
 
-    // Re-open: the v5 migration adds the column and stamps existing rows with the sentinel.
-    const db5 = await openDb({ dbPath: file });
-    const row = (await db5.get(`SELECT query_hash FROM approval_request WHERE id='L1'`)) as any;
-    assert.equal(row.query_hash, 'pre-v5');
-    // A queryless request (live digest '') can NOT consume the legacy grant.
-    const approvals = new Approvals(db5);
-    const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/transfer', queryHash: '', channel: 'C1', thread: null };
-    assert.equal(await approvals.consume(key), null);
-    await db5.close();
+    // (b) partial crash state: column exists (old buggy '' default), '' row, version still 4.
+    const fileB = join(dir, 'partial.db');
+    const b4 = await openDb({ dbPath: fileB });
+    await seedLegacyGrant(b4, ''); // the dangerous state: '' equals the live queryless digest
+    await b4.run(`UPDATE meta SET value='4' WHERE key='schema_version'`, []);
+    await b4.close();
+    const b5 = await openDb({ dbPath: fileB });
+    assert.equal(((await b5.all(`SELECT * FROM approval_request`)) as any[]).length, 0, 'partial-migration rows healed by purge');
+    assert.equal(await new Approvals(b5).consume(queryless), null);
+    await b5.close();
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

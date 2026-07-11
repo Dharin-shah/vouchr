@@ -262,16 +262,18 @@ All notable changes to this project are documented here. This project adheres to
   `POST /transfer?to=alice&amount=10` was indistinguishable from — and spendable by —
   `POST /transfer?to=attacker&amount=1000000`. The grant now also binds the query BYTE-EXACT, as
   a digest of the exact query string sent upstream (no sorting/normalization — upstream parsers
-  treat reordered or duplicated parameters differently, so any textual change re-prompts; raw
-  values may carry PII/secrets and are never persisted, audited, or rendered). The Approve/Deny
-  prompt lists the query parameter NAMES (with an explicit `+N more` overflow, never silent
-  truncation) and states that their exact values are bound; the threat model / README now state
+  treat reordered or duplicated parameters differently, so any textual change re-prompts). Query
+  parameter names and values are BOTH caller-controlled and may carry PII/secrets, so neither is
+  ever persisted, audited, or rendered: the Approve/Deny prompt shows only the parameter COUNT
+  and states the exact query string is bound byte-for-byte; the threat model / README now state
   explicitly that the request body remains outside the key, so approval must not be treated as
   covering the exact action for body-parameterized endpoints. New `approval_request.query_hash`
-  column (schema version 5, purely additive; pre-existing rows are stamped a `'pre-v5'` sentinel
-  that matches no live digest, so every legacy grant fails closed and re-prompts).
-  `ApprovalRequiredError` gains a display-only `queryParams` (names) field and `approvalBlocks` a
-  required `queryParams` input.
+  column (schema version 5, purely additive) lands as ONE atomic ALTER whose `DEFAULT 'pre-v5'`
+  marks anything a pre-v5 writer creates as unmatchable, and the migration purges all existing
+  (minutes-lived) approval rows whenever the stored schema version is below 5 — crash-safe: the
+  version stamp lands only after the purge, so an interrupted upgrade re-heals on the next open.
+  `ApprovalRequiredError` gains a display-only `queryParamCount` field and `approvalBlocks` a
+  required `queryParamCount` input.
 
 - **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
   fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The

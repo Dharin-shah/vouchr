@@ -508,11 +508,11 @@ export class ConnectionHandle {
         const approvalId = await this.approvals.request(key);
         this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
         await this.audit.record('approval_requested', this.acting, this.provider.id, apMeta);
-        // Parameter NAMES only ride the error for the prompt display (GHSA-pg84) — never the
-        // values, which can carry secrets/PII and must not reach Slack or logs (SEC-1); the
-        // values are bound via the digest in the key above.
+        // Only the parameter COUNT rides the error for the prompt display (GHSA-pg84): names are
+        // as caller-controlled as values and must not reach Slack or logs (SEC-1). The exact
+        // query is bound via the digest in the key above.
         throw new ApprovalRequiredError(this.provider.id, ap.approver, method, url.hostname, url.pathname, approvalId,
-          [...new Set(url.searchParams.keys())]);
+          [...url.searchParams.keys()].length);
       }
       // The grant is spent exactly once, right here — so the trail records the consumption even if
       // the upstream call later fails. The approver's identity rides the actor column (STR-4).

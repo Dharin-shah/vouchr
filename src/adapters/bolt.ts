@@ -476,7 +476,7 @@ export class ConnectContext {
   /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
   private async postApprovalPrompt(e: ApprovalRequiredError): Promise<void> {
     const blocks = approvalBlocks({
-      provider: e.provider, method: e.method, host: e.host, path: e.path, queryParams: e.queryParams,
+      provider: e.provider, method: e.method, host: e.host, path: e.path, queryParamCount: e.queryParamCount,
       requester: this.identity.userId, id: e.approvalId, approver: e.approver,
     }) as any;
     const text = `Approval needed for a ${e.provider} action`; // registry-validated id; neutral fallback

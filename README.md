@@ -220,9 +220,10 @@ approval** for sensitive writes at the same boundary. Between "never allowed" (e
 allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
 method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons in
 Slack — to the acting user for `'self'`, to eligible admins for `'admin'` (the same eligibility
-gate as the channel config commands) — showing the provider, method, host+path, and the query
-parameter names (values are bound but never displayed: they can carry secrets/PII), never the
-request body. It then throws the exported `ApprovalRequiredError` (catch and stop the turn,
+gate as the channel config commands) — showing the provider, method, host+path, and the COUNT of
+query parameters (names and values are both caller-controlled and can carry secrets/PII, so
+neither is displayed; the exact query string is bound byte-for-byte), never the request body. It
+then throws the exported `ApprovalRequiredError` (catch and stop the turn,
 exactly like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and
 executes. A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only
 the exact (method, host, path, query) it was minted for — the query byte-exact as a digest, so
