@@ -416,6 +416,30 @@ test('sweepExpired deletes past-TTL connections and audits them', async () => {
   assert.deepEqual((await vault.listForUser(ID)).map((c) => c.provider), ['google']); // only the stale one swept
 });
 
+// #192: a reconnect between the sweep's snapshot and its delete must survive — the delete is
+// conditional on the row STILL being expired, and nothing is audited/notified for the fresh row.
+test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no delete, no audit, no event)', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY, { idleMs: 1000 });
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  await vault.upsert(O1, 'github', FRESH);
+  await db.run('UPDATE connection SET last_used_at=?, created_at=? WHERE provider=?', [Date.now() - 5000, Date.now() - 5000, 'github']);
+  // Barrier: interpose on listExpired so the reconnect lands AFTER the snapshot, BEFORE the delete.
+  const snapshot = vault.listExpired.bind(vault);
+  (vault as any).listExpired = async () => {
+    const rows = await snapshot();
+    await vault.upsert(O1, 'github', FRESH); // the user reconnects mid-sweep
+    return rows;
+  };
+  const events: any[] = [];
+  assert.equal(await sweepExpired(vault, audit, consent, undefined, undefined, (e) => events.push(e)), 0);
+  assert.deepEqual((await vault.listForUser(ID)).map((c) => c.provider), ['github']); // fresh row survived
+  assert.notEqual(await vault.get(O1, 'github'), null); // and is live, satellites untouched
+  assert.equal(((await db.all(`SELECT * FROM audit WHERE action='revoke'`)) as any[]).length, 0, 'no expired audit row');
+  assert.equal(events.filter((e) => e.type === 'expired').length, 0, 'no expired health event');
+});
+
 test('sweepExpired also clears abandoned consent requests', async () => {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY, {});
