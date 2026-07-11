@@ -121,8 +121,9 @@ export async function offboardUser(
   // Auxiliary cleanup, each isolated (GHSA-25m2 review): a cleanup failure must never prevent the
   // credential deletes below — they are the security-meaningful action. Session grants are
   // TTL-bound and swept; opt-ins are inert once the credentials below are gone.
-  let purged = true;
-  try { await consent.deleteForUser(identity); } catch { purged = false; }
+  // Best-effort: the tombstone above is the fence, so a failed consent-row purge is not fatal —
+  // the stale rows are reclaimed by the TTL sweep (consent.sweepStale).
+  try { await consent.deleteForUser(identity); } catch { /* fenced by the tombstone; TTL-swept */ }
   try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
   try { await unionOptin?.deleteForUser(identity); } catch { /* opt-ins are inert once the credentials below are gone */ }
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
