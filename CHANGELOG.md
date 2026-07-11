@@ -5,6 +5,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Removed
+
+- **Union credential-borrowing removed from the production surface** (#196, breaking). The `union`
+  channel mode — where any connected member's account could satisfy another member's request — is
+  gone: `union` is now rejected at the config boundary (slash command, modal, broker
+  `/v1/admin/mode`, and `ChannelConfig.setMode`), the `union_optin` table and the `/vouchr union
+  join|leave` commands are removed, and the exports `UnionOptin` / `eligibleUnionMembers` /
+  `joinUnion` / `leaveUnion` and the broker's `actingMemberId` claim no longer exist. `shared`,
+  `per-user`, and `session` are unchanged. Historical audit rows with the `union` action remain
+  readable; no new ones are written.
+
 ### Added
 
 - **Human-in-the-loop approval for sensitive writes** (#113). New declarative provider knob
@@ -20,7 +31,7 @@ All notable changes to this project are documented here. This project adheres to
   the retried call consumes the grant — SINGLE-USE via the same atomic `DELETE … RETURNING` as the
   OAuth consent state, so two concurrent retries cannot both spend it — and matches only the exact
   (method, host, path) it was minted for (never the payload bytes; tradeoff documented in the
-  threat model) **and the exact credential owner**: a union member switch or a per-user→shared mode
+  threat model) **and the exact credential owner**: a per-user→shared mode
   change re-prompts instead of running against a credential the human didn't approve, and a grant is
   purged the moment its credential is deleted or replaced (disconnect / offboard / bulk-revoke /
   reconnect / TTL-expiry — all via the one vault mutation surface, alongside the notification-state
@@ -151,27 +162,6 @@ All notable changes to this project are documented here. This project adheres to
   declarative field (see `guides/DEPLOYMENT.md` § Provider config). New export: `BrokerMcpRequest`
   (also on `./headless`). Docs in `guides/HEADLESS.md` § MCP servers.
 
-
-- **Union mode: explicit opt-in + owner notification** (#112). New `createVouchr` option
-  `unionRequiresOptIn` — when `true`, `union` resolution only borrows channel members with an
-  explicit opt-in row for that (channel, provider), stored in the new `union_optin` table
-  (additive migration; schema version 2). Opt in by completing a Connect prompted from the union
-  channel (the OAuth callback records it via the consent row's channel, only when that channel is
-  in union mode) or with the new `/vouchr union join <provider>` (requires a connected credential,
-  else you get the Connect prompt); `/vouchr union leave <provider>` is effective on the next
-  resolution, and disconnect / offboarding / break-glass revoke purge opt-ins with the credential.
-  Joins/leaves are audited as a new `union` action (`{ channel, event: 'join'|'leave' }`).
-  Separately (regardless of the flag), when a borrowed union credential actually serves a request
-  by someone other than its owner, the owner gets a courtesy DM (who/where, `/vouchr audit` to review,
-  `/vouchr union leave` to stop), debounced per-process to one per (owner, provider, channel) per
-  hour and never sent on self-use; the audit table remains the record. New exports: `UnionOptin`,
-  `eligibleUnionMembers`, `joinUnion`, `leaveUnion` (also on `./headless`) — the broker trusts
-  the host's signed `actingMemberId`, so a headless host applies the same rule itself; broker-
-  hosted OAuth callbacks record opt-ins like Bolt ones when `channelConfig` is wired.
-
-  **DEPRECATION: `unionRequiresOptIn` defaults to `false`** (any connected member is borrowable —
-  today's behavior, byte-compatible). The default **flips to `true` at the next breaking
-  release** — set it explicitly now.
 
 - **Signed GHCR images** (#131) — the release workflow now keyless-signs every published
   `vouchr-broker` image with cosign (Sigstore), attaches a CycloneDX SBOM attestation, and embeds

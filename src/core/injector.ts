@@ -186,12 +186,8 @@ export class ConnectionHandle {
     // Optional audit STREAM sink (carries the raw actor id). Separate from `sink`, which is
     // deliberately actor-free. Default no-op. The authoritative copy is still the audit table.
     private auditSink: AuditSink = () => {},
-    // The human who TRIGGERED this request, when it differs from `acting` (union mode: `acting` is the
-    // borrowed member, not the caller). Added to the inject audit meta so non-repudiation records BOTH
-    // the acted-as member and the real triggerer. Default null = same as acting (nothing extra recorded).
-    private triggeredBy: string | null = null,
     // The Slack channel this request originated in. Recorded on the inject audit for EVERY owner kind
-    // (not just channel-owned), so `/vouchr stats` can attribute per-user / session / union usage to the
+    // (not just channel-owned), so `/vouchr stats` can attribute per-user / session usage to the
     // channel it happened in — otherwise those (the default modes) all read as "never used". Null when
     // there is no channel context (a DM, or a headless call whose token carries no channel).
     private originChannel: string | null = null,
@@ -227,19 +223,6 @@ export class ConnectionHandle {
    *  else the owning channel for a channel-owned cred (preserves prior behavior), else null. */
   private auditChannel(): string | null {
     return this.originChannel ?? (this.owner.kind === 'channel' ? this.owner.id : null);
-  }
-
-  /** Union non-repudiation: the real triggerer id when a union borrow makes it differ from the acted-as
-   *  member; else undefined. A plain userId, never a secret. Populates the audit `actor` column so the
-   *  owner's `/vouchr audit` view can surface WHO borrowed their credential. */
-  private triggerActor(): string | undefined {
-    return this.triggeredBy && this.triggeredBy !== this.acting.userId ? this.triggeredBy : undefined;
-  }
-
-  /** Same triggerer, in meta form for the audit-stream copy. Empty on every non-union path. */
-  private triggerMeta(): Record<string, string> {
-    const a = this.triggerActor();
-    return a ? { triggeredBy: a } : {};
   }
 
   /** Fire the sink, swallowing any sync throw or async rejection. A bad sink must never break a request. */
@@ -359,11 +342,10 @@ export class ConnectionHandle {
    */
   private async egressError(host: string, reason: string): Promise<void> {
     this.emit({ type: 'egress_error', provider: this.provider.id, host, reason });
-    // Carry the same union triggerer AND origin channel as the success path so a FAILED call keeps its
-    // non-repudiation and its per-channel attribution.
+    // Carry the same origin channel as the success path so a FAILED call keeps its per-channel attribution.
     const ch = this.auditChannel();
     const channelMeta = ch ? { channel: ch } : {};
-    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...channelMeta, ...this.triggerMeta() }, this.triggerActor()).catch(() => undefined);
+    await this.audit.record('inject', this.acting, this.provider.id, { host, reason, ok: false, ...channelMeta }).catch(() => undefined);
   }
 
   /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502.
@@ -478,20 +460,17 @@ export class ConnectionHandle {
         throw new Error(`Provider "${this.provider.id}" requires human approval but no approval store is wired.`);
       }
       // The grant carries TWO identities, matched independently on consume:
-      //  - userId = the human DRIVING the agent (the caller). On every non-union path triggeredBy is
-      //    null so this is the acting user unchanged; in UNION mode `acting` is the BORROWED member
-      //    while `triggeredBy` is the caller — and the caller is who the adapter prompts and who
-      //    self-approval matches, so keying to `acting` there would prompt one human and
-      //    grant/eligibility-check a different one (a permanent 'self' deadlock).
+      //  - userId = the human DRIVING the agent (the caller = the acting user), who the adapter
+      //    prompts and who self-approval matches.
       //  - ownerKind/ownerId = the credential this write will actually use. Binding it means a grant
-      //    minted while borrowing member A can't be spent after resolution switches to member B (or
-      //    after a per-user→shared mode change): the write can never run against a different
-      //    credential than the human approved. It is also the purge key when the credential is
-      //    revoked/reconnected (purgeApprovalsForOwner, run inside the vault mutation).
+      //    minted for one credential can't be spent after a per-user→shared mode change: the write can
+      //    never run against a different credential than the human approved. It is also the purge key
+      //    when the credential is revoked/reconnected (purgeApprovalsForOwner, run inside the vault
+      //    mutation).
       // request() + consume() share this one key object, so both sites stay consistent by
       // construction. Audit still attributes to `acting` + the approver (below).
       const key = {
-        teamId: this.acting.teamId, userId: this.triggeredBy ?? this.acting.userId,
+        teamId: this.acting.teamId, userId: this.acting.userId,
         ownerKind: this.owner.kind, ownerId: this.owner.id, provider: this.provider.id,
         // queryHash (GHSA-pg84): the grant binds the exact query string sent upstream, as a
         // digest — a retry with ANY textual change to the query re-prompts instead of spending
@@ -585,7 +564,7 @@ export class ConnectionHandle {
     const ch = this.auditChannel();
     const channelMeta = ch ? { channel: ch } : {};
     await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta, ...this.triggerMeta() }, this.triggerActor())
+      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta })
       .catch(() => undefined);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });

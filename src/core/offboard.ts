@@ -7,7 +7,6 @@ import type { ProviderRegistry } from './providers';
 import { revokeToken } from './tokens';
 import { userOwner, type Owner } from './owner';
 import { SessionGrants } from './session';
-import { UnionOptin } from './unionOptin';
 
 /**
  * The ONE read → local-delete → upstream-revoke sequence for a user-owned credential, shared by
@@ -73,12 +72,8 @@ export async function disconnectProvider(
   registry: ProviderRegistry | undefined,
   identity: SlackIdentity,
   provider: string,
-  // Optional (#112): also drop the user's union opt-ins for this provider, so a later reconnect
-  // (e.g. from a DM) can't silently resurrect delegation they walked away from.
-  unionOptin?: UnionOptin,
 ): Promise<{ removed: boolean; ok: boolean }> {
   const { removed, ok, attempted } = await removeUserConnection(vault, registry, identity, provider);
-  await unionOptin?.deleteForUserProvider(identity.teamId, identity.userId, provider);
   // meta.ok keeps its shape; upstream:'skipped' (same key as revokeConnection, STR-4) marks that no
   // real revoke call was made — so ok:false + skipped is legible as "token unreadable, revoke due".
   await audit.record('revoke', identity, provider, { ok, ...(attempted ? {} : { upstream: 'skipped' }) }); // never the token
@@ -109,9 +104,6 @@ export async function offboardUser(
   // Optional: when supplied, also clear the user's thread session grants. Centralized here so
   // every offboarding path (per-team and the Grid/SCIM sweep) gets the same cleanup.
   sessions?: SessionGrants,
-  // Optional (#112): when supplied, also delete the user's union opt-ins — an offboarded user's
-  // credentials are gone, so their delegation rows must not linger.
-  unionOptin?: UnionOptin,
 ): Promise<string[]> {
   // The durable fail-closed gate FIRST (GHSA-25m2): once the tombstone is written, no consent
   // minted at or before this instant can ever complete (Consent.consume checks it), so a pending
@@ -120,12 +112,11 @@ export async function offboardUser(
   try { await consent.markOffboarded(identity); } catch { gated = false; }
   // Auxiliary cleanup, each isolated (GHSA-25m2 review): a cleanup failure must never prevent the
   // credential deletes below — they are the security-meaningful action. Session grants are
-  // TTL-bound and swept; opt-ins are inert once the credentials below are gone.
+  // TTL-bound and swept.
   // Best-effort: the tombstone above is the fence, so a failed consent-row purge is not fatal —
   // the stale rows are reclaimed by the TTL sweep (consent.sweepStale).
   try { await consent.deleteForUser(identity); } catch { /* fenced by the tombstone; TTL-swept */ }
   try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
-  try { await unionOptin?.deleteForUser(identity); } catch { /* opt-ins are inert once the credentials below are gone */ }
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
   const removed: string[] = [];
   let deleteFailures = 0;
@@ -249,27 +240,13 @@ export async function countPendingForProvider(db: Db, f: RevokeFilter): Promise<
 /**
  * Delete every pending consent + thread session grant matching the scope, so a pending "Connect" or a
  * lingering thread grant can't complete after the break-glass run and resurrect the revoked provider.
- * Runs regardless of whether any live connection matched (that's the whole point). Also drops union
- * opt-ins (#112) in scope whose owner has NO remaining connection for the provider — stale delegation
- * must not survive the sweep and resurrect on a later reconnect (opt-ins backed by a live connection
- * outside the revocation scope are kept). Returns the consent/grant counts.
+ * Runs regardless of whether any live connection matched (that's the whole point). Returns the
+ * consent/grant counts.
  */
 export async function purgePendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
   const { where, params } = pendingWhere(f);
   const consents = (await db.run(`DELETE FROM consent_request WHERE ${where}`, params)).changes;
   const grants = (await db.run(`DELETE FROM session_grant WHERE ${where}`, params)).changes;
-  // union_optin's channel column is channel_id, so it can't share pendingWhere verbatim.
-  const uw = ['provider=?'];
-  const up: unknown[] = [f.provider];
-  if (f.teamId) { uw.push('team_id=?'); up.push(f.teamId); }
-  if (f.userId) { uw.push('user_id=?'); up.push(f.userId); }
-  if (f.channel) { uw.push('channel_id=?'); up.push(f.channel); }
-  await db.run(
-    `DELETE FROM union_optin WHERE ${uw.join(' AND ')} AND NOT EXISTS (
-       SELECT 1 FROM connection WHERE owner_kind='user' AND owner_id=union_optin.user_id
-         AND team_id=union_optin.team_id AND provider=union_optin.provider)`,
-    up,
-  );
   return { consents, grants };
 }
 
@@ -289,9 +266,6 @@ export async function revokeConnection(
   registry: ProviderRegistry | undefined,
   row: RevokeRow,
   provider: string,
-  // Optional (#112): user rows also drop that user's union opt-ins for the provider (same
-  // resurrection reasoning as disconnectProvider). Channel owners have no opt-ins.
-  unionOptin?: UnionOptin,
 ): Promise<RevokeOutcome> {
   const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
   // Read the token for the upstream revoke — TTL-independent (GHSA-25m2: an expired-here row may
@@ -323,7 +297,6 @@ export async function revokeConnection(
   if (row.ownerKind === 'user') {
     try { await consent.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
     try { await sessions.clearForProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
-    try { await unionOptin?.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
   }
   return { ...row, removed, upstreamAttempted, upstreamOk };
 }
@@ -359,22 +332,18 @@ export async function offboardUserEverywhere(
 ): Promise<{ teamId: string; providers: string[]; ok: boolean }[]> {
   const ent = user.enterpriseId != null;
   const sessions = new SessionGrants(db);
-  const unionOptin = new UnionOptin(db); // #112: opt-ins are purged per team alongside sessions
-  // The ONLY query that spans teams. UNION so a team with only a pending "Connect", only a lingering
-  // thread session grant, or only a union opt-in (#112 — no live connection) is still found and
-  // purged. session_grant and union_optin have no enterprise_id column, so they are always matched by
-  // user_id alone (userId is org-unique).
+  // The ONLY query that spans teams. UNION so a team with only a pending "Connect" or only a lingering
+  // thread session grant (no live connection) is still found and purged. session_grant has no
+  // enterprise_id column, so it is always matched by user_id alone (userId is org-unique).
   const rows = (await db.all(
     `SELECT team_id FROM connection WHERE owner_kind='user' AND owner_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
      SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
-     SELECT team_id FROM session_grant WHERE user_id=?
-     UNION
-     SELECT team_id FROM union_optin WHERE user_id=?`,
+     SELECT team_id FROM session_grant WHERE user_id=?`,
     ent
-      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId, user.userId]
-      : [user.userId, user.userId, user.userId, user.userId],
+      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId]
+      : [user.userId, user.userId, user.userId],
   )) as { team_id: string }[];
 
   const summary: { teamId: string; providers: string[]; ok: boolean }[] = [];
@@ -383,7 +352,7 @@ export async function offboardUserEverywhere(
     // best-effort upstream revoke + audit, and purges this team's pending consent + session grants.
     const identity: SlackIdentity = { enterpriseId: user.enterpriseId ?? null, teamId, userId: user.userId };
     try {
-      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason, sessions, unionOptin), ok: true });
+      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason, sessions), ok: true });
     } catch {
       // Non-fatal per team so later teams still run — but the failure must be SURFACED, not buried
       // (GHSA-25m2 r3): mark this team ok:false so the caller can report the enterprise offboard as

@@ -77,7 +77,7 @@ async function expectApprovalRequired(p: Promise<unknown>): Promise<ApprovalRequ
  * Integration harness through the PUBLIC API (TEST-2): a real createVouchr, its real middleware
  * building context.vouchr, and the real registered Approve/Deny action handlers — Slack faked.
  */
-async function harness(o: { provider?: Provider; slackAdmins?: string[]; members?: string[]; unionMember?: string; sharedChannel?: boolean } = {}) {
+async function harness(o: { provider?: Provider; slackAdmins?: string[]; members?: string[]; sharedChannel?: boolean } = {}) {
   process.env.VOUCHR_MASTER_KEY = randomBytes(32).toString('base64');
   const provider = o.provider ?? approvalProvider();
   const vouchr = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
@@ -105,14 +105,7 @@ async function harness(o: { provider?: Provider; slackAdmins?: string[]; members
   const args: any = { context: {}, client, event: { channel: 'C1', user: 'U1', team: 'T1', thread_ts: 'TH1' }, next: async () => {} };
   await vouchr.middleware(args);
   const ctx = args.context.vouchr;
-  // union: put C1 in union mode and connect the BORROWED member — NOT the caller — so the request
-  // borrows a different human's credential (acting = the member, triggeredBy = the caller U1).
-  if (o.unionMember) {
-    await new ChannelConfig(vouchr.db).setMode('T1', 'C1', provider.id, 'union');
-    await vouchr.vault.upsert(userOwner({ ...ID, userId: o.unionMember }), provider.id, {
-      accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-    });
-  } else if (o.sharedChannel) {
+  if (o.sharedChannel) {
     // shared: the CHANNEL owns the credential (owner_kind=channel/owner_id=C1); the caller borrows it.
     await new ChannelConfig(vouchr.db).setMode('T1', 'C1', provider.id, 'shared');
     await vouchr.vault.upsert(channelOwner('T1', 'C1'), provider.id, {
@@ -416,25 +409,25 @@ test('P1-B: an encoded path separator cannot slip past an approval.paths lock (f
   });
 });
 
-// ── P1-A: grants are bound to the credential OWNER (union switch / mode change) and to its lifecycle ──
+// ── P1-A: grants are bound to the credential OWNER (mode change) and to its lifecycle ──
 
-test('P1-A(a): a grant minted for one credential owner cannot be consumed for another (union member switch)', async () => {
-  // Models "caller borrows member A, then resolution switches to member B": the grant is keyed to
-  // owner A, so a consume that resolves to owner B must MISS (the write would otherwise run against a
-  // DIFFERENT human's credential than was approved). Store-level, deterministic. Fail-before: without
-  // the owner clause in consume(), the B-owner consume would wrongly succeed.
+test('P1-A(a): a grant minted for one credential owner cannot be consumed for another (owner change)', async () => {
+  // Models a mode/owner change between prompt and retry (e.g. per-user → shared): the grant is keyed
+  // to owner A, so a consume that resolves to owner B must MISS (the write would otherwise run against
+  // a DIFFERENT credential than was approved). Store-level, deterministic. Fail-before: without the
+  // owner clause in consume(), the B-owner consume would wrongly succeed.
   const db = await openDb({ dbPath: ':memory:' });
   const approvals = new Approvals(db);
   const forOwner = (ownerId: string) => ({
     teamId: 'T1', userId: 'U_CALLER', ownerKind: 'user' as const, ownerId,
     provider: 'acme', method: 'POST', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
   });
-  const id = await approvals.request(forOwner('U_MEMBER_A'));
+  const id = await approvals.request(forOwner('U_OWNER_A'));
   assert.ok(await approvals.approve(id, 'U_CALLER', 60_000));
-  // Resolution switched to member B → the grant for A does not match.
-  assert.equal(await approvals.consume(forOwner('U_MEMBER_B')), null);
+  // Resolution switched to owner B → the grant for A does not match.
+  assert.equal(await approvals.consume(forOwner('U_OWNER_B')), null);
   // The grant for the ORIGINAL owner A is still spendable exactly once.
-  assert.ok(await approvals.consume(forOwner('U_MEMBER_A')));
+  assert.ok(await approvals.consume(forOwner('U_OWNER_A')));
 });
 
 test('P1-A(b): disconnect purges live grants, so a reconnect cannot spend the old approval', async () => {
@@ -654,70 +647,12 @@ test('providers without the approval knob: writes pass untouched, no approval ro
   });
 });
 
-// ── union mode: the caller (not the borrowed member) is "self" ────────────────────────────────────
-
-test("union + approver 'self': the CALLER is prompted and can approve; no interloper denial", async () => {
-  // Union channel: only U_M is connected, so the write borrows U_M's cred (acting = U_M) while the
-  // caller stays U1 (triggeredBy). Regression: before keying the grant to the caller, U1 got the
-  // prompt but U1's own click was rejected as not-approver and the grant was keyed to the never-
-  // prompted U_M — a permanent 'self' deadlock. This test FAILS before that fix and passes after.
-  const { ctx, ephemerals, dms, click, auditRows } = await harness({ unionMember: 'U_M', members: ['U1', 'U_M'] });
-  await withFetch(async (calls) => {
-    const handle = await ctx.connect('acme');
-    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    assert.equal(e.approver, 'self');
-    // The prompt goes to the CALLER (the human driving the agent), not the borrowed member.
-    const prompt = [...ephemerals, ...dms].find((p) => JSON.stringify(p.blocks ?? '').includes('Approve'));
-    assert.ok(prompt, 'an approval prompt was posted');
-    assert.equal(prompt.user ?? prompt.channel, 'U1');
-
-    // The caller clicking their OWN prompt is eligible → approves; the retry consumes and executes.
-    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
-    const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST' });
-    assert.equal(res.status, 200);
-    assert.equal(calls.length, 1);
-
-    // The caller's own click was NEVER logged as an ineligible interloper.
-    const rows = await auditRows();
-    assert.ok(!rows.some((r) => r.action === 'denied' && r.meta.includes('not-approver')), 'no not-approver denial for the caller');
-    // Audit attribution is unchanged: consumed row is owned by the borrowed member, approved by the caller.
-    const consumed = rows.find((r) => r.action === 'approval_consumed');
-    assert.equal(consumed.user_id, 'U_M'); // acting = the credential owner
-    assert.equal(consumed.actor, 'U1'); // approver = the caller who clicked
-  });
-});
-
-test("union + approver 'admin': an eligible admin approves; an ineligible clicker is rejected + audited", async () => {
-  // admin eligibility is independent of who is borrowed, so union changes nothing here — assert it.
-  const { ctx, ephemerals, click, auditRows } = await harness({
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    unionMember: 'U_M', members: ['U1', 'U_M', 'U_ADM'], slackAdmins: ['U_ADM'],
-  });
-  await withFetch(async (calls) => {
-    const handle = await ctx.connect('acme');
-    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    assert.deepEqual(ephemerals.map((p) => p.user), ['U_ADM']); // prompted the one eligible admin
-
-    // An ineligible clicker (the caller, the borrowed member) is rejected and audited.
-    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
-    await click(APPROVAL_APPROVE_ACTION, 'U_M', e.approvalId);
-    assert.equal((await auditRows()).filter((r) => r.action === 'denied' && r.meta.includes('not-approver')).length, 2);
-
-    // The admin approves a fresh prompt; the retry executes.
-    const e2 = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    await click(APPROVAL_APPROVE_ACTION, 'U_ADM', e2.approvalId);
-    assert.equal((await handle.fetch('https://api.acme.test/repos', { method: 'POST' })).status, 200);
-    assert.equal(calls.length, 1);
-    assert.equal((await auditRows()).find((r) => r.action === 'approval_consumed').actor, 'U_ADM');
-  });
-});
-
 // ── shared channel-owned credential: the grant binds to owner_kind=channel ────────────────────────
 
 test('shared mode: a write on a channel-owned credential prompts, binds to the channel owner, and consumes once', async () => {
   // connect() in shared mode borrows the CHANNEL's credential (owner_kind=channel/owner_id=C1),
-  // audited as the acting human. Closes owner-binding coverage for the third owner kind (user +
-  // union already covered). Approver 'self' = the caller confirms their own action.
+  // audited as the acting human. Closes owner-binding coverage for the channel owner kind (the
+  // per-user kind is covered above). Approver 'self' = the caller confirms their own action.
   const { ctx, ephemerals, click, approvalRows, auditRows } = await harness({ sharedChannel: true });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme'); // shared mode → connectChannel, channel-owned cred
@@ -816,11 +751,11 @@ test('sweep: expired prompts and unspent grants are deleted and audited (actor: 
   const granted = await approvals.request({ ...key, path: '/other' });
   await approvals.approve(granted, 'U_ADM', 1_000); // grant, 1s TTL
   // A live grant survives the sweep.
-  await sweepExpired(vault, audit, consent, undefined, undefined, undefined, approvals);
+  await sweepExpired(vault, audit, consent, undefined, undefined, approvals);
   assert.equal(((await db.all(`SELECT * FROM approval_request`)) as any[]).length, 2);
   // Past both TTLs everything is reclaimed, each expiry audited with the non-human actor.
   await withClockOffset(11 * 60_000, async () => {
-    await sweepExpired(vault, audit, consent, undefined, undefined, undefined, approvals);
+    await sweepExpired(vault, audit, consent, undefined, undefined, approvals);
   });
   assert.equal(((await db.all(`SELECT * FROM approval_request`)) as any[]).length, 0);
   const rows = (await db.all(`SELECT action, user_id, actor, meta FROM audit WHERE action='denied'`)) as any[];

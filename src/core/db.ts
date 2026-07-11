@@ -187,7 +187,8 @@ class PgClientDb implements Db {
  * Monotonic version of the schema this build writes, stamped into the `meta` table on every open.
  * Bump it whenever the schema changes shape. Version 1 = the schema at the release that introduced
  * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
- * Version 2 = + the `union_optin` table (#112, purely additive).
+ * Version 2 = (removed) the `union_optin` table — union credential-borrowing was removed in #196
+ *   before any deploy, so this build never creates it.
  * Version 3 = + the `notification_state` table (#117, purely additive).
  * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
  *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
@@ -327,15 +328,6 @@ function schema(blob: string, int: string): string {
       created_at ${int} NOT NULL,
       expires_at ${int} NOT NULL,
       PRIMARY KEY (team_id, channel, thread, user_id, provider)
-    );
-
-    CREATE TABLE IF NOT EXISTS union_optin (
-      team_id TEXT NOT NULL,
-      channel_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      created_at ${int} NOT NULL,
-      PRIMARY KEY (team_id, channel_id, user_id, provider)
     );
 
     CREATE TABLE IF NOT EXISTS approval_request (

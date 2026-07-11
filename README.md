@@ -120,33 +120,6 @@ Each channel chooses how a provider is authorized; your handler stays scope-agno
 | `per-user` | Each person uses their own connected account. | GitHub, Google, Jira |
 | `session` | A person's account is usable only inside the approving thread (TTL-bounded, default 8h). | Sensitive write actions |
 | `shared` | The channel uses one admin-configured credential. | Team-owned tools, internal APIs |
-| `union` | Any connected member's account may satisfy the request, acting (and audited) as that member. | Shared team channels |
-
-### Union opt-in and owner notification
-
-Delegating your identity to other members' requests should be explicit and visible (#112):
-
-- **Explicit opt-in** — with `createVouchr({ unionRequiresOptIn: true })`, `union` resolution only
-  borrows members who opted in for that (channel, provider): completing a Connect prompt posted in
-  the union channel opts you in automatically, or run `/vouchr union join <provider>` (requires a
-  connected credential; otherwise you get the Connect prompt). `/vouchr union leave <provider>`
-  takes effect on the very next request, and disconnect/offboarding remove eligibility too. With
-  nobody opted in, the requester simply gets the normal Connect prompt. Joins/leaves are audited
-  (`union` action).
-- **Owner notification** — when a union resolution serves someone *else's* request with your
-  credential, Vouchr DMs you who used it and where, with pointers to `/vouchr audit` (the
-  authoritative history) and `/vouchr union leave`. Debounced to one DM per
-  (owner, provider, channel) per hour; never sent when you're serving yourself.
-
-Enforcement scope: the resolution-time opt-in filter runs on the Bolt surface. The headless broker
-trusts the host's signed `actingMemberId` by design — a host that resolves acting members itself
-enforces the same rule with the exported `eligibleUnionMembers` (see `UnionOptin`,
-`joinUnion`/`leaveUnion`, also on `./headless`), and broker-hosted OAuth callbacks record opt-ins
-exactly like Bolt ones when `channelConfig` is wired.
-
-> **Deprecation:** `unionRequiresOptIn` currently defaults to `false` (any connected member is
-> borrowable — the pre-#112 behavior). This compatibility default **flips to `true` at the next
-> breaking release**; set it explicitly today.
 
 Admins govern this in Slack with `/vouchr`: `mode <provider> <mode>`, `enable`/`disable <provider>`
 (per-channel tool allowlist enforced by `connect()`), `configure <provider>` (private modal for
@@ -229,7 +202,7 @@ executes. A grant is **single-use**, expires after `ttlMs` (default 5 minutes), 
 the exact (method, host, path, query) it was minted for — the query byte-exact as a digest, so
 raw values are never persisted and any reordering re-prompts; not a prefix, not the payload
 bytes — **and** the exact
-credential owner: a union member switch or a per-user→shared mode change re-prompts rather than
+credential owner: a per-user→shared mode change re-prompts rather than
 running against a credential the human didn't approve, and disconnecting/reconnecting the credential
 purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every
 egress gate (an additional gate, never a bypass) and **before** the secret is read; every step —

@@ -207,7 +207,7 @@ into many actions, or to skip the approval entirely.
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential
   owner** it was minted against (user vs channel, and which user), so a later resolution
-  switch — a union member A→B, or a per-user→shared mode change — no longer matches and
+  switch — a per-user→shared mode change — no longer matches and
   re-prompts: the write can never run against a different credential than the human
   approved. And a grant is purged the moment its credential is deleted or replaced
   (disconnect, offboard, bulk-revoke, reconnect, TTL-expiry — all route through the one

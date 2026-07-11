@@ -4,8 +4,6 @@ import type { Vault } from './vault';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import type { Consent } from './consent';
 import type { SlackIdentity } from './identity';
-import type { ChannelConfig } from './channelConfig';
-import { joinUnion, type UnionOptin } from './unionOptin';
 import { userOwner } from './owner';
 import { exchangeCode, type TokenResponse } from './tokens';
 import { DRY_RUN_ACCOUNT, DRY_RUN_CODE, DryRunVaultError, dryRunTokenResponse } from './dryRun';
@@ -19,13 +17,9 @@ export interface CallbackDeps {
   redirectUri: string;
   /** Optional audit STREAM sink (raw actor id). No-op when unset; the audit table is authoritative. */
   auditSink?: AuditSink;
-  /** #112: both set → a connect prompted FROM a union-mode channel also records the union opt-in
-   *  (the consent row carries that channel). Unset → callback behavior is unchanged. */
-  channelConfig?: ChannelConfig;
-  unionOptin?: UnionOptin;
   /** #116 dry-run: replace the token-exchange network edge with a synthetic credential (marked
-   *  `external_account: 'dry-run'`). State consumption, vault write, audit, and the union opt-in
-   *  around it run for real. Default false: unchanged behavior. */
+   *  `external_account: 'dry-run'`). State consumption, vault write, and audit around it run for
+   *  real. Default false: unchanged behavior. */
   dryRun?: boolean;
 }
 
@@ -122,17 +116,6 @@ export async function handleOAuthCallback(
       return { ok: false, status: 403, error: 'This account is no longer active. Reconnect is unavailable.' };
     }
     await deps.audit.record('connect', row.identity, provider.id, { account });
-    // #112: connecting IN RESPONSE to a union-channel prompt IS the opt-in moment. The consent row
-    // carries the channel the prompt was posted in; record the opt-in only when that channel is in
-    // union mode for this provider. Best-effort AFTER the vault write: the credential is the primary
-    // outcome, and a missed opt-in is self-serviceable via `/vouchr union join`.
-    if (deps.unionOptin && deps.channelConfig && row.channel) {
-      try {
-        if ((await deps.channelConfig.getMode(row.identity.teamId, row.channel, provider.id)) === 'union') {
-          await joinUnion(deps.unionOptin, deps.audit, row.identity, row.channel, provider.id);
-        }
-      } catch { /* the connect already succeeded; never fail the callback over the opt-in row */ }
-    }
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_granted', 200);
     return { ok: true, provider: provider.id, account, scopes, identity: row.identity };
   } catch {

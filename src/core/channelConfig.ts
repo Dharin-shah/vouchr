@@ -8,18 +8,13 @@ import type { Db } from './db';
  *  - 'per-user': each member uses their own credential; no shared cred may exist here (invariant 7).
  *  - 'session':  per-user, but usable only inside the Slack thread the user approved it in (a thread
  *                 session grant), with a TTL ceiling.
- *  - 'union':    "any connected member" — connect() resolves to WHICHEVER channel member has connected
- *                 the provider and acts as THAT member (their user-owned cred is the key; that member is
- *                 the audited actor). Still per-user creds (no shared channel cred), just resolved across
- *                 the channel's members instead of only the caller. No owner/actor conflation: the audited
- *                 actor is the real member whose credential is used, never the channel and never the caller.
  * No row → unconfigured, treated as 'per-user' (each member uses their own; an admin may set a mode).
  */
-export const CHANNEL_MODES = ['shared', 'per-user', 'session', 'union'] as const;
+export const CHANNEL_MODES = ['shared', 'per-user', 'session'] as const;
 export type ChannelMode = (typeof CHANNEL_MODES)[number];
 /** Runtime guard — the SINGLE source of truth for "is this a valid channel mode". Every caller that
  *  takes a mode from an untrusted surface (a slash arg, a modal view_submission, a broker request body)
- *  routes through this, so the four modes are never re-listed and can never drift out of sync. */
+ *  routes through this, so the three modes are never re-listed and can never drift out of sync. */
 export const isChannelMode = (m: unknown): m is ChannelMode =>
   typeof m === 'string' && (CHANNEL_MODES as readonly string[]).includes(m);
 

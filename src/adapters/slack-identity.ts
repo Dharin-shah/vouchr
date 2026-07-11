@@ -99,10 +99,9 @@ export async function isChannelMember(
 }
 
 /**
- * The user ids of every member of `channel`, paged from conversations.members. Used by the 'union'
- * channel mode to find a member who has connected a provider. Fail-closed: any API error yields an
- * empty list (no member resolves → the caller falls back to prompting the asker), so a read we can't
- * complete never silently borrows a credential.
+ * The user ids of every member of `channel`, paged from conversations.members. Used to find the
+ * channel's eligible approvers (#113). Fail-closed: any API error yields an empty list, so a read we
+ * can't complete never silently widens the candidate set.
  */
 export async function listChannelMembers(
   client: {

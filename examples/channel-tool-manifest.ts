@@ -46,14 +46,14 @@ const payments = defineProvider({
 export const providers = [github(), jira, payments];
 
 // What `context.vouchr.toolManifest()` returns for a channel where Jira is set to
-// 'union' (any connected member) — the shape an agent reads before planning. The
+// 'session' (per-user, thread-scoped) — the shape an agent reads before planning. The
 // host filters on `identity` to decide who runs the tool:
 //
 //   entry.identity === 'acting_human'  → await context.vouchr.connect(entry.provider)
 //   entry.identity === 'service'       → host's own service-to-service call
 export const exampleManifest: ToolManifestEntry[] = [
   { provider: 'github', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'public' },
-  { provider: 'jira', mode: 'union', enabled: true, identity: 'acting_human', visibility: 'private' },
+  { provider: 'jira', mode: 'session', enabled: true, identity: 'acting_human', visibility: 'private' },
   { provider: 'payments', mode: null, enabled: true, identity: 'service', visibility: 'public' },
 ];
 
@@ -64,6 +64,6 @@ export async function dispatch(
   callService: (id: string) => Promise<unknown>,
 ): Promise<unknown> {
   return entry.identity === 'acting_human'
-    ? vouchr.connect(entry.provider) // resolves the human's credential + consent (+ union across members)
+    ? vouchr.connect(entry.provider) // resolves the human's credential + consent
     : callService(entry.provider); // service-to-service: Vouchr is deliberately not in this path
 }

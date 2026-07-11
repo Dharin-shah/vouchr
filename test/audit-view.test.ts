@@ -73,9 +73,9 @@ test('audit: a stored value cannot forge a mrkdwn link/mention (escaped in the v
   assert.match(json, /&lt;https:\/\/evil\.com/);        // present but escaped (inert)
 });
 
-test('audit: surfaces WHO borrowed the credential (union actor column)', async () => {
+test('audit: surfaces the non-caller actor (e.g. an approver) via the actor column', async () => {
   const { audit, run } = await harness();
-  await audit.record('inject', id('U_A'), 'github', { host: 'x' }, 'U_B'); // U_B borrowed U_A's cred
+  await audit.record('approval_consumed', id('U_A'), 'github', { host: 'x' }, 'U_B'); // U_B approved U_A's action
   assert.match(JSON.stringify(await run('audit', 'U_A')), /by <@U_B>/);
 });
 

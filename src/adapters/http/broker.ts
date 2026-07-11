@@ -20,7 +20,6 @@ import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
 import { Approvals, ApprovalRequiredError } from '../../core/approval';
-import { UnionOptin } from '../../core/unionOptin';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
 import { handleOAuthCallback } from '../../core/oauthCallback';
@@ -34,8 +33,8 @@ import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditRespo
  * granting any cross-tenant access.
  *
  * `owner: 'channel'` (#51) is a transport-agnostic channel gate: the broker still has no Slack client,
- * so the trusted caller supplies the Slack-derived facts (eligibility, the union acting-member) as
- * SIGNED claims and the broker resolves the credential owner from those claims, never from this handle.
+ * so the trusted caller supplies the Slack-derived facts (channel eligibility) as SIGNED claims and
+ * the broker resolves the credential owner from those claims, never from this handle.
  * It stays fail-closed: a deployer must opt in with `BrokerOptions.channelConfig`, and the signed
  * `ownerKind` must match this field or the request is refused (a forged body `owner:'channel'` alone
  * can't reach a channel credential). See `resolveOwner`.
@@ -136,9 +135,9 @@ export interface BrokerOptions {
   /**
    * #51 transport-agnostic channel gate. Setting this ENABLES `owner: 'channel'` handles; unset keeps
    * the historical user-only broker (any `owner:'channel'` request is refused). The store resolves the
-   * channel's mode (`shared` → the channel credential; `union` → the signed `actingMemberId`'s own
-   * credential, audited as that member). Owner + eligibility come ONLY from the signed identity claims,
-   * never the request body — so a forged body cannot assert a channel credential.
+   * channel's mode (`shared` → the channel credential, audited as the acting human). Owner + eligibility
+   * come ONLY from the signed identity claims, never the request body — so a forged body cannot assert a
+   * channel credential.
    */
   channelConfig?: ChannelConfig;
   /**
@@ -519,7 +518,6 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   const consent = new Consent(opts.db, dryRun); // #116: dry-run mints local instantly-succeeding authorize URLs
   const sessions = new SessionGrants(opts.db);
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
-  const unionOptin = new UnionOptin(opts.db); // #112: disconnect/offboard purge union opt-ins too
   const callbackPath = opts.callbackPath ?? '/oauth/callback';
   const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
 
@@ -605,8 +603,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * `ownerKind` (never the body): the body handle's `owner` must merely MATCH the signed claim, so a
    * forged `owner:'channel'` on a plain user token is refused rather than silently downgraded. Channel
    * mode is fail-closed: refused unless `channelConfig` is set (opt-in) and the signed eligibility
-   * verdict is present. `shared` keys the vault on the channel and audits the acting human; `union`
-   * keys on and audits the signed acting member — never the channel, never the caller.
+   * verdict is present. `shared` keys the vault on the channel and audits the acting human.
    */
   async function resolveOwner(
     ref: ConnectionHandleRef,
@@ -651,11 +648,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     // treats every channel-owned request as eligible (unchanged).
     const eligible = (opts.requireChannelEligibility ?? true) ? claims.channelEligible === true : true;
     const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
-    const memberId = claims.actingMemberId;
-    const actingMember: SlackIdentity | null = memberId
-      ? { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: memberId }
-      : null;
-    const r = resolveCredentialOwner({ path: 'channel', mode, principal: acting, channel: claims.channel, eligible, actingMember });
+    const r = resolveCredentialOwner({ path: 'channel', mode, principal: acting, channel: claims.channel, eligible });
     if (r.status === 'refused') {
       if (r.code === 'ineligible') {
         await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
@@ -664,11 +657,8 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
       throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
     }
-    if (r.status !== 'resolved') {
-      // union with no signed actingMemberId → no member to act as (the caller resolves it via the Slack
-      // client and signs it). A bad request, not a policy denial.
-      throw new HttpError(400, { error: 'union mode requires a signed actingMemberId' });
-    }
+    // The channel path only ever yields resolved or refused; anything else fails closed (defensive).
+    if (r.status !== 'resolved') throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
     return { owner: r.owner, acting: r.acting };
   }
 
@@ -695,17 +685,15 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     // The 7th arg is the createBroker-scoped SHARED inflight map, so concurrent requests for the same
     // owner+provider collapse to one token refresh (rotating-refresh providers brick on a double
     // refresh). The 8th wires the metrics sink so the broker path stops being a black box; the 9th
-    // wires the audit STREAM sink (raw actor id) for host-side ingestion. The 10th is the real
-    // triggering caller (claims.userId): in union mode `acting` is the borrowed member, so passing the
-    // caller lets the inject audit record BOTH for non-repudiation (no-op when they're the same). The
-    // 11th is the origin channel from the signed claims, so per-channel usage stats see this request.
-    // The 12th is the createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit).
-    // The 13th is the #117 credential-health hook (definitive refresh death → owner identity, no tokens).
-    // The 14th/15th are the #113 approval store + the signed thread (a provider.approval gate is
-    // enforced on this door too; the broker maps the throw to 403 approval_required, approval SURFACE
-    // stays the Bolt app — see mapUpstreamError). The 16th flags dry-run (#116): the injector stubs
-    // ONLY the final network call, after every gate — the approval gate included.
-    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.userId, claims.channel ?? null, rateLimits, opts.onCredentialHealth, approvals, claims.threadTs ?? null, dryRun);
+    // wires the audit STREAM sink (raw actor id) for host-side ingestion. The 10th is the origin
+    // channel from the signed claims, so per-channel usage stats see this request. The 11th is the
+    // createBroker-scoped SHARED rate-limit bucket store (provider.rateLimit). The 12th is the #117
+    // credential-health hook (definitive refresh death → owner identity, no tokens). The 13th/14th are
+    // the #113 approval store + the signed thread (a provider.approval gate is enforced on this door
+    // too; the broker maps the throw to 403 approval_required, approval SURFACE stays the Bolt app —
+    // see mapUpstreamError). The 15th flags dry-run (#116): the injector stubs ONLY the final network
+    // call, after every gate — the approval gate included.
+    const handle = new ConnectionHandle(provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent, opts.auditSink, claims.channel ?? null, rateLimits, opts.onCredentialHealth, approvals, claims.threadTs ?? null, dryRun);
     return { handle, provider, acting };
   }
 
@@ -869,7 +857,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     const claims = await verify(body.identityToken);
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    const { removed, ok } = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId, unionOptin);
+    const { removed, ok } = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId);
     return { ok, revoked: removed ? [providerId] : [] };
   }
 
@@ -898,7 +886,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       return { ok: incompleteTeams === 0, revoked: summary.flatMap((s) => s.providers), ...(incompleteTeams ? { incompleteTeams } : {}) };
     }
     const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
-    const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions, unionOptin);
+    const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions);
     return { ok: true, revoked: providers };
   }
 
@@ -984,7 +972,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
     const mode = body.mode;
     if (!isChannelMode(mode)) {
-      throw new HttpError(400, { error: 'mode must be one of shared|union|per-user|session' });
+      throw new HttpError(400, { error: 'mode must be one of shared|per-user|session' });
     }
     const claims = await verifyBrokerableProvider(providerId, body.identityToken);
     const acting = await requireAdmin(claims, providerId);
@@ -1079,11 +1067,8 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   async function handleCallback(url: URL): Promise<{ status: number; html: string }> {
     const q = url.searchParams;
     const result = await handleOAuthCallback(
-      // channelConfig + unionOptin (#112): a broker-hosted connect prompted from a union-mode channel
-      // (the consent row carries the SIGNED channel from /v1/connect) records the union opt-in exactly
-      // like the Bolt callback. Inert when channelConfig isn't opted in. dryRun (#116) stubs only the
-      // token-exchange edge inside the shared callback.
-      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink, channelConfig: opts.channelConfig, unionOptin, dryRun },
+      // dryRun (#116) stubs only the token-exchange edge inside the shared callback.
+      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink, dryRun },
       q.get('code') ?? undefined,
       q.get('state') ?? undefined,
       q.get('error') ?? undefined,

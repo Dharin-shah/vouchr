@@ -197,7 +197,7 @@ fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay
 
 By default the broker is **user-only**: a `handle.owner` of `"channel"` is refused. Set
 `VOUCHR_CHANNEL_MODES=1` to enable the transport-agnostic channel gate (#51), which lets a headless
-caller reach the same `shared` / `union` channel modes the Bolt adapter offers — **without** a Slack
+caller reach the `shared` channel mode the Bolt adapter offers — **without** a Slack
 client in the broker. The broker has no way to read Slack, so **the caller supplies the Slack-derived
 facts as signed claims** and the broker trusts them at the same level as `teamId`/`userId`:
 
@@ -207,22 +207,19 @@ facts as signed claims** and the broker trusts them at the same level as `teamId
   caller **must** compute this with the exported `channelIneligibleReason` (refuse externally-shared /
   Slack-Connect / DM / archived channels — the cross-org leak case). The broker **fails closed**: a
   channel request with this absent or false is refused.
-- `actingMemberId` — for `union` mode, the connected member the caller elected to act as. That member
-  is the vault owner **and** the audited actor — never the channel, never the caller.
 
 Mint them via `mintIdentity`'s optional fields:
 
 ```ts
 const token = mintIdentity(
-  { teamId, userId, channel, ownerKind: 'channel', channelEligible: channelIneligibleReason(info) === null,
-    actingMemberId /* union only */ },
+  { teamId, userId, channel, ownerKind: 'channel', channelEligible: channelIneligibleReason(info) === null },
   process.env.VOUCHR_IDENTITY_SECRET!,
 );
 ```
 
-`shared` resolves to the channel's credential (audited as the acting human); `union` resolves to the
-signed member's own credential (audited as that member). `per-user` / `session` channels are **not**
-reachable this way — those are user-owned modes, so the caller uses `owner: "user"`.
+`shared` resolves to the channel's credential (audited as the acting human). `per-user` / `session`
+channels are **not** reachable this way — those are user-owned modes, so the caller uses
+`owner: "user"`.
 
 #### Admin channel-credential config (`POST /v1/admin/reference`, #53)
 
@@ -262,7 +259,7 @@ POST /v1/admin/reference
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116): real gates, no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
-| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared/union) via signed channel-fact claims (#51). Off → user-only broker. |
+| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51). Off → user-only broker. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
@@ -524,7 +521,7 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
 - **Events:** `app_mention`, `user_change` (the latter drives auto-revoke on deactivation).
 - **Interactivity:** enabled, and **required** for the Connect button and the key/configure modals.
 - **Slash command:** `/vouchr` — full surface: `status` (default), `disconnect <provider>`,
-  `configure <provider>` (admin channel-credential modal), `mode <provider> <shared|per-user|session|union>`
+  `configure <provider>` (admin channel-credential modal), `mode <provider> <shared|per-user|session>`
   (admin), `tools` (list the channel's tool manifest), and `enable <provider>` / `disable <provider>`
   (admin: the per-channel tool allowlist `connect()` enforces).
 - **Who may configure:** by default the `configure`/`mode`/`enable`/`disable` commands are

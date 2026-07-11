@@ -61,7 +61,7 @@ async function makeHandle(p: Provider, acting: SlackIdentity = U1, store = new M
   const handle = new ConnectionHandle(
     p, owner, acting, vault, new Audit(db),
     { ext: async () => { resolves++; return SECRET_TOKEN; } },
-    new Map(), (e) => events.push(e), () => {}, null, null, store,
+    new Map(), (e) => events.push(e), () => {}, null, store,
   );
   return { handle, db, events, getResolves: () => resolves, getVaultGets: () => vaultGets };
 }

@@ -74,12 +74,12 @@ export class ApprovalRequiredError extends Error {
  * conversation context it was requested from (null = none, stored as '').
  *
  * Two identities are carried SEPARATELY (never conflated):
- *  - `userId`: the REQUESTER (the human driving the agent — the caller, not the borrowed union
- *    member). Who is prompted, and who self-approval matches.
+ *  - `userId`: the REQUESTER (the human driving the agent — the caller). Who is prompted, and who
+ *    self-approval matches.
  *  - `ownerKind`/`ownerId`: the CREDENTIAL OWNER the grant is bound to. consume() matches it too, so
- *    if resolution later picks a different owner (a union member switch A→B, or a per-user→shared
- *    mode change), the grant no longer matches and re-prompts — the write can never run against a
- *    different credential than the human approved. It is also the purge key (purgeApprovalsForOwner).
+ *    if resolution later picks a different owner (a per-user→shared mode change), the grant no longer
+ *    matches and re-prompts — the write can never run against a different credential than the human
+ *    approved. It is also the purge key (purgeApprovalsForOwner).
  */
 export interface ApprovalKey {
   teamId: string;
