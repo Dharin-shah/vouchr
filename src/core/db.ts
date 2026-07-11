@@ -192,8 +192,15 @@ class PgClientDb implements Db {
  * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
  *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
  *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
+ * Version 5 = + the `approval_request.query_hash` column (GHSA-pg84, purely additive). The column
+ *   DEFAULTs to `'pre-v5'` — a value no live digest can equal ('' or 64-char hex) — so any row a
+ *   pre-v5 writer creates matches NOTHING and re-prompts ('' as a default would let a grant minted
+ *   for a query-bearing action authorize a queryless request). The migration additionally PURGES
+ *   all approval rows when the stored version is < 5 (healApprovalRowsPreV5): they are
+ *   minutes-lived prompts/grants, so deleting them is the crash-safe fail-closed upgrade — the
+ *   purge is version-gated, and the version stamp lands only after it succeeds.
  */
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -212,10 +219,10 @@ const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value T
  *   which is what stampSchemaVersion() then records. Newer databases always carry the marker, so
  *   from this release on the ambiguity cannot recur.
  */
-async function guardSchemaVersion(db: Db): Promise<void> {
+async function guardSchemaVersion(db: Db): Promise<number | null> {
   await db.exec(META_DDL);
   const row = await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`);
-  if (!row) return;
+  if (!row) return null;
   const found = Number(row.value);
   if (!Number.isInteger(found) || found > SCHEMA_VERSION) {
     throw new Error(
@@ -225,6 +232,19 @@ async function guardSchemaVersion(db: Db): Promise<void> {
         `version ${row.value}, or restore a database backup taken at schema version ${SCHEMA_VERSION} or older.`,
     );
   }
+  return found;
+}
+
+/**
+ * GHSA-pg84 v5 healing, keyed on the STORED version (crash-safe: the stamp is written only after
+ * this succeeds, so a crash anywhere re-runs it on the next open). Approval rows are minutes-lived
+ * prompts/grants, so the fail-closed migration is simply to purge them: any query-binding
+ * ambiguity a pre-v5 row could carry (including rows written by a still-running v4 process during
+ * a rolling deploy — the ALTER's DEFAULT 'pre-v5' covers those going forward) dies here, and the
+ * agent re-prompts. `from === null` covers fresh/pre-marker DBs, whose table is empty anyway.
+ */
+async function healApprovalRowsPreV5(db: Db, from: number | null): Promise<void> {
+  if (from == null || from < 5) await db.run(`DELETE FROM approval_request`, []);
 }
 
 /** Record that the database is now at this build's schema version (after migrations ran). */
@@ -325,6 +345,7 @@ function schema(blob: string, int: string): string {
       method TEXT NOT NULL,
       host TEXT NOT NULL,
       path TEXT NOT NULL,
+      query_hash TEXT NOT NULL DEFAULT 'pre-v5',
       channel TEXT NOT NULL,
       thread TEXT NOT NULL,
       status TEXT NOT NULL,
@@ -381,12 +402,16 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
     pool.on('error', (e) => console.error('[vouchr] postgres idle-client error:', e.message));
     const db = new PgDb(pool, url);
     try {
-      await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
+      const from = await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
       await db.exec(schema('BYTEA', 'BIGINT'));
       // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
       await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
       // #116 v4: system-only dry-run provenance on the credential row (never user/provider data).
       await db.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS dry_run BIGINT NOT NULL DEFAULT 0`);
+      // GHSA-pg84 v5: query digest on approval rows — ONE atomic statement (no crash window between
+      // adding the column and marking legacy rows: the DEFAULT does the marking).
+      await db.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS query_hash TEXT NOT NULL DEFAULT 'pre-v5'`);
+      await healApprovalRowsPreV5(db, from); // crash-safe fail-closed purge, version-gated
       await stampSchemaVersion(db);
     } catch (e) {
       await db.close().catch(() => undefined);
@@ -400,8 +425,9 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
   raw.pragma('busy_timeout = 5000'); // wait, don't instantly SQLITE_BUSY, on a concurrent writer
   const db = new SqliteDb(raw);
   try {
-    await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
+    const from = await guardSchemaVersion(db); // fail closed on a newer-schema DB, before any migration runs
     migrateSqlite(raw);
+    await healApprovalRowsPreV5(db, from); // GHSA-pg84 v5: crash-safe fail-closed purge, version-gated
     await stampSchemaVersion(db);
   } catch (e) {
     await db.close().catch(() => undefined);
@@ -449,5 +475,13 @@ function migrateSqlite(db: BetterSqlite3.Database): void {
   const connCols = (db.prepare(`PRAGMA table_info(connection)`).all() as any[]).map((c) => c.name);
   if (!connCols.includes('dry_run')) {
     db.exec(`ALTER TABLE connection ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0`);
+  }
+
+  // GHSA-pg84 v5: query digest on a pre-existing approval_request table — ONE atomic ALTER whose
+  // DEFAULT marks legacy rows 'pre-v5' (no crash window between adding and marking; no live digest
+  // — '' or hex — can equal the sentinel, so pre-v5 writers' rows match nothing and re-prompt).
+  const apCols = (db.prepare(`PRAGMA table_info(approval_request)`).all() as any[]).map((c) => c.name);
+  if (!apCols.includes('query_hash')) {
+    db.exec(`ALTER TABLE approval_request ADD COLUMN query_hash TEXT NOT NULL DEFAULT 'pre-v5'`);
   }
 }
