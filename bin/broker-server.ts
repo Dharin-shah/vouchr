@@ -87,7 +87,7 @@ export async function buildBrokerServer(
   // Optional KMS envelope — only when configured.
   let envelope: EnvelopeProvider | undefined;
   if (env.VOUCHR_KMS_KEY_ID) {
-    const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms');
+    const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms.js');
     envelope = kmsEnvelope(env.VOUCHR_KMS_KEY_ID, await awsKmsClient({ region: env.AWS_REGION }));
   }
 

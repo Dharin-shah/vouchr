@@ -77,7 +77,7 @@ async function main(): Promise<void> {
   const backend = isPostgresUrl(url) ? 'postgres' : 'sqlite';
   let envelope: EnvelopeProvider | undefined;
   if (process.env.VOUCHR_KMS_KEY_ID) {
-    const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms');
+    const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms.js');
     envelope = kmsEnvelope(process.env.VOUCHR_KMS_KEY_ID, await awsKmsClient({ region: process.env.AWS_REGION }));
   }
 
