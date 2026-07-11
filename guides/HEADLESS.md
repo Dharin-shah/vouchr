@@ -54,6 +54,7 @@ One core, two front doors — both reach the same credential boundary.
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
 | Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons | ⚠️ enforced (403 `approval_required`) — the approval **surface** is the Slack app |
+| Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
 ## Writes are opt-in
 
@@ -217,6 +218,29 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
   `{"ok":true}` whenever the process is serving, no db touched) and `GET /readyz` (readiness —
   `{"ok":true}` only if a `SELECT 1` round-trip succeeds within ~2s, else `503 {"ok":false}`). Both
   are exempt from auth, identity, and replay, and return a bare status with no secrets or error text.
+
+## Dry-run (offline integration tests)
+
+`BrokerOptions.dryRun` (or `VOUCHR_DRY_RUN=1` for the packaged `vouchr-broker`) runs every gate —
+identity verification, replay, policy, channel tools, owner resolution, egress — for real, and no
+real network call leaves the process on any edge: outbound fetch, token exchange, refresh, and
+upstream revoke are all stubbed or skipped (#116):
+
+- `POST /v1/connect` mints an authorize URL that points at **this broker's own callback** with a
+  synthetic code; a test client completes consent by simply GETting it. The callback consumes the
+  real single-use state and writes a synthetic credential marked `external_account: 'dry-run'`.
+- `POST /v1/fetch` reads that credential from the vault and returns a
+  `200` body of `{ dryRun: true, method, url, wouldInjectAs }` instead of calling the provider;
+  denials map to the same errors as production (403 egress blocked, 409 not connected, …).
+
+Safety rails: provenance is a system-only `dry_run` column (never the account label). The packaged
+broker hard-fails at boot if the database holds any non-dry-run credential ("refusing dryRun against
+a vault with real credentials"); a programmatically constructed `createBroker` fails every request
+closed and reports `/readyz` 503 (while `/healthz` stays 200) until the same check passes; and a
+real row written AFTER boot is refused per-request — never injected, never overwritten by a dry-run
+consent (the synthetic write is an atomic conditional). Dry-run requires a **local master key**: an
+external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup, since its wrap/unwrap are real
+network calls. Audit rows carry `meta.dry_run: true`. Never set it against production state.
 
 ## Local sidecar
 

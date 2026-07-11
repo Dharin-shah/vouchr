@@ -19,6 +19,7 @@ import { sweepExpired } from '../src/core/sweep';
 import { UnionOptin } from '../src/core/unionOptin';
 import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
+import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
 import { isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
 
@@ -33,6 +34,8 @@ export interface BuiltBroker {
   backend: 'postgres' | 'sqlite';
   providerIds: string[];
   allowWrites: boolean;
+  /** #116 dry-run: real gates, no real network on any edge (VOUCHR_DRY_RUN). */
+  dryRun: boolean;
   /** #54 TTL sweep: delete expired connections + stale consent + expired thread grants. Idempotent,
    *  so overlapping runs across replicas are safe (noisy, not destructive). Returns the count swept. */
   sweep: () => Promise<number>;
@@ -66,6 +69,9 @@ export async function buildBrokerServer(
   if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`VOUCHR_PORT invalid: ${env.VOUCHR_PORT}`);
 
   const allowWrites = env.VOUCHR_ALLOW_WRITES === '1' || env.VOUCHR_ALLOW_WRITES === 'true';
+  // #116 dry-run: real gates, stubbed network edges (see BrokerOptions.dryRun). Same env style as
+  // VOUCHR_ALLOW_WRITES; anything but an explicit 1/true stays off (production behavior).
+  const dryRun = env.VOUCHR_DRY_RUN === '1' || env.VOUCHR_DRY_RUN === 'true';
   const brokerToken = env.VOUCHR_BROKER_TOKEN || undefined;
   // #52 setting VOUCHR_BASE_URL mounts the OAuth connect flow (/v1/connect + the callback). Unset →
   // the historical use-only broker (no consent kickoff).
@@ -100,8 +106,13 @@ export async function buildBrokerServer(
   };
 
   const db = await openDb(backend === 'postgres' ? { databaseUrl: url } : { dbPath: env.VOUCHR_DB });
+  // #116 startup hard-fail (createBroker re-runs the same check lazily): never dry-run a real vault.
+  if (dryRun) await assertDryRunVault(db);
   const vault = new Vault(db, masterKey, ttl, envelope);
-  const audit = new Audit(db);
+  // #116: the SAME marked audit instance goes to createBroker AND the local sweep closure below, so
+  // sweep-written rows (revoke reason 'expired') carry meta.dry_run too — createBroker only wraps
+  // its own copy, which would leave the sweep writing unmarked rows.
+  const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
   // Multi-replica safety is now the createBroker default: with a db configured it uses DbReplayStore
   // (shared jti table), so a scaled fleet gets cluster-wide single-use with no wiring here. #100.
 
@@ -122,6 +133,7 @@ export async function buildBrokerServer(
     channelConfig,
     baseUrl,
     callbackPath,
+    dryRun,
     ...overrides,
   });
 
@@ -140,7 +152,7 @@ export async function buildBrokerServer(
   const sweepIntervalMs = rawInterval !== undefined ? Number(rawInterval) : 60 * 60 * 1000;
   if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs < 0) fail(`VOUCHR_SWEEP_INTERVAL_MS invalid: ${rawInterval}`);
 
-  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, sweep, sweepIntervalMs };
+  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, dryRun, sweep, sweepIntervalMs };
 }
 
 const USAGE = `vouchr-broker — standalone headless Vouchr credential broker (no Slack)
@@ -150,7 +162,7 @@ Usage: vouchr-broker            start the broker, config from env
 
 Required env: VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY (base64 of 32 bytes).
 Optional env: VOUCHR_PORT (3000), VOUCHR_DATABASE_URL|VOUCHR_DB, VOUCHR_KMS_KEY_ID,
-              VOUCHR_ALLOW_WRITES, VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
+              VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN, VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -163,7 +175,8 @@ async function main(): Promise<void> {
     // One line, no secrets — startup provenance for ops.
     console.log(
       `[vouchr] broker listening port=${built.port} backend=${built.backend} ` +
-        `providers=[${built.providerIds.join(',')}] allowWrites=${built.allowWrites}`,
+        `providers=[${built.providerIds.join(',')}] allowWrites=${built.allowWrites}` +
+        (built.dryRun ? ' dryRun=true' : ''),
     );
   });
 

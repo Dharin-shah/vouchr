@@ -261,13 +261,14 @@ POST /v1/admin/reference
 | `VOUCHR_BASE_URL` | for OAuth | public HTTPS origin of this broker; setting it mounts `POST /v1/connect` + the OAuth callback (#52). |
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
+| `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116): real gates, no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared/union) via signed channel-fact claims (#51). Off → user-only broker. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 
 Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
-prints one line: port, backend, provider ids, `allowWrites`).
+prints one line: port, backend, provider ids, `allowWrites`, and `dryRun=true` when dry-run is on).
 
 ### Provider config (declarative)
 

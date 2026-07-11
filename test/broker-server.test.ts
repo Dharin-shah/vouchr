@@ -241,6 +241,45 @@ test('#54 sweep interval: default is hourly; VOUCHR_SWEEP_INTERVAL_MS=0 disables
   await assert.rejects(buildBrokerServer(baseEnv({ VOUCHR_SWEEP_INTERVAL_MS: 'nope' })), /VOUCHR_SWEEP_INTERVAL_MS/);
 });
 
+test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot on a real vault', async () => {
+  // Parse + wire-through: 1/true → on, absent/anything else → off (production behavior).
+  const on = await buildBrokerServer(baseEnv({ VOUCHR_DRY_RUN: '1' }));
+  try {
+    assert.equal(on.dryRun, true);
+    // The bin's SWEEP shares the marked audit instance, so its revoke rows carry meta.dry_run too
+    // (createBroker only wraps its own copy — the bin must wrap the one the sweep closure holds).
+    const vault = new Vault(on.db, Buffer.from(KEY_B64, 'base64'));
+    await vault.upsertDryRun(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
+      accessToken: 'x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'dry-run',
+    });
+    await on.db.run(`UPDATE connection SET last_used_at=0, created_at=0 WHERE owner_id='U1'`);
+    assert.equal(await on.sweep(), 1);
+    const swept = (await on.db.all(`SELECT meta FROM audit WHERE action='revoke'`)) as any[];
+    assert.equal(swept.length, 1);
+    assert.equal(JSON.parse(swept[0].meta).dry_run, true);
+  } finally {
+    await on.db.close();
+  }
+  const off = await buildBrokerServer(baseEnv());
+  assert.equal(off.dryRun, false);
+  await off.db.close();
+
+  // Boot-time refusal: a vault holding a non-dry-run row must stop the server before it listens.
+  const dir = mkdtempSync(join(tmpdir(), 'vouchr-dryrun-'));
+  const dbPath = join(dir, 'real.db');
+  const db = await openDb({ dbPath });
+  await new Vault(db, Buffer.from(KEY_B64, 'base64')).upsert(
+    userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+    'internal',
+    { accessToken: 't', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null },
+  );
+  await db.close();
+  await assert.rejects(
+    buildBrokerServer(baseEnv({ VOUCHR_DRY_RUN: 'true', VOUCHR_DB: dbPath })),
+    /refusing dryRun against a vault with real credentials/,
+  );
+});
+
 test('buildBrokerServer: fails fast naming the missing secret', async () => {
   const { VOUCHR_IDENTITY_SECRET, ...noSecret } = baseEnv();
   await assert.rejects(buildBrokerServer(noSecret), /VOUCHR_IDENTITY_SECRET/);
