@@ -198,7 +198,7 @@ test('postgres backend: concurrent cross-process refresh => one /token call, los
 });
 
 test('postgres backend: DbReplayStore makes a jti single-use cluster-wide', async (t) => {
-  const { DbReplayStore } = await import('../src/adapters/http/replayStore');
+  const { DbReplayStore } = await import('../src/adapters/http/replayStore.js');
   let db: Awaited<ReturnType<typeof openDb>> | undefined;
   try {
     db = await openDb({ databaseUrl: PG_URL });
@@ -226,8 +226,8 @@ test('postgres backend: DbReplayStore makes a jti single-use cluster-wide', asyn
 // and a guarded UPDATE comparing BYTEA equality — both engine-specific enough that SQLite passing
 // proves nothing. Same skip contract as the tests above.
 test('postgres backend: rekey converges direct rows onto the primary key (BYTEA guard included)', async (t) => {
-  const { rekey } = await import('../src/core/rekey');
-  const { DbInstallationStore } = await import('../src/adapters/installationStore');
+  const { rekey } = await import('../src/core/rekey.js');
+  const { DbInstallationStore } = await import('../src/adapters/installationStore.js');
   let db: Awaited<ReturnType<typeof openDb>> | undefined;
   try {
     db = await openDb({ databaseUrl: PG_URL });
