@@ -257,6 +257,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Reflected HTML injection on the OAuth callback error path** (#177). A hostile provider holding a
+  valid in-flight `state` could redirect the victim back with `?error=<markup>`; the callback echoes
+  it into `OAuth error: <x>` and the Bolt route served it with Express's default `text/html`,
+  executing the markup on the Vouchr host origin. Error responses are now served as
+  `text/plain; charset=utf-8` with `X-Content-Type-Options: nosniff`, so any echoed value is inert.
+  (The headless broker route already routed these through the escaping `landingHtml`.)
+
 - **Unescaped provider-controlled labels in two post-connect surfaces** (#176). The OAuth-callback
   confirmation DM and `connectedBlocks` interpolated the provider-reported external account label
   (and, in `connectedBlocks`, the token-response scope string) into mrkdwn raw, so a hostile
