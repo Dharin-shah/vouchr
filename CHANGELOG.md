@@ -257,6 +257,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Provider id unescaped in the connect prompt** (#178). `connectBlocks` and its three plain-text
+  fallback notifications interpolated the provider id into Slack mrkdwn without `escapeMrkdwn`. The
+  id is registry-validated, so this was defense-in-depth, but SEC-5 takes no exception; the connect
+  prompt now escapes it like `connectionLine`/`connectedBlocks`. (The button label is Slack
+  `plain_text`, which renders literally, so it is intentionally left raw.) Remaining mrkdwn sites
+  that still interpolate a provider id or raw slash argument are tracked in a follow-up.
+
 - **Reflected HTML injection on the OAuth callback error path** (#177). A hostile provider holding a
   valid in-flight `state` could redirect the victim back with `?error=<markup>`; the callback echoes
   it into `OAuth error: <x>` and the Bolt route served it with Express's default `text/html`,
