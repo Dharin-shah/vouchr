@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
+import { purgeApprovalsForOwner } from './approval';
 import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
@@ -26,6 +27,10 @@ export interface StoredCredential {
   scopes: string;
   expiresAt: number | null;
   externalAccount: string | null;
+  /** #116 system-only provenance: true iff this row was written by a dry-run synthetic consent
+   *  (never user- or provider-controlled — unlike externalAccount). The ONE trusted marker every
+   *  dry-run safety/revoke decision keys off. */
+  dryRun: boolean;
 }
 
 /**
@@ -80,6 +85,7 @@ export class Vault {
       scopes: row.scopes,
       expiresAt: row.expires_at,
       externalAccount: row.external_account,
+      dryRun: row.dry_run === 1, // fail-closed: only an explicit 1 is trusted as synthetic
     };
   }
 
@@ -91,12 +97,19 @@ export class Vault {
    * routes its connection writes/deletes through these three methods — no per-call-site purges to
    * drift (STR-3). updateTokens (silent refresh) deliberately does NOT purge: a refresh is not a
    * reconnect, and the max-age warning must survive it.
+   *
+   * #113 approval grants (`approval_request`) are satellites of a connection the SAME way, and purged
+   * on the SAME three methods for the SAME reason: a grant authorizes use of THIS owner's credential,
+   * so it must not outlive a delete (disconnect / offboard / bulk-revoke / TTL-expiry all route
+   * through delete()) nor be spent after a reconnect/reconfiguration (upsert/reference). updateTokens
+   * again does NOT purge — a silent refresh keeps the same connection, so a live grant stays valid.
    */
-  private async clearNotifyState(db: Db, owner: Owner, provider: string): Promise<void> {
+  private async clearSatellites(db: Db, owner: Owner, provider: string): Promise<void> {
     await db.run(
       `DELETE FROM notification_state WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
       [owner.teamId, owner.kind, owner.id, provider],
     );
+    await purgeApprovalsForOwner(db, owner, provider);
   }
 
   /** Connection write/delete + its notification_state purge are ONE logical mutation: run them in
@@ -107,7 +120,9 @@ export class Vault {
     return this.db.transaction ? this.db.transaction(fn) : fn(this.db);
   }
 
-  /** Store a vaulted credential (Vouchr encrypts and owns refresh). */
+  /** Store a vaulted credential (Vouchr encrypts and owns refresh). A production write is always
+   *  REAL: `dry_run=0` on insert AND on conflict, so overwriting a dry-run row re-marks it real
+   *  (zero-behavior-change — production ignores dry-run provenance entirely). */
   async upsert(owner: Owner, provider: string, t: StoredToken): Promise<void> {
     const now = Date.now();
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
@@ -117,14 +132,14 @@ export class Vault {
         `INSERT INTO connection
            (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
             access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, created_at, updated_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+            external_account, dry_run, created_at, updated_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?)
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
            source='vault', enterprise_id=excluded.enterprise_id,
            access_token_enc=excluded.access_token_enc,
            refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
            scopes=excluded.scopes, expires_at=excluded.expires_at,
-           external_account=excluded.external_account, updated_at=excluded.updated_at,
+           external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
            created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
         [
           randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
@@ -132,9 +147,53 @@ export class Vault {
           t.scopes, t.expiresAt, t.externalAccount, now, now, now,
         ],
       );
-      await this.clearNotifyState(tx, owner, provider); // reconnect ⇒ fresh notification state (#117)
+      await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
     });
   }
+
+  /**
+   * #116 SYNTHETIC (dry-run) write. Like {@link upsert} but sets the trusted `dry_run=1` provenance
+   * column, and is ATOMIC with the no-clobber check: the conditional `ON CONFLICT … WHERE
+   * connection.dry_run=1` only overwrites an existing row that is ITSELF synthetic, so a REAL row a
+   * sibling production process wrote — even one that lands between an earlier read and this call —
+   * survives untouched. Returns false (0 rows written) when a real row blocked it; the caller
+   * refuses the consent. No separate get(): the check and write are one statement, so there is no
+   * TOCTOU window.
+   */
+  async upsertDryRun(owner: Owner, provider: string, t: StoredToken): Promise<boolean> {
+    const now = Date.now();
+    const accessEnc = await seal(t.accessToken, this.key, this.envelope);
+    const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
+    return this.mutation(async (tx) => {
+      const { changes } = await tx.run(
+        `INSERT INTO connection
+           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+            access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
+            external_account, dry_run, created_at, updated_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 1, ?, ?, ?)
+         ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
+           source='vault', enterprise_id=excluded.enterprise_id,
+           access_token_enc=excluded.access_token_enc,
+           refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
+           scopes=excluded.scopes, expires_at=excluded.expires_at,
+           external_account=excluded.external_account, updated_at=excluded.updated_at,
+           created_at=excluded.created_at, last_used_at=excluded.last_used_at
+         WHERE connection.dry_run=1`,
+        [
+          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
+          accessEnc, refreshEnc,
+          t.scopes, t.expiresAt, t.externalAccount, now, now, now,
+        ],
+      );
+      if (changes === 0) return false; // a real row exists → refuse; nothing was written
+      await this.clearSatellites(tx, owner, provider); // #113 renamed clearNotifyState → also purges approvals
+      return true;
+    });
+  }
+
+  /** #116: whether at-rest writes go through an external KMS envelope. Dry-run refuses one at
+   *  startup (its wrap/unwrap are real network calls, breaking the offline guarantee). */
+  get usesEnvelope(): boolean { return !!this.envelope; }
 
   /**
    * Store a REFERENCED credential: the secret stays in an external manager (e.g. AWS
@@ -152,20 +211,20 @@ export class Vault {
         `INSERT INTO connection
            (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
             access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, created_at, updated_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, ?, ?, ?)
+            external_account, dry_run, created_at, updated_at, last_used_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, 0, ?, ?, ?)
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
            source=excluded.source, enterprise_id=excluded.enterprise_id,
            access_token_enc=NULL, refresh_token_enc=NULL,
            secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
-           external_account=excluded.external_account, updated_at=excluded.updated_at,
+           external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
            created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
         [
           randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider, r.source,
           r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
         ],
       );
-      await this.clearNotifyState(tx, owner, provider); // reconnect ⇒ fresh notification state (#117)
+      await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
     });
   }
 
@@ -332,7 +391,7 @@ export class Vault {
         `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
         [owner.teamId, owner.kind, owner.id, provider],
       );
-      await this.clearNotifyState(tx, owner, provider); // state rows must not outlive the connection (#117)
+      await this.clearSatellites(tx, owner, provider); // satellites must not outlive the connection: notification_state (#117) + approval grants (#113)
     });
   }
 }

@@ -149,7 +149,11 @@ export class Audit {
   }
 
   async record(
-    action: 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'rate_limited' | 'config' | 'session' | 'preview' | 'union',
+    action:
+      | 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'rate_limited' | 'config' | 'session' | 'preview' | 'union'
+      // #113 human-in-the-loop approval lifecycle (a denied/expired approval uses 'denied'). The
+      // approver's identity rides the `actor` parameter on approved/consumed rows.
+      | 'approval_requested' | 'approved' | 'approval_consumed',
     i: SlackIdentity,
     provider: string,
     meta: AuditMeta = {},

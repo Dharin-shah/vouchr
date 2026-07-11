@@ -3,6 +3,7 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Provider } from './providers';
 import { sha256base64url } from './crypto';
+import { DRY_RUN_CODE } from './dryRun';
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 
@@ -16,7 +17,13 @@ export interface ConsentRow {
 
 /** Manages the single-use OAuth `state` + PKCE for a consent round-trip. */
 export class Consent {
-  constructor(private db: Db) {}
+  /** `dryRun` (#116): begin() then returns a LOCAL authorize URL — the redirect target itself with
+   *  a synthetic code — instead of the provider's, so clicking Connect completes instantly and
+   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery. */
+  constructor(
+    private db: Db,
+    private dryRun = false,
+  ) {}
 
   /** Create a single-use consent request and return the provider authorize URL. */
   async begin(
@@ -34,6 +41,16 @@ export class Consent {
        VALUES (?,?,?,?,?,?,?,?)`,
       [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, Date.now()],
     );
+
+    // #116 dry-run: the authorize URL is the ONLY thing replaced — an instantly-succeeding local
+    // redirect into the real callback. The code is synthetic; the single-use `state` above is what
+    // the callback verifies, exactly as in production.
+    if (this.dryRun) {
+      const u = new URL(redirectUri);
+      u.searchParams.set('code', DRY_RUN_CODE);
+      u.searchParams.set('state', state);
+      return { authorizeUrl: u.toString(), state };
+    }
 
     const url = new URL(provider.authorizeUrl);
     url.searchParams.set('client_id', provider.clientId!); // guaranteed for oauth providers (defineProvider)
@@ -69,6 +86,17 @@ export class Consent {
   async sweepStale(): Promise<number> {
     const cutoff = Date.now() - STATE_TTL_MS;
     return (await this.db.run(`DELETE FROM consent_request WHERE created_at < ?`, [cutoff])).changes;
+  }
+
+  /** Newest pending state for (user, provider) — the dry-run completeConsent lookup (#116). Scoped
+   *  to a team when one is given. Read-only: consume() stays the single-use gate. */
+  async latestStateFor(userId: string, provider: string, teamId?: string): Promise<string | null> {
+    const row = (await this.db.get(
+      `SELECT state FROM consent_request WHERE user_id=? AND provider=?${teamId ? ' AND team_id=?' : ''}
+       ORDER BY created_at DESC LIMIT 1`,
+      teamId ? [userId, provider, teamId] : [userId, provider],
+    )) as any;
+    return row?.state ?? null;
   }
 
   /** Look up and consume (single-use) a consent request. Returns null if absent/expired. */

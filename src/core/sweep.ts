@@ -4,6 +4,7 @@ import type { Consent } from './consent';
 import type { EventSink } from './injector';
 import type { UnionOptin } from './unionOptin';
 import type { CredentialHealthHook } from './health';
+import type { Approvals } from './approval';
 import { safeEmit } from './safe-emit';
 
 /** #117: warn this far ahead of a connection's TTL ceiling (idle/max-age). */
@@ -25,6 +26,11 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
   // here — it re-fires each sweep pass; notifiers debounce (see NotificationState / the Bolt
   // default wiring). safeEmit: a throwing hook never breaks the sweep.
   health?: CredentialHealthHook,
+  // Optional (#113): reclaim expired approval prompts/grants on the same timer. Each expiry is
+  // audited (acceptance: deny AND expiry paths are audited) as a 'denied' row attributed to the
+  // requesting user, with the non-human sweeper as the actor — the same actor pattern as the
+  // channel-owned expiry above (STR-4).
+  approvals?: Approvals,
 ): Promise<number> {
   const expired = await vault.listExpired();
   for (const { owner, provider } of expired) {
@@ -41,6 +47,16 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
     safeEmit(health, { type: 'expiring_soon', owner, provider, expiresAt });
   }
   await consent.sweepStale();
+  // #113: expired approval prompts and unspent grants. Meta mirrors the injector's approval rows
+  // (method + hostname + pathname, never a body or query value — SEC-1), reason names the expiry.
+  if (approvals) {
+    for (const row of await approvals.sweepExpired()) {
+      const id = { enterpriseId: null, teamId: row.teamId, userId: row.userId };
+      const channelMeta = row.channel ? { channel: row.channel } : {};
+      await audit.record('denied', id, row.provider,
+        { host: row.host, method: row.method, path: row.path, reason: 'approval-expired', ...channelMeta }, 'system');
+    }
+  }
   // No-secret observability: just the count. Best-effort, a bad sink must never break the sweep.
   safeEmit(sink, { type: 'expired', count: expired.length });
   return expired.length;

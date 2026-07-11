@@ -62,11 +62,21 @@ jobs:
           path: sbom.json
           if-no-files-found: warn
 
+  # Blocking gate on PRs and main (#180): a dependency with a CVSS >= 7 NVD/KEV/RetireJS finding
+  # red-X's here. CVE data comes baked into the action's base image (rebuilt regularly upstream;
+  # the SHA pin fixes the entrypoint, not the scanner image), which is why the action runs the
+  # CLI with --noupdate.
   owasp-dependency-check:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 22
+          cache: npm
+      # The Node Package Analyzer resolves the packages actually installed; without node_modules
+      # it warns and the scan is near-empty (green != scanned — the original #180 bug).
+      - run: npm ci
       - name: OWASP Dependency-Check
         uses: dependency-check/Dependency-Check_Action@1e54355a8b4c8abaa8cc7d0b70aa655a3bb15a6c
         with:
@@ -74,9 +84,13 @@ jobs:
           path: .
           format: HTML
           out: reports/dependency-check
+          # Caveat: the action's entrypoint expands this string UNQUOTED (all_args=$@), so it only
+          # parses via shell word-splitting — no values with spaces, and the `**` excludes survive
+          # only while nothing in the workspace glob-matches them. Verified against the pinned SHA.
           args: >
             --failOnCVSS 7
             --enableRetired
+            --disableOssIndex
             --exclude **/node_modules/**
             --exclude **/dist/**
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

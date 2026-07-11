@@ -7,6 +7,62 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Human-in-the-loop approval for sensitive writes** (#113). New declarative provider knob
+  `approval: { methods?, paths?, approver: 'self' | 'admin', ttlMs? }` (default: every non-GET/HEAD
+  method, all paths, 5-minute grant TTL) — between "never allowed" (egress) and "always allowed"
+  there is now "allowed when a human clicks yes". Enforced in the injector, strictly AFTER every
+  egress/allowlist/method/rate-limit gate (an additional gate, never a bypass) and BEFORE the
+  secret is read: a matching request with no live grant records a pending approval, posts
+  Approve/Deny Block Kit buttons (to the acting user for `'self'`; ephemerally to each eligible
+  admin — the same eligibility gate as the channel config commands — for `'admin'`) showing the
+  provider, method, and host+path, **never the request body**, and throws the new exported
+  `ApprovalRequiredError` (catch-and-stop-turn, exactly like `ConsentRequiredError`). On Approve
+  the retried call consumes the grant — SINGLE-USE via the same atomic `DELETE … RETURNING` as the
+  OAuth consent state, so two concurrent retries cannot both spend it — and matches only the exact
+  (method, host, path) it was minted for (never the payload bytes; tradeoff documented in the
+  threat model) **and the exact credential owner**: a union member switch or a per-user→shared mode
+  change re-prompts instead of running against a credential the human didn't approve, and a grant is
+  purged the moment its credential is deleted or replaced (disconnect / offboard / bulk-revoke /
+  reconnect / TTL-expiry — all via the one vault mutation surface, alongside the notification-state
+  purge), so it can't outlive a revocation. An `approval.paths` lock inherits the egress guard's
+  fail-closed encoded-separator rule (`%2f`/`%5c` requires approval). Method/path knob values are
+  validated canonical and normalized (trim + upper-case) at definition time in both `defineProvider`
+  and the env loader — a non-matching form like `'POST '` or `'repos'` is rejected/normalized rather
+  than silently disabling approval (fail-open). The knob threads through the built-in provider
+  configs too (`github({ approval })`, google/gitlab/notion/databricks). Every step is audited
+  (`approval_requested` / `approved` / `denied` / `approval_consumed`, approver in the actor column;
+  button clicks re-validate the provider against the registry and re-check approver eligibility
+  server-side — an ineligible click is rejected and audited) with matching no-secret `approval_*`
+  events. The headless broker enforces the same gate and returns
+  `403 { "error": "approval_required", "approvalId" }` — the approval surface stays the Slack app.
+  Expired prompts/grants are reclaimed (and audited, actor `system`) by the existing TTL sweep. The
+  knob is env-declarable on the standalone broker (`VOUCHR_PROVIDERS`), validated fail-closed at
+  config load and at `defineProvider`. New `approval_request` table (schema version 4, purely
+  additive); new exports `ApprovalRequiredError` + `Approvals` (root and `./headless`). Providers
+  without the knob are byte-for-byte unchanged.
+
+- **Dry-run mode** (#116). `createVouchr({ dryRun: true })` / `BrokerOptions.dryRun`
+  (`VOUCHR_DRY_RUN=1` for the packaged `vouchr-broker`): the full consent → policy → channel-tools
+  → egress → vault → audit machine runs for real, under the invariant that no real network call
+  leaves the process on any edge. The OAuth token exchange yields a synthetic credential; the
+  Connect button's authorize URL becomes a local, instantly-succeeding redirect into the real
+  callback; the outbound provider fetch — after every request gate has passed and the vaulted
+  credential was read — returns a `200 { dryRun: true, method, url, wouldInjectAs }` echo that never
+  contains the credential (the provider's inject hook runs exactly once, with a redacted
+  placeholder); and token refresh / upstream revoke are skipped for dry-run credentials.
+  Request-side denials (egress, policy, mode) throw exactly the production errors. Provenance is a
+  new system-only `dry_run` column on the connection row (schema v4, additive migration) — never
+  the user/provider-controlled account label — so a real account legitimately named "dry-run" is
+  never mistaken for synthetic and always revokes normally. Safety rails: startup hard-fails against
+  a database holding any non-dry-run credential row ("refusing dryRun against a vault with real
+  credentials"); a real row written after startup is refused per-request and never overwritten (the
+  synthetic write is an atomic conditional); an external KMS envelope is refused at startup (its
+  wrap/unwrap are real network calls); a refused broker reports `/readyz` 503 while `/healthz` stays
+  200; and every audit row written in dry-run carries `meta.dry_run: true`. New
+  `vouchr.dryRun.completeConsent(user, provider)` test helper completes a prompted consent
+  programmatically; `examples/dry-run/` is a fully offline `node:test` suite of a Bolt handler.
+  Zero behavior change when the flag is absent.
+
 - **App Home config dashboard** (#111). The app's Home tab (published on `app_home_opened`, and
   re-published after every mutation) is now a console: everyone sees and disconnects their own
   connections (provider + external account, same confirm + revoke flow as the config modal);

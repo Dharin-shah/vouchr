@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { defineProvider, type Provider } from '../src/core/providers';
+import { defineProvider, isCanonicalPath, canonicalMethod, type Provider } from '../src/core/providers';
 
 /**
  * Declarative provider config for the headless broker: an operator declares providers via env/JSON
@@ -12,6 +12,7 @@ const ALLOWED = new Set([
   'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault',
   'egressAllow', 'egressPaths', 'egressMethods', 'refresh', 'pkce', 'tokenAuth', 'bodyFormat',
   'mcp', // #65 /v1/mcp opt-in: { paths: string[], allowContentTypes?: string[] }
+  'approval', // #113 human-in-the-loop approval: { methods?, paths?, approver: 'self'|'admin', ttlMs? }
 ]);
 
 function envKey(id: string): string {
@@ -80,6 +81,45 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
     }
   }
 
+  // #113 approval knob. defineProvider re-validates, but the loader fails with its own
+  // config-shaped message like every other field here (fail closed, unknown keys included).
+  if (entry.approval != null) {
+    if (typeof entry.approval !== 'object' || Array.isArray(entry.approval)) {
+      throw new Error(`provider config: "${entry.id}" field "approval" must be an object like { "approver": "admin" }`);
+    }
+    for (const k of Object.keys(entry.approval)) {
+      if (!['methods', 'paths', 'approver', 'ttlMs'].includes(k)) {
+        throw new Error(`provider config: "${entry.id}" field "approval" has unknown key "${k}" — allowed: methods, paths, approver, ttlMs`);
+      }
+    }
+    if (entry.approval.approver !== 'self' && entry.approval.approver !== 'admin') {
+      throw new Error(`provider config: "${entry.id}" field "approval.approver" must be "self" or "admin"`);
+    }
+    // Canonical checks up front (SAME rules as defineProvider — isCanonicalPath/canonicalMethod,
+    // STR-2), so a fail-open form ('repos', ' /repos', 'POST ') is rejected at config load with a
+    // config-shaped message rather than slipping to defineProvider or, worse, to runtime.
+    if (entry.approval.methods != null) {
+      if (!isStringArray(entry.approval.methods) || entry.approval.methods.length === 0) {
+        throw new Error(`provider config: "${entry.id}" field "approval.methods" must be a non-empty array of HTTP method names`);
+      }
+      if (entry.approval.methods.some((m: string) => canonicalMethod(m) === null)) {
+        throw new Error(`provider config: "${entry.id}" field "approval.methods" entries must be bare HTTP method names (e.g. "POST")`);
+      }
+    }
+    if (entry.approval.paths != null) {
+      if (!isStringArray(entry.approval.paths) || entry.approval.paths.length === 0) {
+        throw new Error(`provider config: "${entry.id}" field "approval.paths" must be a non-empty array of absolute paths`);
+      }
+      if (entry.approval.paths.some((p: string) => !isCanonicalPath(p))) {
+        throw new Error(`provider config: "${entry.id}" field "approval.paths" entries must be absolute paths like "/repos"`);
+      }
+    }
+    const ttl = entry.approval.ttlMs;
+    if (ttl != null && !(typeof ttl === 'number' && Number.isFinite(ttl) && ttl > 0)) {
+      throw new Error(`provider config: "${entry.id}" field "approval.ttlMs" must be a finite number > 0`);
+    }
+  }
+
   const ek = envKey(entry.id);
   // defineProvider throws a clear error if an OAuth provider ends up without client id/secret.
   return defineProvider({
@@ -93,6 +133,7 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
     egressPaths: entry.egressPaths,
     egressMethods: entry.egressMethods,
     mcp: entry.mcp,
+    approval: entry.approval,
     refresh: entry.refresh ?? 'none',
     pkce: entry.pkce ?? false,
     tokenAuth: entry.tokenAuth,

@@ -182,6 +182,38 @@ unintended.
   own scopes and permissions at the provider. DNS rebinding against an allowlisted host
   is not specifically defended.
 
+### Approval replay / bypass (human-in-the-loop writes, #113)
+
+An attacker (a looping or prompt-injected agent) tries to stretch one human approval
+into many actions, or to skip the approval entirely.
+
+- **Mitigated.** The gate runs in the injector strictly AFTER every egress gate (an
+  egress-denied target never even prompts — approval can widen nothing) and BEFORE the
+  secret is read. A grant is SINGLE-USE — consumed with the same atomic
+  `DELETE ... RETURNING` as the OAuth `state`, so two concurrent retries cannot both
+  spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
+  (method, host, path) it was minted for: not a prefix, not a pattern, never a class of
+  actions. When `approval.paths` is set it inherits the egress path lock's fail-closed
+  encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
+  can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential
+  owner** it was minted against (user vs channel, and which user), so a later resolution
+  switch — a union member A→B, or a per-user→shared mode change — no longer matches and
+  re-prompts: the write can never run against a different credential than the human
+  approved. And a grant is purged the moment its credential is deleted or replaced
+  (disconnect, offboard, bulk-revoke, reconnect, TTL-expiry — all route through the one
+  vault mutation surface), so it can't survive a revocation or be spent after a
+  reconnect. Approve/Deny clicks are re-authorized server-side (provider re-validated
+  against the registry, approver eligibility re-checked at the mutation; ineligible
+  clicks are rejected and audited) — nothing in the interaction payload is trusted.
+- **Accepted tradeoff:** the request BODY is not hashed into the grant key. Bodies are
+  legitimately rebuilt on retry (fresh timestamps, idempotency keys), so binding to the
+  payload bytes would break the approve-then-retry flow outright. An approval therefore
+  covers the endpoint + method, not the payload: a compromised host process could swap
+  the body between the prompt and the retry — but that process already holds the handle
+  and is trusted code (same boundary as the rogue-provider section above). This is why
+  approval prompts show the method and host+path and deliberately never render the body
+  (which may carry user content).
+
 ### Replayed OAuth callback / state
 
 An attacker replays or forges an OAuth `state` to bind a connection to the wrong
