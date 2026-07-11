@@ -53,6 +53,8 @@ One core, two front doors — both reach the same credential boundary.
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
+| Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons | ⚠️ enforced (403 `approval_required`) — the approval **surface** is the Slack app |
+| Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
 ## Writes are opt-in
 
@@ -72,6 +74,31 @@ const broker = createBroker({
 Providers without `egressMethods` remain `GET`/`HEAD`-only even when `allowWrites` is enabled.
 Write bodies are small JSON/text payloads, capped at 64 KiB, and still go through the same identity
 verification, replay guard, policy, channel-tool, host/path/method, and HTTPS checks as reads.
+
+## Human-in-the-loop approvals (#113)
+
+A provider declaring the `approval` knob (`{ methods?, paths?, approver: 'self' | 'admin',
+ttlMs? }`; default = every non-GET/HEAD method) requires a live, single-use human approval per
+matching action — enforced in the shared injector, so this door inherits it identically: strictly
+AFTER every egress gate (never a bypass) and BEFORE the credential is read. The broker **cannot
+render Approve/Deny buttons**, so the split is deliberate:
+
+- A matching `/v1/fetch` (or `/v1/mcp`) with no live grant records a pending approval, audits
+  `approval_requested`, and returns:
+
+  ```json
+  { "error": "approval_required", "approvalId": "…" }   // HTTP 403
+  ```
+
+- The approval **surface is the Bolt app** (Approve/Deny buttons, approver eligibility re-checked
+  server-side at the click): the Slack-facing service routes the human there, then the worker
+  retries with a fresh identity token. A host with no Bolt surface can drive its own approve/deny
+  with the exported `Approvals` store (`./headless`), re-checking approver eligibility itself.
+
+The grant matches ONLY the exact (method, host, path) it was minted for, expires after `ttlMs`
+(default 5 minutes), and is consumed atomically on first use — a second identical call returns a
+fresh 403 with a new `approvalId`. The `approvalId` is a lookup handle, not authority and not a
+secret. Expired prompts/grants are reclaimed by the standard TTL sweep (audited, actor `system`).
 
 ## MCP servers (Streamable HTTP): `POST /v1/mcp`
 
@@ -191,6 +218,29 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
   `{"ok":true}` whenever the process is serving, no db touched) and `GET /readyz` (readiness —
   `{"ok":true}` only if a `SELECT 1` round-trip succeeds within ~2s, else `503 {"ok":false}`). Both
   are exempt from auth, identity, and replay, and return a bare status with no secrets or error text.
+
+## Dry-run (offline integration tests)
+
+`BrokerOptions.dryRun` (or `VOUCHR_DRY_RUN=1` for the packaged `vouchr-broker`) runs every gate —
+identity verification, replay, policy, channel tools, owner resolution, egress — for real, and no
+real network call leaves the process on any edge: outbound fetch, token exchange, refresh, and
+upstream revoke are all stubbed or skipped (#116):
+
+- `POST /v1/connect` mints an authorize URL that points at **this broker's own callback** with a
+  synthetic code; a test client completes consent by simply GETting it. The callback consumes the
+  real single-use state and writes a synthetic credential marked `external_account: 'dry-run'`.
+- `POST /v1/fetch` reads that credential from the vault and returns a
+  `200` body of `{ dryRun: true, method, url, wouldInjectAs }` instead of calling the provider;
+  denials map to the same errors as production (403 egress blocked, 409 not connected, …).
+
+Safety rails: provenance is a system-only `dry_run` column (never the account label). The packaged
+broker hard-fails at boot if the database holds any non-dry-run credential ("refusing dryRun against
+a vault with real credentials"); a programmatically constructed `createBroker` fails every request
+closed and reports `/readyz` 503 (while `/healthz` stays 200) until the same check passes; and a
+real row written AFTER boot is refused per-request — never injected, never overwritten by a dry-run
+consent (the synthetic write is an atomic conditional). Dry-run requires a **local master key**: an
+external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup, since its wrap/unwrap are real
+network calls. Audit rows carry `meta.dry_run: true`. Never set it against production state.
 
 ## Local sidecar
 

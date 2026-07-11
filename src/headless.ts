@@ -33,6 +33,10 @@ export { Audit } from './core/audit';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';
 export { SessionGrants } from './core/session';
+// #113 human-in-the-loop approval: the broker maps ApprovalRequiredError to 403 approval_required;
+// the store is exported (like SessionGrants) so a headless host can drive its own approve/deny
+// surface and wire the sweep. All core — no @slack in the graph.
+export { ApprovalRequiredError, Approvals } from './core/approval';
 export { sweepExpired } from './core/sweep';
 
 // ── signed identity minting/verification (the headless auth contract) ──

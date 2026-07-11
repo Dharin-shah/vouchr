@@ -34,7 +34,12 @@ export async function disconnectProvider(
   let ok = true;
   if (registry?.has(provider)) {
     try {
-      if (cred?.accessToken) await revokeToken(registry.get(provider), cred.accessToken);
+      // #116: a dry-run credential is synthetic — an upstream revoke would be a REAL network call
+      // POSTing it to the provider. Keyed off the trusted dry_run column (no flag here), so the CLI
+      // is covered too, and a REAL account labelled "dry-run" still revokes normally.
+      if (cred?.accessToken && !cred.dryRun) {
+        await revokeToken(registry.get(provider), cred.accessToken);
+      }
     } catch {
       ok = false; // network/HTTP failure: local access is already gone; nothing is faked
     }
@@ -85,7 +90,11 @@ export async function offboardUser(
     if (registry) {
       let ok = true;
       try {
-        if (cred?.accessToken) await revokeToken(registry.get(provider), cred.accessToken);
+        // #116: never POST a synthetic (dry-run) token to a real revoke endpoint. Keyed off the
+        // trusted dry_run column, so a REAL "dry-run"-labelled account still revokes normally.
+        if (cred?.accessToken && !cred.dryRun) {
+          await revokeToken(registry.get(provider), cred.accessToken);
+        }
       } catch {
         ok = false; // network/HTTP failure: local access is already gone; nothing is faked
       }
@@ -112,6 +121,8 @@ export interface RevokeRow {
   ownerKind: 'user' | 'channel';
   ownerId: string;
   externalAccount: string | null;
+  /** #116 trusted synthetic-provenance marker; a dry-run row's upstream revoke is skipped. */
+  dryRun: boolean;
   createdAt: number;
 }
 
@@ -138,13 +149,13 @@ export async function selectRevocations(db: Db, f: RevokeFilter): Promise<Revoke
   if (f.userId) { where.push("owner_kind='user' AND owner_id=?"); params.push(f.userId); }
   if (f.channel) { where.push("owner_kind='channel' AND owner_id=?"); params.push(f.channel); }
   const rows = (await db.all(
-    `SELECT team_id, owner_kind, owner_id, external_account, created_at
+    `SELECT team_id, owner_kind, owner_id, external_account, dry_run, created_at
      FROM connection WHERE ${where.join(' AND ')} ORDER BY team_id, owner_kind, owner_id`,
     params,
   )) as any[];
   return rows.map((r) => ({
     teamId: r.team_id, ownerKind: r.owner_kind, ownerId: r.owner_id,
-    externalAccount: r.external_account, createdAt: r.created_at,
+    externalAccount: r.external_account, dryRun: r.dry_run === 1, createdAt: r.created_at,
   }));
 }
 
@@ -226,10 +237,11 @@ export async function revokeConnection(
   let removed = true;
   try { await vault.delete(owner, provider); } catch { removed = false; } // local delete FIRST
   // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
-  // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success.
+  // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success. A dry-run
+  // row (#116) is always SKIPPED: its token is synthetic and must never be POSTed to a real endpoint.
   let upstreamAttempted = false;
   let upstreamOk = true;
-  if (registry?.has(provider) && token) {
+  if (registry?.has(provider) && token && !row.dryRun) {
     const p = registry.get(provider);
     if (p.revoke || p.revokeUrl) {
       upstreamAttempted = true;

@@ -10,6 +10,10 @@ export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
 export { SessionGrants } from './core/session';
+// #113 human-in-the-loop approval for sensitive writes: the typed control-flow error (catch it and
+// stop the turn, exactly like ConsentRequiredError — the prompt was already posted) plus the grant
+// store, exported like SessionGrants so a headless host can drive its own approve/deny surface.
+export { ApprovalRequiredError, Approvals } from './core/approval';
 // #112 union-mode explicit opt-in, exported (like SessionGrants) so a headless host can wire the
 // same opt-in purge into its own disconnect/offboard paths AND — since the broker trusts the host's
 // signed actingMemberId — apply the same candidate rule (eligibleUnionMembers) when it resolves

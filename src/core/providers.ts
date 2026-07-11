@@ -75,6 +75,23 @@ export interface Provider {
    */
   rateLimit?: { perMinute: number; burst?: number };
   /**
+   * OPT-IN human-in-the-loop approval for sensitive writes (#113), enforced in the injector AFTER
+   * every egress gate (an ADDITIONAL gate, never a bypass — an egress-denied target never prompts)
+   * and BEFORE the secret is read or anything goes out on the wire. A matching request with no
+   * live grant throws `ApprovalRequiredError` (the Bolt adapter posts Approve/Deny buttons; the
+   * headless broker returns 403 `approval_required`). A grant is SINGLE-USE, TTL-bound, and matches
+   * ONLY the exact (method, host, path) it was minted for — never the request body (see the threat
+   * model: approval covers the endpoint + method, not the payload bytes).
+   *  - `methods`: which HTTP methods require approval. Default: every non-read method (anything
+   *    but GET/HEAD) — see `approvalNeeded` in the injector, the one place that default lives.
+   *  - `paths`: narrow the requirement to these paths (same matcher semantics as `egressPaths`).
+   *    Default: every path.
+   *  - `approver`: REQUIRED — 'self' (the acting user confirms their own action) or 'admin' (an
+   *    eligible channel admin confirms; same gate as the channel-config commands).
+   *  - `ttlMs`: how long a granted approval stays spendable. Default 5 minutes.
+   */
+  approval?: { methods?: string[]; paths?: string[]; approver: 'self' | 'admin'; ttlMs?: number };
+  /**
    * How the secret is attached to the outbound request. Mutate `headers` in place.
    * Default (unset): `Authorization: Bearer <secret>`. Use for non-Bearer APIs/MCPs,
    * e.g. `(h, s) => h.set('x-api-key', s)`.
@@ -138,17 +155,47 @@ export interface ProviderConfig {
   egressResponse?: Provider['egressResponse'];
   /** Optional per-(owner, provider) throttle at the injection boundary (see Provider). */
   rateLimit?: { perMinute: number; burst?: number };
+  /** Optional human-in-the-loop approval for sensitive writes (see Provider). */
+  approval?: Provider['approval'];
 }
 
-/** The per-config injection-boundary gates (egress + rate limit), passed through to a built-in. */
-function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit'> {
+/** The per-config injection-boundary gates (egress + rate limit + approval), passed through to a built-in. */
+function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit' | 'approval'> {
   return {
     egressPaths: cfg.egressPaths,
     egressMethods: cfg.egressMethods,
     egressValidate: cfg.egressValidate,
     egressResponse: cfg.egressResponse,
     rateLimit: cfg.rateLimit,
+    approval: cfg.approval,
   };
+}
+
+/**
+ * A canonical absolute pathname for an `approval.paths` (or egress) path lock: starts with '/' and
+ * survives a WHATWG URL round-trip UNCHANGED, so it actually equals `url.pathname` at request time.
+ * Rejects the fail-open forms 'repos' (no leading slash), ' /repos' (leading space), '/a b'
+ * (re-encoded to '/a%20b' on parse). ONE rule, shared by defineProvider and the env loader (STR-2).
+ */
+export function isCanonicalPath(p: string): boolean {
+  if (typeof p !== 'string' || !p.startsWith('/')) return false;
+  try {
+    return new URL(p, 'https://placeholder.invalid').pathname === p;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Canonicalize an HTTP method token to trimmed upper-case, or null if it isn't a bare method name
+ * (letters only). 'POST ' → 'POST' (normalized, matches); 'PO ST'/'PO#ST' → null (rejected). The
+ * matcher (`approvalNeeded`) compares upper-case, so 'POST ' with its trailing space would otherwise
+ * never match — a silent fail-open. ONE rule, shared by defineProvider and the env loader (STR-2).
+ */
+export function canonicalMethod(m: string): string | null {
+  if (typeof m !== 'string') return null;
+  const t = m.trim().toUpperCase();
+  return /^[A-Z]+$/.test(t) ? t : null;
 }
 
 export function defineProvider(spec: Provider): Provider {
@@ -200,6 +247,40 @@ export function defineProvider(spec: Provider): Provider {
     if (allowContentTypes !== undefined && (allowContentTypes.length === 0 || allowContentTypes.some((c) => typeof c !== 'string' || !c.trim()))) {
       throw new Error(`Provider "${spec.id}" has an invalid mcp.allowContentTypes: must be a non-empty array of non-empty media types.`);
     }
+  }
+  // #113 approval knob: fail closed on garbage at definition time (SEC-4), in the same style as the
+  // rateLimit/egressResponse/mcp checks above. An empty methods/paths list reads as protection while
+  // matching nothing, a bad approver could never be satisfied by any approval surface, and a
+  // non-finite/<=0 ttlMs would mint grants that are dead on arrival (or, as NaN, never comparable).
+  if (spec.approval) {
+    const { methods, paths, approver, ttlMs } = spec.approval;
+    if (approver !== 'self' && approver !== 'admin') {
+      throw new Error(`Provider "${spec.id}" has an invalid approval.approver: must be "self" or "admin".`);
+    }
+    // Methods/paths are the match predicate: a non-empty-but-non-matching entry (a trailing space,
+    // a relative path) would silently WIDEN what runs without approval — a fail-open bug. Reject
+    // non-canonical forms and NORMALIZE the accepted methods (trim + upper-case) so the stored knob
+    // is exactly what `approvalNeeded` compares against.
+    let normMethods: string[] | undefined;
+    if (methods !== undefined) {
+      if (methods.length === 0) throw new Error(`Provider "${spec.id}" has an invalid approval.methods: must be a non-empty array of HTTP method names.`);
+      normMethods = methods.map((m) => {
+        const c = canonicalMethod(m);
+        if (!c) throw new Error(`Provider "${spec.id}" has an invalid approval.methods entry ${JSON.stringify(m)}: must be a bare HTTP method name (e.g. "POST").`);
+        return c;
+      });
+    }
+    if (paths !== undefined) {
+      if (paths.length === 0) throw new Error(`Provider "${spec.id}" has an invalid approval.paths: must be a non-empty array of absolute paths.`);
+      for (const p of paths) {
+        if (!isCanonicalPath(p)) throw new Error(`Provider "${spec.id}" has an invalid approval.paths entry ${JSON.stringify(p)}: must be an absolute path like "/repos".`);
+      }
+    }
+    if (ttlMs !== undefined && !(Number.isFinite(ttlMs) && ttlMs > 0)) {
+      throw new Error(`Provider "${spec.id}" has an invalid approval.ttlMs: must be a finite number > 0.`);
+    }
+    // Persist the normalized methods so the runtime predicate matches (paths must already be canonical).
+    if (normMethods) spec.approval = { ...spec.approval, methods: normMethods };
   }
   // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
   // a PKCE public client (publicClient:true) authenticates with the code_verifier alone → clientId only.
@@ -425,6 +506,7 @@ export function databricks(cfg: DatabricksConfig): Provider {
     egressValidate: cfg.egressValidate,
     egressResponse: cfg.egressResponse,
     rateLimit: cfg.rateLimit,
+    approval: cfg.approval, // databricks builds its fields by hand (no egressOptions spread), so thread it explicitly
     refresh: 'rotating', // offline_access → refresh token; Databricks rotates it (single-flight guards the swap)
     pkce: true, // U2M requires PKCE
     scopeDescriptions: {

@@ -189,8 +189,11 @@ class PgClientDb implements Db {
  * the marker (post-v0.2.0: everything in schema() below, incl. channel_preview and audit.channel).
  * Version 2 = + the `union_optin` table (#112, purely additive).
  * Version 3 = + the `notification_state` table (#117, purely additive).
+ * Version 4 = + the `approval_request` table (#113) AND the `connection.dry_run` column (#116) —
+ *   both purely additive and idempotent (CREATE TABLE / ADD COLUMN IF NOT EXISTS run every open),
+ *   so they share one version stamp: a v3 DB gains both, and either single-feature deploy converges.
  */
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -250,6 +253,7 @@ function schema(blob: string, int: string): string {
       scopes TEXT NOT NULL,
       expires_at ${int},
       external_account TEXT,
+      dry_run ${int} NOT NULL DEFAULT 0,
       created_at ${int} NOT NULL,
       updated_at ${int} NOT NULL,
       last_used_at ${int},
@@ -311,6 +315,24 @@ function schema(blob: string, int: string): string {
       PRIMARY KEY (team_id, channel_id, user_id, provider)
     );
 
+    CREATE TABLE IF NOT EXISTS approval_request (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      owner_kind TEXT NOT NULL,
+      owner_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      method TEXT NOT NULL,
+      host TEXT NOT NULL,
+      path TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      thread TEXT NOT NULL,
+      status TEXT NOT NULL,
+      approved_by TEXT,
+      created_at ${int} NOT NULL,
+      expires_at ${int} NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS notification_state (
       team_id TEXT NOT NULL,
       owner_kind TEXT NOT NULL,
@@ -363,6 +385,8 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
       await db.exec(schema('BYTEA', 'BIGINT'));
       // CREATE TABLE IF NOT EXISTS won't add `channel` to a pre-existing audit table; do it idempotently.
       await db.exec(`ALTER TABLE audit ADD COLUMN IF NOT EXISTS channel TEXT`);
+      // #116 v4: system-only dry-run provenance on the credential row (never user/provider data).
+      await db.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS dry_run BIGINT NOT NULL DEFAULT 0`);
       await stampSchemaVersion(db);
     } catch (e) {
       await db.close().catch(() => undefined);
@@ -418,5 +442,12 @@ function migrateSqlite(db: BetterSqlite3.Database): void {
   const auditCols = (db.prepare(`PRAGMA table_info(audit)`).all() as any[]).map((c) => c.name);
   if (!auditCols.includes('channel')) {
     db.exec(`ALTER TABLE audit ADD COLUMN channel TEXT`);
+  }
+
+  // #116 v4: system-only dry-run provenance on a pre-existing connection table (plain ADD COLUMN).
+  // Re-read: the table may have just been rebuilt above.
+  const connCols = (db.prepare(`PRAGMA table_info(connection)`).all() as any[]).map((c) => c.name);
+  if (!connCols.includes('dry_run')) {
+    db.exec(`ALTER TABLE connection ADD COLUMN dry_run INTEGER NOT NULL DEFAULT 0`);
   }
 }
