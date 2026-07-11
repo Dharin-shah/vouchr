@@ -39,7 +39,9 @@ export async function sweepExpired(vault: Vault, audit: Audit, consent: Consent,
     // deleted, audited, or notified as 'expired'.
     if (!(await vault.deleteExpired(owner, provider))) continue;
     swept++;
-    if (owner.kind === 'user') await unionOptin?.deleteForUserProvider(owner.teamId, owner.id, provider);
+    // Guarded variant (#192 review): a reconnect landing after deleteExpired above may have
+    // already re-created the opt-in — only purge opt-ins with no live connection behind them.
+    if (owner.kind === 'user') await unionOptin?.deleteForUserProviderIfDisconnected(owner.teamId, owner.id, provider);
     // Audit as the owner. A channel has no acting human → user_id=channel id, actor='system'.
     const id = { enterpriseId: null, teamId: owner.teamId, userId: owner.id };
     await audit.record('revoke', id, provider, { reason: 'expired', owner_kind: owner.kind },

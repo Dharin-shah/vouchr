@@ -13,6 +13,7 @@ import { github, google, gitlab, notion, defineProvider, ProviderRegistry } from
 import { exchangeCode } from '../src/core/tokens';
 import { offboardUser } from '../src/core/offboard';
 import { sweepExpired } from '../src/core/sweep';
+import { UnionOptin } from '../src/core/unionOptin';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -438,6 +439,28 @@ test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no
   assert.notEqual(await vault.get(O1, 'github'), null); // and is live, satellites untouched
   assert.equal(((await db.all(`SELECT * FROM audit WHERE action='revoke'`)) as any[]).length, 0, 'no expired audit row');
   assert.equal(events.filter((e) => e.type === 'expired').length, 0, 'no expired health event');
+});
+
+// #192 review: the credential delete and the union cleanup are separate statements — a reconnect
+// (+ auto re-opt-in via the OAuth callback) landing between them must keep its fresh opt-in.
+test('sweepExpired: a reconnect + re-opt-in after the atomic delete keeps its fresh union opt-in', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const vault = new Vault(db, KEY, { idleMs: 1000 });
+  const optin = new UnionOptin(db);
+  await vault.upsert(O1, 'github', FRESH);
+  await db.run('UPDATE connection SET last_used_at=?, created_at=? WHERE provider=?', [Date.now() - 5000, Date.now() - 5000, 'github']);
+  // Barrier: interpose on deleteExpired so the reconnect + opt-in land right after the atomic
+  // credential delete, BEFORE the sweep's union cleanup statement.
+  const realDelete = vault.deleteExpired.bind(vault);
+  (vault as any).deleteExpired = async (owner: any, provider: string) => {
+    const deleted = await realDelete(owner, provider);
+    await vault.upsert(O1, 'github', FRESH); // the OAuth reconnect…
+    await optin.join(ID, 'C1', 'github'); // …and its auto re-opt-in (joinUnion path)
+    return deleted;
+  };
+  assert.equal(await sweepExpired(vault, new Audit(db), new Consent(db), undefined, optin), 1); // the stale row WAS swept
+  assert.ok((await optin.optedIn(ID.teamId, 'C1', 'github')).has(ID.userId), 'fresh opt-in survived the stale sweep');
+  assert.notEqual(await vault.get(O1, 'github'), null); // fresh credential intact
 });
 
 test('sweepExpired also clears abandoned consent requests', async () => {

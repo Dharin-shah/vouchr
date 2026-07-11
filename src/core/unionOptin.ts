@@ -55,6 +55,23 @@ export class UnionOptin {
       [teamId, userId, provider],
     );
   }
+
+  /**
+   * The TTL-sweep variant of {@link deleteForUserProvider} (#192 review): delete the user's
+   * opt-ins for the provider ONLY where no live connection backs them. The sweep's credential
+   * delete and this cleanup are separate statements, so an OAuth reconnect (which re-creates the
+   * credential AND the opt-in via joinUnion) can land between them — the NOT EXISTS guard makes
+   * this delete a no-op in that case instead of silently destroying the fresh delegation state.
+   * One atomic statement, so there is no window between the check and the delete.
+   */
+  async deleteForUserProviderIfDisconnected(teamId: string, userId: string, provider: string): Promise<void> {
+    await this.db.run(
+      `DELETE FROM union_optin WHERE team_id=? AND user_id=? AND provider=? AND NOT EXISTS (
+         SELECT 1 FROM connection WHERE owner_kind='user' AND owner_id=union_optin.user_id
+           AND team_id=union_optin.team_id AND provider=union_optin.provider)`,
+      [teamId, userId, provider],
+    );
+  }
 }
 
 /**
