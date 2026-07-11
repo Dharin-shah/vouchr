@@ -17,6 +17,7 @@ import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
 import { UnionOptin } from '../src/core/unionOptin';
+import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
@@ -128,9 +129,10 @@ export async function buildBrokerServer(
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
   const unionOptin = new UnionOptin(db); // #112: swept user creds drop their union opt-ins too
+  const approvals = new Approvals(db); // #113: expired approval prompts/grants are reclaimed (and audited) too
   const sweep = async (): Promise<number> => {
     // #117: the deployer's onCredentialHealth override (if any) also hears expiring_soon/expired.
-    const n = await sweepExpired(vault, audit, consent, undefined, unionOptin, overrides.onCredentialHealth);
+    const n = await sweepExpired(vault, audit, consent, undefined, unionOptin, overrides.onCredentialHealth, approvals);
     await sessions.sweepExpired();
     return n;
   };

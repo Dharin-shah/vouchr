@@ -309,6 +309,25 @@ on top of the write gating above, and locks the reachable endpoint + response me
 ]
 ```
 
+To require **human-in-the-loop approval** for a provider's writes (#113), declare the `approval`
+knob — `approver` is required (`"self"` or `"admin"`); `methods` defaults to every non-GET/HEAD
+method, `paths` to all (same matcher as `egressPaths`), `ttlMs` to 5 minutes. Invalid shapes are
+rejected fail-closed at config load. A matching request with no live grant gets
+`403 { "error": "approval_required", "approvalId" }` from the broker — the Approve/Deny surface is
+the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
+
+```json
+[
+  {
+    "id": "internal",
+    "credential": "key",
+    "egressAllow": ["api.internal.example"],
+    "egressMethods": ["GET", "POST"],
+    "approval": { "approver": "admin", "methods": ["POST"], "ttlMs": 300000 }
+  }
+]
+```
+
 ### Provisioning (how credentials get in)
 
 - **Shared / referenced credential** (channel- or team-owned): seed it without Slack.

@@ -22,11 +22,13 @@ import { UnionOptin, eligibleUnionMembers, joinUnion, leaveUnion } from '../core
 import { offboardUser, disconnectProvider } from '../core/offboard';
 import { sweepExpired } from '../core/sweep';
 import { SessionGrants } from '../core/session';
+import { Approvals, ApprovalRequiredError, DEFAULT_APPROVAL_TTL_MS } from '../core/approval';
 import { NotificationState, type CredentialHealthEvent, type CredentialHealthHook } from '../core/health';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
+  approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
   previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
@@ -66,6 +68,25 @@ const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 *
 /** Denial message for the config gate, accurate to whether the channel-creator path is enabled. */
 const adminOnly = (allowCreator: boolean, action: string): string =>
   `Only a workspace admin${allowCreator ? ' or the channel creator' : ''} can ${action}.`;
+
+/**
+ * THE admin-eligibility predicate (STR-2: one rule, every caller): a custom `isAdmin` override
+ * fully decides (a throw fails closed); else workspace admin OR — only when opted in — the channel
+ * creator. ConnectContext.requireAdmin, the command-path gate, and the #113 approval-approver
+ * resolution all route through this one function so the rule cannot drift between surfaces.
+ */
+async function adminEligible(
+  client: WebClient,
+  userId: string,
+  teamId: string,
+  channel: string,
+  adminCheck: VouchrOptions['isAdmin'],
+  allowCreator: boolean,
+): Promise<boolean> {
+  return adminCheck
+    ? await adminCheck(client, userId, teamId).catch(() => false)
+    : (await isSlackAdmin(client, userId) || (allowCreator && await isChannelAdmin(client, channel, userId)));
+}
 
 /** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
 export class ConsentRequiredError extends Error {
@@ -110,6 +131,7 @@ export function safeUserMessage(e: unknown): string {
   if (
     e instanceof ConsentRequiredError ||
     e instanceof SessionApprovalRequiredError ||
+    e instanceof ApprovalRequiredError ||
     e instanceof EgressBlockedError ||
     e instanceof ResponseBlockedError ||
     e instanceof NoConnectionError ||
@@ -301,6 +323,9 @@ export interface ConnectContextDeps {
   /** #112 owner-DM debounce timestamps, shared per createVouchr instance (like `inflight`) so the
    *  once-per-hour rule spans requests. A direct-constructed context gets its own map. */
   unionNotified?: Map<string, number>;
+  /** #113 human-in-the-loop approval store (provider.approval). Absent + a provider that declares
+   *  the knob = the injector fails closed (a declared approval is never silently skipped). */
+  approvals?: Approvals;
   /** Optional audit stream sink (raw actor id). Default no-op; the audit table stays authoritative. */
   auditSink?: AuditSink;
   /** #117 credential-health hook threaded to every ConnectionHandle (see VouchrOptions). Default no-op. */
@@ -337,6 +362,7 @@ export class ConnectContext {
   private unionOptin?: UnionOptin;
   private unionRequiresOptIn: boolean;
   private unionNotified: Map<string, number>;
+  private approvals: Approvals | null;
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
   private previews: PendingPreviews;
@@ -366,6 +392,7 @@ export class ConnectContext {
     this.unionOptin = deps.unionOptin;
     this.unionRequiresOptIn = deps.unionRequiresOptIn ?? false;
     this.unionNotified = deps.unionNotified ?? new Map();
+    this.approvals = deps.approvals ?? null;
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
     this.previews = deps.previews ?? new PendingPreviews(PREVIEW_TTL_MS);
@@ -400,6 +427,84 @@ export class ConnectContext {
       }
     };
     return handle;
+  }
+
+  /**
+   * Slack surface for the #113 approval gate (mirrors notifyRateLimited's wrapper shape): when a
+   * fetch throws ApprovalRequiredError, post the Approve/Deny prompt — ephemerally to the acting
+   * user for approver 'self', ephemerally to each eligible admin for 'admin' — then rethrow, so
+   * the typed error still reaches the caller (catch-and-stop-turn, exactly like
+   * ConsentRequiredError). Best-effort: a Slack hiccup never replaces the typed error. The blocks
+   * show provider/method/host+path and NEVER the request body (SEC-1); the buttons carry only the
+   * pending-approval id (SEC-3 — authority is re-decided server-side at the click).
+   */
+  private notifyApprovalRequired(handle: ConnectionHandle): ConnectionHandle {
+    const fetch = handle.fetch.bind(handle);
+    handle.fetch = async (input: string, init: RequestInit = {}) => {
+      try {
+        return await fetch(input, init);
+      } catch (e) {
+        if (e instanceof ApprovalRequiredError) await this.postApprovalPrompt(e).catch(() => undefined);
+        throw e;
+      }
+    };
+    return handle;
+  }
+
+  /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
+  private async postApprovalPrompt(e: ApprovalRequiredError): Promise<void> {
+    const blocks = approvalBlocks({
+      provider: e.provider, method: e.method, host: e.host, path: e.path,
+      requester: this.identity.userId, id: e.approvalId, approver: e.approver,
+    }) as any;
+    const text = `Approval needed for a ${e.provider} action`; // registry-validated id; neutral fallback
+    const threadArg = this.thread ? { thread_ts: this.thread } : {};
+    if (e.approver === 'self') {
+      if (this.channel) {
+        await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, text });
+      } else {
+        await this.client.chat.postMessage({ channel: this.identity.userId, blocks, text });
+      }
+      return;
+    }
+    // 'admin': the channel is the approval surface. Off-channel (a DM) there are no channel admins
+    // to prompt — tell the requester why nothing can proceed instead of failing silently (STR-5).
+    if (!this.channel) {
+      await this.client.chat.postMessage({
+        channel: this.identity.userId,
+        text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval — run it in a channel so an admin can approve it.`,
+      });
+      return;
+    }
+    const approvers = await this.eligibleApprovers();
+    for (const admin of approvers) {
+      await this.client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, text }).catch(() => undefined);
+    }
+    if (!approvers.length) {
+      // No eligible admin visible from here (fail-closed member/admin reads): the requester should
+      // know the request is parked, not silently dropped.
+      await this.client.chat.postEphemeral({
+        channel: this.channel, user: this.identity.userId, ...threadArg,
+        text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval, but no eligible admin was found in this channel.`,
+      }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Channel members who may decide an 'admin' approval: the SAME eligibility rule as every channel
+   * config mutation (adminEligible — custom override, else workspace admin OR the channel creator
+   * when opted in). Fail-closed reads: an unreadable member list yields nobody.
+   */
+  // ponytail: linear scan of members × one users.info each, like resolveUnionMember; fine for
+  // normal channels. Cache admin flags with a short TTL if a huge channel makes this hot.
+  private async eligibleApprovers(): Promise<string[]> {
+    const out: string[] = [];
+    for (const userId of await listChannelMembers(this.client, this.channel!)) {
+      if (await adminEligible(this.client, userId, this.identity.teamId, this.channel!, this.adminCheck, this.allowChannelCreatorConfig)) {
+        out.push(userId);
+      }
+    }
+    return out;
   }
 
   /**
@@ -511,7 +616,7 @@ export class ConnectContext {
           // #112 part 2: the owner DM fires on ACTUAL use — the wrapped fetch returning a provider
           // Response — not here at resolution: connect() alone injects nothing, and a resolution-time
           // DM would also burn the hourly debounce before the first real use (PR #171 P2).
-          return this.notifyOwnerOnUse(this.notifyRateLimited(new ConnectionHandle(
+          return this.notifyOwnerOnUse(this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
             provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
             // Union non-repudiation: `r.acting` is the borrowed member (audited as them); the REAL
             // requester is the caller. Pass it as triggeredBy so the inject audit records WHO borrowed
@@ -520,19 +625,23 @@ export class ConnectContext {
             this.channel, // origin channel: attribute union usage to the channel it happened in (stats)
             this.rateLimits,
             this.health,
-          )), member, providerId);
+            this.approvals,
+            this.thread,
+          ))), member, providerId);
         }
       }
     }
 
     if (await this.vault.get(userOwner(this.identity), providerId)) {
-      return this.notifyRateLimited(new ConnectionHandle(
+      return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
         provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
         null, // no union borrow on the direct per-user path
         this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
         this.rateLimits,
         this.health,
-      ));
+        this.approvals,
+        this.thread,
+      )));
     }
 
     // Key providers have no OAuth: post a self-service "set up your key" prompt instead.
@@ -675,11 +784,8 @@ export class ConnectContext {
    *  workspace-admin-only; when `allowChannelCreatorConfig` is opted in, the channel creator is also
    *  allowed. A custom `adminCheck` fully replaces the built-in gate (and ignores the flag). */
   private async requireAdmin(providerId: string): Promise<void> {
-    // A custom check overrides the built-in gate; a thrown override fails closed (not admin).
-    const ok = this.adminCheck
-      ? await this.adminCheck(this.client, this.identity.userId, this.identity.teamId).catch(() => false)
-      : (await isSlackAdmin(this.client, this.identity.userId)
-        || (this.allowChannelCreatorConfig && await isChannelAdmin(this.client, this.channel ?? '', this.identity.userId)));
+    // The ONE eligibility predicate (adminEligible); a thrown override fails closed (not admin).
+    const ok = await adminEligible(this.client, this.identity.userId, this.identity.teamId, this.channel ?? '', this.adminCheck, this.allowChannelCreatorConfig);
     if (!ok) {
       await this.audit.record('denied', this.identity, providerId, {
         reason: 'not-admin',
@@ -872,10 +978,10 @@ export class ConnectContext {
     const r = resolveCredentialOwner({ path: 'channel', mode: 'shared', principal: this.identity, channel, eligible: true });
     if (r.status !== 'resolved') throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
     // triggeredBy/originChannel keep their defaults (null): unchanged behavior on this path.
-    return this.notifyRateLimited(new ConnectionHandle(
+    return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
       provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-      null, null, this.rateLimits, this.health,
-    ));
+      null, null, this.rateLimits, this.health, this.approvals, this.thread,
+    )));
   }
 
   /**
@@ -1046,6 +1152,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
+  const approvals = new Approvals(db); // #113 per-action approval requests/grants (provider.approval)
   const unionOptin = new UnionOptin(db); // #112 union opt-in store (rows recorded regardless of the flag)
   const unionRequiresOptIn = opts.unionRequiresOptIn ?? false;
   const unionNotified = new Map<string, number>(); // #112 owner-DM debounce (see UNION_NOTIFY_DEBOUNCE_MS)
@@ -1073,10 +1180,7 @@ export async function createVouchr(opts: VouchrOptions) {
   // (enable/disable tool allowlist, the configure pre-modal gate). Default workspace-admin-only; the
   // channel creator is OR-ed in only when opted in. A custom isAdmin override fully replaces it.
   const commandAdmin = async (client: WebClient, identity: SlackIdentity, channel: string): Promise<boolean> => {
-    return opts.isAdmin
-      ? await opts.isAdmin(client, identity.userId, identity.teamId).catch(() => false)
-      : (await isSlackAdmin(client, identity.userId)
-        || (allowChannelCreatorConfig && await isChannelAdmin(client, channel, identity.userId)));
+    return adminEligible(client, identity.userId, identity.teamId, channel, opts.isAdmin, allowChannelCreatorConfig);
   };
 
   /** The acting user's brokered connections, for the status / config-modal / App-Home surfaces (one
@@ -1212,6 +1316,7 @@ export async function createVouchr(opts: VouchrOptions) {
         unionOptin,
         unionRequiresOptIn,
         unionNotified,
+        approvals,
         auditSink,
         health,
         previews,
@@ -1264,7 +1369,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, auditSink, health, previews,
+      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, approvals, auditSink, health, previews,
     });
   }
 
@@ -1899,6 +2004,72 @@ export async function createVouchr(opts: VouchrOptions) {
       if (respond) await respond({ replace_original: true, text: `✅ Approved *${provider}* for this thread. Ask me again.` });
     });
 
+    // #113 Approve/Deny for a pending sensitive-write approval. The button value is ONLY the
+    // pending-approval id — every field of an interaction payload is forgeable (SEC-3), so
+    // authority is decided here, server-side, at the mutation: the provider is re-validated
+    // against the registry (SEC-4), the approver RULE comes from the registry (never the payload
+    // or the stored row), and the clicker's eligibility is re-checked — 'self' means exactly the
+    // requester, 'admin' means the same adminEligible gate as every channel-config mutation. An
+    // ineligible click is rejected AND audited 'denied'. Approve mints the single-use TTL grant;
+    // Deny records the denial (approver in the actor column) and notifies the requester.
+    const handleApprovalDecision = async ({ ack, body, respond, client }: any, decision: 'approve' | 'deny') => {
+      await ack();
+      const identity = resolveIdentity({ body });
+      const id = body.actions?.[0]?.value;
+      if (!identity || typeof id !== 'string' || !id) return;
+      const pending = await approvals.get(id);
+      // Team binding: a forged id from another workspace must never be decidable here.
+      if (!pending || pending.teamId !== identity.teamId) {
+        if (respond) await respond({ replace_original: true, text: 'This approval expired or was already decided. Ask the agent again.' });
+        return;
+      }
+      if (!registry.has(pending.provider)) return; // stale row for an unregistered provider (SEC-4)
+      const approval = registry.get(pending.provider).approval;
+      const eligible = approval?.approver === 'admin'
+        ? await commandAdmin(client, identity, pending.channel ?? '')
+        : identity.userId === pending.userId; // 'self': exactly the requester, nobody else
+      if (!eligible) {
+        await audit.record('denied', identity, pending.provider,
+          { reason: 'not-approver', ...(pending.channel ? { channel: pending.channel } : {}) });
+        if (respond) await respond({ replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval.' });
+        return;
+      }
+      const requester: SlackIdentity = { enterpriseId: identity.enterpriseId, teamId: pending.teamId, userId: pending.userId };
+      // Same meta shape as the injector's approval rows (STR-4): method + host + pathname, never a
+      // body or query value. Row values were egress-validated before they were ever stored (SEC-4).
+      const meta = { host: pending.host, method: pending.method, path: pending.path, ...(pending.channel ? { channel: pending.channel } : {}) };
+      const p = escapeMrkdwn(pending.provider); // SEC-5, even for a registry-validated id
+      const what = `\`${escapeMrkdwn(pending.method)} ${escapeMrkdwn(pending.host)}${escapeMrkdwn(pending.path)}\``;
+      // Requester notification: ephemeral in the request's channel, or a DM when there was none.
+      const tellRequester = async (text: string) => {
+        if (pending.channel) {
+          await client.chat.postEphemeral({ channel: pending.channel, user: pending.userId, ...(pending.thread ? { thread_ts: pending.thread } : {}), text }).catch(() => undefined);
+        } else {
+          await client.chat.postMessage({ channel: pending.userId, text }).catch(() => undefined);
+        }
+      };
+      if (decision === 'approve') {
+        const ttlMs = approval?.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
+        if (!(await approvals.approve(id, identity.userId, ttlMs))) return; // concurrently decided: exactly one wins
+        await audit.record('approved', requester, pending.provider, meta, identity.userId);
+        emit({ type: 'approval_approved', provider: pending.provider, host: pending.host });
+        if (respond) await respond({ replace_original: true, text: `✅ Approved ${what} on *${p}*. The approval is single-use and expires in ${Math.round(ttlMs / 1000)}s — have the agent retry now.` });
+        if (identity.userId !== pending.userId) {
+          await tellRequester(`✅ <@${escapeMrkdwn(identity.userId)}> approved your *${p}* request (${what}) — ask the agent to retry.`);
+        }
+      } else {
+        if (!(await approvals.deny(id))) return; // concurrently decided: exactly one wins
+        await audit.record('denied', requester, pending.provider, { ...meta, reason: 'approval-denied' }, identity.userId);
+        emit({ type: 'approval_denied', provider: pending.provider, host: pending.host });
+        if (respond) await respond({ replace_original: true, text: `🚫 Denied ${what} on *${p}*. Nothing was sent.` });
+        if (identity.userId !== pending.userId) {
+          await tellRequester(`🚫 <@${escapeMrkdwn(identity.userId)}> denied your *${p}* request (${what}). Nothing was sent.`);
+        }
+      }
+    };
+    app.action(APPROVAL_APPROVE_ACTION, (a: any) => handleApprovalDecision(a, 'approve'));
+    app.action(APPROVAL_DENY_ACTION, (a: any) => handleApprovalDecision(a, 'deny'));
+
     // Share a private preview to the channel/thread. The button value is ONLY the claim id; the
     // authorization is the server-side claim in PendingPreviews.take (recipient + team + channel must
     // match what was stored at issue time — SEC-3: every field of the interaction payload is forgeable,
@@ -1972,9 +2143,10 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
-  /** Delete every connection past its TTL + clear stale consent + expired thread sessions. Run on a timer. */
+  /** Delete every connection past its TTL + clear stale consent + expired thread sessions +
+   *  expired approval prompts/grants (#113, audited inside core sweepExpired). Run on a timer. */
   async function sweep(): Promise<number> {
-    const n = await sweepExpired(vault, audit, consent, sink, unionOptin, health);
+    const n = await sweepExpired(vault, audit, consent, sink, unionOptin, health, approvals);
     await sessions.sweepExpired();
     return n;
   }
