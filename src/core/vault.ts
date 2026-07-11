@@ -438,10 +438,11 @@ export class Vault {
       // incomplete, never as success. `removed` is still unset in that case.
       if (removed === undefined) throw e;
       // Only the satellite purge failed after a successful DELETE. On a transactional backend the
-      // txn rolled the DELETE back, so re-run it; on a minimal non-transactional stub it already
-      // committed and this re-run is a no-op. Either way the credential is gone — a missed purge is
-      // fail-closed (see the doc comment) — so report the known-good delete result.
-      await this.db.run(sql, params).catch(() => {});
+      // txn rolled the DELETE back, so re-run it — and let ITS failure PROPAGATE: if the credential
+      // delete cannot be re-committed the credential is genuinely stranded (never report that as
+      // success, GHSA-25m2 r3). On a minimal non-transactional stub the row is already gone and this
+      // re-run is a harmless 0-row no-op. A missed purge is fail-closed (see the doc comment).
+      await this.db.run(sql, params);
       return removed;
     }
   }

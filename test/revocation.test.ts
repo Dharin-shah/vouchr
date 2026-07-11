@@ -374,6 +374,28 @@ test('vault.delete removes the credential even when the satellite purge fails', 
   assert.equal(await countConnections(db), 0); // the delete committed despite the failed purge
 });
 
+// GHSA-25m2 r3: if the purge fails AND the credential DELETE cannot be re-committed, that is a
+// genuinely stranded credential — delete() must reject, never report the strand as a success.
+test('vault.delete propagates when both the purge and the delete re-run fail', async () => {
+  const db = await openDb({ dbPath: ':memory:' });
+  const seeder = new Vault(db, KEY);
+  await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  let deletes = 0;
+  const failingDb = {
+    get: db.get.bind(db),
+    all: db.all.bind(db),
+    exec: db.exec.bind(db),
+    close: db.close.bind(db),
+    run: (sql: string, params?: unknown[]) => {
+      if (sql.includes('notification_state')) return Promise.reject(new Error('satellite table down'));
+      if (sql.includes('DELETE FROM connection') && deletes++ > 0) return Promise.reject(new Error('connection table down')); // re-run fails
+      return db.run(sql, params as any[]);
+    },
+  } as any;
+  const vault = new Vault(failingDb, KEY);
+  await assert.rejects(vault.delete(O1, 'revocable'), /connection table down/);
+});
+
 // GHSA-25m2 round 2: a pending consent must not be able to resurrect an offboarded user's
 // credential EVEN WHEN the offboarding consent purge transiently fails — the durable tombstone
 // written first makes the saved callback fail closed.
