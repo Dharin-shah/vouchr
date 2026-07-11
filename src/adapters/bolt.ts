@@ -1392,7 +1392,16 @@ export async function createVouchr(opts: VouchrOptions) {
           state == null ? undefined : String(state),
           error == null ? undefined : String(error),
         );
-        if (!result.ok) return res.status(result.status).send(result.error);
+        // SEC-5 (#177): the error path can echo the provider-controlled `error` query param
+        // (`OAuth error: <x>`). Express defaults a string `send()` to text/html, so serve it as
+        // text/plain + nosniff — injected markup renders as inert text instead of executing. The
+        // success path below opts into text/html explicitly for the rendered landing page.
+        if (!result.ok) {
+          return res
+            .status(result.status)
+            .set({ 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' })
+            .send(result.error);
+        }
         emit({ type: 'connected', provider: result.provider });
 
         // Best-effort nudge back into Slack, from the connecting user's own workspace.
