@@ -84,6 +84,19 @@ VOUCHR_MASTER_KEYS="k2026:$NEW_KEY,k2019:$OLD_KEY" vouchr rekey --dry-run
 VOUCHR_MASTER_KEYS="k2026:$NEW_KEY,k2019:$OLD_KEY" vouchr rekey
 ```
 
+### `prune`
+Audit retention (#208): delete `audit` rows older than a cutoff, in **bounded batches**
+so it never holds a long lock, bloats WAL, or monopolizes the pool. Restartable and
+idempotent — an interrupted or repeated run just deletes whatever is now old. Dry-run
+by default (counts only); retention is an explicit choice (nothing prunes automatically).
+Run it on a schedule (cron / k8s `CronJob`). See DEPLOYMENT.md § Audit retention.
+
+```bash
+vouchr prune --older-than-days 90            # DRY-RUN: N rows older than 90 days
+vouchr prune --older-than-days 90 --yes      # delete, in 10k-row batches
+#   --batch <N>   rows per DELETE (default 10000)
+```
+
 ### `health [provider|host ...]`
 Best-effort HTTPS reachability of each provider's authorize/token **hosts** (no
 credentials are ever sent). Defaults to the built-ins `github google gitlab notion`;

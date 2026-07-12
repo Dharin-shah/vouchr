@@ -708,6 +708,44 @@ DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`)
   *direct* keys; it does not convert rows to envelope — that happens as users
   reconnect (each `upsert` re-seals in the current mode).
 
+## Audit retention (#208)
+
+The `audit` table is append-only and grows with usage, so at production volume you must choose a
+retention policy. Vouchr keeps this bounded without owning an archival/partitioning/legal-hold
+platform.
+
+**Indexes.** The read paths are backed by composite indexes so they stay fast as the table grows
+(they are part of the schema `vouchr migrate` creates — no action needed):
+
+- owner history (`/vouchr audit`) → `idx_audit_team_user_at (team_id, user_id, at DESC)`
+- channel history + `/vouchr stats` + channel-config lookup → `idx_audit_team_channel_at (team_id, channel, at DESC)`
+- retention pruning → `idx_audit_at (at)`
+
+**Retention is an explicit choice — there is no automatic pruning.** Keeping rows forever is a
+deliberate default; to bound storage, run the prune command on a schedule (a cron / k8s `CronJob`):
+
+```bash
+# Dry-run first (counts only), then delete rows older than 90 days in bounded batches:
+node dist/bin/vouchr.js prune --older-than-days 90            # DRY-RUN: N rows …
+node dist/bin/vouchr.js prune --older-than-days 90 --yes      # deletes, in 10k-row batches
+#   --batch <N>   rows per DELETE (default 10000)
+```
+
+Each batch is its own transaction, so pruning never holds a long lock, bloats WAL, or monopolizes
+the pool; it is **restartable and idempotent** (an interrupted or repeated run just deletes whatever
+is now old). Pick a `--batch` your `max_connections`/WAL headroom is comfortable with.
+
+**Estimating storage.** A row is on the order of a few hundred bytes plus the three index entries;
+multiply by your injection/consent rate to size the disk, or set a retention window that keeps the
+table within a target row count. `SELECT count(*), pg_size_pretty(pg_total_relation_size('audit'))`
+gives the current footprint.
+
+**Long retention / compliance.** For durable long-term audit beyond the operational window, stream
+events to a sink your side owns rather than growing the table: wire `auditSink`/`onAudit`
+(`VouchrAuditEvent`, no secret material — see the audit-sink docs) into your log pipeline or a Redis
+stream, and prune the Postgres table aggressively. Vouchr deliberately does not implement archive
+tiers or legal-hold workflows.
+
 ## Backup and restore
 
 The credential store and the key that protects it must be backed up **separately**.

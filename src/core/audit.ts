@@ -168,4 +168,35 @@ export class Audit {
       [randomUUID(), i.teamId, i.userId, provider, action, actor ?? null, channel, JSON.stringify(redact(meta)), Date.now()],
     );
   }
+
+  /** How many rows are older than `cutoffEpoch` (ms) — the size of a prune before it runs. Uses the
+   *  `idx_audit_at` index (a range on `at`), so it stays cheap even at production volume. */
+  async countOlderThan(cutoffEpoch: number): Promise<number> {
+    const row = await this.db.get<{ n: unknown }>(`SELECT COUNT(*) AS n FROM audit WHERE at < ?`, [cutoffEpoch]);
+    return Number(row?.n ?? 0);
+  }
+
+  /**
+   * Retention (#208): delete audit rows older than `cutoffEpoch` (ms) in BOUNDED batches, so pruning
+   * never takes a long lock, bloats WAL, or monopolizes the pool — each `DELETE` caps at `batch` rows
+   * and commits on its own (autocommit) before the next, leaving gaps for normal inserts. Restartable
+   * and idempotent: a re-run just deletes whatever is now old; an interrupted run loses no progress
+   * (committed batches stay deleted). Returns the total rows removed. `batch` must be a positive
+   * integer (default 10_000). The at-only predicate touches no secret material.
+   */
+  async pruneOlderThan(cutoffEpoch: number, batch = 10_000): Promise<number> {
+    if (!Number.isInteger(batch) || batch < 1) throw new Error(`audit prune batch must be a positive integer, got ${batch}`);
+    let total = 0;
+    for (;;) {
+      // Delete by PK of the oldest `batch` expired rows: the subquery rides idx_audit_at (at < cutoff,
+      // ORDER BY at), the outer delete rides the PK. Portable (no ctid). Each statement is its own tx.
+      const { changes } = await this.db.run(
+        `DELETE FROM audit WHERE id IN (SELECT id FROM audit WHERE at < ? ORDER BY at LIMIT ?)`,
+        [cutoffEpoch, batch],
+      );
+      total += changes;
+      if (changes < batch) break; // a short (or empty) batch means no expired rows remain
+    }
+    return total;
+  }
 }

@@ -289,6 +289,34 @@ async function cmdDoctor(f: Flags): Promise<number> {
   return failed ? 1 : 0;
 }
 
+/**
+ * Audit retention (#208): delete audit rows older than `--older-than-days N` in bounded batches.
+ * Dry-run by DEFAULT (counts only); `--yes` performs the delete. Retention is an explicit operator
+ * choice — there is no automatic pruning, so keeping rows forever is a deliberate (documented) default.
+ */
+async function cmdPrune(db: Db, f: Flags): Promise<number> {
+  const days = Number(f.values['older-than-days']);
+  if (!('older-than-days' in f.values) || !Number.isFinite(days) || days <= 0) {
+    console.error('prune: --older-than-days <N> is required (a positive number of days; nothing is pruned without it)');
+    return 2;
+  }
+  const batch = 'batch' in f.values ? Number(f.values.batch) : 10_000;
+  if (!Number.isInteger(batch) || batch < 1) {
+    console.error('prune: --batch must be a positive integer');
+    return 2;
+  }
+  const cutoff = Date.now() - days * 86_400_000;
+  const audit = new Audit(db);
+  const n = await audit.countOlderThan(cutoff);
+  if (!('yes' in f.values)) {
+    console.log(`DRY-RUN: ${n} audit row(s) older than ${days} day(s) (before ${ts(cutoff)}). Re-run with --yes to delete in batches of ${batch}.`);
+    return 0;
+  }
+  const deleted = await audit.pruneOlderThan(cutoff, batch);
+  console.log(`Pruned ${deleted} audit row(s) older than ${days} day(s) (before ${ts(cutoff)}), in batches of ${batch}.`);
+  return 0;
+}
+
 /** Best-effort: any HTTP response (even 4xx/5xx) means the host is reachable. */
 async function reachable(host: string, timeoutMs = 5000): Promise<boolean> {
   try {
@@ -364,6 +392,12 @@ Commands:
               Idempotent and safe to interrupt/re-run; prints counts, never secrets.
                 --dry-run        classify + count per key id/scheme; write nothing
                 exits non-zero if any blob decrypts under NO configured key
+  prune       Audit retention (#208): delete audit rows older than a cutoff, in
+              bounded batches (never blocks normal inserts for long). Dry-run by
+              default; retention is an explicit choice (no automatic pruning).
+                --older-than-days <N>  REQUIRED (positive; nothing pruned without it)
+                --batch <N>            rows per delete (default 10000)
+                --yes                  actually delete (default is a dry-run count)
   health [provider|host ...]
               Reachability of provider authorize/token hosts (no credentials sent).
               Defaults to built-ins: ${Object.keys(BUILTINS).join(', ')}.
@@ -415,6 +449,14 @@ async function main(): Promise<number> {
       const db = await openDb({ databaseUrl: f.values.db });
       try {
         return await cmdRekey(db, f);
+      } finally {
+        await db.close();
+      }
+    }
+    case 'prune': {
+      const db = await openDb({ databaseUrl: f.values.db });
+      try {
+        return await cmdPrune(db, f);
       } finally {
         await db.close();
       }
