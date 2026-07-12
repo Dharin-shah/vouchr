@@ -708,6 +708,54 @@ DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`)
   *direct* keys; it does not convert rows to envelope — that happens as users
   reconnect (each `upsert` re-seals in the current mode).
 
+## Audit retention (#208)
+
+The `audit` table is append-only and grows with usage, so at production volume you must choose a
+retention policy. Vouchr keeps this bounded without owning an archival/partitioning/legal-hold
+platform.
+
+**Indexes.** The read paths are backed by composite indexes so they stay fast as the table grows
+(they are part of the schema `vouchr migrate` creates — no action needed):
+
+- owner history (`/vouchr audit`) → `idx_audit_team_user_at (team_id, user_id, at DESC)`
+- channel history + `/vouchr stats` → `idx_audit_team_channel_at (team_id, channel, at DESC)`
+- "who configured this" lookups → partial `idx_audit_config (team_id, channel, provider, at DESC) WHERE action='config'`
+- retention pruning → `idx_audit_at (at)`
+
+**Retention is an explicit choice — there is no automatic pruning.** Keeping rows forever is a
+deliberate default; to bound storage, run the prune command on a schedule (a cron / k8s `CronJob`):
+
+```bash
+# Dry-run first (counts only), then delete rows older than 90 days in bounded batches:
+node dist/bin/vouchr.js prune --older-than-days 90            # DRY-RUN: N rows …
+node dist/bin/vouchr.js prune --older-than-days 90 --yes      # deletes, in 10k-row batches
+#   --batch <N>   rows per DELETE (default 10000)
+```
+
+Each batch is its own transaction, so pruning **bounds the WAL and lock held per statement** — it
+never takes a long lock or monopolizes the pool. (Deletes still generate WAL and leave dead tuples;
+autovacuum reclaims that space over time, so expect vacuum activity after a large prune.) It is
+**restartable and idempotent** — an interrupted or repeated run just deletes whatever is now old, and
+`FOR UPDATE SKIP LOCKED` lets two prune jobs take disjoint batches. Pick a `--batch` your
+`max_connections` / WAL / autovacuum headroom is comfortable with.
+
+**Estimating storage.** A row is on the order of a few hundred bytes plus the index entries; multiply
+by your injection/consent rate to size the disk, or set a retention window that keeps the table
+within a target row count. The current footprint:
+
+```sql
+SELECT count(*) AS rows, pg_size_pretty(pg_total_relation_size('audit')) AS total_size FROM audit;
+```
+
+**Long retention / compliance.** The `audit` TABLE is the authoritative record; do NOT prune based on
+`auditSink` — it is a lossy, fire-and-forget convenience copy (a capped stream may drop events and it
+does not carry every audited action), so it cannot stand in for the table. For durable long-term or
+compliance archives, run an operator-owned durable pipeline off PostgreSQL itself — logical
+replication / CDC (e.g. a replication slot) to a warehouse, or periodic `pg_dump`/`COPY` exports to
+object storage — and **verify delivery and a test restore before you prune**. Only prune rows you
+have confirmed are safely archived. Vouchr deliberately does not implement archive tiers or
+legal-hold workflows.
+
 ## Backup and restore
 
 The credential store and the key that protects it must be backed up **separately**.

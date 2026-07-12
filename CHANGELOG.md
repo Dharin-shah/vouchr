@@ -5,6 +5,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **Audit indexes + bounded retention** (#208). The `audit` table gets composite indexes (owner
+  history, channel history/stats, retention) plus a partial index for the rare "who configured this"
+  lookup, so those paths ride an index instead of a full scan at volume — verified with real-Postgres
+  `EXPLAIN` plan tests, including the complete prune `DELETE`. New `vouchr prune --older-than-days <N>`
+  command deletes old audit rows in bounded, restartable, idempotent batches (each an `id = ANY(ARRAY(…
+  FOR UPDATE SKIP LOCKED))` delete that rides the index — no per-batch table scan — and its own
+  transaction), plus `Audit.pruneOlderThan` / `Audit.countOlderThan`. Retention is an explicit operator
+  choice — nothing prunes automatically. Deletion requires an exact bare `--yes` (a valued or
+  `--dry-run`-conflicting form is rejected, not obeyed); the same exact-confirmation now guards
+  `revoke`. The deployment guide documents storage estimation and durable off-Postgres archival
+  (logical replication / CDC / export with verified restore) before pruning.
+
 ### Changed
 
 - Added the canonical `vision.md` product contract and an issue-specific agent workflow that loads

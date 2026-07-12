@@ -333,6 +333,19 @@ function schema(): string {
       meta TEXT,
       at ${int} NOT NULL
     );
+    -- Audit read paths (#208). Each serves a real query — no speculative indexes on this insert-heavy
+    -- table. Composite (…, at DESC) so the ORDER BY at DESC LIMIT reads straight off the index.
+    --  · owner history (listByOwnerUser): team_id, user_id, at DESC
+    --  · channel history + stats + last-config (listByChannel / statsByChannel / lastChannelConfigActor):
+    --    team_id, channel, at DESC
+    --  · retention prune (pruneOlderThan): a plain (at) btree for the global at<cutoff batch scan.
+    CREATE INDEX IF NOT EXISTS idx_audit_team_user_at ON audit (team_id, user_id, at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_team_channel_at ON audit (team_id, channel, at DESC);
+    CREATE INDEX IF NOT EXISTS idx_audit_at ON audit (at);
+    -- lastChannelConfigActor looks up the newest 'config' row for (team, channel, provider). 'config'
+    -- rows are rare among injects, so a PARTIAL index on just those keeps the "who configured this"
+    -- lookup from scanning the channel's whole history. Small (only config rows).
+    CREATE INDEX IF NOT EXISTS idx_audit_config ON audit (team_id, channel, provider, at DESC) WHERE action = 'config';
 
     CREATE TABLE IF NOT EXISTS installation (
       id TEXT PRIMARY KEY,

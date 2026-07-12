@@ -5,11 +5,14 @@
  * Connects to the SAME credential store the app uses (PostgreSQL via
  * VOUCHR_DATABASE_URL or --db) through `openDb`. The read commands
  * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
- * token/secret material. Two commands mutate: `revoke` DELETES rows and may
- * best-effort decrypt an access token to hand to the upstream revoke — never to
- * stdout; `rekey` re-encrypts ciphertext columns under the primary master key and
- * prints counts only. `secret_ref` (an external manager ARN/pointer, non-secret by
- * design) is the only ref any command surfaces.
+ * token/secret material. Four commands mutate: `migrate` creates/alters the schema;
+ * `revoke` DELETES credential rows and may best-effort decrypt an access token to hand
+ * to the upstream revoke — never to stdout; `rekey` re-encrypts ciphertext columns under
+ * the primary master key and prints counts only; `prune` DELETES old `audit` rows
+ * (retention, #208). `revoke` and `prune` are dry-run by default and require an exact
+ * bare `--yes` to delete.
+ * `secret_ref` (an external manager ARN/pointer, non-secret by design) is the only
+ * ref any command surfaces.
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
@@ -19,7 +22,7 @@ import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
 import { github, google, gitlab, notion, ProviderRegistry, type Provider } from '../src/core/providers';
 import { Vault } from '../src/core/vault';
-import { Audit } from '../src/core/audit';
+import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
@@ -43,6 +46,82 @@ function parseFlags(argv: string[]): Flags {
     } else positional.push(a);
   }
   return { values, positional };
+}
+
+type FlagSpec = Record<string, 'string' | 'boolean'>;
+type StrictValues = Record<string, string | true>;
+
+/**
+ * Strict CLI parse for the DESTRUCTIVE commands (`revoke`, `prune`) — the loose {@link parseFlags}
+ * fails open (collapses `--yes`/`--yes=`, silently drops unknown flags/typos, last-writer-wins on
+ * duplicates), so a misspelled scope or a `--yes=` could delete data. This one rejects: an unknown
+ * flag, a positional argument, a duplicate flag, a boolean flag given a value (`--yes=…`), and a
+ * value flag missing its value or given a flag-shaped one (the `--team --yes` typo). Consequently a
+ * confirmed delete requires an EXACT bare `--yes`. Runs BEFORE the database is opened.
+ */
+function strictParse(argv: string[], spec: FlagSpec): { values: StrictValues } | { error: string } {
+  // SEC-1: error messages NEVER echo an argument value or an unknown flag name — a positional or an
+  // unknown flag could be token-shaped or a credential-bearing URL. Only canonical spec flag names
+  // (safe by construction) appear in messages.
+  const allowed = () => Object.keys(spec).map((k) => `--${k}`).join(', ');
+  const values: StrictValues = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) return { error: `unexpected positional argument (only flags are allowed: ${allowed()})` };
+    const eq = a.indexOf('=');
+    const name = eq === -1 ? a.slice(2) : a.slice(2, eq);
+    const inline = eq === -1 ? undefined : a.slice(eq + 1);
+    const type = spec[name];
+    if (!type) return { error: `unknown flag (allowed: ${allowed()})` }; // never echo the unknown name
+    if (name in values) return { error: `--${name} given more than once` };
+    if (type === 'boolean') {
+      if (inline !== undefined) return { error: `--${name} takes no value (pass a bare --${name})` };
+      values[name] = true;
+    } else {
+      // A value flag: inline `--k=v`, else the next token (which must not be a flag). Empty/whitespace
+      // is rejected — an empty scope (`--team=`) would otherwise mean "no filter" and widen a delete.
+      let val: string;
+      if (inline !== undefined) val = inline;
+      else {
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith('--')) return { error: `--${name} requires a value` };
+        val = next;
+        i++;
+      }
+      if (val.trim() === '') return { error: `--${name} requires a non-empty value` };
+      values[name] = val;
+    }
+  }
+  return { values };
+}
+
+/**
+ * Exact destructive confirmation for `revoke`/`prune`, over strictly-parsed values (so `--yes` is
+ * already guaranteed bare — a valued form was rejected upstream). Returns 'go' only for a bare
+ * `--yes`; 'dry-run' otherwise; an `{ error }` when `--yes` and `--dry-run` conflict.
+ */
+function destructiveIntent(v: StrictValues): 'go' | 'dry-run' | { error: string } {
+  if (v.yes === true && v['dry-run'] === true) return { error: '--yes and --dry-run are mutually exclusive' };
+  return v.yes === true ? 'go' : 'dry-run';
+}
+
+const REVOKE_SPEC: FlagSpec = { db: 'string', provider: 'string', team: 'string', user: 'string', channel: 'string', yes: 'boolean', 'dry-run': 'boolean' };
+const PRUNE_SPEC: FlagSpec = { db: 'string', 'older-than-days': 'string', batch: 'string', yes: 'boolean', 'dry-run': 'boolean' };
+
+type RevokePlan = { db?: string; filter: RevokeFilter; dryRun: boolean };
+
+/** Validate revoke's arguments BEFORE any DB opens: `--provider` is required, and the exact-bare-
+ *  `--yes` confirmation is resolved here — so invalid usage exits 2 even if Postgres is unreachable. */
+function planRevoke(v: StrictValues): RevokePlan | { error: string } {
+  const provider = v.provider as string | undefined;
+  if (!provider) return { error: '--provider <id> is required (refusing to revoke across every provider)' };
+  const intent = destructiveIntent(v);
+  if (typeof intent === 'object') return intent;
+  return {
+    db: v.db as string | undefined,
+    filter: { provider, teamId: v.team as string | undefined, userId: v.user as string | undefined, channel: v.channel as string | undefined },
+    dryRun: intent === 'dry-run',
+  };
 }
 
 const ts = (ms: number | null | undefined): string =>
@@ -126,27 +205,12 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
  * the upstream revoke, never to stdout. Pending consent + thread grants for the scope are cleared too.
  */
-async function cmdRevoke(db: Db, f: Flags): Promise<number> {
-  // A scoping flag written with NO value (e.g. the typo `--team --yes`, where `--yes` is consumed as a
-  // boolean and `--team` is left empty) must NOT silently widen the blast radius to every team. Refuse
-  // any scope flag that is PRESENT but empty rather than treating it as "unset".
-  for (const k of ['provider', 'team', 'user', 'channel'] as const) {
-    if (k in f.values && !f.values[k]) {
-      console.error(`revoke: --${k} was given with no value; refusing to run with an ambiguous scope`);
-      return 2;
-    }
-  }
-  const provider = f.values.provider;
-  if (!provider) {
-    console.error('revoke: --provider <id> is required (refusing to revoke across every provider)');
-    return 2;
-  }
-  const filter: RevokeFilter = { provider, teamId: f.values.team, userId: f.values.user, channel: f.values.channel };
+async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
+  const { filter, dryRun } = plan;
   const rows = await selectRevocations(db, filter);
-
-  // Dry-run unless --yes (and an explicit --dry-run forces it even alongside --yes). Print + exit.
-  const dryRun = 'dry-run' in f.values || !('yes' in f.values);
-  const scope = [`provider=${provider}`, f.values.team && `team=${f.values.team}`, f.values.user && `user=${f.values.user}`, f.values.channel && `channel=${f.values.channel}`].filter(Boolean).join(' ');
+  // SEC-1: scope values came directly from argv and may be credential-shaped. Report which canonical
+  // filters were applied, never their raw values; matched stored metadata is shown in the table below.
+  const scope = ['provider', filter.teamId && 'team', filter.userId && 'user', filter.channel && 'channel'].filter(Boolean).join('+');
   console.log(`${dryRun ? 'DRY-RUN' : 'REVOKE'} ${scope}: ${rows.length} connection(s)`);
   printTable(
     ['team', 'owner_kind', 'owner', 'external_account', 'created_at'],
@@ -190,7 +254,7 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
     // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on one row
     // never strands the rest of a break-glass sweep.
     try {
-      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, provider);
+      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, filter.provider);
       if (!r.removed) localFailures++;
       if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
       else upstreamSkipped++;
@@ -289,6 +353,50 @@ async function cmdDoctor(f: Flags): Promise<number> {
   return failed ? 1 : 0;
 }
 
+type PrunePlan = { cutoff: number; batch: number; dryRun: boolean };
+
+/**
+ * Validate prune's arguments BEFORE any DB is opened (#208): a positive-integer `--older-than-days`
+ * whose resulting cutoff is a SAFE integer epoch (so `1e100` is a clean usage error, not a Postgres
+ * internal error), a `--batch` in `1..MAX_AUDIT_PRUNE_BATCH`, and an exact-bare-`--yes` confirmation.
+ */
+function planPrune(v: StrictValues): PrunePlan | { error: string } {
+  const daysRaw = v['older-than-days'];
+  const days = Number(daysRaw);
+  if (typeof daysRaw !== 'string' || !Number.isSafeInteger(days) || days < 1) {
+    return { error: '--older-than-days <N> is required (a positive integer number of days; nothing is pruned without it)' };
+  }
+  const cutoff = Date.now() - days * 86_400_000;
+  // The cutoff must be a safe integer AND within the ECMAScript Date range (±8.64e15 ms), else
+  // rendering it (dry-run output) would throw "Invalid time value" AFTER doing DB work.
+  if (!Number.isSafeInteger(cutoff) || cutoff < -8_640_000_000_000_000) {
+    return { error: '--older-than-days is too large to represent a cutoff' };
+  }
+  const batch = typeof v.batch === 'string' ? Number(v.batch) : MAX_AUDIT_PRUNE_BATCH;
+  if (!Number.isSafeInteger(batch) || batch < 1 || batch > MAX_AUDIT_PRUNE_BATCH) {
+    return { error: `--batch must be an integer between 1 and ${MAX_AUDIT_PRUNE_BATCH}` };
+  }
+  const intent = destructiveIntent(v);
+  if (typeof intent === 'object') return intent;
+  return { cutoff, batch, dryRun: intent === 'dry-run' };
+}
+
+/** Execute a validated {@link PrunePlan}. Retention is an explicit operator choice — nothing prunes
+ *  automatically, and keeping rows forever is the deliberate default. */
+async function runPrune(db: Db, plan: PrunePlan): Promise<number> {
+  const audit = new Audit(db);
+  if (plan.dryRun) {
+    // The count is ONLY for the preview — never on the destructive path, where an exact count of a
+    // huge expired set could scan the table / hit statement_timeout before the first bounded delete.
+    const n = await audit.countOlderThan(plan.cutoff);
+    console.log(`DRY-RUN: ${n} audit row(s) before ${ts(plan.cutoff)}. Re-run with --yes to delete in bounded batches.`);
+    return 0;
+  }
+  const deleted = await audit.pruneOlderThan(plan.cutoff, plan.batch);
+  console.log(`Pruned ${deleted} audit row(s) before ${ts(plan.cutoff)}, in bounded batches.`);
+  return 0;
+}
+
 /** Best-effort: any HTTP response (even 4xx/5xx) means the host is reachable. */
 async function reachable(host: string, timeoutMs = 5000): Promise<boolean> {
   try {
@@ -333,7 +441,7 @@ async function cmdHealth(f: Flags): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`vouchr: operator CLI (reads are metadata-only; only \`revoke\` and \`rekey\` mutate)
+  console.log(`vouchr: operator CLI (reads are metadata-only; \`migrate\`, \`revoke\`, \`rekey\`, \`prune\` mutate)
 
 Usage: vouchr <command> [options]
 
@@ -364,6 +472,12 @@ Commands:
               Idempotent and safe to interrupt/re-run; prints counts, never secrets.
                 --dry-run        classify + count per key id/scheme; write nothing
                 exits non-zero if any blob decrypts under NO configured key
+  prune       Audit retention (#208): delete audit rows older than a cutoff, in
+              bounded batches (never blocks normal inserts for long). Dry-run by
+              default; retention is an explicit choice (no automatic pruning).
+                --older-than-days <N>  REQUIRED (positive; nothing pruned without it)
+                --batch <N>            rows per delete (default 10000)
+                --yes                  actually delete (default is a dry-run count)
   health [provider|host ...]
               Reachability of provider authorize/token hosts (no credentials sent).
               Defaults to built-ins: ${Object.keys(BUILTINS).join(', ')}.
@@ -404,9 +518,15 @@ async function main(): Promise<number> {
       return 0;
     }
     case 'revoke': {
-      const db = await openDb({ databaseUrl: f.values.db });
+      // Parse AND validate BEFORE opening the DB: a typo'd/empty scope or a valued --yes must be
+      // rejected (exit 2) even when Postgres is unavailable — never widened to "delete everything".
+      const p = strictParse(rest, REVOKE_SPEC);
+      if ('error' in p) { console.error(`revoke: ${p.error}`); return 2; }
+      const plan = planRevoke(p.values);
+      if ('error' in plan) { console.error(`revoke: ${plan.error}`); return 2; }
+      const db = await openDb({ databaseUrl: plan.db });
       try {
-        return await cmdRevoke(db, f);
+        return await cmdRevoke(db, plan);
       } finally {
         await db.close();
       }
@@ -415,6 +535,18 @@ async function main(): Promise<number> {
       const db = await openDb({ databaseUrl: f.values.db });
       try {
         return await cmdRekey(db, f);
+      } finally {
+        await db.close();
+      }
+    }
+    case 'prune': {
+      const p = strictParse(rest, PRUNE_SPEC);
+      if ('error' in p) { console.error(`prune: ${p.error}`); return 2; }
+      const pre = planPrune(p.values); // days/batch/confirmation validated BEFORE the DB opens
+      if ('error' in pre) { console.error(`prune: ${pre.error}`); return 2; }
+      const db = await openDb({ databaseUrl: p.values.db as string | undefined });
+      try {
+        return await runPrune(db, pre);
       } finally {
         await db.close();
       }
