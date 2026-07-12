@@ -7,6 +7,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- Added the canonical `vision.md` product contract and an issue-specific agent workflow that loads
+  live requirements, affected surfaces, edge cases, resource bounds, and acceptance evidence before
+  editing. The full test command now fails closed when its required PostgreSQL is unavailable instead
+  of allowing PostgreSQL-backed cases to skip.
+
 - **PostgreSQL is now the only backend** (#204). The embedded SQLite mode (`better-sqlite3`,
   `dbPath`, `VOUCHR_DB`, `:memory:`) is removed. `openDb` requires a `postgres://` connection
   string via `databaseUrl` or `VOUCHR_DATABASE_URL` and fails closed on a missing or non-Postgres

@@ -5,6 +5,7 @@
 
 <p>
   <a href="#quickstart">Quickstart</a> |
+  <a href="./vision.md">Vision</a> |
   <a href="#how-it-works">How It Works</a> |
   <a href="#credential-modes">Credential Modes</a> |
   <a href="#providers">Providers</a> |
@@ -19,6 +20,9 @@
 > **Vouchr is in alpha** and not yet tested in a live deployment. APIs may change between
 > releases. Review the [production readiness checklist](./guides/DEPLOYMENT.md#production-readiness-checklist)
 > before adopting — feedback and issues are very welcome!
+
+The supported product, deliberate removals, simplification rules, execution order, and
+production-ready definition live in the canonical [vision](./vision.md).
 
 **Vouchr is a self-hostable credential broker for Slack agents. Users connect or approve access in
 Slack, your agent receives a safe handle, and Vouchr injects the right credential only at the
@@ -253,8 +257,8 @@ More examples: [Google user credentials](./examples/google-user) ·
 `dryRun: true` runs the whole machine — consent state, channel modes, policy, tool allowlists,
 egress gates, vault, audit — under one invariant: **no real network call leaves the process on any
 edge** (outbound fetch, OAuth token exchange, token refresh, upstream revoke). Your app's test
-suite exercises its real Vouchr wiring fully offline, with zero Slack or provider OAuth apps
-configured:
+suite exercises its real Vouchr wiring with no external network, with zero Slack or provider OAuth
+apps configured (it still uses the required local PostgreSQL):
 
 - `connect()` posts the real Connect prompt, but the authorize URL is a local,
   instantly-succeeding redirect into the real OAuth callback. Complete it by "clicking" it, or from
@@ -293,8 +297,9 @@ await res.json(); // { dryRun: true, method: 'GET', url: …, wouldInjectAs: 'au
 
 The headless broker takes the same flag (`BrokerOptions.dryRun`, or `VOUCHR_DRY_RUN=1` for the
 packaged `vouchr-broker`): `/v1/connect` mints a URL pointing at the broker's own callback —
-GETting it completes consent — and `/v1/fetch` returns the echo. A complete offline `node:test`
-suite of a Bolt handler lives in [`examples/dry-run/`](./examples/dry-run).
+GETting it completes consent — and `/v1/fetch` returns the echo. A complete
+no-external-network `node:test` suite of a Bolt handler lives in
+[`examples/dry-run/`](./examples/dry-run).
 
 ## Headless
 

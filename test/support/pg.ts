@@ -16,9 +16,10 @@ process.env.VOUCHR_PG_POOL_MAX ??= '2';
 export const TEST_PG_URL = process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5433/vouchr';
 
 /** True if the test Postgres is reachable. Retries a few times: under the parallel suite a momentary
- *  connection-pressure blip (a burst of pools near the server ceiling) must NOT be misread as "no PG"
- *  and silently skip a real-PG test — Vouchr is container-only, so PG is required, not optional. A
- *  genuinely-down PG still fails fast (each attempt errors immediately, so ~5 tries ≈ 1s). */
+ *  connection-pressure blip (a burst of pools near the server ceiling) must NOT be misread as "no PG".
+ *  Full npm test/coverage set VOUCHR_REQUIRE_POSTGRES=1, so any later outage THROWS instead of turning
+ *  individual files into false-green skips. Directly-invoked focused tests retain the convenient
+ *  boolean/skip behavior. A genuinely-down PG still fails fast (~5 attempts ≈ 1s). */
 export async function pgReachable(): Promise<boolean> {
   for (let attempt = 0; attempt < 5; attempt++) {
     const c = new Client(TEST_PG_URL);
@@ -30,6 +31,9 @@ export async function pgReachable(): Promise<boolean> {
       await c.end().catch(() => undefined);
       if (attempt < 4) await new Promise((r) => setTimeout(r, 200)); // let a transient burst drain
     }
+  }
+  if (process.env.VOUCHR_REQUIRE_POSTGRES === '1') {
+    throw new Error('required test PostgreSQL is unreachable; run npm run pg:up or set VOUCHR_TEST_PG_URL');
   }
   return false;
 }

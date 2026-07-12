@@ -1,0 +1,4 @@
+interface:
+  display_name: "Implement Vouchr Issue"
+  short_description: "Front-load issue context and safeguards"
+  default_prompt: "Use $implement-vouchr-issue to implement a Vouchr GitHub issue from its acceptance criteria."

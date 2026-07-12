@@ -33,7 +33,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      # Exercises the real Postgres backend (the suite skips PG if this is unreachable).
+      # Exercises the required real Postgres backend; the suite's sentinel fails if unreachable.
       VOUCHR_TEST_PG_URL: postgres://vouchr:vouchr@localhost:5432/vouchr
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
