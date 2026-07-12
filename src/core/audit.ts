@@ -207,9 +207,9 @@ export class Audit {
    * normal inserts — it never holds a long lock or monopolizes the pool. (Deletes still generate WAL
    * and dead tuples; autovacuum reclaims that space for reuse over time.) Restartable and idempotent:
    * a re-run just deletes whatever is now old; an interrupted run loses no progress (committed batches
-   * stay deleted). Returns the total rows removed. `cutoffEpoch` and `batch` are validated (Vault is a
-   * public export, so the bound is enforced here, not only in the CLI). The at-only predicate touches
-   * no secret material.
+   * stay deleted). Returns the total rows removed. `cutoffEpoch` and `batch` are validated (`Audit`
+   * is a public export, so the bound is enforced here, not only in the CLI). The at-only predicate
+   * touches no secret material.
    */
   async pruneOlderThan(cutoffEpoch: number, batch: number = MAX_AUDIT_PRUNE_BATCH): Promise<number> {
     assertSafeCutoff(cutoffEpoch);

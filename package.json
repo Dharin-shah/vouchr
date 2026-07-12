@@ -77,6 +77,7 @@
     "docker-smoke": "bash test/docker-smoke.sh",
     "pg:up": "docker run --rm -d --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr -p 5433:5432 postgres:16-alpine",
     "pg:down": "docker rm -f vouchr-pg",
+    "bench:audit": "node --import tsx test/bench/audit-bench.ts",
     "example:github": "node --env-file=.env --import tsx examples/bolt-github/app.ts",
     "example:dry-run": "node --import tsx --test examples/dry-run/app.test.ts"
   },
