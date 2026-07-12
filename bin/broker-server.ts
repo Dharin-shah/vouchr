@@ -4,7 +4,7 @@
  *
  * Reads config from env, wires the same core (openDb → Vault → Audit → createBroker) the Bolt path
  * uses, and serves /v1/fetch, /v1/resolve, and the /healthz + /readyz probes. Postgres + KMS + the
- * default shared jti store (DbReplayStore) make it multi-replica safe; see DEPLOYMENT.md.
+ * required shared jti store (DbReplayStore) make it multi-replica safe; see DEPLOYMENT.md.
  * Run: `node dist/bin/broker-server.js`.
  */
 import http from 'node:http';
@@ -165,8 +165,8 @@ export async function buildBrokerServer(
   // sweep-written rows (revoke reason 'expired') carry meta.dry_run too — createBroker only wraps
   // its own copy, which would leave the sweep writing unmarked rows.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
-  // Multi-replica safety is now the createBroker default: with a db configured it uses DbReplayStore
-  // (shared jti table), so a scaled fleet gets cluster-wide single-use with no wiring here. #100.
+  // createBroker always uses DbReplayStore (shared jti table), so a scaled fleet gets cluster-wide
+  // single-use with no alternate replay path to wire here. #100/#212.
 
   // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
   // default (user-only broker). The caller supplies eligibility facts as signed claims; the store

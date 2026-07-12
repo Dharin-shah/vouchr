@@ -12,12 +12,14 @@ import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
+import { identityKid, normalizeIdentityConfig } from '../src/adapters/http/identity';
 import {
   signIdentity,
   verifyIdentity,
   identityConfig,
   IdentityError,
   ReplayGuard,
+  IDENTITY_SKEW_MS,
   type IdentityClaims,
 } from './support/identity';
 
@@ -126,7 +128,7 @@ test('identity: round-trips and rejects tampering/expiry/over-long lifetime', ()
   // flipped last char -> bad signature
   assert.throws(() => verifyIdentity(tok.slice(0, -1) + (tok.endsWith('a') ? 'b' : 'a'), SECRET), IdentityError);
   // expired
-  assert.throws(() => verifyIdentity(signIdentity(claims({ exp: Date.now() - 1 }), SECRET), SECRET), /expired/);
+  assert.throws(() => verifyIdentity(signIdentity(claims({ exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET), SECRET), /expired/);
   // lifetime > 5min
   assert.throws(() => verifyIdentity(signIdentity(claims({ exp: Date.now() + 10 * 60_000 }), SECRET), SECRET), /5min/);
 });
@@ -175,6 +177,20 @@ test('#212 createBroker rejects identity-key reuse with direct broker/provider s
       (error: Error) => /distinct/.test(error.message) && !error.message.includes(reused),
     );
   }
+
+  const masterSecret = 'M7vouchrMasterKey2026abcdef12345';
+  const masterIdentity = normalizeIdentityConfig({
+    issuer: 'vouchr-test',
+    audience: 'test-deployment',
+    keys: [{ kid: identityKid(masterSecret), secret: masterSecret }],
+  });
+  assert.throws(
+    () => createBroker({
+      providers: [acme], vault: new Vault(db, Buffer.from(masterSecret)), audit, db,
+      identitySecret: masterIdentity,
+    }),
+    (error: Error) => /distinct from the master key/.test(error.message) && !error.message.includes(masterSecret),
+  );
 });
 
 // ── /v1/fetch ────────────────────────────────────────────────────────────────
@@ -497,7 +513,7 @@ test('fetch: unsigned/expired identity -> 401', async (t) => {
     const bad = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: 'not.a.real.token', method: 'GET', path: '/x' });
     assert.equal(bad.status, 401);
     const expired = await post(port, '/v1/fetch', {
-      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims({ exp: Date.now() - 1 }), SECRET), method: 'GET', path: '/x',
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims({ exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET), method: 'GET', path: '/x',
     });
     assert.equal(expired.status, 401);
   } finally {
@@ -520,33 +536,8 @@ test('fetch: a replayed jti is rejected on the second call', async (t) => {
   }
 });
 
-test('fetch: a shared replayStore rejects a replay across DIFFERENT broker instances (multi-pod)', async (t) => {
-  // A shared store makes single-use cluster-wide, not per-process (the default in-memory guard would
-  // let each instance accept the same jti once). Simulates two pods behind one Redis-backed store.
-  const seen = new Map<string, number>();
-  const replayStore = {
-    use: (jti: string, exp: number) => { if (seen.has(jti)) return false; seen.set(jti, exp); return true; },
-    ready: async () => {},
-  };
-  const a = await makeBroker(t, { replayStore });
-  const b = await makeBroker(t, { replayStore });
-  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
-  try {
-    const token = signIdentity(claims(), SECRET);
-    const first = await post(a.port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
-    assert.equal(first.status, 200);
-    const onOther = await post(b.port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
-    assert.equal(onOther.status, 401); // second pod refuses the already-used jti
-  } finally {
-    up.restore();
-    a.server.close();
-    b.server.close();
-  }
-});
-
-test('#100 default (no explicit replayStore) shares replay protection across instances on one db', async (t) => {
-  // Two brokers over ONE shared db and NO explicit replayStore: the #100 default (DbReplayStore on the
-  // shared db) must make a jti single-use CLUSTER-WIDE, so a token spent on A is refused on B.
+test('#212 PostgreSQL replay protection rejects one jti across broker instances', async (t) => {
+  // Two brokers over ONE shared db must make a jti single-use CLUSTER-WIDE.
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -569,22 +560,6 @@ test('#100 default (no explicit replayStore) shares replay protection across ins
     a.close();
     b.close();
     await db.close();
-  }
-});
-
-test('#100 an explicit replayStore override still wins (its use() is called, the db default is not)', async (t) => {
-  const calls: string[] = [];
-  const replayStore = { use: (jti: string) => { calls.push(jti); return true; }, ready: async () => {} };
-  const { server, port } = await makeBroker(t, { replayStore });
-  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
-  try {
-    const c = claims();
-    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(c, SECRET), method: 'GET', path: '/x' });
-    assert.equal(r.status, 200);
-    assert.deepEqual(calls, [c.jti]); // the caller's spy store was consulted, not the DbReplayStore default
-  } finally {
-    up.restore();
-    server.close();
   }
 });
 
@@ -738,15 +713,42 @@ test('#212 readyz: 503 when the cluster-wide replay relation is missing', async 
   }
 });
 
-test('#212 readyz: 503 for the process-local replay guard', async (t) => {
-  const { server, port } = await makeBroker(t, { replayStore: new ReplayGuard() });
+test('#212 readyz: 503 when the replay conflict arbiter is missing', async (t) => {
+  const { server, db, port } = await makeBroker(t);
   try {
+    assert.equal((await get(port, '/readyz')).status, 200);
+    await db.exec('ALTER TABLE broker_jti DROP CONSTRAINT broker_jti_pkey');
     const notReady = await get(port, '/readyz');
     assert.equal(notReady.status, 503);
     assert.deepEqual(notReady.json, { ok: false });
   } finally {
     server.close();
   }
+});
+
+test('#212 readyz: 503 when the replay expiry column is missing', async (t) => {
+  const { server, db, port } = await makeBroker(t);
+  try {
+    assert.equal((await get(port, '/readyz')).status, 200);
+    await db.exec('ALTER TABLE broker_jti DROP COLUMN exp');
+    const notReady = await get(port, '/readyz');
+    assert.equal(notReady.status, 503);
+    assert.deepEqual(notReady.json, { ok: false });
+  } finally {
+    server.close();
+  }
+});
+
+test('#212 createBroker rejects the removed custom replayStore at runtime', async (t) => {
+  const db = await openTestDb(t);
+  assert.throws(
+    () => createBroker({
+      providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db,
+      identitySecret: identityConfig(SECRET),
+      replayStore: { use: () => true, ready: async () => {} },
+    } as any),
+    /replayStore is not configurable; PostgreSQL replay protection is required/,
+  );
 });
 
 test('#101 probes need no auth and leak no secrets even behind a brokerToken gate', async (t) => {

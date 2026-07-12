@@ -429,6 +429,10 @@ test('buildBrokerServer: fails closed on a weak/placeholder/reused identity secr
   await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_IDENTITY_SECRET: 'ChangeMe' }), /placeholder/);
   const { VOUCHR_DEPLOYMENT_ID, ...noDeploy } = await baseEnv(t);
   await assert.rejects(buildBrokerServer(noDeploy), /VOUCHR_DEPLOYMENT_ID/);
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), VOUCHR_DEPLOYMENT_ID: 'REPLACE_ME-vouchr-production' }),
+    /placeholder/,
+  );
   // Reused-purpose: identity secret == the base64 master key value.
   await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_IDENTITY_SECRET: KEY_B64 }), /distinct from the master key/);
   // Reused-purpose: identity secret == a provider OAuth client secret (a value shared with a third party).
@@ -438,7 +442,7 @@ test('buildBrokerServer: fails closed on a weak/placeholder/reused identity secr
   );
   // Compare KEY MATERIAL, not only equal env text: the identity secret below is the raw 32-byte
   // ASCII value whose base64 form is used as the encryption master key.
-  const sameKeyBytes = 'M'.repeat(32);
+  const sameKeyBytes = 'M7vouchrMasterKey2026abcdef12345';
   await assert.rejects(
     buildBrokerServer({
       ...await baseEnv(t),

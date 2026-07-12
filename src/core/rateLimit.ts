@@ -30,9 +30,8 @@ export class RateLimitedError extends Error {
  * Pluggable token-bucket store. `take` atomically removes `cost` tokens from `key`'s bucket
  * (created full at `capacity`, refilling at `refillPerMs` tokens per millisecond, capped at
  * `capacity`). On deny it consumes nothing and reports how long until `cost` tokens will be
- * available. May be async so a multi-instance deployment can back it with a shared store —
- * mirroring `ReplayStore` (identity.ts). Supply one via `VouchrOptions.rateLimitStore` /
- * `BrokerOptions.rateLimitStore`.
+ * available. May be async so a multi-instance deployment can back it with a shared store. Supply one
+ * via `VouchrOptions.rateLimitStore` / `BrokerOptions.rateLimitStore`.
  */
 export interface RateLimitStore {
   take(

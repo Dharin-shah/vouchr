@@ -47,7 +47,7 @@ export interface ChannelInfo {
 /**
  * Why a channel is INELIGIBLE for a shared (channel-owned) credential (invariant 6), or null if
  * it's eligible. The classification rule lives in core (transport-agnostic) so every adapter
- * (the Bolt middleware today, a sidecar + thin clients later) enforces the SAME security rule
+ * (the Bolt middleware and packaged broker) enforces the SAME security rule
  * instead of re-implementing it. The adapter only fetches the info; pass `null` if it couldn't
  * (fails closed). Externally shared / Slack Connect is the security-critical case (cross-org leak).
  */

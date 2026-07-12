@@ -75,10 +75,10 @@ This boundary is enforced by `test/architecture.test.ts`, which scans every file
 `src/core/` and fails if any imports `@slack/*` or `../adapters/`. The same test asserts
 the channel-eligibility rule (`channelIneligibleReason`) lives in core.
 
-Why it matters: the boundary is what lets a future **sidecar + thin clients** (other
-languages) reuse the identical core (and its security rules) instead of
-re-implementing them. The eligibility classification, owner keying, egress check, and
-crypto are all decided in one place; an adapter only supplies inputs (e.g.
+Why it matters: the boundary lets the packaged deployment-bound **headless broker + thin HTTP
+clients** (other languages) reuse the identical core and its security rules instead of
+re-implementing them. The eligibility classification, owner keying, egress check, and crypto are
+all decided in one place; an adapter only supplies verified inputs (e.g.
 `conversations.info` output is passed to `channelIneligibleReason`, which fails closed on
 `null`).
 

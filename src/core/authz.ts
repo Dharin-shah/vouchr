@@ -10,7 +10,7 @@ import type { ProviderRegistry } from './providers';
  * as ONE transport-agnostic source of truth both adapters (Bolt + the headless HTTP broker) call.
  * They used to be duplicated across the two adapters and DRIFTED (that drift is how the session-mode
  * fail-closed rule went missing on the broker). Keeping the DECISION here means the Bolt path, the
- * broker, and a future sidecar all enforce the identical rule; each adapter keeps only its own
+ * Bolt adapter and packaged broker enforce the identical rule; each adapter keeps only its own
  * transport I/O (Slack client / HTTP status / audit meta / Block Kit prompts) and maps the result.
  *
  * No @slack/HTTP knowledge lives here (architecture.test.ts enforces it): callers pass in the already

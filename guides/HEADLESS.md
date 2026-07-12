@@ -207,10 +207,9 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
   workers, and keep them distinct from the Slack signing secret, encryption keys, broker bearer, and
   provider OAuth client secrets. See the deployment guide for the required upgrade and rotation order.
 - **Replay protection.** Automatic when you use a shared database — every db-configured broker
-  defaults to a durable `DbReplayStore`, so a `jti` spent on one pod is rejected on the others. You
-  may still pass a custom `replayStore`, but it must implement `ready()` and prove that its shared
-  dependency is usable. The exported in-memory `ReplayGuard` deliberately fails readiness and is
-  only for low-level tests, never production.
+  uses the durable PostgreSQL `DbReplayStore`, so a `jti` spent on one pod is rejected on the others.
+  The replay store is not configurable; the exported in-memory `ReplayGuard` is only for direct
+  verifier unit tests, never broker construction or production.
 - **Not connected yet?** Route the user back through the Slack connect/approval flow.
 - **Credential health.** There is no Slack client here, so nothing is DM'd for you: pass
   `onCredentialHealth` (a `BrokerOptions` field, e.g. `buildBrokerServer(env, { onCredentialHealth })`)
@@ -255,7 +254,11 @@ consent (the synthetic write is an atomic conditional). Dry-run requires a **loc
 external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup, since its wrap/unwrap are real
 network calls. Audit rows carry `meta.dry_run: true`. Never set it against production state.
 
-## Local sidecar
+## Other-language workers
 
-When a Python, Go, Rust, or MCP runtime wants a tiny localhost contract instead of a network broker,
-see [`examples/sidecar`](../examples/sidecar).
+Run the packaged `vouchr-broker` and call this documented HTTP contract from Python, Go, Rust, or an
+MCP runtime; do not build a second sidecar that trusts caller-supplied owner ids. The trusted
+Slack-facing service mints a fresh deployment-bound `identityToken` for each broker call, while the
+worker receives only that short-lived assertion and never the signing key. The TypeScript flow in
+[`examples/broker-client`](../examples/broker-client) is the reference request shape to reproduce in
+another language.

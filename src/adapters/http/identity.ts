@@ -13,7 +13,7 @@ export interface IdentityClaims {
   threadTs?: string;
   /** Absolute expiry, epoch milliseconds (Date.now()), to match the rest of the codebase. */
   exp: number;
-  /** Single-use id (replay guard within the exp window). Must be non-empty. */
+  /** Single-use id (replay guard within the full acceptance window). Must be non-empty. */
   jti: string;
   /**
    * Deployment-binding claims (#212), set by the minter when an {@link IdentityConfig} is used (the
@@ -60,7 +60,7 @@ export interface IdentityClaims {
 export const MAX_LIFETIME_MS = 5 * 60 * 1000;
 
 /** Clock-skew tolerance for iat/exp comparisons in deployment-bound (config) mode. Small + documented. */
-export const DEFAULT_SKEW_MS = 30 * 1000;
+export const IDENTITY_SKEW_MS = 30 * 1000;
 
 /** Minimum identity signing-secret strength: at least 32 bytes of key material (#212). */
 export const MIN_IDENTITY_SECRET_BYTES = 32;
@@ -93,12 +93,10 @@ export interface IdentityConfig {
   readonly audience: string;
   /** keys[0] signs new tokens; every key is a verify candidate (rotation overlap). Non-empty. */
   readonly keys: readonly IdentityKey[];
-  /** Clock-skew tolerance on iat/exp (default {@link DEFAULT_SKEW_MS}). */
-  readonly skewMs?: number;
 }
 
-/** A validated snapshot always has the defaulted skew materialized. It is deep-frozen at runtime. */
-export type NormalizedIdentityConfig = IdentityConfig & { readonly skewMs: number };
+/** A validated deployment-bound snapshot, deep-frozen at runtime. */
+export type NormalizedIdentityConfig = IdentityConfig;
 
 /** Module-private brand: only snapshots produced by the validator get the normalize-once fast path. */
 const NORMALIZED_IDENTITY_CONFIGS = new WeakSet<object>();
@@ -113,8 +111,11 @@ const PLACEHOLDER_SECRETS = new Set([
   'secret', 'changeme', 'change-me', 'password', 'test', 'example', 'shhh', 'vouchr', 'identity',
   'broker-secret', 'placeholder', 'your-secret-here', 'replace-me',
 ]);
+const PLACEHOLDER_AUDIENCES = new Set([
+  'replace_me-vouchr-production', 'replace-me', 'changeme', 'your-deployment-id',
+]);
 
-const IDENTITY_CONFIG_FIELDS = new Set<PropertyKey>(['issuer', 'audience', 'keys', 'skewMs']);
+const IDENTITY_CONFIG_FIELDS = new Set<PropertyKey>(['issuer', 'audience', 'keys']);
 const IDENTITY_KEY_FIELDS = new Set<PropertyKey>(['kid', 'secret']);
 
 function isPlainRecord(value: unknown): value is Record<PropertyKey, unknown> {
@@ -159,6 +160,17 @@ function assertBoundedLabel(value: unknown, label: string): asserts value is str
   }
 }
 
+/** Reject only deterministic repeated patterns; this is not a claim to estimate arbitrary entropy. */
+function hasObviousRepeatedPattern(value: string): boolean {
+  const maxUnit = Math.min(16, Math.floor(value.length / 2));
+  for (let unitLength = 1; unitLength <= maxUnit; unitLength++) {
+    if (value.length % unitLength !== 0) continue;
+    const unit = value.slice(0, unitLength);
+    if (unit.repeat(value.length / unitLength) === value) return true;
+  }
+  return false;
+}
+
 function assertStrongIdentitySecretFor(secret: unknown, label: string): asserts secret is string {
   if (typeof secret === 'string' && PLACEHOLDER_SECRETS.has(secret.trim().toLowerCase())) {
     throw new Error(`${label} is a known placeholder value; use random key material`);
@@ -172,6 +184,9 @@ function assertStrongIdentitySecretFor(secret: unknown, label: string): asserts 
     throw new Error(
       `${label} must be at least ${MIN_IDENTITY_SECRET_BYTES} bytes and at most ${MAX_IDENTITY_SECRET_BYTES} bytes of random key material`,
     );
+  }
+  if (hasObviousRepeatedPattern(secret)) {
+    throw new Error(`${label} has an obvious repeated pattern; use random key material`);
   }
 }
 
@@ -187,9 +202,9 @@ export function assertStrongIdentitySecret(secret: string): void {
 
 /**
  * The one runtime boundary for programmatic and env-built identity configuration (#212). Rejects
- * malformed/ambiguous objects, weak or mis-labelled rotation keys, and unsafe skew before any token
- * is minted or verified. The returned clone is deep-frozen so later caller mutation cannot change a
- * live broker's trust root or desynchronise verification from its replay-retention horizon.
+ * malformed/ambiguous objects and weak or mis-labelled rotation keys before any token is minted or
+ * verified. The returned clone is deep-frozen so later caller mutation cannot change a live broker's
+ * trust root.
  */
 export function normalizeIdentityConfig(config: IdentityConfig): NormalizedIdentityConfig {
   if (config && typeof config === 'object' && NORMALIZED_IDENTITY_CONFIGS.has(config)) {
@@ -199,6 +214,9 @@ export function normalizeIdentityConfig(config: IdentityConfig): NormalizedIdent
   assertExactFields(config, IDENTITY_CONFIG_FIELDS, ['issuer', 'audience', 'keys'], 'identity config');
   assertBoundedLabel(config.issuer, 'identity config issuer');
   assertBoundedLabel(config.audience, 'identity config audience');
+  if (PLACEHOLDER_AUDIENCES.has(config.audience.toLowerCase())) {
+    throw new Error('identity config audience is a placeholder; set one stable deployment id');
+  }
 
   const rawKeys = config.keys;
   if (!Array.isArray(rawKeys) || rawKeys.length < 1 || rawKeys.length > 2) {
@@ -232,16 +250,10 @@ export function normalizeIdentityConfig(config: IdentityConfig): NormalizedIdent
     return Object.freeze({ kid: expectedKid, secret: rawKey.secret });
   });
 
-  const skewMs = config.skewMs ?? DEFAULT_SKEW_MS;
-  if (!Number.isSafeInteger(skewMs) || skewMs < 0 || skewMs > DEFAULT_SKEW_MS) {
-    throw new Error(`identity config skewMs must be an integer from 0 to ${DEFAULT_SKEW_MS}`);
-  }
-
   const normalized = Object.freeze({
     issuer: config.issuer,
     audience: config.audience,
     keys: Object.freeze(keys),
-    skewMs,
   });
   NORMALIZED_IDENTITY_CONFIGS.add(normalized);
   return normalized;
@@ -291,6 +303,7 @@ function configuredOtherSecretBytes(env: NodeJS.ProcessEnv, explicit: readonly S
 export function assertIdentityPurposeDistinct(
   config: IdentityConfig,
   otherSecrets: readonly SecretMaterial[],
+  conflictsWithHiddenSecret: (secret: string) => boolean = () => false,
 ): void {
   const normalized = normalizeIdentityConfig(config);
   if (!Array.isArray(otherSecrets) || otherSecrets.some((value) => typeof value !== 'string' && !Buffer.isBuffer(value))) {
@@ -299,7 +312,10 @@ export function assertIdentityPurposeDistinct(
   const otherBytes = otherSecrets.map(secretBuffer);
   for (const identityKey of normalized.keys) {
     const identityBytes = Buffer.from(identityKey.secret, 'utf8');
-    if (otherBytes.some((other) => other.length === identityBytes.length && timingSafeEqual(other, identityBytes))) {
+    if (
+      otherBytes.some((other) => other.length === identityBytes.length && timingSafeEqual(other, identityBytes)) ||
+      conflictsWithHiddenSecret(identityKey.secret)
+    ) {
       throw new Error(
         'identity signing keys must be distinct from the master key, broker token, provider client secrets, and Slack signing secret',
       );
@@ -422,23 +438,10 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
 }
 
 /**
- * Single-use jti store. `use()` returns true if the jti is fresh (and records it until `exp`),
- * false if it was already used. May be async so a multi-instance broker can back it with a shared
- * store. Broker construction requires a store whose `ready()` proves that shared dependency is
- * usable; the packaged broker uses PostgreSQL's `DbReplayStore`.
+ * Low-level in-memory replay guard for direct verifier unit tests. It is never accepted by the
+ * production broker: a fleet could otherwise accept one jti once per pod.
  */
-export interface ReplayStore {
-  use(jti: string, exp: number): boolean | Promise<boolean>;
-  /** Prove the shared store is currently usable; production readiness fails when this rejects. */
-  ready(): Promise<void>;
-}
-
-/**
- * Low-level in-memory replay guard for a single process or unit test. It deliberately fails
- * `ready()` and is never the production broker default: a fleet could otherwise accept one jti once
- * per pod.
- */
-export class ReplayGuard implements ReplayStore {
+export class ReplayGuard {
   private seen = new Map<string, number>(); // jti -> exp (epoch ms)
   private lastPrune = 0;
 
@@ -455,10 +458,6 @@ export class ReplayGuard implements ReplayStore {
     if (this.seen.has(jti)) return false;
     this.seen.set(jti, exp);
     return true;
-  }
-
-  async ready(): Promise<void> {
-    throw new Error('process-local replay protection is not production-ready');
   }
 }
 
@@ -547,7 +546,9 @@ export function verifyIdentity(
   const b = Buffer.from(expected);
   if (a.length !== b.length || !timingSafeEqual(a, b)) throw new IdentityError('bad signature');
 
-  const skew = config?.skewMs ?? 0;
+  // One documented tolerance for every deployment. A per-replica skew knob would create another
+  // compatibility state and is unnecessary for the supported production shape.
+  const skew = config ? IDENTITY_SKEW_MS : 0;
   if (!config) {
     // Legacy mode: exactly the historical time checks (no iss/aud/iat/skew).
     if (claims.exp <= now) throw new IdentityError('expired');

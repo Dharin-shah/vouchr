@@ -11,7 +11,7 @@ import { channelOwner } from '../src/core/owner';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { createVouchr } from '../src/adapters/bolt';
-import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { identityConfig, signIdentity, IDENTITY_SKEW_MS, type IdentityClaims } from './support/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -393,7 +393,7 @@ test('admin config routes reject an invalid/expired identity token (401)', async
     assert.equal(badMode.status, 401);
     const badTools = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: 'not.a.token' });
     assert.equal(badTools.status, 401);
-    const expired = signIdentity(claims({ isAdmin: true, exp: Date.now() - 1 }), SECRET);
+    const expired = signIdentity(claims({ isAdmin: true, exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET);
     const badConfig = await getConfig(port, expired);
     assert.equal(badConfig.status, 401);
   } finally {

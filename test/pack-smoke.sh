@@ -59,7 +59,7 @@ cat > "$CONSUMER/consumer.ts" <<'TS'
 import { createVouchr } from '@vouchr/core';
 import {
   createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
-  type BrokerFetchResponse, type IdentityConfig,
+  type BrokerFetchResponse, type BrokerOptions, type IdentityConfig,
 } from '@vouchr/core/headless';
 
 const identity: IdentityConfig = loadIdentityConfig({
@@ -68,6 +68,12 @@ const identity: IdentityConfig = loadIdentityConfig({
 });
 const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
 void verifyIdentity(identityToken, identity);
+type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : false;
+type HasSkewKnob = 'skewMs' extends keyof IdentityConfig ? true : false;
+const noReplayOverride: false = null as unknown as HasReplayOverride;
+const noSkewKnob: false = null as unknown as HasSkewKnob;
+void noReplayOverride;
+void noSkewKnob;
 
 // Type-level only — never executed. Proves the type entrypoints resolve and the shapes exist.
 export function _smoke(r: BrokerFetchResponse): number {

@@ -4,7 +4,8 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
-import { DbReplayStore, replayExpiryHorizon } from '../src/adapters/http/replayStore';
+import { DbReplayStore, replayRetentionGrace } from '../src/adapters/http/replayStore';
+import { IDENTITY_SKEW_MS } from '../src/adapters/http/identity';
 import { kmsEnvelope, type KmsClientLike } from '../src/adapters/kms';
 
 // ── T4: DbReplayStore (cluster-wide single-use jti) ──────────────────────────
@@ -33,25 +34,51 @@ test('#212 DbReplayStore: fast-pruner/slow-verifier clock skew cannot reopen a c
   const db = await openTestDb(t);
   const exp = 1_000_000;
   const skew = 30_000;
-  const horizon = replayExpiryHorizon(exp, skew);
 
   // Consume once before expiry. The production horizon is exp + 3*skew: the slow verifier accepts
   // through exp+skew on its clock while a fast replica can be another 2*skew ahead.
   const first = new DbReplayStore(db, () => exp - 60_000);
-  assert.equal(await first.use('spent-across-clocks', horizon), true);
+  assert.equal(await first.use('spent-across-clocks', exp), true);
 
   // At the last acceptable instant the slow verifier reads exp+skew-1 while the fast replica can
   // read exp+3*skew-1. A two-window horizon would already have deleted the spent row.
   const fastPruner = new DbReplayStore(db, () => exp + 3 * skew - 1);
   assert.equal(
-    await fastPruner.use('prune-trigger', replayExpiryHorizon(exp + 60_000, skew)),
+    await fastPruner.use('prune-trigger', exp + 60_000),
     true,
   );
 
   // The slow verifier still accepts the assertion at this instant. Its store must see the existing
   // row and reject the replay; this assertion fails against the old exp+skew implementation.
   const slowVerifier = new DbReplayStore(db, () => exp + skew - 1);
-  assert.equal(await slowVerifier.use('spent-across-clocks', horizon), false);
+  assert.equal(await slowVerifier.use('spent-across-clocks', exp), false);
+});
+
+test('#212 DbReplayStore: an assertion cannot become fresh at its exact retention boundary', async (t) => {
+  const db = await openTestDb(t);
+  const exp = 1_000_000;
+  assert.equal(await new DbReplayStore(db, () => exp - 1).use('boundary', exp), true);
+  assert.equal(await new DbReplayStore(db, () => exp + replayRetentionGrace()).use('boundary', exp), false);
+});
+
+test('#212 DbReplayStore: the public constructor defaults to the fixed cluster-skew grace', async (t) => {
+  const db = await openTestDb(t);
+  const exp = 2_000_000;
+  assert.equal(await new DbReplayStore(db, () => exp - 1).use('safe-default', exp), true);
+  const stillWithinGrace = new DbReplayStore(db, () => exp + IDENTITY_SKEW_MS - 1);
+  assert.equal(await stillWithinGrace.use('prune-trigger', exp + 60_000), true);
+  assert.equal(await stillWithinGrace.use('safe-default', exp), false);
+  assert.equal(await new DbReplayStore(db, () => Number.NaN).use('invalid-clock', exp), false);
+});
+
+test('#212 DbReplayStore: after cutover, new pruning preserves an existing raw-expiry row', async (t) => {
+  const db = await openTestDb(t);
+  const exp = 1_000_000;
+  // Existing row meaning: raw token expiry; retention grace is never encoded into the stored value.
+  assert.equal(await new DbReplayStore(db, () => exp - 1).use('old-row', exp), true);
+  const upgraded = new DbReplayStore(db, () => exp + 1);
+  assert.equal(await upgraded.use('prune-trigger', exp + 60_000), true);
+  assert.equal(await upgraded.use('old-row', exp), false);
 });
 
 // ── T5: kmsEnvelope (at-rest DEK wrapping, injectable client) ─────────────────

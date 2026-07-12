@@ -77,7 +77,7 @@ spec:
             - { name: VOUCHR_PORT, value: "3000" }
             # REQUIRED on every broker replica and trusted minter; replace with one stable id for this
             # deployment. Changing it invalidates every in-flight assertion from the previous id.
-            - { name: VOUCHR_DEPLOYMENT_ID, value: "REPLACE_ME-vouchr-production" }
+            - { name: VOUCHR_DEPLOYMENT_ID, value: "" } # intentionally fails closed until set
             # Optional; defaults to "vouchr" and must match every trusted minter.
             # - { name: VOUCHR_IDENTITY_ISSUER, value: "vouchr" }
             # Recommended for multi-instance / production: Postgres (VOUCHR_DATABASE_URL) AND a KMS

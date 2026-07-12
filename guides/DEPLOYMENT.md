@@ -282,14 +282,23 @@ configuration. Do not roll brokers before their trusted minter:
 1. Keep the existing signing secret, choose `VOUCHR_DEPLOYMENT_ID`, and upgrade the minter first so it
    uses `loadIdentityConfig` and emits `iss`/`aud`/`iat`/`kid`. An older broker verifies that signature
    with the same secret and ignores the additive bound claims.
-2. After every minter emits bound assertions, roll the broker replicas with the same deployment id,
-   issuer, and secret. A new broker intentionally rejects an older unbound assertion.
-3. Rotate the signing key only after every replica is on the bound format.
+2. After every minter emits bound assertions, let the old 5-minute maximum token lifetime plus the
+   30-second verifier allowance elapse. This avoids turning an already-issued unbound assertion into
+   a user-visible failure when the new broker intentionally rejects it.
+3. Perform the broker format change as a **drained cutover, not an ordinary rolling overlap**. Stop
+   all old broker replicas and pause broker traffic; after the last old replica stops, keep the
+   broker unavailable for the conservative 90-second cluster-skew horizon, then start the new
+   replicas together with the same deployment id, issuer, and secret. Old replicas prune replay rows
+   at raw expiry, while new replicas deliberately retain them through clock tolerance; the short
+   no-broker gap ensures a row removed by an old pruner cannot be accepted by a new verifier.
+4. Resume broker traffic, then rotate the signing key only after every replica is on the bound
+   format. Normal active/previous key rotations below remain rolling and downtime-free.
 
 If the existing secret is shorter than 32 bytes, a known placeholder, or reused for another purpose,
-it cannot enter the overlap set. Drain identity-token traffic (at most the old token lifetime), then
-cut the minter and brokers over together during a maintenance window with a new random secret. Do not
-weaken the validator to carry an unsafe legacy key forward.
+it cannot enter the overlap set. Drain identity-token traffic for the old token lifetime plus clock
+tolerance, stop every old broker for the same conservative 90-second gap, then cut the minter and
+brokers over together during a maintenance window with a new random secret. Do not weaken the
+validator to carry an unsafe legacy key forward.
 
 **Rolling key rotation (no downtime, after the format upgrade).** Use two rollout phases; changing the
 active key everywhere in one ordinary rolling deployment is unsafe because a new token can land on an
@@ -549,13 +558,11 @@ package root.
 ### Replay (multi-replica)
 
 A signed `jti` must be single-use across the fleet. Shared replay protection is automatic: every
-broker defaults to a durable `DbReplayStore` (`INSERT … ON CONFLICT DO NOTHING` on the baseline
-`broker_jti` table), so a token replayed against a different pod is rejected. You may still pass a
-custom durable `replayStore` to direct `createBroker` construction. `buildBrokerServer` deliberately
-owns its PostgreSQL replay store and does not accept a replay override. A custom store must implement
-both atomic `use()` and a real `ready()` dependency probe; a process-local `ReplayGuard` deliberately
-fails readiness. This is why the supported deployment stays simple: one shared Postgres table backs
-the whole fleet.
+broker uses the durable `DbReplayStore` (`INSERT … ON CONFLICT DO NOTHING` on the baseline
+`broker_jti` table), so a token replayed against a different pod is rejected. Replay storage is not
+configurable on either `createBroker` or `buildBrokerServer`: one shared PostgreSQL table backs the
+whole fleet, and `/readyz` fails when that exact dependency is unusable. `ReplayGuard` remains only a
+low-level direct-verifier test utility.
 
 ### Perimeter auth
 

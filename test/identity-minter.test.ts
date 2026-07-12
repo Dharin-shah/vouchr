@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   signIdentity, mintIdentity, verifyIdentity, ReplayGuard, MAX_LIFETIME_MS,
-  loadIdentityConfig, normalizeIdentityConfig, assertStrongIdentitySecret, identityKid, DEFAULT_SKEW_MS,
+  loadIdentityConfig, normalizeIdentityConfig, assertStrongIdentitySecret, identityKid, IDENTITY_SKEW_MS,
   type IdentityConfig, type IdentityClaims,
 } from '../src/adapters/http/identity';
 
@@ -28,9 +28,11 @@ test('#212 config mode: a deployment-bound token round-trips with iss/aud/iat/ki
 test('#212 normalizeIdentityConfig: rejects malformed, ambiguous, weak, and non-canonical config', () => {
   assert.throws(() => normalizeIdentityConfig(null as any), /plain object/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), extra: true } as any), /unknown field/);
+  assert.throws(() => normalizeIdentityConfig({ ...cfg(), skewMs: 0 } as any), /unknown field/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), issuer: '' }), /issuer/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), audience: ' deploy-A' }), /audience/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), audience: 'a'.repeat(257) }), /audience/);
+  assert.throws(() => normalizeIdentityConfig({ ...cfg(), audience: 'REPLACE_ME-vouchr-production' }), /placeholder/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), keys: [] }), /one active key/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), keys: Array(1) } as any), /dense array/);
   const keysWithExtra = [{ kid: identityKid(ACTIVE), secret: ACTIVE }];
@@ -49,12 +51,9 @@ test('#212 normalizeIdentityConfig: rejects malformed, ambiguous, weak, and non-
   assert.throws(() => normalizeIdentityConfig({
     ...cfg(), keys: [{ kid: identityKid(ACTIVE), secret: ACTIVE }, { kid: identityKid(ACTIVE), secret: ACTIVE }],
   }), /must be distinct/);
-  assert.throws(() => normalizeIdentityConfig({ ...cfg(), skewMs: Number.NaN }), /skewMs/);
-  assert.throws(() => normalizeIdentityConfig({ ...cfg(), skewMs: Number.POSITIVE_INFINITY }), /skewMs/);
-  assert.throws(() => normalizeIdentityConfig({ ...cfg(), skewMs: DEFAULT_SKEW_MS + 1 }), /skewMs/);
 });
 
-test('#212 normalizeIdentityConfig: returns an immutable defensive snapshot with a materialized skew', () => {
+test('#212 normalizeIdentityConfig: returns an immutable defensive snapshot', () => {
   const raw = cfg() as any;
   const normalized = normalizeIdentityConfig(raw);
   raw.audience = 'mutated-deployment';
@@ -62,7 +61,6 @@ test('#212 normalizeIdentityConfig: returns an immutable defensive snapshot with
 
   assert.equal(normalized.audience, 'deploy-A');
   assert.equal(normalized.keys[0].secret, ACTIVE);
-  assert.equal(normalized.skewMs, DEFAULT_SKEW_MS);
   assert.ok(Object.isFrozen(normalized));
   assert.ok(Object.isFrozen(normalized.keys));
   assert.ok(Object.isFrozen(normalized.keys[0]));
@@ -90,16 +88,16 @@ test('#212 config mode: a future-issued token (beyond skew) is rejected; within 
   const now = 1_000_000;
   // iat is stamped at mint time; verify at an EARLIER now to simulate a token from a fast clock.
   const token = mintIdentity(who, cfg(), 60_000, now);
-  assert.throws(() => verifyIdentity(token, cfg(), { now: now - DEFAULT_SKEW_MS - 1_000 }), /issued in the future/);
-  assert.doesNotThrow(() => verifyIdentity(token, cfg(), { now: now - DEFAULT_SKEW_MS + 1_000 })); // within skew
+  assert.throws(() => verifyIdentity(token, cfg(), { now: now - IDENTITY_SKEW_MS - 1_000 }), /issued in the future/);
+  assert.doesNotThrow(() => verifyIdentity(token, cfg(), { now: now - IDENTITY_SKEW_MS + 1_000 })); // within skew
 });
 
 test('#212 config mode: an expired token within skew still passes; past skew is rejected', () => {
   const now = 1_000_000;
   const token = mintIdentity(who, cfg(), 60_000, now);
-  const justExpired = now + 60_000 + DEFAULT_SKEW_MS - 1_000; // exp is now+60s; still within skew
+  const justExpired = now + 60_000 + IDENTITY_SKEW_MS - 1_000; // exp is now+60s; still within skew
   assert.doesNotThrow(() => verifyIdentity(token, cfg(), { now: justExpired }));
-  assert.throws(() => verifyIdentity(token, cfg(), { now: now + 60_000 + DEFAULT_SKEW_MS + 1_000 }), /expired/);
+  assert.throws(() => verifyIdentity(token, cfg(), { now: now + 60_000 + IDENTITY_SKEW_MS + 1_000 }), /expired/);
 });
 
 test('#212 config mode: rolling rotation — a previous-key token verifies during overlap, fails after drop', () => {
@@ -126,15 +124,24 @@ test('#212 config mode: a jti stays single-use through the whole skew window (no
   const token = mintIdentity(who, cfg(), 60_000, now); // exp = now + 60_000
   const replay = new ReplayGuard();
   verifyIdentity(token, cfg(), { replay, now }); // consumed
-  const inSkewWindow = now + 60_000 + DEFAULT_SKEW_MS - 1_000; // past exp, still within skew → acceptable
+  const inSkewWindow = now + 60_000 + IDENTITY_SKEW_MS - 1_000; // past exp, still within skew → acceptable
   assert.throws(() => verifyIdentity(token, cfg(), { replay, now: inSkewWindow }), /replayed jti/);
 });
 
-test('#212 assertStrongIdentitySecret: rejects short + placeholder, accepts a 32+ byte random-ish secret', () => {
+test('#212 assertStrongIdentitySecret: rejects short, placeholder, and repeated-pattern material', () => {
   assert.throws(() => assertStrongIdentitySecret('short'), /at least 32 bytes/);
   assert.throws(() => assertStrongIdentitySecret(' '.repeat(32)), /at least 32 bytes/);
   assert.throws(() => assertStrongIdentitySecret('ChangeMe'), /placeholder/);
+  assert.throws(() => assertStrongIdentitySecret('abcd'.repeat(8)), /obvious repeated pattern/);
   assert.doesNotThrow(() => assertStrongIdentitySecret(ACTIVE));
+});
+
+test('#212 repeated-key rejection never echoes the supplied key', () => {
+  const repeated = 'abcd'.repeat(8);
+  assert.throws(
+    () => normalizeIdentityConfig({ ...cfg(), keys: [{ kid: identityKid(repeated), secret: repeated }] }),
+    (error: Error) => error.message.includes('obvious repeated pattern') && !error.message.includes(repeated),
+  );
 });
 
 test('#212 loadIdentityConfig: builds a config; fails closed on weak secret / missing deployment id / reuse / prev==active', () => {
@@ -189,8 +196,7 @@ test('#212 config mode: an empty jti is rejected (not a usable single-use id)', 
   assert.throws(() => verifyIdentity(bad, cfg()), /incomplete claims/);
 });
 
-test('#212 config mode: non-finite time/config inputs and oversized replay keys fail closed', () => {
-  assert.throws(() => mintIdentity(who, cfg({ skewMs: Number.POSITIVE_INFINITY })), /skewMs/);
+test('#212 config mode: non-finite time inputs and oversized replay keys fail closed', () => {
   assert.throws(() => mintIdentity(who, cfg(), 60_000, Number.NaN), /finite safe integers/);
   assert.throws(() => verifyIdentity(mintIdentity(who, cfg()), cfg(), { now: Number.NaN }), /verification time/);
 

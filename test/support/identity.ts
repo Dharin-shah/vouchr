@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import {
   IdentityError,
   ReplayGuard,
+  IDENTITY_SKEW_MS,
   identityKid,
   mintIdentity as mintBoundIdentity,
   normalizeIdentityConfig,
@@ -12,7 +13,7 @@ import {
   type MintIdentityInput,
 } from '../../src/adapters/http/identity';
 
-export { IdentityError, ReplayGuard };
+export { IdentityError, ReplayGuard, IDENTITY_SKEW_MS };
 export type { IdentityClaims, IdentityConfig, MintIdentityInput };
 
 /**
@@ -26,7 +27,6 @@ export function identityConfig(label: string): IdentityConfig {
     issuer: 'vouchr-test',
     audience: 'test-deployment',
     keys: [{ kid: identityKid(secret), secret }],
-    skewMs: 0,
   });
 }
 
