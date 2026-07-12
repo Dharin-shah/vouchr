@@ -1,8 +1,9 @@
 # vouchr operator CLI
 
 A secret-free CLI for self-hosted operators. It connects to the **same** credential
-store the app uses; reads are metadata-only, and the mutating commands (`revoke`,
-`rekey`) never print tokens, refresh tokens, key material, or secret ciphertext.
+store the app uses; reads are metadata-only, and the mutating commands (`migrate`,
+`revoke`, `rekey`, `prune`) never print tokens, refresh tokens, key material, or
+secret ciphertext.
 
 ## Run
 
@@ -86,15 +87,19 @@ VOUCHR_MASTER_KEYS="k2026:$NEW_KEY,k2019:$OLD_KEY" vouchr rekey
 
 ### `prune`
 Audit retention (#208): delete `audit` rows older than a cutoff, in **bounded batches**
-so it never holds a long lock, bloats WAL, or monopolizes the pool. Restartable and
-idempotent — an interrupted or repeated run just deletes whatever is now old. Dry-run
-by default (counts only); retention is an explicit choice (nothing prunes automatically).
-Run it on a schedule (cron / k8s `CronJob`). See DEPLOYMENT.md § Audit retention.
+(each ≤ 10000 rows, its own transaction) so it **bounds** the WAL and locks held per
+statement and never monopolizes the pool. (Deletes still generate WAL and dead tuples;
+autovacuum makes that space reusable over time — it does not necessarily shrink the table
+on disk.) Restartable and idempotent — an interrupted or repeated run just deletes
+whatever is now old. Deletion needs an **exact bare `--yes`** (a valued `--yes=…`, a
+`--yes` with `--dry-run`, an unknown/duplicate flag, or a positional is rejected, not
+obeyed). Dry-run by default (counts only); retention is an explicit choice (nothing prunes
+automatically). Run it on a schedule (cron / k8s `CronJob`). See DEPLOYMENT.md § Audit retention.
 
 ```bash
 vouchr prune --older-than-days 90            # DRY-RUN: N rows older than 90 days
-vouchr prune --older-than-days 90 --yes      # delete, in 10k-row batches
-#   --batch <N>   rows per DELETE (default 10000)
+vouchr prune --older-than-days 90 --yes      # delete, in bounded batches
+#   --batch <N>   rows per DELETE (1..10000; default 10000)
 ```
 
 ### `health [provider|host ...]`

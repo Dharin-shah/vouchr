@@ -212,9 +212,30 @@ test('CLI refuses an empty --team scope instead of widening to every team', asyn
     env: { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: keyB64 }, encoding: 'utf8',
   });
   assert.equal(res.status, 2); // refused with the usage exit code
-  assert.match(res.stderr, /ambiguous scope/);
+  assert.match(res.stderr, /--team requires a value/); // strict parse: --yes can't be --team's value
   const db2 = await openDb({ databaseUrl: dbPath });
   const n = (await db2.get('SELECT COUNT(*) AS n FROM connection')) as any;
   await db2.close();
   assert.equal(n.n, 2); // BOTH teams' connections survive — nothing was revoked
+});
+
+test('CLI revoke rejects an unknown/typo scope flag instead of widening the blast radius', async (t) => {
+  // `--teem T1` (typo) must be REJECTED, not silently dropped to leave an all-teams --yes revoke.
+  const dbPath = await testDbUrl(t);
+  const keyB64 = randomBytes(32).toString('base64');
+  const db = await openDb({ databaseUrl: dbPath });
+  const vault = new Vault(db, Buffer.from(keyB64, 'base64'));
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'gh', tok('X1'));
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T2', userId: 'U2' }), 'gh', tok('X2'));
+  await db.close();
+
+  const res = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', 'gh', '--teem', 'T1', '--yes'], {
+    env: { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: keyB64 }, encoding: 'utf8',
+  });
+  assert.equal(res.status, 2);
+  assert.match(res.stderr, /unknown flag --teem/);
+  const db2 = await openDb({ databaseUrl: dbPath });
+  const n = (await db2.get('SELECT COUNT(*) AS n FROM connection')) as any;
+  await db2.close();
+  assert.equal(n.n, 2); // nothing revoked — the typo did not widen to all teams
 });

@@ -83,6 +83,28 @@ export interface StatsRow {
   lastUsed: number; // ms epoch of the most recent injection
 }
 
+/** The fixed maximum rows a single retention `DELETE` may target (#208). Bounds the work/WAL/locks
+ *  per statement; the loop repeats to delete more. Defined here (not just in the CLI) because `Audit`
+ *  is a public export — the bound must hold for every caller. */
+export const MAX_AUDIT_PRUNE_BATCH = 10_000;
+
+/** The ONE prune-batch statement, single-sourced so the plan regression test EXPLAINs the exact SQL
+ *  the production method runs (a test copy could stay index-driven while production regressed).
+ *  Materializes the oldest `batch` expired ids as an ARRAY — rides `idx_audit_at` for the `at<cutoff`
+ *  range, then deletes via the PRIMARY KEY. The plain `id IN (SELECT …)` form instead plans as a
+ *  hash-semi-join SEQ SCAN of the whole table per batch (measured on 1M rows). `FOR UPDATE SKIP
+ *  LOCKED` lets two concurrent prune jobs take disjoint batches instead of contending. */
+export const PRUNE_BATCH_SQL =
+  'DELETE FROM audit WHERE id = ANY(ARRAY(SELECT id FROM audit WHERE at < ? ORDER BY at LIMIT ? FOR UPDATE SKIP LOCKED))';
+
+/** Reject a cutoff that isn't a safe integer epoch (ms): e.g. `1e100` is `Number.isInteger` but not
+ *  safe, and would reach Postgres and fail as an internal error instead of a clean usage error. */
+function assertSafeCutoff(cutoffEpoch: number): void {
+  if (!Number.isSafeInteger(cutoffEpoch)) {
+    throw new Error(`audit prune cutoff must be a safe integer epoch in ms, got ${cutoffEpoch}`);
+  }
+}
+
 /** Append-only audit log. `meta` must NEVER contain token material; defense-in-depth redaction enforces it anyway. */
 export class Audit {
   constructor(private db: Db) {}
@@ -170,34 +192,33 @@ export class Audit {
   }
 
   /** How many rows are older than `cutoffEpoch` (ms) — the size of a prune before it runs. Uses the
-   *  `idx_audit_at` index (a range on `at`), so it stays cheap even at production volume. */
+   *  `idx_audit_at` index, but note this is a broad `COUNT(*)` that still touches every matching
+   *  index entry, so on a large expired set it is NOT cheap — only the DRY-RUN path calls it. */
   async countOlderThan(cutoffEpoch: number): Promise<number> {
+    assertSafeCutoff(cutoffEpoch);
     const row = await this.db.get<{ n: unknown }>(`SELECT COUNT(*) AS n FROM audit WHERE at < ?`, [cutoffEpoch]);
     return Number(row?.n ?? 0);
   }
 
   /**
-   * Retention (#208): delete audit rows older than `cutoffEpoch` (ms) in BOUNDED batches, so pruning
-   * never takes a long lock, bloats WAL, or monopolizes the pool — each `DELETE` caps at `batch` rows
-   * and commits on its own (autocommit) before the next, leaving gaps for normal inserts. Restartable
-   * and idempotent: a re-run just deletes whatever is now old; an interrupted run loses no progress
-   * (committed batches stay deleted). Returns the total rows removed. `batch` must be a positive
-   * integer (default 10_000). The at-only predicate touches no secret material.
+   * Retention (#208): delete audit rows older than `cutoffEpoch` (ms) in BOUNDED batches. Each
+   * `DELETE` caps at `batch` rows (≤ {@link MAX_AUDIT_PRUNE_BATCH}) and commits on its own (autocommit)
+   * before the next, so retention BOUNDS the WAL and locks held per statement and leaves gaps for
+   * normal inserts — it never holds a long lock or monopolizes the pool. (Deletes still generate WAL
+   * and dead tuples; autovacuum reclaims that space for reuse over time.) Restartable and idempotent:
+   * a re-run just deletes whatever is now old; an interrupted run loses no progress (committed batches
+   * stay deleted). Returns the total rows removed. `cutoffEpoch` and `batch` are validated (Vault is a
+   * public export, so the bound is enforced here, not only in the CLI). The at-only predicate touches
+   * no secret material.
    */
-  async pruneOlderThan(cutoffEpoch: number, batch = 10_000): Promise<number> {
-    if (!Number.isInteger(batch) || batch < 1) throw new Error(`audit prune batch must be a positive integer, got ${batch}`);
+  async pruneOlderThan(cutoffEpoch: number, batch: number = MAX_AUDIT_PRUNE_BATCH): Promise<number> {
+    assertSafeCutoff(cutoffEpoch);
+    if (!Number.isSafeInteger(batch) || batch < 1 || batch > MAX_AUDIT_PRUNE_BATCH) {
+      throw new Error(`audit prune batch must be an integer in 1..${MAX_AUDIT_PRUNE_BATCH}, got ${batch}`);
+    }
     let total = 0;
     for (;;) {
-      // Materialize the oldest `batch` expired ids as an ARRAY (rides idx_audit_at for the at<cutoff
-      // range), then delete via the PRIMARY KEY. The plain `id IN (SELECT …)` form plans as a hash
-      // semi-join with a SEQ SCAN of the whole table per batch (measured on 1M rows) — the ARRAY form
-      // does not. `FOR UPDATE SKIP LOCKED` lets two concurrent prune jobs take disjoint batches
-      // instead of contending. Each statement is its own tx, so batches commit independently.
-      const { changes } = await this.db.run(
-        `DELETE FROM audit WHERE id = ANY(ARRAY(
-           SELECT id FROM audit WHERE at < ? ORDER BY at LIMIT ? FOR UPDATE SKIP LOCKED))`,
-        [cutoffEpoch, batch],
-      );
+      const { changes } = await this.db.run(PRUNE_BATCH_SQL, [cutoffEpoch, batch]);
       total += changes;
       if (changes < batch) break; // a short (or empty) batch means no expired rows remain (for this job)
     }

@@ -21,7 +21,7 @@ import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
 import { github, google, gitlab, notion, ProviderRegistry, type Provider } from '../src/core/providers';
 import { Vault } from '../src/core/vault';
-import { Audit } from '../src/core/audit';
+import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
@@ -47,19 +47,55 @@ function parseFlags(argv: string[]): Flags {
   return { values, positional };
 }
 
+type FlagSpec = Record<string, 'string' | 'boolean'>;
+type StrictValues = Record<string, string | true>;
+
 /**
- * Exact destructive confirmation shared by every deleting command (`revoke`, `prune`). ONLY a bare
- * `--yes` (no value) confirms; a valued form (`--yes=false`, `--yes no`) or `--yes` together with
- * `--dry-run` is a mistake, not consent, and is REJECTED — a typo must never delete data. Returns
- * 'go' to proceed, 'dry-run' to preview only, or an `{ error }` the caller prints before exiting 2.
+ * Strict CLI parse for the DESTRUCTIVE commands (`revoke`, `prune`) — the loose {@link parseFlags}
+ * fails open (collapses `--yes`/`--yes=`, silently drops unknown flags/typos, last-writer-wins on
+ * duplicates), so a misspelled scope or a `--yes=` could delete data. This one rejects: an unknown
+ * flag, a positional argument, a duplicate flag, a boolean flag given a value (`--yes=…`), and a
+ * value flag missing its value or given a flag-shaped one (the `--team --yes` typo). Consequently a
+ * confirmed delete requires an EXACT bare `--yes`. Runs BEFORE the database is opened.
  */
-function destructiveIntent(f: Flags): 'go' | 'dry-run' | { error: string } {
-  const hasYes = 'yes' in f.values;
-  const hasDry = 'dry-run' in f.values;
-  if (hasYes && f.values.yes !== '') return { error: '--yes takes no value (pass a bare `--yes` to confirm the delete)' };
-  if (hasYes && hasDry) return { error: '--yes and --dry-run are mutually exclusive' };
-  return hasYes ? 'go' : 'dry-run';
+function strictParse(argv: string[], spec: FlagSpec): { values: StrictValues } | { error: string } {
+  const values: StrictValues = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) return { error: `unexpected argument "${a}" (only --flags are allowed)` };
+    const eq = a.indexOf('=');
+    const name = eq === -1 ? a.slice(2) : a.slice(2, eq);
+    const inline = eq === -1 ? undefined : a.slice(eq + 1);
+    const type = spec[name];
+    if (!type) return { error: `unknown flag --${name}` };
+    if (name in values) return { error: `--${name} given more than once` };
+    if (type === 'boolean') {
+      if (inline !== undefined) return { error: `--${name} takes no value (pass a bare --${name})` };
+      values[name] = true;
+    } else if (inline !== undefined) {
+      values[name] = inline;
+    } else {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith('--')) return { error: `--${name} requires a value` };
+      values[name] = next;
+      i++;
+    }
+  }
+  return { values };
 }
+
+/**
+ * Exact destructive confirmation for `revoke`/`prune`, over strictly-parsed values (so `--yes` is
+ * already guaranteed bare — a valued form was rejected upstream). Returns 'go' only for a bare
+ * `--yes`; 'dry-run' otherwise; an `{ error }` when `--yes` and `--dry-run` conflict.
+ */
+function destructiveIntent(v: StrictValues): 'go' | 'dry-run' | { error: string } {
+  if (v.yes === true && v['dry-run'] === true) return { error: '--yes and --dry-run are mutually exclusive' };
+  return v.yes === true ? 'go' : 'dry-run';
+}
+
+const REVOKE_SPEC: FlagSpec = { db: 'string', provider: 'string', team: 'string', user: 'string', channel: 'string', yes: 'boolean', 'dry-run': 'boolean' };
+const PRUNE_SPEC: FlagSpec = { db: 'string', 'older-than-days': 'string', batch: 'string', yes: 'boolean', 'dry-run': 'boolean' };
 
 const ts = (ms: number | null | undefined): string =>
   ms == null ? '-' : new Date(ms).toISOString();
@@ -142,32 +178,28 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
  * the upstream revoke, never to stdout. Pending consent + thread grants for the scope are cleared too.
  */
-async function cmdRevoke(db: Db, f: Flags): Promise<number> {
-  // A scoping flag written with NO value (e.g. the typo `--team --yes`, where `--yes` is consumed as a
-  // boolean and `--team` is left empty) must NOT silently widen the blast radius to every team. Refuse
-  // any scope flag that is PRESENT but empty rather than treating it as "unset".
-  for (const k of ['provider', 'team', 'user', 'channel'] as const) {
-    if (k in f.values && !f.values[k]) {
-      console.error(`revoke: --${k} was given with no value; refusing to run with an ambiguous scope`);
-      return 2;
-    }
-  }
-  const provider = f.values.provider;
+async function cmdRevoke(db: Db, v: StrictValues): Promise<number> {
+  // strictParse already rejected unknown flags, positionals, duplicates, a valued --yes, and a
+  // missing/flag-shaped scope value (the `--team --yes` typo), so a scope here is a real value.
+  const provider = v.provider as string | undefined;
+  const teamId = v.team as string | undefined;
+  const userId = v.user as string | undefined;
+  const channel = v.channel as string | undefined;
   if (!provider) {
     console.error('revoke: --provider <id> is required (refusing to revoke across every provider)');
     return 2;
   }
-  const filter: RevokeFilter = { provider, teamId: f.values.team, userId: f.values.user, channel: f.values.channel };
+  const filter: RevokeFilter = { provider, teamId, userId, channel };
   const rows = await selectRevocations(db, filter);
 
-  // Dry-run unless an exact bare --yes confirms (a valued/conflicting --yes is rejected, not obeyed).
-  const intent = destructiveIntent(f);
+  // Dry-run unless an exact bare --yes confirms (a --yes/--dry-run conflict is rejected, not obeyed).
+  const intent = destructiveIntent(v);
   if (typeof intent === 'object') {
     console.error(`revoke: ${intent.error}`);
     return 2;
   }
   const dryRun = intent === 'dry-run';
-  const scope = [`provider=${provider}`, f.values.team && `team=${f.values.team}`, f.values.user && `user=${f.values.user}`, f.values.channel && `channel=${f.values.channel}`].filter(Boolean).join(' ');
+  const scope = [`provider=${provider}`, teamId && `team=${teamId}`, userId && `user=${userId}`, channel && `channel=${channel}`].filter(Boolean).join(' ');
   console.log(`${dryRun ? 'DRY-RUN' : 'REVOKE'} ${scope}: ${rows.length} connection(s)`);
   printTable(
     ['team', 'owner_kind', 'owner', 'external_account', 'created_at'],
@@ -310,40 +342,43 @@ async function cmdDoctor(f: Flags): Promise<number> {
   return failed ? 1 : 0;
 }
 
+type PrunePlan = { cutoff: number; days: number; batch: number; dryRun: boolean };
+
 /**
- * Audit retention (#208): delete audit rows older than `--older-than-days N` in bounded batches.
- * Dry-run by DEFAULT (counts only); `--yes` performs the delete. Retention is an explicit operator
- * choice — there is no automatic pruning, so keeping rows forever is a deliberate (documented) default.
+ * Validate prune's arguments BEFORE any DB is opened (#208): a positive-integer `--older-than-days`
+ * whose resulting cutoff is a SAFE integer epoch (so `1e100` is a clean usage error, not a Postgres
+ * internal error), a `--batch` in `1..MAX_AUDIT_PRUNE_BATCH`, and an exact-bare-`--yes` confirmation.
  */
-async function cmdPrune(db: Db, f: Flags): Promise<number> {
-  // Bounded integers only: a positive whole number of days, and a batch in [1, 10000] (the fixed
-  // per-statement ceiling — larger batches defeat the "bounded work" guarantee).
-  const days = Number(f.values['older-than-days']);
-  if (!('older-than-days' in f.values) || !Number.isInteger(days) || days < 1) {
-    console.error('prune: --older-than-days <N> is required (a positive integer number of days; nothing is pruned without it)');
-    return 2;
-  }
-  const batch = 'batch' in f.values ? Number(f.values.batch) : 10_000;
-  if (!Number.isInteger(batch) || batch < 1 || batch > 10_000) {
-    console.error('prune: --batch must be an integer between 1 and 10000');
-    return 2;
-  }
-  const intent = destructiveIntent(f);
-  if (typeof intent === 'object') {
-    console.error(`prune: ${intent.error}`);
-    return 2;
+function planPrune(v: StrictValues): PrunePlan | { error: string } {
+  const daysRaw = v['older-than-days'];
+  const days = Number(daysRaw);
+  if (typeof daysRaw !== 'string' || !Number.isSafeInteger(days) || days < 1) {
+    return { error: '--older-than-days <N> is required (a positive integer number of days; nothing is pruned without it)' };
   }
   const cutoff = Date.now() - days * 86_400_000;
+  if (!Number.isSafeInteger(cutoff)) return { error: `--older-than-days ${days} is too large to represent a cutoff` };
+  const batch = typeof v.batch === 'string' ? Number(v.batch) : MAX_AUDIT_PRUNE_BATCH;
+  if (!Number.isSafeInteger(batch) || batch < 1 || batch > MAX_AUDIT_PRUNE_BATCH) {
+    return { error: `--batch must be an integer between 1 and ${MAX_AUDIT_PRUNE_BATCH}` };
+  }
+  const intent = destructiveIntent(v);
+  if (typeof intent === 'object') return intent;
+  return { cutoff, days, batch, dryRun: intent === 'dry-run' };
+}
+
+/** Execute a validated {@link PrunePlan}. Retention is an explicit operator choice — nothing prunes
+ *  automatically, and keeping rows forever is the deliberate default. */
+async function runPrune(db: Db, plan: PrunePlan): Promise<number> {
   const audit = new Audit(db);
-  if (intent === 'dry-run') {
+  if (plan.dryRun) {
     // The count is ONLY for the preview — never on the destructive path, where an exact count of a
     // huge expired set could scan the table / hit statement_timeout before the first bounded delete.
-    const n = await audit.countOlderThan(cutoff);
-    console.log(`DRY-RUN: ${n} audit row(s) older than ${days} day(s) (before ${ts(cutoff)}). Re-run with --yes to delete in batches of ${batch}.`);
+    const n = await audit.countOlderThan(plan.cutoff);
+    console.log(`DRY-RUN: ${n} audit row(s) older than ${plan.days} day(s) (before ${ts(plan.cutoff)}). Re-run with --yes to delete in batches of ${plan.batch}.`);
     return 0;
   }
-  const deleted = await audit.pruneOlderThan(cutoff, batch);
-  console.log(`Pruned ${deleted} audit row(s) older than ${days} day(s) (before ${ts(cutoff)}), in batches of ${batch}.`);
+  const deleted = await audit.pruneOlderThan(plan.cutoff, plan.batch);
+  console.log(`Pruned ${deleted} audit row(s) older than ${plan.days} day(s) (before ${ts(plan.cutoff)}), in batches of ${plan.batch}.`);
   return 0;
 }
 
@@ -391,7 +426,7 @@ async function cmdHealth(f: Flags): Promise<void> {
 }
 
 function usage(): void {
-  console.log(`vouchr: operator CLI (reads are metadata-only; only \`revoke\` and \`rekey\` mutate)
+  console.log(`vouchr: operator CLI (reads are metadata-only; \`migrate\`, \`revoke\`, \`rekey\`, \`prune\` mutate)
 
 Usage: vouchr <command> [options]
 
@@ -468,9 +503,13 @@ async function main(): Promise<number> {
       return 0;
     }
     case 'revoke': {
-      const db = await openDb({ databaseUrl: f.values.db });
+      // Strict parse BEFORE opening the DB: a typo'd scope or a valued --yes must be rejected, never
+      // widened to "delete everything" (the loose parser drops unknown flags and collapses --yes=).
+      const p = strictParse(rest, REVOKE_SPEC);
+      if ('error' in p) { console.error(`revoke: ${p.error}`); return 2; }
+      const db = await openDb({ databaseUrl: p.values.db as string | undefined });
       try {
-        return await cmdRevoke(db, f);
+        return await cmdRevoke(db, p.values);
       } finally {
         await db.close();
       }
@@ -484,9 +523,13 @@ async function main(): Promise<number> {
       }
     }
     case 'prune': {
-      const db = await openDb({ databaseUrl: f.values.db });
+      const p = strictParse(rest, PRUNE_SPEC);
+      if ('error' in p) { console.error(`prune: ${p.error}`); return 2; }
+      const pre = planPrune(p.values); // days/batch/confirmation validated BEFORE the DB opens
+      if ('error' in pre) { console.error(`prune: ${pre.error}`); return 2; }
+      const db = await openDb({ databaseUrl: p.values.db as string | undefined });
       try {
-        return await cmdPrune(db, f);
+        return await runPrune(db, pre);
       } finally {
         await db.close();
       }

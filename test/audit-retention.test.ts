@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { Audit } from '../src/core/audit';
+import { Audit, MAX_AUDIT_PRUNE_BATCH, PRUNE_BATCH_SQL } from '../src/core/audit';
 import { openDb, type Db } from '../src/core/db';
 import { openTestDb, testDbUrl, pgReachable } from './support/pg';
 
@@ -13,10 +13,9 @@ import { openTestDb, testDbUrl, pgReachable } from './support/pg';
 const SKIP = 'Postgres not reachable (run `npm run pg:up`)';
 const HOUR = 3_600_000;
 const DAY = 24 * HOUR;
-// The exact DELETE the prune loop issues — asserted at the plan level so a regression to a
-// full-table-scan form (e.g. `id IN (SELECT …)`) fails here.
-const PRUNE_DELETE =
-  'DELETE FROM audit WHERE id = ANY(ARRAY(SELECT id FROM audit WHERE at < ? ORDER BY at LIMIT ? FOR UPDATE SKIP LOCKED))';
+// The plan test EXPLAINs the SAME statement the production method runs (imported, not copied), so a
+// regression to a full-table-scan form (e.g. `id IN (SELECT …)`) can't stay green here.
+const PRUNE_DELETE = PRUNE_BATCH_SQL;
 
 /** Bulk-insert `n` rows spread across teams/users/channels/providers/time in ONE statement. */
 async function seed(db: Db, n: number, now: number): Promise<void> {
@@ -42,7 +41,10 @@ test('audit plans: owner / channel / stats / config / the whole prune DELETE rid
   if (!(await pgReachable())) return t.skip(SKIP);
   const db = await openTestDb(t);
   const now = Date.now();
-  await seed(db, 200_000, now); // a scale where the old `id IN (SELECT …)` DELETE would seq-scan
+  // 50k keeps the seed under the test pool's statement_timeout (the migrated schema has 4 audit
+  // indexes to maintain per insert). The DELETE plan is deterministic, so this is enough to assert it;
+  // the 1M-row EXPLAIN ANALYZE reference measurement is recorded on the PR.
+  await seed(db, 50_000, now);
   // A handful of rare 'config' rows for one (team, channel, provider) — the partial index target.
   await db.exec(
     `INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at)
@@ -125,10 +127,15 @@ test('prune is restartable: a committed batch survives an "interruption" and a r
   assert.equal(await audit.countOlderThan(cutoff), 0);
 });
 
-test('pruneOlderThan rejects a non-positive batch', async (t) => {
+test('core Audit enforces its own bounds (public export must not accept oversized/unsafe input)', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
-  const db = await openTestDb(t);
-  await assert.rejects(() => new Audit(db).pruneOlderThan(Date.now(), 0), /positive integer/);
+  const audit = new Audit(await openTestDb(t));
+  const now = Date.now();
+  await assert.rejects(() => audit.pruneOlderThan(now, 0), new RegExp(`1..${MAX_AUDIT_PRUNE_BATCH}`));
+  await assert.rejects(() => audit.pruneOlderThan(now, MAX_AUDIT_PRUNE_BATCH + 1), new RegExp(`1..${MAX_AUDIT_PRUNE_BATCH}`));
+  await assert.rejects(() => audit.pruneOlderThan(now, 1_000_000), /1..10000/);
+  await assert.rejects(() => audit.pruneOlderThan(1e100, 100), /safe integer/); // unsafe cutoff, not a DB error
+  await assert.rejects(() => audit.countOlderThan(1e100), /safe integer/);
 });
 
 test('prune CLI: only a bare --yes deletes; valued/conflicting forms are rejected (real CLI + DB state)', async (t) => {
@@ -148,31 +155,33 @@ test('prune CLI: only a bare --yes deletes; valued/conflicting forms are rejecte
     spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'prune', '--older-than-days', '1', '--db', url, ...extra], { encoding: 'utf8' });
   const count = async () => Number((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit`))?.n);
 
-  await seed5();
-  let r = run('--yes=false'); // valued --yes → rejected
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /takes no value/);
-  assert.equal(await count(), 5, '--yes=false must delete nothing');
+  // Every fail-open form the loose parser allowed must now be REJECTED with nothing deleted.
+  for (const [label, extra, errRe] of [
+    ['valued --yes=false', ['--yes=false'], /takes no value/],
+    ['empty --yes=', ['--yes='], /takes no value/],
+    ['--yes= then --yes', ['--yes=', '--yes'], /takes no value/],
+    ['--yes no (positional)', ['--yes', 'no'], /unexpected argument/],
+    ['duplicate --yes', ['--yes', '--yes'], /more than once/],
+    ['unknown flag typo', ['--bacth', '1', '--yes'], /unknown flag/],
+    ['positional arg', ['github', '--yes'], /unexpected argument/],
+    ['--dry-run --yes conflict', ['--dry-run', '--yes'], /mutually exclusive/],
+    ['batch over max', ['--batch', '20000', '--yes'], /between 1 and 10000/],
+  ] as const) {
+    await seed5();
+    const r = run(...extra);
+    assert.notEqual(r.status, 0, `${label} must exit non-zero`);
+    assert.match(r.stderr, errRe, `${label}: stderr`);
+    assert.equal(await count(), 5, `${label} must delete nothing`);
+  }
 
   await seed5();
-  r = run('--yes', 'no'); // 'no' consumed as --yes's value → rejected
-  assert.notEqual(r.status, 0);
-  assert.equal(await count(), 5, '--yes no must delete nothing');
-
-  await seed5();
-  r = run('--dry-run', '--yes'); // conflicting → rejected
-  assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /mutually exclusive/);
-  assert.equal(await count(), 5, '--dry-run --yes must delete nothing');
-
-  await seed5();
-  r = run(); // no --yes → dry-run
+  let r = run(); // no --yes → dry-run
   assert.equal(r.status, 0);
   assert.match(r.stdout, /DRY-RUN: 5/);
   assert.equal(await count(), 5, 'a dry-run must delete nothing');
 
   await seed5();
-  r = run('--yes'); // bare --yes → deletes
+  r = run('--yes'); // exact bare --yes → deletes
   assert.equal(r.status, 0);
   assert.match(r.stdout, /Pruned 5/);
   assert.equal(await count(), 0, 'a bare --yes deletes');
