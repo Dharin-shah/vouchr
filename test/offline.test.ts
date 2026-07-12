@@ -10,7 +10,7 @@ import { ConnectionHandle } from '../src/core/injector';
 import { resolveIdentity } from '../src/adapters/slack-identity';
 import { Policy } from '../src/core/policy';
 import { github, google, gitlab, notion, defineProvider, ProviderRegistry } from '../src/core/providers';
-import { exchangeCode } from '../src/core/tokens';
+import { exchangeCode, refreshToken } from '../src/core/tokens';
 import { offboardUser } from '../src/core/offboard';
 import { sweepExpired } from '../src/core/sweep';
 import { userOwner } from '../src/core/owner';
@@ -167,6 +167,52 @@ test('tokens: provider-supplied OAuth error text is not propagated', async () =>
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+test('tokens: exchange and refresh refuse redirects without forwarding credentials or exposing the endpoint', async () => {
+  const endpointSecret = 'TOKEN_URL_QUERY_SECRET';
+  const codeSecret = 'AUTHORIZATION_CODE_SECRET';
+  const refreshSecret = 'REFRESH_TOKEN_SECRET';
+  const clientSecret = 'CLIENT_SECRET';
+  const provider = defineProvider({
+    id: 'redirecting',
+    authorizeUrl: 'https://oauth.example/authorize',
+    tokenUrl: `https://oauth.example/token?private=${endpointSecret}`,
+    scopesDefault: ['read'],
+    egressAllow: ['api.example'],
+    refresh: 'rotating',
+    pkce: true,
+    clientId: 'client',
+    clientSecret,
+  });
+  const redirectDestination = 'https://attacker.example/collect';
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    return new Response(null, { status: 307, headers: { location: redirectDestination } });
+  }) as typeof fetch;
+  try {
+    for (const request of [
+      () => exchangeCode(provider, codeSecret, 'https://broker.example/oauth/callback', 'verifier'),
+      () => refreshToken(provider, refreshSecret),
+    ]) {
+      await assert.rejects(request, (error: Error) => {
+        assert.equal(error.message, 'Token endpoint returned HTTP 307');
+        assert.ok(!error.message.includes(endpointSecret));
+        assert.ok(!error.message.includes(provider.tokenUrl));
+        return true;
+      });
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.equal(calls.length, 2, 'exchange and refresh each make only the original request');
+  assert.ok(calls.every(({ url }) => url !== redirectDestination), 'redirect destination receives no request');
+  assert.ok(calls.every(({ init }) => init.redirect === 'manual'), 'credential-bearing requests refuse redirects');
+  const captured = JSON.stringify(calls);
+  assert.ok(captured.includes(codeSecret) && captured.includes(refreshSecret) && captured.includes(clientSecret), 'test exercised real credential-bearing request bodies');
 });
 
 test('injector: egress allowlist blocks disallowed hosts before any token use', async (t) => {

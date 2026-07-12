@@ -62,6 +62,8 @@ export function connectBlocks(
   authorizeUrl: string,
   scopes?: { list: string[]; describe?: Record<string, string> },
 ): unknown[] {
+  const MAX_SECTION_TEXT = 3000;
+  const MAX_SCOPE_SECTIONS = 48; // intro + scope sections + actions must stay within 50 message blocks
   // SEC-5 (#178): escape the provider id like every other mrkdwn renderer — no exception for a
   // registry-validated id. One escape site, used everywhere `provider` hits mrkdwn below.
   const p = escapeMrkdwn(provider);
@@ -78,15 +80,33 @@ export function connectBlocks(
     },
   ];
   if (scopes && scopes.list.length) {
-    blocks.push({
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text:
-          'Connecting grants the agent, acting as you:\n' +
-          scopes.list.map((s) => `• ${scopes.describe?.[s] ?? s}`).join('\n'),
-      },
+    const lines = scopes.list.map((s) => {
+      // Both values are provider configuration and therefore user-influenced. Keep the renderer
+      // safe even when called directly, and do not let a blank description hide the actual scope.
+      const description = scopes.describe?.[s];
+      const label = typeof description === 'string' && description.trim() ? description : s;
+      return `• ${escapeMrkdwn(label)}`;
     });
+    const firstPrefix = 'Connecting grants the agent, acting as you:';
+    const continuationPrefix = 'Additional granted scopes:';
+    const sections: string[] = [];
+    let current = firstPrefix;
+    for (const line of lines) {
+      const candidate = `${current}\n${line}`;
+      if (candidate.length <= MAX_SECTION_TEXT) {
+        current = candidate;
+        continue;
+      }
+      if (current === firstPrefix) throw new Error('Provider scope copy exceeds the Slack section limit.');
+      sections.push(current);
+      current = `${continuationPrefix}\n${line}`;
+      if (current.length > MAX_SECTION_TEXT) throw new Error('Provider scope copy exceeds the Slack section limit.');
+    }
+    sections.push(current);
+    if (sections.length > MAX_SCOPE_SECTIONS) throw new Error('Provider scopes exceed the Slack message block limit.');
+    for (const text of sections) {
+      blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
+    }
   }
   blocks.push({
     type: 'actions',

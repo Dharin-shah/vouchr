@@ -2,7 +2,7 @@ import { test, type TestContext } from 'node:test';
 import { testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
@@ -13,6 +13,7 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
 import { signIdentity } from '../src/adapters/http/identity';
+import { defineProvider } from '../src/core/providers';
 
 const KEY_B64 = Buffer.alloc(32, 7).toString('base64');
 const CONFLUENCE = {
@@ -43,7 +44,25 @@ test('loadProviders: parses an OAuth provider, resolving client creds from per-p
 
 test('loadProviders: rejects an unknown/non-declarative field (fail closed)', () => {
   const env = { VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, inject: 'x' }]) } as any;
-  assert.throws(() => loadProviders(env), /unknown field "inject"/);
+  assert.throws(() => loadProviders(env), /unknown field/);
+});
+
+test('loadProviders: provider-file read and parse errors never echo the configured path', () => {
+  const sentinel = 'ghp_PROVIDER_FILE_SENTINEL_123';
+  for (const file of [
+    join(tmpdir(), `${sentinel}-missing.json`),
+    (() => {
+      const path = join(mkdtempSync(join(tmpdir(), 'vouchr-provider-')), `${sentinel}.json`);
+      writeFileSync(path, '{not-json', 'utf8');
+      return path;
+    })(),
+  ]) {
+    let message = '';
+    try { loadProviders({ VOUCHR_PROVIDERS_FILE: file } as any); } catch (error) { message = (error as Error).message; }
+    assert.ok(message);
+    assert.equal(message.includes(sentinel), false, message);
+    assert.equal(message.includes(file), false, message);
+  }
 });
 
 test('loadProviders: rejects invalid declarative enum values', () => {
@@ -92,11 +111,11 @@ test('#65 loadProviders: invalid mcp shapes are rejected at config load with the
   const load = (mcp: unknown) => () =>
     loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...MCP_INTERNAL, mcp }]) } as any);
   assert.throws(load('yes'), /field "mcp" must be an object/);
-  assert.throws(load({ paths: [] }), /"mcp\.paths" must be a non-empty array/);
-  assert.throws(load({ paths: [42] }), /"mcp\.paths" must be a non-empty array/);
-  assert.throws(load({ paths: [' '] }), /"mcp\.paths" must be a non-empty array/);
-  assert.throws(load({ paths: ['/mcp'], allowContentTypes: [] }), /"mcp\.allowContentTypes" must be a non-empty array/);
-  assert.throws(load({ paths: ['/mcp'], allowContentType: ['x'] }), /unknown key "allowContentType"/); // typo fails closed
+  assert.throws(load({ paths: [] }), /mcp\.paths.*non-empty.*array/);
+  assert.throws(load({ paths: [42] }), /mcp\.paths.*strings/);
+  assert.throws(load({ paths: [' '] }), /mcp\.paths.*strings/);
+  assert.throws(load({ paths: ['/mcp'], allowContentTypes: [] }), /mcp\.allowContentTypes.*non-empty.*array/);
+  assert.throws(load({ paths: ['/mcp'], allowContentType: ['x'] }), /mcp.*unknown key/); // typo fails closed without reflecting input
 });
 
 // #113 the approval knob must be env-declarable too, or the SHIPPED standalone broker could never
@@ -119,18 +138,18 @@ test("#113 loadProviders: invalid approval shapes are rejected at config load wi
   const load = (approval: unknown) => () =>
     loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval }]) } as any);
   assert.throws(load('yes'), /field "approval" must be an object/);
-  assert.throws(load({}), /"approval\.approver" must be "self" or "admin"/);
-  assert.throws(load({ approver: 'anyone' }), /"approval\.approver" must be "self" or "admin"/);
-  assert.throws(load({ approver: 'self', methods: [] }), /"approval\.methods" must be a non-empty array/);
-  assert.throws(load({ approver: 'self', methods: [42] }), /"approval\.methods" must be a non-empty array/);
-  assert.throws(load({ approver: 'self', ttlMs: 0 }), /"approval\.ttlMs" must be a finite number > 0/);
-  assert.throws(load({ approver: 'self', ttlMs: '5m' }), /"approval\.ttlMs" must be a finite number > 0/);
-  assert.throws(load({ approver: 'self', ttl: 5 }), /unknown key "ttl"/); // typo fails closed
+  assert.throws(load({}), /approval\.approver.*unsupported/);
+  assert.throws(load({ approver: 'anyone' }), /approval\.approver.*unsupported/);
+  assert.throws(load({ approver: 'self', methods: [] }), /approval\.methods.*non-empty.*array/);
+  assert.throws(load({ approver: 'self', methods: [42] }), /approval\.methods.*strings/);
+  assert.throws(load({ approver: 'self', ttlMs: 0 }), /approval\.ttlMs.*positive safe integer/);
+  assert.throws(load({ approver: 'self', ttlMs: '5m' }), /approval\.ttlMs.*positive safe integer/);
+  assert.throws(load({ approver: 'self', ttl: 5 }), /approval.*unknown key/); // typo fails closed
   // P2-D fail-OPEN forms: non-empty but non-canonical → they'd never match at runtime, so reject.
-  assert.throws(load({ approver: 'self', paths: [' '] }), /"approval\.paths" entries must be absolute paths/);
-  assert.throws(load({ approver: 'self', paths: ['repos'] }), /"approval\.paths" entries must be absolute paths/); // no leading slash
-  assert.throws(load({ approver: 'self', paths: [' /repos'] }), /"approval\.paths" entries must be absolute paths/); // leading space
-  assert.throws(load({ approver: 'self', methods: ['PO ST'] }), /"approval\.methods" entries must be bare HTTP method names/);
+  assert.throws(load({ approver: 'self', paths: [' '] }), /approval\.paths/);
+  assert.throws(load({ approver: 'self', paths: ['repos'] }), /approval\.paths/); // no leading slash
+  assert.throws(load({ approver: 'self', paths: [' /repos'] }), /approval\.paths/); // leading space
+  assert.throws(load({ approver: 'self', methods: ['PO ST'] }), /approval\.methods/);
 });
 
 test('#113 loadProviders: canonicalizable approval methods are normalized (trim + upper-case)', () => {
@@ -138,6 +157,113 @@ test('#113 loadProviders: canonicalizable approval methods are normalized (trim 
   // defineProvider normalizes it to 'POST' so it actually enforces (fail-closed, not fail-open).
   const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: { approver: 'self', methods: ['post '] } }]) } as any);
   assert.deepEqual(p.approval!.methods, ['POST']);
+});
+
+// #211 the remaining declarative knobs (scope descriptions, authorize params, public client, standard
+// revocation, finite request/response limits) must be env-declarable too, routing through the same
+// core validator as the built-in factories — otherwise the standalone broker can't reach them.
+test('#211 loadProviders: the expanded declarative fields load and reach the provider', () => {
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([{
+      ...CONFLUENCE,
+      scopeDescriptions: { 'read:confluence': 'Read your Confluence pages' },
+      authorizeParams: { audience: 'api.atlassian.com', prompt: 'consent' },
+      revokeUrl: 'https://auth.atlassian.com/oauth/revoke',
+      revokeAuth: 'body',
+      egressResponse: { maxBytes: 1048576, allowContentTypes: ['application/json'] },
+      rateLimit: { perMinute: 60, burst: 10 },
+    }]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid',
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+  } as any;
+  const [p] = loadProviders(env);
+  assert.deepEqual(p.scopeDescriptions, { 'read:confluence': 'Read your Confluence pages' });
+  assert.deepEqual(p.authorizeParams, { audience: 'api.atlassian.com', prompt: 'consent' });
+  assert.equal(p.revokeUrl, 'https://auth.atlassian.com/oauth/revoke');
+  assert.equal(p.revokeAuth, 'body');
+  assert.deepEqual(p.egressResponse, { maxBytes: 1048576, allowContentTypes: ['application/json'] });
+  assert.deepEqual(p.rateLimit, { perMinute: 60, burst: 10 });
+});
+
+test('#211 loadProviders: a public-client provider (no secret, PKCE-only) loads from JSON', () => {
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, publicClient: true, pkce: true }]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', // no _CLIENT_SECRET — a public client needs none
+  } as any;
+  const [p] = loadProviders(env);
+  assert.equal(p.publicClient, true);
+  assert.equal(p.clientSecret, undefined);
+});
+
+test('#211 loadProviders: an http tokenUrl / revokeUrl is rejected via the core validator (no cleartext secret)', () => {
+  const bad = (over: Record<string, unknown>) => () =>
+    loadProviders({
+      VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, ...over }]),
+      VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+    } as any);
+  assert.throws(bad({ tokenUrl: 'http://auth.atlassian.com/oauth/token' }), /tokenUrl must use https/);
+  assert.throws(bad({ revokeUrl: 'http://auth.atlassian.com/oauth/revoke' }), /revokeUrl must use https/);
+});
+
+test('#211 loadProviders: a reserved authorizeParams key (state) is rejected at load', () => {
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, authorizeParams: { state: 'attacker' } }]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+  } as any;
+  assert.throws(() => loadProviders(env), /authorizeParams.*Vouchr-owned/);
+});
+
+test('#211 loadProviders: malformed shapes for the new fields fail closed with a config-shaped message', () => {
+  const bad = (over: Record<string, unknown>) => () =>
+    loadProviders({
+      VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, ...over }]),
+      VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+    } as any);
+  assert.throws(bad({ publicClient: 'yes' }), /field "publicClient" must be a boolean/);
+  assert.throws(bad({ revokeAuth: 'header' }), /field "revokeAuth" must be one of/);
+  assert.throws(bad({ scopeDescriptions: { x: 1 } }), /scopeDescriptions/);
+  assert.throws(bad({ rateLimit: { burst: 5 } }), /invalid rateLimit/);
+  assert.throws(bad({ rateLimit: { perMinute: 60, nope: 1 } }), /rateLimit.*unknown key/);
+  assert.throws(bad({ egressResponse: { maxBytes: 'big' } }), /invalid egressResponse\.maxBytes/);
+  assert.throws(bad({ egressResponse: { nope: 1 } }), /egressResponse.*unknown key/);
+});
+
+test('#211 loadProviders: JSON and code normalize to the same immutable provider', () => {
+  const raw = { ...CONFLUENCE, egressAllow: ['API.ATLASSIAN.COM'], egressMethods: [' get ', 'POST'] };
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([raw]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid',
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+  } as any;
+  const [fromJson] = loadProviders(env);
+  const fromCode = defineProvider({ ...raw, clientId: 'cid', clientSecret: 'csecret' } as any);
+  assert.deepEqual(fromJson, fromCode);
+  assert.equal(Object.isFrozen(fromJson), true);
+  assert.equal(Object.isFrozen(fromJson.egressMethods), true);
+});
+
+test('#211 loadProviders: errors never reflect hostile ids, keys, or nested values', () => {
+  const sentinel = 'ghp_SECRET_SENTINEL_123';
+  const configs = [
+    [{ ...CONFLUENCE, id: sentinel.repeat(4) }],
+    [{ ...CONFLUENCE, [sentinel]: true }],
+    [{ ...CONFLUENCE, egressResponse: { maxBytes: 1, [sentinel]: true } }],
+    [{ ...CONFLUENCE, authorizeParams: { state: sentinel } }],
+  ];
+  for (const config of configs) {
+    let message = '';
+    try {
+      loadProviders({
+        VOUCHR_PROVIDERS: JSON.stringify(config),
+        VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid',
+        VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+      } as any);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    assert.ok(message);
+    assert.equal(message.includes(sentinel), false, message);
+  }
 });
 
 // ── T6: broker-server entrypoint ─────────────────────────────────────────────

@@ -40,9 +40,11 @@ test('defineProvider: key provider needs no OAuth client', () => {
   assert.doesNotThrow(() =>
     defineProvider({ id: 'k', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [], egressAllow: ['a'], refresh: 'none', pkce: false }),
   );
-  // OAuth provider still requires them.
-  assert.throws(() =>
-    defineProvider({ id: 'o', authorizeUrl: 'x', tokenUrl: 'y', scopesDefault: [], egressAllow: ['a'], refresh: 'none', pkce: false } as any),
+  // OAuth provider still requires them (valid URLs, so it's the missing client that trips it).
+  assert.throws(
+    () =>
+      defineProvider({ id: 'o', authorizeUrl: 'https://o.example/a', tokenUrl: 'https://o.example/t', scopesDefault: [], egressAllow: ['a'], refresh: 'none', pkce: false } as any),
+    /missing clientId\/clientSecret/,
   );
 });
 

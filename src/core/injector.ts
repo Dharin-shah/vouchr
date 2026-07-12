@@ -1,4 +1,4 @@
-import type { Provider } from './providers';
+import { hasAmbiguousPathEncoding, isLoopbackHost, type Provider } from './providers';
 import type { Vault, StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
@@ -77,7 +77,6 @@ export type EventSink = (e: VouchrEvent) => void;
  *  - `acting`: the human who triggered this request (audit attribution), even when a
  *    shared channel credential is used. A shared cred never launders away who acted.
  */
-const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 
 /**
  * Egress allowlist / policy rejection — the requested target failed a gate BEFORE any secret was read.
@@ -129,14 +128,11 @@ export function pathAllowed(pathname: string, allowed: string): boolean {
 }
 
 /**
- * Encoded path separators (%2f, %5c) survive WHATWG URL parsing UN-decoded, so a traversal segment
- * like `..%2f` can match an allowed prefix here yet resolve to a DIFFERENT path on an upstream that
- * later decodes it. Wherever a path lock IS the security boundary (`egressPaths` below, the
- * broker's `mcp.paths`), the ambiguity is refused fail-closed — a legitimate locked path never
- * contains an encoded separator. One rule, shared (STR-2).
+ * Encoded path separators and traversal can survive one parsing layer and become routing syntax
+ * after another proxy/application decode. Wherever a path lock IS the security boundary
+ * (`egressPaths` below, the broker's `mcp.paths`), that ambiguity is refused fail-closed. One rule,
+ * shared across configuration and request-time enforcement (STR-2).
  */
-export const ENCODED_PATH_SEPARATOR = /%2f|%5c/i;
-
 /**
  * Whether (method, path) falls under a provider's human-approval requirement (#113): the explicit
  * `approval.methods` list when set, else ANY non-read method (everything but GET/HEAD) — this is
@@ -150,13 +146,10 @@ export function approvalNeeded(a: NonNullable<Provider['approval']>, method: str
   if (!methodMatch) return false;
   if (!a.paths) return true;
   // `approval.paths` is a security boundary, so it inherits the egress guard's fail-closed rule
-  // (STR-2, same ENCODED_PATH_SEPARATOR constant): an encoded separator (%2f/%5c) survives WHATWG
-  // parsing here yet an upstream that decodes it routes to a DIFFERENT path — so `/payments%2Fsend`
-  // could slip past a `/payments` lock unconfirmed. Require approval rather than let it through: the
-  // human sees the odd path and decides. (When egressPaths is ALSO set, the injector's egress guard
-  // already threw on the encoded separator before this ever runs; this covers the paths-without-
-  // egressPaths case.)
-  if (ENCODED_PATH_SEPARATOR.test(pathname)) return true;
+  // (STR-2, same hasAmbiguousPathEncoding predicate): encoded routing syntax can survive one layer
+  // and become a different path after another decode. Require approval rather than let the write
+  // through unconfirmed. (When egressPaths is ALSO set, the injector already refuses the request.)
+  if (hasAmbiguousPathEncoding(pathname)) return true;
   return a.paths.some((p) => pathAllowed(pathname, p));
 }
 
@@ -397,22 +390,21 @@ export class ConnectionHandle {
     // implicit HTTPS port is permitted: WHATWG normalizes the default `:443` to an empty `url.port`,
     // so `https://host:443` is allowed, while any non-default explicit port (e.g. `:2375`) is blocked.
     // Loopback is exempt for local dev, mirroring the https carve-out below (dev servers bind a port).
-    if (url.port !== '' && !LOOPBACK.has(url.hostname)) {
+    if (url.port !== '' && !isLoopbackHost(url.hostname)) {
       await this.denyEgress(url.hostname, 'host', `Egress blocked: explicit port ":${url.port}" is not allowed for provider "${this.provider.id}"`);
     }
     // The caller (and the LLM) controls this URL. Require https so the bearer is never sent in
     // cleartext (it goes out before any http→https redirect). Loopback is exempt for local dev.
-    if (url.protocol !== 'https:' && !LOOPBACK.has(url.hostname)) {
+    if (url.protocol !== 'https:' && !isLoopbackHost(url.hostname)) {
       await this.denyEgress(url.hostname, 'host', `Egress blocked: provider "${this.provider.id}" requires https, got "${url.protocol}"`);
     }
     // Optional finer egress controls, all additive (unset = no constraint). Checked here so a denial
     // never reaches the vault: the secret is read strictly after every egress check passes.
     if (this.provider.egressPaths) {
-      // See ENCODED_PATH_SEPARATOR: with a path lock in force the encoded-separator ambiguity is
-      // refused fail-closed. (Providers WITHOUT a path lock, e.g. GitLab whose project ids are
-      // `group%2Fproject`, are unaffected: this guard is gated on egressPaths.)
-      if (ENCODED_PATH_SEPARATOR.test(url.pathname)) {
-        await this.denyEgress(url.hostname, 'path', `Egress blocked: encoded path separator is not allowed for provider "${this.provider.id}"`);
+      // See hasAmbiguousPathEncoding: with a path lock in force, routing changes exposed by one or
+      // more decode passes are refused fail-closed. Providers WITHOUT a path lock are unaffected.
+      if (hasAmbiguousPathEncoding(url.pathname)) {
+        await this.denyEgress(url.hostname, 'path', `Egress blocked: ambiguous path encoding is not allowed for provider "${this.provider.id}"`);
       }
       if (!this.provider.egressPaths.some((p) => pathAllowed(url.pathname, p))) {
         await this.denyEgress(url.hostname, 'path', `Egress blocked: path "${url.pathname}" is not in the allowed paths for provider "${this.provider.id}"`);

@@ -201,6 +201,8 @@ test('databricks egress: everything outside statement execution is DENIED, secre
       [`${HOST}/api/2.0/sql/statements/..%2f..%2fsecrets/acls/list`, 'GET'],
       [`${HOST}/api/2.0/sql/statements/..%2F..%2Fjobs/runs/list`, 'POST'],
       [`${HOST}/api/2.0/sql/statements/..%5c..%5csecrets`, 'GET'], // backslash variant
+      // Two decoding layers can expose traversal that the literal %2f/%5c check never saw.
+      [`${HOST}/api/2.0/sql/statements/%252e%252e%252fsecrets`, 'GET'],
     ];
     for (const [url, method] of denied) {
       reset();

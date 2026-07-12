@@ -353,8 +353,9 @@ test('P1-B: an encoded path separator cannot slip past an approval.paths lock (f
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     await expectApprovalRequired(handle.fetch('https://api.acme.test/payments%2Fsend', { method: 'POST' }));
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/payments/%252e%252e%252fadmin', { method: 'POST' }));
     assert.equal(calls.length, 0, 'the encoded-separator write never reached the wire unconfirmed');
-    assert.equal((await approvalRows()).length, 1, 'it minted a pending approval instead of bypassing');
+    assert.equal((await approvalRows()).length, 2, 'direct and nested encodings minted approvals instead of bypassing');
     // A path plainly OUTSIDE the lock still needs no approval (the guard didn't over-fire).
     const res = await handle.fetch('https://api.acme.test/orders', { method: 'POST' });
     assert.equal(res.status, 200);

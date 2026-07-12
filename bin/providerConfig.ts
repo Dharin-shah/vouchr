@@ -1,5 +1,11 @@
 import { readFileSync } from 'node:fs';
-import { defineProvider, isCanonicalPath, canonicalMethod, type Provider } from '../src/core/providers';
+import {
+  defineProvider,
+  isValidProviderId,
+  providerEnvKey,
+  assertNoProviderCollisions,
+  type Provider,
+} from '../src/core/providers';
 
 /**
  * Declarative provider config for the headless broker: an operator declares providers via env/JSON
@@ -9,135 +15,26 @@ import { defineProvider, isCanonicalPath, canonicalMethod, type Provider } from 
  * not the JSON: `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` (id upper-cased, non-alnum → _).
  */
 const ALLOWED = new Set([
-  'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault',
-  'egressAllow', 'egressPaths', 'egressMethods', 'refresh', 'pkce', 'tokenAuth', 'bodyFormat',
+  'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault', 'scopeDescriptions',
+  'egressAllow', 'egressPaths', 'egressMethods', 'egressResponse', 'rateLimit', 'refresh', 'pkce',
+  'publicClient', 'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth',
   'mcp', // #65 /v1/mcp opt-in: { paths: string[], allowContentTypes?: string[] }
   'approval', // #113 human-in-the-loop approval: { methods?, paths?, approver: 'self'|'admin', ttlMs? }
 ]);
-
-function envKey(id: string): string {
-  return id.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-}
-
-function isStringArray(v: unknown): v is string[] {
-  return Array.isArray(v) && v.every((x) => typeof x === 'string');
-}
-
-function assertOneOf(entry: any, field: string, allowed: readonly string[]): void {
-  const value = entry[field];
-  if (value == null) return;
-  if (!allowed.includes(value)) {
-    throw new Error(`provider config: "${entry.id}" field "${field}" must be one of: ${allowed.join(', ')}`);
-  }
-}
 
 function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
     throw new Error('provider config: each entry must be a JSON object');
   }
-  for (const k of Object.keys(entry)) {
-    if (!ALLOWED.has(k)) {
-      throw new Error(`provider config: unknown field "${k}" — declarative fields only; register providers needing functions (inject/egressValidate/revoke) in code`);
-    }
+  if (Object.keys(entry).some((key) => !ALLOWED.has(key))) {
+    throw new Error('provider config: unknown field; declarative fields only');
   }
-  if (typeof entry.id !== 'string' || !entry.id.trim()) throw new Error('provider config: "id" is required');
-  if (!isStringArray(entry.egressAllow) || entry.egressAllow.length === 0) {
-    throw new Error(`provider config: "${entry.id}" needs a non-empty "egressAllow" host list (the egress boundary)`);
-  }
-  if (entry.credential != null && entry.credential !== 'oauth' && entry.credential !== 'key') {
-    throw new Error(`provider config: "${entry.id}" credential must be "oauth" or "key"`);
-  }
-  assertOneOf(entry, 'identity', ['service', 'acting_human']);
-  assertOneOf(entry, 'refresh', ['rotating', 'static', 'none']);
-  assertOneOf(entry, 'tokenAuth', ['body', 'basic']);
-  assertOneOf(entry, 'bodyFormat', ['form', 'json']);
-  if (entry.pkce != null && typeof entry.pkce !== 'boolean') {
-    throw new Error(`provider config: "${entry.id}" field "pkce" must be a boolean`);
-  }
-  const isKey = entry.credential === 'key';
-  if (!isKey) {
-    if (typeof entry.authorizeUrl !== 'string' || !entry.authorizeUrl) throw new Error(`provider config: OAuth provider "${entry.id}" needs "authorizeUrl"`);
-    if (typeof entry.tokenUrl !== 'string' || !entry.tokenUrl) throw new Error(`provider config: OAuth provider "${entry.id}" needs "tokenUrl"`);
-  }
-  for (const arr of ['scopesDefault', 'egressPaths', 'egressMethods'] as const) {
-    if (entry[arr] != null && !isStringArray(entry[arr])) throw new Error(`provider config: "${entry.id}" field "${arr}" must be an array of strings`);
-  }
-  // #65 /v1/mcp opt-in knob. defineProvider re-validates, but the loader fails with its own
-  // config-shaped message like every other field here (fail closed, unknown keys included).
-  if (entry.mcp != null) {
-    if (typeof entry.mcp !== 'object' || Array.isArray(entry.mcp)) {
-      throw new Error(`provider config: "${entry.id}" field "mcp" must be an object like { "paths": ["/mcp"] }`);
-    }
-    for (const k of Object.keys(entry.mcp)) {
-      if (k !== 'paths' && k !== 'allowContentTypes') {
-        throw new Error(`provider config: "${entry.id}" field "mcp" has unknown key "${k}" — allowed: paths, allowContentTypes`);
-      }
-    }
-    if (!isStringArray(entry.mcp.paths) || entry.mcp.paths.length === 0 || entry.mcp.paths.some((p: string) => !p.trim())) {
-      throw new Error(`provider config: "${entry.id}" field "mcp.paths" must be a non-empty array of non-empty strings`);
-    }
-    if (entry.mcp.allowContentTypes != null && (!isStringArray(entry.mcp.allowContentTypes) || entry.mcp.allowContentTypes.length === 0 || entry.mcp.allowContentTypes.some((c: string) => !c.trim()))) {
-      throw new Error(`provider config: "${entry.id}" field "mcp.allowContentTypes" must be a non-empty array of non-empty strings`);
-    }
-  }
-
-  // #113 approval knob. defineProvider re-validates, but the loader fails with its own
-  // config-shaped message like every other field here (fail closed, unknown keys included).
-  if (entry.approval != null) {
-    if (typeof entry.approval !== 'object' || Array.isArray(entry.approval)) {
-      throw new Error(`provider config: "${entry.id}" field "approval" must be an object like { "approver": "admin" }`);
-    }
-    for (const k of Object.keys(entry.approval)) {
-      if (!['methods', 'paths', 'approver', 'ttlMs'].includes(k)) {
-        throw new Error(`provider config: "${entry.id}" field "approval" has unknown key "${k}" — allowed: methods, paths, approver, ttlMs`);
-      }
-    }
-    if (entry.approval.approver !== 'self' && entry.approval.approver !== 'admin') {
-      throw new Error(`provider config: "${entry.id}" field "approval.approver" must be "self" or "admin"`);
-    }
-    // Canonical checks up front (SAME rules as defineProvider — isCanonicalPath/canonicalMethod,
-    // STR-2), so a fail-open form ('repos', ' /repos', 'POST ') is rejected at config load with a
-    // config-shaped message rather than slipping to defineProvider or, worse, to runtime.
-    if (entry.approval.methods != null) {
-      if (!isStringArray(entry.approval.methods) || entry.approval.methods.length === 0) {
-        throw new Error(`provider config: "${entry.id}" field "approval.methods" must be a non-empty array of HTTP method names`);
-      }
-      if (entry.approval.methods.some((m: string) => canonicalMethod(m) === null)) {
-        throw new Error(`provider config: "${entry.id}" field "approval.methods" entries must be bare HTTP method names (e.g. "POST")`);
-      }
-    }
-    if (entry.approval.paths != null) {
-      if (!isStringArray(entry.approval.paths) || entry.approval.paths.length === 0) {
-        throw new Error(`provider config: "${entry.id}" field "approval.paths" must be a non-empty array of absolute paths`);
-      }
-      if (entry.approval.paths.some((p: string) => !isCanonicalPath(p))) {
-        throw new Error(`provider config: "${entry.id}" field "approval.paths" entries must be absolute paths like "/repos"`);
-      }
-    }
-    const ttl = entry.approval.ttlMs;
-    if (ttl != null && !(typeof ttl === 'number' && Number.isFinite(ttl) && ttl > 0)) {
-      throw new Error(`provider config: "${entry.id}" field "approval.ttlMs" must be a finite number > 0`);
-    }
-  }
-
-  const ek = envKey(entry.id);
-  // defineProvider throws a clear error if an OAuth provider ends up without client id/secret.
+  // This early check is required only to derive the credential environment key safely. The same
+  // predicate is enforced again by defineProvider, which owns every other normalization and guard.
+  if (!isValidProviderId(entry.id)) throw new Error('Provider field "id" must be a conservative identifier of at most 63 characters.');
+  const ek = providerEnvKey(entry.id);
   return defineProvider({
-    id: entry.id,
-    credential: entry.credential,
-    identity: entry.identity,
-    authorizeUrl: entry.authorizeUrl ?? '',
-    tokenUrl: entry.tokenUrl ?? '',
-    scopesDefault: entry.scopesDefault ?? [],
-    egressAllow: entry.egressAllow,
-    egressPaths: entry.egressPaths,
-    egressMethods: entry.egressMethods,
-    mcp: entry.mcp,
-    approval: entry.approval,
-    refresh: entry.refresh ?? 'none',
-    pkce: entry.pkce ?? false,
-    tokenAuth: entry.tokenAuth,
-    bodyFormat: entry.bodyFormat,
+    ...entry,
     clientId: env[`VOUCHR_PROVIDER_${ek}_CLIENT_ID`],
     clientSecret: env[`VOUCHR_PROVIDER_${ek}_CLIENT_SECRET`],
   } as Provider);
@@ -156,23 +53,14 @@ export function loadProviders(env: NodeJS.ProcessEnv = process.env): Provider[] 
   if (env.VOUCHR_PROVIDERS_FILE) {
     let raw: string;
     try { raw = readFileSync(env.VOUCHR_PROVIDERS_FILE, 'utf8'); }
-    catch (e) { throw new Error(`VOUCHR_PROVIDERS_FILE: cannot read ${env.VOUCHR_PROVIDERS_FILE}: ${(e as Error).message}`); }
-    specs.push(...parseArray(raw, `VOUCHR_PROVIDERS_FILE (${env.VOUCHR_PROVIDERS_FILE})`));
+    catch { throw new Error('VOUCHR_PROVIDERS_FILE: cannot read the configured provider file'); }
+    specs.push(...parseArray(raw, 'VOUCHR_PROVIDERS_FILE'));
   }
   if (env.VOUCHR_PROVIDERS) specs.push(...parseArray(env.VOUCHR_PROVIDERS, 'VOUCHR_PROVIDERS'));
 
   const providers = specs.map((s) => toProvider(s, env));
-  const seen = new Set<string>();
-  const seenEnvKey = new Map<string, string>();
-  for (const p of providers) {
-    if (seen.has(p.id)) throw new Error(`provider config: duplicate provider id "${p.id}"`);
-    seen.add(p.id);
-    // Two ids that normalize to the same VOUCHR_PROVIDER_<KEY>_CLIENT_SECRET would silently share
-    // one secret (e.g. "a.b" and "a-b" → "A_B"). Reject the collision, not just exact id dups.
-    const ek = envKey(p.id);
-    const clash = seenEnvKey.get(ek);
-    if (clash) throw new Error(`provider config: ids "${clash}" and "${p.id}" derive the same client-secret env key VOUCHR_PROVIDER_${ek}_CLIENT_*`);
-    seenEnvKey.set(ek, p.id);
-  }
+  // Duplicate ids + normalized env-key collisions (e.g. "a.b" and "a-b" → shared A_B secret) are
+  // rejected by the SAME core guard the registry uses (STR-2/STR-3), so the two paths can't disagree.
+  assertNoProviderCollisions(providers);
   return providers;
 }

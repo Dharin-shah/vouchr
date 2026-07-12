@@ -68,6 +68,12 @@ export class Consent {
     }
 
     const url = new URL(provider.authorizeUrl);
+    // Provider extras FIRST, so the Vouchr-owned params below always win even if one slipped past the
+    // definition-time reserved-key guard (RESERVED_AUTHORIZE_PARAMS in defineProvider). Belt and
+    // suspenders on the single-use `state` / `redirect_uri` (SEC-2): render order can't clobber them.
+    for (const [k, v] of Object.entries(provider.authorizeParams ?? {})) {
+      url.searchParams.set(k, v);
+    }
     url.searchParams.set('client_id', provider.clientId!); // guaranteed for oauth providers (defineProvider)
     url.searchParams.set('redirect_uri', redirectUri);
     if (provider.scopesDefault.length) {
@@ -78,9 +84,6 @@ export class Consent {
     if (provider.pkce) {
       url.searchParams.set('code_challenge', sha256base64url(pkceVerifier));
       url.searchParams.set('code_challenge_method', 'S256');
-    }
-    for (const [k, v] of Object.entries(provider.authorizeParams ?? {})) {
-      url.searchParams.set(k, v);
     }
     return { authorizeUrl: url.toString(), state };
   }
