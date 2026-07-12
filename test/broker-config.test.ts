@@ -159,14 +159,14 @@ test('admin/mode: channel comes from the signed claim, never the body (no spoofi
   try {
     // Sign for channel C1 but stuff a different channel + team in the body — both must be ignored.
     const r = await post(port, '/v1/admin/mode', {
-      provider: 'acme', mode: 'union',
+      provider: 'acme', mode: 'session',
       identityToken: admin({ channel: 'C1' }),
       channel: 'CEVIL', teamId: 'TEVIL',
     } as any);
     assert.equal(r.status, 200);
 
     // The mode was written to the SIGNED channel (T1/C1), not the body-supplied CEVIL/TEVIL.
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), 'union');
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), 'session');
     assert.equal(await channelConfig.getMode('TEVIL', 'CEVIL', 'acme'), null);
 
     // And the read side, scoped to a token signed for CEVIL, sees no config there.
@@ -248,13 +248,13 @@ test('admin/mode: `shared` on an ineligible channel is refused (eligibility pari
 test('admin/mode: a mode write is audited as `config` with owner:channel (non-repudiation)', async () => {
   const { server, port, db } = await makeConfigBroker();
   try {
-    await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'union', identityToken: admin() });
+    await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'session', identityToken: admin() });
     const row = (await db.get(`SELECT user_id, channel, meta FROM audit WHERE action='config' ORDER BY at DESC LIMIT 1`)) as any;
     assert.ok(row, 'a config audit row was written');
     assert.equal(row.user_id, 'U1'); // the acting admin, from the SIGNED claims
     assert.equal(row.channel, 'C1');
     const meta = JSON.parse(row.meta);
-    assert.equal(meta.mode, 'union');
+    assert.equal(meta.mode, 'session');
     assert.equal(meta.owner, 'channel');
   } finally {
     server.close();
@@ -317,11 +317,11 @@ test('manifest: POST returns the channel-scoped manifest including preview visib
   const { server, port, channelConfig } = await makeConfigBroker();
   try {
     await channelConfig.setVisibility('T1', 'C1', 'acme', 'private');
-    await channelConfig.setMode('T1', 'C1', 'acme', 'union');
+    await channelConfig.setMode('T1', 'C1', 'acme', 'session');
     const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.tools.find((t: any) => t.provider === 'acme'), {
-      provider: 'acme', mode: 'union', enabled: true, identity: 'acting_human', visibility: 'private',
+      provider: 'acme', mode: 'session', enabled: true, identity: 'acting_human', visibility: 'private',
     });
     // Service tools appear (identity tells the host who runs them) with the channel's visibility bit.
     assert.equal(r.json.tools.find((t: any) => t.provider === 'svc').identity, 'service');

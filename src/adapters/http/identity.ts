@@ -40,11 +40,6 @@ export interface IdentityClaims {
    * request with this absent/false is refused.
    */
   channelEligible?: boolean;
-  /**
-   * For `union` mode: the connected channel member the caller selected to act as (#51). The audited
-   * actor is this real member — never the channel, never the caller. Signed so the body can't forge it.
-   */
-  actingMemberId?: string;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -76,7 +71,7 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
  *  single-workspace, user-owned request when omitted. */
 export type MintIdentityInput = Pick<
   IdentityClaims,
-  'teamId' | 'userId' | 'channel' | 'threadTs' | 'isAdmin' | 'enterpriseId' | 'ownerKind' | 'channelEligible' | 'actingMemberId'
+  'teamId' | 'userId' | 'channel' | 'threadTs' | 'isAdmin' | 'enterpriseId' | 'ownerKind' | 'channelEligible'
 >;
 
 /**
@@ -101,7 +96,6 @@ export function mintIdentity(input: MintIdentityInput, secret: string, ttlMs = 6
     ...(input.enterpriseId !== undefined ? { enterpriseId: input.enterpriseId } : {}),
     ...(input.ownerKind !== undefined ? { ownerKind: input.ownerKind } : {}),
     ...(input.channelEligible !== undefined ? { channelEligible: input.channelEligible } : {}),
-    ...(input.actingMemberId !== undefined ? { actingMemberId: input.actingMemberId } : {}),
     jti: randomUUID(),
     exp: now + lifetime,
   };
@@ -160,8 +154,7 @@ function isClaims(v: unknown): v is IdentityClaims {
     // Channel-fact claims (#51): reject a wrong-typed value rather than coercing it — a malformed
     // signed claim fails closed (an unknown ownerKind can't slip through as 'channel').
     (c.ownerKind === undefined || c.ownerKind === 'user' || c.ownerKind === 'channel') &&
-    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean') &&
-    (c.actingMemberId === undefined || typeof c.actingMemberId === 'string')
+    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean')
   );
 }
 

@@ -16,7 +16,6 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
-import { UnionOptin } from '../src/core/unionOptin';
 import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
@@ -117,8 +116,8 @@ export async function buildBrokerServer(
   // (shared jti table), so a scaled fleet gets cluster-wide single-use with no wiring here. #100.
 
   // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
-  // default (user-only broker). The caller supplies eligibility/union facts as signed claims; the
-  // store here only maps (team, channel, provider) → mode.
+  // default (user-only broker). The caller supplies eligibility facts as signed claims; the store
+  // here only maps (team, channel, provider) → mode.
   const channelModes = env.VOUCHR_CHANNEL_MODES === '1' || env.VOUCHR_CHANNEL_MODES === 'true';
   const channelConfig = channelModes ? new ChannelConfig(db) : undefined;
 
@@ -140,11 +139,10 @@ export async function buildBrokerServer(
   // #54 TTL sweep, wired the same way the Bolt path does (core sweepExpired + session-grant sweep).
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
-  const unionOptin = new UnionOptin(db); // #112: swept user creds drop their union opt-ins too
   const approvals = new Approvals(db); // #113: expired approval prompts/grants are reclaimed (and audited) too
   const sweep = async (): Promise<number> => {
     // #117: the deployer's onCredentialHealth override (if any) also hears expiring_soon/expired.
-    const n = await sweepExpired(vault, audit, consent, undefined, unionOptin, overrides.onCredentialHealth, approvals);
+    const n = await sweepExpired(vault, audit, consent, undefined, overrides.onCredentialHealth, approvals);
     await sessions.sweepExpired();
     return n;
   };

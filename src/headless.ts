@@ -68,10 +68,6 @@ export type { Owner } from './core/owner';
 // ── opt-in channel gate ──
 export { ChannelConfig, channelIneligibleReason } from './core/channelConfig';
 export type { ChannelMode } from './core/channelConfig';
-// #112 union opt-in: the broker trusts the host's signed actingMemberId, so a headless host that
-// resolves acting members itself applies the candidate rule (eligibleUnionMembers) and drives the
-// audited join/leave lifecycle with the same core the Bolt surface uses.
-export { UnionOptin, eligibleUnionMembers, joinUnion, leaveUnion } from './core/unionOptin';
 // Preview visibility (per-channel rendering policy) + the pending-preview claim store, so a headless
 // host can honor `visibility` from the manifest and run the same single-use share authorization.
 export { PREVIEW_VISIBILITIES, isPreviewVisibility } from './core/channelConfig';

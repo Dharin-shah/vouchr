@@ -5,7 +5,7 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelConfig, isChannelMode } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
@@ -174,4 +174,27 @@ test('flag on: isAdmin override false blocks the creator on the command path', a
   assert.doesNotMatch(h.out[0], /Enabled/);
   const row = await h.lan.db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
   assert.equal(row, undefined); // never written
+});
+
+// #196: `union` was removed. It must be rejected at the config boundary BEFORE any persist/audit
+// (SEC-4), both at the guard the slash command routes through and at the true sink (ChannelConfig).
+test('union mode is rejected at the config boundary, writing nothing (SEC-4)', async () => {
+  // The single-source-of-truth guard no longer admits it; the surviving three still pass.
+  assert.equal(isChannelMode('union'), false);
+  for (const m of ['shared', 'per-user', 'session']) assert.equal(isChannelMode(m), true);
+
+  // Slash command: an admin creator runs `mode mcp union` → the usage message, and NO row is written.
+  const h = await commandHarness({ creator: ID.userId, allowCreator: true });
+  await h.run('mode mcp union');
+  assert.match(h.out[0], /Usage: `\/vouchr mode/);
+  const cfgRow = await h.lan.db.get(
+    'SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
+  assert.equal(cfgRow, undefined); // never persisted
+  assert.equal((await h.lan.db.all('SELECT 1 FROM audit') as any[]).length, 0); // never audited
+
+  // True sink: ChannelConfig.setMode itself throws on the bogus runtime value and writes nothing.
+  const db = await openDb({ dbPath: ':memory:' });
+  const cfg = new ChannelConfig(db);
+  await assert.rejects(() => cfg.setMode('T1', 'C_FIN', 'mcp', 'union' as any), /invalid channel mode/);
+  assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), null);
 });

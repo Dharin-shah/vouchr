@@ -70,7 +70,7 @@ function redact(value: unknown): unknown {
 export interface AuditRow {
   provider: string;
   action: string;
-  actor: string | null; // who triggered it (union non-repudiation); null on most rows
+  actor: string | null; // a non-caller actor (e.g. an approver, or 'system' on a sweep); null on most rows
   channel: string | null;
   at: number; // ms epoch
 }
@@ -88,8 +88,8 @@ export class Audit {
   constructor(private db: Db) {}
 
   /** The caller's own audit trail: rows attributed to them as the acting/owning user, across channels.
-   *  `user_id` is always the acted-as member (the credential owner in union mode), so this scopes strictly
-   *  to the caller — never another user's rows. Excludes `meta`. */
+   *  `user_id` is always the credential owner, so this scopes strictly to the caller — never another
+   *  user's rows. Excludes `meta`. */
   async listByOwnerUser(i: SlackIdentity, limit: number): Promise<AuditRow[]> {
     return this.db.all(
       `SELECT provider, action, actor, channel, at FROM audit
@@ -112,11 +112,11 @@ export class Audit {
    *  distinct requesting humans, and last-used time. One GROUP BY, backend-agnostic (epoch comparison,
    *  no date functions). Admin-gated at the call site; powers `/vouchr stats`.
    *
-   *  "Distinct humans" = `COALESCE(actor, user_id)`: in union mode `user_id` is the acted-as member and
-   *  `actor` is the real requester, so we count requesters; otherwise `actor` is null and `user_id` IS
-   *  the requester. Counts are numeric on both backends (SQLite native; Postgres via the global int8
-   *  parser in db.ts) and Postgres lowercases unquoted aliases, so we alias in snake_case and coerce
-   *  with Number() defensively. */
+   *  "Distinct humans" = `COALESCE(actor, user_id)`: an inject row's `actor` is null and `user_id` IS
+   *  the requester, so this counts requesters (the COALESCE also covers any future non-null actor).
+   *  Counts are numeric on both backends (SQLite native; Postgres via the global int8 parser in db.ts)
+   *  and Postgres lowercases unquoted aliases, so we alias in snake_case and coerce with Number()
+   *  defensively. */
   async statsByChannel(teamId: string, channelId: string, sinceEpoch: number): Promise<StatsRow[]> {
     const rows = await this.db.all<{ provider: string; uses: unknown; distinct_actors: unknown; last_used: unknown }>(
       `SELECT provider,
@@ -150,7 +150,7 @@ export class Audit {
 
   async record(
     action:
-      | 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'rate_limited' | 'config' | 'session' | 'preview' | 'union'
+      | 'connect' | 'refresh' | 'inject' | 'revoke' | 'denied' | 'rate_limited' | 'config' | 'session' | 'preview'
       // #113 human-in-the-loop approval lifecycle (a denied/expired approval uses 'denied'). The
       // approver's identity rides the `actor` parameter on approved/consumed rows.
       | 'approval_requested' | 'approved' | 'approval_consumed',

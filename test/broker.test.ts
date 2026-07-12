@@ -850,7 +850,7 @@ test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; f
 // ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
 
 /** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
-async function makeChannelBroker(mode: 'shared' | 'union' | 'per-user') {
+async function makeChannelBroker(mode: 'shared' | 'per-user') {
   const db = await openDb({ dbPath: ':memory:' });
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -859,12 +859,6 @@ async function makeChannelBroker(mode: 'shared' | 'union' | 'per-user') {
   if (mode === 'shared') {
     // The channel owns one credential every member injects.
     await vault.upsert(channelOwner('T1', 'C1'), 'acme', {
-      accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-    });
-  }
-  if (mode === 'union') {
-    // A connected member (U9) whose OWN credential the caller elects to act as.
-    await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U9' }), 'acme', {
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
   }
@@ -893,39 +887,6 @@ test('#51 shared: owner:"channel" resolves to the channel credential and injects
     assert.equal(row.channel, 'C1'); // attributed to the channel that owns the credential
   } finally {
     up.restore();
-    server.close();
-  }
-});
-
-test('#51 union: resolves to and audits the SIGNED acting member (never the caller)', async () => {
-  const { server, db, port } = await makeChannelBroker('union');
-  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
-  try {
-    // Caller (U1) elects to act as connected member U9; the member is the vault owner AND audited actor.
-    const r = await post(port, '/v1/fetch', {
-      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken({ actingMemberId: 'U9' }), method: 'GET', path: '/x',
-    });
-    assert.equal(r.status, 200);
-    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
-    const row = (await db.get(`SELECT user_id, channel FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`)) as any;
-    assert.equal(row.user_id, 'U9');   // audited as U9 (the real member whose cred was used), not caller U1
-    // Attributed to the ORIGIN channel the request came in on (so /vouchr stats sees union usage). Not
-    // owner conflation: the vault owner is still U9's user-owned cred; user_id above is the member.
-    assert.equal(row.channel, 'C1');
-  } finally {
-    up.restore();
-    server.close();
-  }
-});
-
-test('#51 union without a signed actingMemberId -> 400 (no member to act as)', async () => {
-  const { server, port } = await makeChannelBroker('union');
-  try {
-    const r = await post(port, '/v1/fetch', {
-      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
-    });
-    assert.equal(r.status, 400);
-  } finally {
     server.close();
   }
 });
@@ -1250,38 +1211,6 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
     assert.equal(upstreamAuth, `Bearer ${NEW}`);
     const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(rv.json.consentState, 'connected');
-  } finally {
-    globalThis.fetch = real;
-    server.close();
-  }
-});
-
-// #112: a broker-hosted connect prompted from a union-mode channel records the union opt-in at the
-// callback, exactly like the Bolt path — the consent row carries the SIGNED channel from /v1/connect.
-test('#112 broker callback from a union-mode channel records the union opt-in row', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  const channelConfig = new ChannelConfig(db);
-  await channelConfig.setMode('T1', 'C_UNION', 'acme', 'union');
-  const server = createBroker({
-    providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig,
-    baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',
-  });
-  await new Promise<void>((r) => server.listen(0, r));
-  const port = (server.address() as any).port;
-  const real = globalThis.fetch;
-  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'tok_new' }),
-    { status: 200, headers: { 'content-type': 'application/json' } })) as any;
-  try {
-    const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channel: 'C_UNION' }), SECRET) });
-    const cb = await getRaw(port, `/oauth/callback?code=abc123&state=${encodeURIComponent(c.json.state)}`);
-    assert.equal(cb.status, 200);
-    const row = (await db.get(`SELECT * FROM union_optin`)) as any;
-    assert.equal(row?.team_id, 'T1');
-    assert.equal(row?.channel_id, 'C_UNION');
-    assert.equal(row?.user_id, 'U1');
-    assert.equal(row?.provider, 'acme');
   } finally {
     globalThis.fetch = real;
     server.close();

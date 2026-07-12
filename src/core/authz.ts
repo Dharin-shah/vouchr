@@ -85,7 +85,7 @@ export async function buildToolManifest(o: {
  *  or a typed "cannot serve" signal the adapter maps to its own surface. Fail-closed by construction. */
 export type OwnerResolution =
   | { status: 'resolved'; owner: Owner; acting: SlackIdentity }
-  /** No credential to serve (user path: caller not connected; union path: no member to act as). */
+  /** No credential to serve: the caller is not connected. */
   | { status: 'needs_consent' }
   /** Session mode, fail-closed: no thread to scope a grant, or no live grant for it. */
   | { status: 'needs_session'; reason: 'no-thread' | 'no-session-grant' }
@@ -95,9 +95,8 @@ export type OwnerResolution =
 export interface OwnerInputs {
   /**
    * Which credential family the caller is on. The Bolt path derives this from the mode (`connect()` for
-   * user-owned + union, `connectChannel()` for shared); the broker derives it from the SIGNED `ownerKind`.
-   * 'user' → the caller's own credential (+ the session gate); 'channel' → a channel-borrowed credential
-   * (shared cred or a union member's cred).
+   * user-owned, `connectChannel()` for shared); the broker derives it from the SIGNED `ownerKind`.
+   * 'user' → the caller's own credential (+ the session gate); 'channel' → the channel's shared credential.
    */
   path: 'user' | 'channel';
   /** The channel's configured mode for this provider; null = unconfigured (treated as per-user). */
@@ -106,11 +105,6 @@ export interface OwnerInputs {
   principal: SlackIdentity;
   /** The VERIFIED channel this request is in (Slack event / signed claim), or null off-channel. */
   channel: string | null;
-  /**
-   * union: the connected member the caller resolved to act AS (their user-owned cred is borrowed and they
-   * are the audited actor). null = no connected member. Only consulted on a union channel-path request.
-   */
-  actingMember?: SlackIdentity | null;
   /**
    * Channel-borrow eligibility verdict, already computed by the adapter from the channel class via the
    * core `channelIneligibleReason` rule. Fail-closed: only an explicit `true` is eligible; undefined/false
@@ -146,18 +140,12 @@ export function resolveCredentialOwner(i: OwnerInputs): OwnerResolution {
     return { status: 'resolved', owner: userOwner(i.principal), acting: i.principal };
   }
 
-  // channel-borrow (shared / union). Eligibility is fail-closed for ANY channel-borrowed credential
-  // (invariant 6): an externally-shared / Slack-Connect / DM / archived channel would leak cross-org.
+  // channel-borrow (shared). Eligibility is fail-closed for a channel-owned credential (invariant 6):
+  // an externally-shared / Slack-Connect / DM / archived channel would leak cross-org.
   if (i.eligible !== true) return { status: 'refused', code: 'ineligible' };
   if (i.mode === 'shared' && i.channel) {
     // The channel OWNS the credential; the audited actor stays the acting human (invariant 9).
     return { status: 'resolved', owner: channelOwner(i.principal.teamId, i.channel), acting: i.principal };
-  }
-  if (i.mode === 'union') {
-    // Borrow the connected member's OWN credential and act AS that member — never the channel, never the
-    // caller. No member to borrow → needs_consent (Bolt falls through to prompt; the broker maps to 400).
-    if (!i.actingMember) return { status: 'needs_consent' };
-    return { status: 'resolved', owner: userOwner(i.actingMember), acting: i.actingMember };
   }
   // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
   return { status: 'refused', code: 'not_configured' };

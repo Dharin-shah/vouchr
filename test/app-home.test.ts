@@ -135,13 +135,13 @@ test('creator flag: creator gets rows for their channel; a foreign channel degra
 
 test('selecting a channel re-renders rows reflecting the stored mode + enablement', async () => {
   const h = await harness({ slackAdmin: true });
-  await new ChannelConfig(h.lan.db).setMode('T1', 'C_FIN', 'mcp', 'union');
+  await new ChannelConfig(h.lan.db).setMode('T1', 'C_FIN', 'mcp', 'session');
   await new ChannelTools(h.lan.db).setEnabled('T1', 'C_FIN', 'mcp', false);
   await h.selectChannel('C_FIN');
   const view = h.published().view;
   assert.equal(JSON.parse(view.private_metadata).channel, 'C_FIN'); // selection persists for the next render
   const modeBlock = view.blocks.find((b: any) => b.block_id === 'home_mode:mcp');
-  assert.equal(modeBlock.accessory.initial_option.value, 'union'); // current mode as the select's initial
+  assert.equal(modeBlock.accessory.initial_option.value, 'session'); // current mode as the select's initial
   const toolBlock = view.blocks.find((b: any) => b.block_id === 'home_tool:mcp');
   const toggle = toolBlock.elements.find((e: any) => e.action_id === HOME_TOOL_ACTION);
   assert.equal(toggle.value, 'enable:mcp'); // disabled now → the button offers Enable
@@ -150,10 +150,10 @@ test('selecting a channel re-renders rows reflecting the stored mode + enablemen
 
 test('home mode select == /vouchr mode: identical channel_config row and audit row', async () => {
   const viaCommand = await harness({ slackAdmin: true });
-  await viaCommand.runCommand('mode mcp union');
+  await viaCommand.runCommand('mode mcp session');
   const viaHome = await harness({ slackAdmin: true });
-  await viaHome.setMode('mcp', 'union');
-  assert.equal(await modeRow(viaHome.lan.db), 'union');
+  await viaHome.setMode('mcp', 'session');
+  assert.equal(await modeRow(viaHome.lan.db), 'session');
   assert.deepEqual(await auditRows(viaHome.lan.db), await auditRows(viaCommand.lan.db)); // STR-4 parity
   assert.ok(viaHome.published()); // re-published after the mutation
 });

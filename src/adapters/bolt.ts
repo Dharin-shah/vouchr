@@ -18,7 +18,6 @@ import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibil
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { PendingPreviews } from '../core/preview';
 import { handleOAuthCallback } from '../core/oauthCallback';
-import { UnionOptin, eligibleUnionMembers, joinUnion, leaveUnion } from '../core/unionOptin';
 import { offboardUser, disconnectProvider } from '../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
 import { sweepExpired } from '../core/sweep';
@@ -44,12 +43,6 @@ const PREVIEW_TTL_MS = 10 * 60_000;
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
  *  how long a single approval can live before the user must re-approve in the thread. */
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-
-/** #112 part 2: at most one owner-notification DM per (owner, provider, channel) per hour. */
-// ponytail: per-process debounce, duplicate DMs possible multi-instance, harmless. The map's keys
-// are never pruned, but real cardinality is bounded by owner×provider×channel; prune-on-size if a
-// long-lived pod ever cares.
-const UNION_NOTIFY_DEBOUNCE_MS = 60 * 60 * 1000;
 
 /** Map an external ref to its resolver source id. Add resolvers → extend this. */
 export function refSource(ref: string): string {
@@ -241,18 +234,6 @@ export interface VouchrOptions {
    */
   sessionTtlMs?: number;
   /**
-   * #112 union-mode explicit opt-in. When true, `union` resolution only ever borrows a member who
-   * explicitly opted in for that (channel, provider): by completing a Connect prompted from the
-   * union channel, or `/vouchr union join <provider>`. `/vouchr union leave`, disconnect, and
-   * offboarding remove eligibility immediately. With nobody opted in, the caller gets the normal
-   * Connect prompt. When false (the default), ANY connected channel member is borrowable — exactly
-   * today's behavior.
-   *
-   * DEPRECATED DEFAULT: `false` is a temporary compatibility default and will flip to `true` at the
-   * next breaking release. Set it explicitly.
-   */
-  unionRequiresOptIn?: boolean;
-  /**
    * Pluggable store for the per-(owner, provider) token buckets behind `provider.rateLimit`. The
    * default is in-memory per-process — a multi-instance deployment multiplies the effective limit by
    * replica count unless a shared store is supplied (same upgrade shape as the broker's replayStore).
@@ -332,14 +313,6 @@ export interface ConnectContextDeps {
   thread?: string | null;
   /** Thread session-grant store. The 'session' channel mode drives whether the gate runs. */
   sessions?: SessionGrants;
-  /** #112 union opt-in store. Consulted by union resolution when `unionRequiresOptIn` is true
-   *  (absent + flag on = fail closed: no candidates). */
-  unionOptin?: UnionOptin;
-  /** #112: whether union resolution requires an explicit opt-in row. Default false (today's behavior). */
-  unionRequiresOptIn?: boolean;
-  /** #112 owner-DM debounce timestamps, shared per createVouchr instance (like `inflight`) so the
-   *  once-per-hour rule spans requests. A direct-constructed context gets its own map. */
-  unionNotified?: Map<string, number>;
   /** #113 human-in-the-loop approval store (provider.approval). Absent + a provider that declares
    *  the knob = the injector fails closed (a declared approval is never silently skipped). */
   approvals?: Approvals;
@@ -379,9 +352,6 @@ export class ConnectContext {
   private requireMembership: boolean;
   private thread: string | null;
   private sessions?: SessionGrants;
-  private unionOptin?: UnionOptin;
-  private unionRequiresOptIn: boolean;
-  private unionNotified: Map<string, number>;
   private approvals: Approvals | null;
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
@@ -410,9 +380,6 @@ export class ConnectContext {
     this.requireMembership = deps.requireMembership ?? false;
     this.thread = deps.thread ?? null;
     this.sessions = deps.sessions;
-    this.unionOptin = deps.unionOptin;
-    this.unionRequiresOptIn = deps.unionRequiresOptIn ?? false;
-    this.unionNotified = deps.unionNotified ?? new Map();
     this.approvals = deps.approvals ?? null;
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
@@ -517,8 +484,8 @@ export class ConnectContext {
    * config mutation (adminEligible — custom override, else workspace admin OR the channel creator
    * when opted in). Fail-closed reads: an unreadable member list yields nobody.
    */
-  // ponytail: linear scan of members × one users.info each, like resolveUnionMember; fine for
-  // normal channels. Cache admin flags with a short TTL if a huge channel makes this hot.
+  // ponytail: linear scan of members × one users.info each; fine for normal channels. Cache admin
+  // flags with a short TTL if a huge channel makes this hot.
   private async eligibleApprovers(): Promise<string[]> {
     const out: string[] = [];
     for (const userId of await listChannelMembers(this.client, this.channel!)) {
@@ -576,7 +543,6 @@ export class ConnectContext {
     // The channel's configured auth mode for this provider decides the credential model:
     //   'shared'  → the channel's shared credential (delegate to connectChannel)
     //   'session' → the user's own credential, gated by a per-thread approval
-    //   'union'   → any connected member's own credential, acting as that member
     //   'per-user' / unset → the user's own credential, no gate
     const mode = this.channel && this.channelConfig
       ? await this.channelConfig.getMode(this.identity.teamId, this.channel, providerId)
@@ -611,54 +577,9 @@ export class ConnectContext {
       // resolved → fall through to the stored-credential / consent tail below (as before).
     }
 
-    // 'union' (any connected member): resolve to WHICHEVER channel member has connected this provider
-    // and act AS that member — their user-owned cred is the vault key AND they are the audited actor.
-    // No owner/actor conflation: we never key on the channel and we attribute the real member, not the
-    // caller. If no member is connected yet, fall through so the caller is prompted to connect (and so
-    // becomes the connected member next time).
-    if (mode === 'union') {
-      // Union borrows another member's user-owned cred THROUGH the channel, so it inherits the SAME
-      // channel-eligibility rule as a shared cred (invariant 6): never resolve on an externally-shared /
-      // Slack Connect channel, or a member's third-party credential would leak cross-org. Re-checked at
-      // USE time (not just at config) because a channel can turn Slack Connect after union was set —
-      // mirrors connectChannel's use-time guard. Fails CLOSED (null info → refuse).
-      await this.assertChannelEligible();
-      // Governance parity with shared creds: when membership is required, only an actual channel member
-      // may borrow. Fail-closed (isChannelMember is false on any error / unverifiable membership).
-      if (this.requireMembership && !(await isChannelMember(this.client, this.channel!, this.identity.userId))) {
-        await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'not-member' });
-        throw new Error(`You must be a member of this channel to use a shared "${providerId}" connection.`);
-      }
-      // The mode→owner mapping (union → the member's user-owned cred, audited as that member) is the shared
-      // core decision. Eligibility already re-checked above; a resolved member yields its owner + actor.
-      const member = await this.resolveUnionMember(providerId);
-      if (member) {
-        const r = resolveCredentialOwner({ path: 'channel', mode, principal: this.identity, channel: this.channel, eligible: true, actingMember: member });
-        if (r.status === 'resolved') {
-          // #112 part 2: the owner DM fires on ACTUAL use — the wrapped fetch returning a provider
-          // Response — not here at resolution: connect() alone injects nothing, and a resolution-time
-          // DM would also burn the hourly debounce before the first real use (PR #171 P2).
-          return this.notifyOwnerOnUse(this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
-            provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-            // Union non-repudiation: `r.acting` is the borrowed member (audited as them); the REAL
-            // requester is the caller. Pass it as triggeredBy so the inject audit records WHO borrowed
-            // the credential — this is what surfaces in the owner's `/vouchr audit` view.
-            this.identity.userId,
-            this.channel, // origin channel: attribute union usage to the channel it happened in (stats)
-            this.rateLimits,
-            this.health,
-            this.approvals,
-            this.thread,
-            this.dryRun,
-          ))), member, providerId);
-        }
-      }
-    }
-
     if (await this.vault.get(userOwner(this.identity), providerId)) {
       return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
         provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-        null, // no union borrow on the direct per-user path
         this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
         this.rateLimits,
         this.health,
@@ -681,96 +602,9 @@ export class ConnectContext {
       this.redirectUri,
       this.channel,
     );
-    // #112 informed consent: in a union-mode channel, completing this connect ALSO opts the user
-    // into serving other members' requests (the callback records it) — the prompt must say so.
-    await this.postConnectPrompt(providerId, authorizeUrl, mode === 'union');
+    await this.postConnectPrompt(providerId, authorizeUrl);
     this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId);
-  }
-
-  /**
-   * 'union' mode resolver: the first channel member who has a live connection to `provider`, built as
-   * a SlackIdentity (their userId, the caller's team — invariant 2: never the channel's). Returns null
-   * when no member is connected (fail-closed list → no resolution). The member becomes BOTH the vault
-   * owner and the audited actor, so the credential's owner and the acting human stay the same real
-   * person; the channel is never the owner and the caller is never credited with another's action.
-   */
-  private async resolveUnionMember(provider: string): Promise<SlackIdentity | null> {
-    if (!this.channel) return null;
-    // ponytail: linear scan of members × one vault.get each; fine for normal channels. If a huge
-    // channel makes this hot, add a "connected members for (team, channel, provider)" index query.
-    // Sort by userId so selection is DETERMINISTIC: Slack's conversations.members ordering is
-    // arbitrary, and with 2+ connected members a non-deterministic pick would make the borrowed (and
-    // audited) credential change between calls. Sorted → the same member always wins.
-    const members = [...(await listChannelMembers(this.client, this.channel))].sort();
-    // #112 explicit opt-in: the candidate rule is the core eligibleUnionMembers (flag off → all
-    // members, unchanged). Flag on with no store wired = fail closed: no candidates, so the caller
-    // falls through to the Connect prompt rather than borrowing without consent.
-    const candidates = this.unionOptin
-      ? await eligibleUnionMembers(this.unionOptin, this.unionRequiresOptIn, this.identity.teamId, this.channel, provider, members)
-      : (this.unionRequiresOptIn ? [] : members);
-    for (const userId of candidates) {
-      const member: SlackIdentity = { enterpriseId: this.identity.enterpriseId, teamId: this.identity.teamId, userId };
-      if (await this.vault.get(userOwner(member), provider)) return member;
-    }
-    return null;
-  }
-
-  /**
-   * #112 part 2 — wrap a resolved union handle so the owner DM fires on ACTUAL use: after the
-   * underlying fetch resolves with a provider Response (credential injected, provider answered —
-   * ANY status counts as use), or rejects with ResponseBlockedError (#110's post-injection response
-   * guard — the request WAS served). Any other thrown fetch (egress/policy deny, rate limit,
-   * network failure) never notifies. ALL rejections re-throw unchanged. Mirrors notifyRateLimited's
-   * wrapper shape; applied outermost so an inner throw skips the DM. Not applied on self-use —
-   * nothing to disclose.
-   */
-  private notifyOwnerOnUse(handle: ConnectionHandle, owner: SlackIdentity, provider: string): ConnectionHandle {
-    if (owner.userId === this.identity.userId) return handle; // serving yourself: no wrap, no DM
-    const fetch = handle.fetch.bind(handle);
-    handle.fetch = async (input: string, init: RequestInit = {}) => {
-      let res: Response;
-      try {
-        res = await fetch(input, init);
-      } catch (err) {
-        // #110's response guard throws ResponseBlockedError POST-injection — after the provider call
-        // happened and its inject audit row was written — so a response-blocked use still notifies:
-        // the credential DID serve the request, only the response was withheld, and the DM stays in
-        // lockstep with the audit record. Pre-injection denials (egress/policy/rate-limit/
-        // no-connection) are different classes and stay silent. Every rejection re-throws unchanged.
-        if (err instanceof ResponseBlockedError) this.notifyUnionOwner(owner, provider);
-        throw err;
-      }
-      this.notifyUnionOwner(owner, provider); // debounced + fire-and-forget; never affects `res`
-      return res;
-    };
-    return handle;
-  }
-
-  /**
-   * #112 part 2 — DM the credential owner that their union connection just served ANOTHER member's
-   * request (invoked by notifyOwnerOnUse after a real provider round-trip): who used it, where, and
-   * how to review (`/vouchr audit`) or withdraw (`/vouchr union leave`). A courtesy signal only —
-   * the audit table is the record (the inject row carries the borrower as `actor`). Never fires on
-   * self-use. Fire-and-forget with a swallowed failure, so a Slack hiccup can never break the
-   * request path. Debounced per (owner, provider, channel), consumed by real use only.
-   */
-  private notifyUnionOwner(owner: SlackIdentity, provider: string): void {
-    if (!this.channel || owner.userId === this.identity.userId) return; // serving yourself → no DM
-    const key = `${owner.userId}|${provider}|${this.channel}`;
-    const now = Date.now();
-    if (now - (this.unionNotified.get(key) ?? 0) < UNION_NOTIFY_DEBOUNCE_MS) return;
-    this.unionNotified.set(key, now);
-    const p = escapeMrkdwn(provider); // SEC-5, even for a registry-validated id
-    try {
-      void this.client.chat.postMessage({
-        channel: owner.userId,
-        text:
-          `Your ${p} connection was used by <@${this.identity.userId}> in <#${this.channel}> just now. ` +
-          `\`/vouchr audit\` to review · \`/vouchr union leave ${p}\` to stop. ` +
-          `(This DM is a courtesy heads-up; the full history is in \`/vouchr audit\`.)`,
-      }).catch(() => undefined);
-    } catch { /* .catch() only guards the async path; a sync-throwing client must not break the request either */ }
   }
 
   /**
@@ -1001,10 +835,10 @@ export class ConnectContext {
     // and the helper always resolves (to channelOwner(teamId, channel) + this.identity — today's values).
     const r = resolveCredentialOwner({ path: 'channel', mode: 'shared', principal: this.identity, channel, eligible: true });
     if (r.status !== 'resolved') throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
-    // triggeredBy/originChannel keep their defaults (null): unchanged behavior on this path.
+    // originChannel keeps its default (null): the channel-owned cred is attributed to its owning channel.
     return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
       provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
-      null, null, this.rateLimits, this.health, this.approvals, this.thread, this.dryRun,
+      null, this.rateLimits, this.health, this.approvals, this.thread, this.dryRun,
     )));
   }
 
@@ -1050,23 +884,12 @@ export class ConnectContext {
     }
   }
 
-  private async postConnectPrompt(providerId: string, url: string, unionNote = false): Promise<void> {
+  private async postConnectPrompt(providerId: string, url: string): Promise<void> {
     const provider = this.registry.get(providerId);
     const blocks = connectBlocks(providerId, url, {
       list: provider.scopesDefault,
       describe: provider.scopeDescriptions,
     });
-    if (unionNote) {
-      // #112: disclose the opt-in side effect of a union-channel connect (SEC-5-escaped id).
-      const p = escapeMrkdwn(providerId);
-      blocks.push({
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: `This channel is in *union* mode: completing this connect also makes your ${p} account usable for other members' requests here. \`/vouchr union leave ${p}\` to undo.`,
-        }],
-      });
-    }
     const text = `Connect your ${escapeMrkdwn(providerId)} account`; // SEC-5 #178: fallback notification text is mrkdwn too
     if (this.channel) {
       await this.client.chat.postEphemeral({
@@ -1184,9 +1007,6 @@ export async function createVouchr(opts: VouchrOptions) {
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
   const approvals = new Approvals(db); // #113 per-action approval requests/grants (provider.approval)
-  const unionOptin = new UnionOptin(db); // #112 union opt-in store (rows recorded regardless of the flag)
-  const unionRequiresOptIn = opts.unionRequiresOptIn ?? false;
-  const unionNotified = new Map<string, number>(); // #112 owner-DM debounce (see UNION_NOTIFY_DEBOUNCE_MS)
   // The 'session' channel mode drives whether a thread grant is required; this is just the TTL ceiling.
   const sessionTtlMs = opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
   const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
@@ -1344,9 +1164,6 @@ export async function createVouchr(opts: VouchrOptions) {
         requireMembership: opts.requireChannelMembership ?? false,
         thread,
         sessions,
-        unionOptin,
-        unionRequiresOptIn,
-        unionNotified,
         approvals,
         auditSink,
         health,
@@ -1357,14 +1174,12 @@ export async function createVouchr(opts: VouchrOptions) {
     await args.next();
   };
 
-  // channelConfig + unionOptin let the callback record the union opt-in for a connect prompted
-  // from a union-mode channel (the consent row carries that channel). See handleOAuthCallback.
-  const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, channelConfig, unionOptin, dryRun };
+  const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, dryRun };
 
   /**
    * #116 dry-run test helper: complete the NEWEST pending consent for (user, provider) through the
    * REAL callback path — single-use state consumption, synthetic token exchange, vault write, audit
-   * row, union opt-in — exactly as if the user had clicked Connect. Accepts a bare userId or a
+   * row — exactly as if the user had clicked Connect. Accepts a bare userId or a
    * `{ teamId, userId }` identity (to disambiguate multi-workspace tests). Throws when nothing is
    * pending (call `connect()` first — it posts the prompt and records the consent state) or when
    * the callback reports a failure.
@@ -1430,7 +1245,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, unionOptin, unionRequiresOptIn, unionNotified, approvals, auditSink, health, previews, dryRun,
+      thread: null, sessions, approvals, auditSink, health, previews, dryRun,
     });
   }
 
@@ -1513,11 +1328,11 @@ export async function createVouchr(opts: VouchrOptions) {
         return respond(`${on ? 'Enabled' : 'Disabled'} *${arg}* in <#${command.channel_id}>.`);
       }
 
-      // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant)
-      // | union (any connected member, acting as that member). Admin-gated + audited in setChannelMode.
+      // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant).
+      // Admin-gated + audited in setChannelMode.
       if (sub === 'mode') {
         if (!arg || !isChannelMode(arg2)) {
-          return respond('Usage: `/vouchr mode <provider> <shared|per-user|session|union>`');
+          return respond('Usage: `/vouchr mode <provider> <shared|per-user|session>`');
         }
         if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
         if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');
@@ -1547,48 +1362,6 @@ export async function createVouchr(opts: VouchrOptions) {
           : `Set *${arg}* previews to *public* in <#${command.channel_id}>.`);
       }
 
-      // #112 union opt-in: join/leave the union pool for THIS channel — self-service, acting user
-      // only (it's their own delegation decision, so no admin gate). `leave` is effective on the
-      // very next resolution. Rows are recorded even while `unionRequiresOptIn` is off, so flipping
-      // the flag later doesn't strand members who already opted in.
-      if (sub === 'union') {
-        if ((arg !== 'join' && arg !== 'leave') || !arg2) return respond('Usage: `/vouchr union join|leave <provider>`');
-        if (!command.channel_id) return respond('Run `/vouchr union` from inside a channel.');
-        // SEC-4: validate the provider against the registry BEFORE any persist or audit write.
-        // SEC-5: the refused id is raw user input, so it's escaped at render.
-        if (!registry.has(arg2)) return respond(`Unknown provider "${escapeMrkdwn(arg2)}". See \`/vouchr tools\` for the registered ones.`);
-        const provider = registry.get(arg2);
-        const p = escapeMrkdwn(arg2);
-        if (!isBrokeredProvider(provider)) {
-          return respond(`"${p}" is a service-to-service tool; Vouchr does not broker it, so there is no union pool for it.`);
-        }
-        if (arg === 'leave') {
-          const left = await leaveUnion(unionOptin, audit, identity, command.channel_id, arg2);
-          return respond(left
-            ? `Left the *${p}* union pool in <#${command.channel_id}>. Your credential no longer serves other members' requests here.`
-            : `You weren't in the *${p}* union pool in <#${command.channel_id}>.`);
-        }
-        // join requires a connected credential; otherwise post the normal setup/Connect prompt.
-        // Completing a Connect from this channel auto-joins when the channel is in union mode for
-        // the provider (the consent row carries the channel — see handleOAuthCallback).
-        if (!(await vault.get(userOwner(identity), arg2))) {
-          if (provider.credential === 'key') {
-            return respond({ text: `Set up your ${arg2} access first`, blocks: keySetupBlocks(arg2) as any });
-          }
-          const { authorizeUrl } = await consent.begin(identity, provider, redirectUri, command.channel_id);
-          return respond({
-            text: `Connect your ${escapeMrkdwn(arg2)} account first`,
-            blocks: connectBlocks(arg2, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions }) as any,
-          });
-        }
-        await joinUnion(unionOptin, audit, identity, command.channel_id, arg2);
-        return respond(
-          `Joined the *${p}* union pool in <#${command.channel_id}>: your connected account may now serve ` +
-          `other members' requests here (each use is audited with the requester as the actor). ` +
-          `\`/vouchr union leave ${p}\` to stop.`,
-        );
-      }
-
       if (sub === 'configure') {
         if (!arg) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
@@ -1609,9 +1382,8 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'disconnect') {
         if (!arg) return respond('Usage: `/vouchr disconnect <provider>`');
         // Shared with the headless broker's /v1/disconnect (core disconnectProvider): local delete
-        // FIRST, then best-effort upstream revoke — a revoke failure is non-fatal. Union opt-ins
-        // for the provider go with the credential (#112).
-        const { ok } = await disconnectProvider(vault, audit, registry, identity, arg, unionOptin);
+        // FIRST, then best-effort upstream revoke — a revoke failure is non-fatal.
+        const { ok } = await disconnectProvider(vault, audit, registry, identity, arg);
         emit({ type: 'revoked', provider: arg, ok });
         return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
       }
@@ -2009,7 +1781,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // Validate against the registry before writing anything: disconnectProvider records the provider
       // into the audit `provider` column unconditionally, so a forged/unknown value would pollute audit.
       if (!identity || typeof provider !== 'string' || !registry.has(provider)) return;
-      const { ok } = await disconnectProvider(vault, audit, registry, identity, provider, unionOptin);
+      const { ok } = await disconnectProvider(vault, audit, registry, identity, provider);
       emit({ type: 'revoked', provider, ok });
       const channel = homeSelectedChannel(body.view);
       if (surface === 'home') return publishHome(identity, client, channel);
@@ -2029,8 +1801,7 @@ export async function createVouchr(opts: VouchrOptions) {
     // minutes (STATE_TTL_MS) and the DM may sit unread for hours, and the 24h DM debounce means a
     // dead baked-in link would have no recovery path. The button value is forgeable (SEC-3/SEC-4):
     // validate it against the registry before anything, and mint for the ACTING user from the
-    // Slack-verified payload — exactly what that user could do themselves via connect(). DM
-    // context ⇒ channel=null, so the callback records no union opt-in.
+    // Slack-verified payload — exactly what that user could do themselves via connect().
     app.action(RECONNECT_ACTION, async ({ ack, body, respond }: any) => {
       await ack();
       const identity = resolveIdentity({ body });
@@ -2177,7 +1948,7 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).
    *  offboardUser clears the session grants (passed through), so the Grid/SCIM path gets it too. */
   function offboard(identity: SlackIdentity): Promise<string[]> {
-    return offboardUser(vault, audit, consent, identity, registry, 'offboarded', sessions, unionOptin);
+    return offboardUser(vault, audit, consent, identity, registry, 'offboarded', sessions);
   }
 
   /**
@@ -2209,7 +1980,7 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Delete every connection past its TTL + clear stale consent + expired thread sessions +
    *  expired approval prompts/grants (#113, audited inside core sweepExpired). Run on a timer. */
   async function sweep(): Promise<number> {
-    const n = await sweepExpired(vault, audit, consent, sink, unionOptin, health, approvals);
+    const n = await sweepExpired(vault, audit, consent, sink, health, approvals);
     await sessions.sweepExpired();
     return n;
   }
