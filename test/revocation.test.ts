@@ -86,6 +86,43 @@ test('revokeToken sends client creds in the body when revokeAuth=body (GitLab-st
   }
 });
 
+test('revokeToken refuses redirects without forwarding credentials or exposing the endpoint', async () => {
+  const endpointSecret = 'REVOKE_URL_QUERY_SECRET';
+  const tokenSecret = 'LIVE_TOKEN_SECRET';
+  const clientSecret = 'REVOKE_CLIENT_SECRET';
+  const provider = defineProvider({
+    ...revocable,
+    id: 'redirecting-revoke',
+    revokeUrl: `https://acme.example/revoke?private=${endpointSecret}`,
+    revokeAuth: 'body',
+    clientSecret,
+  });
+  const redirectDestination = 'https://attacker.example/collect';
+  const calls: Array<{ url: string; init: RequestInit }> = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(url), init: init ?? {} });
+    return new Response(null, { status: 308, headers: { location: redirectDestination } });
+  }) as typeof fetch;
+  try {
+    await assert.rejects(() => revokeToken(provider, tokenSecret), (error: Error) => {
+      assert.equal(error.message, 'Revoke endpoint returned HTTP 308');
+      assert.ok(!error.message.includes(endpointSecret));
+      assert.ok(!error.message.includes(provider.revokeUrl!));
+      return true;
+    });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.equal(calls.length, 1, 'only the original revoke endpoint receives a request');
+  assert.notEqual(calls[0].url, redirectDestination, 'redirect destination receives no request');
+  assert.equal(calls[0].init.redirect, 'manual');
+  const body = String(calls[0].init.body);
+  assert.equal(new URLSearchParams(body).get('token'), tokenSecret, 'test exercised the live-token path');
+  assert.equal(new URLSearchParams(body).get('client_secret'), clientSecret, 'test exercised revoke client authentication');
+});
+
 test('revokeToken is a no-op for a provider with no revoke capability (fetch not called)', async () => {
   const realFetch = globalThis.fetch;
   let called = false;

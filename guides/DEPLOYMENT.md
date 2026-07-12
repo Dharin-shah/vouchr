@@ -363,21 +363,30 @@ The validator is strict and fail-fast at config load:
   two ids that normalize to the same client-secret env key (`a.b` and `a-b` → `VOUCHR_PROVIDER_A_B_*`),
   are rejected.
 - **`authorizeUrl` / `tokenUrl` / `revokeUrl`** — must be `https` (a loopback host may use `http` for
-  local testing), with no embedded credentials, fragment, or explicit non-default port. The token
+  local testing), with no embedded credentials, fragment, or explicit port. The token
   exchange and revoke POSTs are not behind the egress gate, so a downgraded endpoint would leak the
-  code / client secret / token in cleartext — hence the check.
+  code / client secret / token in cleartext — hence the check. Token, refresh, revoke, and built-in
+  account-probe requests also refuse redirects rather than forwarding credentials to another URL.
 - **`egressAllow`** hosts are lower-cased and must be bare hostnames (no scheme/port/path);
   **`egressPaths`** must be absolute (`/repos`); **`egressMethods`** are normalized (`" post "` →
   `POST`). Canonicalizing once at load means the value the injector compares at egress is exactly what
-  you wrote — no silent never-match.
+  you wrote — no silent never-match. Path locks reject encoded separators/traversal even when nested
+  across multiple decode layers, before Vouchr reads or forwards the credential.
 - **`authorizeParams`** may add provider-specific query params (e.g. `{"prompt": "consent"}`) but may
   **not** carry a Vouchr-owned key (`client_id`, `redirect_uri`, `scope`, `state`, `response_type`,
   `code_challenge`, `code_challenge_method`) — those are set by Vouchr and overriding `state`/
   `redirect_uri` would defeat the single-use CSRF `state`.
-- The full declarative surface also includes `scopeDescriptions` (per-scope consent copy),
+- The full declarative surface also includes `scopeDescriptions` (non-blank, escaped per-scope
+  consent copy; scope ids/descriptions are at most 512 characters and the default list at most 48),
   `publicClient` (PKCE-only, no secret), `revokeAuth` (`none`/`body`), `egressResponse`
   (`maxBytes` / `allowContentTypes` / `stripHeaders`), and `rateLimit` (`perMinute` / `burst`) —
   each validated identically to its in-code form.
+
+Validation produces the immutable snapshot used at runtime; mutating the object originally passed by
+code cannot add an egress host, path, or method after registration. `callbackPath` is likewise a
+canonical literal pathname such as `/oauth/callback`—not a relative path, URL, encoded path,
+route pattern, query, or fragment—and must resolve to an HTTPS URL on the configured `baseUrl` origin
+(loopback local testing excepted).
 
 With no `egressMethods`, the broker default-denies non-GET/HEAD — a read-only provider. Opt into
 writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the provider.

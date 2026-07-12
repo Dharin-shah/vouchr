@@ -8,8 +8,8 @@ import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
-import { ProviderRegistry, isBrokeredProvider, assertCallbackUrl, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, ENCODED_PATH_SEPARATOR, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
@@ -84,11 +84,11 @@ export interface BrokerOptions {
    * #52 public HTTPS origin of THIS broker (e.g. `https://broker.example`). Setting it MOUNTS the OAuth
    * connect flow: `POST /v1/connect` (mint an authorize URL for the verified user) and
    * `GET <callbackPath>` (the provider redirect target). Unset → neither route mounts (additive; the
-   * historical use-only broker is unchanged). The `redirectUri` handed to providers is
-   * `new URL(callbackPath, baseUrl)`.
+   * historical use-only broker is unchanged). The `redirectUri` handed to providers is the public
+   * origin plus one validated canonical absolute callback pathname.
    */
   baseUrl?: string;
-  /** #52 OAuth redirect path mounted under `baseUrl`. Default `/oauth/callback`. */
+  /** #52 canonical absolute OAuth redirect pathname mounted under `baseUrl`. Default `/oauth/callback`. */
   callbackPath?: string;
   /**
    * Single-use jti store for replay protection. Default is an in-memory per-process guard, which is
@@ -518,11 +518,10 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   const consent = new Consent(opts.db, dryRun); // #116: dry-run mints local instantly-succeeding authorize URLs
   const sessions = new SessionGrants(opts.db);
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
-  const callbackPath = opts.callbackPath ?? '/oauth/callback';
-  const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
-  // When the OAuth flow is mounted (baseUrl set), the redirect_uri must be https + within the base
-  // origin (#211) — the same guard the Bolt adapter runs, so both callback surfaces agree (STR-3).
-  if (opts.baseUrl) assertCallbackUrl(opts.baseUrl, redirectUri!);
+  const callbackPath = opts.callbackPath === undefined ? '/oauth/callback' : opts.callbackPath;
+  // The same core helper owns origin/path validation for both adapters. A configured callback path
+  // must be the exact pathname this server matches, never a relative/URL/query/fragment variant.
+  const redirectUri = opts.baseUrl ? buildCallbackUrl(opts.baseUrl, callbackPath) : undefined;
 
   // #116 safety rail: dry-run must never serve against a vault holding REAL credential rows.
   // createBroker is sync, so the async check starts here and every request (health probes excepted)
@@ -794,7 +793,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
     // The declared MCP endpoint lock: the SAME matching semantics as egressPaths (shared matcher,
     // shared fail-closed encoded-separator rule — a path lock is a security boundary).
-    if (ENCODED_PATH_SEPARATOR.test(url.pathname) || !mcp.paths.some((p) => pathAllowed(url.pathname, p))) {
+    if (hasAmbiguousPathEncoding(url.pathname) || !mcp.paths.some((p) => pathAllowed(url.pathname, p))) {
       emit({ type: 'egress_denied', provider: provider.id, host: url.hostname, reason: 'path' });
       await opts.audit.record('denied', acting, provider.id, { host: url.hostname, reason: 'path' });
       throw new HttpError(403, { error: 'path is not in the provider mcp.paths allowlist' });

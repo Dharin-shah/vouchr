@@ -114,6 +114,41 @@ test('connectBlocks: an unknown scope falls back to its raw string, never droppe
   assert.match(j(b), /mystery:scope/); // raw fallback, not hidden
 });
 
+test('connectBlocks: scope descriptions and fallback ids are inert mrkdwn, and blanks cannot hide a scope', () => {
+  const b = connectBlocks('acme', 'https://auth', {
+    list: ['known', '<!channel> <@U123>'],
+    describe: { known: '   ' },
+  }) as any[];
+  const mrkdwn = b.filter((x: any) => x.text?.type === 'mrkdwn').map((x: any) => x.text.text).join('\n');
+
+  assert.match(mrkdwn, /• known/); // blank description falls back to the real scope id
+  assert.ok(!mrkdwn.includes('<!channel>'));
+  assert.ok(!mrkdwn.includes('<@U123>'));
+  assert.match(mrkdwn, /&lt;!channel&gt; &lt;@U123&gt;/); // present and truthful, but inert
+});
+
+test('connectBlocks: large valid scope copy is split into Slack-compliant sections without hiding scopes', () => {
+  const first = '&'.repeat(512);
+  const second = '<'.repeat(512);
+  const b = connectBlocks('acme', 'https://auth', {
+    list: ['first', 'second'],
+    describe: { first, second },
+  }) as any[];
+  const scopeSections = b.filter((x: any) => x.text?.type === 'mrkdwn' && /granted|Connecting grants/.test(x.text.text));
+  assert.equal(scopeSections.length, 2);
+  assert.ok(scopeSections.every((x: any) => x.text.text.length <= 3000));
+  const rendered = scopeSections.map((x: any) => x.text.text).join('\n');
+  assert.match(rendered, /&amp;/);
+  assert.match(rendered, /&lt;/);
+});
+
+test('connectBlocks: a direct caller cannot construct an oversized Slack section', () => {
+  assert.throws(
+    () => connectBlocks('acme', 'https://auth', { list: ['x'], describe: { x: '&'.repeat(600) } }),
+    /scope copy exceeds the Slack section limit/,
+  );
+});
+
 test('consentDeniedBlocks: states provider, default reason, and next step', () => {
   const b = consentDeniedBlocks('stripe') as any[];
   assert.equal(b[0].type, 'section');

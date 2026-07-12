@@ -188,6 +188,35 @@ export function isCanonicalPath(p: string): boolean {
   }
 }
 
+const ENCODED_PATH_SEPARATOR = /%2f|%5c/i;
+const ENCODED_OCTET = /%[0-9a-f]{2}/i;
+const MAX_PATH_DECODE_PASSES = 8;
+
+/**
+ * Whether one or more decoding passes can change a path's routing structure. A proxy and its
+ * application may each decode once, so checking only literal `%2f`/`%5c` misses `%252f` and an
+ * encoded `..` segment. Decode only for validation (the original bytes still go upstream), reject
+ * malformed encodings, and fail closed when excessive nesting remains after the bounded loop.
+ */
+export function hasAmbiguousPathEncoding(path: string): boolean {
+  let candidate = path;
+  for (let pass = 0; pass < MAX_PATH_DECODE_PASSES; pass += 1) {
+    if (ENCODED_PATH_SEPARATOR.test(candidate)) return true;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(candidate);
+    } catch {
+      return true;
+    }
+    if (decoded === candidate) return false;
+    if (decoded.includes('\\') || decoded.split('/').some((segment) => segment === '.' || segment === '..')) {
+      return true;
+    }
+    candidate = decoded;
+  }
+  return ENCODED_OCTET.test(candidate) || candidate.includes('%');
+}
+
 /**
  * Canonicalize an HTTP method token to trimmed upper-case, or null if it isn't a bare method name
  * (letters only). 'POST ' → 'POST' (normalized, matches); 'PO ST'/'PO#ST' → null (rejected). The
@@ -209,7 +238,12 @@ export function canonicalMethod(m: string): string | null {
 // WHATWG parses an IPv6 host into a BRACKETED `url.hostname` (`new URL('http://[::1]/').hostname` ===
 // '[::1]'), so the bracketed form is what actually appears at the comparison sites; the bare '::1' is
 // kept too so a caller comparing an un-bracketed host still matches.
-export const LOOPBACK = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
+
+/** One read-only query for the shared local-development carve-out; callers cannot widen the set. */
+export function isLoopbackHost(hostname: string): boolean {
+  return LOOPBACK_HOSTS.has(hostname);
+}
 
 /**
  * The OAuth authorize-URL query parameters Vouchr OWNS and sets itself in `consent.begin`
@@ -218,7 +252,7 @@ export const LOOPBACK = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
  * defeat the single-use CSRF `state` (SEC-2) or point the code at another origin. ONE list, so the
  * definition-time guard (below) and the render order in `consent.begin` agree by construction.
  */
-export const RESERVED_AUTHORIZE_PARAMS = new Set([
+const RESERVED_AUTHORIZE_PARAMS = new Set([
   'client_id', 'redirect_uri', 'scope', 'state', 'response_type', 'code_challenge', 'code_challenge_method',
 ]);
 
@@ -250,24 +284,67 @@ export function providerEnvKey(id: string): string {
  * `tokenUrl`, and revoke POSTs the live token to `revokeUrl` — NEITHER is behind the injector's egress
  * https gate — so an `http://` or userinfo-bearing endpoint would leak them in cleartext. Require
  * https (loopback may use http for local testing), and reject embedded credentials, a fragment, and an
- * explicit non-default port (the same "ambiguous port" rule the egress guard enforces). Extracted from
+ * explicit port (the local loopback test carve-out may use one). Extracted from
  * databricks()'s inline host check so every entry point shares one rule (STR-2/STR-3). `label`
  * identifies the field in the error; the URL VALUE is never interpolated (it may carry a query).
  */
 export function assertSafeHttpsUrl(raw: string, label: string): URL {
+  let unsafeRawCharacter = false;
+  if (typeof raw === 'string') {
+    for (let i = 0; i < raw.length; i += 1) {
+      const code = raw.charCodeAt(i);
+      if (code <= 0x1f || code === 0x7f || code === 0x5c) {
+        unsafeRawCharacter = true;
+        break;
+      }
+    }
+  }
+  if (typeof raw !== 'string' || raw.length === 0 || raw.trim() !== raw || unsafeRawCharacter) {
+    throw new Error(`${label} must be a valid URL.`);
+  }
   let u: URL;
   try {
     u = new URL(raw);
   } catch {
     throw new Error(`${label} must be a valid URL.`);
   }
-  const loopback = LOOPBACK.has(u.hostname);
+  // WHATWG normalizes alternate IPv4 spellings, empty/default ports, empty userinfo
+  // (`https://@host`), and an empty fragment (`#`) away. Inspect the raw authority/delimiters so
+  // every accepted URL has one unambiguous spelling before we trust the parsed destination.
+  const authority = raw.match(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/([^/?#]*)/)?.[1] ?? '';
+  if (authority.includes('@') || u.username || u.password) throw new Error(`${label} must not contain URL credentials (userinfo).`);
+  if (raw.includes('#')) throw new Error(`${label} must not contain a URL fragment.`);
+  let rawHost = authority;
+  let rawPort: string | undefined;
+  if (authority.startsWith('[')) {
+    const close = authority.indexOf(']');
+    rawHost = close < 0 ? '' : authority.slice(0, close + 1);
+    const suffix = close < 0 ? '' : authority.slice(close + 1);
+    if (suffix) rawPort = suffix.startsWith(':') ? suffix.slice(1) : '';
+  } else {
+    const colon = authority.lastIndexOf(':');
+    if (colon >= 0) {
+      rawHost = authority.slice(0, colon);
+      rawPort = authority.slice(colon + 1);
+    }
+  }
+  let canonicalRawHost = '';
+  try {
+    canonicalRawHost = canonicalEgressHost(rawHost);
+  } catch {
+    throw new Error(`${label} must contain one canonical hostname.`);
+  }
+  if (canonicalRawHost !== u.hostname) throw new Error(`${label} must contain one canonical hostname.`);
+  const loopback = isLoopbackHost(u.hostname);
   if (u.protocol !== 'https:' && !(loopback && u.protocol === 'http:')) {
     throw new Error(`${label} must use https (only loopback may use http for local testing).`);
   }
-  if (u.username || u.password) throw new Error(`${label} must not contain URL credentials (userinfo).`);
-  if (u.hash) throw new Error(`${label} must not contain a URL fragment.`);
-  if (u.port !== '' && !loopback) throw new Error(`${label} must not specify an explicit port.`);
+  if (rawPort !== undefined) {
+    if (!/^\d+$/.test(rawPort) || String(Number(rawPort)) !== rawPort) {
+      throw new Error(`${label} must specify a canonical numeric port.`);
+    }
+    if (!loopback) throw new Error(`${label} must not specify an explicit port.`);
+  }
   return u;
 }
 
@@ -292,24 +369,47 @@ export function assertCallbackUrl(baseUrl: string, redirectUri: string): void {
   }
 }
 
+/** Build the one canonical OAuth callback URL shared by Bolt and the headless broker. */
+export function buildCallbackUrl(baseUrl: string, callbackPath: string): string {
+  if (
+    typeof callbackPath !== 'string' || !isCanonicalPath(callbackPath) ||
+    callbackPath.includes('\\') || callbackPath.includes('%') ||
+    !/^\/(?:[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*)$/.test(callbackPath)
+  ) {
+    throw new Error('callbackPath must be one canonical absolute path with no query or fragment.');
+  }
+  const base = assertSafeHttpsUrl(baseUrl, 'baseUrl');
+  if (base.pathname !== '/' || base.search || baseUrl.includes('?')) {
+    throw new Error('baseUrl must be an origin with no path, query, or fragment.');
+  }
+  const redirectUri = `${base.origin}${callbackPath}`;
+  assertCallbackUrl(base.origin, redirectUri);
+  return redirectUri;
+}
+
 /**
  * Canonicalize + validate one egress-allowlist host (#211): it is compared raw against `url.hostname`
  * (already lower-cased by WHATWG) in the injector, so a mis-cased or decorated entry silently never
  * matches. Accept only a bare hostname — no scheme, userinfo, port, path, query, or fragment — and
  * return it lower-cased so `egressAllow.includes(url.hostname)` works regardless of how it was written.
  */
-export function canonicalEgressHost(host: string, id: string): string {
+export function canonicalEgressHost(host: string, _id?: string): string {
   if (typeof host !== 'string' || !host.trim()) {
-    throw new Error(`Provider "${id}" has an invalid egressAllow host: must be a non-empty hostname.`);
+    throw new Error('Provider has an invalid egressAllow host: entries must be non-empty bare hostnames.');
   }
   let u: URL;
   try {
     u = new URL(`https://${host}`);
   } catch {
-    throw new Error(`Provider "${id}" has an invalid egressAllow host ${JSON.stringify(host)}: not a bare hostname.`);
+    throw new Error('Provider has an invalid egressAllow host: entries must be bare hostnames.');
   }
-  if (u.username || u.password || u.port || u.pathname !== '/' || u.search || u.hash || u.hostname !== host.toLowerCase()) {
-    throw new Error(`Provider "${id}" has an invalid egressAllow host ${JSON.stringify(host)}: use a bare hostname with no scheme, port, or path.`);
+  const canonical = host.toLowerCase();
+  const hostnameShape = /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/.test(canonical) || /^\[[0-9a-f:]+\]$/.test(canonical);
+  if (
+    !hostnameShape || canonical.includes('..') || u.username || u.password || u.port ||
+    u.pathname !== '/' || u.search || u.hash || u.hostname !== canonical
+  ) {
+    throw new Error('Provider has an invalid egressAllow host: entries must not include a scheme, port, wildcard, or path.');
   }
   return u.hostname;
 }
@@ -325,166 +425,293 @@ export function assertNoProviderCollisions(providers: Pick<Provider, 'id'>[]): v
   const seen = new Set<string>();
   const seenEnvKey = new Map<string, string>();
   for (const p of providers) {
-    if (seen.has(p.id)) throw new Error(`duplicate provider id "${p.id}"`);
+    if (seen.has(p.id)) throw new Error('duplicate provider id.');
     seen.add(p.id);
     const ek = providerEnvKey(p.id);
     const clash = seenEnvKey.get(ek);
-    if (clash) throw new Error(`provider ids "${clash}" and "${p.id}" derive the same client-secret env key VOUCHR_PROVIDER_${ek}_CLIENT_*`);
+    if (clash) throw new Error('Provider ids derive the same client-secret env key.');
     seenEnvKey.set(ek, p.id);
   }
 }
 
+const PROVIDER_FIELDS = new Set([
+  'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault',
+  'scopeDescriptions', 'egressAllow', 'egressPaths', 'egressMethods', 'egressValidate',
+  'egressResponse', 'mcp', 'rateLimit', 'approval', 'inject', 'refresh', 'pkce',
+  'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth', 'revoke',
+  'clientId', 'clientSecret', 'publicClient', 'accountProbe',
+]);
+const MAX_PROVIDER_ITEMS = 128;
+const MAX_PROVIDER_SCOPES = 48; // intro + one worst-case section per scope + actions = Slack's 50-block ceiling
+const MAX_PROVIDER_TEXT = 512; // escaped mrkdwn worst case remains below one 3,000-character section
+
+function providerError(field: string, requirement: string): never {
+  throw new Error(`Provider field "${field}" ${requirement}.`);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const proto = Object.getPrototypeOf(value);
+  return proto === Object.prototype || proto === null;
+}
+
+function assertKnownKeys(value: Record<string, unknown>, allowed: readonly string[], field: string): void {
+  if (Object.keys(value).some((key) => !allowed.includes(key))) {
+    providerError(field, 'contains an unknown key');
+  }
+}
+
+function stringArray(value: unknown, field: string, allowEmpty = false): string[] {
+  if (!Array.isArray(value) || (!allowEmpty && value.length === 0) || value.length > MAX_PROVIDER_ITEMS) {
+    providerError(field, allowEmpty ? 'must be a bounded array of strings' : 'must be a non-empty bounded array of strings');
+  }
+  const out = value.map((item) => {
+    if (typeof item !== 'string' || !item.trim() || item.length > MAX_PROVIDER_TEXT) {
+      providerError(field, 'must contain only non-empty bounded strings');
+    }
+    return item;
+  });
+  if (new Set(out).size !== out.length) providerError(field, 'must not contain duplicates');
+  return out;
+}
+
+function optionalEnum(value: unknown, field: string, allowed: readonly string[], fallback: string): string {
+  const resolved = value === undefined ? fallback : value;
+  if (typeof resolved !== 'string' || !allowed.includes(resolved)) providerError(field, 'must be one of its supported values');
+  return resolved;
+}
+
+function optionalBoolean(value: unknown, field: string, fallback = false): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'boolean') providerError(field, 'must be a boolean');
+  return value;
+}
+
+function cloneStringRecord(value: unknown, field: string, allowEmptyValues: boolean): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!isPlainRecord(value) || Object.keys(value).length > MAX_PROVIDER_ITEMS) {
+    providerError(field, 'must be a bounded object of string values');
+  }
+  const out: Record<string, string> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (!key.trim() || key.length > MAX_PROVIDER_TEXT || typeof raw !== 'string' || raw.length > MAX_PROVIDER_TEXT || (!allowEmptyValues && !raw.trim())) {
+      providerError(field, 'must contain only non-empty bounded string keys and values');
+    }
+    out[key] = raw;
+  }
+  return out;
+}
+
+function contentTypes(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  const values = stringArray(value, field).map((entry) => entry.toLowerCase());
+  if (values.some((entry) => !/^[!#$%&'*+.^_`|~0-9a-z-]+\/[!#$%&'*+.^_`|~0-9a-z-]+$/.test(entry))) {
+    providerError(field, 'must contain only bare media types');
+  }
+  if (new Set(values).size !== values.length) providerError(field, 'must not contain duplicates after normalization');
+  return values;
+}
+
+function canonicalMethods(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  const values = stringArray(value, field).map((entry) => {
+    const method = canonicalMethod(entry);
+    if (!method) providerError(field, 'must contain only bare HTTP method names');
+    return method;
+  });
+  if (new Set(values).size !== values.length) providerError(field, 'must not contain duplicates after normalization');
+  return values;
+}
+
+function canonicalPaths(value: unknown, field: string): string[] | undefined {
+  if (value === undefined) return undefined;
+  const values = stringArray(value, field);
+  if (values.some((entry) => !isCanonicalPath(entry) || hasAmbiguousPathEncoding(entry))) {
+    providerError(field, 'must contain only unambiguous canonical absolute paths');
+  }
+  return values;
+}
+
+function freezeProvider(provider: Provider): Provider {
+  for (const key of ['scopesDefault', 'egressAllow', 'egressPaths', 'egressMethods'] as const) {
+    if (provider[key]) Object.freeze(provider[key]);
+  }
+  for (const key of ['scopeDescriptions', 'authorizeParams'] as const) {
+    if (provider[key]) Object.freeze(provider[key]);
+  }
+  for (const key of ['egressResponse', 'mcp', 'rateLimit', 'approval'] as const) {
+    const nested = provider[key] as Record<string, unknown> | undefined;
+    if (!nested) continue;
+    for (const value of Object.values(nested)) if (Array.isArray(value)) Object.freeze(value);
+    Object.freeze(nested);
+  }
+  return Object.freeze(provider);
+}
+
+/** Normalize, validate, defensively copy, and freeze every provider registration path. */
 export function defineProvider(spec: Provider): Provider {
-  // The id is the first thing every downstream sink (env key, audit, mrkdwn) reads, so validate it
-  // before any other check can interpolate it into an error message (#211, SEC-4).
-  if (!isValidProviderId(spec.id)) {
-    throw new Error(
-      `Provider id ${JSON.stringify(spec.id)} is invalid: use ≤63 chars of letters, digits, '.', '_', or '-', starting alphanumeric.`,
-    );
+  if (!isPlainRecord(spec)) providerError('provider', 'must be an object');
+  if (Object.keys(spec).some((key) => !PROVIDER_FIELDS.has(key))) providerError('provider', 'contains an unknown field');
+  if (!isValidProviderId(spec.id)) providerError('id', 'is invalid; use a conservative identifier of at most 63 characters');
+
+  const credential = optionalEnum(spec.credential, 'credential', ['oauth', 'key'], 'oauth') as Provider['credential'];
+  const identity = optionalEnum(spec.identity, 'identity', ['service', 'acting_human'], 'acting_human') as Provider['identity'];
+  const refresh = optionalEnum(spec.refresh, 'refresh', ['rotating', 'static', 'none'], 'none') as RefreshStrategy;
+  const tokenAuth = optionalEnum(spec.tokenAuth, 'tokenAuth', ['body', 'basic'], 'body') as NonNullable<Provider['tokenAuth']>;
+  const bodyFormat = optionalEnum(spec.bodyFormat, 'bodyFormat', ['form', 'json'], 'form') as NonNullable<Provider['bodyFormat']>;
+  const revokeAuth = optionalEnum(spec.revokeAuth, 'revokeAuth', ['none', 'body'], 'none') as NonNullable<Provider['revokeAuth']>;
+  const pkce = optionalBoolean(spec.pkce, 'pkce');
+  const publicClient = optionalBoolean(spec.publicClient, 'publicClient');
+
+  const scopesDefault = stringArray(spec.scopesDefault === undefined ? [] : spec.scopesDefault, 'scopesDefault', true);
+  if (scopesDefault.length > MAX_PROVIDER_SCOPES) providerError('scopesDefault', 'must fit the bounded consent surface');
+  if (scopesDefault.some((scope) => scope.trim() !== scope)) providerError('scopesDefault', 'must contain canonical values without surrounding whitespace');
+  // RFC 6749 `scope-token`: printable ASCII except DQUOTE and backslash. In particular, one array
+  // item may not contain whitespace and silently turn into multiple grants when joined with spaces.
+  if (scopesDefault.some((scope) => !/^[\x21\x23-\x5b\x5d-\x7e]+$/.test(scope))) {
+    providerError('scopesDefault', 'must contain one OAuth scope token per item');
   }
-  // Canonicalize the egress allowlist once, here, so the normalized value is what the injector
-  // compares at request time (#211): a mis-cased/decorated host would otherwise silently never match
-  // url.hostname. Reject anything that isn't a bare hostname; store the lower-cased form.
-  if (spec.egressAllow) spec.egressAllow = spec.egressAllow.map((h) => canonicalEgressHost(h, spec.id));
-  // egressPaths / egressMethods are security locks compared at egress; validate + normalize them at
-  // definition with the SAME rules as approval.paths/methods (STR-2) so a fail-open form (a relative
-  // path, a trailing-space method) is rejected here instead of silently never matching at runtime.
-  if (spec.egressPaths) {
-    for (const p of spec.egressPaths) {
-      if (!isCanonicalPath(p)) throw new Error(`Provider "${spec.id}" has an invalid egressPaths entry ${JSON.stringify(p)}: must be an absolute path like "/repos".`);
-    }
+  const scopeDescriptions = cloneStringRecord(spec.scopeDescriptions, 'scopeDescriptions', false);
+  if (scopeDescriptions && Object.keys(scopeDescriptions).some((key) => key.trim() !== key)) {
+    providerError('scopeDescriptions', 'must contain canonical keys without surrounding whitespace');
   }
-  if (spec.egressMethods) {
-    spec.egressMethods = spec.egressMethods.map((m) => {
-      const c = canonicalMethod(m);
-      if (!c) throw new Error(`Provider "${spec.id}" has an invalid egressMethods entry ${JSON.stringify(m)}: must be a bare HTTP method name (e.g. "GET").`);
-      return c;
-    });
+  const authorizeParams = cloneStringRecord(spec.authorizeParams, 'authorizeParams', true);
+  if (authorizeParams && Object.keys(authorizeParams).some((key) => key.trim() !== key)) {
+    providerError('authorizeParams', 'must contain canonical keys without surrounding whitespace');
   }
-  // A Vouchr-owned OAuth param in authorizeParams would clobber the value consent.begin sets — most
-  // dangerously the single-use `state` or `redirect_uri` (SEC-2). Reject at definition time; the
-  // render loop in consent.begin ALSO applies authorizeParams first so Vouchr's params win regardless.
-  for (const k of Object.keys(spec.authorizeParams ?? {})) {
-    if (RESERVED_AUTHORIZE_PARAMS.has(k)) {
-      throw new Error(`Provider "${spec.id}" has a reserved authorizeParams key "${k}": ${[...RESERVED_AUTHORIZE_PARAMS].join(', ')} are set by Vouchr and cannot be overridden.`);
-    }
+  if (authorizeParams && Object.keys(authorizeParams).some((key) => RESERVED_AUTHORIZE_PARAMS.has(key.toLowerCase()))) {
+    providerError('authorizeParams', 'must not contain a Vouchr-owned OAuth parameter');
   }
-  // A zero/negative/NaN rate limit would build a bucket that can never refill (or never denies) —
-  // reject the misconfiguration at definition time rather than shipping a broken limiter.
-  if (spec.rateLimit) {
-    const { perMinute, burst } = spec.rateLimit;
-    if (!(Number.isFinite(perMinute) && perMinute > 0) || (burst !== undefined && !(Number.isFinite(burst) && burst > 0))) {
-      throw new Error(`Provider "${spec.id}" has an invalid rateLimit: perMinute (and burst, when set) must be a finite number > 0.`);
-    }
-    // The bucket's capacity is `burst ?? perMinute`, every request costs 1, and refill is capped at
-    // capacity — so an effective capacity < 1 can never accumulate a whole token and would deny
-    // every request forever. Sub-1/minute rates stay expressible via an explicit burst >= 1.
-    if ((burst ?? perMinute) < 1) {
-      throw new Error(
-        `Provider "${spec.id}" has an invalid rateLimit: burst (or perMinute, when burst is unset) must be >= 1, or no request can ever be admitted. For rates below one per minute, set burst: 1.`,
-      );
-    }
+
+  const egressAllow = stringArray(spec.egressAllow, 'egressAllow').map((host) => canonicalEgressHost(host));
+  if (new Set(egressAllow).size !== egressAllow.length) providerError('egressAllow', 'must not contain duplicates after normalization');
+  let egressPaths: string[] | undefined;
+  try {
+    egressPaths = canonicalPaths(spec.egressPaths, 'egressPaths');
+  } catch {
+    throw new Error('Provider has an invalid egressPaths entry: use canonical absolute paths.');
   }
-  // A NaN/zero/negative maxBytes would silently disable the cap (NaN comparisons are all false) or
-  // deny every response; an invalid stripHeaders NAME would throw per-request at strip time — AFTER
-  // the token was already spent. Reject both at definition time, like the rateLimit checks above.
-  if (spec.egressResponse) {
-    const { maxBytes, allowContentTypes, stripHeaders } = spec.egressResponse;
-    if (maxBytes !== undefined && !(Number.isFinite(maxBytes) && maxBytes > 0)) {
-      throw new Error(`Provider "${spec.id}" has an invalid egressResponse.maxBytes: must be a finite number > 0.`);
-    }
-    // An empty array is a silent deny-all, an empty entry a misconfigured (never-matching) type —
-    // both read as protection while doing something else entirely. Reject at definition time.
-    if (allowContentTypes !== undefined && (allowContentTypes.length === 0 || allowContentTypes.some((c) => typeof c !== 'string' || !c.trim()))) {
-      throw new Error(`Provider "${spec.id}" has an invalid egressResponse.allowContentTypes: must be a non-empty array of non-empty media types.`);
-    }
-    for (const h of stripHeaders ?? []) {
-      try {
-        new Headers().delete(h);
-      } catch {
-        throw new Error(`Provider "${spec.id}" has an invalid egressResponse.stripHeaders entry: not a valid header name.`);
-      }
-    }
+  let egressMethods: string[] | undefined;
+  try {
+    egressMethods = canonicalMethods(spec.egressMethods, 'egressMethods');
+  } catch {
+    throw new Error('Provider has an invalid egressMethods entry: use bare HTTP method names.');
   }
-  // #65 /v1/mcp opt-in: an empty/invalid `paths` lock and an empty content-type list are silent
-  // misconfigurations (allow-nothing that reads as protection, or a never-matching type) — reject
-  // at definition time, in the same style as the egressResponse checks above.
-  if (spec.mcp) {
-    const { paths, allowContentTypes } = spec.mcp;
-    if (!Array.isArray(paths) || paths.length === 0 || paths.some((p) => typeof p !== 'string' || !p.trim())) {
-      throw new Error(`Provider "${spec.id}" has an invalid mcp.paths: must be a non-empty array of non-empty path prefixes.`);
+
+  let egressResponse: Provider['egressResponse'];
+  if (spec.egressResponse !== undefined) {
+    if (!isPlainRecord(spec.egressResponse)) providerError('egressResponse', 'must be an object');
+    assertKnownKeys(spec.egressResponse, ['maxBytes', 'allowContentTypes', 'stripHeaders'], 'egressResponse');
+    const maxBytes = spec.egressResponse.maxBytes;
+    if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || (maxBytes as number) <= 0)) {
+      throw new Error('Provider has an invalid egressResponse.maxBytes: it must be a positive safe integer.');
     }
-    if (allowContentTypes !== undefined && (allowContentTypes.length === 0 || allowContentTypes.some((c) => typeof c !== 'string' || !c.trim()))) {
-      throw new Error(`Provider "${spec.id}" has an invalid mcp.allowContentTypes: must be a non-empty array of non-empty media types.`);
+    let allowContentTypes: string[] | undefined;
+    try {
+      allowContentTypes = contentTypes(spec.egressResponse.allowContentTypes, 'egressResponse.allowContentTypes');
+    } catch {
+      throw new Error('Provider has an invalid egressResponse.allowContentTypes: use bare media types.');
     }
-  }
-  // #113 approval knob: fail closed on garbage at definition time (SEC-4), in the same style as the
-  // rateLimit/egressResponse/mcp checks above. An empty methods/paths list reads as protection while
-  // matching nothing, a bad approver could never be satisfied by any approval surface, and a
-  // non-finite/<=0 ttlMs would mint grants that are dead on arrival (or, as NaN, never comparable).
-  if (spec.approval) {
-    const { methods, paths, approver, ttlMs } = spec.approval;
-    if (approver !== 'self' && approver !== 'admin') {
-      throw new Error(`Provider "${spec.id}" has an invalid approval.approver: must be "self" or "admin".`);
-    }
-    // Methods/paths are the match predicate: a non-empty-but-non-matching entry (a trailing space,
-    // a relative path) would silently WIDEN what runs without approval — a fail-open bug. Reject
-    // non-canonical forms and NORMALIZE the accepted methods (trim + upper-case) so the stored knob
-    // is exactly what `approvalNeeded` compares against.
-    let normMethods: string[] | undefined;
-    if (methods !== undefined) {
-      if (methods.length === 0) throw new Error(`Provider "${spec.id}" has an invalid approval.methods: must be a non-empty array of HTTP method names.`);
-      normMethods = methods.map((m) => {
-        const c = canonicalMethod(m);
-        if (!c) throw new Error(`Provider "${spec.id}" has an invalid approval.methods entry ${JSON.stringify(m)}: must be a bare HTTP method name (e.g. "POST").`);
-        return c;
+    const stripHeaders = spec.egressResponse.stripHeaders === undefined
+      ? undefined
+      : stringArray(spec.egressResponse.stripHeaders, 'egressResponse.stripHeaders', true).map((header) => {
+        try {
+          new Headers().delete(header);
+        } catch {
+          throw new Error('Provider has an invalid egressResponse.stripHeaders entry: use valid header names.');
+        }
+        return header.toLowerCase();
       });
-    }
-    if (paths !== undefined) {
-      if (paths.length === 0) throw new Error(`Provider "${spec.id}" has an invalid approval.paths: must be a non-empty array of absolute paths.`);
-      for (const p of paths) {
-        if (!isCanonicalPath(p)) throw new Error(`Provider "${spec.id}" has an invalid approval.paths entry ${JSON.stringify(p)}: must be an absolute path like "/repos".`);
-      }
-    }
-    if (ttlMs !== undefined && !(Number.isFinite(ttlMs) && ttlMs > 0)) {
-      throw new Error(`Provider "${spec.id}" has an invalid approval.ttlMs: must be a finite number > 0.`);
-    }
-    // Persist the normalized methods so the runtime predicate matches (paths must already be canonical).
-    if (normMethods) spec.approval = { ...spec.approval, methods: normMethods };
+    egressResponse = { ...(maxBytes === undefined ? {} : { maxBytes: maxBytes as number }), ...(allowContentTypes ? { allowContentTypes } : {}), ...(stripHeaders ? { stripHeaders } : {}) };
   }
-  // The revoke endpoint receives the LIVE token (and, with revokeAuth:'body', the client secret) in a
-  // POST that is NOT behind the egress https gate — validate it for every provider that declares one,
-  // key providers included, since a bad revokeUrl leaks regardless of credential kind (#211, SEC-1).
-  if (spec.revokeUrl) assertSafeHttpsUrl(spec.revokeUrl, `Provider "${spec.id}" revokeUrl`);
-  // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
-  // a PKCE public client (publicClient:true) authenticates with the code_verifier alone → clientId only.
-  if (spec.credential !== 'key') {
-    // The token exchange POSTs the auth code + client secret to tokenUrl, and the browser is redirected
-    // to authorizeUrl carrying the single-use state — neither is behind the egress gate, so an http://
-    // or userinfo-bearing endpoint leaks/downgrades them. Validate both here, at the one chokepoint
-    // every OAuth provider (built-in, code, JSON) routes through (#211, SEC-1/SEC-2).
-    assertSafeHttpsUrl(spec.authorizeUrl, `Provider "${spec.id}" authorizeUrl`);
-    assertSafeHttpsUrl(spec.tokenUrl, `Provider "${spec.id}" tokenUrl`);
-    if (spec.publicClient && !spec.pkce) {
-      throw new Error(
-        `Provider "${spec.id}" is a public client (publicClient:true) but PKCE is disabled — a public client must use PKCE.`,
-      );
-    }
-    if (spec.publicClient && (spec.tokenAuth ?? 'body') === 'basic') {
-      // Basic token auth IS a client-secret credential (Basic base64(id:secret)); a public client has
-      // no secret, so it would send `Basic base64(id:)` — nonsensical. Reject rather than half-auth.
-      throw new Error(
-        `Provider "${spec.id}" is a public client but uses Basic token auth — Basic transmits a client secret a public client does not have.`,
-      );
-    }
-    const needsSecret = !spec.publicClient;
-    if (!spec.clientId || (needsSecret && !spec.clientSecret)) {
-      throw new Error(
-        `Provider "${spec.id}" is missing clientId/clientSecret. Set them in the provider config or via env.`,
-      );
-    }
+
+  let mcp: Provider['mcp'];
+  if (spec.mcp !== undefined) {
+    if (!isPlainRecord(spec.mcp)) providerError('mcp', 'must be an object');
+    assertKnownKeys(spec.mcp, ['paths', 'allowContentTypes'], 'mcp');
+    const paths = canonicalPaths(spec.mcp.paths, 'mcp.paths');
+    if (!paths) providerError('mcp.paths', 'is required');
+    const allowContentTypes = contentTypes(spec.mcp.allowContentTypes, 'mcp.allowContentTypes');
+    mcp = { paths, ...(allowContentTypes ? { allowContentTypes } : {}) };
   }
-  return spec;
+
+  let rateLimit: Provider['rateLimit'];
+  if (spec.rateLimit !== undefined) {
+    if (!isPlainRecord(spec.rateLimit)) providerError('rateLimit', 'must be an object');
+    assertKnownKeys(spec.rateLimit, ['perMinute', 'burst'], 'rateLimit');
+    const { perMinute, burst } = spec.rateLimit;
+    if (typeof perMinute !== 'number' || !Number.isFinite(perMinute) || perMinute <= 0) throw new Error('Provider has an invalid rateLimit: perMinute must be a finite number greater than zero.');
+    if (burst !== undefined && (typeof burst !== 'number' || !Number.isFinite(burst) || burst <= 0)) throw new Error('Provider has an invalid rateLimit: burst must be a finite number greater than zero.');
+    if ((burst ?? perMinute) < 1) throw new Error('Provider has an invalid rateLimit: capacity must admit at least one request.');
+    rateLimit = { perMinute, ...(burst === undefined ? {} : { burst }) };
+  }
+
+  let approval: Provider['approval'];
+  if (spec.approval !== undefined) {
+    if (!isPlainRecord(spec.approval)) providerError('approval', 'must be an object');
+    assertKnownKeys(spec.approval, ['methods', 'paths', 'approver', 'ttlMs'], 'approval');
+    if (spec.approval.approver !== 'self' && spec.approval.approver !== 'admin') providerError('approval.approver', 'has an unsupported value');
+    const methods = canonicalMethods(spec.approval.methods, 'approval.methods');
+    const paths = canonicalPaths(spec.approval.paths, 'approval.paths');
+    const ttlMs = spec.approval.ttlMs;
+    if (ttlMs !== undefined && (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0)) providerError('approval.ttlMs', 'must be a positive safe integer');
+    approval = { approver: spec.approval.approver, ...(methods ? { methods } : {}), ...(paths ? { paths } : {}), ...(ttlMs === undefined ? {} : { ttlMs: ttlMs as number }) };
+  }
+
+  for (const field of ['egressValidate', 'inject', 'revoke', 'accountProbe'] as const) {
+    if (spec[field] !== undefined && typeof spec[field] !== 'function') providerError(field, 'must be a function when registered from code');
+  }
+  for (const field of ['authorizeUrl', 'tokenUrl', 'revokeUrl', 'clientId', 'clientSecret'] as const) {
+    if (spec[field] !== undefined && typeof spec[field] !== 'string') providerError(field, 'must be a string');
+  }
+
+  const authorizeUrl = spec.authorizeUrl ?? '';
+  const tokenUrl = spec.tokenUrl ?? '';
+  if (spec.revokeUrl !== undefined && !spec.revokeUrl) providerError('revokeUrl', 'must be non-empty when set');
+  if (spec.revokeUrl) assertSafeHttpsUrl(spec.revokeUrl, 'Provider revokeUrl');
+  if (!spec.revokeUrl && revokeAuth !== 'none') providerError('revokeAuth', 'requires revokeUrl');
+
+  if (credential === 'oauth') {
+    assertSafeHttpsUrl(authorizeUrl, 'Provider authorizeUrl');
+    assertSafeHttpsUrl(tokenUrl, 'Provider tokenUrl');
+    if (!spec.clientId || (!publicClient && !spec.clientSecret)) {
+      throw new Error('Provider is missing clientId/clientSecret configuration.');
+    }
+    if (publicClient) {
+      if (!pkce) throw new Error('Provider public client configuration is invalid: PKCE is required.');
+      if (tokenAuth === 'basic') throw new Error('Provider public client configuration is invalid: Basic token authentication is not supported.');
+      if (spec.clientSecret) providerError('clientSecret', 'must be absent for a public client');
+      if (revokeAuth === 'body') providerError('revokeAuth', 'cannot use client-secret body authentication for a public client');
+    }
+  } else if (publicClient) {
+    providerError('publicClient', 'is only valid for OAuth providers');
+  }
+  if (revokeAuth === 'body' && (!spec.clientId || !spec.clientSecret)) providerError('revokeAuth', 'requires clientId and clientSecret');
+
+  return freezeProvider({
+    ...spec,
+    credential,
+    identity,
+    authorizeUrl,
+    tokenUrl,
+    scopesDefault: [...scopesDefault],
+    ...(scopeDescriptions ? { scopeDescriptions: { ...scopeDescriptions } } : { scopeDescriptions: undefined }),
+    egressAllow: [...egressAllow],
+    ...(egressPaths ? { egressPaths: [...egressPaths] } : { egressPaths: undefined }),
+    ...(egressMethods ? { egressMethods: [...egressMethods] } : { egressMethods: undefined }),
+    egressResponse,
+    mcp,
+    rateLimit,
+    approval,
+    refresh,
+    pkce,
+    ...(authorizeParams ? { authorizeParams: { ...authorizeParams } } : { authorizeParams: undefined }),
+    tokenAuth,
+    bodyFormat,
+    revokeAuth,
+    publicClient,
+    clientSecret: publicClient ? undefined : spec.clientSecret,
+  });
 }
 
 /** Built-in GitHub provider. Classic OAuth tokens are long-lived (no refresh). */
@@ -507,8 +734,9 @@ export function github(cfg: ProviderConfig = {}): Provider {
     // Non-standard shape (DELETE + Basic + JSON + client_id in the path) → function escape hatch.
     revoke: async (p, token, signal) => {
       const creds = Buffer.from(`${p.clientId}:${p.clientSecret}`).toString('base64');
-      const r = await fetch(`https://api.github.com/applications/${p.clientId}/token`, {
+      const r = await fetch(`https://api.github.com/applications/${encodeURIComponent(p.clientId!)}/token`, {
         method: 'DELETE',
+        redirect: 'manual',
         headers: {
           Authorization: `Basic ${creds}`,
           Accept: 'application/vnd.github+json',
@@ -523,6 +751,7 @@ export function github(cfg: ProviderConfig = {}): Provider {
     accountProbe: async (token) => {
       const r = await fetch('https://api.github.com/user', {
         headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'vouchr' },
+        redirect: 'manual',
       });
       if (!r.ok) return null;
       const j: any = await r.json();
@@ -562,6 +791,7 @@ export function google(cfg: ProviderConfig = {}): Provider {
     accountProbe: async (token) => {
       const r = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
         headers: { Authorization: `Bearer ${token}` },
+        redirect: 'manual',
       });
       if (!r.ok) return null;
       const j: any = await r.json();
@@ -592,6 +822,7 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     accountProbe: async (token) => {
       const r = await fetch('https://gitlab.com/api/v4/user', {
         headers: { Authorization: `Bearer ${token}` },
+        redirect: 'manual',
       });
       if (!r.ok) return null;
       const j: any = await r.json();
@@ -623,6 +854,7 @@ export function notion(cfg: ProviderConfig = {}): Provider {
     accountProbe: async (token) => {
       const r = await fetch('https://api.notion.com/v1/users/me', {
         headers: { Authorization: `Bearer ${token}`, 'Notion-Version': '2022-06-28' },
+        redirect: 'manual',
       });
       if (!r.ok) return null;
       const j: any = await r.json();
@@ -703,18 +935,20 @@ export function databricks(cfg: DatabricksConfig): Provider {
 export class ProviderRegistry {
   private map = new Map<string, Provider>();
   constructor(providers: Provider[]) {
-    // Reject duplicate ids + env-key collisions BEFORE building the map, so a colliding pair fails
-    // loudly instead of silently last-winning (a shadowed provider) or sharing a client secret. Same
-    // guard the env loader runs (STR-2), so every registration path — built-in, code, JSON — agrees.
-    assertNoProviderCollisions(providers);
-    for (const p of providers) this.map.set(p.id, p);
+    // The registry is a public registration path, so it must not trust callers to have used the
+    // factory. Re-normalize every input, then retain only frozen defensive copies: mutating either
+    // the original object or a nested allowlist after registration cannot widen live egress.
+    if (!Array.isArray(providers) || providers.length > MAX_PROVIDER_ITEMS) {
+      providerError('providers', 'must be a bounded array');
+    }
+    const normalized = providers.map((provider) => defineProvider(provider));
+    assertNoProviderCollisions(normalized);
+    for (const provider of normalized) this.map.set(provider.id, provider);
   }
   get(id: string): Provider {
     const p = this.map.get(id);
     if (!p) {
-      throw new Error(
-        `Unknown provider "${id}". Registered: ${[...this.map.keys()].join(', ') || '(none)'}`,
-      );
+      throw new Error('Unknown provider.');
     }
     return p;
   }

@@ -62,6 +62,10 @@ async function tokenRequest(
     method: 'POST',
     headers,
     body,
+    // OAuth codes, refresh tokens, and client credentials are all replayable secrets. Fetch's
+    // default redirect mode would resend this POST body on a 307/308, potentially to a different
+    // origin. Token endpoints must be final destinations: surface every redirect as a failure.
+    redirect: 'manual',
     signal: AbortSignal.timeout(TOKEN_FETCH_TIMEOUT_MS), // release the lock/pool if the endpoint hangs
   });
   if (!res.ok) {
@@ -85,7 +89,9 @@ async function tokenRequest(
       // hourly-sweep refresh retries against a 429/5xx-ing endpoint would accumulate pinned sockets.
       res.body?.cancel().catch(() => undefined);
     }
-    throw new TokenEndpointError(`Token endpoint ${provider.tokenUrl} returned HTTP ${res.status}`, definitive);
+    // The configured URL is external input and may contain credential-like query values. Identify
+    // the field and status only; never reflect the endpoint itself into owner/operator error text.
+    throw new TokenEndpointError(`Token endpoint returned HTTP ${res.status}`, definitive);
   }
   const json: any = await res.json();
   if (json.error) {
@@ -176,12 +182,15 @@ async function standardRevoke(provider: Provider, token: string, signal: AbortSi
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(fields).toString(),
+    // A 307/308 would replay the live token (and, for revokeAuth=body, client credentials) to the
+    // redirect destination. Revocation endpoints must be final destinations.
+    redirect: 'manual',
     signal,
   });
   // Revoke responses are never read (only the status matters): cancel the body on BOTH paths, or
   // undici pins the socket to it until GC (#172).
   res.body?.cancel().catch(() => undefined);
   if (!res.ok) {
-    throw new Error(`Revoke endpoint ${provider.revokeUrl} returned HTTP ${res.status}`); // never includes the token
+    throw new Error(`Revoke endpoint returned HTTP ${res.status}`); // never includes the token or configured URL
   }
 }

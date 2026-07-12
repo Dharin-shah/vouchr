@@ -2,7 +2,7 @@ import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, isBrokeredProvider, assertCallbackUrl, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -160,6 +160,7 @@ export interface VouchrOptions {
   providers: Provider[];
   /** Public origin where the callback is reachable, e.g. https://abc.ngrok.io */
   baseUrl: string;
+  /** Canonical absolute OAuth callback pathname. Default `/vouchr/oauth/callback`. */
   callbackPath?: string;
   /** PostgreSQL connection string. Falls back to VOUCHR_DATABASE_URL. Vouchr is PostgreSQL-only
    *  (#204) — no embedded/SQLite mode, no generic DATABASE_URL fallback. Ignored when `db` is given. */
@@ -1002,13 +1003,11 @@ export async function createVouchr(opts: VouchrOptions) {
   // returns). Only assertDryRunVault (which reads the vault) is post-open, and it's guarded below.
   const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
   const registry = new ProviderRegistry(opts.providers);
-  // Parse the callback/redirect URL here too (new URL throws on a malformed baseUrl) — BEFORE the pool
-  // opens, so a bad baseUrl can't strand an owned pool with no handle to close it.
-  const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
-  const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
-  // The redirect_uri handed to providers must be https + within the base origin (#211): a http:// or
-  // off-origin callback would carry the auth code in cleartext / to another host. Loopback dev is exempt.
-  assertCallbackUrl(opts.baseUrl, redirectUri);
+  // Validate the origin + mounted pathname and build their redirect URL in ONE core helper, BEFORE
+  // the pool opens. Keeping callbackPath as a canonical absolute pathname prevents the Express route
+  // and the OAuth redirect URI from interpreting relative/URL/query/fragment forms differently.
+  const callbackPath = opts.callbackPath === undefined ? '/vouchr/oauth/callback' : opts.callbackPath;
+  const redirectUri = buildCallbackUrl(opts.baseUrl, callbackPath);
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));

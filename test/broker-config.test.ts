@@ -10,12 +10,35 @@ import { ChannelTools } from '../src/core/tools';
 import { channelOwner } from '../src/core/owner';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
+import { createVouchr } from '../src/adapters/bolt';
 import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
 
 const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK';
+
+const INVALID_CALLBACK_PATHS = [
+  null as unknown as string,
+  '',
+  '   ',
+  'oauth/callback',
+  'https://broker.example/oauth/callback',
+  '//broker.example/oauth/callback',
+  '/oauth/callback?next=1',
+  '/oauth/callback#fragment',
+  '/oauth/../callback',
+  '/oauth/./callback',
+  '/oauth/%2e%2e/callback',
+  '/oauth\\callback',
+  '/oauth%2fcallback',
+  '/oauth%5ccallback',
+  '/oauth/*callback',
+  '/oauth/(callback)',
+  '/oauth/[callback]',
+  '/oauth/+callback',
+  '/oauth/:callback',
+];
 
 const acme = defineProvider({
   id: 'acme',
@@ -74,6 +97,15 @@ function post(port: number, path: string, body: unknown): Promise<{ status: numb
   });
 }
 
+function getStatus(port: number, path: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    http.get({ host: '127.0.0.1', port, path }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    }).on('error', reject);
+  });
+}
+
 /** GET with the signed identity token on the header the config read expects. */
 function getConfig(port: number, token?: string): Promise<{ status: number; json: any }> {
   return new Promise((resolve, reject) => {
@@ -92,13 +124,63 @@ function getConfig(port: number, token?: string): Promise<{ status: number; json
 // with /v1/admin/reference and Bolt's assertChannelEligible). Override to false to exercise the refusal.
 const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
 
-// #211: the callback-URL guard is actually wired into createBroker (not just unit-tested on the helper)
-// — an off-origin or non-https redirect_uri must fail construction so the OAuth code can't leave the origin.
-test('#211 createBroker: an off-origin or non-https callback is rejected at construction', async (t) => {
+// #211: callbackPath is BOTH a Node route matcher and part of the public OAuth redirect URI. Admit
+// exactly one canonical absolute pathname so those parsers cannot disagree about what is mounted.
+test('#211 createBroker: only a canonical callback pathname is accepted and the accepted path routes', async (t) => {
   const db = await openTestDb(t);
   const opts = { providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET, baseUrl: 'https://broker.example' };
-  assert.throws(() => createBroker({ ...opts, callbackPath: 'https://evil.example/cb' }), /within the baseUrl origin/);
+  for (const callbackPath of INVALID_CALLBACK_PATHS) {
+    assert.throws(
+      () => createBroker({ ...opts, callbackPath }),
+      /callbackPath must be one canonical absolute path/,
+      callbackPath || '(empty)',
+    );
+  }
   assert.throws(() => createBroker({ ...opts, baseUrl: 'http://broker.example' }), /must use https/);
+
+  const server = createBroker({ ...opts, callbackPath: '/custom/oauth/callback' });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  try {
+    assert.equal(await getStatus(port, '/custom/oauth/callback'), 400, 'the exact configured callback route is mounted');
+    assert.equal(await getStatus(port, '/oauth/callback'), 404, 'the default route is not also mounted');
+  } finally {
+    server.close();
+  }
+});
+
+test('#211 createVouchr: the same callback pathname contract runs before DB access', async (t) => {
+  const previousKey = process.env.VOUCHR_MASTER_KEY;
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  t.after(() => {
+    if (previousKey === undefined) delete process.env.VOUCHR_MASTER_KEY;
+    else process.env.VOUCHR_MASTER_KEY = previousKey;
+  });
+
+  for (const callbackPath of INVALID_CALLBACK_PATHS) {
+    let dbRead = false;
+    const opts: any = { providers: [acme], baseUrl: 'https://broker.example', callbackPath };
+    Object.defineProperty(opts, 'db', {
+      get() {
+        dbRead = true;
+        throw new Error('database must not be read for invalid callback configuration');
+      },
+    });
+    await assert.rejects(createVouchr(opts), /callbackPath must be one canonical absolute path/, callbackPath || '(empty)');
+    assert.equal(dbRead, false, `callbackPath ${JSON.stringify(callbackPath)} must fail before DB access`);
+  }
+
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({
+    providers: [acme],
+    baseUrl: 'https://broker.example',
+    callbackPath: '/custom/vouchr/oauth/callback',
+    db,
+  });
+  let mountedPath: string | undefined;
+  vouchr.mountRoutes({ get: (path: string) => { mountedPath = path; } });
+  assert.equal(mountedPath, '/custom/vouchr/oauth/callback');
+  await vouchr.close(); // injected DB remains owned by the test fixture
 });
 
 // (a) an admin token can set the mode, and GET /v1/admin/config reflects it.

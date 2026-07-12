@@ -488,7 +488,7 @@ test('#65 mcp: a path outside mcp.paths is refused — same matcher as egressPat
   const { server, port } = await makeMcpBroker(t); // mcpAcme declares mcp.paths: ['/mcp']
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
-    for (const path of ['/admin', '/mcp-evil', '/mcp/..%2f..%2fsecrets']) {
+    for (const path of ['/admin', '/mcp-evil', '/mcp/..%2f..%2fsecrets', '/mcp/%252e%252e%252fadmin']) {
       const r = await postRaw(port, '/v1/mcp', envelope({ path }));
       assert.equal(r.status, 403, `path ${path} must be refused`);
     }
