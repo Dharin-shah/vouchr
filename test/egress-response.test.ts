@@ -10,7 +10,7 @@ import { defineProvider, github, type Provider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
 // Structural response constraints at the injection boundary (#110): per-provider egressResponse
 // (maxBytes / allowContentTypes / stripHeaders) enforced in the injector AFTER the fetch, plus the
@@ -387,7 +387,7 @@ test('broker: provider-level size/content-type breaches deny on the wire (413/50
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
   }
-  const server = createBroker({ providers: [capped, typed], vault, audit, db, identitySecret: 'broker-secret' });
+  const server = createBroker({ providers: [capped, typed], vault, audit, db, identitySecret: identityConfig('broker-secret') });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;
@@ -429,7 +429,7 @@ test('broker: a compliant response with set-cookie relays the body with the cook
   await vault.upsert(userOwner(U1), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [p], vault, audit: new Audit(db), db, identitySecret: 'broker-secret' });
+  const server = createBroker({ providers: [p], vault, audit: new Audit(db), db, identitySecret: identityConfig('broker-secret') });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;

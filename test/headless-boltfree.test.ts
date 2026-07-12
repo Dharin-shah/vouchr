@@ -10,6 +10,7 @@ import http from 'node:http';
 import { openDb, Vault, Audit, createBroker, github, sweepExpired, Consent, Policy, ChannelTools } from '../src/headless';
 import type { Db, TtlPolicy } from '../src/headless';
 import { testDbUrl } from './support/pg';
+import { identityConfig } from './support/identity';
 
 /**
  * Proves the Bolt-free claim (Product H2): the `./headless` entry's RESOLVED CommonJS module graph must
@@ -52,7 +53,7 @@ test('headless entry: createBroker is constructible end-to-end from ./headless a
     // all from ./headless alone.
     const policy = new Policy({ github: { defaultAllow: false, allowChannels: ['C_canary'] } }, { defaultDeny: true });
     const channelTools = new ChannelTools(db);
-    const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: 'test-secret', policy, channelTools });
+    const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: identityConfig('test-secret'), policy, channelTools });
     assert.ok(server instanceof http.Server);
     // sweep lifecycle bits are reachable too (all from ./headless).
     assert.equal(await sweepExpired(vault, audit, new Consent(db)), 0);

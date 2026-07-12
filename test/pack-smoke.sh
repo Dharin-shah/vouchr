@@ -27,9 +27,21 @@ mkdir -p "$CONSUMER"
 
 echo "==> require() every published entrypoint (CJS exports map)"
 ( cd "$CONSUMER" && node -e "
-  require('@vouchr/core');
-  require('@vouchr/core/headless');
+  const root = require('@vouchr/core');
+  const headless = require('@vouchr/core/headless');
   require('@vouchr/core/broker-server');
+  for (const surface of [root, headless]) {
+    for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity']) {
+      if (typeof surface[name] !== 'function') throw new Error('missing packed identity export: ' + name);
+    }
+  }
+  const identity = headless.loadIdentityConfig({
+    VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
+    VOUCHR_DEPLOYMENT_ID: 'packed-consumer',
+  });
+  const token = headless.mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
+  const claims = headless.verifyIdentity(token, identity);
+  if (claims.aud !== 'packed-consumer' || !claims.kid) throw new Error('packed bound identity round-trip failed');
   console.log('    all three entrypoints require() cleanly');
 " )
 
@@ -45,13 +57,22 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import { createVouchr } from '@vouchr/core';
-import { createBroker, signIdentity, type BrokerFetchResponse } from '@vouchr/core/headless';
+import {
+  createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
+  type BrokerFetchResponse, type IdentityConfig,
+} from '@vouchr/core/headless';
+
+const identity: IdentityConfig = loadIdentityConfig({
+  VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
+  VOUCHR_DEPLOYMENT_ID: 'packed-consumer',
+});
+const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
+void verifyIdentity(identityToken, identity);
 
 // Type-level only — never executed. Proves the type entrypoints resolve and the shapes exist.
 export function _smoke(r: BrokerFetchResponse): number {
   void createVouchr;
   void createBroker;
-  void signIdentity;
   return r.status;
 }
 TS

@@ -7,7 +7,7 @@ Vouchr over HTTP. The token stays inside Vouchr.
 Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 
 ```ts
-import { createBroker, signIdentity } from '@vouchr/core/headless';
+import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/headless';
 ```
 
 `@vouchr/core/headless` re-exports exactly the headless surface — `createBroker`, `buildBrokerServer`
@@ -23,8 +23,15 @@ mounted).
 
 ## Making a request
 
-The Slack-facing service verifies Slack, mints a short-lived `identityToken` with `signIdentity()`,
-and the worker calls `POST /v1/fetch`:
+The Slack-facing service verifies Slack, loads the same deployment identity as the broker, and mints
+a fresh short-lived `identityToken` for each call:
+
+```ts
+const identity = loadIdentityConfig(process.env);
+const identityToken = mintIdentity({ teamId, userId, channel, threadTs }, identity);
+```
+
+The worker then calls `POST /v1/fetch`:
 
 ```json
 {
@@ -67,7 +74,8 @@ const broker = createBroker({
     github({ egressMethods: ['GET', 'POST'] }), // provider-level method allowlist
   ],
   allowWrites: true,                            // broker-level write switch
-  // vault, audit, db, identitySecret...
+  identitySecret: loadIdentityConfig(process.env),
+  // vault, audit, db...
 });
 ```
 
@@ -194,11 +202,15 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
 
 ## Operations
 
-- **Identity secret.** Keep `identitySecret` with the Slack verifier and broker, not arbitrary
-  workers.
+- **Deployment identity.** Build `identitySecret` with `loadIdentityConfig(process.env)` in both the
+  trusted Slack verifier/minter and every broker replica. Keep the signing keys out of arbitrary
+  workers, and keep them distinct from the Slack signing secret, encryption keys, broker bearer, and
+  provider OAuth client secrets. See the deployment guide for the required upgrade and rotation order.
 - **Replay protection.** Automatic when you use a shared database — every db-configured broker
   defaults to a durable `DbReplayStore`, so a `jti` spent on one pod is rejected on the others. You
-  may still pass a custom `replayStore`.
+  may still pass a custom `replayStore`, but it must implement `ready()` and prove that its shared
+  dependency is usable. The exported in-memory `ReplayGuard` deliberately fails readiness and is
+  only for low-level tests, never production.
 - **Not connected yet?** Route the user back through the Slack connect/approval flow.
 - **Credential health.** There is no Slack client here, so nothing is DM'd for you: pass
   `onCredentialHealth` (a `BrokerOptions` field, e.g. `buildBrokerServer(env, { onCredentialHealth })`)
@@ -216,7 +228,8 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
   alternative is cross-replica duplicates.
 - **Probes.** Two unauthenticated endpoints for orchestrators: `GET /healthz` (liveness — a bare
   `{"ok":true}` whenever the process is serving, no db touched) and `GET /readyz` (readiness —
-  `{"ok":true}` only if a `SELECT 1` round-trip succeeds within ~2s, else `503 {"ok":false}`). Both
+  `{"ok":true}` only if the schema and cluster-wide replay store are usable within ~2s, else
+  `503 {"ok":false}`). Both
   are exempt from auth, identity, and replay, and return a bare status with no secrets or error text.
 
 ## Dry-run (offline integration tests)

@@ -13,7 +13,7 @@ import { defineProvider, ProviderRegistry, type Provider } from '../src/core/pro
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import { ConnectContext, safeUserMessage } from '../src/adapters/bolt';
 
 // Per-(owner, provider) rate limiting at the injection boundary (#114). Time-sensitive cases run on
@@ -251,7 +251,7 @@ test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, up
   await vault.upsert(userOwner(U1), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [limited], vault, audit, db, identitySecret: 'broker-secret' });
+  const server = createBroker({ providers: [limited], vault, audit, db, identitySecret: identityConfig('broker-secret') });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;

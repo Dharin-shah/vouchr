@@ -9,7 +9,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import type { SlackIdentity } from '../src/core/identity';
 
 // Headless /v1/audit parity (#150). Same invariants as the Slack /vouchr audit (#104): a caller only
@@ -34,7 +34,7 @@ async function harness(t: TestContext) {
   const db = await openTestDb(t);
   const audit = new Audit(db);
   const server = createBroker({
-    providers: [acme], vault: new Vault(db, KEY), audit, db, identitySecret: SECRET,
+    providers: [acme], vault: new Vault(db, KEY), audit, db, identitySecret: identityConfig(SECRET),
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',
   });

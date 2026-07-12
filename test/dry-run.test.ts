@@ -13,7 +13,7 @@ import { SessionGrants } from '../src/core/session';
 import { revokeConnection, selectRevocations } from '../src/core/offboard';
 import { EgressBlockedError } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
-import { signIdentity } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity } from './support/identity';
 import type { SlackIdentity } from '../src/core/identity';
 
 process.env.VOUCHR_MASTER_KEY = randomBytes(32).toString('base64');
@@ -267,7 +267,7 @@ test('dry-run: a non-boolean flag fails closed at construction (SEC-4)', async (
   );
   const db = await openTestDb(t);
   assert.throws(
-    () => createBroker({ providers: [acme()], vault: new Vault(db, randomBytes(32)), audit: new Audit(db), db, identitySecret: 's', dryRun: 1 as any }),
+    () => createBroker({ providers: [acme()], vault: new Vault(db, randomBytes(32)), audit: new Audit(db), db, identitySecret: identityConfig('s'), dryRun: 1 as any }),
     /createBroker: dryRun must be a boolean/,
   );
 });
@@ -556,7 +556,7 @@ test('P2-E: dry-run refuses an external KMS envelope at startup (both factories)
   assert.throws(
     () => createBroker({
       providers: [acme()], vault: new Vault(db, MASTER, {}, fakeEnvelope), audit: new Audit(db), db,
-      identitySecret: 's', dryRun: true,
+      identitySecret: identityConfig('s'), dryRun: true,
     }),
     /dryRun requires a local master key/,
   );
@@ -602,7 +602,7 @@ test('dry-run broker: /v1/connect → local callback → /v1/fetch echo, fully o
   const vault = new Vault(db, randomBytes(32));
   const server = createBroker({
     providers: [acme()], vault, audit: new Audit(db), db,
-    identitySecret: 'shh', baseUrl: 'https://broker.test', dryRun: true,
+    identitySecret: identityConfig('shh'), baseUrl: 'https://broker.test', dryRun: true,
   });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
@@ -654,7 +654,7 @@ test('dry-run broker: callback refuses a foreign code and never clobbers a real 
   const vault = new Vault(db, randomBytes(32));
   const server = createBroker({
     providers: [acme()], vault, audit: new Audit(db), db,
-    identitySecret: 'shh', baseUrl: 'https://broker.test', dryRun: true,
+    identitySecret: identityConfig('shh'), baseUrl: 'https://broker.test', dryRun: true,
   });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
@@ -686,7 +686,7 @@ test('dry-run broker: fails every request closed against a vault with real crede
   const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));
   await vault.upsert(userOwner(ID), 'acme', { ...FRESH, externalAccount: 'octocat' }); // a REAL row
-  const server = createBroker({ providers: [acme()], vault, audit: new Audit(db), db, identitySecret: 'shh', dryRun: true });
+  const server = createBroker({ providers: [acme()], vault, audit: new Audit(db), db, identitySecret: identityConfig('shh'), dryRun: true });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   try {

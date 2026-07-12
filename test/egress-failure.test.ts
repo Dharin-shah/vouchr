@@ -9,7 +9,7 @@ import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import { type VouchrEvent } from '../src/core/injector';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -38,7 +38,7 @@ async function makeBroker(t: TestContext, events: VouchrEvent[]) {
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, onEvent: (e) => events.push(e) });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), onEvent: (e) => events.push(e) });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, db, port: (server.address() as any).port };
 }

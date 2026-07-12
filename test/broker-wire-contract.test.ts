@@ -12,7 +12,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import { userOwner } from '../src/core/owner';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({
-    providers: [acme, svc], vault, audit, db, identitySecret: SECRET,
+    providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },

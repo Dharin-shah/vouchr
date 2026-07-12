@@ -266,25 +266,52 @@ cannot be replayed against deployment B, and fails closed on weak configuration:
   token whose audience is not its own. `VOUCHR_IDENTITY_ISSUER` (default `vouchr`) is the verified
   `iss`.
 - **`VOUCHR_IDENTITY_SECRET`** must be **≥ 32 bytes** of random key material (`openssl rand -base64 32`)
-  and **distinct** from `VOUCHR_MASTER_KEY` and `VOUCHR_BROKER_TOKEN` — one value must not serve two
-  purposes. A short, placeholder, missing, or reused secret fails the broker at startup.
+  and **distinct** from the Slack signing secret, encryption master keys, broker bearer, and every
+  provider OAuth client secret — one value must not serve two purposes. A short, placeholder,
+  missing, or reused secret fails the broker at startup.
 - Each token also carries `iat` (issued-at); one issued in the future beyond a small clock-skew
   allowance (30s) is rejected, as is one whose lifetime exceeds the 5-minute ceiling.
-- **Every replica and every minter must share the same `VOUCHR_DEPLOYMENT_ID`, issuer, and active key
-  set.** A replica configured for a different deployment or key will reject the fleet's tokens.
+- **Every replica and every minter must share the same `VOUCHR_DEPLOYMENT_ID`, issuer, and bounded
+  verification key set.** A replica configured for a different deployment or key will reject the
+  fleet's tokens. During a staged rotation, active-key order differs temporarily by design while the
+  two-key verification set remains compatible.
 
-**Rolling key rotation (no downtime).** To rotate the signing secret: set the new secret as
-`VOUCHR_IDENTITY_SECRET` and the old one as `VOUCHR_IDENTITY_SECRET_PREVIOUS` on every replica and
-minter. During the overlap the broker verifies tokens signed by **either** key (selected by a `kid`
-fingerprint), while new tokens are signed with the active key. Once all in-flight tokens signed by the
-old key have expired (≤ 5 min), drop `VOUCHR_IDENTITY_SECRET_PREVIOUS`; the old key is then rejected
-as an unknown `kid`.
+**Upgrade from an older bare-secret broker.** The packaged broker now requires deployment-bound
+configuration. Do not roll brokers before their trusted minter:
 
-Mint tokens on the caller side with the exported `mintIdentity(acting, identity)` helper — pass a bare
-secret string for a single-deployment/dev broker, or an `IdentityConfig` from
-`loadIdentityConfig(process.env)` to bind the token to your deployment (the packaged broker's mode).
-It fills a fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay/expiry
-rules. See [`examples/broker-client/client.ts`](../examples/broker-client/client.ts) for the full call.
+1. Keep the existing signing secret, choose `VOUCHR_DEPLOYMENT_ID`, and upgrade the minter first so it
+   uses `loadIdentityConfig` and emits `iss`/`aud`/`iat`/`kid`. An older broker verifies that signature
+   with the same secret and ignores the additive bound claims.
+2. After every minter emits bound assertions, roll the broker replicas with the same deployment id,
+   issuer, and secret. A new broker intentionally rejects an older unbound assertion.
+3. Rotate the signing key only after every replica is on the bound format.
+
+If the existing secret is shorter than 32 bytes, a known placeholder, or reused for another purpose,
+it cannot enter the overlap set. Drain identity-token traffic (at most the old token lifetime), then
+cut the minter and brokers over together during a maintenance window with a new random secret. Do not
+weaken the validator to carry an unsafe legacy key forward.
+
+**Rolling key rotation (no downtime, after the format upgrade).** Use two rollout phases; changing the
+active key everywhere in one ordinary rolling deployment is unsafe because a new token can land on an
+old replica that has never seen that key.
+
+1. **Pre-stage:** keep the old key in `VOUCHR_IDENTITY_SECRET` and put the new key in
+   `VOUCHR_IDENTITY_SECRET_PREVIOUS` on every minter and broker. Despite the historical variable name,
+   it is the one bounded overlap slot; all processes still mint with the old active key but can verify
+   either key.
+2. **Activate:** after pre-stage completes everywhere, roll again with the new key active and the old
+   key in `VOUCHR_IDENTITY_SECRET_PREVIOUS`. Phase-1 replicas already know the new key, and phase-2
+   replicas still know the old one, so mixed-version routing accepts both.
+3. **Retire:** after the last old-key token's 5-minute maximum lifetime **plus the conservative
+   90-second cluster-skew horizon** (6m30s), remove `VOUCHR_IDENTITY_SECRET_PREVIOUS`. That horizon
+   covers the verifier's 30-second tolerance plus the maximum 60-second difference between replicas
+   at opposite documented clock extremes. The retired `kid` then fails closed.
+
+Mint tokens with the exported `mintIdentity(acting, identity)` helper and an `IdentityConfig` from
+`loadIdentityConfig(process.env)`. It fills a fresh `jti` and a short, ceiling-clamped `exp` so you do
+not hand-roll replay/expiry rules. Bare-secret signing is a low-level legacy compatibility helper, not
+a broker deployment mode. See [`examples/broker-client/client.ts`](../examples/broker-client/client.ts)
+for the full call.
 
 ### Channel-owned credentials headless (`owner: "channel"`)
 
@@ -339,9 +366,9 @@ POST /v1/admin/reference
 
 | Var | Required | Purpose |
 | --- | --- | --- |
-| `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. Must be **≥ 32 bytes** and **distinct** from the master key / broker token (#212). |
+| `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. Must be **≥ 32 bytes** and distinct from Slack signing, master/KMS, broker-bearer, and provider client secrets (#212). |
 | `VOUCHR_DEPLOYMENT_ID` | yes | the deployment every identity assertion is bound to (`aud`); a token minted for another deployment is rejected (#212). |
-| `VOUCHR_IDENTITY_SECRET_PREVIOUS` | no | previous identity secret during a rolling key rotation; verified via `kid` overlap, drop it after the ≤5-min token window (#212). |
+| `VOUCHR_IDENTITY_SECRET_PREVIOUS` | no | the single overlap key during staged rotation (the previous key after activation, or next key during pre-stage); drop the retired key only after the 6m30s maximum token + cluster-skew horizon (#212). |
 | `VOUCHR_IDENTITY_ISSUER` | no | the verified `iss` claim (default `vouchr`). |
 | `VOUCHR_MASTER_KEY` | yes* | base64 of 32 bytes; encrypts tokens at rest (`openssl rand -base64 32`). *Or `VOUCHR_MASTER_KEYS`. |
 | `VOUCHR_MASTER_KEYS` | no | comma-separated `id:base64key` entries for master-key rotation; the FIRST entry encrypts new writes, every entry decrypts (see [Key rotation](#key-rotation)). |
@@ -524,8 +551,11 @@ package root.
 A signed `jti` must be single-use across the fleet. Shared replay protection is automatic: every
 broker defaults to a durable `DbReplayStore` (`INSERT … ON CONFLICT DO NOTHING` on the baseline
 `broker_jti` table), so a token replayed against a different pod is rejected. You may still pass a
-custom `replayStore` (e.g. Redis `SET jti 1 NX PX=<ttl>`). This is why `replicas > 1` is safe —
-one shared Postgres table backs the whole fleet.
+custom durable `replayStore` to direct `createBroker` construction. `buildBrokerServer` deliberately
+owns its PostgreSQL replay store and does not accept a replay override. A custom store must implement
+both atomic `use()` and a real `ready()` dependency probe; a process-local `ReplayGuard` deliberately
+fails readiness. This is why the supported deployment stays simple: one shared Postgres table backs
+the whole fleet.
 
 ### Perimeter auth
 
@@ -541,8 +571,9 @@ Vouchr ships two ways; pick by how your platform builds:
 
 - **npm library (`@vouchr/core`)** — the primary artifact. `npm install @vouchr/core`, then a thin
   service that calls `buildBrokerServer`. This is the right fit when your platform builds images from
-  its own base and needs to inject a rotating-serviceauth `authorize` hook (see below). A ~15-line
-  wrapper:
+  its own base and needs to inject code hooks (`authorize`, secret `resolvers`, safe event/audit sinks,
+  or `onCredentialHealth`). The builder rejects every configuration/security override; use direct
+  `createBroker` construction when you intentionally need the full lower-level surface. A ~15-line wrapper:
 
   ```ts
   // server.ts — your repo, your base image, your auth
@@ -617,10 +648,10 @@ ARN is hardcoded. For KMS, add `@aws-sdk/client-kms` to the image and bind an IR
 the SDK default credential chain does the rest.
 
 Health probes: `GET /healthz` is liveness (a bare `{"ok":true}` while the process serves, no DB call —
-a DB blip must never restart the fleet); `GET /readyz` is readiness (`{"ok":true}` only if a schema-version
-round-trip against a **migrated** database succeeds within ~2s, else `503 {"ok":false}` so the pod drains
-from the Service). Because readiness reflects schema readiness, a pod stays `503` until `vouchr migrate`
-has brought the database to the current version — run the migrate step before the runtime rolls out. Both
+a DB blip must never restart the fleet); `GET /readyz` is readiness (`{"ok":true}` only if the schema is
+current and the cluster-wide replay store is usable within ~2s, else `503 {"ok":false}` so the pod drains
+from the Service). A pod stays `503` until `vouchr migrate` has brought the database to the current
+version and the runtime role can use `broker_jti` — run the migrate step before the runtime rolls out. Both
 probes are unauthenticated, exempt from identity/replay, and return a bare status with no secrets. Wire
 them as:
 

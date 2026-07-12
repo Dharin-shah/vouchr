@@ -9,7 +9,7 @@ import { Policy } from '../src/core/policy';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // #65 POST /v1/mcp — MCP-aware egress proxy: SSE + session-header passthrough, stateless.
@@ -65,7 +65,7 @@ async function makeMcpBroker(t: TestContext, extra: Partial<Parameters<typeof cr
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [mcpAcme], vault, audit, db, identitySecret: SECRET, allowWrites: true, ...extra });
+  const server = createBroker({ providers: [mcpAcme], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true, ...extra });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, port: (server.address() as any).port };
 }
@@ -539,7 +539,7 @@ test('#65 mcp: defineProvider rejects an invalid mcp knob at definition time', (
 
 test('#65 mcp: createBroker rejects NaN/Infinity/zero/negative stream ceilings; valid values construct', async (t) => {
   const db = await openTestDb(t);
-  const base = { providers: [mcpAcme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET };
+  const base = { providers: [mcpAcme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET) };
   try {
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
       assert.throws(() => createBroker({ ...base, maxStreamBytes: bad }), /maxStreamBytes/, `maxStreamBytes: ${bad} must be rejected`);

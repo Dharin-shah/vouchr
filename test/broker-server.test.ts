@@ -436,6 +436,42 @@ test('buildBrokerServer: fails closed on a weak/placeholder/reused identity secr
     buildBrokerServer({ ...await baseEnv(t), VOUCHR_PROVIDER_GITHUB_CLIENT_SECRET: IDENTITY_SECRET }),
     /provider client secrets/,
   );
+  // Compare KEY MATERIAL, not only equal env text: the identity secret below is the raw 32-byte
+  // ASCII value whose base64 form is used as the encryption master key.
+  const sameKeyBytes = 'M'.repeat(32);
+  await assert.rejects(
+    buildBrokerServer({
+      ...await baseEnv(t),
+      VOUCHR_IDENTITY_SECRET: sameKeyBytes,
+      VOUCHR_MASTER_KEY: Buffer.from(sameKeyBytes).toString('base64'),
+    }),
+    /distinct from the master key/,
+  );
+  // A leaked Slack signing/provider OAuth secret must not also mint broker identities.
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), SLACK_SIGNING_SECRET: IDENTITY_SECRET }),
+    /Slack signing secret/,
+  );
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), GITHUB_CLIENT_SECRET: IDENTITY_SECRET }),
+    /provider client secrets/,
+  );
+});
+
+test('buildBrokerServer: hook overrides cannot replace identity/replay/provider security configuration', async (t) => {
+  const env = await baseEnv(t);
+  await assert.rejects(
+    buildBrokerServer(env, { identitySecret: 'weak-legacy-secret' } as any),
+    /unsupported override; allowed hooks:/,
+  );
+  const sentinel = 'ghp_unknown_override_secret';
+  await assert.rejects(
+    buildBrokerServer(env, { [sentinel]: true } as any),
+    (e: Error) => /unsupported override; allowed hooks:/.test(e.message) && !e.message.includes(sentinel),
+  );
+  // The intentional wrapper hook remains supported.
+  const built = await buildBrokerServer(env, { authorize: () => undefined });
+  await built.db.close();
 });
 
 // ── T8: seed CLI ─────────────────────────────────────────────────────────────

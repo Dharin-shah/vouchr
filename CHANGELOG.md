@@ -12,16 +12,18 @@ All notable changes to this project are documented here. This project adheres to
   (`loadIdentityConfig`) with a verified issuer (`VOUCHR_IDENTITY_ISSUER`, default `vouchr`) and
   audience (`VOUCHR_DEPLOYMENT_ID`, **required**), so a token minted for one deployment is rejected by
   another. New checks fail closed before authorization/audit: `VOUCHR_IDENTITY_SECRET` must be ≥ 32
-  bytes and distinct from the master key / broker token; tokens carry `iat` and are rejected if issued
-  in the future (beyond a 30s skew) or over the 5-minute lifetime; `jti` must be non-empty. Rolling key
+  bytes and distinct from Slack signing, encryption, broker-bearer, and provider client secrets;
+  tokens carry `iat` and are rejected if issued in the future (beyond a 30s skew) or over the 5-minute
+  lifetime; `jti` must be non-empty. Rolling key
   rotation is supported via `VOUCHR_IDENTITY_SECRET_PREVIOUS` — during the overlap the broker verifies
   either key (selected by a `kid` fingerprint) and rejects an unknown `kid` once the previous key is
   dropped. The broker no longer silently falls back to a process-local replay guard (cluster-wide
   Postgres `broker_jti` remains the default). The signing algorithm stays fixed HS256 with no `alg`
-  header, and rejection errors never echo the assertion or key material. `mintIdentity`/`verifyIdentity`
-  accept a bare secret (legacy single-deployment) or an `IdentityConfig` (deployment-bound); new
-  exports: `loadIdentityConfig`, `assertStrongIdentitySecret`, `identityKid`, `IdentityConfig`,
-  `IdentityKey`, `DEFAULT_SKEW_MS`, `MIN_IDENTITY_SECRET_BYTES`.
+  header, and rejection errors never echo the assertion or key material. Low-level
+  `mintIdentity`/`verifyIdentity` retain their bare-secret overload for legacy token-format migration;
+  broker construction uses a validated `IdentityConfig`. New exports: `loadIdentityConfig`,
+  `assertStrongIdentitySecret`, `identityKid`, `IdentityConfig`, `IdentityKey`, `DEFAULT_SKEW_MS`,
+  `MIN_IDENTITY_SECRET_BYTES`.
 
 - **One strict provider / OAuth / egress boundary** (#211). `defineProvider` is now the single core
   validator every provider passes through — built-in factories, code registration, and broker JSON all
@@ -58,6 +60,18 @@ All notable changes to this project are documented here. This project adheres to
   (logical replication / CDC / export with verified restore) before pruning.
 
 ### Changed
+
+- **Breaking — headless broker identity configuration** (#212). The packaged broker now requires
+  `VOUCHR_DEPLOYMENT_ID` and a strong purpose-distinct identity secret. Direct `createBroker`
+  construction requires a validated deployment-bound `IdentityConfig`, not a bare string.
+  `buildBrokerServer` no longer accepts arbitrary `Partial<BrokerOptions>` overrides that could
+  replace identity, replay, database, provider, or egress configuration; its second argument is
+  restricted at type and runtime to the documented code hooks. Custom `ReplayStore`
+  implementations must now provide `ready()`; the in-memory `ReplayGuard` deliberately reports not
+  ready and is not a production store. Upgrade the trusted minter first, then broker replicas;
+  weak/reused legacy keys require a drained maintenance cutover. Signing-key rotation is a
+  two-rollout pre-stage/activate sequence, with retirement after the conservative 6m30s maximum-token
+  plus cluster-skew horizon. See the deployment guide for the exact order.
 
 - Added the canonical `vision.md` product contract and an issue-specific agent workflow that loads
   live requirements, affected surfaces, edge cases, resource bounds, and acceptance evidence before

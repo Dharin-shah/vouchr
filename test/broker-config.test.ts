@@ -11,7 +11,7 @@ import { channelOwner } from '../src/core/owner';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { createVouchr } from '../src/adapters/bolt';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -71,7 +71,7 @@ async function makeConfigBroker(t: TestContext) {
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
-  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, channelConfig, channelTools });
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig, channelTools });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, db, vault, channelConfig, channelTools, port: (server.address() as any).port };
 }
@@ -128,7 +128,7 @@ const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAd
 // exactly one canonical absolute pathname so those parsers cannot disagree about what is mounted.
 test('#211 createBroker: only a canonical callback pathname is accepted and the accepted path routes', async (t) => {
   const db = await openTestDb(t);
-  const opts = { providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET, baseUrl: 'https://broker.example' };
+  const opts = { providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
   for (const callbackPath of INVALID_CALLBACK_PATHS) {
     assert.throws(
       () => createBroker({ ...opts, callbackPath }),
@@ -282,7 +282,7 @@ test('admin config routes validate input and require the stores to be enabled', 
 
   // A broker with neither store wired refuses the writes (fail closed), but still reads config (all defaults).
   const db = await openTestDb(t);
-  const bare = createBroker({ providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET });
+  const bare = createBroker({ providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET) });
   await new Promise<void>((r) => bare.listen(0, r));
   const p2 = (bare.address() as any).port;
   try {

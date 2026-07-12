@@ -42,16 +42,15 @@ export interface BrokerCall {
 }
 
 /**
- * Mint a fresh token for `acting` and POST one request through the broker. `identity` is the shared
- * HS256 trust root: pass a bare secret string for a single-deployment/dev broker, or — matching the
- * packaged broker (#212) — an `IdentityConfig` built from `loadIdentityConfig(process.env)` so the
- * token is bound to your deployment (issuer/audience) and signed with the active key. Your minter and
- * every broker replica must share the SAME config. `brokerToken` is the optional coarse perimeter
+ * Mint a fresh token for `acting` and POST one request through the broker. `identity` is the
+ * deployment-bound `IdentityConfig` built from `loadIdentityConfig(process.env)`, so the assertion is
+ * bound to one issuer/audience and signed with the active key. Your trusted minter and every broker
+ * replica must share the same verification key set. `brokerToken` is the optional coarse perimeter
  * bearer if your broker sets one. Returns the broker's JSON response.
  */
 export async function fetchThroughBroker(
   brokerUrl: string,
-  identity: string | IdentityConfig,
+  identity: IdentityConfig,
   acting: Acting,
   call: BrokerCall,
   brokerToken?: string,

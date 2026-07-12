@@ -65,14 +65,19 @@ export const DEFAULT_SKEW_MS = 30 * 1000;
 /** Minimum identity signing-secret strength: at least 32 bytes of key material (#212). */
 export const MIN_IDENTITY_SECRET_BYTES = 32;
 
+/** Bound deployment labels and replay keys before they reach signed payloads or persistent storage. */
+const MAX_IDENTITY_LABEL_BYTES = 256;
+const MAX_IDENTITY_SECRET_BYTES = 1024;
+const MAX_JTI_BYTES = 128;
+
 /**
  * A named identity signing key. `kid` is a short, stable fingerprint of the secret ({@link identityKid}),
  * so the minter and every broker replica derive the SAME id from the SAME secret with no extra config —
  * and a broker mid-rotation can tell which key signed a token and reject an unknown one.
  */
 export interface IdentityKey {
-  kid: string;
-  secret: string;
+  readonly kid: string;
+  readonly secret: string;
 }
 
 /**
@@ -83,14 +88,20 @@ export interface IdentityKey {
  * issuer/audience/kid/iat verification; a bare `secret: string` stays legacy single-deployment mode.
  */
 export interface IdentityConfig {
-  issuer: string;
+  readonly issuer: string;
   /** The deployment id. A token minted for one audience is rejected by a broker expecting another. */
-  audience: string;
+  readonly audience: string;
   /** keys[0] signs new tokens; every key is a verify candidate (rotation overlap). Non-empty. */
-  keys: IdentityKey[];
+  readonly keys: readonly IdentityKey[];
   /** Clock-skew tolerance on iat/exp (default {@link DEFAULT_SKEW_MS}). */
-  skewMs?: number;
+  readonly skewMs?: number;
 }
+
+/** A validated snapshot always has the defaulted skew materialized. It is deep-frozen at runtime. */
+export type NormalizedIdentityConfig = IdentityConfig & { readonly skewMs: number };
+
+/** Module-private brand: only snapshots produced by the validator get the normalize-once fast path. */
+const NORMALIZED_IDENTITY_CONFIGS = new WeakSet<object>();
 
 /** A short, deterministic key id from the secret — same secret ⇒ same kid on minter and every broker. */
 export function identityKid(secret: string): string {
@@ -103,23 +114,196 @@ const PLACEHOLDER_SECRETS = new Set([
   'broker-secret', 'placeholder', 'your-secret-here', 'replace-me',
 ]);
 
+const IDENTITY_CONFIG_FIELDS = new Set<PropertyKey>(['issuer', 'audience', 'keys', 'skewMs']);
+const IDENTITY_KEY_FIELDS = new Set<PropertyKey>(['kid', 'secret']);
+
+function isPlainRecord(value: unknown): value is Record<PropertyKey, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function assertExactFields(
+  value: Record<PropertyKey, unknown>,
+  allowed: ReadonlySet<PropertyKey>,
+  required: readonly PropertyKey[],
+  label: string,
+): void {
+  if (Reflect.ownKeys(value).some((field) => !allowed.has(field))) {
+    throw new Error(`${label} contains an unknown field`);
+  }
+  for (const field of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (!descriptor || !('value' in descriptor)) throw new Error(`${label} fields must be plain data values`);
+  }
+  if (required.some((field) => !Object.hasOwn(value, field))) throw new Error(`${label} is missing a required field`);
+}
+
+function hasControlCharacters(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
+
+function assertBoundedLabel(value: unknown, label: string): asserts value is string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim() ||
+    Buffer.byteLength(value, 'utf8') > MAX_IDENTITY_LABEL_BYTES ||
+    hasControlCharacters(value)
+  ) {
+    throw new Error(`${label} must be a non-empty, bounded identifier without surrounding whitespace or control characters`);
+  }
+}
+
+function assertStrongIdentitySecretFor(secret: unknown, label: string): asserts secret is string {
+  if (typeof secret === 'string' && PLACEHOLDER_SECRETS.has(secret.trim().toLowerCase())) {
+    throw new Error(`${label} is a known placeholder value; use random key material`);
+  }
+  if (
+    typeof secret !== 'string' ||
+    !secret.trim() ||
+    Buffer.byteLength(secret, 'utf8') < MIN_IDENTITY_SECRET_BYTES ||
+    Buffer.byteLength(secret, 'utf8') > MAX_IDENTITY_SECRET_BYTES
+  ) {
+    throw new Error(
+      `${label} must be at least ${MIN_IDENTITY_SECRET_BYTES} bytes and at most ${MAX_IDENTITY_SECRET_BYTES} bytes of random key material`,
+    );
+  }
+}
+
 /**
  * Reject an identity signing secret that is too short or an obvious placeholder (#212). The signing
  * secret is the broker's trust root, so a weak one lets anyone mint accepted assertions. Enforced at
  * the env/config boundary ({@link loadIdentityConfig}), mirroring how master-key strength is validated
  * in `loadKeyring` — the low-level sign/verify helpers trust their caller, like the vault trusts its key.
  */
-export function assertStrongIdentitySecret(secret: string, label = 'identity secret'): void {
-  if (typeof secret !== 'string') {
-    throw new Error(`${label} must be at least ${MIN_IDENTITY_SECRET_BYTES} bytes of random key material`);
+export function assertStrongIdentitySecret(secret: string): void {
+  assertStrongIdentitySecretFor(secret, 'identity secret');
+}
+
+/**
+ * The one runtime boundary for programmatic and env-built identity configuration (#212). Rejects
+ * malformed/ambiguous objects, weak or mis-labelled rotation keys, and unsafe skew before any token
+ * is minted or verified. The returned clone is deep-frozen so later caller mutation cannot change a
+ * live broker's trust root or desynchronise verification from its replay-retention horizon.
+ */
+export function normalizeIdentityConfig(config: IdentityConfig): NormalizedIdentityConfig {
+  if (config && typeof config === 'object' && NORMALIZED_IDENTITY_CONFIGS.has(config)) {
+    return config as NormalizedIdentityConfig;
   }
-  // Placeholder check first so an obvious example gets a clear message even if it also happens to be
-  // long enough; then the length floor for everything else (the low-length case).
-  if (PLACEHOLDER_SECRETS.has(secret.trim().toLowerCase())) {
-    throw new Error(`${label} is a known placeholder value; use a random ${MIN_IDENTITY_SECRET_BYTES}-byte secret`);
+  if (!isPlainRecord(config)) throw new Error('identity config must be a plain object');
+  assertExactFields(config, IDENTITY_CONFIG_FIELDS, ['issuer', 'audience', 'keys'], 'identity config');
+  assertBoundedLabel(config.issuer, 'identity config issuer');
+  assertBoundedLabel(config.audience, 'identity config audience');
+
+  const rawKeys = config.keys;
+  if (!Array.isArray(rawKeys) || rawKeys.length < 1 || rawKeys.length > 2) {
+    throw new Error('identity config keys must contain one active key and at most one previous key');
   }
-  if (Buffer.byteLength(secret, 'utf8') < MIN_IDENTITY_SECRET_BYTES) {
-    throw new Error(`${label} must be at least ${MIN_IDENTITY_SECRET_BYTES} bytes of random key material`);
+  const keyIndexes = Array.from({ length: rawKeys.length }, (_, index) => index);
+  const allowedKeyIndexes = new Set<PropertyKey>(['length', ...keyIndexes.map(String)]);
+  if (
+    keyIndexes.some((index) => !Object.hasOwn(rawKeys, index)) ||
+    Reflect.ownKeys(rawKeys).some((field) => !allowedKeyIndexes.has(field))
+  ) {
+    throw new Error('identity config keys must be a dense array without extra fields');
+  }
+
+  const kids = new Set<string>();
+  const secretBytes: Buffer[] = [];
+  const keys = rawKeys.map((rawKey, index): IdentityKey => {
+    if (!isPlainRecord(rawKey)) throw new Error(`identity config key ${index + 1} must be a plain object`);
+    assertExactFields(rawKey, IDENTITY_KEY_FIELDS, ['kid', 'secret'], `identity config key ${index + 1}`);
+    assertStrongIdentitySecretFor(rawKey.secret, `identity config key ${index + 1} secret`);
+    const expectedKid = identityKid(rawKey.secret);
+    if (rawKey.kid !== expectedKid) {
+      throw new Error(`identity config key ${index + 1} kid must be the canonical fingerprint of its secret`);
+    }
+    const bytes = Buffer.from(rawKey.secret, 'utf8');
+    if (kids.has(expectedKid) || secretBytes.some((other) => other.length === bytes.length && timingSafeEqual(other, bytes))) {
+      throw new Error('identity config active and previous keys must be distinct');
+    }
+    kids.add(expectedKid);
+    secretBytes.push(bytes);
+    return Object.freeze({ kid: expectedKid, secret: rawKey.secret });
+  });
+
+  const skewMs = config.skewMs ?? DEFAULT_SKEW_MS;
+  if (!Number.isSafeInteger(skewMs) || skewMs < 0 || skewMs > DEFAULT_SKEW_MS) {
+    throw new Error(`identity config skewMs must be an integer from 0 to ${DEFAULT_SKEW_MS}`);
+  }
+
+  const normalized = Object.freeze({
+    issuer: config.issuer,
+    audience: config.audience,
+    keys: Object.freeze(keys),
+    skewMs,
+  });
+  NORMALIZED_IDENTITY_CONFIGS.add(normalized);
+  return normalized;
+}
+
+type SecretMaterial = string | Buffer;
+
+function secretBuffer(material: SecretMaterial): Buffer {
+  return Buffer.isBuffer(material) ? Buffer.from(material) : Buffer.from(material, 'utf8');
+}
+
+function addRawAndDecodedMasterKey(materials: Buffer[], raw: string | undefined): void {
+  if (!raw) return;
+  const value = raw.trim();
+  if (!value) return;
+  materials.push(Buffer.from(raw, 'utf8'));
+  if (value !== raw) materials.push(Buffer.from(value, 'utf8'));
+  const decoded = Buffer.from(value, 'base64');
+  if (decoded.length) materials.push(decoded);
+}
+
+function configuredOtherSecretBytes(env: NodeJS.ProcessEnv, explicit: readonly SecretMaterial[]): Buffer[] {
+  if (!Array.isArray(explicit) || explicit.some((value) => typeof value !== 'string' && !Buffer.isBuffer(value))) {
+    throw new Error('other secret material must contain only strings or buffers');
+  }
+  const materials = explicit.map(secretBuffer);
+  for (const [name, value] of Object.entries(env)) {
+    if (
+      value &&
+      (name === 'SLACK_SIGNING_SECRET' || name === 'VOUCHR_BROKER_TOKEN' || name.endsWith('_CLIENT_SECRET'))
+    ) {
+      materials.push(Buffer.from(value, 'utf8'));
+    }
+  }
+  addRawAndDecodedMasterKey(materials, env.VOUCHR_MASTER_KEY);
+  for (const entry of (env.VOUCHR_MASTER_KEYS ?? '').split(',')) {
+    const colon = entry.indexOf(':');
+    if (colon >= 0) addRawAndDecodedMasterKey(materials, entry.slice(colon + 1));
+  }
+  return materials;
+}
+
+/**
+ * Enforce purpose separation at every construction boundary that can see another configured secret.
+ * The comparison is byte-wise and errors are deliberately static so neither value can reach output.
+ */
+export function assertIdentityPurposeDistinct(
+  config: IdentityConfig,
+  otherSecrets: readonly SecretMaterial[],
+): void {
+  const normalized = normalizeIdentityConfig(config);
+  if (!Array.isArray(otherSecrets) || otherSecrets.some((value) => typeof value !== 'string' && !Buffer.isBuffer(value))) {
+    throw new Error('other secret material must contain only strings or buffers');
+  }
+  const otherBytes = otherSecrets.map(secretBuffer);
+  for (const identityKey of normalized.keys) {
+    const identityBytes = Buffer.from(identityKey.secret, 'utf8');
+    if (otherBytes.some((other) => other.length === identityBytes.length && timingSafeEqual(other, identityBytes))) {
+      throw new Error(
+        'identity signing keys must be distinct from the master key, broker token, provider client secrets, and Slack signing secret',
+      );
+    }
   }
 }
 
@@ -133,7 +317,10 @@ export function assertStrongIdentitySecret(secret: string, label = 'identity sec
  *  - VOUCHR_DEPLOYMENT_ID            — the audience every assertion is bound to (required).
  *  - VOUCHR_IDENTITY_ISSUER          — the issuer claim (optional; default 'vouchr').
  */
-export function loadIdentityConfig(env: NodeJS.ProcessEnv, otherSecrets: string[] = []): IdentityConfig {
+export function loadIdentityConfig(
+  env: NodeJS.ProcessEnv,
+  otherSecrets: readonly SecretMaterial[] = [],
+): NormalizedIdentityConfig {
   const active = env.VOUCHR_IDENTITY_SECRET;
   if (!active || !active.trim()) {
     throw new Error('VOUCHR_IDENTITY_SECRET is required (the HS256 secret shared with the identity-token minter)');
@@ -142,23 +329,26 @@ export function loadIdentityConfig(env: NodeJS.ProcessEnv, otherSecrets: string[
   if (!audience || !audience.trim()) {
     throw new Error('VOUCHR_DEPLOYMENT_ID is required (the deployment id every identity assertion is bound to)');
   }
-  assertStrongIdentitySecret(active, 'VOUCHR_IDENTITY_SECRET');
+  assertStrongIdentitySecretFor(active, 'VOUCHR_IDENTITY_SECRET');
   const keys: IdentityKey[] = [{ kid: identityKid(active), secret: active }];
   const previous = env.VOUCHR_IDENTITY_SECRET_PREVIOUS;
-  if (previous && previous.trim()) {
-    assertStrongIdentitySecret(previous, 'VOUCHR_IDENTITY_SECRET_PREVIOUS');
+  if (previous !== undefined) {
+    if (!previous.trim()) throw new Error('VOUCHR_IDENTITY_SECRET_PREVIOUS must not be empty when set');
+    assertStrongIdentitySecretFor(previous, 'VOUCHR_IDENTITY_SECRET_PREVIOUS');
     if (previous === active) throw new Error('VOUCHR_IDENTITY_SECRET_PREVIOUS must differ from VOUCHR_IDENTITY_SECRET');
     keys.push({ kid: identityKid(previous), secret: previous });
   }
-  // Reused-purpose guard (#212): the identity signing secret must not double as the encryption master
-  // key, the broker bearer, a provider OAuth client secret, or any other purpose — one leaked value
-  // would then break two boundaries at once. Callers pass those secrets in `otherSecrets`.
-  for (const other of otherSecrets) {
-    if (other && (other === active || other === previous)) {
-      throw new Error('VOUCHR_IDENTITY_SECRET must be distinct from the master key, broker token, and provider client secrets (no reused-purpose secrets)');
-    }
-  }
-  return { issuer: env.VOUCHR_IDENTITY_ISSUER?.trim() || 'vouchr', audience: audience.trim(), keys };
+  const issuer = env.VOUCHR_IDENTITY_ISSUER ?? 'vouchr';
+  const normalized = normalizeIdentityConfig({
+    issuer,
+    audience,
+    keys,
+  });
+
+  // Reused-purpose guard (#212): compare the actual HMAC key bytes with every colocated secret and
+  // both the raw and decoded master-key forms. Values never reach an error or log message.
+  assertIdentityPurposeDistinct(normalized, configuredOtherSecretBytes(env, otherSecrets));
+  return normalized;
 }
 
 /** Raised on any verification failure. Carries no token/secret material; the broker maps it to 401. */
@@ -202,7 +392,14 @@ export type MintIdentityInput = Pick<
  * tool surface. Mint per request; do not cache or reuse a token across calls.
  */
 export function mintIdentity(input: MintIdentityInput, key: string | IdentityConfig, ttlMs = 60_000, now = Date.now()): string {
+  const config = typeof key === 'string' ? null : normalizeIdentityConfig(key);
+  if (config && (!Number.isSafeInteger(now) || !Number.isSafeInteger(ttlMs))) {
+    throw new Error('identity token now and ttlMs must be finite safe integers');
+  }
   const lifetime = Math.min(Math.max(1, ttlMs), MAX_LIFETIME_MS);
+  if (config && !Number.isSafeInteger(now + lifetime)) {
+    throw new Error('identity token expiry must be a finite safe integer');
+  }
   const claims: IdentityClaims = {
     teamId: input.teamId,
     userId: input.userId,
@@ -218,26 +415,28 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
   // Bare secret → legacy single-deployment token (no binding). IdentityConfig → deployment-bound:
   // stamp iss/aud/iat/kid and sign with the ACTIVE key, so the broker can verify the binding + pick
   // the key by kid during rotation.
-  if (typeof key === 'string') return signIdentity(claims, key);
-  const active = key.keys[0];
-  const bound: IdentityClaims = { ...claims, iss: key.issuer, aud: key.audience, iat: now, kid: active.kid };
+  if (!config) return signIdentity(claims, key as string);
+  const active = config.keys[0];
+  const bound: IdentityClaims = { ...claims, iss: config.issuer, aud: config.audience, iat: now, kid: active.kid };
   return signIdentity(bound, active.secret);
 }
 
 /**
  * Single-use jti store. `use()` returns true if the jti is fresh (and records it until `exp`),
  * false if it was already used. May be async so a multi-instance broker can back it with a shared
- * store (e.g. Redis `SET jti 1 NX PX=<ttl-to-exp>`). Supply one via `BrokerOptions.replayStore`.
+ * store. Broker construction requires a store whose `ready()` proves that shared dependency is
+ * usable; the packaged broker uses PostgreSQL's `DbReplayStore`.
  */
 export interface ReplayStore {
   use(jti: string, exp: number): boolean | Promise<boolean>;
+  /** Prove the shared store is currently usable; production readiness fails when this rejects. */
+  ready(): Promise<void>;
 }
 
 /**
- * Default single-use jti replay guard: an in-memory per-process set.
- * ponytail: single process only. In a multi-instance broker fleet a jti can be replayed once PER
- * POD within its (<=5min) window, so single-use is NOT cluster-wide with this default — a horizontally
- * scaled broker MUST pass a shared `replayStore` (Redis SET NX PX). Upgrade path: any `ReplayStore`.
+ * Low-level in-memory replay guard for a single process or unit test. It deliberately fails
+ * `ready()` and is never the production broker default: a fleet could otherwise accept one jti once
+ * per pod.
  */
 export class ReplayGuard implements ReplayStore {
   private seen = new Map<string, number>(); // jti -> exp (epoch ms)
@@ -256,6 +455,10 @@ export class ReplayGuard implements ReplayStore {
     if (this.seen.has(jti)) return false;
     this.seen.set(jti, exp);
     return true;
+  }
+
+  async ready(): Promise<void> {
+    throw new Error('process-local replay protection is not production-ready');
   }
 }
 
@@ -287,6 +490,15 @@ function isClaims(v: unknown): v is IdentityClaims {
   );
 }
 
+function isBoundedJti(jti: string): boolean {
+  return (
+    jti.length > 0 &&
+    jti === jti.trim() &&
+    Buffer.byteLength(jti, 'utf8') <= MAX_JTI_BYTES &&
+    !hasControlCharacters(jti)
+  );
+}
+
 /**
  * Verify a minted identity token. Throws IdentityError on a bad/missing signature, a malformed or
  * incomplete payload, an expired token, an over-long lifetime (> 5min), or a replayed jti. On
@@ -298,6 +510,8 @@ export function verifyIdentity(
   opts: { replay?: ReplayGuard; now?: number } = {},
 ): IdentityClaims {
   const now = opts.now ?? Date.now();
+  if (!Number.isSafeInteger(now)) throw new IdentityError('invalid verification time');
+  const config = typeof key === 'string' ? null : normalizeIdentityConfig(key);
   if (typeof token !== 'string' || !token) throw new IdentityError('missing token');
   const dot = token.indexOf('.');
   if (dot <= 0 || dot === token.length - 1) throw new IdentityError('malformed');
@@ -319,10 +533,10 @@ export function verifyIdentity(
   // Select the verifying secret. Bare string → legacy single key. IdentityConfig → the key whose kid
   // matches the token's `kid`; an unknown kid is rejected before any signature work (#212).
   let secret: string;
-  if (typeof key === 'string') {
-    secret = key;
+  if (!config) {
+    secret = key as string;
   } else {
-    const match = claims.kid ? key.keys.find((k) => k.kid === claims.kid) : undefined;
+    const match = claims.kid ? config.keys.find((k) => k.kid === claims.kid) : undefined;
     if (!match) throw new IdentityError('unknown kid');
     secret = match.secret;
   }
@@ -333,20 +547,24 @@ export function verifyIdentity(
   const b = Buffer.from(expected);
   if (a.length !== b.length || !timingSafeEqual(a, b)) throw new IdentityError('bad signature');
 
-  const skew = typeof key === 'string' ? 0 : (key.skewMs ?? DEFAULT_SKEW_MS);
-  if (typeof key === 'string') {
+  const skew = config?.skewMs ?? 0;
+  if (!config) {
     // Legacy mode: exactly the historical time checks (no iss/aud/iat/skew).
     if (claims.exp <= now) throw new IdentityError('expired');
     if (claims.exp - now > MAX_LIFETIME_MS) throw new IdentityError('lifetime exceeds 5min');
   } else {
     // Deployment-bound mode (#212): a token minted for another deployment (aud) or minter (iss), or
     // issued in the future / with an over-long lifetime, fails BEFORE the replay check (and authz).
-    if (claims.iss !== key.issuer) throw new IdentityError('wrong issuer');
-    if (claims.aud !== key.audience) throw new IdentityError('wrong audience');
-    if (typeof claims.iat !== 'number') throw new IdentityError('missing iat');
-    if (claims.iat > now + skew) throw new IdentityError('issued in the future');
+    if (claims.iss !== config.issuer) throw new IdentityError('wrong issuer');
+    if (claims.aud !== config.audience) throw new IdentityError('wrong audience');
+    const iat = claims.iat;
+    if (typeof iat !== 'number' || !Number.isSafeInteger(iat)) throw new IdentityError('invalid iat');
+    if (!Number.isSafeInteger(claims.exp)) throw new IdentityError('invalid exp');
+    if (!isBoundedJti(claims.jti)) throw new IdentityError('invalid jti');
+    if (iat > now + skew) throw new IdentityError('issued in the future');
     if (claims.exp <= now - skew) throw new IdentityError('expired');
-    if (claims.exp - claims.iat > MAX_LIFETIME_MS) throw new IdentityError('lifetime exceeds 5min');
+    if (claims.exp <= iat) throw new IdentityError('expiry must follow issued-at');
+    if (claims.exp - iat > MAX_LIFETIME_MS) throw new IdentityError('lifetime exceeds 5min');
   }
   // Record the jti until the acceptance HORIZON (exp + skew), not exp: a token is acceptable in
   // [exp, exp+skew) under clock skew, so the replay record must live that long or a pruned jti could be
