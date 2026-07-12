@@ -208,7 +208,9 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
 async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   const { filter, dryRun } = plan;
   const rows = await selectRevocations(db, filter);
-  const scope = [`provider=${filter.provider}`, filter.teamId && `team=${filter.teamId}`, filter.userId && `user=${filter.userId}`, filter.channel && `channel=${filter.channel}`].filter(Boolean).join(' ');
+  // SEC-1: scope values came directly from argv and may be credential-shaped. Report which canonical
+  // filters were applied, never their raw values; matched stored metadata is shown in the table below.
+  const scope = ['provider', filter.teamId && 'team', filter.userId && 'user', filter.channel && 'channel'].filter(Boolean).join('+');
   console.log(`${dryRun ? 'DRY-RUN' : 'REVOKE'} ${scope}: ${rows.length} connection(s)`);
   printTable(
     ['team', 'owner_kind', 'owner', 'external_account', 'created_at'],
@@ -351,7 +353,7 @@ async function cmdDoctor(f: Flags): Promise<number> {
   return failed ? 1 : 0;
 }
 
-type PrunePlan = { cutoff: number; days: number; batch: number; dryRun: boolean };
+type PrunePlan = { cutoff: number; batch: number; dryRun: boolean };
 
 /**
  * Validate prune's arguments BEFORE any DB is opened (#208): a positive-integer `--older-than-days`
@@ -368,7 +370,7 @@ function planPrune(v: StrictValues): PrunePlan | { error: string } {
   // The cutoff must be a safe integer AND within the ECMAScript Date range (±8.64e15 ms), else
   // rendering it (dry-run output) would throw "Invalid time value" AFTER doing DB work.
   if (!Number.isSafeInteger(cutoff) || cutoff < -8_640_000_000_000_000) {
-    return { error: `--older-than-days ${days} is too large to represent a cutoff` };
+    return { error: '--older-than-days is too large to represent a cutoff' };
   }
   const batch = typeof v.batch === 'string' ? Number(v.batch) : MAX_AUDIT_PRUNE_BATCH;
   if (!Number.isSafeInteger(batch) || batch < 1 || batch > MAX_AUDIT_PRUNE_BATCH) {
@@ -376,7 +378,7 @@ function planPrune(v: StrictValues): PrunePlan | { error: string } {
   }
   const intent = destructiveIntent(v);
   if (typeof intent === 'object') return intent;
-  return { cutoff, days, batch, dryRun: intent === 'dry-run' };
+  return { cutoff, batch, dryRun: intent === 'dry-run' };
 }
 
 /** Execute a validated {@link PrunePlan}. Retention is an explicit operator choice — nothing prunes
@@ -387,11 +389,11 @@ async function runPrune(db: Db, plan: PrunePlan): Promise<number> {
     // The count is ONLY for the preview — never on the destructive path, where an exact count of a
     // huge expired set could scan the table / hit statement_timeout before the first bounded delete.
     const n = await audit.countOlderThan(plan.cutoff);
-    console.log(`DRY-RUN: ${n} audit row(s) older than ${plan.days} day(s) (before ${ts(plan.cutoff)}). Re-run with --yes to delete in batches of ${plan.batch}.`);
+    console.log(`DRY-RUN: ${n} audit row(s) before ${ts(plan.cutoff)}. Re-run with --yes to delete in bounded batches.`);
     return 0;
   }
   const deleted = await audit.pruneOlderThan(plan.cutoff, plan.batch);
-  console.log(`Pruned ${deleted} audit row(s) older than ${plan.days} day(s) (before ${ts(plan.cutoff)}), in batches of ${plan.batch}.`);
+  console.log(`Pruned ${deleted} audit row(s) before ${ts(plan.cutoff)}, in bounded batches.`);
   return 0;
 }
 

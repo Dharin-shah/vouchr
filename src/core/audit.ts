@@ -101,7 +101,7 @@ export const PRUNE_BATCH_SQL =
  *  safe, and would reach Postgres and fail as an internal error instead of a clean usage error. */
 function assertSafeCutoff(cutoffEpoch: number): void {
   if (!Number.isSafeInteger(cutoffEpoch)) {
-    throw new Error(`audit prune cutoff must be a safe integer epoch in ms, got ${cutoffEpoch}`);
+    throw new Error('audit prune cutoff must be a safe integer epoch in ms');
   }
 }
 
@@ -214,7 +214,7 @@ export class Audit {
   async pruneOlderThan(cutoffEpoch: number, batch: number = MAX_AUDIT_PRUNE_BATCH): Promise<number> {
     assertSafeCutoff(cutoffEpoch);
     if (!Number.isSafeInteger(batch) || batch < 1 || batch > MAX_AUDIT_PRUNE_BATCH) {
-      throw new Error(`audit prune batch must be an integer in 1..${MAX_AUDIT_PRUNE_BATCH}, got ${batch}`);
+      throw new Error(`audit prune batch must be an integer in 1..${MAX_AUDIT_PRUNE_BATCH}`);
     }
     let total = 0;
     for (;;) {

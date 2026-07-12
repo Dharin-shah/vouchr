@@ -273,4 +273,10 @@ test('CLI revoke does not echo a token-shaped positional or unknown-flag secret 
     assert.notEqual(res.status, 0);
     assert.doesNotMatch(res.stderr + res.stdout, /ghp_TOPSECRET/, `must not echo the secret in ${args.join(' ')}`);
   }
+
+  // Recognized flag values are untrusted too; a token pasted as --provider must not be reflected in
+  // the scope summary even though parsing succeeds and the dry-run safely matches zero rows.
+  const recognized = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', secret, '--dry-run'], { env, encoding: 'utf8' });
+  assert.equal(recognized.status, 0);
+  assert.doesNotMatch(recognized.stderr + recognized.stdout, /ghp_TOPSECRET/);
 });

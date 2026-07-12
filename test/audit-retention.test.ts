@@ -147,8 +147,8 @@ test('core Audit enforces its own bounds (public export must not accept oversize
   const now = Date.now();
   await assert.rejects(() => audit.pruneOlderThan(now, 0), new RegExp(`1..${MAX_AUDIT_PRUNE_BATCH}`));
   await assert.rejects(() => audit.pruneOlderThan(now, MAX_AUDIT_PRUNE_BATCH + 1), new RegExp(`1..${MAX_AUDIT_PRUNE_BATCH}`));
-  await assert.rejects(() => audit.pruneOlderThan(1e100, 100), /safe integer/); // unsafe cutoff, not a DB error
-  await assert.rejects(() => audit.countOlderThan(1e100), /safe integer/);
+  await assert.rejects(() => audit.pruneOlderThan(1e100, 100), (e: Error) => /safe integer/.test(e.message) && !e.message.includes('1e+100'));
+  await assert.rejects(() => audit.countOlderThan(1e100), (e: Error) => /safe integer/.test(e.message) && !e.message.includes('1e+100'));
 });
 
 test('prune CLI: only a bare --yes deletes; malformed forms are rejected without echoing input (real CLI + DB state)', async (t) => {
@@ -192,6 +192,7 @@ test('prune CLI: only a bare --yes deletes; malformed forms are rejected without
   const rDays = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'prune', '--older-than-days', '104000000', '--db', url, '--yes'], { encoding: 'utf8' });
   assert.notEqual(rDays.status, 0);
   assert.match(rDays.stderr, /too large/);
+  assert.doesNotMatch(rDays.stderr + rDays.stdout, /104000000/, 'an invalid recognized value must not be echoed');
   assert.equal(await count(), 5, 'an out-of-range days must delete nothing');
 
   // SEC-1: a token-shaped positional and an unknown flag carrying a secret must NOT be echoed.
@@ -214,4 +215,12 @@ test('prune CLI: only a bare --yes deletes; malformed forms are rejected without
   assert.equal(r.status, 0);
   assert.match(r.stdout, /Pruned 5/);
   assert.equal(await count(), 0, 'a bare --yes deletes');
+
+  // Valid recognized numeric values are not reflected either: they may have been pasted from a
+  // credential field, and the cutoff/result is sufficient operator feedback.
+  await seed5();
+  const numericSecret = '123456';
+  const rNumeric = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'prune', '--older-than-days', numericSecret, '--batch', '9876', '--db', url], { encoding: 'utf8' });
+  assert.equal(rNumeric.status, 0);
+  assert.doesNotMatch(rNumeric.stderr + rNumeric.stdout, /123456|9876/, 'recognized values must not be echoed');
 });
