@@ -226,27 +226,29 @@ test('privilege split: a DML-only role runs the runtime but is denied CREATE', a
   await assert.rejects(() => db.exec('CREATE TABLE evil (x int)'), /permission denied|insufficient/i); // no DDL
 });
 
-// Finding 5: a REAL failed v6→7 migration must roll back entirely — the cleanup (drop union_optin,
-// convert modes, stamp) is INSIDE the transaction, so a failure leaves the v6 database untouched.
-test('a failed v6→7 migration rolls back entirely: v6 marker, union_optin, and the union mode all survive', async (t) => {
+// Finding 5: a REAL failed v6→7 migration must roll back EVERY mutation — the drop, the mode
+// conversion, and the version stamp all run inside migrate()'s one transaction. Here union_optin is
+// a real TABLE (so the DROP succeeds) and a CHECK on meta.value forces the FINAL stamp to fail, so
+// the failure lands AFTER the drop + conversion — the strongest rollback proof.
+test('a failed v6→7 migration rolls back the drop, conversion, and stamp together', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url, tableExists } = await emptySchema(t);
   const raw = rawDb(t, url);
   await raw.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT, PRIMARY KEY(team_id,channel,provider))`);
-  // union_optin as a VIEW, not a table: migrate()'s `DROP TABLE IF EXISTS union_optin` then errors
-  // ("not a table") mid-transaction — a deterministic failure AFTER the baseline DDL + BEFORE stamp.
-  await raw.exec(`CREATE VIEW union_optin AS SELECT 1 AS x`);
-  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  await raw.exec(`CREATE TABLE union_optin (team_id TEXT, channel_id TEXT, user_id TEXT, provider TEXT)`); // a REAL table — DROP will succeed
+  // CHECK pins value to '6', so migrate()'s final stamp of '7' violates it — the deterministic failure.
+  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (value = '6'))`);
   await raw.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T1','C1','github','union')`);
   await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','6')`);
 
-  await assert.rejects(() => migrate({ databaseUrl: url }), /is not a table|union_optin/i);
+  await assert.rejects(() => migrate({ databaseUrl: url }), /violates check constraint|check constraint/i);
 
-  // Nothing partially applied: marker still 6, union mode unchanged, union_optin still present, and
-  // NONE of the baseline tables migrate() would have created were committed.
+  // The stamp failed LAST, so a correct migrate rolls back the earlier drop + conversion too: the
+  // union_optin table is back, the union mode is unchanged, the marker is still 6, and none of the
+  // baseline tables migrate would have created were committed.
   assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, '6');
-  assert.equal((await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1'`))?.mode, 'union');
-  assert.equal(await tableExists('union_optin'), true, 'the union_optin object survives the rollback');
+  assert.equal((await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1'`))?.mode, 'union', 'the union→per-user conversion rolled back');
+  assert.equal(await tableExists('union_optin'), true, 'the dropped union_optin table was restored by rollback');
   assert.equal(await tableExists('session_grant'), false, 'no baseline table migrate would create was committed');
 });
 
@@ -262,9 +264,11 @@ test('migrate() refuses an unsupported lineage: a v1–v5 marker, and a markerle
   await assert.rejects(() => migrate({ databaseUrl: a.url }), /schema version 3 is not supported/);
   assert.equal(await a.tableExists('connection'), false, 'a rejected lineage gets no baseline tables');
 
-  // A markerless legacy schema (vouchr tables present, no version marker) is also refused.
+  // A markerless legacy schema whose only relation is NON-`connection` (channel_config) must ALSO be
+  // refused — "fresh" means genuinely empty, not merely "no connection table".
   const b = await emptySchema(t);
   const rawB = rawDb(t, b.url);
-  await rawB.exec(`CREATE TABLE connection (id TEXT PRIMARY KEY)`);
+  await rawB.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT)`);
   await assert.rejects(() => migrate({ databaseUrl: b.url }), /unrecognized database|no schema-version marker/i);
+  assert.equal(await b.tableExists('connection'), false, 'the rejected markerless schema got no baseline tables');
 });

@@ -159,21 +159,33 @@ const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value T
  * database is to recreate it fresh, not to add historical migrations.
  */
 async function guardSchemaVersion(db: Db): Promise<void> {
-  await db.exec(META_DDL);
-  const row = await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`);
-  if (!row) {
-    // No version marker. Only a genuinely empty schema is a fresh install; a markerless schema that
-    // already carries vouchr tables is a pre-marker legacy layout we won't (and can't) migrate.
-    const conn = await db.get<{ reg: string | null }>(`SELECT to_regclass('connection') AS reg`);
-    if (conn?.reg) {
+  // Probe the marker WITHOUT creating `meta` first, so a genuinely empty schema is distinguishable
+  // from a markerless legacy one. `to_regclass` returns NULL (never errors) for a missing table — a
+  // SELECT on the missing table would raise 42P01 and, since this runs inside migrate's transaction,
+  // abort it. Only read the marker row once we know `meta` exists.
+  const metaReg = (await db.get<{ reg: string | null }>(`SELECT to_regclass('meta') AS reg`))?.reg;
+  const marker = metaReg
+    ? await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`)
+    : undefined;
+  if (!marker) {
+    // No version marker. A fresh install requires a genuinely EMPTY schema — reject a markerless
+    // schema that already holds ANY relation (connection, channel_config, audit, a view, …): it is a
+    // pre-marker legacy layout this build never created and cannot correctly migrate. `meta` itself
+    // is excluded (it may exist empty, and we create it just below for a truly fresh schema).
+    const rel = await db.get<{ n: number }>(
+      `SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema = current_schema() AND table_name <> 'meta'`,
+    );
+    if ((rel?.n ?? 0) > 0) {
       throw new Error(
-        'vouchr: unrecognized database — vouchr tables are present but there is no schema-version ' +
-          'marker (a pre-marker legacy layout). Vouchr is PostgreSQL-only and greenfield; recreate a ' +
-          'fresh database and run `vouchr migrate`.',
+        'vouchr: unrecognized database — the schema already contains relations but has no schema-version ' +
+          'marker (a pre-marker legacy layout). Vouchr is PostgreSQL-only and greenfield; migrate into a ' +
+          'fresh, empty database.',
       );
     }
-    return; // fresh → migrate() creates the baseline and stamps SCHEMA_VERSION
+    await db.exec(META_DDL); // fresh → ensure the marker table exists for the version stamp
+    return; // migrate() creates the baseline and stamps SCHEMA_VERSION
   }
+  const row = marker;
   const found = Number(row.value);
   if (!Number.isInteger(found)) throw new Error(`vouchr: unreadable schema_version "${row.value}".`);
   if (found > SCHEMA_VERSION) {
