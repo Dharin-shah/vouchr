@@ -1,4 +1,4 @@
-import type { Provider } from './providers';
+import { LOOPBACK, type Provider } from './providers';
 import type { Vault, StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
@@ -77,7 +77,6 @@ export type EventSink = (e: VouchrEvent) => void;
  *  - `acting`: the human who triggered this request (audit attribution), even when a
  *    shared channel credential is used. A shared cred never launders away who acted.
  */
-const LOOPBACK = new Set(['127.0.0.1', '::1', 'localhost']);
 
 /**
  * Egress allowlist / policy rejection — the requested target failed a gate BEFORE any secret was read.

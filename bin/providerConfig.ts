@@ -1,5 +1,12 @@
 import { readFileSync } from 'node:fs';
-import { defineProvider, isCanonicalPath, canonicalMethod, type Provider } from '../src/core/providers';
+import {
+  defineProvider,
+  isCanonicalPath,
+  canonicalMethod,
+  providerEnvKey,
+  assertNoProviderCollisions,
+  type Provider,
+} from '../src/core/providers';
 
 /**
  * Declarative provider config for the headless broker: an operator declares providers via env/JSON
@@ -9,18 +16,25 @@ import { defineProvider, isCanonicalPath, canonicalMethod, type Provider } from 
  * not the JSON: `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` (id upper-cased, non-alnum → _).
  */
 const ALLOWED = new Set([
-  'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault',
-  'egressAllow', 'egressPaths', 'egressMethods', 'refresh', 'pkce', 'tokenAuth', 'bodyFormat',
+  'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault', 'scopeDescriptions',
+  'egressAllow', 'egressPaths', 'egressMethods', 'egressResponse', 'rateLimit', 'refresh', 'pkce',
+  'publicClient', 'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth',
   'mcp', // #65 /v1/mcp opt-in: { paths: string[], allowContentTypes?: string[] }
   'approval', // #113 human-in-the-loop approval: { methods?, paths?, approver: 'self'|'admin', ttlMs? }
 ]);
 
-function envKey(id: string): string {
-  return id.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
-}
-
 function isStringArray(v: unknown): v is string[] {
   return Array.isArray(v) && v.every((x) => typeof x === 'string');
+}
+
+/** A plain (non-array, non-null) object — the shape of scopeDescriptions/authorizeParams/egressResponse/rateLimit. */
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+/** A `Record<string, string>` — scopeDescriptions and authorizeParams both require all-string values. */
+function isStringRecord(v: unknown): v is Record<string, string> {
+  return isPlainObject(v) && Object.values(v).every((x) => typeof x === 'string');
 }
 
 function assertOneOf(entry: any, field: string, allowed: readonly string[]): void {
@@ -51,8 +65,23 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
   assertOneOf(entry, 'refresh', ['rotating', 'static', 'none']);
   assertOneOf(entry, 'tokenAuth', ['body', 'basic']);
   assertOneOf(entry, 'bodyFormat', ['form', 'json']);
-  if (entry.pkce != null && typeof entry.pkce !== 'boolean') {
-    throw new Error(`provider config: "${entry.id}" field "pkce" must be a boolean`);
+  assertOneOf(entry, 'revokeAuth', ['none', 'body']);
+  for (const b of ['pkce', 'publicClient'] as const) {
+    if (entry[b] != null && typeof entry[b] !== 'boolean') {
+      throw new Error(`provider config: "${entry.id}" field "${b}" must be a boolean`);
+    }
+  }
+  // revokeUrl is a plain string here; defineProvider enforces https / no-userinfo / no-port on it
+  // (the revoke POST carries the live token + client secret and is not behind the egress gate).
+  if (entry.revokeUrl != null && (typeof entry.revokeUrl !== 'string' || !entry.revokeUrl.trim())) {
+    throw new Error(`provider config: "${entry.id}" field "revokeUrl" must be a non-empty string`);
+  }
+  // scopeDescriptions + authorizeParams are Record<string,string>. defineProvider additionally rejects
+  // reserved OAuth keys in authorizeParams (state/redirect_uri/…); the loader only shape-checks here.
+  for (const rec of ['scopeDescriptions', 'authorizeParams'] as const) {
+    if (entry[rec] != null && !isStringRecord(entry[rec])) {
+      throw new Error(`provider config: "${entry.id}" field "${rec}" must be an object of string values`);
+    }
   }
   const isKey = entry.credential === 'key';
   if (!isKey) {
@@ -120,7 +149,49 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
     }
   }
 
-  const ek = envKey(entry.id);
+  // egressResponse (finite response limits) — shape-check with a config-shaped message, unknown keys
+  // rejected; defineProvider re-validates deeply (maxBytes finite>0, content-types, header names).
+  if (entry.egressResponse != null) {
+    if (!isPlainObject(entry.egressResponse)) {
+      throw new Error(`provider config: "${entry.id}" field "egressResponse" must be an object like { "maxBytes": 1048576 }`);
+    }
+    for (const k of Object.keys(entry.egressResponse)) {
+      if (!['maxBytes', 'allowContentTypes', 'stripHeaders'].includes(k)) {
+        throw new Error(`provider config: "${entry.id}" field "egressResponse" has unknown key "${k}" — allowed: maxBytes, allowContentTypes, stripHeaders`);
+      }
+    }
+    if (entry.egressResponse.maxBytes != null && typeof entry.egressResponse.maxBytes !== 'number') {
+      throw new Error(`provider config: "${entry.id}" field "egressResponse.maxBytes" must be a number`);
+    }
+    for (const arr of ['allowContentTypes', 'stripHeaders'] as const) {
+      if (entry.egressResponse[arr] != null && !isStringArray(entry.egressResponse[arr])) {
+        throw new Error(`provider config: "${entry.id}" field "egressResponse.${arr}" must be an array of strings`);
+      }
+    }
+  }
+
+  // rateLimit (finite request rate) — shape-check; defineProvider re-validates the finite>0 +
+  // effective-capacity>=1 rules that keep the token bucket from bricking or never denying.
+  if (entry.rateLimit != null) {
+    if (!isPlainObject(entry.rateLimit)) {
+      throw new Error(`provider config: "${entry.id}" field "rateLimit" must be an object like { "perMinute": 60 }`);
+    }
+    for (const k of Object.keys(entry.rateLimit)) {
+      if (k !== 'perMinute' && k !== 'burst') {
+        throw new Error(`provider config: "${entry.id}" field "rateLimit" has unknown key "${k}" — allowed: perMinute, burst`);
+      }
+    }
+    for (const n of ['perMinute', 'burst'] as const) {
+      if (entry.rateLimit[n] != null && typeof entry.rateLimit[n] !== 'number') {
+        throw new Error(`provider config: "${entry.id}" field "rateLimit.${n}" must be a number`);
+      }
+    }
+    if (entry.rateLimit.perMinute == null) {
+      throw new Error(`provider config: "${entry.id}" field "rateLimit" requires "perMinute"`);
+    }
+  }
+
+  const ek = providerEnvKey(entry.id);
   // defineProvider throws a clear error if an OAuth provider ends up without client id/secret.
   return defineProvider({
     id: entry.id,
@@ -129,15 +200,22 @@ function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {
     authorizeUrl: entry.authorizeUrl ?? '',
     tokenUrl: entry.tokenUrl ?? '',
     scopesDefault: entry.scopesDefault ?? [],
+    scopeDescriptions: entry.scopeDescriptions,
     egressAllow: entry.egressAllow,
     egressPaths: entry.egressPaths,
     egressMethods: entry.egressMethods,
+    egressResponse: entry.egressResponse,
+    rateLimit: entry.rateLimit,
     mcp: entry.mcp,
     approval: entry.approval,
     refresh: entry.refresh ?? 'none',
     pkce: entry.pkce ?? false,
+    publicClient: entry.publicClient,
+    authorizeParams: entry.authorizeParams,
     tokenAuth: entry.tokenAuth,
     bodyFormat: entry.bodyFormat,
+    revokeUrl: entry.revokeUrl,
+    revokeAuth: entry.revokeAuth,
     clientId: env[`VOUCHR_PROVIDER_${ek}_CLIENT_ID`],
     clientSecret: env[`VOUCHR_PROVIDER_${ek}_CLIENT_SECRET`],
   } as Provider);
@@ -162,17 +240,8 @@ export function loadProviders(env: NodeJS.ProcessEnv = process.env): Provider[] 
   if (env.VOUCHR_PROVIDERS) specs.push(...parseArray(env.VOUCHR_PROVIDERS, 'VOUCHR_PROVIDERS'));
 
   const providers = specs.map((s) => toProvider(s, env));
-  const seen = new Set<string>();
-  const seenEnvKey = new Map<string, string>();
-  for (const p of providers) {
-    if (seen.has(p.id)) throw new Error(`provider config: duplicate provider id "${p.id}"`);
-    seen.add(p.id);
-    // Two ids that normalize to the same VOUCHR_PROVIDER_<KEY>_CLIENT_SECRET would silently share
-    // one secret (e.g. "a.b" and "a-b" → "A_B"). Reject the collision, not just exact id dups.
-    const ek = envKey(p.id);
-    const clash = seenEnvKey.get(ek);
-    if (clash) throw new Error(`provider config: ids "${clash}" and "${p.id}" derive the same client-secret env key VOUCHR_PROVIDER_${ek}_CLIENT_*`);
-    seenEnvKey.set(ek, p.id);
-  }
+  // Duplicate ids + normalized env-key collisions (e.g. "a.b" and "a-b" → shared A_B secret) are
+  // rejected by the SAME core guard the registry uses (STR-2/STR-3), so the two paths can't disagree.
+  assertNoProviderCollisions(providers);
   return providers;
 }

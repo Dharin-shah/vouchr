@@ -338,8 +338,10 @@ prints one line: port, backend, provider ids, `allowWrites`, and `dryRun=true` w
 ### Provider config (declarative)
 
 Declare providers without editing source. Declarative fields only — a provider needing function
-fields (`inject`, `egressValidate`, `revoke`) must be registered in code. Unknown fields are
-rejected (fail closed). Secrets come from the per-provider env vars above, never the JSON:
+fields (`inject`, `egressValidate`, `revoke`, `accountProbe`) must be registered in code. Unknown
+fields are rejected (fail closed). A JSON provider goes through the **same core validator** as the
+built-in factories and any code-registered provider, so the three paths cannot disagree about OAuth,
+egress, or supported behavior. Secrets come from the per-provider env vars above, never the JSON:
 
 ```json
 [
@@ -355,8 +357,39 @@ rejected (fail closed). Secrets come from the per-provider env vars above, never
 ]
 ```
 
+The validator is strict and fail-fast at config load:
+
+- **`id`** — letters, digits, `.`, `_`, `-`, ≤ 63 chars, starting alphanumeric. Duplicate ids, and
+  two ids that normalize to the same client-secret env key (`a.b` and `a-b` → `VOUCHR_PROVIDER_A_B_*`),
+  are rejected.
+- **`authorizeUrl` / `tokenUrl` / `revokeUrl`** — must be `https` (a loopback host may use `http` for
+  local testing), with no embedded credentials, fragment, or explicit non-default port. The token
+  exchange and revoke POSTs are not behind the egress gate, so a downgraded endpoint would leak the
+  code / client secret / token in cleartext — hence the check.
+- **`egressAllow`** hosts are lower-cased and must be bare hostnames (no scheme/port/path);
+  **`egressPaths`** must be absolute (`/repos`); **`egressMethods`** are normalized (`" post "` →
+  `POST`). Canonicalizing once at load means the value the injector compares at egress is exactly what
+  you wrote — no silent never-match.
+- **`authorizeParams`** may add provider-specific query params (e.g. `{"prompt": "consent"}`) but may
+  **not** carry a Vouchr-owned key (`client_id`, `redirect_uri`, `scope`, `state`, `response_type`,
+  `code_challenge`, `code_challenge_method`) — those are set by Vouchr and overriding `state`/
+  `redirect_uri` would defeat the single-use CSRF `state`.
+- The full declarative surface also includes `scopeDescriptions` (per-scope consent copy),
+  `publicClient` (PKCE-only, no secret), `revokeAuth` (`none`/`body`), `egressResponse`
+  (`maxBytes` / `allowContentTypes` / `stripHeaders`), and `rateLimit` (`perMinute` / `burst`) —
+  each validated identically to its in-code form.
+
 With no `egressMethods`, the broker default-denies non-GET/HEAD — a read-only provider. Opt into
 writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the provider.
+
+**Write/approval boundary (plain language).** Enabling writes lets the agent use the connected
+credential at the endpoints and methods you allowlisted — nothing more. A generic session approval is
+permission to *use the credential at that endpoint/method*, not transaction-level sign-off on an
+arbitrary request body: Vouchr does not inspect or fingerprint payloads. A provider that needs a human
+to confirm the specific action (an amount, a recipient) must either keep generic writes off, or the
+host must implement that confirmation with a tool-specific step — see the `approval` knob below for
+per-endpoint human-in-the-loop approval, which binds a grant to the exact method + host + path +
+query, single-use.
 
 To expose a provider on `POST /v1/mcp` (#65), declare the `mcp` knob too — it is a separate opt-in
 on top of the write gating above, and locks the reachable endpoint + response media types

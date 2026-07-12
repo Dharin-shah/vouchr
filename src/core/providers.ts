@@ -200,7 +200,175 @@ export function canonicalMethod(m: string): string | null {
   return /^[A-Z]+$/.test(t) ? t : null;
 }
 
+/**
+ * Loopback hosts exempt from the https / explicit-port rules — the "test-only local path" carve-out
+ * (#211): a mock OAuth server and a local dev broker bind `http://127.0.0.1:<port>`. The injector's
+ * egress guard uses the SAME set (STR-2), so a provider's OAuth-endpoint carve-out and its API-egress
+ * carve-out can never disagree about what "local" means. Any non-loopback host is held to https.
+ */
+// WHATWG parses an IPv6 host into a BRACKETED `url.hostname` (`new URL('http://[::1]/').hostname` ===
+// '[::1]'), so the bracketed form is what actually appears at the comparison sites; the bare '::1' is
+// kept too so a caller comparing an un-bracketed host still matches.
+export const LOOPBACK = new Set(['127.0.0.1', '::1', '[::1]', 'localhost']);
+
+/**
+ * The OAuth authorize-URL query parameters Vouchr OWNS and sets itself in `consent.begin`
+ * (client_id, redirect_uri, scope, state, response_type, PKCE challenge). A provider's
+ * `authorizeParams` must never carry one of these: overriding `state` or `redirect_uri` would
+ * defeat the single-use CSRF `state` (SEC-2) or point the code at another origin. ONE list, so the
+ * definition-time guard (below) and the render order in `consent.begin` agree by construction.
+ */
+export const RESERVED_AUTHORIZE_PARAMS = new Set([
+  'client_id', 'redirect_uri', 'scope', 'state', 'response_type', 'code_challenge', 'code_challenge_method',
+]);
+
+/**
+ * A conservative provider-id rule (#211): the id is interpolated into the client-secret env key
+ * (`providerEnvKey`), audit rows, and Slack mrkdwn — so it must be a short, boring token. Start with
+ * an alphanumeric, then alphanumerics plus `.`/`_`/`-`, ≤ 63 chars. Rejects spaces, slashes, path
+ * traversal, control chars, and unicode before any of those sinks ever sees the value.
+ */
+const PROVIDER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+export function isValidProviderId(id: string): boolean {
+  return typeof id === 'string' && PROVIDER_ID_RE.test(id);
+}
+
+/**
+ * Normalize a provider id to the client-secret env-key stem: upper-cased, every run of non-alnum
+ * collapsed to `_` (so `github` → `GITHUB`, `a.b` → `A_B`). The env loader reads
+ * `VOUCHR_PROVIDER_<stem>_CLIENT_ID/_SECRET`; because the collapse is lossy, two distinct ids can
+ * map to the same stem and silently share a secret — which is why `assertNoProviderCollisions`
+ * rejects that below. ONE derivation, shared by the loader and the collision check (STR-2).
+ */
+export function providerEnvKey(id: string): string {
+  return id.toUpperCase().replace(/[^A-Z0-9]+/g, '_');
+}
+
+/**
+ * Assert a provider OAuth endpoint (authorizeUrl / tokenUrl / revokeUrl) is safe to send credentials
+ * to (#211). The token exchange POSTs the auth code + refresh token + (confidential) client secret to
+ * `tokenUrl`, and revoke POSTs the live token to `revokeUrl` — NEITHER is behind the injector's egress
+ * https gate — so an `http://` or userinfo-bearing endpoint would leak them in cleartext. Require
+ * https (loopback may use http for local testing), and reject embedded credentials, a fragment, and an
+ * explicit non-default port (the same "ambiguous port" rule the egress guard enforces). Extracted from
+ * databricks()'s inline host check so every entry point shares one rule (STR-2/STR-3). `label`
+ * identifies the field in the error; the URL VALUE is never interpolated (it may carry a query).
+ */
+export function assertSafeHttpsUrl(raw: string, label: string): URL {
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    throw new Error(`${label} must be a valid URL.`);
+  }
+  const loopback = LOOPBACK.has(u.hostname);
+  if (u.protocol !== 'https:' && !(loopback && u.protocol === 'http:')) {
+    throw new Error(`${label} must use https (only loopback may use http for local testing).`);
+  }
+  if (u.username || u.password) throw new Error(`${label} must not contain URL credentials (userinfo).`);
+  if (u.hash) throw new Error(`${label} must not contain a URL fragment.`);
+  if (u.port !== '' && !loopback) throw new Error(`${label} must not specify an explicit port.`);
+  return u;
+}
+
+/**
+ * Validate the OAuth callback/redirect URL an adapter builds from `baseUrl` + `callbackPath` (#211).
+ * It becomes the browser redirect_uri AND the token-exchange redirect_uri, so it inherits the same
+ * https / no-userinfo / no-fragment safety as the provider endpoints (loopback may use http for local
+ * dev), and it must stay WITHIN the base origin — a `callbackPath` that resolves off-origin (an
+ * absolute URL) would point the authorization code at another host. ONE helper both adapters import
+ * (STR-3), so the Bolt and headless callback surfaces enforce the same rule.
+ */
+export function assertCallbackUrl(baseUrl: string, redirectUri: string): void {
+  const cb = assertSafeHttpsUrl(redirectUri, 'callback URL (baseUrl + callbackPath)');
+  let base: URL;
+  try {
+    base = new URL(baseUrl);
+  } catch {
+    throw new Error('baseUrl must be a valid URL.');
+  }
+  if (cb.origin !== base.origin) {
+    throw new Error('callbackPath must resolve within the baseUrl origin (not an absolute off-origin URL).');
+  }
+}
+
+/**
+ * Canonicalize + validate one egress-allowlist host (#211): it is compared raw against `url.hostname`
+ * (already lower-cased by WHATWG) in the injector, so a mis-cased or decorated entry silently never
+ * matches. Accept only a bare hostname — no scheme, userinfo, port, path, query, or fragment — and
+ * return it lower-cased so `egressAllow.includes(url.hostname)` works regardless of how it was written.
+ */
+export function canonicalEgressHost(host: string, id: string): string {
+  if (typeof host !== 'string' || !host.trim()) {
+    throw new Error(`Provider "${id}" has an invalid egressAllow host: must be a non-empty hostname.`);
+  }
+  let u: URL;
+  try {
+    u = new URL(`https://${host}`);
+  } catch {
+    throw new Error(`Provider "${id}" has an invalid egressAllow host ${JSON.stringify(host)}: not a bare hostname.`);
+  }
+  if (u.username || u.password || u.port || u.pathname !== '/' || u.search || u.hash || u.hostname !== host.toLowerCase()) {
+    throw new Error(`Provider "${id}" has an invalid egressAllow host ${JSON.stringify(host)}: use a bare hostname with no scheme, port, or path.`);
+  }
+  return u.hostname;
+}
+
+/**
+ * Reject duplicate provider ids AND normalized env-key collisions across a provider set (#211). Two
+ * ids that collapse to the same `providerEnvKey` (e.g. `a.b` and `a-b` → `A_B`) would silently share
+ * one `VOUCHR_PROVIDER_A_B_CLIENT_SECRET`. ONE guard, imported by BOTH the registry (programmatic /
+ * built-in registration) and the env loader (STR-2/STR-3) so neither path can register a colliding
+ * pair the other would catch.
+ */
+export function assertNoProviderCollisions(providers: Pick<Provider, 'id'>[]): void {
+  const seen = new Set<string>();
+  const seenEnvKey = new Map<string, string>();
+  for (const p of providers) {
+    if (seen.has(p.id)) throw new Error(`duplicate provider id "${p.id}"`);
+    seen.add(p.id);
+    const ek = providerEnvKey(p.id);
+    const clash = seenEnvKey.get(ek);
+    if (clash) throw new Error(`provider ids "${clash}" and "${p.id}" derive the same client-secret env key VOUCHR_PROVIDER_${ek}_CLIENT_*`);
+    seenEnvKey.set(ek, p.id);
+  }
+}
+
 export function defineProvider(spec: Provider): Provider {
+  // The id is the first thing every downstream sink (env key, audit, mrkdwn) reads, so validate it
+  // before any other check can interpolate it into an error message (#211, SEC-4).
+  if (!isValidProviderId(spec.id)) {
+    throw new Error(
+      `Provider id ${JSON.stringify(spec.id)} is invalid: use ≤63 chars of letters, digits, '.', '_', or '-', starting alphanumeric.`,
+    );
+  }
+  // Canonicalize the egress allowlist once, here, so the normalized value is what the injector
+  // compares at request time (#211): a mis-cased/decorated host would otherwise silently never match
+  // url.hostname. Reject anything that isn't a bare hostname; store the lower-cased form.
+  if (spec.egressAllow) spec.egressAllow = spec.egressAllow.map((h) => canonicalEgressHost(h, spec.id));
+  // egressPaths / egressMethods are security locks compared at egress; validate + normalize them at
+  // definition with the SAME rules as approval.paths/methods (STR-2) so a fail-open form (a relative
+  // path, a trailing-space method) is rejected here instead of silently never matching at runtime.
+  if (spec.egressPaths) {
+    for (const p of spec.egressPaths) {
+      if (!isCanonicalPath(p)) throw new Error(`Provider "${spec.id}" has an invalid egressPaths entry ${JSON.stringify(p)}: must be an absolute path like "/repos".`);
+    }
+  }
+  if (spec.egressMethods) {
+    spec.egressMethods = spec.egressMethods.map((m) => {
+      const c = canonicalMethod(m);
+      if (!c) throw new Error(`Provider "${spec.id}" has an invalid egressMethods entry ${JSON.stringify(m)}: must be a bare HTTP method name (e.g. "GET").`);
+      return c;
+    });
+  }
+  // A Vouchr-owned OAuth param in authorizeParams would clobber the value consent.begin sets — most
+  // dangerously the single-use `state` or `redirect_uri` (SEC-2). Reject at definition time; the
+  // render loop in consent.begin ALSO applies authorizeParams first so Vouchr's params win regardless.
+  for (const k of Object.keys(spec.authorizeParams ?? {})) {
+    if (RESERVED_AUTHORIZE_PARAMS.has(k)) {
+      throw new Error(`Provider "${spec.id}" has a reserved authorizeParams key "${k}": ${[...RESERVED_AUTHORIZE_PARAMS].join(', ')} are set by Vouchr and cannot be overridden.`);
+    }
+  }
   // A zero/negative/NaN rate limit would build a bucket that can never refill (or never denies) —
   // reject the misconfiguration at definition time rather than shipping a broken limiter.
   if (spec.rateLimit) {
@@ -284,9 +452,19 @@ export function defineProvider(spec: Provider): Provider {
     // Persist the normalized methods so the runtime predicate matches (paths must already be canonical).
     if (normMethods) spec.approval = { ...spec.approval, methods: normMethods };
   }
+  // The revoke endpoint receives the LIVE token (and, with revokeAuth:'body', the client secret) in a
+  // POST that is NOT behind the egress https gate — validate it for every provider that declares one,
+  // key providers included, since a bad revokeUrl leaks regardless of credential kind (#211, SEC-1).
+  if (spec.revokeUrl) assertSafeHttpsUrl(spec.revokeUrl, `Provider "${spec.id}" revokeUrl`);
   // Key providers carry no OAuth client. OAuth confidential clients need clientId + clientSecret;
   // a PKCE public client (publicClient:true) authenticates with the code_verifier alone → clientId only.
   if (spec.credential !== 'key') {
+    // The token exchange POSTs the auth code + client secret to tokenUrl, and the browser is redirected
+    // to authorizeUrl carrying the single-use state — neither is behind the egress gate, so an http://
+    // or userinfo-bearing endpoint leaks/downgrades them. Validate both here, at the one chokepoint
+    // every OAuth provider (built-in, code, JSON) routes through (#211, SEC-1/SEC-2).
+    assertSafeHttpsUrl(spec.authorizeUrl, `Provider "${spec.id}" authorizeUrl`);
+    assertSafeHttpsUrl(spec.tokenUrl, `Provider "${spec.id}" tokenUrl`);
     if (spec.publicClient && !spec.pkce) {
       throw new Error(
         `Provider "${spec.id}" is a public client (publicClient:true) but PKCE is disabled — a public client must use PKCE.`,
@@ -525,6 +703,10 @@ export function databricks(cfg: DatabricksConfig): Provider {
 export class ProviderRegistry {
   private map = new Map<string, Provider>();
   constructor(providers: Provider[]) {
+    // Reject duplicate ids + env-key collisions BEFORE building the map, so a colliding pair fails
+    // loudly instead of silently last-winning (a shadowed provider) or sharing a client secret. Same
+    // guard the env loader runs (STR-2), so every registration path — built-in, code, JSON — agrees.
+    assertNoProviderCollisions(providers);
     for (const p of providers) this.map.set(p.id, p);
   }
   get(id: string): Provider {

@@ -140,6 +140,75 @@ test('#113 loadProviders: canonicalizable approval methods are normalized (trim 
   assert.deepEqual(p.approval!.methods, ['POST']);
 });
 
+// #211 the remaining declarative knobs (scope descriptions, authorize params, public client, standard
+// revocation, finite request/response limits) must be env-declarable too, routing through the same
+// core validator as the built-in factories — otherwise the standalone broker can't reach them.
+test('#211 loadProviders: the expanded declarative fields load and reach the provider', () => {
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([{
+      ...CONFLUENCE,
+      scopeDescriptions: { 'read:confluence': 'Read your Confluence pages' },
+      authorizeParams: { audience: 'api.atlassian.com', prompt: 'consent' },
+      revokeUrl: 'https://auth.atlassian.com/oauth/revoke',
+      revokeAuth: 'body',
+      egressResponse: { maxBytes: 1048576, allowContentTypes: ['application/json'] },
+      rateLimit: { perMinute: 60, burst: 10 },
+    }]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid',
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+  } as any;
+  const [p] = loadProviders(env);
+  assert.deepEqual(p.scopeDescriptions, { 'read:confluence': 'Read your Confluence pages' });
+  assert.deepEqual(p.authorizeParams, { audience: 'api.atlassian.com', prompt: 'consent' });
+  assert.equal(p.revokeUrl, 'https://auth.atlassian.com/oauth/revoke');
+  assert.equal(p.revokeAuth, 'body');
+  assert.deepEqual(p.egressResponse, { maxBytes: 1048576, allowContentTypes: ['application/json'] });
+  assert.deepEqual(p.rateLimit, { perMinute: 60, burst: 10 });
+});
+
+test('#211 loadProviders: a public-client provider (no secret, PKCE-only) loads from JSON', () => {
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, publicClient: true, pkce: true }]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', // no _CLIENT_SECRET — a public client needs none
+  } as any;
+  const [p] = loadProviders(env);
+  assert.equal(p.publicClient, true);
+  assert.equal(p.clientSecret, undefined);
+});
+
+test('#211 loadProviders: an http tokenUrl / revokeUrl is rejected via the core validator (no cleartext secret)', () => {
+  const bad = (over: Record<string, unknown>) => () =>
+    loadProviders({
+      VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, ...over }]),
+      VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+    } as any);
+  assert.throws(bad({ tokenUrl: 'http://auth.atlassian.com/oauth/token' }), /tokenUrl must use https/);
+  assert.throws(bad({ revokeUrl: 'http://auth.atlassian.com/oauth/revoke' }), /revokeUrl must use https/);
+});
+
+test('#211 loadProviders: a reserved authorizeParams key (state) is rejected at load', () => {
+  const env = {
+    VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, authorizeParams: { state: 'attacker' } }]),
+    VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+  } as any;
+  assert.throws(() => loadProviders(env), /reserved authorizeParams key "state"/);
+});
+
+test('#211 loadProviders: malformed shapes for the new fields fail closed with a config-shaped message', () => {
+  const bad = (over: Record<string, unknown>) => () =>
+    loadProviders({
+      VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, ...over }]),
+      VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid', VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
+    } as any);
+  assert.throws(bad({ publicClient: 'yes' }), /field "publicClient" must be a boolean/);
+  assert.throws(bad({ revokeAuth: 'header' }), /field "revokeAuth" must be one of/);
+  assert.throws(bad({ scopeDescriptions: { x: 1 } }), /field "scopeDescriptions" must be an object of string values/);
+  assert.throws(bad({ rateLimit: { burst: 5 } }), /field "rateLimit" requires "perMinute"/);
+  assert.throws(bad({ rateLimit: { perMinute: 60, nope: 1 } }), /field "rateLimit" has unknown key "nope"/);
+  assert.throws(bad({ egressResponse: { maxBytes: 'big' } }), /field "egressResponse.maxBytes" must be a number/);
+  assert.throws(bad({ egressResponse: { nope: 1 } }), /field "egressResponse" has unknown key "nope"/);
+});
+
 // ── T6: broker-server entrypoint ─────────────────────────────────────────────
 
 async function baseEnv(t: TestContext, extra: Record<string, string> = {}): Promise<any> {

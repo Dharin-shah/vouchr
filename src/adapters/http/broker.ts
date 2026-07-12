@@ -8,7 +8,7 @@ import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
-import { ProviderRegistry, isBrokeredProvider, type Provider } from '../../core/providers';
+import { ProviderRegistry, isBrokeredProvider, assertCallbackUrl, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, ENCODED_PATH_SEPARATOR, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { safeEmit } from '../../core/safe-emit';
@@ -520,6 +520,9 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
   const callbackPath = opts.callbackPath ?? '/oauth/callback';
   const redirectUri = opts.baseUrl ? new URL(callbackPath, opts.baseUrl).toString() : undefined;
+  // When the OAuth flow is mounted (baseUrl set), the redirect_uri must be https + within the base
+  // origin (#211) — the same guard the Bolt adapter runs, so both callback surfaces agree (STR-3).
+  if (opts.baseUrl) assertCallbackUrl(opts.baseUrl, redirectUri!);
 
   // #116 safety rail: dry-run must never serve against a vault holding REAL credential rows.
   // createBroker is sync, so the async check starts here and every request (health probes excepted)

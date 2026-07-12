@@ -2,7 +2,7 @@ import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, isBrokeredProvider, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, assertCallbackUrl, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -1006,6 +1006,9 @@ export async function createVouchr(opts: VouchrOptions) {
   // opens, so a bad baseUrl can't strand an owned pool with no handle to close it.
   const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
   const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
+  // The redirect_uri handed to providers must be https + within the base origin (#211): a http:// or
+  // off-origin callback would carry the auth code in cleartext / to another host. Loopback dev is exempt.
+  assertCallbackUrl(opts.baseUrl, redirectUri);
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));

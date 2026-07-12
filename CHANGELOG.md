@@ -7,6 +7,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **One strict provider / OAuth / egress boundary** (#211). `defineProvider` is now the single core
+  validator every provider passes through — built-in factories, code registration, and broker JSON all
+  normalize to the same checked object. New, fail-fast at definition/config load: `authorizeUrl` /
+  `tokenUrl` / `revokeUrl` must be `https` (loopback may use `http` for local testing) with no
+  userinfo, fragment, or explicit port (closing a cleartext client-secret/token leak on the exchange
+  and revoke POSTs, which are not behind the egress gate); a conservative provider-`id` charset/length
+  rule; `authorizeParams` may not override a Vouchr-owned OAuth parameter (`state`, `redirect_uri`, …),
+  so the single-use CSRF `state` can't be clobbered; `egressAllow` hosts / `egressPaths` /
+  `egressMethods` are validated and canonicalized once so the injector compares exactly what was
+  declared; and the `ProviderRegistry` now rejects duplicate ids and normalized client-secret env-key
+  collisions (previously only the JSON loader did). The declarative JSON surface gains
+  `scopeDescriptions`, `authorizeParams`, `publicClient`, `revokeUrl`, `revokeAuth`, `egressResponse`,
+  and `rateLimit` (function fields stay code-only). The OAuth callback/redirect URL (baseUrl +
+  callbackPath) is likewise required to be https and within the base origin. Validation errors name
+  the field, never a secret value.
+
 - **Audit indexes + bounded retention** (#208). The `audit` table gets composite indexes (owner
   history, channel history/stats, retention) plus a partial index for the rare "who configured this"
   lookup, so those paths ride an index instead of a full scan at volume — verified with real-Postgres

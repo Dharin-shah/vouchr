@@ -92,6 +92,15 @@ function getConfig(port: number, token?: string): Promise<{ status: number; json
 // with /v1/admin/reference and Bolt's assertChannelEligible). Override to false to exercise the refusal.
 const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
 
+// #211: the callback-URL guard is actually wired into createBroker (not just unit-tested on the helper)
+// — an off-origin or non-https redirect_uri must fail construction so the OAuth code can't leave the origin.
+test('#211 createBroker: an off-origin or non-https callback is rejected at construction', async (t) => {
+  const db = await openTestDb(t);
+  const opts = { providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET, baseUrl: 'https://broker.example' };
+  assert.throws(() => createBroker({ ...opts, callbackPath: 'https://evil.example/cb' }), /within the baseUrl origin/);
+  assert.throws(() => createBroker({ ...opts, baseUrl: 'http://broker.example' }), /must use https/);
+});
+
 // (a) an admin token can set the mode, and GET /v1/admin/config reflects it.
 test('admin/mode: an admin claim sets the channel mode; GET /v1/admin/config reflects it', async (t) => {
   const { server, port } = await makeConfigBroker(t);
