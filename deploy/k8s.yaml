@@ -66,6 +66,9 @@ spec:
           # This VOUCHR_DATABASE_URL is the DML-only runtime credential (no CREATE) — distinct from
           # the schema-owner URL the vouchr-migrate Job uses. Put sslmode=require in the URL for TLS;
           # size the pool with VOUCHR_PG_POOL_MAX (a positive integer) if pg's default doesn't fit.
+          # Connection budget: each replica uses up to VOUCHR_PG_POOL_MAX (application_name=vouchr)
+          # PLUS a lazily-opened refresh pool of up to 4 (application_name=vouchr-refresh) — so plan
+          # for (VOUCHR_PG_POOL_MAX + 4) * replicas against your Postgres max_connections.
           envFrom:
             - secretRef: { name: vouchr-broker }
           env:

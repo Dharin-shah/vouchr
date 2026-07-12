@@ -150,6 +150,8 @@ test('migrate() carries a legacy v6 database to head: accepts it, drops union_op
 test('connection selection: DATABASE_URL is refused, and a hostless/malformed URL is rejected', async () => {
   assert.equal(isPostgresUrl('postgres://'), false, 'hostless postgres:// must be rejected');
   assert.equal(isPostgresUrl('postgres:///vouchr'), false, 'socket-style (no host) must be rejected');
+  assert.equal(isPostgresUrl('postgres://host'), false, 'no database name → pg uses PGDATABASE; rejected');
+  assert.equal(isPostgresUrl('postgres://host/'), false, 'empty database path → rejected');
   assert.equal(isPostgresUrl('postgres://h/db'), true);
   assert.equal(isPostgresUrl('postgresql://u:p@h:5432/db?sslmode=require'), true);
   assert.equal(isPostgresUrl('http://h/db'), false);
@@ -224,19 +226,45 @@ test('privilege split: a DML-only role runs the runtime but is denied CREATE', a
   await assert.rejects(() => db.exec('CREATE TABLE evil (x int)'), /permission denied|insufficient/i); // no DDL
 });
 
-test('migration transaction is all-or-nothing: a throw mid-transaction rolls back its DDL', async (t) => {
+// Finding 5: a REAL failed v6→7 migration must roll back entirely — the cleanup (drop union_optin,
+// convert modes, stamp) is INSIDE the transaction, so a failure leaves the v6 database untouched.
+test('a failed v6→7 migration rolls back entirely: v6 marker, union_optin, and the union mode all survive', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url, tableExists } = await emptySchema(t);
-  await migrate({ databaseUrl: url });
-  const db = await openDb({ databaseUrl: url });
-  t.after(() => db.close());
-  // The exact tx mechanism migrate() uses: a throw inside db.transaction rolls the whole thing back.
-  await assert.rejects(
-    () => db.transaction!(async (tx) => {
-      await tx.exec('CREATE TABLE half_migrated (x int)');
-      throw new Error('boom');
-    }),
-    /boom/,
-  );
-  assert.equal(await tableExists('half_migrated'), false, 'the rolled-back DDL must leave no table');
+  const raw = rawDb(t, url);
+  await raw.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT, PRIMARY KEY(team_id,channel,provider))`);
+  // union_optin as a VIEW, not a table: migrate()'s `DROP TABLE IF EXISTS union_optin` then errors
+  // ("not a table") mid-transaction — a deterministic failure AFTER the baseline DDL + BEFORE stamp.
+  await raw.exec(`CREATE VIEW union_optin AS SELECT 1 AS x`);
+  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  await raw.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T1','C1','github','union')`);
+  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','6')`);
+
+  await assert.rejects(() => migrate({ databaseUrl: url }), /is not a table|union_optin/i);
+
+  // Nothing partially applied: marker still 6, union mode unchanged, union_optin still present, and
+  // NONE of the baseline tables migrate() would have created were committed.
+  assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, '6');
+  assert.equal((await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1'`))?.mode, 'union');
+  assert.equal(await tableExists('union_optin'), true, 'the union_optin object survives the rollback');
+  assert.equal(await tableExists('session_grant'), false, 'no baseline table migrate would create was committed');
+});
+
+// Finding 1: unsupported lineages fail closed rather than being stamped v7 over an unknown shape.
+test('migrate() refuses an unsupported lineage: a v1–v5 marker, and a markerless legacy schema', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+
+  // A v3 marker (1–5 are unsupported: migrate only knows fresh / v6 / v7).
+  const a = await emptySchema(t);
+  const rawA = rawDb(t, a.url);
+  await rawA.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  await rawA.run(`INSERT INTO meta (key, value) VALUES ('schema_version','3')`);
+  await assert.rejects(() => migrate({ databaseUrl: a.url }), /schema version 3 is not supported/);
+  assert.equal(await a.tableExists('connection'), false, 'a rejected lineage gets no baseline tables');
+
+  // A markerless legacy schema (vouchr tables present, no version marker) is also refused.
+  const b = await emptySchema(t);
+  const rawB = rawDb(t, b.url);
+  await rawB.exec(`CREATE TABLE connection (id TEXT PRIMARY KEY)`);
+  await assert.rejects(() => migrate({ databaseUrl: b.url }), /unrecognized database|no schema-version marker/i);
 });

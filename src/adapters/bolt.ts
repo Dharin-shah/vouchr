@@ -1002,6 +1002,10 @@ export async function createVouchr(opts: VouchrOptions) {
   // returns). Only assertDryRunVault (which reads the vault) is post-open, and it's guarded below.
   const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
   const registry = new ProviderRegistry(opts.providers);
+  // Parse the callback/redirect URL here too (new URL throws on a malformed baseUrl) — BEFORE the pool
+  // opens, so a bad baseUrl can't strand an owned pool with no handle to close it.
+  const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
+  const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
@@ -1028,8 +1032,6 @@ export async function createVouchr(opts: VouchrOptions) {
   const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
   const policy = opts.policy ?? new Policy();
   const resolvers = opts.resolvers ?? {};
-  const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
-  const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map

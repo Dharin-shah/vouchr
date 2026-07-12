@@ -33,8 +33,10 @@ migrated (or is on a different schema version).
 - **TLS is native.** There is no separate TLS knob — put `sslmode=require` (or stricter, e.g.
   `verify-full` with `sslrootcert=`) in the connection string and the `pg` driver negotiates it.
 - **Pool size** is `VOUCHR_PG_POOL_MAX` (a validated positive integer; the driver's default of 10
-  applies when unset). Size it to your `max_connections` and replica count. The pool sets
-  `application_name=vouchr`, so it's identifiable in `pg_stat_activity`.
+  applies when unset). It caps only the MAIN pool (`application_name=vouchr`). On first token
+  refresh each replica ALSO lazily opens a separate bounded refresh pool of up to **4** connections
+  (`application_name=vouchr-refresh`), so budget **`VOUCHR_PG_POOL_MAX + 4` per replica** against
+  your Postgres `max_connections`. Both names are visible in `pg_stat_activity`.
 - **Pool shutdown.** `createVouchr(...).close()` and the async `install(...).stop()` close the pool
   **Vouchr opened**. If you inject your own `db` (see below), Vouchr does **not** close it — its
   lifecycle is yours.

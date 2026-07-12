@@ -148,22 +148,45 @@ export const SCHEMA_VERSION = 7;
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
- * Downgrade guard — runs BEFORE the schema DDL. If the DB carries a marker NEWER than this build,
- * throw and fail closed: old code writing a newer schema is the one unrecoverable failure mode (it
- * can corrupt encrypted credential rows). A missing marker means a fresh database (greenfield), and
- * an equal-or-older marker proceeds to the idempotent baseline DDL.
+ * Migration entry guard — runs BEFORE any DDL. `migrate()` implements exactly two lineages: create a
+ * fresh baseline, and carry a v6 database to v7. So the ONLY inputs it can correctly converge are:
+ *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
+ *  - a v6 database → the v6→7 cleanup;
+ *  - a v7 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v7 over an unknown shape (a v1–v5 marker,
+ * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v7 downgrade —
+ * which would let old code corrupt encrypted rows). Vouchr is greenfield: the fix for a rejected
+ * database is to recreate it fresh, not to add historical migrations.
  */
 async function guardSchemaVersion(db: Db): Promise<void> {
   await db.exec(META_DDL);
   const row = await db.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`);
-  if (!row) return;
+  if (!row) {
+    // No version marker. Only a genuinely empty schema is a fresh install; a markerless schema that
+    // already carries vouchr tables is a pre-marker legacy layout we won't (and can't) migrate.
+    const conn = await db.get<{ reg: string | null }>(`SELECT to_regclass('connection') AS reg`);
+    if (conn?.reg) {
+      throw new Error(
+        'vouchr: unrecognized database — vouchr tables are present but there is no schema-version ' +
+          'marker (a pre-marker legacy layout). Vouchr is PostgreSQL-only and greenfield; recreate a ' +
+          'fresh database and run `vouchr migrate`.',
+      );
+    }
+    return; // fresh → migrate() creates the baseline and stamps SCHEMA_VERSION
+  }
   const found = Number(row.value);
-  if (!Number.isInteger(found) || found > SCHEMA_VERSION) {
+  if (!Number.isInteger(found)) throw new Error(`vouchr: unreadable schema_version "${row.value}".`);
+  if (found > SCHEMA_VERSION) {
     throw new Error(
-      `vouchr: this database reports schema version ${row.value}, but this vouchr build supports up to ` +
-        `schema version ${SCHEMA_VERSION}. Refusing to open it: running older code against a newer schema ` +
-        `could corrupt encrypted credential rows. Upgrade the vouchr package to one that supports schema ` +
-        `version ${row.value}, or restore a database backup taken at schema version ${SCHEMA_VERSION} or older.`,
+      `vouchr: this database reports schema version ${found}, newer than this build (${SCHEMA_VERSION}). ` +
+        'Refusing to open it: old code against a newer schema could corrupt encrypted credential rows. ' +
+        'Upgrade the vouchr package.',
+    );
+  }
+  if (found !== 6 && found !== SCHEMA_VERSION) {
+    throw new Error(
+      `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
+        `version 6 or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
     );
   }
 }
