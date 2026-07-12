@@ -1,6 +1,6 @@
 import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
-import { openDb } from '../core/db';
+import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, isBrokeredProvider, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
@@ -161,10 +161,13 @@ export interface VouchrOptions {
   /** Public origin where the callback is reachable, e.g. https://abc.ngrok.io */
   baseUrl: string;
   callbackPath?: string;
-  /** SQLite file path (the zero-config default). */
-  dbPath?: string;
-  /** Postgres connection string, for stateless / multi-instance infra. Overrides dbPath. */
+  /** PostgreSQL connection string. Falls back to VOUCHR_DATABASE_URL. Vouchr is PostgreSQL-only
+   *  (#204) — no embedded/SQLite mode, no generic DATABASE_URL fallback. Ignored when `db` is given. */
   databaseUrl?: string;
+  /** A pre-opened, caller-managed store (see `openDb`). Inject one to share a single pool across a
+   *  multi-workspace host (or a test), instead of Vouchr opening its own from `databaseUrl`. When
+   *  injected, the caller owns its lifecycle — `install().stop()` will NOT close it. */
+  db?: Db;
   policy?: Policy;
   /** Bot token used only to post the "connected" confirmation back to Slack. */
   botToken?: string;
@@ -994,11 +997,28 @@ export async function createVouchr(opts: VouchrOptions) {
   // #116: external KMS makes real wrap/unwrap network calls — refuse fail-closed before opening the
   // db, so the "no real network on any edge" guarantee holds. Local master key only in dry-run.
   if (dryRun) assertDryRunLocalKey(!!opts.envelope);
-  const db = await openDb({ dbPath: opts.dbPath, databaseUrl: opts.databaseUrl });
-  // #116 safety rail: dry-run hard-fails at startup against a vault holding real credential rows.
-  if (dryRun) await assertDryRunVault(db);
+  // Validate everything that DOESN'T need the db BEFORE opening the pool, so a bad master key or
+  // provider config can't leak an owned pool (there's no handle to close it before createVouchr
+  // returns). Only assertDryRunVault (which reads the vault) is post-open, and it's guarded below.
   const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
   const registry = new ProviderRegistry(opts.providers);
+  // Parse the callback/redirect URL here too (new URL throws on a malformed baseUrl) — BEFORE the pool
+  // opens, so a bad baseUrl can't strand an owned pool with no handle to close it.
+  const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
+  const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
+  // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
+  const ownsDb = !opts.db;
+  const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
+  // #116 safety rail: dry-run hard-fails at startup against a vault holding real credential rows.
+  // Close the pool WE opened if this refuses — don't strand it (an injected db is the caller's).
+  if (dryRun) {
+    try {
+      await assertDryRunVault(db);
+    } catch (e) {
+      if (ownsDb) await db.close().catch(() => undefined);
+      throw e;
+    }
+  }
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
@@ -1012,8 +1032,6 @@ export async function createVouchr(opts: VouchrOptions) {
   const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
   const policy = opts.policy ?? new Policy();
   const resolvers = opts.resolvers ?? {};
-  const callbackPath = opts.callbackPath ?? '/vouchr/oauth/callback';
-  const redirectUri = new URL(callbackPath, opts.baseUrl).toString();
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
   const confirmClient = botToken ? new WebClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
@@ -2002,7 +2020,7 @@ export async function createVouchr(opts: VouchrOptions) {
     },
     receiver: { router: any },
     opts: { sweepIntervalMs?: number } = {},
-  ): { stop: () => void } {
+  ): { stop: () => Promise<void> } {
     app.use(middleware);
     mountRoutes(receiver.router);
     registerCommands(app);
@@ -2014,11 +2032,20 @@ export async function createVouchr(opts: VouchrOptions) {
       timer = setInterval(() => void sweep().catch(() => undefined), intervalMs);
       timer.unref(); // never keep the process alive for the sweep alone
     }
-    return { stop: () => { if (timer) clearInterval(timer); } };
+    // stop() tears down what install() started: the sweep timer, and (only if Vouchr opened it) the
+    // db pool. An injected db is the caller's to close.
+    return { stop: async () => { if (timer) clearInterval(timer); if (ownsDb) await db.close(); } };
+  }
+
+  /** Close the store pool if Vouchr opened it (a no-op for an injected db, which the caller owns).
+   *  For hosts that wire the granular methods instead of install(); install().stop() calls this too. */
+  async function close(): Promise<void> {
+    if (ownsDb) await db.close();
   }
 
   return {
     install,
+    close,
     middleware,
     mountRoutes,
     registerCommands,

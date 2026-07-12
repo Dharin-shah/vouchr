@@ -1,6 +1,6 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
-import { openDb } from '../src/core/db';
 import { ReplayGuard } from '../src/adapters/http/identity';
 import { DbReplayStore } from '../src/adapters/http/replayStore';
 
@@ -35,9 +35,9 @@ test('ReplayGuard: prune does not run within 60s of the last prune', () => {
   assert.equal(g.use('y', t0 + 5_000, t0 + 10_000), false, 'entry persists between prunes');
 });
 
-// Db path smoke test: end-to-end single-use over SQLite with the new exp index in the DDL.
-test('DbReplayStore: single-use works end-to-end on the in-memory SQLite path', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+// Db path smoke test: end-to-end single-use over Postgres against the baseline broker_jti table.
+test('DbReplayStore: single-use works end-to-end on the Postgres path', async (t) => {
+  const db = await openTestDb(t);
   const store = new DbReplayStore(db);
   const exp = Date.now() + 60_000;
   assert.equal(await store.use('jti-1', exp), true, 'fresh jti accepted');

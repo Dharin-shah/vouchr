@@ -34,7 +34,7 @@ flowchart TB
     end
 
     subgraph store["Credential store"]
-        db[("SQLite / Postgres\nencrypted token columns")]
+        db[("PostgreSQL\nencrypted token columns")]
     end
 
     subgraph ext["External services"]
@@ -66,8 +66,8 @@ Boundaries, and what crosses each:
   any tool runtime) receives a `ConnectionHandle`, never the secret
   (`src/core/injector.ts`). The handle exposes `fetch()` and `account()` only.
 - **Vouchr ↔ database.** Token material is stored encrypted (AES-256-GCM, optional
-  KMS envelope); the rest of the row and the SQLite file are not encrypted by
-  Vouchr (`src/core/crypto.ts`, `src/core/db.ts`). At-rest protection of the file
+  KMS envelope); the rest of the row and the Postgres database are not encrypted by
+  Vouchr (`src/core/crypto.ts`, `src/core/db.ts`). At-rest protection of the database
   itself is the operator's job.
 - **Vouchr ↔ external secret manager.** Two distinct integrations: `EnvelopeProvider`
   wraps/unwraps per-secret data keys (`crypto.ts`); `Resolvers` resolve a non-secret
@@ -156,16 +156,16 @@ or buggy.
 
 ### Database reader
 
-An attacker with read access to the SQLite file or Postgres.
+An attacker with read access to the Postgres database.
 
 - **Mitigated for token material.** `access_token_enc` / `refresh_token_enc` and the
   installation `bot_token`/`data` columns are AES-256-GCM encrypted with the master
   key; with an `EnvelopeProvider`, each secret has its own DEK wrapped by an external
   KEK (`crypto.ts:seal`, `vault.ts`, `installationStore.ts`).
 - **Not mitigated by Vouchr:** the rest of each row (provider id, scopes, owner key,
-  `secret_ref`, timestamps) and the SQLite file as a whole are plaintext. The master
-  key in memory/env is also out of scope here. Operator must encrypt the store at rest
-  and access-control it (SECURITY.md, "The SQLite file is not wholly encrypted at
+  `secret_ref`, timestamps) and the Postgres database as a whole are plaintext. The master
+  key in memory/env is also out of scope here. Operator must encrypt the database at rest
+  and access-control it (SECURITY.md, "The Postgres database is not wholly encrypted at
   rest"; "Operator responsibilities").
 
 ### Network redirect / egress bypass
@@ -311,7 +311,7 @@ non-goals live in [SECURITY.md -> "What Vouchr does not protect against"](../SEC
 - Raw keys typed into a Slack modal pass through Slack (prefer external references).
 - Disconnect/offboard deletes locally first; upstream revocation is best-effort.
 - Audit metadata is caller-supplied; don't put secrets in it.
-- The SQLite file is not wholly encrypted at rest.
+- The Postgres database is not wholly encrypted at rest.
 - Audit completeness is best-effort, not guaranteed (see below).
 
 ### Audit completeness is best-effort by design

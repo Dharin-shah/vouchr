@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ChannelConfig } from '../src/core/channelConfig';
@@ -42,8 +42,8 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
 
 /** A broker with BOTH channel config stores wired to the SAME in-memory db, so a config write via
  *  the admin routes is reflected by a subsequent GET /v1/admin/config read (and vice versa). */
-async function makeConfigBroker() {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeConfigBroker(t: TestContext) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
@@ -93,8 +93,8 @@ function getConfig(port: number, token?: string): Promise<{ status: number; json
 const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
 
 // (a) an admin token can set the mode, and GET /v1/admin/config reflects it.
-test('admin/mode: an admin claim sets the channel mode; GET /v1/admin/config reflects it', async () => {
-  const { server, port } = await makeConfigBroker();
+test('admin/mode: an admin claim sets the channel mode; GET /v1/admin/config reflects it', async (t) => {
+  const { server, port } = await makeConfigBroker(t);
   try {
     const before = await getConfig(port, admin());
     assert.equal(before.status, 200);
@@ -112,8 +112,8 @@ test('admin/mode: an admin claim sets the channel mode; GET /v1/admin/config ref
 });
 
 // (b) an admin token can toggle a provider in the channel's tool allowlist.
-test('admin/tools: an admin claim toggles a provider on/off; GET /v1/admin/config reflects it', async () => {
-  const { server, port } = await makeConfigBroker();
+test('admin/tools: an admin claim toggles a provider on/off; GET /v1/admin/config reflects it', async (t) => {
+  const { server, port } = await makeConfigBroker(t);
   try {
     // Disable acme -> the channel becomes an allowlist that does not include it.
     const off = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: false, identityToken: admin() });
@@ -132,8 +132,8 @@ test('admin/tools: an admin claim toggles a provider on/off; GET /v1/admin/confi
 });
 
 // (c) a NON-admin token is refused (403) on all three routes — fail closed. A forged body isAdmin is ignored.
-test('config routes fail closed: a non-admin token gets 403 on mode/tools/config (forged body isAdmin ignored)', async () => {
-  const { server, port, channelConfig } = await makeConfigBroker();
+test('config routes fail closed: a non-admin token gets 403 on mode/tools/config (forged body isAdmin ignored)', async (t) => {
+  const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
     const userTok = () => signIdentity(claims(), SECRET); // no isAdmin claim
 
@@ -154,8 +154,8 @@ test('config routes fail closed: a non-admin token gets 403 on mode/tools/config
 });
 
 // (d) channel/mode cannot be spoofed via the body — the channel written is the SIGNED one.
-test('admin/mode: channel comes from the signed claim, never the body (no spoofing)', async () => {
-  const { server, port, channelConfig } = await makeConfigBroker();
+test('admin/mode: channel comes from the signed claim, never the body (no spoofing)', async (t) => {
+  const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
     // Sign for channel C1 but stuff a different channel + team in the body — both must be ignored.
     const r = await post(port, '/v1/admin/mode', {
@@ -178,8 +178,8 @@ test('admin/mode: channel comes from the signed claim, never the body (no spoofi
 });
 
 // Guardrails: bad mode / non-boolean enabled / opt-out broker.
-test('admin config routes validate input and require the stores to be enabled', async () => {
-  const { server, port } = await makeConfigBroker();
+test('admin config routes validate input and require the stores to be enabled', async (t) => {
+  const { server, port } = await makeConfigBroker(t);
   try {
     const badMode = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'nonsense', identityToken: admin() });
     assert.equal(badMode.status, 400);
@@ -190,7 +190,7 @@ test('admin config routes validate input and require the stores to be enabled', 
   }
 
   // A broker with neither store wired refuses the writes (fail closed), but still reads config (all defaults).
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const bare = createBroker({ providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET });
   await new Promise<void>((r) => bare.listen(0, r));
   const p2 = (bare.address() as any).port;
@@ -210,8 +210,8 @@ test('admin config routes validate input and require the stores to be enabled', 
 
 // P1: flipping a channel OFF `shared` deletes the shared credential (the re-authorization boundary),
 // and it does NOT silently resurrect on a later flip back to `shared`.
-test('admin/mode: flipping shared -> per-user deletes the shared credential (no dormant resurrection)', async () => {
-  const { server, port, vault } = await makeConfigBroker();
+test('admin/mode: flipping shared -> per-user deletes the shared credential (no dormant resurrection)', async (t) => {
+  const { server, port, vault } = await makeConfigBroker(t);
   const owner = channelOwner('T1', 'C1');
   // The channel owns a shared credential + is marked shared.
   await vault.upsert(owner, 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -230,8 +230,8 @@ test('admin/mode: flipping shared -> per-user deletes the shared credential (no 
 });
 
 // P2: marking `shared` on an ineligible channel is refused (parity with /v1/admin/reference + Bolt).
-test('admin/mode: `shared` on an ineligible channel is refused (eligibility parity)', async () => {
-  const { server, port, channelConfig } = await makeConfigBroker();
+test('admin/mode: `shared` on an ineligible channel is refused (eligibility parity)', async (t) => {
+  const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
     const r = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: admin({ channelEligible: false }) });
     assert.equal(r.status, 403);
@@ -245,8 +245,8 @@ test('admin/mode: `shared` on an ineligible channel is refused (eligibility pari
 });
 
 // P3(d): a mode write emits a `config` audit row (the non-repudiation claim).
-test('admin/mode: a mode write is audited as `config` with owner:channel (non-repudiation)', async () => {
-  const { server, port, db } = await makeConfigBroker();
+test('admin/mode: a mode write is audited as `config` with owner:channel (non-repudiation)', async (t) => {
+  const { server, port, db } = await makeConfigBroker(t);
   try {
     await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'session', identityToken: admin() });
     const row = (await db.get(`SELECT user_id, channel, meta FROM audit WHERE action='config' ORDER BY at DESC LIMIT 1`)) as any;
@@ -262,8 +262,8 @@ test('admin/mode: a mode write is audited as `config` with owner:channel (non-re
 });
 
 // P3(a): the channel is the SIGNED one on /tools too — a body-supplied channel is ignored.
-test('admin/tools: channel comes from the signed claim, never the body (no spoofing)', async () => {
-  const { server, port, channelTools } = await makeConfigBroker();
+test('admin/tools: channel comes from the signed claim, never the body (no spoofing)', async (t) => {
+  const { server, port, channelTools } = await makeConfigBroker(t);
   try {
     const r = await post(port, '/v1/admin/tools', {
       provider: 'acme', enabled: false, identityToken: admin({ channel: 'C1' }),
@@ -278,8 +278,8 @@ test('admin/tools: channel comes from the signed claim, never the body (no spoof
 });
 
 // P3(b): unknown provider -> 404, service-to-service provider -> 403, on both write routes.
-test('admin config write routes reject unknown (404) and service (403) providers', async () => {
-  const { server, port } = await makeConfigBroker();
+test('admin config write routes reject unknown (404) and service (403) providers', async (t) => {
+  const { server, port } = await makeConfigBroker(t);
   try {
     const unknownMode = await post(port, '/v1/admin/mode', { provider: 'nope', mode: 'shared', identityToken: admin() });
     assert.equal(unknownMode.status, 404);
@@ -295,8 +295,8 @@ test('admin config write routes reject unknown (404) and service (403) providers
 });
 
 // P3(c): an unsigned/expired identity token -> 401 on all three routes.
-test('admin config routes reject an invalid/expired identity token (401)', async () => {
-  const { server, port } = await makeConfigBroker();
+test('admin config routes reject an invalid/expired identity token (401)', async (t) => {
+  const { server, port } = await makeConfigBroker(t);
   try {
     const badMode = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: 'not.a.token' });
     assert.equal(badMode.status, 401);
@@ -313,8 +313,8 @@ test('admin config routes reject an invalid/expired identity token (401)', async
 // (e) POST /v1/manifest — the CHANNEL-SCOPED manifest any member can read (the headless analogue of
 // Bolt's toolManifest, same core builder). This is how a headless host learns preview `visibility`
 // (a 'private' provider's output must go only to the requester), plus mode/enabled per channel.
-test('manifest: POST returns the channel-scoped manifest including preview visibility', async () => {
-  const { server, port, channelConfig } = await makeConfigBroker();
+test('manifest: POST returns the channel-scoped manifest including preview visibility', async (t) => {
+  const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
     await channelConfig.setVisibility('T1', 'C1', 'acme', 'private');
     await channelConfig.setMode('T1', 'C1', 'acme', 'session');
@@ -330,8 +330,8 @@ test('manifest: POST returns the channel-scoped manifest including preview visib
   }
 });
 
-test('manifest: POST requires a valid signed identity and reads only the claims channel', async () => {
-  const { server, port, channelConfig } = await makeConfigBroker();
+test('manifest: POST requires a valid signed identity and reads only the claims channel', async (t) => {
+  const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
     const bad = await post(port, '/v1/manifest', { identityToken: 'garbage' });
     assert.equal(bad.status, 401);

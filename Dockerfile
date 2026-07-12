@@ -6,7 +6,7 @@ ARG RUNTIME_IMAGE=node:22-bookworm-slim
 
 FROM ${BUILD_IMAGE} AS build
 WORKDIR /app
-# Install with the lockfile first for a cached dependency layer (better-sqlite3 compiles here).
+# Install with the lockfile first for a cached dependency layer.
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .

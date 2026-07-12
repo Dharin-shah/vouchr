@@ -25,7 +25,8 @@ app.event('app_mention', async ({ context, event, client }) => {
 
 (async () => {
   // 3. Vouchr in one call: middleware + OAuth callback + /vouchr command + offboarding + TTL sweep.
-  //    Defaults to SQLite (VOUCHR_DB); set VOUCHR_DATABASE_URL for Postgres.
+  //    Requires a PostgreSQL connection string in VOUCHR_DATABASE_URL. Run `npm run cli -- migrate`
+  //    once against it first — the runtime connects DML-only and never creates tables.
   const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
   vouchr.install(app, receiver);
 

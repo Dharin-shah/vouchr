@@ -53,8 +53,8 @@ export function assertDryRunFlag(v: unknown, factory: string): boolean {
 export class DryRunVaultError extends Error {
   constructor() {
     super(
-      'refusing dryRun against a vault with real credentials — point dryRun at a fresh database ' +
-        '(dbPath: ":memory:" or a dedicated test file)',
+      'refusing dryRun against a vault with real credentials — point dryRun at a fresh, ' +
+        'dedicated PostgreSQL database (an empty schema)',
     );
     this.name = 'DryRunVaultError';
   }

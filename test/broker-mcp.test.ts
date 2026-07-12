@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
@@ -58,8 +58,8 @@ function envelope(over: Record<string, unknown> = {}) {
 }
 
 /** Broker with U1's acme credential seeded and the write path opted in (MCP rides POST). */
-async function makeMcpBroker(extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeMcpBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
@@ -117,8 +117,8 @@ const sse = (data: string) => `data: ${data}\n\n`;
 
 // ── the acceptance flow: initialize → tools/list → tools/call, credential injected, never revealed ──
 
-test('#65 mcp: initialize/listTools/callTool round trip — token injected, session + protocol headers pass both ways, secret never revealed', async () => {
-  const { server, port, db } = await makeMcpBroker();
+test('#65 mcp: initialize/listTools/callTool round trip — token injected, session + protocol headers pass both ways, secret never revealed', async (t) => {
+  const { server, port, db } = await makeMcpBroker(t);
   const up = mockUpstream((_url, init) => {
     const rpc = JSON.parse(String(init.body));
     if (rpc.method === 'initialize') {
@@ -193,8 +193,8 @@ test('#65 mcp: initialize/listTools/callTool round trip — token injected, sess
 
 // ── SSE genuinely streams (not buffered): event 2 is only SENT after event 1 was RECEIVED ──
 
-test('#65 mcp: SSE passthrough is incremental — the client sees event 1 while the upstream stream is still open', async () => {
-  const { server, port } = await makeMcpBroker();
+test('#65 mcp: SSE passthrough is incremental — the client sees event 1 while the upstream stream is still open', async (t) => {
+  const { server, port } = await makeMcpBroker(t);
   let push!: (s: string | null) => void; // null = close the upstream stream
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -229,8 +229,8 @@ test('#65 mcp: SSE passthrough is incremental — the client sees event 1 while 
 
 // ── every /v1/fetch gate applies, BEFORE any byte flows ──
 
-test('#65 mcp: non-allowlisted host -> 403 before any upstream request, denied audit row matches the fetch shape', async () => {
-  const { server, port, db } = await makeMcpBroker();
+test('#65 mcp: non-allowlisted host -> 403 before any upstream request, denied audit row matches the fetch shape', async (t) => {
+  const { server, port, db } = await makeMcpBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope({ host: 'evil.example.com' }));
@@ -245,8 +245,8 @@ test('#65 mcp: non-allowlisted host -> 403 before any upstream request, denied a
   }
 });
 
-test('#65 mcp: writes off (no allowWrites) -> 405 before identity/vault/upstream', async () => {
-  const { server, port } = await makeMcpBroker({ allowWrites: false });
+test('#65 mcp: writes off (no allowWrites) -> 405 before identity/vault/upstream', async (t) => {
+  const { server, port } = await makeMcpBroker(t, { allowWrites: false });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
@@ -258,9 +258,9 @@ test('#65 mcp: writes off (no allowWrites) -> 405 before identity/vault/upstream
   }
 });
 
-test('#65 mcp: a provider without egressMethods POST stays refused even with allowWrites on', async () => {
+test('#65 mcp: a provider without egressMethods POST stays refused even with allowWrites on', async (t) => {
   const readOnly = { ...mcpAcme, egressMethods: undefined } as Provider; // no per-provider write opt-in
-  const { server, port } = await makeMcpBroker({ providers: [readOnly] });
+  const { server, port } = await makeMcpBroker(t, { providers: [readOnly] });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
@@ -272,8 +272,8 @@ test('#65 mcp: a provider without egressMethods POST stays refused even with all
   }
 });
 
-test('#65 mcp: a replayed jti is rejected on the second call (single-use identity per JSON-RPC message)', async () => {
-  const { server, port } = await makeMcpBroker();
+test('#65 mcp: a replayed jti is rejected on the second call (single-use identity per JSON-RPC message)', async (t) => {
+  const { server, port } = await makeMcpBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const env = envelope(); // ONE token, used twice
@@ -288,8 +288,8 @@ test('#65 mcp: a replayed jti is rejected on the second call (single-use identit
   }
 });
 
-test('#65 mcp: identity comes from the signed token, never the body (cross-tenant probe gets its own empty owner)', async () => {
-  const { server, port } = await makeMcpBroker();
+test('#65 mcp: identity comes from the signed token, never the body (cross-tenant probe gets its own empty owner)', async (t) => {
+  const { server, port } = await makeMcpBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     // Attacker U2 (no credential) signs their own token but stuffs U1's ids into the body.
@@ -305,9 +305,9 @@ test('#65 mcp: identity comes from the signed token, never the body (cross-tenan
   }
 });
 
-test('#65 mcp: a Policy that denies the provider in this channel -> 403, credential never injected', async () => {
+test('#65 mcp: a Policy that denies the provider in this channel -> 403, credential never injected', async (t) => {
   const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
-  const { server, port } = await makeMcpBroker({ policy });
+  const { server, port } = await makeMcpBroker(t, { policy });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
@@ -321,8 +321,8 @@ test('#65 mcp: a Policy that denies the provider in this channel -> 403, credent
 
 // ── stream ceilings: terminated, never a clean end ──
 
-test('#65 mcp: maxStreamBytes terminates the stream — client receives <= cap, socket torn down, upstream aborted', async () => {
-  const { server, port } = await makeMcpBroker({ maxStreamBytes: 64 });
+test('#65 mcp: maxStreamBytes terminates the stream — client receives <= cap, socket torn down, upstream aborted', async (t) => {
+  const { server, port } = await makeMcpBroker(t, { maxStreamBytes: 64 });
   const chunk = new TextEncoder().encode('x'.repeat(16));
   const up = mockUpstream(() => new Response(
     new ReadableStream<Uint8Array>({
@@ -345,8 +345,8 @@ test('#65 mcp: maxStreamBytes terminates the stream — client receives <= cap, 
   }
 });
 
-test('#65 mcp: maxStreamMs aborts a stream that never ends', async () => {
-  const { server, port } = await makeMcpBroker({ maxStreamMs: 80 });
+test('#65 mcp: maxStreamMs aborts a stream that never ends', async (t) => {
+  const { server, port } = await makeMcpBroker(t, { maxStreamMs: 80 });
   const up = mockUpstream(() => new Response(
     new ReadableStream<Uint8Array>({
       start(controller) {
@@ -369,9 +369,9 @@ test('#65 mcp: maxStreamMs aborts a stream that never ends', async () => {
 
 // ── #110 composition: a provider egressResponse.maxBytes stricter than the stream ceiling wins ──
 
-test('#65 mcp: provider egressResponse.maxBytes (stricter) denies with 413 before any byte is relayed', async () => {
+test('#65 mcp: provider egressResponse.maxBytes (stricter) denies with 413 before any byte is relayed', async (t) => {
   const capped = { ...mcpAcme, egressResponse: { maxBytes: 32 } } as Provider;
-  const { server, port } = await makeMcpBroker({ providers: [capped] }); // broker ceiling stays 8 MiB
+  const { server, port } = await makeMcpBroker(t, { providers: [capped] }); // broker ceiling stays 8 MiB
   const up = mockUpstream(() => new Response('x'.repeat(100), { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
@@ -386,9 +386,9 @@ test('#65 mcp: provider egressResponse.maxBytes (stricter) denies with 413 befor
 
 // ── audit parity + statelessness ──
 
-test('#65 mcp: the inject audit row is indistinguishable in shape from a /v1/fetch write (STR-4)', async () => {
+test('#65 mcp: the inject audit row is indistinguishable in shape from a /v1/fetch write (STR-4)', async (t) => {
   const writeAcme = { ...mcpAcme, egressAllow: ['mcp.acme.example', 'api.acme.example'] } as Provider;
-  const { server, port, db } = await makeMcpBroker({ providers: [writeAcme] });
+  const { server, port, db } = await makeMcpBroker(t, { providers: [writeAcme] });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     await postRaw(port, '/v1/mcp', envelope());
@@ -410,15 +410,15 @@ test('#65 mcp: the inject audit row is indistinguishable in shape from a /v1/fet
   }
 });
 
-test('#65 mcp: the broker is stateless — no MCP/session table, the session id persisted nowhere', async () => {
-  const { server, port, db } = await makeMcpBroker();
+test('#65 mcp: the broker is stateless — no MCP/session table, the session id persisted nowhere', async (t) => {
+  const { server, port, db } = await makeMcpBroker(t);
   const up = mockUpstream(() => new Response('{}', {
     status: 200, headers: { 'content-type': 'application/json', 'mcp-session-id': 'sess-STATELESS-42' },
   }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope({ headers: { 'mcp-session-id': 'sess-STATELESS-42' } }));
     assert.equal(r.headers['mcp-session-id'], 'sess-STATELESS-42', 'the id round-trips…');
-    const tables = (await db.all(`SELECT name FROM sqlite_master WHERE type='table' AND (name LIKE '%mcp%' OR name LIKE '%stream%')`)) as any[];
+    const tables = (await db.all(`SELECT table_name AS name FROM information_schema.tables WHERE table_schema = current_schema() AND (table_name LIKE '%mcp%' OR table_name LIKE '%stream%')`)) as any[];
     assert.deepEqual(tables, [], '…but no MCP/stream state table exists');
     const persisted = (await db.get(`SELECT count(*) AS n FROM audit WHERE meta LIKE '%sess-STATELESS-42%'`)) as any;
     assert.equal(persisted.n, 0, 'the session id is relayed, never stored');
@@ -428,8 +428,8 @@ test('#65 mcp: the broker is stateless — no MCP/session table, the session id 
   }
 });
 
-test('#65 mcp: a client that vanishes before headers flush is torn down cleanly — no crash, broker keeps serving', async () => {
-  const { server, port } = await makeMcpBroker();
+test('#65 mcp: a client that vanishes before headers flush is torn down cleanly — no crash, broker keeps serving', async (t) => {
+  const { server, port } = await makeMcpBroker(t);
   // Gate the upstream response so we can destroy the CLIENT socket while the broker is mid-fetch:
   // when released, the relay reaches writeHead with the client already gone. A regression that
   // rethrows out of the relay would double-writeHead in the outer catch and crash the process as
@@ -467,9 +467,9 @@ test('#65 mcp: a client that vanishes before headers flush is torn down cleanly 
 
 // ── the declarative per-provider opt-in (provider.mcp) ──
 
-test('#65 mcp: a POST-enabled provider WITHOUT the mcp knob is refused — /v1/mcp is opt-in, not implied by /v1/fetch writes', async () => {
+test('#65 mcp: a POST-enabled provider WITHOUT the mcp knob is refused — /v1/mcp is opt-in, not implied by /v1/fetch writes', async (t) => {
   const noKnob = { ...mcpAcme, mcp: undefined } as Provider; // POST-capable for /v1/fetch, NOT MCP-declared
-  const { server, port, db } = await makeMcpBroker({ providers: [noKnob] });
+  const { server, port, db } = await makeMcpBroker(t, { providers: [noKnob] });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
@@ -484,8 +484,8 @@ test('#65 mcp: a POST-enabled provider WITHOUT the mcp knob is refused — /v1/m
   }
 });
 
-test('#65 mcp: a path outside mcp.paths is refused — same matcher as egressPaths, encoded separators fail closed', async () => {
-  const { server, port } = await makeMcpBroker(); // mcpAcme declares mcp.paths: ['/mcp']
+test('#65 mcp: a path outside mcp.paths is refused — same matcher as egressPaths, encoded separators fail closed', async (t) => {
+  const { server, port } = await makeMcpBroker(t); // mcpAcme declares mcp.paths: ['/mcp']
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     for (const path of ['/admin', '/mcp-evil', '/mcp/..%2f..%2fsecrets']) {
@@ -503,8 +503,8 @@ test('#65 mcp: a path outside mcp.paths is refused — same matcher as egressPat
   }
 });
 
-test('#65 mcp: a text/plain upstream reflecting the injected Authorization is withheld unread (default content-type gate)', async () => {
-  const { server, port } = await makeMcpBroker();
+test('#65 mcp: a text/plain upstream reflecting the injected Authorization is withheld unread (default content-type gate)', async (t) => {
+  const { server, port } = await makeMcpBroker(t);
   // The review probe: an allowlisted-but-hostile MCP endpoint echoing the request Authorization
   // header into a text/plain error body. The default mcp.allowContentTypes gate must stop it.
   const up = mockUpstream((_url, init) => new Response(
@@ -537,8 +537,8 @@ test('#65 mcp: defineProvider rejects an invalid mcp knob at definition time', (
 
 // ── construction-time ceiling validation (a NaN cap would silently fail open) ──
 
-test('#65 mcp: createBroker rejects NaN/Infinity/zero/negative stream ceilings; valid values construct', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('#65 mcp: createBroker rejects NaN/Infinity/zero/negative stream ceilings; valid values construct', async (t) => {
+  const db = await openTestDb(t);
   const base = { providers: [mcpAcme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: SECRET };
   try {
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
@@ -553,8 +553,8 @@ test('#65 mcp: createBroker rejects NaN/Infinity/zero/negative stream ceilings; 
 
 // ── MCP spec: unsupported GET listening stream / DELETE termination answer 405, not 404 ──
 
-test('#65 mcp: GET and DELETE on /v1/mcp -> 405 with Allow: POST, no gates run, zero upstream hits', async () => {
-  const { server, port } = await makeMcpBroker();
+test('#65 mcp: GET and DELETE on /v1/mcp -> 405 with Allow: POST, no gates run, zero upstream hits', async (t) => {
+  const { server, port } = await makeMcpBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     for (const method of ['GET', 'DELETE']) {

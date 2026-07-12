@@ -19,7 +19,6 @@ import { sweepExpired } from '../src/core/sweep';
 import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
-import { isPostgresUrl } from '../src/core/options';
 import { loadProviders } from './providerConfig';
 
 function fail(msg: string): never {
@@ -30,7 +29,7 @@ export interface BuiltBroker {
   server: http.Server;
   db: Db;
   port: number;
-  backend: 'postgres' | 'sqlite';
+  backend: 'postgres';
   providerIds: string[];
   allowWrites: boolean;
   /** #116 dry-run: real gates, no real network on any edge (VOUCHR_DRY_RUN). */
@@ -80,8 +79,8 @@ export async function buildBrokerServer(
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
 
-  const url = env.VOUCHR_DATABASE_URL ?? env.DATABASE_URL;
-  const backend: 'postgres' | 'sqlite' = isPostgresUrl(url) ? 'postgres' : 'sqlite';
+  const url = env.VOUCHR_DATABASE_URL; // explicit only — no generic DATABASE_URL fallback (#204)
+  const backend = 'postgres' as const; // PostgreSQL-only (#204); openDb fails closed if url unset/non-PG
 
   // Optional KMS envelope — only when configured.
   let envelope: EnvelopeProvider | undefined;
@@ -104,7 +103,8 @@ export async function buildBrokerServer(
     maxAgeMs: ttlDim(env.VOUCHR_TTL_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000),
   };
 
-  const db = await openDb(backend === 'postgres' ? { databaseUrl: url } : { dbPath: env.VOUCHR_DB });
+  const db = await openDb({ databaseUrl: url });
+  try {
   // #116 startup hard-fail (createBroker re-runs the same check lazily): never dry-run a real vault.
   if (dryRun) await assertDryRunVault(db);
   const vault = new Vault(db, masterKey, ttl, envelope);
@@ -151,6 +151,10 @@ export async function buildBrokerServer(
   if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs < 0) fail(`VOUCHR_SWEEP_INTERVAL_MS invalid: ${rawInterval}`);
 
   return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, dryRun, sweep, sweepIntervalMs };
+  } catch (e) {
+    await db.close().catch(() => undefined); // boot failed after the pool opened — don't leak it
+    throw e;
+  }
 }
 
 const USAGE = `vouchr-broker — standalone headless Vouchr credential broker (no Slack)
@@ -159,7 +163,7 @@ Usage: vouchr-broker            start the broker, config from env
        vouchr-broker --help     show this message
 
 Required env: VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY (base64 of 32 bytes).
-Optional env: VOUCHR_PORT (3000), VOUCHR_DATABASE_URL|VOUCHR_DB, VOUCHR_KMS_KEY_ID,
+Optional env: VOUCHR_PORT (3000), VOUCHR_DATABASE_URL (PostgreSQL; required), VOUCHR_KMS_KEY_ID,
               VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN, VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {

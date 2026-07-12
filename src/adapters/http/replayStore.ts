@@ -8,23 +8,17 @@ import type { ReplayStore } from './identity';
  * multi-replica headless broker — the default in-memory `ReplayGuard` is per-process only.
  *
  * `use()` is atomic per row via `INSERT ... ON CONFLICT DO NOTHING`: exactly one concurrent caller
- * gets `changes === 1` (fresh), the rest get `0` (already used). Works on Postgres (production) and
- * SQLite (single-replica / tests) unchanged — `?` placeholders and `ON CONFLICT` are portable here.
+ * gets `changes === 1` (fresh), the rest get `0` (already used).
+ *
+ * The `broker_jti` table is part of the baseline schema (see `schema()` in core/db) — no DDL runs
+ * here, so two replicas constructing a store on one DB can't race `CREATE TABLE`.
  */
 export class DbReplayStore implements ReplayStore {
-  private ready: Promise<void>;
   private lastPrune = 0;
 
-  constructor(private db: Db) {
-    // exp is epoch-ms (IdentityClaims.exp). BIGINT on PG; INTEGER affinity on SQLite — both fine.
-    this.ready = db.exec(
-      `CREATE TABLE IF NOT EXISTS broker_jti (jti TEXT PRIMARY KEY, exp BIGINT NOT NULL);
-       CREATE INDEX IF NOT EXISTS idx_broker_jti_exp ON broker_jti (exp);`,
-    );
-  }
+  constructor(private db: Db) {}
 
   async use(jti: string, exp: number): Promise<boolean> {
-    await this.ready;
     const now = Date.now();
     // Opportunistic, time-gated prune keeps the table bounded by the live token window without a
     // table scan on every request. Expired jtis are safe to drop — verifyIdentity already rejects an

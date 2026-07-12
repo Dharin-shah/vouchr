@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle, ResponseBlockedError, type VouchrEvent } from '../src/core/injector';
@@ -36,8 +36,8 @@ function provider(id: string, egressResponse?: Provider['egressResponse']): Prov
   });
 }
 
-async function makeHandle(p: Provider) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeHandle(t: TestContext, p: Provider) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const owner = userOwner(U1);
   await vault.reference(owner, p.id, { source: 'ext', secretRef: 'arn:secret' });
@@ -70,11 +70,11 @@ function endlessBody(chunkBytes = 1024) {
   return { stream, getPulls: () => pulls, wasCancelled: () => cancelled };
 }
 
-test('response: oversized chunked body (no Content-Length) aborts at the cap — no partial body, stream cancelled, event + audit', async () => {
+test('response: oversized chunked body (no Content-Length) aborts at the cap — no partial body, stream cancelled, event + audit', async (t) => {
   const probe = endlessBody(1024);
   const up = stubFetch(() => new Response(probe.stream, { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
-    const { handle, db, events } = await makeHandle(provider('cap', { maxBytes: 4096 }));
+    const { handle, db, events } = await makeHandle(t, provider('cap', { maxBytes: 4096 }));
     const err = await handle.fetch('https://api.acme.example/rows').then(() => null, (e: unknown) => e);
     assert.ok(err instanceof ResponseBlockedError, `expected ResponseBlockedError, got ${String(err)}`);
     assert.equal(err.reason, 'size');
@@ -108,11 +108,11 @@ test('response: oversized chunked body (no Content-Length) aborts at the cap —
   }
 });
 
-test('response: a lying-big Content-Length fast-fails before a single body byte is read', async () => {
+test('response: a lying-big Content-Length fast-fails before a single body byte is read', async (t) => {
   const probe = endlessBody();
   const up = stubFetch(() => new Response(probe.stream, { status: 200, headers: { 'content-length': '5000' } }));
   try {
-    const { handle, db } = await makeHandle(provider('cl', { maxBytes: 100 }));
+    const { handle, db } = await makeHandle(t, provider('cl', { maxBytes: 100 }));
     const err = await handle.fetch('https://api.acme.example/rows').then(() => null, (e: unknown) => e);
     assert.ok(err instanceof ResponseBlockedError);
     assert.equal(err.reason, 'size');
@@ -126,11 +126,11 @@ test('response: a lying-big Content-Length fast-fails before a single body byte 
   }
 });
 
-test('response: disallowed content-type denies with the body unread; the header value never enters the audit', async () => {
+test('response: disallowed content-type denies with the body unread; the header value never enters the audit', async (t) => {
   const probe = endlessBody();
   const up = stubFetch(() => new Response(probe.stream, { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }));
   try {
-    const { handle, db, events } = await makeHandle(provider('ct', { allowContentTypes: ['application/json'] }));
+    const { handle, db, events } = await makeHandle(t, provider('ct', { allowContentTypes: ['application/json'] }));
     const err = await handle.fetch('https://api.acme.example/login').then(() => null, (e: unknown) => e);
     assert.ok(err instanceof ResponseBlockedError);
     assert.equal(err.reason, 'content_type');
@@ -148,11 +148,11 @@ test('response: disallowed content-type denies with the body unread; the header 
   }
 });
 
-test('response: allowContentTypes matches the bare media type exactly — params/case ignored, prefix lookalikes denied', async () => {
+test('response: allowContentTypes matches the bare media type exactly — params/case ignored, prefix lookalikes denied', async (t) => {
   let contentType = 'Application/JSON; charset=UTF-8';
   const up = stubFetch(() => new Response('{"ok":1}', { status: 200, headers: { 'content-type': contentType } }));
   try {
-    const { handle } = await makeHandle(provider('ct2', { allowContentTypes: ['application/json'] }));
+    const { handle } = await makeHandle(t, provider('ct2', { allowContentTypes: ['application/json'] }));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), { ok: 1 });
@@ -166,11 +166,11 @@ test('response: allowContentTypes matches the bare media type exactly — params
   }
 });
 
-test('response: a missing Content-Type header under allowContentTypes denies fail-closed', async () => {
+test('response: a missing Content-Type header under allowContentTypes denies fail-closed', async (t) => {
   // A BufferSource body implies no content-type (a string body would auto-set text/plain).
   const up = stubFetch(() => new Response(new TextEncoder().encode('{"ok":1}'), { status: 200 }));
   try {
-    const { handle } = await makeHandle(provider('noct', { allowContentTypes: ['application/json'] }));
+    const { handle } = await makeHandle(t, provider('noct', { allowContentTypes: ['application/json'] }));
     const err = await handle.fetch('https://api.acme.example/rows').then(() => null, (e: unknown) => e);
     assert.ok(err instanceof ResponseBlockedError, `expected ResponseBlockedError, got ${String(err)}`);
     assert.equal(err.reason, 'content_type');
@@ -179,11 +179,11 @@ test('response: a missing Content-Type header under allowContentTypes denies fai
   }
 });
 
-test('response: a body exactly AT maxBytes passes — the cap boundary is >, not >=', async () => {
+test('response: a body exactly AT maxBytes passes — the cap boundary is >, not >=', async (t) => {
   const BODY = 'x'.repeat(16);
   const up = stubFetch(() => new Response(BODY, { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
-    const { handle, events } = await makeHandle(provider('atcap', { maxBytes: 16 }));
+    const { handle, events } = await makeHandle(t, provider('atcap', { maxBytes: 16 }));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.status, 200);
     assert.equal(await res.text(), BODY);
@@ -193,10 +193,10 @@ test('response: a body exactly AT maxBytes passes — the cap boundary is >, not
   }
 });
 
-test('response: a 204 with no Content-Type passes allowContentTypes — bodyless, nothing to constrain; set-cookie still stripped', async () => {
+test('response: a 204 with no Content-Type passes allowContentTypes — bodyless, nothing to constrain; set-cookie still stripped', async (t) => {
   const up = stubFetch(() => new Response(null, { status: 204, headers: { 'set-cookie': 'sid=1' } }));
   try {
-    const { handle, db, events } = await makeHandle(provider('nc', { allowContentTypes: ['application/json'] }));
+    const { handle, db, events } = await makeHandle(t, provider('nc', { allowContentTypes: ['application/json'] }));
     const res = await handle.fetch('https://api.acme.example/rows', { method: 'GET' });
     assert.equal(res.status, 204);
     assert.equal(res.headers.get('set-cookie'), null, 'strip must still apply to bodyless responses');
@@ -207,10 +207,10 @@ test('response: a 204 with no Content-Type passes allowContentTypes — bodyless
   }
 });
 
-test('response: a HEAD response (null body) passes allowContentTypes', async () => {
+test('response: a HEAD response (null body) passes allowContentTypes', async (t) => {
   const up = stubFetch(() => new Response(null, { status: 200, headers: { 'set-cookie': 'sid=1', etag: '"v1"' } }));
   try {
-    const { handle, events } = await makeHandle(provider('hd', { allowContentTypes: ['application/json'] }));
+    const { handle, events } = await makeHandle(t, provider('hd', { allowContentTypes: ['application/json'] }));
     const res = await handle.fetch('https://api.acme.example/rows', { method: 'HEAD' });
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('etag'), '"v1"');
@@ -221,10 +221,10 @@ test('response: a HEAD response (null body) passes allowContentTypes', async () 
   }
 });
 
-test('response: a 204 under maxBytes passes — the null-body cap path never touches a reader', async () => {
+test('response: a 204 under maxBytes passes — the null-body cap path never touches a reader', async (t) => {
   const up = stubFetch(() => new Response(null, { status: 204, headers: { 'set-cookie': 'sid=1' } }));
   try {
-    const { handle, events } = await makeHandle(provider('nb', { maxBytes: 8 }));
+    const { handle, events } = await makeHandle(t, provider('nb', { maxBytes: 8 }));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.status, 204);
     assert.equal(res.headers.get('set-cookie'), null);
@@ -234,7 +234,7 @@ test('response: a 204 under maxBytes passes — the null-body cap path never tou
   }
 });
 
-test('response: .url survives reconstruction (the set-cookie strip / cap-buffer path)', async () => {
+test('response: .url survives reconstruction (the set-cookie strip / cap-buffer path)', async (t) => {
   const up = stubFetch(() => {
     const r = new Response('{}', { status: 200, headers: { 'set-cookie': 'sid=1', 'content-type': 'application/json' } });
     // Constructed Responses carry url:''; simulate the url a real undici fetch would set.
@@ -242,7 +242,7 @@ test('response: .url survives reconstruction (the set-cookie strip / cap-buffer 
     return r;
   });
   try {
-    const { handle } = await makeHandle(provider('urlkeep'));
+    const { handle } = await makeHandle(t, provider('urlkeep'));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.headers.get('set-cookie'), null, 'reconstruction must actually have happened');
     assert.equal(res.url, 'https://api.acme.example/rows');
@@ -251,13 +251,13 @@ test('response: .url survives reconstruction (the set-cookie strip / cap-buffer 
   }
 });
 
-test('response: set-cookie is stripped on a NON-opt-in provider — unconditional hardening, body intact', async () => {
+test('response: set-cookie is stripped on a NON-opt-in provider — unconditional hardening, body intact', async (t) => {
   const up = stubFetch(() => new Response('{"a":1}', {
     status: 200,
     headers: { 'set-cookie': 'sid=SESSIONSECRET; HttpOnly', 'content-type': 'application/json', 'x-keep': 'yes' },
   }));
   try {
-    const { handle, db, events } = await makeHandle(provider('plain')); // no egressResponse knob
+    const { handle, db, events } = await makeHandle(t, provider('plain')); // no egressResponse knob
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.status, 200);
     assert.equal(res.headers.get('set-cookie'), null, 'set-cookie must never reach the caller');
@@ -272,13 +272,13 @@ test('response: set-cookie is stripped on a NON-opt-in provider — unconditiona
   }
 });
 
-test('response: set-cookie is stripped from a 3xx too (redirects are manual — the 3xx object reaches the caller)', async () => {
+test('response: set-cookie is stripped from a 3xx too (redirects are manual — the 3xx object reaches the caller)', async (t) => {
   const up = stubFetch(() => new Response(null, {
     status: 302,
     headers: { location: 'https://api.acme.example/next', 'set-cookie': 'sid=abc' },
   }));
   try {
-    const { handle } = await makeHandle(provider('plain3xx'));
+    const { handle } = await makeHandle(t, provider('plain3xx'));
     const res = await handle.fetch('https://api.acme.example/old');
     assert.equal(res.status, 302);
     assert.equal(res.headers.get('set-cookie'), null);
@@ -288,7 +288,7 @@ test('response: set-cookie is stripped from a 3xx too (redirects are manual — 
   }
 });
 
-test('response: opt-in stripHeaders are removed (case-insensitive) alongside set-cookie; the rest is byte-identical', async () => {
+test('response: opt-in stripHeaders are removed (case-insensitive) alongside set-cookie; the rest is byte-identical', async (t) => {
   const BODY = '{"rows":[1,2,3],"cursor":"abc"}';
   const up = stubFetch(() => new Response(BODY, {
     status: 200,
@@ -300,7 +300,7 @@ test('response: opt-in stripHeaders are removed (case-insensitive) alongside set
     },
   }));
   try {
-    const { handle } = await makeHandle(provider('strip', { stripHeaders: ['x-internal-trace'] }));
+    const { handle } = await makeHandle(t, provider('strip', { stripHeaders: ['x-internal-trace'] }));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.headers.get('set-cookie'), null);
     assert.equal(res.headers.get('x-internal-trace'), null);
@@ -311,10 +311,10 @@ test('response: opt-in stripHeaders are removed (case-insensitive) alongside set
   }
 });
 
-test('response: a compliant response under maxBytes+allowContentTypes passes; .json() works on the buffered path', async () => {
+test('response: a compliant response under maxBytes+allowContentTypes passes; .json() works on the buffered path', async (t) => {
   const up = stubFetch(() => new Response('{"rows":[1,2,3]}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
-    const { handle, events } = await makeHandle(provider('ok', { maxBytes: 1024, allowContentTypes: ['application/json'] }));
+    const { handle, events } = await makeHandle(t, provider('ok', { maxBytes: 1024, allowContentTypes: ['application/json'] }));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res.status, 200);
     assert.deepEqual(await res.json(), { rows: [1, 2, 3] });
@@ -324,14 +324,14 @@ test('response: a compliant response under maxBytes+allowContentTypes passes; .j
   }
 });
 
-test('response: no knob + no set-cookie returns the untouched original Response (zero behavior change)', async () => {
+test('response: no knob + no set-cookie returns the untouched original Response (zero behavior change)', async (t) => {
   let original: Response | null = null;
   const up = stubFetch(() => {
     original = new Response('{"a":1}', { status: 200, headers: { 'content-type': 'application/json' } });
     return original;
   });
   try {
-    const { handle } = await makeHandle(provider('untouched'));
+    const { handle } = await makeHandle(t, provider('untouched'));
     const res = await handle.fetch('https://api.acme.example/rows');
     assert.equal(res, original, 'a compliant response with nothing to strip must pass through untouched');
   } finally {
@@ -375,8 +375,8 @@ function postJson(port: number, path: string, body: unknown): Promise<{ status: 
   });
 }
 
-test('broker: provider-level size/content-type breaches deny on the wire (413/502), body never relayed, audit written', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('broker: provider-level size/content-type breaches deny on the wire (413/502), body never relayed, audit written', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   // Caps far below the broker's own #26 defaults, so a deny here proves the INJECTOR gate fired.
@@ -422,8 +422,8 @@ test('broker: provider-level size/content-type breaches deny on the wire (413/50
   }
 });
 
-test('broker: a compliant response with set-cookie relays the body with the cookie stripped upstream of the wire', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('broker: a compliant response with set-cookie relays the body with the cookie stripped upstream of the wire', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const p = provider('acme');
   await vault.upsert(userOwner(U1), 'acme', {

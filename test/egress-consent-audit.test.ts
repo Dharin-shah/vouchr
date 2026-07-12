@@ -1,7 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -28,8 +28,8 @@ async function deniedRows(db: any): Promise<Array<{ user_id: string; provider: s
 }
 
 // (a) A refused host and a refused port each write a `denied` audit row carrying ONLY {host, reason}.
-test('egress deny: refused host + refused port each audit denied with only host+reason (no token/url)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('egress deny: refused host + refused port each audit denied with only host+reason (no token/url)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'acme', { accessToken: TOKEN, refreshToken: null, scopes: 'x', expiresAt: null, externalAccount: null });
   const handle = new ConnectionHandle(ACME, O1, ID, vault, new Audit(db));
@@ -61,8 +61,8 @@ test('egress deny: refused host + refused port each audit denied with only host+
 });
 
 // (b) The 401 -> refresh retry cancels the first (discarded) body and returns the refreshed response.
-test('401 refresh-retry: drains the discarded 401 body and returns the refreshed 200', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('401 refresh-retry: drains the discarded 401 body and returns the refreshed 200', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
   const handle = new ConnectionHandle(ACME, O1, ID, vault, new Audit(db));
@@ -93,9 +93,9 @@ test('401 refresh-retry: drains the discarded 401 body and returns the refreshed
 });
 
 // (c) A consent denial and a post-consent exchange failure each write a `denied` row for the right identity.
-test('consent deny: user denial + exchange failure each audit denied attributed to the state identity', async () => {
+test('consent deny: user denial + exchange failure each audit denied attributed to the state identity', async (t) => {
   // User clicked "Deny": ?error=access_denied, valid state, no code.
-  const db1 = await openDb({ dbPath: ':memory:' });
+  const db1 = await openTestDb(t);
   const consent1 = new Consent(db1);
   const registry = new ProviderRegistry([ACME]);
   const { state: s1 } = await consent1.begin(ID, ACME, 'https://app.example/cb', null);
@@ -111,7 +111,7 @@ test('consent deny: user denial + exchange failure each audit denied attributed 
   assert.deepEqual(r1[0].meta, { reason: 'consent_denied' });
 
   // Post-consent failure: valid code+state, but the token exchange 400s.
-  const db2 = await openDb({ dbPath: ':memory:' });
+  const db2 = await openTestDb(t);
   const consent2 = new Consent(db2);
   const { state: s2 } = await consent2.begin(ID, ACME, 'https://app.example/cb', null);
   const realFetch = globalThis.fetch;

@@ -5,6 +5,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **PostgreSQL is now the only backend** (#204). The embedded SQLite mode (`better-sqlite3`,
+  `dbPath`, `VOUCHR_DB`, `:memory:`) is removed. `openDb` requires a `postgres://` connection
+  string via `databaseUrl` or `VOUCHR_DATABASE_URL` and fails closed on a missing or non-Postgres
+  value — there is no silent embedded fallback and no generic `DATABASE_URL` fallback. Schema
+  creation moves to a separately invoked, advisory-locked `vouchr migrate` command run with a
+  schema-owner role; runtime replicas connect with a DML-only role and never create tables (`openDb`
+  verifies the schema version and fails closed if un-migrated). The schema version stays monotonic
+  (`SCHEMA_VERSION = 7`, past the pre-#204 max of 6); `migrate` carries a legacy v6 database to head,
+  dropping `union_optin` and converting stored `union` modes to `per-user`. TLS is native
+  (`sslmode=` in the URL); the pool sets `application_name`, a validated `VOUCHR_PG_POOL_MAX`, and a
+  connection lifetime. Tests and CI run against a real PostgreSQL container (`npm run pg:up`).
+  `better-sqlite3` is dropped as a dependency.
+
 ### Removed
 
 - **Union credential-borrowing removed from the production surface** (#196, breaking). The `union`

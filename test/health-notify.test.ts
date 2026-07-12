@@ -1,8 +1,9 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import type { WebClient } from '@slack/web-api';
-import { openDb, type Db } from '../src/core/db';
+import { type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -37,8 +38,8 @@ const acme = () => defineProvider({
 });
 
 /** A handle whose next fetch must refresh first (expiresAt in the past), plus the health events. */
-async function deadRefreshSetup() {
-  const db = await openDb({ dbPath: ':memory:' });
+async function deadRefreshSetup(t: TestContext) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = acme();
@@ -113,8 +114,8 @@ test('classification: 400/401 and invalid_grant are definitive; 5xx and other OA
   }
 });
 
-test('refresh_dead: a definitive token-endpoint failure fires the hook once, with identity and no token material', async () => {
-  const { handle, events } = await deadRefreshSetup();
+test('refresh_dead: a definitive token-endpoint failure fires the hook once, with identity and no token material', async (t) => {
+  const { handle, events } = await deadRefreshSetup(t);
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 })) as any;
   try {
@@ -127,13 +128,13 @@ test('refresh_dead: a definitive token-endpoint failure fires the hook once, wit
   assert.ok(!s.includes(ACCESS) && !s.includes(REFRESH), 'hook payload must carry no token material');
 });
 
-test('refresh_dead: transient failures (5xx, network throw, timeout) never fire the hook', async () => {
+test('refresh_dead: transient failures (5xx, network throw, timeout) never fire the hook', async (t) => {
   for (const boom of [
     async () => new Response('flaky', { status: 500 }),
     async () => { throw new TypeError('fetch failed'); },
     async () => { throw new DOMException('The operation timed out', 'TimeoutError'); },
   ]) {
-    const { handle, events } = await deadRefreshSetup();
+    const { handle, events } = await deadRefreshSetup(t);
     const realFetch = globalThis.fetch;
     globalThis.fetch = boom as any;
     try {
@@ -145,11 +146,14 @@ test('refresh_dead: transient failures (5xx, network throw, timeout) never fire 
   }
 });
 
-test('refresh_dead: not fired when the lock section rolls back for a non-endpoint reason', async () => {
-  const { vault, handle, events } = await deadRefreshSetup();
+test('refresh_dead: not fired when the lock section rolls back for a non-endpoint reason', async (t) => {
+  const { handle, events } = await deadRefreshSetup(t);
   // The /token call SUCCEEDS; the in-lock store write fails → the section rolls back. The refresh
   // token is NOT dead, so the hook must stay silent (only TokenEndpointError.definitive fires it).
-  (vault as any).updateTokens = async () => { throw new Error('db down'); };
+  // Stub the PROTOTYPE, not the instance: on PG withRefreshLock runs fn against a fresh tx-bound
+  // Vault, so an instance stub on the outer vault would be bypassed.
+  const realUpdate = Vault.prototype.updateTokens;
+  (Vault.prototype as any).updateTokens = async () => { throw new Error('db down'); };
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () =>
     new Response(JSON.stringify({ access_token: 'new', refresh_token: 'r2' }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
@@ -157,15 +161,16 @@ test('refresh_dead: not fired when the lock section rolls back for a non-endpoin
     await assert.rejects(() => handle.fetch('https://api.acme.example/data'), /db down/);
   } finally {
     globalThis.fetch = realFetch;
+    Vault.prototype.updateTokens = realUpdate;
   }
   assert.equal(events.length, 0);
 });
 
-test('an ASYNC, rejecting hook/sink never becomes an unhandled rejection nor affects the refresh flow', async () => {
+test('an ASYNC, rejecting hook/sink never becomes an unhandled rejection nor affects the refresh flow', async (t) => {
   // `=> void` hook signatures admit async functions (TS void-callback rule); safeEmit must attach
   // a rejection handler or these rejections kill the process. node:test dies on an unhandled
   // rejection, so this test COMPLETING is the proof the handler is attached.
-  const setup = await deadRefreshSetup();
+  const setup = await deadRefreshSetup(t);
   let hookFired = 0;
   const handle = new ConnectionHandle(
     acme(), O1, ID, setup.vault, setup.audit, {}, new Map(),
@@ -185,8 +190,8 @@ test('an ASYNC, rejecting hook/sink never becomes an unhandled rejection nor aff
   await new Promise((r) => setImmediate(r)); // drain microtasks: an unhandled rejection would be fatal here
 });
 
-test('refresh_dead: a throwing hook never masks the original refresh error', async () => {
-  const setup = await deadRefreshSetup();
+test('refresh_dead: a throwing hook never masks the original refresh error', async (t) => {
+  const setup = await deadRefreshSetup(t);
   const handle = new ConnectionHandle(
     acme(), O1, ID, setup.vault, setup.audit, {}, new Map(), () => {}, () => {}, null, undefined,
     () => { throw new Error('bad hook'); },
@@ -200,8 +205,8 @@ test('refresh_dead: a throwing hook never masks the original refresh error', asy
   }
 });
 
-test('default notifier: one DM with a reconnect ACTION button (no expirable URL); debounced across repeats and restarts; reconnect resets', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('default notifier: one DM with a reconnect ACTION button (no expirable URL); debounced across repeats and restarts; reconnect resets', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const registry = new ProviderRegistry([acme()]);
@@ -246,10 +251,10 @@ test('default notifier: one DM with a reconnect ACTION button (no expirable URL)
   }
 });
 
-test('reconnect button click mints a FRESH single-use state — works no matter how old the DM is; forged values do nothing', async () => {
+test('reconnect button click mints a FRESH single-use state — works no matter how old the DM is; forged values do nothing', async (t) => {
   // Drive the registered RECONNECT_ACTION handler through the real createVouchr wiring.
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
-  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://broker.example', dbPath: ':memory:' });
+  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://broker.example', db: await openTestDb(t) });
   const actions: Record<string, (args: any) => Promise<void>> = {};
   vouchr.registerCommands({
     command: () => {}, view: () => {},
@@ -284,8 +289,8 @@ test('reconnect button click mints a FRESH single-use state — works no matter 
   assert.equal(Number(((await vouchr.db.get(`SELECT COUNT(*) AS n FROM consent_request`)) as any).n), 0);
 });
 
-test('default notifier: a failed Slack send RELEASES the claim, so the next sweep retries', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('default notifier: a failed Slack send RELEASES the claim, so the next sweep retries', async (t) => {
+  const db = await openTestDb(t);
   const registry = new ProviderRegistry([acme()]);
   const dms: any[] = [];
   let down = true;
@@ -304,8 +309,8 @@ test('default notifier: a failed Slack send RELEASES the claim, so the next swee
   assert.match(dms[0].text, /expires in ~20h\. Reconnect to keep using it\./);
 });
 
-test('claim is atomic: concurrent duplicate events produce exactly one winner and one DM', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('claim is atomic: concurrent duplicate events produce exactly one winner and one DM', async (t) => {
+  const db = await openTestDb(t);
   const state = new NotificationState(db);
   // Store-level: two racing claims for the same (owner, provider, type) — exactly one wins.
   const [a, b] = await Promise.all([
@@ -326,8 +331,8 @@ test('claim is atomic: concurrent duplicate events produce exactly one winner an
   assert.equal(dms.length, 1);
 });
 
-test('sweep: expiring_soon carries the EARLIEST ceiling (idle vs max-age) and only fires inside the 72h window', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('sweep: expiring_soon carries the EARLIEST ceiling (idle vs max-age) and only fires inside the 72h window', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { idleMs: 80 * H, maxAgeMs: 100 * H });
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -344,7 +349,7 @@ test('sweep: expiring_soon carries the EARLIEST ceiling (idle vs max-age) and on
   assert.ok(drift < 5_000, `expiresAt must be the idle ceiling, off by ${drift}ms`);
 
   // Outside the window (fresh row, ceilings 200h/300h away) → no events at all.
-  const db2 = await openDb({ dbPath: ':memory:' });
+  const db2 = await openTestDb(t);
   const vault2 = new Vault(db2, KEY, { idleMs: 200 * H, maxAgeMs: 300 * H });
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events2: CredentialHealthEvent[] = [];
@@ -359,12 +364,12 @@ test('sweep: expiring_soon carries the EARLIEST ceiling (idle vs max-age) and on
   assert.equal(await vault2.get(O1, 'acme'), null);
 });
 
-test('window guard: a TTL dimension <= the 72h window never warns (no perpetual daily nag); the defaults still do', async () => {
+test('window guard: a TTL dimension <= the 72h window never warns (no perpetual daily nag); the defaults still do', async (t) => {
   const now = Date.now();
   // idleMs = 48h (an "aggressive" per-user policy) is <= the 72h window: EVERY live connection —
   // used one second ago or one hour from idle death — would permanently sit "inside the window",
   // turning the warning into a daily reconnect nag forever. The dimension must be excluded.
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { idleMs: 48 * H });
   await vault.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events: CredentialHealthEvent[] = [];
@@ -375,7 +380,7 @@ test('window guard: a TTL dimension <= the 72h window never warns (no perpetual 
 
   // The shipped defaults (idle 7d / max-age 30d) both exceed the window: a fresh connection is
   // silent; a genuinely idle one inside 72h of its idle ceiling still warns, with that ceiling.
-  const db2 = await openDb({ dbPath: ':memory:' });
+  const db2 = await openTestDb(t);
   const vault2 = new Vault(db2, KEY, { idleMs: 7 * 24 * H, maxAgeMs: 30 * 24 * H });
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events2: CredentialHealthEvent[] = [];
@@ -392,7 +397,7 @@ test('window guard: a TTL dimension <= the 72h window never warns (no perpetual 
   // never selects) + max-age 100h, row created 30h ago and used just now: selected via max-age
   // (~70h out), but the credential actually dies of the idle TTL in ~48h — expiresAt must be
   // lastUsed + 48h, NOT created + 100h ("expires in ~Nh" must not overstate the lifetime).
-  const db3 = await openDb({ dbPath: ':memory:' });
+  const db3 = await openTestDb(t);
   const vault3 = new Vault(db3, KEY, { idleMs: 48 * H, maxAgeMs: 100 * H });
   await vault3.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db3, 'U1', 'user', 'acme', now - 30 * H, now); // created 30h ago, used now
@@ -404,8 +409,8 @@ test('window guard: a TTL dimension <= the 72h window never warns (no perpetual 
   assert.ok(drift3 < 5_000, `expiresAt must be the REAL earliest ceiling (idle), off by ${drift3}ms`);
 });
 
-test('sweep 3x in a row still sends ONE expiring-soon DM (persistent debounce through the notifier)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('sweep 3x in a row still sends ONE expiring-soon DM (persistent debounce through the notifier)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { maxAgeMs: 100 * H });
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -428,8 +433,8 @@ test('sweep 3x in a row still sends ONE expiring-soon DM (persistent debounce th
   assert.match(dms[0].text, /Your acme connection expires in ~70h\. Reconnect to keep using it\./);
 });
 
-test('channel-owned credential: the expiring-soon DM goes to the configuring admin, or is skipped when unknown', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('channel-owned credential: the expiring-soon DM goes to the configuring admin, or is skipped when unknown', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { maxAgeMs: 100 * H });
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -463,8 +468,8 @@ test('channel-owned credential: the expiring-soon DM goes to the configuring adm
   assert.deepEqual(rows.map((r) => r.owner_id), ['C9']); // only the delivered DM was marked
 });
 
-test('claim window math: 24h per (owner, provider, type), per-type independent; release restores claimability', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('claim window math: 24h per (owner, provider, type), per-type independent; release restores claimability', async (t) => {
+  const db = await openTestDb(t);
   const state = new NotificationState(db);
   const now = Date.now();
   assert.equal(await state.claim(O1, 'acme', 'refresh_dead', now - 25 * H), true); // fresh row: wins
@@ -480,27 +485,22 @@ test('claim window math: 24h per (owner, provider, type), per-type independent; 
   assert.equal(await state.claim(O1, 'gh2', 'refresh_dead', now + 1), true);
 });
 
-test('sqlite transaction isolation: a concurrent unrelated write WAITS, reports truthfully, and survives the rollback', async () => {
-  // Maintainer's repro: without full-connection queuing, B's autocommit insert lands INSIDE A's
-  // open transaction (single shared better-sqlite3 connection), reports changes: 1 — and then
-  // vanishes when A rolls back. With the FIFO queue, B must WAIT until A settles.
-  const db = await openDb({ dbPath: ':memory:' });
-  let bRan = false;
-  let bRanDuringTx: boolean | undefined;
+test('transaction isolation: an unrelated concurrent write is isolated from a rolled-back transaction', async (t) => {
+  // Postgres runs each pooled connection as its own transaction, so B's autocommit insert can never
+  // land inside A's open transaction and can never vanish when A rolls back (the single-connection
+  // hazard the old SQLite backend had). Assert the real invariant: A's row is gone, B's SURVIVES.
+  const db = await openTestDb(t);
   const a = db.transaction!(async (tx) => {
     await tx.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T','CA','p','shared')`);
-    await new Promise((r) => setTimeout(r, 20)); // hold the transaction open across real time
-    bRanDuringTx = bRan; // B must still be queued behind us, not interleaved into our tx
+    await new Promise((r) => setTimeout(r, 20)); // hold the transaction open across a real concurrent write
     throw new Error('boom');
   }).catch((e: Error) => e);
   const b = db.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T','CB','p','shared')`);
-  void b.then(() => { bRan = true; });
   const [aErr, bResult] = await Promise.all([a, b]);
   assert.match((aErr as Error).message, /boom/);
-  assert.equal(bRanDuringTx, false, 'the unrelated write must WAIT for the open transaction');
-  assert.equal(bResult.changes, 1); // B's report reflects reality…
+  assert.equal(bResult.changes, 1); // B committed on its own connection
   const rows = (await db.all(`SELECT channel FROM channel_config ORDER BY channel`)) as any[];
-  assert.deepEqual(rows.map((r) => r.channel), ['CB']); // …A's row rolled back, B's row SURVIVES
+  assert.deepEqual(rows.map((r) => r.channel), ['CB']); // A's row rolled back, B's row survives
 });
 
 test('transient token-endpoint and revoke responses cancel their unread bodies (no pinned sockets)', async () => {
@@ -521,10 +521,10 @@ test('transient token-endpoint and revoke responses cancel their unread bodies (
   }
 });
 
-test('vault WRITES are ATOMIC with the notification-state purge; a DELETE survives a purge failure', async () => {
+test('vault WRITES are ATOMIC with the notification-state purge; a DELETE survives a purge failure', async (t) => {
   // upsert: hostile db (notification_state dropped) → the INSERT must not survive the failed purge
   // (fail-closed: no new credential lands without its satellites cleared).
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await db.exec(`DROP TABLE notification_state`);
   await assert.rejects(
@@ -534,7 +534,7 @@ test('vault WRITES are ATOMIC with the notification-state purge; a DELETE surviv
 
   // delete is the OPPOSITE contract (GHSA-25m2 review): the credential delete is the
   // security-meaningful action, so a satellite-purge failure must never roll it back or throw.
-  const db2 = await openDb({ dbPath: ':memory:' });
+  const db2 = await openTestDb(t);
   const vault2 = new Vault(db2, KEY);
   await vault2.upsert(O1, 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await db2.exec(`DROP TABLE notification_state`);

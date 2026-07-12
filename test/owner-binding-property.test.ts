@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ChannelConfig } from '../src/core/channelConfig';
@@ -36,8 +36,8 @@ const acme = defineProvider({
 
 /** A broker with the channel gate wired iff `channelConfigSet`. Returns a recorder of every owner the
  *  vault is keyed on — the sole way to observe whether a channel credential was reached. */
-async function makeBroker(channelConfigSet: boolean) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeBroker(t: TestContext, channelConfigSet: boolean) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   // Seed BOTH a user-owned (U1) and a channel-owned (C1) acme credential so a permitted resolution of
@@ -94,12 +94,12 @@ function post(port: number, path: string, body: unknown): Promise<{ status: numb
 const BODY_OWNERS = ['user', 'channel'] as const;
 const SIGNED_KINDS = ['user', 'channel', undefined] as const;
 
-test('#51 owner-binding: exhaustive enumeration — a channel credential is reached ONLY on a fully-signed match, else fail-closed', async () => {
+test('#51 owner-binding: exhaustive enumeration — a channel credential is reached ONLY on a fully-signed match, else fail-closed', async (t) => {
   // Mock the upstream provider fetch so a permitted resolution returns 200 rather than hitting the wire.
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
 
-  const brokers = { true: await makeBroker(true), false: await makeBroker(false) };
+  const brokers = { true: await makeBroker(t, true), false: await makeBroker(t, false) };
   try {
     let i = 0; // loop index doubles as the deterministic seed — no wall-clock dependence anywhere.
     for (const channelConfigSet of [true, false] as const) {
@@ -169,10 +169,10 @@ test('#51 owner-binding: exhaustive enumeration — a channel credential is reac
   }
 });
 
-test('#51 owner-binding: a forged body owner:"channel" on a plain user token never reaches a channel credential (fail-closed)', async () => {
+test('#51 owner-binding: a forged body owner:"channel" on a plain user token never reaches a channel credential (fail-closed)', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
-  const b = await makeBroker(true); // gate ENABLED — the refusal is the signed-mismatch, not a missing config
+  const b = await makeBroker(t, true); // gate ENABLED — the refusal is the signed-mismatch, not a missing config
   try {
     // Plain user token (no signed ownerKind) + a forged body owner:'channel'. Refused 403; the channel
     // credential is never read — a forged body alone can never cross into a channel-owned credential.
@@ -186,10 +186,10 @@ test('#51 owner-binding: a forged body owner:"channel" on a plain user token nev
   }
 });
 
-test('#51 owner-binding: the resolved credential owner derives ONLY from signed claims, never the body', async () => {
+test('#51 owner-binding: the resolved credential owner derives ONLY from signed claims, never the body', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
-  const b = await makeBroker(false);
+  const b = await makeBroker(t, false);
   try {
     // The signed acting human is U1 in T1. The body tries to imply a DIFFERENT owner (U2 / T2 / C9).
     // The vault must be keyed on the claims-derived owner (userOwner(T1,U1)) — never the body's values.

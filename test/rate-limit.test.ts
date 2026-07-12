@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -45,8 +45,8 @@ function provider(id: string, rateLimit?: Provider['rateLimit']): Provider {
  * (the property.test.ts technique): `resolves` counts secret resolutions, `vaultGets` counts
  * vault.get calls — a rate-limit deny must leave BOTH untouched.
  */
-async function makeHandle(p: Provider, acting: SlackIdentity = U1, store = new MemoryRateLimitStore()) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeHandle(t: TestContext, p: Provider, acting: SlackIdentity = U1, store = new MemoryRateLimitStore()) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const owner = userOwner(acting);
   await vault.reference(owner, p.id, { source: 'ext', secretRef: 'arn:secret' });
@@ -78,7 +78,7 @@ test('rate limit: N+1th request inside the window is denied BEFORE the vault is 
   const up = stubUpstream();
   try {
     const p = provider('rl', { perMinute: 60, burst: 3 });
-    const { handle, db, events, getResolves, getVaultGets } = await makeHandle(p);
+    const { handle, db, events, getResolves, getVaultGets } = await makeHandle(t, p);
 
     for (let i = 0; i < 3; i++) {
       const res = await handle.fetch('https://api.acme.example/user');
@@ -127,7 +127,7 @@ test('rate limit: the bucket refills over time and retryAfter tracks the exact d
   const up = stubUpstream();
   try {
     const p = provider('rl', { perMinute: 60, burst: 2 });
-    const { handle } = await makeHandle(p);
+    const { handle } = await makeHandle(t, p);
     await handle.fetch('https://api.acme.example/user');
     await handle.fetch('https://api.acme.example/user');
     await assert.rejects(() => handle.fetch('https://api.acme.example/user'), RateLimitedError);
@@ -156,9 +156,9 @@ test('rate limit: buckets are isolated per owner and per provider; user A limite
   try {
     const store = new MemoryRateLimitStore(); // one SHARED store, as in a real deployment
     const p = provider('rl', { perMinute: 60, burst: 1 });
-    const a = await makeHandle(p, U1, store);
-    const b = await makeHandle(p, U2, store);
-    const other = await makeHandle(provider('rl2', { perMinute: 60, burst: 1 }), U1, store);
+    const a = await makeHandle(t, p, U1, store);
+    const b = await makeHandle(t, p, U2, store);
+    const other = await makeHandle(t, provider('rl2', { perMinute: 60, burst: 1 }), U1, store);
 
     assert.equal((await a.handle.fetch('https://api.acme.example/user')).status, 200);
     await assert.rejects(() => a.handle.fetch('https://api.acme.example/user'), RateLimitedError);
@@ -174,7 +174,7 @@ test('rate limit: a provider without the knob is unlimited (no event, no audit, 
   t.mock.timers.enable({ apis: ['Date'], now: T0 });
   const up = stubUpstream();
   try {
-    const { handle, db, events } = await makeHandle(provider('free'));
+    const { handle, db, events } = await makeHandle(t, provider('free'));
     for (let i = 0; i < 50; i++) {
       assert.equal((await handle.fetch('https://api.acme.example/user')).status, 200);
     }
@@ -241,10 +241,10 @@ function postJson(port: number, path: string, body: unknown): Promise<{ status: 
   });
 }
 
-test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, upstream untouched', async () => {
+test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, upstream untouched', async (t) => {
   // Real clock here (an HTTP round trip needs live timers): perMinute 1 makes the window generous
   // enough that two back-to-back calls can never straddle a refill.
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const limited = provider('acme', { perMinute: 1 }); // burst defaults to perMinute = 1
@@ -287,8 +287,8 @@ test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, up
 
 // ── Bolt surface: ephemeral notice ───────────────────────────────────────────
 
-test('bolt: a rate-limited fetch tells the acting user ephemerally and still throws the typed error', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('bolt: a rate-limited fetch tells the acting user ephemerally and still throws the typed error', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const p = provider('rl', { perMinute: 1 }); // real clock; 1/min cannot refill between two awaits
   await vault.upsert(userOwner(U1), 'rl', {

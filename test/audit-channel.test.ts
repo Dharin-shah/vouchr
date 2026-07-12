@@ -1,7 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Audit } from '../src/core/audit';
 import { Vault } from '../src/core/vault';
 import { ConnectionHandle } from '../src/core/injector';
@@ -17,22 +17,22 @@ const tok = (t: string) => ({ accessToken: t, refreshToken: null, scopes: '', ex
 const lastChannel = (db: any) =>
   db.get('SELECT channel FROM audit ORDER BY at DESC LIMIT 1').then((r: any) => r.channel);
 
-test('audit: meta.channel is promoted to the channel column', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('audit: meta.channel is promoted to the channel column', async (t) => {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   await audit.record('config', ID, 'github', { owner: 'channel', channel: 'C123', mode: 'shared' });
   assert.equal(await lastChannel(db), 'C123');
 });
 
-test('audit: a user event with no channel leaves the column null', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('audit: a user event with no channel leaves the column null', async (t) => {
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   await audit.record('config', ID, 'github', { owner: 'user', kind: 'secret' });
   assert.equal(await lastChannel(db), null);
 });
 
-test('audit: a channel-owned injection attributes the channel column', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('audit: a channel-owned injection attributes the channel column', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const owner = channelOwner('T1', 'C999');
   await vault.upsert(owner, 'github', tok('xoxb-secret-token'));

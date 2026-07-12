@@ -1,35 +1,65 @@
 #!/usr/bin/env bash
 # Docker image smoke test (#124): build the broker image and prove it actually BOOTS and serves —
-# a broken Dockerfile (missing native rebuild for better-sqlite3, bad entrypoint, missing dist path)
-# is otherwise discovered only at deploy time. The image is the quick-start artifact.
+# a broken Dockerfile (bad entrypoint, missing dist path, unreachable Postgres) is otherwise
+# discovered only at deploy time. The image is the quick-start artifact.
+#
+# Vouchr is PostgreSQL-only, so the smoke stands up a throwaway Postgres container on a private
+# docker network and points the broker at it — the same shape a real deployment uses.
 #
 # Runnable locally (`npm run docker-smoke`, needs Docker) and in CI. No external credentials.
 set -euo pipefail
 
 IMAGE=vouchr-smoke
 NAME=vouchr-smoke-test
+PG_NAME=vouchr-smoke-pg
+NET=vouchr-smoke-net
 PORT=3010 # avoid clashing with a local dev broker on 3000
 # Distinctive secret values so the log-leak check below is meaningful (not real secrets).
 SECRET="smoke-identity-secret-DO-NOT-LOG-$$"
 MASTER_KEY="$(openssl rand -base64 32)"
 PROVIDERS='[{"id":"smoke","credential":"key","egressAllow":["api.example.com"]}]'
 
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
+cleanup() {
+  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
+  docker network rm "$NET" >/dev/null 2>&1 || true
+}
 trap cleanup EXIT
 
 echo "==> docker build"
 docker build -t "$IMAGE" . >/dev/null
 
-echo "==> run the broker with minimal env (sqlite default, one key provider)"
-docker run -d --name "$NAME" \
+echo "==> start a throwaway Postgres on a private network"
+docker network create "$NET" >/dev/null
+docker run -d --name "$PG_NAME" --network "$NET" \
+  -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr \
+  postgres:16-alpine >/dev/null
+echo "==> wait for Postgres to accept connections (30s timeout)"
+for i in $(seq 1 30); do
+  if docker exec "$PG_NAME" pg_isready -U vouchr >/dev/null 2>&1; then echo "    pg ready after ${i}s"; break; fi
+  [ "$i" = 30 ] && { echo "FAIL: Postgres never became ready"; docker logs "$PG_NAME"; exit 1; }
+  sleep 1
+done
+
+DB_URL="postgres://vouchr:vouchr@${PG_NAME}:5432/vouchr"
+
+# The runtime no longer creates tables (it connects with a DML-only role and fails closed on an
+# unmigrated DB), so migrate the schema first using the SAME image. `vouchr migrate` is idempotent
+# and advisory-locked. Fail the smoke if it errors — a broken migrate path must not reach a deploy.
+echo "==> migrate the schema (vouchr migrate) against Postgres"
+docker run --rm --network "$NET" \
+  -e VOUCHR_DATABASE_URL="$DB_URL" \
+  "$IMAGE" node dist/bin/vouchr.js migrate \
+  || { echo "FAIL: vouchr migrate errored"; exit 1; }
+
+echo "==> run the broker with minimal env (one key provider), pointed at the migrated Postgres"
+docker run -d --name "$NAME" --network "$NET" \
   -e VOUCHR_IDENTITY_SECRET="$SECRET" \
   -e VOUCHR_MASTER_KEY="$MASTER_KEY" \
   -e VOUCHR_PROVIDERS="$PROVIDERS" \
   -e VOUCHR_PORT="$PORT" \
-  -e VOUCHR_DB=":memory:" \
+  -e VOUCHR_DATABASE_URL="$DB_URL" \
   -p "$PORT:$PORT" "$IMAGE" >/dev/null
-# In-memory sqlite keeps the smoke self-contained (the read-only rootfs / non-root USER can't create a
-# default db file). Real deployments point VOUCHR_DATABASE_URL at Postgres or VOUCHR_DB at a volume.
 
 # Poll /readyz, not /healthz: /healthz is bare liveness (no db), so it can't tell a booted server from
 # a usable one. /readyz does a real SELECT 1 through the store, so 200 proves listening AND store-ready.

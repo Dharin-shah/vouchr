@@ -1,8 +1,8 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider } from '../src/core/providers';
@@ -31,8 +31,8 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
 }
 
-async function makeBroker(events: VouchrEvent[]) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeBroker(t: TestContext, events: VouchrEvent[]) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
@@ -61,9 +61,9 @@ function post(port: number, path: string, body: unknown): Promise<{ status: numb
 
 // A network-level throw from the upstream fetch (DNS/connection refused) must (a) map to 502 and (b) fire
 // the no-secret egress_error signal with only host + reason — never the token, never the error message.
-test('egress-failure: an upstream fetch throw returns 502 and emits egress_error (no secret)', async () => {
+test('egress-failure: an upstream fetch throw returns 502 and emits egress_error (no secret)', async (t) => {
   const events: VouchrEvent[] = [];
-  const { server, port } = await makeBroker(events);
+  const { server, port } = await makeBroker(t, events);
   const real = globalThis.fetch;
   globalThis.fetch = (async () => { throw new Error(`ECONNREFUSED reaching ${SECRET_TOKEN}`); }) as any; // error carries a secret on purpose
   try {

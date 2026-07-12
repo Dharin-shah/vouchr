@@ -23,4 +23,4 @@ labels: bug
 ## Environment
 
 - Node version:
-- Store: SQLite or Postgres
+- PostgreSQL version:

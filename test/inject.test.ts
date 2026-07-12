@@ -1,7 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -12,8 +12,8 @@ const KEY = randomBytes(32);
 const tok = (t: string) => ({ accessToken: t, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
 
 // A non-Bearer provider (x-api-key) injects via the custom hook, NOT Authorization.
-test('Provider.inject: custom header instead of Authorization: Bearer', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('Provider.inject: custom header instead of Authorization: Bearer', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const owner = channelOwner('T1', 'C1');
   await vault.upsert(owner, 'custommcp', tok('SECRET_KEY'));

@@ -19,13 +19,24 @@ and `npm link`/install it can also be invoked as `vouchr`.)
 
 | Var / flag            | Purpose                                                       |
 | --------------------- | ------------------------------------------------------------ |
-| `--db <path>`         | SQLite file path (overrides `VOUCHR_DB`; default `vouchr.db`) |
-| `VOUCHR_DB`           | SQLite file path                                             |
-| `VOUCHR_DATABASE_URL` | Postgres connection string (takes precedence over SQLite)   |
+| `VOUCHR_DATABASE_URL` | Postgres connection string (`postgres://…`) — required; boot fails closed if unset or non-`postgres://` (no `DATABASE_URL` fallback). Add `sslmode=require` to the URL for TLS. |
+| `--db <url>`          | Postgres connection string (overrides `VOUCHR_DATABASE_URL`) |
 | `VOUCHR_MASTER_KEY`   | base64 32-byte id-less key (validated by `doctor`; used by `revoke`/`rekey`) |
 | `VOUCHR_MASTER_KEYS`  | comma-separated `id:base64key` entries; first = primary (encrypts new writes), all decrypt — see DEPLOYMENT.md § Key rotation |
 
 ## Commands
+
+### `migrate`
+Creates/converges the PostgreSQL schema to this build's version. Run it **once per
+deploy/upgrade** with a **schema-owner** DB role (may `CREATE`/`ALTER` tables) — the runtime
+connects DML-only and never creates tables, and fails closed until the database is migrated.
+Idempotent and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
+See [DEPLOYMENT.md § Migrations](./DEPLOYMENT.md#migrations) for the schema-owner vs DML-only roles
+and example `GRANT`s.
+
+```bash
+VOUCHR_DATABASE_URL=postgres://vouchr_owner:...@host:5432/vouchr vouchr migrate
+```
 
 ### `inventory`
 Lists stored connections from the `connection` table: team, owner_kind, owner_id,

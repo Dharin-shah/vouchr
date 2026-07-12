@@ -40,7 +40,8 @@ connection and approval.
 
 ## Quickstart
 
-Requires Node >= 22.
+Requires Node >= 22 and a **PostgreSQL** database (Vouchr is Postgres-only — there is no
+embedded/SQLite mode).
 
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
@@ -81,8 +82,16 @@ Register each OAuth provider's app with callback `$PUBLIC_URL/vouchr/oauth/callb
 
 ```bash
 npm install && cp .env.example .env   # VOUCHR_MASTER_KEY, Slack secrets, provider OAuth creds
+# Point at your PostgreSQL database (fails closed at boot if unset or non-postgres://):
+export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
+npm run cli -- migrate                # create/upgrade the schema (once per deploy; schema-owner role)
 npm run example:github                # then @-mention the bot in a channel
 ```
+
+`vouchr migrate` creates the schema and is run **once per deploy/upgrade** with a schema-owner DB
+role; the runtime connects with a DML-only role and never creates tables (it fails closed if the
+database hasn't been migrated). See the [deployment guide](./guides/DEPLOYMENT.md#migrations) for the
+migrate-vs-runtime role split.
 
 Prefer finer control than `install()`? Each piece is callable individually:
 
@@ -273,7 +282,7 @@ const vouchr = await createVouchr({
   dryRun: true, // the only change vs production wiring
   providers: [github({ clientId: 'dry-run', clientSecret: 'dry-run' })], // dummies, no OAuth app
   baseUrl: 'https://my-app.test', // never contacted
-  dbPath: ':memory:',
+  databaseUrl: process.env.VOUCHR_DATABASE_URL, // a fresh, dedicated Postgres schema for the dry run
 });
 
 await assert.rejects(() => ctx.vouchr.connect('github'), ConsentRequiredError); // real prompt
@@ -333,9 +342,8 @@ local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 
 ## Status
 
-**Alpha. Not yet tested in a live deployment.** Every push and PR runs the full suite — 366 tests
-across SQLite and Postgres at **97% line / 88% branch coverage** — plus CodeQL and dependency
-security checks. Review the
+**Alpha. Not yet tested in a live deployment.** Every push and PR runs the full suite against a
+real PostgreSQL container — plus CodeQL and dependency security checks. Review the
 [production readiness checklist](./guides/DEPLOYMENT.md#production-readiness-checklist) before
 adopting, and see [CONTRIBUTING.md](./CONTRIBUTING.md) to help.
 

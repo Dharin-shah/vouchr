@@ -1,8 +1,8 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
@@ -74,8 +74,8 @@ async function listen(server: http.Server): Promise<number> {
 
 // ── (a) SECURITY: session-mode is fail-closed in the headless broker ──────────
 
-test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
@@ -98,8 +98,8 @@ test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', 
   } finally { up.restore(); server.close(); }
 });
 
-test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
@@ -120,8 +120,8 @@ test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', asy
   } finally { up.restore(); server.close(); }
 });
 
-test('session-mode is opt-in: with NO channelConfig the user credential serves as before', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('session-mode is opt-in: with NO channelConfig the user credential serves as before', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -136,8 +136,8 @@ test('session-mode is opt-in: with NO channelConfig the user credential serves a
 
 // ── (b) /v1/status: single query, no per-provider decrypt ─────────────────────
 
-test('/v1/status: one listForUser call, no per-provider vault.get decrypts', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('/v1/status: one listForUser call, no per-provider vault.get decrypts', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -158,8 +158,8 @@ test('/v1/status: one listForUser call, no per-provider vault.get decrypts', asy
   } finally { server.close(); }
 });
 
-test('/v1/status: a past-idle-TTL connection reports needs_consent, not connected', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('/v1/status: a past-idle-TTL connection reports needs_consent, not connected', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { idleMs: 1000 }); // idle-expire after 1s
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -179,8 +179,8 @@ test('/v1/status: a past-idle-TTL connection reports needs_consent, not connecte
 
 // ── (c) policy_denied metric fires on a denied fetch ──────────────────────────
 
-test('policy_denied event fires on a policy-denied fetch (parity with the Bolt path)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('policy_denied event fires on a policy-denied fetch (parity with the Bolt path)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -200,8 +200,8 @@ test('policy_denied event fires on a policy-denied fetch (parity with the Bolt p
   } finally { up.restore(); server.close(); }
 });
 
-test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -221,8 +221,8 @@ test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403
 
 // ── (d) removing defaultDenyNonGet did not change write-gating ────────────────
 
-test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });

@@ -3,7 +3,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as WebReadableStream } from 'node:stream/web';
-import type { Db } from '../../core/db';
+import { assertSchemaCurrent, type Db } from '../../core/db';
 import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
@@ -1196,14 +1196,15 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     return { status: 200, payload: { ok: true } };
   }
 
-  // #101 readiness: a trivial db round-trip (SELECT 1 through the Db seam) within ~2s. 200 when the
-  // store is reachable, else 503 — so a k8s readinessProbe pulls a pod whose db is down out of rotation
-  // without killing it. NO auth, NO vault. The body is a BARE status: never a connection string, error
-  // text, or config (the catch swallows the error rather than reflecting it).
+  // #101 readiness: a real store round-trip that also verifies the SCHEMA is migrated to this build's
+  // version (assertSchemaCurrent reads the meta marker), within ~2s. 200 when the store is reachable
+  // AND current, else 503 — so a k8s readinessProbe pulls a pod out of rotation when its db is down OR
+  // unmigrated/mismatched, without killing it. NO auth, NO vault. The body is a BARE status: never a
+  // connection string, error text, or config (the catch swallows the error rather than reflecting it).
   async function handleReadyz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     try {
       const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('readyz timeout')), 2000).unref());
-      await Promise.race([opts.db.get('SELECT 1'), timeout]);
+      await Promise.race([assertSchemaCurrent(opts.db), timeout]);
       return { status: 200, payload: { ok: true } };
     } catch {
       return { status: 503, payload: { ok: false } };

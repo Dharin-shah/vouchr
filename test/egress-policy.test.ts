@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -31,8 +31,8 @@ const guarded = defineProvider({
 
 // Wire the handle so its secret comes ONLY from the resolver, and a resolver call count of 0 proves
 // the token was never read. The injector reads the secret strictly after every egress check passes.
-async function makeHandle(provider = guarded) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function makeHandle(t: TestContext, provider = guarded) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   let resolverCalls = 0;
@@ -47,7 +47,7 @@ async function makeHandle(provider = guarded) {
   return { handle, calls: () => resolverCalls };
 }
 
-test('egress: allowed path + method passes, reads the token, and injects', async () => {
+test('egress: allowed path + method passes, reads the token, and injects', async (t) => {
   const realFetch = globalThis.fetch;
   let sawAuth: string | null = null;
   globalThis.fetch = (async (_url: any, init: any) => {
@@ -55,7 +55,7 @@ test('egress: allowed path + method passes, reads the token, and injects', async
     return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
   }) as any;
   try {
-    const { handle, calls } = await makeHandle();
+    const { handle, calls } = await makeHandle(t);
     const res = await handle.fetch('https://api.acme.example/repos/x', { method: 'POST' });
     assert.equal(res.status, 200);
     assert.equal(sawAuth, 'Bearer super-secret-token'); // token resolved and injected
@@ -65,7 +65,7 @@ test('egress: allowed path + method passes, reads the token, and injects', async
   }
 });
 
-test('egress: disallowed path is denied before the token is read', async () => {
+test('egress: disallowed path is denied before the token is read', async (t) => {
   const realFetch = globalThis.fetch;
   let fetched = false;
   globalThis.fetch = (async () => {
@@ -73,7 +73,7 @@ test('egress: disallowed path is denied before the token is read', async () => {
     return new Response('{}', { status: 200 });
   }) as any;
   try {
-    const { handle, calls } = await makeHandle();
+    const { handle, calls } = await makeHandle(t);
     await assert.rejects(() => handle.fetch('https://api.acme.example/secrets', { method: 'GET' }), /not in the allowed paths/);
     await assert.rejects(() => handle.fetch('https://api.acme.example/userish', { method: 'GET' }), /not in the allowed paths/);
     assert.equal(calls(), 0); // resolver never called, secret never read
@@ -83,7 +83,7 @@ test('egress: disallowed path is denied before the token is read', async () => {
   }
 });
 
-test('egress: URL userinfo is denied before the token is read', async () => {
+test('egress: URL userinfo is denied before the token is read', async (t) => {
   const realFetch = globalThis.fetch;
   let fetched = false;
   globalThis.fetch = (async () => {
@@ -91,7 +91,7 @@ test('egress: URL userinfo is denied before the token is read', async () => {
     return new Response('{}', { status: 200 });
   }) as any;
   try {
-    const { handle, calls } = await makeHandle();
+    const { handle, calls } = await makeHandle(t);
     await assert.rejects(
       () => handle.fetch('https://caller:password@api.acme.example/user', { method: 'GET' }),
       /URL credentials are not allowed/,
@@ -103,18 +103,18 @@ test('egress: URL userinfo is denied before the token is read', async () => {
   }
 });
 
-test('egress: disallowed method is denied before the token is read', async () => {
-  const { handle, calls } = await makeHandle();
+test('egress: disallowed method is denied before the token is read', async (t) => {
+  const { handle, calls } = await makeHandle(t);
   await assert.rejects(() => handle.fetch('https://api.acme.example/repos/x', { method: 'DELETE' }), /method "DELETE" is not allowed/);
   assert.equal(calls(), 0);
 });
 
-test('egress: default method is GET (no init.method)', async () => {
+test('egress: default method is GET (no init.method)', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
     // GET is allowed; absence of init.method must not deny.
-    const { handle } = await makeHandle();
+    const { handle } = await makeHandle(t);
     const res = await handle.fetch('https://api.acme.example/user');
     assert.equal(res.status, 200);
   } finally {
@@ -122,13 +122,13 @@ test('egress: default method is GET (no init.method)', async () => {
   }
 });
 
-test('egress: validator returning false denies before the token is read', async () => {
-  const { handle, calls } = await makeHandle();
+test('egress: validator returning false denies before the token is read', async (t) => {
+  const { handle, calls } = await makeHandle(t);
   await assert.rejects(() => handle.fetch('https://api.acme.example/user?blocked=1', { method: 'GET' }), /validator rejected/);
   assert.equal(calls(), 0);
 });
 
-test('egress: provider WITHOUT the new fields is unchanged (hostname-only baseline)', async () => {
+test('egress: provider WITHOUT the new fields is unchanged (hostname-only baseline)', async (t) => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
@@ -143,7 +143,7 @@ test('egress: provider WITHOUT the new fields is unchanged (hostname-only baseli
       clientId: 'id',
       clientSecret: 'sec',
     });
-    const { handle } = await makeHandle(plain);
+    const { handle } = await makeHandle(t, plain);
     // Any path, any method: only the hostname allowlist applies, exactly as before.
     const res = await handle.fetch('https://api.acme.example/anything/at/all', { method: 'DELETE' });
     assert.equal(res.status, 200);

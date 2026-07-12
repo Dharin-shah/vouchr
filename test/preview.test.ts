@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { ChannelConfig, isPreviewVisibility } from '../src/core/channelConfig';
 import { PendingPreviews } from '../src/core/preview';
 import { previewBlocks, previewPostBlocks, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION } from '../src/adapters/blocks';
@@ -28,8 +28,8 @@ const provider = defineProvider({
 
 // ── ChannelConfig.visibility: the policy bit ──
 
-test('visibility: no row → public; set/get round-trip; scoped per channel+provider', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('visibility: no row → public; set/get round-trip; scoped per channel+provider', async (t) => {
+  const db = await openTestDb(t);
   const cfg = new ChannelConfig(db);
   assert.equal(await cfg.getVisibility('T1', 'C_FIN', 'mcp'), 'public');
   await cfg.setVisibility('T1', 'C_FIN', 'mcp', 'private');
@@ -40,8 +40,8 @@ test('visibility: no row → public; set/get round-trip; scoped per channel+prov
   assert.equal(await cfg.getVisibility('T1', 'C_FIN', 'mcp'), 'public');
 });
 
-test('visibility: the runtime guard refuses a bogus value at the sink (SEC-4)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('visibility: the runtime guard refuses a bogus value at the sink (SEC-4)', async (t) => {
+  const db = await openTestDb(t);
   const cfg = new ChannelConfig(db);
   await assert.rejects(() => cfg.setVisibility('T1', 'C_FIN', 'mcp', 'everyone' as any), /invalid preview visibility/);
   assert.equal(isPreviewVisibility('private'), true);
@@ -127,14 +127,14 @@ test('preview blocks: empty/blank title and lines still produce valid blocks (no
 
 // ── ConnectContext: the admin gate + posting paths ──
 
-async function ctx(opts: {
+async function ctx(t: TestContext, opts: {
   isAdmin?: boolean;
   visibility?: 'public' | 'private';
   thread?: string | null;
   toolsOff?: boolean;    // disable 'mcp' in the channel tool allowlist
   denyPolicy?: boolean;  // Policy denies 'mcp' everywhere
 } = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   if (opts.visibility) await channelConfig.setVisibility('T1', 'C_FIN', 'mcp', opts.visibility);
@@ -160,13 +160,13 @@ async function ctx(opts: {
   return { c, db, posted, ephemeral, previews };
 }
 
-test('setChannelVisibility: non-admin is denied and audited; admin write is audited as config', async () => {
-  const denied = await ctx({ isAdmin: false });
+test('setChannelVisibility: non-admin is denied and audited; admin write is audited as config', async (t) => {
+  const denied = await ctx(t, { isAdmin: false });
   await assert.rejects(() => denied.c.setChannelVisibility('mcp', 'private'), /admin/);
   let rows = (await denied.db.all(`SELECT action FROM audit`)) as any[];
   assert.deepEqual(rows.map((r) => r.action), ['denied']);
 
-  const admin = await ctx({ isAdmin: true });
+  const admin = await ctx(t, { isAdmin: true });
   await admin.c.setChannelVisibility('mcp', 'private');
   rows = (await admin.db.all(`SELECT action, provider, meta FROM audit`)) as any[];
   assert.equal(rows[0].action, 'config');
@@ -174,21 +174,21 @@ test('setChannelVisibility: non-admin is denied and audited; admin write is audi
   assert.equal(JSON.parse(rows[0].meta).owner, 'channel');
 });
 
-test('setChannelVisibility: unknown provider is refused BEFORE persist/audit (SEC-4)', async () => {
-  const { c, db } = await ctx({ isAdmin: true });
+test('setChannelVisibility: unknown provider is refused BEFORE persist/audit (SEC-4)', async (t) => {
+  const { c, db } = await ctx(t, { isAdmin: true });
   await assert.rejects(() => c.setChannelVisibility('nope', 'private'));
   assert.equal(((await db.all(`SELECT * FROM audit`)) as any[]).length, 0);
   assert.equal(((await db.all(`SELECT * FROM channel_preview`)) as any[]).length, 0);
 });
 
-test('preview(): public (default) posts to the channel; private posts ephemerally to the requester', async () => {
-  const pub = await ctx();
+test('preview(): public (default) posts to the channel; private posts ephemerally to the requester', async (t) => {
+  const pub = await ctx(t);
   assert.equal(await pub.c.preview('mcp', { title: 'PRs', lines: ['#1'] }), 'posted');
   assert.equal(pub.posted.length, 1);
   assert.equal(pub.posted[0].channel, 'C_FIN');
   assert.equal(pub.ephemeral.length, 0);
 
-  const priv = await ctx({ visibility: 'private', thread: '111.222' });
+  const priv = await ctx(t, { visibility: 'private', thread: '111.222' });
   assert.equal(await priv.c.preview('mcp', { title: 'PRs', lines: ['#1'] }), 'private');
   assert.equal(priv.posted.length, 0); // nothing reached the channel
   assert.equal(priv.ephemeral.length, 1);
@@ -197,15 +197,15 @@ test('preview(): public (default) posts to the channel; private posts ephemerall
   assert.match(JSON.stringify(priv.ephemeral[0].blocks), /Share to thread/);
 });
 
-test('preview(): unknown provider throws and nothing is posted or stored', async () => {
-  const { c, posted, ephemeral } = await ctx({ visibility: 'private' });
+test('preview(): unknown provider throws and nothing is posted or stored', async (t) => {
+  const { c, posted, ephemeral } = await ctx(t, { visibility: 'private' });
   await assert.rejects(() => c.preview('nope', { title: 't', lines: [] }));
   assert.equal(posted.length + ephemeral.length, 0);
 });
 
-test('preview(): a tool-disabled or policy-denied provider posts NOTHING (same gate as connect)', async () => {
+test('preview(): a tool-disabled or policy-denied provider posts NOTHING (same gate as connect)', async (t) => {
   // Tool allowlist off → refused + audited with the connect() deny shape; nothing posted, nothing held.
-  const off = await ctx({ visibility: 'private', toolsOff: true });
+  const off = await ctx(t, { visibility: 'private', toolsOff: true });
   await assert.rejects(() => off.c.preview('mcp', { title: 't', lines: ['x'] }), /not enabled/);
   assert.equal(off.posted.length + off.ephemeral.length, 0);
   assert.equal((off.previews as any).map.size, 0);
@@ -214,14 +214,14 @@ test('preview(): a tool-disabled or policy-denied provider posts NOTHING (same g
   assert.equal(JSON.parse(rows[0].meta).reason, 'tool-disabled');
 
   // Policy deny → same refusal on the (default) public path.
-  const pol = await ctx({ denyPolicy: true });
+  const pol = await ctx(t, { denyPolicy: true });
   await assert.rejects(() => pol.c.preview('mcp', { title: 't', lines: ['x'] }), /Policy denies/);
   assert.equal(pol.posted.length + pol.ephemeral.length, 0);
   assert.equal(((await pol.db.all(`SELECT action FROM audit`)) as any[])[0].action, 'denied');
 });
 
-test('preview(): the pending store holds only what was rendered (clipped, blanks dropped)', async () => {
-  const priv = await ctx({ visibility: 'private' });
+test('preview(): the pending store holds only what was rendered (clipped, blanks dropped)', async (t) => {
+  const priv = await ctx(t, { visibility: 'private' });
   const big = 'x'.repeat(10_000);
   await priv.c.preview('mcp', { title: big, lines: ['', big, big] });
   const stored = [...(priv.previews as any).map.values()][0] as { title: string; lines: string[] };
@@ -230,19 +230,19 @@ test('preview(): the pending store holds only what was rendered (clipped, blanks
   assert.ok(stored.lines.every((l) => l.trim().length > 0));
 });
 
-test('preview(): the fallback `text` never carries the provider-derived title (SEC-5)', async () => {
+test('preview(): the fallback `text` never carries the provider-derived title (SEC-5)', async (t) => {
   // Slack parses top-level `text` as mrkdwn (notifications/fallback), unlike the escaped blocks — a
   // title of `<!channel>` must not be able to ping the room from there.
-  const pub = await ctx();
+  const pub = await ctx(t);
   await pub.c.preview('mcp', { title: '<!channel> pwned', lines: ['x'] });
   assert.doesNotMatch(pub.posted[0].text, /<!channel>/);
 });
 
 // ── End-to-end through createVouchr: middleware → private preview → Share click (TEST-2) ──
 
-async function harness() {
+async function harness(t: TestContext) {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
-  const lan = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', dbPath: ':memory:' });
+  const lan = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   const actions: Record<string, any> = {};
   lan.registerCommands({ command: () => undefined, view: () => undefined, action: (id: string, h: any) => (actions[id] = h) });
   const posted: any[] = [];
@@ -267,8 +267,8 @@ async function harness() {
   return { lan, actions, client, posted, ephemeral, vouchr: args.context.vouchr };
 }
 
-test('e2e: private preview → only the recipient can share; the share posts publicly, attributed + audited', async () => {
-  const { lan, actions, client, posted, ephemeral, vouchr } = await harness();
+test('e2e: private preview → only the recipient can share; the share posts publicly, attributed + audited', async (t) => {
+  const { lan, actions, client, posted, ephemeral, vouchr } = await harness(t);
   await new ChannelConfig(lan.db).setVisibility('T1', 'C_FIN', 'mcp', 'private');
 
   assert.equal(await vouchr.preview('mcp', { title: 'Open PRs (2) <!channel>', lines: ['#1 fix', '#2 feat'] }), 'private');
@@ -301,8 +301,8 @@ test('e2e: private preview → only the recipient can share; the share posts pub
   assert.equal(posted.length, 1); // a second click can't double-post
 });
 
-test('e2e: toolManifest reports the visibility bit agents plan against', async () => {
-  const { lan, vouchr } = await harness();
+test('e2e: toolManifest reports the visibility bit agents plan against', async (t) => {
+  const { lan, vouchr } = await harness(t);
   assert.equal((await vouchr.toolManifest())[0].visibility, 'public');
   await new ChannelConfig(lan.db).setVisibility('T1', 'C_FIN', 'mcp', 'private');
   assert.equal((await vouchr.toolManifest())[0].visibility, 'private');

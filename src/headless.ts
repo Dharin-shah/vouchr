@@ -22,7 +22,7 @@ export type { BuiltBroker } from '../bin/broker-server';
 // vault/audit/db, so a typed consumer must be able to build them with ONLY `./headless` imports
 // (openDb → new Vault → new Audit → createBroker). Consent/SessionGrants/sweepExpired/TtlPolicy are
 // the lifecycle bits a headless deploy wires for the TTL sweep. All core — no @slack in the graph. ──
-export { openDb } from './core/db';
+export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
 export { Vault } from './core/vault';
 export type { TtlPolicy } from './core/vault';

@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -22,8 +22,8 @@ const keyProvider = defineProvider({
   inject: (h, s) => h.set('x-api-key', s),
 });
 
-async function ctx(channel: string | null = 'C1', client: any = {}) {
-  const db = await openDb({ dbPath: ':memory:' });
+async function ctx(t: TestContext, channel: string | null = 'C1', client: any = {}) {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const c = new ConnectContext({
@@ -47,15 +47,15 @@ test('defineProvider: key provider needs no OAuth client', () => {
 });
 
 // Self-service: a user sets their OWN key: no admin gate, keyed to the user.
-test('setUserSecret: self-service, stored under the user', async () => {
-  const { c, vault } = await ctx();
+test('setUserSecret: self-service, stored under the user', async (t) => {
+  const { c, vault } = await ctx(t);
   await c.setUserSecret('customdb', SECRET);
   assert.equal((await vault.get(userOwner(ID), 'customdb'))?.accessToken, SECRET);
 });
 
 // Leak-safe: the user's key never lands in audit meta / return / error.
-test('setUserSecret: secret never leaks to audit/return', async () => {
-  const { c, db } = await ctx();
+test('setUserSecret: secret never leaks to audit/return', async (t) => {
+  const { c, db } = await ctx(t);
   const ret = await c.setUserSecret('customdb', SECRET);
   assert.equal(ret, undefined);
   for (const r of await auditRows(db)) assert.ok(!r.meta.includes(SECRET));
@@ -63,8 +63,8 @@ test('setUserSecret: secret never leaks to audit/return', async () => {
 });
 
 // referenceUserSecret stores a non-secret pointer under the user.
-test('referenceUserSecret: external ref under the user, no secret stored', async () => {
-  const { c, vault } = await ctx();
+test('referenceUserSecret: external ref under the user, no secret stored', async (t) => {
+  const { c, vault } = await ctx(t);
   await c.referenceUserSecret('customdb', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:r:k' });
   const cred = await vault.get(userOwner(ID), 'customdb');
   assert.equal(cred?.source, 'aws-sm');
@@ -73,10 +73,10 @@ test('referenceUserSecret: external ref under the user, no secret stored', async
 });
 
 // connect() on a key provider with no cred → posts the key-setup prompt (NOT OAuth), then stops.
-test('connect: key provider, no cred → ephemeral key-setup prompt + ConsentRequiredError', async () => {
+test('connect: key provider, no cred → ephemeral key-setup prompt + ConsentRequiredError', async (t) => {
   let ephemeral: any = null;
   const client = { chat: { postEphemeral: async (a: any) => { ephemeral = a; return {}; } } };
-  const { c } = await ctx('C1', client);
+  const { c } = await ctx(t, 'C1', client);
   await assert.rejects(() => c.connect('customdb'), ConsentRequiredError);
   assert.equal(ephemeral.user, 'U_MAYA'); // posted to the asking user, ephemeral
   // It's the key-setup button (has an action_id), not an OAuth url button.
@@ -86,8 +86,8 @@ test('connect: key provider, no cred → ephemeral key-setup prompt + ConsentReq
 });
 
 // Once the user has set their key, connect() returns a handle (no prompt).
-test('connect: key provider with cred → handle, no prompt', async () => {
-  const { c } = await ctx('C1', {});
+test('connect: key provider with cred → handle, no prompt', async (t) => {
+  const { c } = await ctx(t, 'C1', {});
   await c.setUserSecret('customdb', SECRET);
   const handle = await c.connect('customdb'); // must not call any client method
   assert.ok(handle);

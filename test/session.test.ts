@@ -1,7 +1,7 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -22,8 +22,8 @@ const gh = defineProvider({
 });
 
 // ── Store unit tests ──────────────────────────────────────────────────────────────────────
-test('SessionGrants: thread-scoped grant, isolation, expiry, revoke, sweep', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('SessionGrants: thread-scoped grant, isolation, expiry, revoke, sweep', async (t) => {
+  const db = await openTestDb(t);
   const s = new SessionGrants(db);
 
   // No grant initially.
@@ -52,8 +52,8 @@ test('SessionGrants: thread-scoped grant, isolation, expiry, revoke, sweep', asy
 
 // Regression: the Grid/SCIM cross-team sweep must clear session grants too, including a team that
 // is discoverable ONLY by a lingering grant (no connection/consent there).
-test('offboardUserEverywhere clears session grants across teams', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUserEverywhere clears session grants across teams', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -77,8 +77,8 @@ test('offboardUserEverywhere clears session grants across teams', async () => {
 
 // ── connect() gate (driven by the 'session' channel mode) ───────────────────────────────────
 // `ghMode` sets the channel auth mode for 'gh' in channel C1 (default 'session' to exercise the gate).
-async function setup(ghMode: 'session' | 'per-user' | 'shared' = 'session') {
-  const db = await openDb({ dbPath: ':memory:' });
+async function setup(t: TestContext, ghMode: 'session' | 'per-user' | 'shared' = 'session') {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const sessions = new SessionGrants(db);
@@ -96,8 +96,8 @@ async function setup(ghMode: 'session' | 'per-user' | 'shared' = 'session') {
   return { db, vault, sessions, posted, make, auditRows };
 }
 
-test('connect(): covered provider with no grant posts an in-thread approval and throws', async () => {
-  const { vault, posted, make, auditRows } = await setup();
+test('connect(): covered provider with no grant posts an in-thread approval and throws', async (t) => {
+  const { vault, posted, make, auditRows } = await setup(t);
   await vault.upsert(userOwner(ID), 'gh', {
     accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
@@ -113,8 +113,8 @@ test('connect(): covered provider with no grant posts an in-thread approval and 
   assert.match(sessionRows[0].meta, /prompt/);
 });
 
-test('connect(): after granting the thread, the same thread proceeds but other threads do not', async () => {
-  const { vault, sessions, make } = await setup();
+test('connect(): after granting the thread, the same thread proceeds but other threads do not', async (t) => {
+  const { vault, sessions, make } = await setup(t);
   await vault.upsert(userOwner(ID), 'gh', {
     accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
@@ -126,17 +126,17 @@ test('connect(): after granting the thread, the same thread proceeds but other t
   await assert.rejects(() => make('TH_B').connect('gh'), SessionApprovalRequiredError);
 });
 
-test('connect(): covered provider off-thread is refused (no thread to scope a session)', async () => {
-  const { make, auditRows } = await setup();
+test('connect(): covered provider off-thread is refused (no thread to scope a session)', async (t) => {
+  const { make, auditRows } = await setup(t);
   await assert.rejects(() => make(null).connect('gh'), /thread-scoped session/);
   const denied = (await auditRows()).filter((r) => r.action === 'denied');
   assert.equal(denied.length, 1);
   assert.match(denied[0].meta, /no-thread/);
 });
 
-test('connect(): a provider in per-user mode is not gated', async () => {
+test('connect(): a provider in per-user mode is not gated', async (t) => {
   // Channel mode is 'per-user' for gh → no session needed; with a stored cred connect() returns a handle.
-  const { vault, posted, make } = await setup('per-user');
+  const { vault, posted, make } = await setup(t, 'per-user');
   await vault.upsert(userOwner(ID), 'gh', {
     accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
@@ -144,9 +144,9 @@ test('connect(): a provider in per-user mode is not gated', async () => {
   assert.equal(posted.length, 0); // no approval prompt
 });
 
-test('connect(): shared mode routes to the channel-credential path', async () => {
+test('connect(): shared mode routes to the channel-credential path', async (t) => {
   // With no shared cred configured, connect() in 'shared' mode surfaces connectChannel's specific
   // error, proving it delegated to the channel path rather than the per-user one.
-  const { make } = await setup('shared');
+  const { make } = await setup(t, 'shared');
   await assert.rejects(() => make('TH_A').connect('gh'), /No channel credential configured/);
 });

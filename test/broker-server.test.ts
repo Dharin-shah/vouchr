@@ -1,4 +1,5 @@
-import { test } from 'node:test';
+import { test, type TestContext } from 'node:test';
+import { testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
@@ -141,36 +142,36 @@ test('#113 loadProviders: canonicalizable approval methods are normalized (trim 
 
 // ── T6: broker-server entrypoint ─────────────────────────────────────────────
 
-function baseEnv(extra: Record<string, string> = {}): any {
+async function baseEnv(t: TestContext, extra: Record<string, string> = {}): Promise<any> {
   return {
     VOUCHR_IDENTITY_SECRET: 'shhh',
     VOUCHR_MASTER_KEY: KEY_B64,
-    VOUCHR_DB: ':memory:',
+    VOUCHR_DATABASE_URL: await testDbUrl(t), // PostgreSQL-only; a fresh isolated schema per broker
     VOUCHR_PROVIDERS: JSON.stringify([{ id: 'internal', credential: 'key', egressAllow: ['api.internal.example'] }]),
     ...extra,
   };
 }
 
-test('buildBrokerServer: boots on SQLite and serves /healthz + /health + /readyz', async () => {
-  const built = await buildBrokerServer(baseEnv({ VOUCHR_PORT: '0' }));
+test('buildBrokerServer: boots on PostgreSQL and serves /healthz + /health + /readyz', async (t) => {
+  const built = await buildBrokerServer(await baseEnv(t, { VOUCHR_PORT: '0' }));
   await new Promise<void>((r) => built.server.listen(0, r));
   const port = (built.server.address() as any).port;
   try {
-    assert.equal(built.backend, 'sqlite');
+    assert.equal(built.backend, 'postgres');
     assert.deepEqual(built.providerIds, ['internal']);
     assert.equal(await get(port, '/healthz'), 200);
     assert.equal(await get(port, '/health'), 200);
-    assert.equal(await get(port, '/readyz'), 200); // readiness passes over the live sqlite db
+    assert.equal(await get(port, '/readyz'), 200); // readiness passes over the live Postgres db
   } finally {
     built.server.close();
     await built.db.close();
   }
 });
 
-test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp end to end', async () => {
+test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp end to end', async (t) => {
   // The whole distribution path in one test: documented JSON config -> loadProviders ->
   // buildBrokerServer -> /v1/mcp, with the env-declared provider's credential injected upstream.
-  const built = await buildBrokerServer(baseEnv({
+  const built = await buildBrokerServer(await baseEnv(t, {
     VOUCHR_ALLOW_WRITES: '1',
     VOUCHR_PROVIDERS: JSON.stringify([MCP_INTERNAL]),
   }));
@@ -214,8 +215,8 @@ test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp en
   }
 });
 
-test('#54 buildBrokerServer.sweep removes an expired connection (headless TTL sweep)', async () => {
-  const built = await buildBrokerServer(baseEnv());
+test('#54 buildBrokerServer.sweep removes an expired connection (headless TTL sweep)', async (t) => {
+  const built = await buildBrokerServer(await baseEnv(t));
   try {
     const vault = new Vault(built.db, Buffer.from(KEY_B64, 'base64'));
     await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
@@ -231,19 +232,19 @@ test('#54 buildBrokerServer.sweep removes an expired connection (headless TTL sw
   }
 });
 
-test('#54 sweep interval: default is hourly; VOUCHR_SWEEP_INTERVAL_MS=0 disables it', async () => {
-  const dflt = await buildBrokerServer(baseEnv());
+test('#54 sweep interval: default is hourly; VOUCHR_SWEEP_INTERVAL_MS=0 disables it', async (t) => {
+  const dflt = await buildBrokerServer(await baseEnv(t));
   assert.equal(dflt.sweepIntervalMs, 60 * 60 * 1000);
   await dflt.db.close();
-  const off = await buildBrokerServer(baseEnv({ VOUCHR_SWEEP_INTERVAL_MS: '0' }));
+  const off = await buildBrokerServer(await baseEnv(t, { VOUCHR_SWEEP_INTERVAL_MS: '0' }));
   assert.equal(off.sweepIntervalMs, 0);
   await off.db.close();
-  await assert.rejects(buildBrokerServer(baseEnv({ VOUCHR_SWEEP_INTERVAL_MS: 'nope' })), /VOUCHR_SWEEP_INTERVAL_MS/);
+  await assert.rejects(buildBrokerServer(await baseEnv(t, { VOUCHR_SWEEP_INTERVAL_MS: 'nope' })), /VOUCHR_SWEEP_INTERVAL_MS/);
 });
 
-test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot on a real vault', async () => {
+test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot on a real vault', async (t) => {
   // Parse + wire-through: 1/true → on, absent/anything else → off (production behavior).
-  const on = await buildBrokerServer(baseEnv({ VOUCHR_DRY_RUN: '1' }));
+  const on = await buildBrokerServer(await baseEnv(t, { VOUCHR_DRY_RUN: '1' }));
   try {
     assert.equal(on.dryRun, true);
     // The bin's SWEEP shares the marked audit instance, so its revoke rows carry meta.dry_run too
@@ -260,14 +261,14 @@ test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot o
   } finally {
     await on.db.close();
   }
-  const off = await buildBrokerServer(baseEnv());
+  const off = await buildBrokerServer(await baseEnv(t));
   assert.equal(off.dryRun, false);
   await off.db.close();
 
   // Boot-time refusal: a vault holding a non-dry-run row must stop the server before it listens.
-  const dir = mkdtempSync(join(tmpdir(), 'vouchr-dryrun-'));
-  const dbPath = join(dir, 'real.db');
-  const db = await openDb({ dbPath });
+  const _dir = mkdtempSync(join(tmpdir(), 'vouchr-dryrun-'));
+  const dbPath = await testDbUrl(t);
+  const db = await openDb({ databaseUrl: dbPath });
   await new Vault(db, Buffer.from(KEY_B64, 'base64')).upsert(
     userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
     'internal',
@@ -275,31 +276,31 @@ test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot o
   );
   await db.close();
   await assert.rejects(
-    buildBrokerServer(baseEnv({ VOUCHR_DRY_RUN: 'true', VOUCHR_DB: dbPath })),
+    buildBrokerServer(await baseEnv(t, { VOUCHR_DRY_RUN: 'true', VOUCHR_DATABASE_URL: dbPath })),
     /refusing dryRun against a vault with real credentials/,
   );
 });
 
-test('buildBrokerServer: fails fast naming the missing secret', async () => {
-  const { VOUCHR_IDENTITY_SECRET, ...noSecret } = baseEnv();
+test('buildBrokerServer: fails fast naming the missing secret', async (t) => {
+  const { VOUCHR_IDENTITY_SECRET, ...noSecret } = await baseEnv(t);
   await assert.rejects(buildBrokerServer(noSecret), /VOUCHR_IDENTITY_SECRET/);
-  await assert.rejects(buildBrokerServer({ ...baseEnv(), VOUCHR_MASTER_KEY: undefined }), /VOUCHR_MASTER_KEY/);
-  await assert.rejects(buildBrokerServer({ ...baseEnv(), VOUCHR_MASTER_KEY: 'dG9vc2hvcnQ=' }), /32 bytes/);
+  await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_MASTER_KEY: undefined }), /VOUCHR_MASTER_KEY/);
+  await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_MASTER_KEY: 'dG9vc2hvcnQ=' }), /32 bytes/);
 });
 
 // ── T8: seed CLI ─────────────────────────────────────────────────────────────
 
-test('broker-seed: reference mode writes a credential the broker can resolve', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'vouchr-seed-'));
-  const dbPath = join(dir, 'v.db');
-  const env = { ...process.env, VOUCHR_DB: dbPath, VOUCHR_MASTER_KEY: KEY_B64 };
+test('broker-seed: reference mode writes a credential the broker can resolve', async (t) => {
+  const _dir = mkdtempSync(join(tmpdir(), 'vouchr-seed-'));
+  const dbPath = await testDbUrl(t);
+  const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: KEY_B64 };
   execFileSync(process.execPath, [
     '--import', 'tsx', 'bin/broker-seed.ts', 'reference',
     '--provider', 'confluence', '--team', 'T1', '--user', 'U1',
     '--source', 'aws-sm', '--secret-ref', 'arn:aws:secretsmanager:xyz',
   ], { env, stdio: 'pipe' });
 
-  const db = await openDb({ dbPath });
+  const db = await openDb({ databaseUrl: dbPath });
   try {
     const cred = await new Vault(db, Buffer.from(KEY_B64, 'base64')).get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'confluence');
     assert.equal(cred?.secretRef, 'arn:aws:secretsmanager:xyz'); // provisioned without Slack

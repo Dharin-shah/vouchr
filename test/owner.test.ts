@@ -1,12 +1,7 @@
 import { test } from 'node:test';
+import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { unlinkSync } from 'node:fs';
-import Database from 'better-sqlite3';
-import { encrypt } from '../src/core/crypto';
-import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -20,8 +15,8 @@ const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes:
 
 // T3 + invariant 4: a user cred and a channel cred sharing an id string, and the same channel
 // id in another team, are all independently addressable. No lookup satisfies another's.
-test('owner isolation: (team,channel) vs (team,user) vs (otherTeam,channel) never cross', async () => {
-  const vault = new Vault(await openDb({ dbPath: ':memory:' }), KEY);
+test('owner isolation: (team,channel) vs (team,user) vs (otherTeam,channel) never cross', async (t) => {
+  const vault = new Vault(await openTestDb(t), KEY);
   await vault.upsert(channelOwner('T1', 'X'), 'p', tok('chan-T1'));
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'X' }), 'p', tok('user-T1'));
   await vault.upsert(channelOwner('T2', 'X'), 'p', tok('chan-T2'));
@@ -36,8 +31,8 @@ test('owner isolation: (team,channel) vs (team,user) vs (otherTeam,channel) neve
 
 // The AWS-delegate model: a referenced secret lives in an external manager. We persist only a
 // non-secret ref; the resolver produces the secret JIT at injection; it is never stored.
-test('referenced secret-source: resolved JIT, injected, never persisted', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('referenced secret-source: resolved JIT, injected, never persisted', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const owner = channelOwner('T1', 'C_FIN');
@@ -76,8 +71,8 @@ test('referenced secret-source: resolved JIT, injected, never persisted', async 
   }
 });
 
-test('referenced secret-source: missing resolver fails closed (no silent skip)', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('referenced secret-source: missing resolver fails closed (no silent skip)', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const owner = channelOwner('T1', 'C1');
   await vault.reference(owner, 'mcp', { source: 'aws-sm', secretRef: 'arn:x' });
@@ -91,8 +86,8 @@ test('referenced secret-source: missing resolver fails closed (no silent skip)',
 
 // T5: offboarding a member who linked a shared channel cred must NOT delete the channel's cred,
 // and `/vouchr status` (listForUser) must never surface it.
-test('offboard leaves channel-owned creds; status never lists them', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('offboard leaves channel-owned creds; status never lists them', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const consent = new Consent(db);
@@ -107,8 +102,8 @@ test('offboard leaves channel-owned creds; status never lists them', async () =>
 });
 
 // T9: a shared-channel-cred injection audits the ACTING human, never the channel.
-test('audit attribution: shared-cred injection records the acting user, not the channel', async () => {
-  const db = await openDb({ dbPath: ':memory:' });
+test('audit attribution: shared-cred injection records the acting user, not the channel', async (t) => {
+  const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const owner = channelOwner('T1', 'C_FIN');
@@ -126,41 +121,5 @@ test('audit attribution: shared-cred injection records the acting user, not the 
     assert.equal(row.user_id, 'U_HUMAN'); // the human who acted, not 'C_FIN'
   } finally {
     globalThis.fetch = realFetch;
-  }
-});
-
-// Migration: a pre-owner-keying DB (user_id, no owner_kind) is rebuilt: each row becomes an
-// owner_kind='user' row with ciphertext + timestamps preserved verbatim.
-test('migration: legacy user_id rows backfill to owner_kind=user, ciphertext preserved', async () => {
-  const path = join(tmpdir(), `vouchr-mig-${randomBytes(6).toString('hex')}.db`);
-  try {
-    const old = new Database(path);
-    old.exec(`CREATE TABLE connection (
-      id TEXT PRIMARY KEY, enterprise_id TEXT, team_id TEXT NOT NULL, user_id TEXT NOT NULL,
-      provider TEXT NOT NULL, access_token_enc BLOB NOT NULL, refresh_token_enc BLOB,
-      scopes TEXT NOT NULL, expires_at INTEGER, external_account TEXT,
-      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, last_used_at INTEGER,
-      UNIQUE (team_id, user_id, provider));`);
-    old.prepare(`INSERT INTO connection
-      (id, enterprise_id, team_id, user_id, provider, access_token_enc, scopes, created_at, updated_at, last_used_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?)`)
-      .run('row1', null, 'T1', 'U1', 'github', encrypt('legacy-token', KEY), 'repo', 1000, 1000, 2000);
-    old.close();
-
-    const db = await openDb({ dbPath: path }); // runs the rebuild migration
-    const cols = (await db.all(`PRAGMA table_info(connection)`) as any[]).map((c) => c.name);
-    assert.ok(cols.includes('owner_kind') && cols.includes('source') && !cols.includes('user_id'));
-
-    const vault = new Vault(db, KEY);
-    const got = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'github');
-    assert.equal(got?.accessToken, 'legacy-token'); // ciphertext decrypts → preserved
-    assert.equal(got?.source, 'vault');
-    const row = await db.get(`SELECT owner_kind, owner_id, created_at FROM connection`) as any;
-    assert.equal(row.owner_kind, 'user');
-    assert.equal(row.owner_id, 'U1');
-    assert.equal(row.created_at, 1000); // timestamp preserved
-    await db.close();
-  } finally {
-    try { unlinkSync(path); } catch {}
   }
 });

@@ -32,7 +32,7 @@ flowchart LR
         audit["Audit\n(redacting)"]
     end
 
-    db[("SQLite / Postgres")]
+    db[("PostgreSQL")]
     prov["Provider API"]
     kms["KMS / secret manager"]
 
@@ -84,9 +84,9 @@ crypto are all decided in one place; an adapter only supplies inputs (e.g.
 
 ## Storage schema
 
-One store, two backends: SQLite (embedded, zero-config default) or Postgres (stateless
-/ multi-instance), behind a minimal async `Db` seam (`src/core/db.ts`, `?`
-placeholders rewritten to `$n` for Postgres). Tables (`schema()` in `db.ts`):
+One store, PostgreSQL only (stateless / multi-instance), behind a minimal async `Db`
+seam (`src/core/db.ts`). A connection string is required; there is no embedded fallback.
+Tables (`schema()` in `db.ts`):
 
 | Table | Purpose | Key |
 | --- | --- | --- |

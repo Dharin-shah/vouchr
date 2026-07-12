@@ -299,9 +299,10 @@ export class Vault {
   /**
    * Run `fn` while holding the cross-process refresh lock for (owner, provider), with the vault
    * rebound to the locked transaction so `fn`'s reads/writes (get/updateTokens) see the same tx.
-   * On a backend without a lock (SQLite) this is a passthrough that runs `fn(this)` — the injector's
-   * in-process single-flight map already serializes a single process. Key matches the injector's
-   * inflight key so in-process and cross-process coordination agree on identity.
+   * A Db without `withRefreshLock` (a tx-bound client already inside a transaction) is a passthrough
+   * that runs `fn(this)` — the injector's in-process single-flight map already serializes a single
+   * process. Key matches the injector's inflight key so in-process and cross-process coordination
+   * agree on identity.
    */
   async withRefreshLock<T>(owner: Owner, provider: string, fn: (locked: Vault) => Promise<T>): Promise<T> {
     if (!this.db.withRefreshLock) return fn(this);
