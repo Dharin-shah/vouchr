@@ -186,6 +186,22 @@ A provider is declarative OAuth2 (see `src/core/providers.ts`). Most are ~10 lin
 `refresh` strategy, and `pkce`. Non-standard token endpoints use `tokenAuth: 'basic'`
 and/or `bodyFormat: 'json'` (see `notion()`). Do not add a new dependency for a provider.
 
+## Review rules (REV)
+
+- **REV-1 — Checks are evidence, not review.** GitHub's mergeability state and green
+  checks are useful signals only. Review the current-head diff and behavior against the
+  SEC/STR/PLAT/UX/ADOPT/TEST rules, the issue acceptance criteria, and relevant edge
+  cases; state the review conclusion separately from the check status.
+- **REV-2 — Turn reusable findings into guardrails.** For every finding, identify and
+  recommend the smallest durable guardrail when the invariant is deterministic and
+  generalizable: prefer a regression test, static check, or CI rule over prose. Use a
+  canonical agent rule only when mechanical enforcement is impractical. If the guardrail
+  is outside the reviewed PR's scope, search open and closed GitHub issues first; if none
+  covers it, create one with the failure mode, invariant, proposed enforcement point, and
+  acceptance criteria. If issue creation is unavailable, provide the ready-to-file body
+  and say why. Link an existing owner issue instead of creating duplicate or speculative
+  work.
+
 ## Pull requests
 
 Process rules — `pr-lint` CI checks PROC-1..4 and blocks the PR if they fail. Automated

@@ -2,7 +2,7 @@
 
 @AGENTS.md
 
-AGENTS.md (imported above) is the canonical contract: SEC/STR/TEST/PROC rules, exact
+AGENTS.md (imported above) is the canonical contract: SEC/STR/TEST/REV/PROC rules, exact
 commands, and the PR template. Everything below is workflow guidance on top of it.
 
 ## Workflow
@@ -10,6 +10,8 @@ commands, and the PR template. Everything below is workflow guidance on top of i
 - Every PR targets `main`. Never base a PR on another PR's branch.
 - Do feature work in a dedicated git worktree, not by switching branches in the main
   checkout: `git worktree add ../vouchr-worktrees/<branch> -b <branch> origin/main`.
+- Reviews follow `AGENTS.md` section **Review rules (REV)**, including the deterministic
+  guardrail or non-duplicate issue disposition before approval.
 - Before opening a PR, walk the Pre-PR checklist at the bottom of AGENTS.md and copy the
   sign-off template from AGENTS.md § Pull requests verbatim.
 
