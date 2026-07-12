@@ -17,7 +17,7 @@ echo "==> npm pack (runs prepack → build)"
 TGZ="$(ls "$WORK"/vouchr-core-*.tgz)"
 [ -f "$TGZ" ] || { echo "FAIL: no tarball produced"; exit 1; }
 echo "    packed: $(basename "$TGZ")"
-tar -tzf "$TGZ" | grep -qx 'package/vision.md' \
+tar -tzf "$TGZ" | grep -x 'package/vision.md' >/dev/null \
   || { echo "FAIL: README's canonical vision.md target is missing from the package"; exit 1; }
 
 echo "==> install into a fresh consumer project"
