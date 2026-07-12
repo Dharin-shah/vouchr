@@ -718,7 +718,8 @@ platform.
 (they are part of the schema `vouchr migrate` creates — no action needed):
 
 - owner history (`/vouchr audit`) → `idx_audit_team_user_at (team_id, user_id, at DESC)`
-- channel history + `/vouchr stats` + channel-config lookup → `idx_audit_team_channel_at (team_id, channel, at DESC)`
+- channel history + `/vouchr stats` → `idx_audit_team_channel_at (team_id, channel, at DESC)`
+- "who configured this" lookups → partial `idx_audit_config (team_id, channel, provider, at DESC) WHERE action='config'`
 - retention pruning → `idx_audit_at (at)`
 
 **Retention is an explicit choice — there is no automatic pruning.** Keeping rows forever is a
@@ -731,20 +732,29 @@ node dist/bin/vouchr.js prune --older-than-days 90 --yes      # deletes, in 10k-
 #   --batch <N>   rows per DELETE (default 10000)
 ```
 
-Each batch is its own transaction, so pruning never holds a long lock, bloats WAL, or monopolizes
-the pool; it is **restartable and idempotent** (an interrupted or repeated run just deletes whatever
-is now old). Pick a `--batch` your `max_connections`/WAL headroom is comfortable with.
+Each batch is its own transaction, so pruning **bounds the WAL and lock held per statement** — it
+never takes a long lock or monopolizes the pool. (Deletes still generate WAL and leave dead tuples;
+autovacuum reclaims that space over time, so expect vacuum activity after a large prune.) It is
+**restartable and idempotent** — an interrupted or repeated run just deletes whatever is now old, and
+`FOR UPDATE SKIP LOCKED` lets two prune jobs take disjoint batches. Pick a `--batch` your
+`max_connections` / WAL / autovacuum headroom is comfortable with.
 
-**Estimating storage.** A row is on the order of a few hundred bytes plus the three index entries;
-multiply by your injection/consent rate to size the disk, or set a retention window that keeps the
-table within a target row count. `SELECT count(*), pg_size_pretty(pg_total_relation_size('audit'))`
-gives the current footprint.
+**Estimating storage.** A row is on the order of a few hundred bytes plus the index entries; multiply
+by your injection/consent rate to size the disk, or set a retention window that keeps the table
+within a target row count. The current footprint:
 
-**Long retention / compliance.** For durable long-term audit beyond the operational window, stream
-events to a sink your side owns rather than growing the table: wire `auditSink`/`onAudit`
-(`VouchrAuditEvent`, no secret material — see the audit-sink docs) into your log pipeline or a Redis
-stream, and prune the Postgres table aggressively. Vouchr deliberately does not implement archive
-tiers or legal-hold workflows.
+```sql
+SELECT count(*) AS rows, pg_size_pretty(pg_total_relation_size('audit')) AS total_size FROM audit;
+```
+
+**Long retention / compliance.** The `audit` TABLE is the authoritative record; do NOT prune based on
+`auditSink` — it is a lossy, fire-and-forget convenience copy (a capped stream may drop events and it
+does not carry every audited action), so it cannot stand in for the table. For durable long-term or
+compliance archives, run an operator-owned durable pipeline off PostgreSQL itself — logical
+replication / CDC (e.g. a replication slot) to a warehouse, or periodic `pg_dump`/`COPY` exports to
+object storage — and **verify delivery and a test restore before you prune**. Only prune rows you
+have confirmed are safely archived. Vouchr deliberately does not implement archive tiers or
+legal-hold workflows.
 
 ## Backup and restore
 

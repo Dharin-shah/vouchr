@@ -5,11 +5,13 @@
  * Connects to the SAME credential store the app uses (PostgreSQL via
  * VOUCHR_DATABASE_URL or --db) through `openDb`. The read commands
  * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
- * token/secret material. Two commands mutate: `revoke` DELETES rows and may
- * best-effort decrypt an access token to hand to the upstream revoke — never to
+ * token/secret material. Three commands mutate: `revoke` DELETES credential rows and
+ * may best-effort decrypt an access token to hand to the upstream revoke — never to
  * stdout; `rekey` re-encrypts ciphertext columns under the primary master key and
- * prints counts only. `secret_ref` (an external manager ARN/pointer, non-secret by
- * design) is the only ref any command surfaces.
+ * prints counts only; `prune` DELETES old `audit` rows (retention, #208). `revoke`
+ * and `prune` are dry-run by default and require an exact bare `--yes` to delete.
+ * `secret_ref` (an external manager ARN/pointer, non-secret by design) is the only
+ * ref any command surfaces.
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
@@ -43,6 +45,20 @@ function parseFlags(argv: string[]): Flags {
     } else positional.push(a);
   }
   return { values, positional };
+}
+
+/**
+ * Exact destructive confirmation shared by every deleting command (`revoke`, `prune`). ONLY a bare
+ * `--yes` (no value) confirms; a valued form (`--yes=false`, `--yes no`) or `--yes` together with
+ * `--dry-run` is a mistake, not consent, and is REJECTED — a typo must never delete data. Returns
+ * 'go' to proceed, 'dry-run' to preview only, or an `{ error }` the caller prints before exiting 2.
+ */
+function destructiveIntent(f: Flags): 'go' | 'dry-run' | { error: string } {
+  const hasYes = 'yes' in f.values;
+  const hasDry = 'dry-run' in f.values;
+  if (hasYes && f.values.yes !== '') return { error: '--yes takes no value (pass a bare `--yes` to confirm the delete)' };
+  if (hasYes && hasDry) return { error: '--yes and --dry-run are mutually exclusive' };
+  return hasYes ? 'go' : 'dry-run';
 }
 
 const ts = (ms: number | null | undefined): string =>
@@ -144,8 +160,13 @@ async function cmdRevoke(db: Db, f: Flags): Promise<number> {
   const filter: RevokeFilter = { provider, teamId: f.values.team, userId: f.values.user, channel: f.values.channel };
   const rows = await selectRevocations(db, filter);
 
-  // Dry-run unless --yes (and an explicit --dry-run forces it even alongside --yes). Print + exit.
-  const dryRun = 'dry-run' in f.values || !('yes' in f.values);
+  // Dry-run unless an exact bare --yes confirms (a valued/conflicting --yes is rejected, not obeyed).
+  const intent = destructiveIntent(f);
+  if (typeof intent === 'object') {
+    console.error(`revoke: ${intent.error}`);
+    return 2;
+  }
+  const dryRun = intent === 'dry-run';
   const scope = [`provider=${provider}`, f.values.team && `team=${f.values.team}`, f.values.user && `user=${f.values.user}`, f.values.channel && `channel=${f.values.channel}`].filter(Boolean).join(' ');
   console.log(`${dryRun ? 'DRY-RUN' : 'REVOKE'} ${scope}: ${rows.length} connection(s)`);
   printTable(
@@ -295,20 +316,29 @@ async function cmdDoctor(f: Flags): Promise<number> {
  * choice — there is no automatic pruning, so keeping rows forever is a deliberate (documented) default.
  */
 async function cmdPrune(db: Db, f: Flags): Promise<number> {
+  // Bounded integers only: a positive whole number of days, and a batch in [1, 10000] (the fixed
+  // per-statement ceiling — larger batches defeat the "bounded work" guarantee).
   const days = Number(f.values['older-than-days']);
-  if (!('older-than-days' in f.values) || !Number.isFinite(days) || days <= 0) {
-    console.error('prune: --older-than-days <N> is required (a positive number of days; nothing is pruned without it)');
+  if (!('older-than-days' in f.values) || !Number.isInteger(days) || days < 1) {
+    console.error('prune: --older-than-days <N> is required (a positive integer number of days; nothing is pruned without it)');
     return 2;
   }
   const batch = 'batch' in f.values ? Number(f.values.batch) : 10_000;
-  if (!Number.isInteger(batch) || batch < 1) {
-    console.error('prune: --batch must be a positive integer');
+  if (!Number.isInteger(batch) || batch < 1 || batch > 10_000) {
+    console.error('prune: --batch must be an integer between 1 and 10000');
+    return 2;
+  }
+  const intent = destructiveIntent(f);
+  if (typeof intent === 'object') {
+    console.error(`prune: ${intent.error}`);
     return 2;
   }
   const cutoff = Date.now() - days * 86_400_000;
   const audit = new Audit(db);
-  const n = await audit.countOlderThan(cutoff);
-  if (!('yes' in f.values)) {
+  if (intent === 'dry-run') {
+    // The count is ONLY for the preview — never on the destructive path, where an exact count of a
+    // huge expired set could scan the table / hit statement_timeout before the first bounded delete.
+    const n = await audit.countOlderThan(cutoff);
     console.log(`DRY-RUN: ${n} audit row(s) older than ${days} day(s) (before ${ts(cutoff)}). Re-run with --yes to delete in batches of ${batch}.`);
     return 0;
   }

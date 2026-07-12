@@ -188,14 +188,18 @@ export class Audit {
     if (!Number.isInteger(batch) || batch < 1) throw new Error(`audit prune batch must be a positive integer, got ${batch}`);
     let total = 0;
     for (;;) {
-      // Delete by PK of the oldest `batch` expired rows: the subquery rides idx_audit_at (at < cutoff,
-      // ORDER BY at), the outer delete rides the PK. Portable (no ctid). Each statement is its own tx.
+      // Materialize the oldest `batch` expired ids as an ARRAY (rides idx_audit_at for the at<cutoff
+      // range), then delete via the PRIMARY KEY. The plain `id IN (SELECT …)` form plans as a hash
+      // semi-join with a SEQ SCAN of the whole table per batch (measured on 1M rows) — the ARRAY form
+      // does not. `FOR UPDATE SKIP LOCKED` lets two concurrent prune jobs take disjoint batches
+      // instead of contending. Each statement is its own tx, so batches commit independently.
       const { changes } = await this.db.run(
-        `DELETE FROM audit WHERE id IN (SELECT id FROM audit WHERE at < ? ORDER BY at LIMIT ?)`,
+        `DELETE FROM audit WHERE id = ANY(ARRAY(
+           SELECT id FROM audit WHERE at < ? ORDER BY at LIMIT ? FOR UPDATE SKIP LOCKED))`,
         [cutoffEpoch, batch],
       );
       total += changes;
-      if (changes < batch) break; // a short (or empty) batch means no expired rows remain
+      if (changes < batch) break; // a short (or empty) batch means no expired rows remain (for this job)
     }
     return total;
   }
