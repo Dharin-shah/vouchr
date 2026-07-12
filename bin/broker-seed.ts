@@ -72,7 +72,7 @@ async function main(): Promise<void> {
   // scopes stored space-separated, matching the OAuth path.
   const scopes = f.scopes ? f.scopes.split(',').map((s) => s.trim()).filter(Boolean).join(' ') : undefined;
 
-  const url = process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
+  const url = process.env.VOUCHR_DATABASE_URL; // explicit only — no generic DATABASE_URL fallback (#204)
   let envelope: EnvelopeProvider | undefined;
   if (process.env.VOUCHR_KMS_KEY_ID) {
     const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms.js');

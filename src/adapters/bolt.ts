@@ -997,13 +997,24 @@ export async function createVouchr(opts: VouchrOptions) {
   // #116: external KMS makes real wrap/unwrap network calls — refuse fail-closed before opening the
   // db, so the "no real network on any edge" guarantee holds. Local master key only in dry-run.
   if (dryRun) assertDryRunLocalKey(!!opts.envelope);
+  // Validate everything that DOESN'T need the db BEFORE opening the pool, so a bad master key or
+  // provider config can't leak an owned pool (there's no handle to close it before createVouchr
+  // returns). Only assertDryRunVault (which reads the vault) is post-open, and it's guarded below.
+  const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
+  const registry = new ProviderRegistry(opts.providers);
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
   // #116 safety rail: dry-run hard-fails at startup against a vault holding real credential rows.
-  if (dryRun) await assertDryRunVault(db);
-  const key = loadKeyring(); // VOUCHR_MASTER_KEY alone behaves exactly as before; VOUCHR_MASTER_KEYS adds rotation (#115)
-  const registry = new ProviderRegistry(opts.providers);
+  // Close the pool WE opened if this refuses — don't strand it (an injected db is the caller's).
+  if (dryRun) {
+    try {
+      await assertDryRunVault(db);
+    } catch (e) {
+      if (ownsDb) await db.close().catch(() => undefined);
+      throw e;
+    }
+  }
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);

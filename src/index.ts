@@ -17,7 +17,7 @@ export { ApprovalRequiredError, Approvals } from './core/approval';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
 // (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
 // `./headless`. SessionGrants/sweepExpired/TtlPolicy are already exported below.
-export { openDb } from './core/db';
+export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
 export { Vault } from './core/vault';
 export { Audit } from './core/audit';

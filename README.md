@@ -84,7 +84,7 @@ Register each OAuth provider's app with callback `$PUBLIC_URL/vouchr/oauth/callb
 npm install && cp .env.example .env   # VOUCHR_MASTER_KEY, Slack secrets, provider OAuth creds
 # Point at your PostgreSQL database (fails closed at boot if unset or non-postgres://):
 export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
-npx vouchr migrate                    # create/upgrade the schema (once per deploy; schema-owner role)
+npm run cli -- migrate                # create/upgrade the schema (once per deploy; schema-owner role)
 npm run example:github                # then @-mention the bot in a channel
 ```
 

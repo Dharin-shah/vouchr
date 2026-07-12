@@ -79,7 +79,7 @@ export async function buildBrokerServer(
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
 
-  const url = env.VOUCHR_DATABASE_URL ?? env.DATABASE_URL;
+  const url = env.VOUCHR_DATABASE_URL; // explicit only — no generic DATABASE_URL fallback (#204)
   const backend = 'postgres' as const; // PostgreSQL-only (#204); openDb fails closed if url unset/non-PG
 
   // Optional KMS envelope — only when configured.

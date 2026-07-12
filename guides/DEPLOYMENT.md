@@ -69,9 +69,10 @@ split so the long-running process holds no DDL privileges.
   and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
 
   ```bash
-  VOUCHR_DATABASE_URL=postgres://vouchr_owner:...@host:5432/vouchr npx vouchr migrate
-  # or, from a checkout: node bin/vouchr.ts migrate
-  # in the container image: node dist/bin/vouchr.js migrate
+  # built package / container image (the `vouchr` bin is dist/bin/vouchr.js):
+  VOUCHR_DATABASE_URL=postgres://vouchr_owner:...@host:5432/vouchr node dist/bin/vouchr.js migrate
+  # from a source checkout (Node >= 22 runs the TS entry via tsx):
+  VOUCHR_DATABASE_URL=postgres://vouchr_owner:...@host:5432/vouchr npm run cli -- migrate
   ```
 
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
@@ -130,7 +131,7 @@ const app = new App({ /* ...OAuth config... */, installationStore: store });
 const vouchr = await createVouchr({
   providers: [github()],
   baseUrl: process.env.PUBLIC_URL!,
-  databaseUrl: process.env.VOUCHR_DATABASE_URL!,
+  db,                       // inject the SAME handle the store uses → one shared pool, not two
   installationStore: store, // confirmation DM uses the connecting user's workspace token
 });
 ```

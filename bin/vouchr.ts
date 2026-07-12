@@ -63,7 +63,7 @@ function printTable(headers: string[], rows: string[][]): void {
 
 /** Mirror openDb's backend resolution so `doctor` can report it without opening twice. */
 function describeBackend(dbUrl?: string): string {
-  const url = dbUrl ?? process.env.VOUCHR_DATABASE_URL ?? process.env.DATABASE_URL;
+  const url = dbUrl ?? process.env.VOUCHR_DATABASE_URL; // no generic DATABASE_URL fallback (#204)
   return isPostgresUrl(url) ? 'PostgreSQL' : 'PostgreSQL (not configured — set VOUCHR_DATABASE_URL)';
 }
 

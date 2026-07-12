@@ -56,9 +56,11 @@ class PgDb implements Db {
     if (!this.refreshPool) {
       this.refreshPool = new Pool({
         connectionString: this.connectionString,
+        application_name: 'vouchr-refresh', // distinct in pg_stat_activity from the main pool
         max: 4, // bounded: a stuck token endpoint caps at this many pinned backends, never the read pool
         connectionTimeoutMillis: 5_000,
         idleTimeoutMillis: 30_000,
+        maxLifetimeSeconds: 3600,
       });
       // Attach the idle-client error handler exactly ONCE, at pool creation. If this sat after the
       // lazy-init it would re-register on every withRefreshLock call (unbounded 'error' listeners +
@@ -105,9 +107,16 @@ class PgDb implements Db {
     }
   }
 
+  // Idempotent: `pg-pool` rejects a second `end()`, and two shutdown paths can both call close()
+  // (install().stop() AND the standalone close(), or a test's t.after AND an explicit close). Memoize
+  // so every caller after the first awaits the same teardown instead of throwing.
+  private closing?: Promise<void>;
   async close() {
-    await this.pool.end();
-    if (this.refreshPool) await this.refreshPool.end();
+    this.closing ??= (async () => {
+      await this.pool.end();
+      if (this.refreshPool) await this.refreshPool.end();
+    })();
+    return this.closing;
   }
 }
 
@@ -125,13 +134,15 @@ class PgClientDb implements Db {
 
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
- * Vouchr is PostgreSQL-only and greenfield (#204): there are no deployed databases to migrate
- * through the old incremental v1..v6 history, so the schema is defined once at its final shape in
- * {@link schema} and this is the single baseline. Bump it — and add a real migration step — only
- * when a shipped release's schema must change. The `meta` marker still exists so a downgrade (old
- * code against a newer DB) fails closed rather than corrupting encrypted rows.
+ * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so this PostgreSQL
+ * baseline is 7 — never a reset to 1, or a v6 Postgres database (from a `main` checkout) would be
+ * (wrongly) refused as "newer" by {@link guardSchemaVersion} and could never be migrated. `migrate()`
+ * applies the one-way cleanup that carries a v6 DB to 7 (drop `union_optin`, convert `union` modes —
+ * both idempotent on a fresh DB). Vouchr is greenfield, so that is the only migration step; add
+ * another only when a shipped release's schema must change. The `meta` marker fails a downgrade
+ * closed (old code vs a newer DB) rather than corrupting encrypted rows.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 7;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -318,27 +329,31 @@ function poolMax(): number | undefined {
 
 /** Resolve + validate the connection string and build a pool. No DDL, no schema check — the shared
  *  guts of {@link openDb} and {@link migrate}. TLS is native: put `sslmode=require` (or stricter) in
- *  the connection string and the pg driver negotiates it; there is no separate TLS knob to drift. */
-function connectDb(opts: DbOptions): PgDb {
+ *  the connection string and the pg driver negotiates it; there is no separate TLS knob to drift.
+ *  `statementTimeoutMs` defaults to the runtime's tight 10s; the migration path passes a longer one
+ *  so a slow DDL, data conversion, or advisory-lock WAIT (a concurrent migrate holding the lock)
+ *  isn't cancelled mid-migration. */
+function connectDb(opts: DbOptions, statementTimeoutMs = 10_000, appName = 'vouchr'): PgDb {
   const url = opts.databaseUrl ?? process.env.VOUCHR_DATABASE_URL;
   if (!isPostgresUrl(url)) {
     throw new Error(
       'vouchr: a PostgreSQL connection string is required (VOUCHR_DATABASE_URL, or the databaseUrl ' +
         'option). Vouchr is PostgreSQL-only; there is no embedded/SQLite mode and no generic ' +
-        'DATABASE_URL fallback.',
+        'DATABASE_URL fallback. The URL must include a host (e.g. postgres://user:pass@host:5432/db).',
     );
   }
   types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
   const pool = new Pool({
     connectionString: url,
-    application_name: 'vouchr', // names the backend in pg_stat_activity for operators
+    application_name: appName, // names the backend in pg_stat_activity for operators
     // Explicit pool size (VOUCHR_PG_POOL_MAX; pg's default 10 otherwise). Deployments size this to
-    // their `max_connections` / replica count.
+    // their `max_connections` / replica count. NOTE: each replica also lazily opens a SEPARATE 4-conn
+    // refresh pool (application_name 'vouchr-refresh') on first token refresh — budget max + 4 per replica.
     max: poolMax(),
     connectionTimeoutMillis: 5_000,
     idleTimeoutMillis: 30_000,
     maxLifetimeSeconds: 3600, // recycle a backend after an hour so a long-lived pod doesn't pin aging connections
-    statement_timeout: 10_000, // fail a request fast instead of hanging the Bolt handler
+    statement_timeout: statementTimeoutMs,
   });
   // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
   // throws and kills the whole process; swallow it, pg reconnects on the next query.
@@ -392,12 +407,17 @@ export async function assertSchemaCurrent(db: Db): Promise<void> {
  * short-lived connection and closes it before returning.
  */
 export async function migrate(opts: DbOptions = {}): Promise<{ version: number }> {
-  const db = connectDb(opts);
+  const db = connectDb(opts, 300_000, 'vouchr-migrate'); // generous timeout: DDL + lock wait, not a request
   try {
     await db.transaction(async (tx) => {
       await tx.get('SELECT pg_advisory_xact_lock(hashtext(current_schema()))'); // released at COMMIT
       await guardSchemaVersion(tx); // fail closed on a newer-schema DB, before any DDL
-      await tx.exec(schema()); // single idempotent baseline; no incremental migrations (greenfield)
+      await tx.exec(schema()); // idempotent baseline (CREATE TABLE IF NOT EXISTS)
+      // One-way carry from the pre-#204 v6 lineage (#196): union credential-borrowing is gone. Both
+      // statements are idempotent — no-ops on a fresh DB (no union_optin table, no union modes) and
+      // on a re-run. Atomic with the DDL above (one advisory-locked tx), so migrate is all-or-nothing.
+      await tx.exec(`DROP TABLE IF EXISTS union_optin`);
+      await tx.run(`UPDATE channel_config SET mode='per-user' WHERE mode='union'`);
       await stampSchemaVersion(tx);
     });
     return { version: SCHEMA_VERSION };
@@ -422,4 +442,3 @@ export async function openDb(opts: DbOptions = {}): Promise<Db> {
   }
   return db;
 }
-
