@@ -7,6 +7,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Deployment-bound, replay-safe broker identity assertions** (#212). A signed identity token is now
+  bound to one deployment: the packaged broker builds an `IdentityConfig` from env
+  (`loadIdentityConfig`) with a verified issuer (`VOUCHR_IDENTITY_ISSUER`, default `vouchr`) and
+  audience (`VOUCHR_DEPLOYMENT_ID`, **required**), so a token minted for one deployment is rejected by
+  another. New checks fail closed before authorization/audit: `VOUCHR_IDENTITY_SECRET` must be ≥ 32
+  bytes and distinct from the master key / broker token; tokens carry `iat` and are rejected if issued
+  in the future (beyond a 30s skew) or over the 5-minute lifetime; `jti` must be non-empty. Rolling key
+  rotation is supported via `VOUCHR_IDENTITY_SECRET_PREVIOUS` — during the overlap the broker verifies
+  either key (selected by a `kid` fingerprint) and rejects an unknown `kid` once the previous key is
+  dropped. The broker no longer silently falls back to a process-local replay guard (cluster-wide
+  Postgres `broker_jti` remains the default). The signing algorithm stays fixed HS256 with no `alg`
+  header, and rejection errors never echo the assertion or key material. `mintIdentity`/`verifyIdentity`
+  accept a bare secret (legacy single-deployment) or an `IdentityConfig` (deployment-bound); new
+  exports: `loadIdentityConfig`, `assertStrongIdentitySecret`, `identityKid`, `IdentityConfig`,
+  `IdentityKey`, `DEFAULT_SKEW_MS`, `MIN_IDENTITY_SECRET_BYTES`.
+
 - **One strict provider / OAuth / egress boundary** (#211). `defineProvider` is now the single core
   validator every provider passes through — built-in factories, code registration, and broker JSON all
   normalize to the same checked object. New, fail-fast at definition/config load: `authorizeUrl` /

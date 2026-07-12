@@ -4,8 +4,12 @@ export type { ConnectContextDeps } from './adapters/bolt';
 // Headless HTTP broker (non-Bolt agent runtimes): signed identity + fail-closed read-only egress.
 export { createBroker } from './adapters/http/broker';
 export type { BrokerOptions, BrokerFetchRequest, BrokerMcpRequest, ConnectionHandleRef } from './adapters/http/broker';
-export { signIdentity, mintIdentity, verifyIdentity, ReplayGuard, IdentityError, MAX_LIFETIME_MS } from './adapters/http/identity';
-export type { IdentityClaims, MintIdentityInput, ReplayStore } from './adapters/http/identity';
+export {
+  signIdentity, mintIdentity, verifyIdentity, ReplayGuard, IdentityError, MAX_LIFETIME_MS,
+  // #212 deployment-bound identity: config builder + helpers for minting/verifying bound assertions.
+  loadIdentityConfig, assertStrongIdentitySecret, identityKid, DEFAULT_SKEW_MS, MIN_IDENTITY_SECRET_BYTES,
+} from './adapters/http/identity';
+export type { IdentityClaims, MintIdentityInput, ReplayStore, IdentityConfig, IdentityKey } from './adapters/http/identity';
 export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';

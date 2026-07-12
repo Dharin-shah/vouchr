@@ -12,6 +12,7 @@ import { openDb, type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
+import { loadIdentityConfig, type IdentityConfig } from '../src/adapters/http/identity';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
@@ -50,15 +51,31 @@ export async function buildBrokerServer(
   env: NodeJS.ProcessEnv = process.env,
   overrides: Partial<BrokerOptions> = {},
 ): Promise<BuiltBroker> {
-  const identitySecret = env.VOUCHR_IDENTITY_SECRET;
-  if (!identitySecret || !identitySecret.trim()) {
-    fail('VOUCHR_IDENTITY_SECRET is required (the HS256 secret shared with the identity-token minter)');
-  }
   // Master key(s): VOUCHR_MASTER_KEY and/or VOUCHR_MASTER_KEYS (#115). loadKeyring reads the
   // injected env for testability; its errors already name the variable and the 32-byte rule.
   let masterKey: Keyring;
   try {
     masterKey = loadKeyring(env);
+  } catch (e: any) {
+    fail(e?.message ?? String(e));
+  }
+  // #212 deployment-bound identity: build the issuer/audience/key set from env and fail closed on a
+  // weak/missing secret, a missing deployment id, or a secret reused for ANOTHER purpose — the master
+  // key (both env forms), the broker bearer, AND every provider OAuth client secret (a value shared
+  // with a third-party provider must never double as the identity trust root). The resulting
+  // IdentityConfig — not a bare secret — is what makes an assertion minted for another deployment
+  // un-acceptable here.
+  const otherSecrets = [
+    env.VOUCHR_MASTER_KEY,
+    ...(env.VOUCHR_MASTER_KEYS ?? '').split(',').map((e) => e.split(':').slice(1).join(':').trim()),
+    env.VOUCHR_BROKER_TOKEN,
+    ...Object.entries(env)
+      .filter(([k]) => /^VOUCHR_PROVIDER_.+_CLIENT_SECRET$/.test(k))
+      .map(([, v]) => v),
+  ].filter((s): s is string => !!s);
+  let identityConfig: IdentityConfig;
+  try {
+    identityConfig = loadIdentityConfig(env, otherSecrets);
   } catch (e: any) {
     fail(e?.message ?? String(e));
   }
@@ -126,7 +143,7 @@ export async function buildBrokerServer(
     vault,
     audit,
     db,
-    identitySecret,
+    identitySecret: identityConfig,
     allowWrites,
     brokerToken,
     channelConfig,
@@ -162,9 +179,12 @@ const USAGE = `vouchr-broker — standalone headless Vouchr credential broker (n
 Usage: vouchr-broker            start the broker, config from env
        vouchr-broker --help     show this message
 
-Required env: VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY (base64 of 32 bytes).
-Optional env: VOUCHR_PORT (3000), VOUCHR_DATABASE_URL (PostgreSQL; required), VOUCHR_KMS_KEY_ID,
-              VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN, VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
+Required env: VOUCHR_IDENTITY_SECRET (>= 32 random bytes; distinct from the master key),
+              VOUCHR_DEPLOYMENT_ID (binds every identity assertion to this deployment),
+              VOUCHR_MASTER_KEY (base64 of 32 bytes), VOUCHR_DATABASE_URL (PostgreSQL).
+Optional env: VOUCHR_IDENTITY_SECRET_PREVIOUS (rolling key rotation), VOUCHR_IDENTITY_ISSUER (default
+              'vouchr'), VOUCHR_PORT (3000), VOUCHR_KMS_KEY_ID, VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN,
+              VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);

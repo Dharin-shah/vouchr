@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual, randomUUID } from 'node:crypto';
+import { createHmac, timingSafeEqual, randomUUID, createHash } from 'node:crypto';
 
 /**
  * Verified claims about WHO is acting, minted by a trusted upstream (the receiver that already
@@ -13,8 +13,22 @@ export interface IdentityClaims {
   threadTs?: string;
   /** Absolute expiry, epoch milliseconds (Date.now()), to match the rest of the codebase. */
   exp: number;
-  /** Single-use id (replay guard within the exp window). */
+  /** Single-use id (replay guard within the exp window). Must be non-empty. */
   jti: string;
+  /**
+   * Deployment-binding claims (#212), set by the minter when an {@link IdentityConfig} is used (the
+   * packaged broker's path). Absent on a legacy bare-secret token. When present they are VERIFIED:
+   *  - `iss` — the trusted minter (config.issuer);
+   *  - `aud` — the deployment this token is for (config.audience). A token minted for deployment A is
+   *    rejected by deployment B, which expects its own audience — the core cross-deployment binding.
+   *  - `iat` — issued-at (epoch ms); a token issued in the future (beyond clock skew) is rejected.
+   *  - `kid` — which signing key signed it, so a broker with rotated keys picks the right one and
+   *    rejects an unknown key id.
+   */
+  iss?: string;
+  aud?: string;
+  iat?: number;
+  kid?: string;
   /**
    * Admin authority for admin-gated routes (#54 `/v1/admin/*`). The broker cannot verify workspace
    * admin itself (no Slack client), so the trusted caller sets this AFTER its own admin check and
@@ -44,6 +58,108 @@ export interface IdentityClaims {
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
 export const MAX_LIFETIME_MS = 5 * 60 * 1000;
+
+/** Clock-skew tolerance for iat/exp comparisons in deployment-bound (config) mode. Small + documented. */
+export const DEFAULT_SKEW_MS = 30 * 1000;
+
+/** Minimum identity signing-secret strength: at least 32 bytes of key material (#212). */
+export const MIN_IDENTITY_SECRET_BYTES = 32;
+
+/**
+ * A named identity signing key. `kid` is a short, stable fingerprint of the secret ({@link identityKid}),
+ * so the minter and every broker replica derive the SAME id from the SAME secret with no extra config —
+ * and a broker mid-rotation can tell which key signed a token and reject an unknown one.
+ */
+export interface IdentityKey {
+  kid: string;
+  secret: string;
+}
+
+/**
+ * Deployment-bound identity configuration (#212) — the hardened alternative to a bare secret. Binds
+ * every assertion to ONE deployment (`audience`) and one `issuer`, signs with the active key
+ * (`keys[0]`), and verifies against ANY key in `keys` (active + previous, for rolling rotation with no
+ * downtime). Passing this to {@link mintIdentity}/{@link verifyIdentity} instead of a `string` turns on
+ * issuer/audience/kid/iat verification; a bare `secret: string` stays legacy single-deployment mode.
+ */
+export interface IdentityConfig {
+  issuer: string;
+  /** The deployment id. A token minted for one audience is rejected by a broker expecting another. */
+  audience: string;
+  /** keys[0] signs new tokens; every key is a verify candidate (rotation overlap). Non-empty. */
+  keys: IdentityKey[];
+  /** Clock-skew tolerance on iat/exp (default {@link DEFAULT_SKEW_MS}). */
+  skewMs?: number;
+}
+
+/** A short, deterministic key id from the secret — same secret ⇒ same kid on minter and every broker. */
+export function identityKid(secret: string): string {
+  return createHash('sha256').update(secret).digest('hex').slice(0, 12);
+}
+
+/** Obvious placeholder secrets rejected regardless of length — the "example" case of #212. */
+const PLACEHOLDER_SECRETS = new Set([
+  'secret', 'changeme', 'change-me', 'password', 'test', 'example', 'shhh', 'vouchr', 'identity',
+  'broker-secret', 'placeholder', 'your-secret-here', 'replace-me',
+]);
+
+/**
+ * Reject an identity signing secret that is too short or an obvious placeholder (#212). The signing
+ * secret is the broker's trust root, so a weak one lets anyone mint accepted assertions. Enforced at
+ * the env/config boundary ({@link loadIdentityConfig}), mirroring how master-key strength is validated
+ * in `loadKeyring` — the low-level sign/verify helpers trust their caller, like the vault trusts its key.
+ */
+export function assertStrongIdentitySecret(secret: string, label = 'identity secret'): void {
+  if (typeof secret !== 'string') {
+    throw new Error(`${label} must be at least ${MIN_IDENTITY_SECRET_BYTES} bytes of random key material`);
+  }
+  // Placeholder check first so an obvious example gets a clear message even if it also happens to be
+  // long enough; then the length floor for everything else (the low-length case).
+  if (PLACEHOLDER_SECRETS.has(secret.trim().toLowerCase())) {
+    throw new Error(`${label} is a known placeholder value; use a random ${MIN_IDENTITY_SECRET_BYTES}-byte secret`);
+  }
+  if (Buffer.byteLength(secret, 'utf8') < MIN_IDENTITY_SECRET_BYTES) {
+    throw new Error(`${label} must be at least ${MIN_IDENTITY_SECRET_BYTES} bytes of random key material`);
+  }
+}
+
+/**
+ * Build a deployment-bound {@link IdentityConfig} from env (#212), the packaged broker's identity
+ * setup — the parallel to `loadKeyring` for the master key. Fails closed on a missing/weak secret,
+ * a missing deployment id, or a previous key equal to the active one. `otherSecrets` (the master
+ * key(s), broker token) are checked for equality so one value can't be reused across purposes.
+ *  - VOUCHR_IDENTITY_SECRET          — active signing secret (required, >= 32 bytes).
+ *  - VOUCHR_IDENTITY_SECRET_PREVIOUS — previous secret during a rotation window (optional).
+ *  - VOUCHR_DEPLOYMENT_ID            — the audience every assertion is bound to (required).
+ *  - VOUCHR_IDENTITY_ISSUER          — the issuer claim (optional; default 'vouchr').
+ */
+export function loadIdentityConfig(env: NodeJS.ProcessEnv, otherSecrets: string[] = []): IdentityConfig {
+  const active = env.VOUCHR_IDENTITY_SECRET;
+  if (!active || !active.trim()) {
+    throw new Error('VOUCHR_IDENTITY_SECRET is required (the HS256 secret shared with the identity-token minter)');
+  }
+  const audience = env.VOUCHR_DEPLOYMENT_ID;
+  if (!audience || !audience.trim()) {
+    throw new Error('VOUCHR_DEPLOYMENT_ID is required (the deployment id every identity assertion is bound to)');
+  }
+  assertStrongIdentitySecret(active, 'VOUCHR_IDENTITY_SECRET');
+  const keys: IdentityKey[] = [{ kid: identityKid(active), secret: active }];
+  const previous = env.VOUCHR_IDENTITY_SECRET_PREVIOUS;
+  if (previous && previous.trim()) {
+    assertStrongIdentitySecret(previous, 'VOUCHR_IDENTITY_SECRET_PREVIOUS');
+    if (previous === active) throw new Error('VOUCHR_IDENTITY_SECRET_PREVIOUS must differ from VOUCHR_IDENTITY_SECRET');
+    keys.push({ kid: identityKid(previous), secret: previous });
+  }
+  // Reused-purpose guard (#212): the identity signing secret must not double as the encryption master
+  // key, the broker bearer, a provider OAuth client secret, or any other purpose — one leaked value
+  // would then break two boundaries at once. Callers pass those secrets in `otherSecrets`.
+  for (const other of otherSecrets) {
+    if (other && (other === active || other === previous)) {
+      throw new Error('VOUCHR_IDENTITY_SECRET must be distinct from the master key, broker token, and provider client secrets (no reused-purpose secrets)');
+    }
+  }
+  return { issuer: env.VOUCHR_IDENTITY_ISSUER?.trim() || 'vouchr', audience: audience.trim(), keys };
+}
 
 /** Raised on any verification failure. Carries no token/secret material; the broker maps it to 401. */
 export class IdentityError extends Error {
@@ -85,7 +201,7 @@ export type MintIdentityInput = Pick<
  * broker's trust root: keep it only in the minter and the broker, never in the model or the agent's
  * tool surface. Mint per request; do not cache or reuse a token across calls.
  */
-export function mintIdentity(input: MintIdentityInput, secret: string, ttlMs = 60_000, now = Date.now()): string {
+export function mintIdentity(input: MintIdentityInput, key: string | IdentityConfig, ttlMs = 60_000, now = Date.now()): string {
   const lifetime = Math.min(Math.max(1, ttlMs), MAX_LIFETIME_MS);
   const claims: IdentityClaims = {
     teamId: input.teamId,
@@ -99,7 +215,13 @@ export function mintIdentity(input: MintIdentityInput, secret: string, ttlMs = 6
     jti: randomUUID(),
     exp: now + lifetime,
   };
-  return signIdentity(claims, secret);
+  // Bare secret → legacy single-deployment token (no binding). IdentityConfig → deployment-bound:
+  // stamp iss/aud/iat/kid and sign with the ACTIVE key, so the broker can verify the binding + pick
+  // the key by kid during rotation.
+  if (typeof key === 'string') return signIdentity(claims, key);
+  const active = key.keys[0];
+  const bound: IdentityClaims = { ...claims, iss: key.issuer, aud: key.audience, iat: now, kid: active.kid };
+  return signIdentity(bound, active.secret);
 }
 
 /**
@@ -145,8 +267,15 @@ function isClaims(v: unknown): v is IdentityClaims {
     typeof c.userId === 'string' &&
     typeof c.channel === 'string' &&
     typeof c.exp === 'number' &&
-    typeof c.jti === 'string' &&
+    // jti is the replay key; an empty one is not a usable single-use id — reject it (#212), never coerce.
+    typeof c.jti === 'string' && c.jti.length > 0 &&
     (c.threadTs === undefined || typeof c.threadTs === 'string') &&
+    // Deployment-binding claims (#212): reject a wrong-typed value rather than coercing it — a
+    // malformed signed iss/aud/iat/kid fails closed instead of silently disabling a binding check.
+    (c.iss === undefined || typeof c.iss === 'string') &&
+    (c.aud === undefined || typeof c.aud === 'string') &&
+    (c.iat === undefined || typeof c.iat === 'number') &&
+    (c.kid === undefined || typeof c.kid === 'string') &&
     // Admin/lifecycle claims (#54): reject a wrong-typed value rather than coercing — a malformed
     // signed isAdmin fails closed (it can't slip through as true).
     (c.isAdmin === undefined || typeof c.isAdmin === 'boolean') &&
@@ -165,7 +294,7 @@ function isClaims(v: unknown): v is IdentityClaims {
  */
 export function verifyIdentity(
   token: string,
-  secret: string,
+  key: string | IdentityConfig,
   opts: { replay?: ReplayGuard; now?: number } = {},
 ): IdentityClaims {
   const now = opts.now ?? Date.now();
@@ -175,23 +304,54 @@ export function verifyIdentity(
   const payload = token.slice(0, dot);
   const sig = token.slice(dot + 1);
 
+  // Parse the payload up front. In config mode the `kid` selects the verifying key, so it must be read
+  // before the signature check — safe, because nothing here is trusted until the HMAC verifies below:
+  // a forged kid either names no key (rejected) or names a real key whose secret won't match the sig.
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+  } catch {
+    throw new IdentityError('malformed payload');
+  }
+  if (!isClaims(parsed)) throw new IdentityError('incomplete claims');
+  const claims = parsed;
+
+  // Select the verifying secret. Bare string → legacy single key. IdentityConfig → the key whose kid
+  // matches the token's `kid`; an unknown kid is rejected before any signature work (#212).
+  let secret: string;
+  if (typeof key === 'string') {
+    secret = key;
+  } else {
+    const match = claims.kid ? key.keys.find((k) => k.kid === claims.kid) : undefined;
+    if (!match) throw new IdentityError('unknown kid');
+    secret = match.secret;
+  }
+
   const expected = createHmac('sha256', secret).update(payload).digest('base64url');
   // Constant-time compare; differing lengths can't be timingSafeEqual'd, so reject first.
   const a = Buffer.from(sig);
   const b = Buffer.from(expected);
   if (a.length !== b.length || !timingSafeEqual(a, b)) throw new IdentityError('bad signature');
 
-  let claims: unknown;
-  try {
-    claims = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-  } catch {
-    throw new IdentityError('malformed payload');
+  const skew = typeof key === 'string' ? 0 : (key.skewMs ?? DEFAULT_SKEW_MS);
+  if (typeof key === 'string') {
+    // Legacy mode: exactly the historical time checks (no iss/aud/iat/skew).
+    if (claims.exp <= now) throw new IdentityError('expired');
+    if (claims.exp - now > MAX_LIFETIME_MS) throw new IdentityError('lifetime exceeds 5min');
+  } else {
+    // Deployment-bound mode (#212): a token minted for another deployment (aud) or minter (iss), or
+    // issued in the future / with an over-long lifetime, fails BEFORE the replay check (and authz).
+    if (claims.iss !== key.issuer) throw new IdentityError('wrong issuer');
+    if (claims.aud !== key.audience) throw new IdentityError('wrong audience');
+    if (typeof claims.iat !== 'number') throw new IdentityError('missing iat');
+    if (claims.iat > now + skew) throw new IdentityError('issued in the future');
+    if (claims.exp <= now - skew) throw new IdentityError('expired');
+    if (claims.exp - claims.iat > MAX_LIFETIME_MS) throw new IdentityError('lifetime exceeds 5min');
   }
-  if (!isClaims(claims)) throw new IdentityError('incomplete claims');
-
-  if (claims.exp <= now) throw new IdentityError('expired');
-  if (claims.exp - now > MAX_LIFETIME_MS) throw new IdentityError('lifetime exceeds 5min');
-  if (opts.replay && !opts.replay.use(claims.jti, claims.exp, now)) throw new IdentityError('replayed jti');
+  // Record the jti until the acceptance HORIZON (exp + skew), not exp: a token is acceptable in
+  // [exp, exp+skew) under clock skew, so the replay record must live that long or a pruned jti could be
+  // replayed there (#212). Legacy mode has skew 0, so the horizon is exp — unchanged.
+  if (opts.replay && !opts.replay.use(claims.jti, claims.exp + skew, now)) throw new IdentityError('replayed jti');
 
   return claims;
 }

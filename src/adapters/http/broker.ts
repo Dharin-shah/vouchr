@@ -23,7 +23,7 @@ import { Approvals, ApprovalRequiredError } from '../../core/approval';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
 import { handleOAuthCallback } from '../../core/oauthCallback';
-import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
+import { verifyIdentity, IdentityError, DEFAULT_SKEW_MS, type IdentityClaims, type ReplayStore, type IdentityConfig } from './identity';
 import { DbReplayStore } from './replayStore';
 import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse, BrokerChannelManifestResponse } from '../../broker-types';
 
@@ -78,8 +78,14 @@ export interface BrokerOptions {
   audit: Audit;
   /** Used by /healthz to confirm the store is reachable. */
   db: Db;
-  /** HS256 secret shared ONLY by the upstream minter and this broker. */
-  identitySecret: string;
+  /**
+   * The HS256 trust root shared ONLY by the upstream minter and this broker. Either:
+   *  - a bare `string` — legacy single-deployment mode (no issuer/audience/kid/iat binding), or
+   *  - an {@link IdentityConfig} — deployment-bound mode (#212): the packaged broker builds this from
+   *    env via `loadIdentityConfig`, so an assertion minted for another deployment, issued in the
+   *    future, or signed by an unknown/rotated key is rejected before authorization.
+   */
+  identitySecret: string | IdentityConfig;
   /**
    * #52 public HTTPS origin of THIS broker (e.g. `https://broker.example`). Setting it MOUNTS the OAuth
    * connect flow: `POST /v1/connect` (mint an authorize URL for the verified user) and
@@ -494,9 +500,17 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   } else if (opts.db) {
     replay = new DbReplayStore(opts.db);
   } else {
-    console.warn('[vouchr] replay guard is process-local; run a single instance or pass a shared replayStore');
-    replay = new ReplayGuard();
+    // #212: never silently fall back to a process-local guard — that would let a jti be replayed once
+    // per pod across a fleet. `db` is required (BrokerOptions.db), so this is unreachable in practice;
+    // fail closed rather than warn if a caller ever nulls it, naming the durable options.
+    throw new Error('createBroker: no durable replay store — provide opts.db (for the cluster-wide DbReplayStore) or an explicit opts.replayStore. A process-local guard is unsafe for a multi-replica fleet.');
   }
+  // #212: the replay record must outlive the token's acceptance window. verifyIdentity accepts a
+  // config-mode token until exp + skew (clock tolerance), so store the jti until that same horizon —
+  // else a prune at exp could evict a still-acceptable jti and let it be replayed. Legacy string mode
+  // has no skew (horizon = exp), so behavior there is unchanged.
+  const identitySkewMs = typeof opts.identitySecret === 'string' ? 0 : (opts.identitySecret.skewMs ?? DEFAULT_SKEW_MS);
+  const replayHorizon = (exp: number): number => exp + identitySkewMs;
   // ONE inflight map shared by every request's ConnectionHandle, so concurrent requests for the same
   // owner+provider collapse to a single token refresh (rotating-refresh providers brick on a double
   // refresh). Per-request maps would defeat that. On Postgres the advisory lock also coordinates
@@ -569,7 +583,10 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       if (e instanceof IdentityError) throw new HttpError(401, { error: 'invalid identity token' });
       throw e;
     }
-    if (!(await replay.use(claims.jti, claims.exp))) {
+    // #212: a config-mode token is accepted until exp + skew (clock tolerance), so the replay record
+    // must survive that whole window — otherwise a prune at exp could delete the jti while the token is
+    // still acceptable, letting it be replayed once. Store it until the true acceptance horizon.
+    if (!(await replay.use(claims.jti, replayHorizon(claims.exp)))) {
       throw new HttpError(401, { error: 'invalid identity token' });
     }
     return claims;

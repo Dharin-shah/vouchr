@@ -47,8 +47,14 @@ export {
   ReplayGuard,
   IdentityError,
   MAX_LIFETIME_MS,
+  // #212 deployment-bound identity assertions.
+  loadIdentityConfig,
+  assertStrongIdentitySecret,
+  identityKid,
+  DEFAULT_SKEW_MS,
+  MIN_IDENTITY_SECRET_BYTES,
 } from './adapters/http/identity';
-export type { IdentityClaims, MintIdentityInput, ReplayStore } from './adapters/http/identity';
+export type { IdentityClaims, MintIdentityInput, ReplayStore, IdentityConfig, IdentityKey } from './adapters/http/identity';
 
 // ── shared jti replay store (Postgres-backed, cluster-wide single-use) ──
 export { DbReplayStore } from './adapters/http/replayStore';

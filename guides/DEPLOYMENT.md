@@ -254,11 +254,37 @@ The broker trusts a **signed identity token** (HS256, `VOUCHR_IDENTITY_SECRET` s
 upstream minter), never the request body — the owner is always the verified acting user. Each token
 carries a `jti` that is single-use; on Postgres this is enforced **cluster-wide** (see *Replay*). A
 network perimeter (`VOUCHR_BROKER_TOKEN`, or a pluggable `authorize` hook) is a coarse gate in front,
-NOT identity.
+NOT identity. The signing algorithm is fixed (HS256); the token carries no `alg` header, so there is
+no algorithm-substitution surface.
 
-Mint tokens on the caller side with the exported `mintIdentity(acting, secret)` helper — it fills a
-fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay/expiry rules. See
-[`examples/broker-client/client.ts`](../examples/broker-client/client.ts) for the full call.
+### Deployment-bound assertions (#212)
+
+The packaged broker binds every assertion to **one deployment** so a token minted for deployment A
+cannot be replayed against deployment B, and fails closed on weak configuration:
+
+- **`VOUCHR_DEPLOYMENT_ID`** (required) — the `audience` every token is bound to. The broker rejects a
+  token whose audience is not its own. `VOUCHR_IDENTITY_ISSUER` (default `vouchr`) is the verified
+  `iss`.
+- **`VOUCHR_IDENTITY_SECRET`** must be **≥ 32 bytes** of random key material (`openssl rand -base64 32`)
+  and **distinct** from `VOUCHR_MASTER_KEY` and `VOUCHR_BROKER_TOKEN` — one value must not serve two
+  purposes. A short, placeholder, missing, or reused secret fails the broker at startup.
+- Each token also carries `iat` (issued-at); one issued in the future beyond a small clock-skew
+  allowance (30s) is rejected, as is one whose lifetime exceeds the 5-minute ceiling.
+- **Every replica and every minter must share the same `VOUCHR_DEPLOYMENT_ID`, issuer, and active key
+  set.** A replica configured for a different deployment or key will reject the fleet's tokens.
+
+**Rolling key rotation (no downtime).** To rotate the signing secret: set the new secret as
+`VOUCHR_IDENTITY_SECRET` and the old one as `VOUCHR_IDENTITY_SECRET_PREVIOUS` on every replica and
+minter. During the overlap the broker verifies tokens signed by **either** key (selected by a `kid`
+fingerprint), while new tokens are signed with the active key. Once all in-flight tokens signed by the
+old key have expired (≤ 5 min), drop `VOUCHR_IDENTITY_SECRET_PREVIOUS`; the old key is then rejected
+as an unknown `kid`.
+
+Mint tokens on the caller side with the exported `mintIdentity(acting, identity)` helper — pass a bare
+secret string for a single-deployment/dev broker, or an `IdentityConfig` from
+`loadIdentityConfig(process.env)` to bind the token to your deployment (the packaged broker's mode).
+It fills a fresh `jti` and a short, ceiling-clamped `exp` so you don't hand-roll the replay/expiry
+rules. See [`examples/broker-client/client.ts`](../examples/broker-client/client.ts) for the full call.
 
 ### Channel-owned credentials headless (`owner: "channel"`)
 
@@ -278,9 +304,10 @@ facts as signed claims** and the broker trusts them at the same level as `teamId
 Mint them via `mintIdentity`'s optional fields:
 
 ```ts
+const identity = loadIdentityConfig(process.env); // deployment-bound; same config the broker uses
 const token = mintIdentity(
   { teamId, userId, channel, ownerKind: 'channel', channelEligible: channelIneligibleReason(info) === null },
-  process.env.VOUCHR_IDENTITY_SECRET!,
+  identity,
 );
 ```
 
@@ -312,7 +339,10 @@ POST /v1/admin/reference
 
 | Var | Required | Purpose |
 | --- | --- | --- |
-| `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. |
+| `VOUCHR_IDENTITY_SECRET` | yes | HS256 secret shared with the identity-token minter. Must be **≥ 32 bytes** and **distinct** from the master key / broker token (#212). |
+| `VOUCHR_DEPLOYMENT_ID` | yes | the deployment every identity assertion is bound to (`aud`); a token minted for another deployment is rejected (#212). |
+| `VOUCHR_IDENTITY_SECRET_PREVIOUS` | no | previous identity secret during a rolling key rotation; verified via `kid` overlap, drop it after the ≤5-min token window (#212). |
+| `VOUCHR_IDENTITY_ISSUER` | no | the verified `iss` claim (default `vouchr`). |
 | `VOUCHR_MASTER_KEY` | yes* | base64 of 32 bytes; encrypts tokens at rest (`openssl rand -base64 32`). *Or `VOUCHR_MASTER_KEYS`. |
 | `VOUCHR_MASTER_KEYS` | no | comma-separated `id:base64key` entries for master-key rotation; the FIRST entry encrypts new writes, every entry decrypts (see [Key rotation](#key-rotation)). |
 | `VOUCHR_DATABASE_URL` | yes | `postgres://…` connection string. Required — boot fails closed if unset or non-`postgres://`. No `DATABASE_URL` fallback. Put `sslmode=require` (or stricter) in the URL for TLS. Migrate first with `vouchr migrate` (schema-owner role); the runtime connects DML-only. |

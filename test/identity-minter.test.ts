@@ -1,9 +1,123 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mintIdentity, verifyIdentity, ReplayGuard, MAX_LIFETIME_MS } from '../src/adapters/http/identity';
+import {
+  signIdentity, mintIdentity, verifyIdentity, ReplayGuard, MAX_LIFETIME_MS,
+  loadIdentityConfig, assertStrongIdentitySecret, identityKid, DEFAULT_SKEW_MS,
+  type IdentityConfig,
+} from '../src/adapters/http/identity';
 
 const SECRET = 'trust-root';
 const who = { teamId: 'T1', userId: 'U1', channel: 'C1' };
+
+// ── #212 deployment-bound (IdentityConfig) mode ────────────────────────────────────────────────────
+const ACTIVE = 'active-identity-secret-32-bytes-or-more!!';
+const PREV = 'previous-identity-secret-32-bytes-or-more!';
+const cfg = (over: Partial<IdentityConfig> = {}): IdentityConfig => ({
+  issuer: 'vouchr', audience: 'deploy-A', keys: [{ kid: identityKid(ACTIVE), secret: ACTIVE }], ...over,
+});
+
+test('#212 config mode: a deployment-bound token round-trips with iss/aud/iat/kid set + verified', () => {
+  const now = 1_000_000;
+  const claims = verifyIdentity(mintIdentity(who, cfg(), 60_000, now), cfg(), { now });
+  assert.equal(claims.iss, 'vouchr');
+  assert.equal(claims.aud, 'deploy-A');
+  assert.equal(claims.iat, now);
+  assert.equal(claims.kid, identityKid(ACTIVE));
+});
+
+test('#212 config mode: a token minted for one deployment is rejected by another (audience binding)', () => {
+  const token = mintIdentity(who, cfg({ audience: 'deploy-A' }));
+  assert.throws(() => verifyIdentity(token, cfg({ audience: 'deploy-B' })), /wrong audience/);
+});
+
+test('#212 config mode: a wrong issuer is rejected', () => {
+  const token = mintIdentity(who, cfg({ issuer: 'someone-else' }));
+  assert.throws(() => verifyIdentity(token, cfg({ issuer: 'vouchr' })), /wrong issuer/);
+});
+
+test('#212 config mode: an unknown kid (rotated-away key) is rejected before signature work', () => {
+  // Token signed by a key whose kid is not in the verifier's key set.
+  const token = mintIdentity(who, cfg({ keys: [{ kid: identityKid(PREV), secret: PREV }] }));
+  assert.throws(() => verifyIdentity(token, cfg()), /unknown kid/); // verifier only knows ACTIVE
+});
+
+test('#212 config mode: a future-issued token (beyond skew) is rejected; within skew it passes', () => {
+  const now = 1_000_000;
+  // iat is stamped at mint time; verify at an EARLIER now to simulate a token from a fast clock.
+  const token = mintIdentity(who, cfg(), 60_000, now);
+  assert.throws(() => verifyIdentity(token, cfg(), { now: now - DEFAULT_SKEW_MS - 1_000 }), /issued in the future/);
+  assert.doesNotThrow(() => verifyIdentity(token, cfg(), { now: now - DEFAULT_SKEW_MS + 1_000 })); // within skew
+});
+
+test('#212 config mode: an expired token within skew still passes; past skew is rejected', () => {
+  const now = 1_000_000;
+  const token = mintIdentity(who, cfg(), 60_000, now);
+  const justExpired = now + 60_000 + DEFAULT_SKEW_MS - 1_000; // exp is now+60s; still within skew
+  assert.doesNotThrow(() => verifyIdentity(token, cfg(), { now: justExpired }));
+  assert.throws(() => verifyIdentity(token, cfg(), { now: now + 60_000 + DEFAULT_SKEW_MS + 1_000 }), /expired/);
+});
+
+test('#212 config mode: rolling rotation — a previous-key token verifies during overlap, fails after drop', () => {
+  // Minter still signs with PREV (the old active) while the broker has rotated: new active + prev overlap.
+  const oldToken = mintIdentity(who, cfg({ keys: [{ kid: identityKid(PREV), secret: PREV }] }));
+  const overlap = cfg({ keys: [{ kid: identityKid(ACTIVE), secret: ACTIVE }, { kid: identityKid(PREV), secret: PREV }] });
+  assert.doesNotThrow(() => verifyIdentity(oldToken, overlap)); // accepted during the overlap window
+  // After the operator drops the previous key, the same token no longer verifies (unknown kid).
+  assert.throws(() => verifyIdentity(oldToken, cfg()), /unknown kid/);
+});
+
+test('#212 config mode: a jti replay is rejected (single-use) just like legacy mode', () => {
+  const token = mintIdentity(who, cfg());
+  const replay = new ReplayGuard();
+  verifyIdentity(token, cfg(), { replay });
+  assert.throws(() => verifyIdentity(token, cfg(), { replay }), /replayed jti/);
+});
+
+test('#212 config mode: a jti stays single-use through the whole skew window (no prune-then-replay)', () => {
+  // The token is acceptable in [exp, exp+skew) under clock skew, so the replay record must survive that
+  // window even though the guard prunes on use(). Without storing the exp+skew horizon, a prune here
+  // would evict the jti and the second use would be (wrongly) accepted.
+  const now = 1_000_000;
+  const token = mintIdentity(who, cfg(), 60_000, now); // exp = now + 60_000
+  const replay = new ReplayGuard();
+  verifyIdentity(token, cfg(), { replay, now }); // consumed
+  const inSkewWindow = now + 60_000 + DEFAULT_SKEW_MS - 1_000; // past exp, still within skew → acceptable
+  assert.throws(() => verifyIdentity(token, cfg(), { replay, now: inSkewWindow }), /replayed jti/);
+});
+
+test('#212 assertStrongIdentitySecret: rejects short + placeholder, accepts a 32+ byte random-ish secret', () => {
+  assert.throws(() => assertStrongIdentitySecret('short'), /at least 32 bytes/);
+  assert.throws(() => assertStrongIdentitySecret('ChangeMe'), /placeholder/);
+  assert.doesNotThrow(() => assertStrongIdentitySecret(ACTIVE));
+});
+
+test('#212 loadIdentityConfig: builds a config; fails closed on weak secret / missing deployment id / reuse / prev==active', () => {
+  const good = loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: ACTIVE, VOUCHR_DEPLOYMENT_ID: 'deploy-A' } as any);
+  assert.equal(good.audience, 'deploy-A');
+  assert.equal(good.issuer, 'vouchr');
+  assert.equal(good.keys[0].kid, identityKid(ACTIVE));
+  // previous key adds a second verify candidate
+  const rotated = loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: ACTIVE, VOUCHR_IDENTITY_SECRET_PREVIOUS: PREV, VOUCHR_DEPLOYMENT_ID: 'deploy-A' } as any);
+  assert.deepEqual(rotated.keys.map((k) => k.kid), [identityKid(ACTIVE), identityKid(PREV)]);
+  assert.throws(() => loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: 'short', VOUCHR_DEPLOYMENT_ID: 'd' } as any), /at least 32 bytes/);
+  assert.throws(() => loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: ACTIVE } as any), /VOUCHR_DEPLOYMENT_ID/);
+  assert.throws(() => loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: ACTIVE, VOUCHR_IDENTITY_SECRET_PREVIOUS: ACTIVE, VOUCHR_DEPLOYMENT_ID: 'd' } as any), /PREVIOUS must differ/);
+  assert.throws(() => loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: ACTIVE, VOUCHR_DEPLOYMENT_ID: 'd' } as any, [ACTIVE]), /distinct from the master key/);
+});
+
+test('#212 a rejection error never echoes the assertion or the signing secret', () => {
+  const token = mintIdentity(who, cfg({ audience: 'deploy-A' }));
+  assert.throws(
+    () => verifyIdentity(token, cfg({ audience: 'deploy-B' })),
+    (e: Error) => e.message.includes(token) === false && e.message.includes(ACTIVE) === false && /wrong audience/.test(e.message),
+  );
+});
+
+test('#212 config mode: an empty jti is rejected (not a usable single-use id)', () => {
+  // A hand-forged token with an empty jti, signed with the active key, must fail the claims check.
+  const bad = signIdentity({ ...who, jti: '', exp: Date.now() + 60_000, iss: 'vouchr', aud: 'deploy-A', iat: Date.now(), kid: identityKid(ACTIVE) }, ACTIVE);
+  assert.throws(() => verifyIdentity(bad, cfg()), /incomplete claims/);
+});
 
 test('mintIdentity: produces a token verifyIdentity accepts, preserving the claims', () => {
   const token = mintIdentity({ ...who, threadTs: '123.45' }, SECRET);
