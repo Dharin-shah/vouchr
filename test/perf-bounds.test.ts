@@ -312,6 +312,28 @@ test('/v1/fetch: rejected upstream metadata is never reflected in the wire error
   }
 });
 
+test('/v1/fetch: an extension throw cannot smuggle a secret through logs or the wire (SEC-1)', async (t) => {
+  const secret = 'ghp_EXTENSION_THROW_MUST_NOT_LEAK';
+  const throwingProvider = defineProvider({
+    ...acme,
+    inject() { throw { message: secret, constructor: { name: secret } }; },
+  });
+  const { port } = await buildBroker(t, { providers: [throwingProvider] });
+  const originalError = console.error;
+  const logged: string[] = [];
+  console.error = (...args: unknown[]) => { logged.push(args.map(String).join(' ')); };
+  try {
+    const response = await post(port, '/v1/fetch', fetchBody());
+    assert.equal(response.status, 502);
+    assert.deepEqual(response.json, { error: 'upstream fetch failed' });
+    assert.doesNotMatch(JSON.stringify(response.json), new RegExp(secret));
+    assert.doesNotMatch(logged.join('\n'), new RegExp(secret));
+    assert.deepEqual(logged, []);
+  } finally {
+    console.error = originalError;
+  }
+});
+
 // ── concurrency ceilings ──────────────────────────────────────────────────────
 
 test('/v1/fetch: global admission runs before an asynchronous perimeter hook (#209)', async (t) => {

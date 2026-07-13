@@ -666,16 +666,16 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   // awaits it FAIL-CLOSED below; the packaged broker (bin/broker-server) additionally awaits the
   // same check at boot for a true startup hard-fail. The refusal is remembered (never swallowed) —
   // the .catch only prevents an unhandled rejection from killing a host process before its first
-  // request. Only DryRunVaultError's static message is printed; any other failure (a db driver
-  // error could carry paths/hosts) is reduced to its class name, the same convention as the
-  // request-level catch below. ponytail: a transient db error here wedges dry-run fail-closed with
+  // request. Only DryRunVaultError's static message is printed; every other thrown value is reduced
+  // to one static line because even constructor.name is attacker-overridable. ponytail: a transient
+  // db error here wedges dry-run fail-closed with
   // no retry (while /readyz separately reports the db) — acceptable for a construction-time check;
   // restarting the process is the recovery, a retry loop belongs to the host's readiness probe.
   let dryRunRefusal: Error | undefined;
   const dryRunReady = dryRun
     ? assertDryRunVault(opts.db).catch((e: Error) => {
         dryRunRefusal = e;
-        console.error(`[vouchr] ${e instanceof DryRunVaultError ? e.message : `dry-run vault check failed: ${e?.constructor?.name ?? 'Error'}`}`);
+        console.error(e instanceof DryRunVaultError ? `[vouchr] ${e.message}` : '[vouchr] dry-run vault check failed');
       })
     : undefined;
 
@@ -1642,10 +1642,9 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         if (e instanceof OverloadedError) {
           return send(503, { error: 'overloaded', scope: e.scope, retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
         }
-        // Log the error CLASS NAME only — never the message/stack/payload. An extension point (e.g. a
-        // custom provider.inject) can throw AFTER touching the secret, so the message could carry the
-        // token; logging it would break the "tokens never enter logs" invariant. The type still triages.
-        console.error('[vouchr] request failed:', (e as Error)?.constructor?.name ?? 'Error');
+        // Log no part of an unknown thrown value. An extension point (e.g. a custom provider.inject)
+        // can throw AFTER touching the secret, and even constructor.name is attacker-overridable.
+        console.error('[vouchr] request failed');
         send(500, { error: 'internal error' }); // never echo internals to the client either
       } finally {
         markHandlerDone();

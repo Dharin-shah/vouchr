@@ -258,9 +258,11 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
       if (!r.removed) localFailures++;
       if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
       else upstreamSkipped++;
-    } catch (e: any) {
+    } catch {
       localFailures++;
-      console.error(`revoke: ${row.ownerKind}:${row.ownerId} failed (${e?.message ?? e})`);
+      // A provider/KMS extension may include credential material in a thrown value. Keep the
+      // break-glass sweep moving, but never serialize that value (SEC-1).
+      console.error('revoke: one connection failed; continuing');
     }
   }
   // Clear pending consent + thread grants for the SCOPE regardless of whether any connection matched —
