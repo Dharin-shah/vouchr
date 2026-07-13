@@ -1507,15 +1507,16 @@ export async function createVouchr(opts: VouchrOptions) {
      * read-only displays.
      */
     async function adminToolRows(identity: SlackIdentity, channel: string, tools: ToolManifestEntry[]): Promise<ConfigAdminRow[]> {
-      return Promise.all(
-        tools.map(async (t) => ({
-          provider: t.provider,
-          mode: t.mode,
-          enabled: await channelTools.isEnabled(identity.teamId, channel, t.provider),
-          visibility: t.visibility,
-          identity: t.identity,
-        })),
-      );
+      // Raw tool-allowlist bit (NOT the manifest's policy-intersected `enabled`) for every provider in ONE
+      // channel-scoped read, instead of an isEnabled query per provider (#209).
+      const toolAllowed = await channelTools.enabledSnapshot(identity.teamId, channel);
+      return tools.map((t) => ({
+        provider: t.provider,
+        mode: t.mode,
+        enabled: toolAllowed(t.provider),
+        visibility: t.visibility,
+        identity: t.identity,
+      }));
     }
 
     // Config modal submit: apply the admin mode/enable changes. Authorization is RE-CHECKED here

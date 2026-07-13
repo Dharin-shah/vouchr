@@ -10,6 +10,8 @@ import { ChannelTools } from '../src/core/tools';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
+import { buildToolManifest } from '../src/core/authz';
+import type { Db } from '../src/core/db';
 import { ConnectContext } from '../src/adapters/bolt';
 
 const KEY = randomBytes(32);
@@ -228,4 +230,100 @@ test('applyEnabled: failure after materialization still leaves a COMPLETE allowl
   assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
   assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true);
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+});
+
+// ── #209 batched manifest reads: query count is bounded by the CHANNEL, not the provider count ────
+// The whole point of this change: buildToolManifest (and the App Home admin console) must issue a fixed
+// number of channel-scoped reads no matter how many providers are registered. Wrapping the Db to count
+// its get/all calls makes that a regression test — pre-batch it was ~4 per-provider gets and grew with N.
+function mkProvider(id: string) {
+  return defineProvider({
+    id, authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+  });
+}
+
+/** Wrap a Db counting only its READ calls (get/all). run/exec pass through — writes are fixture setup,
+ *  not what we're bounding — so counts reflect exactly the reads the code under test issued. */
+function countingDb(db: Db): { db: Db; counts: { get: number; all: number } } {
+  const counts = { get: 0, all: 0 };
+  const wrapped = {
+    get: (sql: string, params?: any[]) => { counts.get++; return db.get(sql, params); },
+    all: (sql: string, params?: any[]) => { counts.all++; return db.all(sql, params); },
+    run: (sql: string, params?: any[]) => db.run(sql, params),
+    exec: (sql: string) => db.exec(sql),
+    close: () => db.close(),
+  } as unknown as Db;
+  return { db: wrapped, counts };
+}
+
+test('buildToolManifest issues a fixed 3 reads regardless of provider count (#209)', async (t) => {
+  const base = await openTestDb(t);
+  // Configure the channel so all three tables have rows — exercises the real batched read paths.
+  await new ChannelTools(base).setEnabled('T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, rest off
+  await new ChannelConfig(base).setMode('T1', 'C_FIN', 'mcp', 'per-user');
+  await new ChannelConfig(base).setVisibility('T1', 'C_FIN', 'mcp', 'private');
+
+  const build = async (extra: number) => {
+    const { db, counts } = countingDb(base);
+    const ids = ['mcp', ...Array.from({ length: extra }, (_, i) => `p${i}`)];
+    const manifest = await buildToolManifest({
+      providerIds: ids, registry: new ProviderRegistry(ids.map(mkProvider)),
+      channelTools: new ChannelTools(db), channelConfig: new ChannelConfig(db),
+      principal: ID, channel: 'C_FIN',
+    });
+    return { counts, manifest };
+  };
+
+  const few = await build(1); // 2 providers
+  const many = await build(50); // 51 providers
+
+  // Exactly three channel-scoped reads (tool allowlist + mode + visibility), no per-provider gets, and
+  // identical whether the channel has 2 or 51 providers.
+  assert.deepEqual(few.counts, { get: 0, all: 3 });
+  assert.deepEqual(many.counts, { get: 0, all: 3 });
+
+  // Batching preserved semantics: 'mcp' enabled+per-user+private; every unlisted provider disabled with
+  // the unconfigured defaults (mode null from modeSnapshot, visibility 'public' from visibilitySnapshot).
+  assert.deepEqual(
+    many.manifest.find((e) => e.provider === 'mcp'),
+    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'private' },
+  );
+  assert.ok(many.manifest
+    .filter((e) => e.provider !== 'mcp')
+    .every((e) => e.enabled === false && e.mode === null && e.visibility === 'public'));
+
+  // Off-channel (channel null): every snapshot short-circuits to its in-memory fallback — ZERO reads,
+  // every provider enabled with the null/'public' defaults. Pins that a manifest with no channel queries nothing.
+  const off = countingDb(base);
+  const offManifest = await buildToolManifest({
+    providerIds: ['mcp', 'other'], registry: new ProviderRegistry(['mcp', 'other'].map(mkProvider)),
+    channelTools: new ChannelTools(off.db), channelConfig: new ChannelConfig(off.db), principal: ID, channel: null,
+  });
+  assert.deepEqual(off.counts, { get: 0, all: 0 });
+  assert.deepEqual(
+    offManifest.map((e) => [e.enabled, e.mode, e.visibility]),
+    [[true, null, 'public'], [true, null, 'public']],
+  );
+});
+
+test('enabledSnapshot is one read and matches isEnabled per provider (App Home admin batch, #209)', async (t) => {
+  const base = await openTestDb(t);
+  await new ChannelTools(base).setEnabled('T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, rest off
+
+  const { db, counts } = countingDb(base);
+  const snap = await new ChannelTools(db).enabledSnapshot('T1', 'C_FIN');
+  assert.deepEqual(counts, { get: 0, all: 1 }); // one read for the whole channel, no per-provider gets
+
+  // The batched predicate gives the exact same verdict isEnabled gives, provider by provider.
+  const plain = new ChannelTools(base);
+  for (const p of ['mcp', 'other', 'p0', 'p1']) {
+    assert.equal(snap(p), await plain.isEnabled('T1', 'C_FIN', p), `snapshot disagrees with isEnabled for ${p}`);
+  }
+
+  // And an unconfigured channel snapshots to all-enabled (backward compat), still one read.
+  const fresh = countingDb(base);
+  const snap2 = await new ChannelTools(fresh.db).enabledSnapshot('T1', 'C_EMPTY');
+  assert.deepEqual(fresh.counts, { get: 0, all: 1 });
+  assert.equal(snap2('anything'), true);
 });

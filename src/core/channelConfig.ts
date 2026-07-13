@@ -73,6 +73,17 @@ export class ChannelConfig {
     return row?.mode ?? null;
   }
 
+  /** Every provider's configured mode in this channel in ONE read — the batched form of {@link getMode}
+   *  (an unconfigured provider → null). Bounds the manifest's mode reads to one query (#209). */
+  async modeSnapshot(teamId: string, channel: string): Promise<(provider: string) => ChannelMode | null> {
+    const rows = (await this.db.all(
+      `SELECT provider, mode FROM channel_config WHERE team_id=? AND channel=?`,
+      [teamId, channel],
+    )) as { provider: string; mode: ChannelMode }[];
+    const m = new Map(rows.map((r) => [r.provider, r.mode]));
+    return (provider) => m.get(provider) ?? null;
+  }
+
   async setMode(teamId: string, channel: string, provider: string, mode: ChannelMode): Promise<void> {
     // Defense-in-depth at the true sink: TypeScript's `ChannelMode` is compile-time only, so a value
     // arriving from an untrusted surface (modal/broker/slash) could still be a bogus string at runtime.
@@ -91,6 +102,17 @@ export class ChannelConfig {
       [teamId, channel, provider],
     )) as { visibility: PreviewVisibility } | undefined;
     return row?.visibility ?? 'public';
+  }
+
+  /** Every provider's preview visibility in this channel in ONE read — the batched form of
+   *  {@link getVisibility} (no row → 'public'). Bounds the manifest's visibility reads to one query (#209). */
+  async visibilitySnapshot(teamId: string, channel: string): Promise<(provider: string) => PreviewVisibility> {
+    const rows = (await this.db.all(
+      `SELECT provider, visibility FROM channel_preview WHERE team_id=? AND channel=?`,
+      [teamId, channel],
+    )) as { provider: string; visibility: PreviewVisibility }[];
+    const m = new Map(rows.map((r) => [r.provider, r.visibility]));
+    return (provider) => m.get(provider) ?? 'public';
   }
 
   async setVisibility(teamId: string, channel: string, provider: string, visibility: PreviewVisibility): Promise<void> {

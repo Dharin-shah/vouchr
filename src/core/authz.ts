@@ -1,6 +1,6 @@
 import { userOwner, channelOwner, type Owner } from './owner';
 import type { SlackIdentity } from './identity';
-import type { ChannelMode, ChannelConfig } from './channelConfig';
+import type { ChannelMode, ChannelConfig, PreviewVisibility } from './channelConfig';
 import type { Policy } from './policy';
 import type { ChannelTools, ToolManifestEntry } from './tools';
 import type { ProviderRegistry } from './providers';
@@ -24,6 +24,20 @@ import type { ProviderRegistry } from './providers';
 export type AuthzDenial = 'policy' | 'tool-disabled';
 
 /**
+ * The authorization VERDICT from the two already-resolved bits (pure, no I/O): Policy first, then the
+ * channel tool allowlist. `policyAllows` = Policy permits this provider in this channel; `toolAllowed` =
+ * the channel allowlist permits it (true where nothing restricts). `authorizeProvider` resolves the two
+ * bits for ONE provider (a query); `buildToolManifest` resolves them for ALL providers in one batch —
+ * both fold the ordering/mapping through HERE, so the manifest's `enabled` can never disagree with the
+ * runtime gate or with which denial reason wins.
+ */
+export function authorizeVerdict(policyAllows: boolean, toolAllowed: boolean): AuthzDenial | null {
+  if (!policyAllows) return 'policy';
+  if (!toolAllowed) return 'tool-disabled';
+  return null;
+}
+
+/**
  * The credential-use authorization gate, identical for both adapters: Policy first, then the per-channel
  * tool allowlist (backward-compat: an unconfigured channel allows all — see ChannelTools.isEnabled). The
  * channel/team are the VERIFIED ones (Slack event or signed claim), never a request body. Returns the
@@ -37,12 +51,13 @@ export async function authorizeProvider(
   channel: string | null,
   provider: string,
 ): Promise<AuthzDenial | null> {
-  if (policy && !policy.check(provider, channel)) return 'policy';
-  // Tool allowlist is channel-scoped; with no channel there is nothing to restrict (matches both adapters).
-  if (channel && channelTools && !(await channelTools.isEnabled(principal.teamId, channel, provider))) {
-    return 'tool-disabled';
-  }
-  return null;
+  const policyAllows = !policy || policy.check(provider, channel);
+  // Resolve the tool-allowlist bit only when policy would allow AND there's a channel + store to
+  // restrict against — so a policy-deny still never runs the allowlist query (unchanged short-circuit).
+  const toolAllowed = policyAllows && channel && channelTools
+    ? await channelTools.isEnabled(principal.teamId, channel, provider)
+    : true;
+  return authorizeVerdict(policyAllows, toolAllowed);
 }
 
 /**
@@ -63,20 +78,31 @@ export async function buildToolManifest(o: {
   principal: SlackIdentity;
   channel: string | null;
 }): Promise<ToolManifestEntry[]> {
-  const out: ToolManifestEntry[] = [];
-  for (const provider of o.providerIds) {
-    const enabled = (await authorizeProvider(o.policy, o.channelTools, o.principal, o.channel, provider)) === null;
-    const mode = o.channel && o.channelConfig
-      ? await o.channelConfig.getMode(o.principal.teamId, o.channel, provider)
-      : null;
-    const visibility = o.channel && o.channelConfig
-      ? await o.channelConfig.getVisibility(o.principal.teamId, o.channel, provider)
-      : 'public';
-    // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
-    const identity = o.registry.get(provider).identity ?? 'acting_human';
-    out.push({ provider, mode, enabled, identity, visibility });
-  }
-  return out;
+  // Three channel-scoped batch reads (tool allowlist, mode, visibility) — a fixed query count regardless
+  // of provider count, replacing the per-provider isEnabled/getMode/getVisibility fan-out (#209). With no
+  // channel (or no store) there is nothing channel-scoped to read: tools unrestricted, mode null, public.
+  const toolAllowed: (provider: string) => boolean = o.channel && o.channelTools
+    ? await o.channelTools.enabledSnapshot(o.principal.teamId, o.channel)
+    : () => true;
+  const modeOf: (provider: string) => ChannelMode | null = o.channel && o.channelConfig
+    ? await o.channelConfig.modeSnapshot(o.principal.teamId, o.channel)
+    : () => null;
+  const visibilityOf: (provider: string) => PreviewVisibility = o.channel && o.channelConfig
+    ? await o.channelConfig.visibilitySnapshot(o.principal.teamId, o.channel)
+    : () => 'public';
+  return o.providerIds.map((provider) => {
+    const policyAllows = !o.policy || o.policy.check(provider, o.channel);
+    return {
+      provider,
+      mode: modeOf(provider),
+      // `enabled` = exactly authorizeProvider's verdict (via the shared authorizeVerdict), so the manifest
+      // can never disagree with what connect()/fetch enforce in this channel.
+      enabled: authorizeVerdict(policyAllows, toolAllowed(provider)) === null,
+      // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
+      identity: o.registry.get(provider).identity ?? 'acting_human',
+      visibility: visibilityOf(provider),
+    };
+  });
 }
 
 // ── Owner resolution ──────────────────────────────────────────────────────────────────────────────

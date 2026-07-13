@@ -82,6 +82,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Bounded per-channel manifest queries** (#209). Building a channel's tool manifest (Bolt's `tools`
+  command, the broker's `POST /v1/manifest`) and the App Home admin console now issue a fixed number of
+  channel-scoped reads — the tool allowlist, credential mode, and preview visibility for every provider
+  are each loaded once — instead of several queries per configured provider, so database round-trips no
+  longer grow with the provider count. No behavior change: the manifest, authorization verdicts, and
+  admin rows are identical; a query-count regression test asserts the bound holds as providers grow.
+
 - **Breaking — headless broker identity configuration** (#212). The packaged broker now requires
   `VOUCHR_DEPLOYMENT_ID` and a strong purpose-distinct identity secret. Direct `createBroker`
   construction requires a validated deployment-bound `IdentityConfig`, not a bare string.

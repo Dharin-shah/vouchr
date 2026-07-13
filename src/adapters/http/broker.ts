@@ -1231,15 +1231,18 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
     await requireAdmin(claims, 'config');
-    const providers = await Promise.all(
-      opts.providers
-        .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
-        .map(async (p) => ({
-          provider: p.id,
-          mode: opts.channelConfig ? await opts.channelConfig.getMode(claims.teamId, claims.channel, p.id) : null,
-          enabled: opts.channelTools ? await opts.channelTools.isEnabled(claims.teamId, claims.channel, p.id) : true,
-        })),
-    );
+    // Two channel-scoped batch reads (mode + tool allowlist) instead of getMode/isEnabled per provider,
+    // so the query count is bounded by the channel, not the provider count (#209). `enabled` is the raw
+    // allowlist bit — same backward-compat rule ChannelTools.isEnabled applies — mode null when unset.
+    const modeOf: (provider: string) => ChannelMode | null = opts.channelConfig
+      ? await opts.channelConfig.modeSnapshot(claims.teamId, claims.channel)
+      : () => null;
+    const toolAllowed: (provider: string) => boolean = opts.channelTools
+      ? await opts.channelTools.enabledSnapshot(claims.teamId, claims.channel)
+      : () => true;
+    const providers = opts.providers
+      .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
+      .map((p) => ({ provider: p.id, mode: modeOf(p.id), enabled: toolAllowed(p.id) }));
     return { providers };
   }
 
