@@ -58,8 +58,8 @@ principles, execution order, and production-ready definition.
 - **STR-1 — Core owns the logic.** New logic — especially security logic and validation —
   lives in `src/core/`. `src/adapters/` holds only genuinely Slack/Bolt/HTTP-specific
   glue. `test/architecture.test.ts` fails if `core/` imports `@slack/*` or an adapter.
-  This boundary is what lets a sidecar + thin clients reuse the core instead of
-  re-implementing the security rules.
+  This boundary is what lets the packaged headless broker + thin HTTP clients reuse the core
+  instead of re-implementing the security rules.
 - **STR-2 — One source of truth per fact.** Before declaring a list, constant, type, or
   query: `grep` for it. Never re-declare something core already exports. A runtime guard
   for a core type lives **next to the type in core** and is imported by every entry point

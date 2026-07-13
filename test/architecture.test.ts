@@ -9,7 +9,7 @@ import {
 } from '../src';
 
 // The broker core must stay transport-agnostic: no Slack/Bolt or adapter imports. That boundary is
-// what lets a future sidecar + thin clients reuse the SAME core (and its security logic) instead of
+// what lets the packaged broker + thin clients reuse the SAME core (and its security logic) instead of
 // re-implementing it per language. Slack-specific pieces (e.g. the InstallationStore) live in
 // src/adapters/. This test fails the moment something couples core to the transport.
 test('core is transport-agnostic (no @slack or adapter imports)', () => {

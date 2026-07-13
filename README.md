@@ -186,7 +186,7 @@ looping (or prompt-injected) agent is refused **before the token is read**, so i
 human's account rate-banned by the provider. Past the limit, Bolt tells the user ephemerally ("Slow
 down…") and the headless broker returns 429 with a `Retry-After` header; callers can catch the
 exported `RateLimitedError`. Absent = unlimited. Buckets are per-process by default — a
-multi-replica deployment passes a shared `rateLimitStore` (same idea as the broker's `replayStore`).
+multi-replica deployment may pass a shared `rateLimitStore` when it needs a fleet-wide limit.
 
 `egressResponse: { maxBytes?, allowContentTypes?, stripHeaders? }` adds structural constraints on
 the provider's **response** at the same boundary — shape only, deliberately no content/PII
@@ -250,7 +250,7 @@ More examples: [Google user credentials](./examples/google-user) ·
 [Azure Key Vault](./examples/azure-key-vault) ·
 [HashiCorp Vault](./examples/hashicorp-vault) ·
 [Postgres + KMS](./examples/postgres-kms) ·
-[sidecar broker](./examples/sidecar)
+[headless broker client](./examples/broker-client)
 
 ## Test Your Integration
 
@@ -307,7 +307,10 @@ Slack-facing service and agent workers in separate processes? The same core expo
 a verified Slack identity goes in, a provider response comes out, and the token stays inside Vouchr.
 
 ```ts
-import { createBroker, signIdentity } from '@vouchr/core/headless'; // Bolt-free, no @slack/* loaded
+import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/headless'; // Bolt-free
+
+const identity = loadIdentityConfig(process.env); // strong key + issuer + deployment audience
+const identityToken = mintIdentity({ teamId, userId, channel }, identity); // fresh per broker call
 ```
 
 Read-only by default (writes are a double opt-in), reference-only for secrets (raw keys stay in the
@@ -317,7 +320,9 @@ and credential injection as `/v1/fetch`, plus SSE stream passthrough and `Mcp-Se
 It is opt-in per provider (the declarative `mcp: { paths, allowContentTypes? }` knob locks the
 endpoint and response types) and bounded by the `maxStreamBytes`/`maxStreamMs` broker options.
 Full details — capability matrix vs Bolt, wire format, replay protection, health probes, and the
-local sidecar for Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md).
+HTTP contract for Python/Go/Rust/MCP runtimes — in the [headless guide](./guides/HEADLESS.md). The
+packaged broker requires `VOUCHR_DEPLOYMENT_ID`; every trusted minter and broker replica uses the same
+issuer, audience, and bounded active/overlap key set so assertions cannot cross deployments.
 
 ## Production Notes
 

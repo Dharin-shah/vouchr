@@ -23,7 +23,7 @@ import { Approvals, ApprovalRequiredError } from '../../core/approval';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
 import { handleOAuthCallback } from '../../core/oauthCallback';
-import { verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims, type ReplayStore } from './identity';
+import { verifyIdentity, IdentityError, normalizeIdentityConfig, assertIdentityPurposeDistinct, type IdentityClaims, type IdentityConfig } from './identity';
 import { DbReplayStore } from './replayStore';
 import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse, BrokerChannelManifestResponse } from '../../broker-types';
 
@@ -76,10 +76,14 @@ export interface BrokerOptions {
   providers: Provider[];
   vault: Vault;
   audit: Audit;
-  /** Used by /healthz to confirm the store is reachable. */
+  /** Used by /readyz to confirm the store and replay table are reachable. */
   db: Db;
-  /** HS256 secret shared ONLY by the upstream minter and this broker. */
-  identitySecret: string;
+  /**
+   * Deployment-bound HS256 trust config shared ONLY by the upstream minter and this broker. The
+   * packaged broker builds it from env via `loadIdentityConfig`; createBroker defensively normalizes
+   * and freezes custom configs. Bare legacy secrets are rejected on this production boundary.
+   */
+  identitySecret: IdentityConfig;
   /**
    * #52 public HTTPS origin of THIS broker (e.g. `https://broker.example`). Setting it MOUNTS the OAuth
    * connect flow: `POST /v1/connect` (mint an authorize URL for the verified user) and
@@ -91,17 +95,10 @@ export interface BrokerOptions {
   /** #52 canonical absolute OAuth redirect pathname mounted under `baseUrl`. Default `/oauth/callback`. */
   callbackPath?: string;
   /**
-   * Single-use jti store for replay protection. Default is an in-memory per-process guard, which is
-   * single-use ONLY within one process — a horizontally scaled broker fleet MUST supply a shared
-   * store (e.g. Redis `SET jti 1 NX PX=<ttl>`) or a signed token can be replayed once per pod within
-   * its (<=5min) window. See ReplayStore / #22.
-   */
-  replayStore?: ReplayStore;
-  /**
    * Pluggable store for the per-(owner, provider) token buckets behind `provider.rateLimit`. Default
    * is in-memory per-process: a fleet of N broker replicas multiplies the effective limit by N —
-   * supply a shared store for cluster-wide limits (same upgrade shape as `replayStore`). Providers
-   * without `rateLimit` are never limited. A limited /v1/fetch maps to 429 with a Retry-After header.
+   * supply a shared store for cluster-wide limits. Providers without `rateLimit` are never limited.
+   * A limited /v1/fetch maps to 429 with a Retry-After header.
    */
   rateLimitStore?: RateLimitStore;
   resolvers?: Resolvers;
@@ -455,6 +452,12 @@ function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdenti
 }
 
 export function createBroker(rawOpts: BrokerOptions): http.Server {
+  // #212 / PostgreSQL-only production: never accept a caller-supplied replay implementation. A
+  // JavaScript caller may still carry the removed property after a type upgrade; reject it instead
+  // of silently ignoring a process-local store and reporting false readiness.
+  if (Object.hasOwn(rawOpts, 'replayStore')) {
+    throw new Error('createBroker: replayStore is not configurable; PostgreSQL replay protection is required');
+  }
   // #116 dryRun: SEC-4 fail-closed flag validation before anything is wired; when on, EVERY audit
   // row written through this broker carries meta.dry_run (the wrapped audit replaces the caller's).
   const dryRun = assertDryRunFlag(rawOpts.dryRun, 'createBroker');
@@ -462,8 +465,20 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   // so the "no real network on any edge" guarantee stays literally true (the vault safety check is
   // async below; this one is synchronous — the envelope is known now).
   if (dryRun) assertDryRunLocalKey(rawOpts.vault.usesEnvelope);
-  const opts: BrokerOptions = dryRun ? { ...rawOpts, audit: dryRunAudit(rawOpts.audit) } : rawOpts;
-  if (!opts.identitySecret) throw new Error('createBroker: identitySecret is required');
+  // #212 production broker boundary: no legacy bare-secret mode. Normalize once into a defensive,
+  // deep-frozen config so caller mutation cannot change issuer/audience/keys after construction.
+  const identityConfig = normalizeIdentityConfig(rawOpts.identitySecret);
+  // Direct constructors do not pass through the env loader, but they still expose the broker bearer
+  // and provider client secrets here. Enforce the same purpose-separation invariant before startup.
+  assertIdentityPurposeDistinct(identityConfig, [
+    ...(rawOpts.brokerToken ? [rawOpts.brokerToken] : []),
+    ...rawOpts.providers.flatMap((provider) => provider.clientSecret ? [provider.clientSecret] : []),
+  ], (secret) => rawOpts.vault.usesMasterKeyMaterial(secret));
+  const opts: BrokerOptions = {
+    ...rawOpts,
+    identitySecret: identityConfig,
+    ...(dryRun ? { audit: dryRunAudit(rawOpts.audit) } : {}),
+  };
   // authorize REPLACES the static brokerToken gate (not AND). Setting both means the bearer is never
   // checked — reject it so nobody wires both expecting defense-in-depth.
   if (opts.authorize && opts.brokerToken) {
@@ -483,24 +498,16 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
   const maxStreamBytes = opts.maxStreamBytes ?? DEFAULT_MAX_STREAM_BYTES; // #65 /v1/mcp ceilings
   const maxStreamMs = opts.maxStreamMs ?? DEFAULT_MAX_STREAM_MS;
-  // #100 default replay store: a jti is single-use CLUSTER-WIDE when it's backed by the shared db
-  // (DbReplayStore), which every db-configured broker now gets by default — a scaled fleet on one
-  // database no longer replays a jti once per pod. An explicit opts.replayStore always wins (including
-  // an explicit ReplayGuard). Only a genuinely db-less broker falls back to the in-memory guard, which
-  // is single-process; warn once at startup so that regression is never silent.
-  let replay: ReplayStore;
-  if (opts.replayStore) {
-    replay = opts.replayStore;
-  } else if (opts.db) {
-    replay = new DbReplayStore(opts.db);
-  } else {
-    console.warn('[vouchr] replay guard is process-local; run a single instance or pass a shared replayStore');
-    replay = new ReplayGuard();
-  }
+  // #212: one supported replay path. Every broker replica consumes jtis through the shared
+  // PostgreSQL table; there is no injectable/process-local alternative that can make readiness lie.
+  // Store raw token expiry as the stable schema meaning. The store applies the three-skew cluster
+  // horizon only to pruning; the one-time upgrade from pre-#212 brokers uses a drained cutover
+  // because an old replica does not know that grace.
+  const replay = new DbReplayStore(opts.db);
   // ONE inflight map shared by every request's ConnectionHandle, so concurrent requests for the same
   // owner+provider collapse to a single token refresh (rotating-refresh providers brick on a double
   // refresh). Per-request maps would defeat that. On Postgres the advisory lock also coordinates
-  // cross-pod; this covers in-process concurrency (incl. the SQLite single-replica case).
+  // cross-pod; this map covers the remaining in-process concurrency.
   const inflight = new Map<string, Promise<string | null>>();
   // ONE rate-limit bucket store shared by every request's ConnectionHandle (provider.rateLimit);
   // a per-request store would never accumulate budget across requests. Per-process by default.
@@ -569,6 +576,9 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       if (e instanceof IdentityError) throw new HttpError(401, { error: 'invalid identity token' });
       throw e;
     }
+    // #212: keep the persisted value as raw token expiry. DbReplayStore applies the fixed
+    // cluster-skew grace to pruning, so every #212 replica preserves the row through every
+    // verifier's acceptance window. The pre-#212 upgrade is drained because old replicas lack it.
     if (!(await replay.use(claims.jti, claims.exp))) {
       throw new HttpError(401, { error: 'invalid identity token' });
     }
@@ -1198,15 +1208,14 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     return { status: 200, payload: { ok: true } };
   }
 
-  // #101 readiness: a real store round-trip that also verifies the SCHEMA is migrated to this build's
-  // version (assertSchemaCurrent reads the meta marker), within ~2s. 200 when the store is reachable
-  // AND current, else 503 — so a k8s readinessProbe pulls a pod out of rotation when its db is down OR
-  // unmigrated/mismatched, without killing it. NO auth, NO vault. The body is a BARE status: never a
-  // connection string, error text, or config (the catch swallows the error rather than reflecting it).
+  // #101/#212 readiness: verify the schema marker plus non-mutating EXPLAINs of the exact replay
+  // INSERT/prune statements, within ~2s. 200 only when the runtime can execute its production replay
+  // path; otherwise 503 pulls the pod out of rotation without killing it. NO auth, NO vault. The body
+  // is a BARE status: never a connection string, error text, or config.
   async function handleReadyz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     try {
       const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('readyz timeout')), 2000).unref());
-      await Promise.race([assertSchemaCurrent(opts.db), timeout]);
+      await Promise.race([Promise.all([assertSchemaCurrent(opts.db), replay.ready()]), timeout]);
       return { status: 200, payload: { ok: true } };
     } catch {
       return { status: 503, payload: { ok: false } };

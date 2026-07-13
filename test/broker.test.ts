@@ -12,7 +12,16 @@ import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
-import { signIdentity, verifyIdentity, IdentityError, ReplayGuard, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityKid, normalizeIdentityConfig } from '../src/adapters/http/identity';
+import {
+  signIdentity,
+  verifyIdentity,
+  identityConfig,
+  IdentityError,
+  ReplayGuard,
+  IDENTITY_SKEW_MS,
+  type IdentityClaims,
+} from './support/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -49,7 +58,7 @@ async function makeBroker(t: TestContext, extra: Partial<Parameters<typeof creat
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, ...extra });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   return { server, vault, db, port };
@@ -110,14 +119,16 @@ function mockUpstream(response: () => Response) {
 test('identity: round-trips and rejects tampering/expiry/over-long lifetime', () => {
   const c = claims();
   const tok = signIdentity(c, SECRET);
-  assert.deepEqual(verifyIdentity(tok, SECRET), c);
+  const { iss, aud, iat, kid, ...roundTrip } = verifyIdentity(tok, SECRET);
+  assert.deepEqual(roundTrip, c);
+  assert.ok(iss && aud && iat && kid, 'test broker identity is deployment-bound');
 
   // wrong secret -> bad signature
   assert.throws(() => verifyIdentity(tok, 'other'), IdentityError);
   // flipped last char -> bad signature
   assert.throws(() => verifyIdentity(tok.slice(0, -1) + (tok.endsWith('a') ? 'b' : 'a'), SECRET), IdentityError);
   // expired
-  assert.throws(() => verifyIdentity(signIdentity(claims({ exp: Date.now() - 1 }), SECRET), SECRET), /expired/);
+  assert.throws(() => verifyIdentity(signIdentity(claims({ exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET), SECRET), /expired/);
   // lifetime > 5min
   assert.throws(() => verifyIdentity(signIdentity(claims({ exp: Date.now() + 10 * 60_000 }), SECRET), SECRET), /5min/);
 });
@@ -127,6 +138,59 @@ test('identity: jti is single-use within the replay guard', () => {
   const tok = signIdentity(claims(), SECRET);
   assert.ok(verifyIdentity(tok, SECRET, { replay })); // first use ok
   assert.throws(() => verifyIdentity(tok, SECRET, { replay }), /replayed jti/); // second use rejected
+});
+
+test('#212 createBroker rejects a legacy bare identity secret at the production boundary', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  assert.throws(
+    () => createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET as any }),
+    /identity config must be a plain object/,
+  );
+});
+
+test('#212 createBroker rejects identity-key reuse with direct broker/provider secrets', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const identity = identityConfig('purpose-reuse');
+  const reused = identity.keys[0].secret;
+  const provider = defineProvider({
+    id: 'reused',
+    authorizeUrl: 'https://reused.example/auth',
+    tokenUrl: 'https://reused.example/token',
+    scopesDefault: ['x'],
+    egressAllow: ['api.reused.example'],
+    refresh: 'none',
+    pkce: false,
+    clientId: 'id',
+    clientSecret: reused,
+  });
+
+  for (const options of [
+    { providers: [acme], brokerToken: reused },
+    { providers: [provider] },
+  ]) {
+    assert.throws(
+      () => createBroker({ ...options, vault, audit, db, identitySecret: identity }),
+      (error: Error) => /distinct/.test(error.message) && !error.message.includes(reused),
+    );
+  }
+
+  const masterSecret = 'M7vouchrMasterKey2026abcdef12345';
+  const masterIdentity = normalizeIdentityConfig({
+    issuer: 'vouchr-test',
+    audience: 'test-deployment',
+    keys: [{ kid: identityKid(masterSecret), secret: masterSecret }],
+  });
+  assert.throws(
+    () => createBroker({
+      providers: [acme], vault: new Vault(db, Buffer.from(masterSecret)), audit, db,
+      identitySecret: masterIdentity,
+    }),
+    (error: Error) => /distinct from the master key/.test(error.message) && !error.message.includes(masterSecret),
+  );
 });
 
 // ── /v1/fetch ────────────────────────────────────────────────────────────────
@@ -449,7 +513,7 @@ test('fetch: unsigned/expired identity -> 401', async (t) => {
     const bad = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: 'not.a.real.token', method: 'GET', path: '/x' });
     assert.equal(bad.status, 401);
     const expired = await post(port, '/v1/fetch', {
-      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims({ exp: Date.now() - 1 }), SECRET), method: 'GET', path: '/x',
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims({ exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET), method: 'GET', path: '/x',
     });
     assert.equal(expired.status, 401);
   } finally {
@@ -472,38 +536,16 @@ test('fetch: a replayed jti is rejected on the second call', async (t) => {
   }
 });
 
-test('fetch: a shared replayStore rejects a replay across DIFFERENT broker instances (multi-pod)', async (t) => {
-  // A shared store makes single-use cluster-wide, not per-process (the default in-memory guard would
-  // let each instance accept the same jti once). Simulates two pods behind one Redis-backed store.
-  const seen = new Map<string, number>();
-  const replayStore = { use: (jti: string, exp: number) => { if (seen.has(jti)) return false; seen.set(jti, exp); return true; } };
-  const a = await makeBroker(t, { replayStore });
-  const b = await makeBroker(t, { replayStore });
-  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
-  try {
-    const token = signIdentity(claims(), SECRET);
-    const first = await post(a.port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
-    assert.equal(first.status, 200);
-    const onOther = await post(b.port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token, method: 'GET', path: '/x' });
-    assert.equal(onOther.status, 401); // second pod refuses the already-used jti
-  } finally {
-    up.restore();
-    a.server.close();
-    b.server.close();
-  }
-});
-
-test('#100 default (no explicit replayStore) shares replay protection across instances on one db', async (t) => {
-  // Two brokers over ONE shared db and NO explicit replayStore: the #100 default (DbReplayStore on the
-  // shared db) must make a jti single-use CLUSTER-WIDE, so a token spent on A is refused on B.
+test('#212 PostgreSQL replay protection rejects one jti across broker instances', async (t) => {
+  // Two brokers over ONE shared db must make a jti single-use CLUSTER-WIDE.
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const a = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET });
-  const b = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET });
+  const a = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const b = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
   await new Promise<void>((r) => a.listen(0, r));
   await new Promise<void>((r) => b.listen(0, r));
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -518,22 +560,6 @@ test('#100 default (no explicit replayStore) shares replay protection across ins
     a.close();
     b.close();
     await db.close();
-  }
-});
-
-test('#100 an explicit replayStore override still wins (its use() is called, the db default is not)', async (t) => {
-  const calls: string[] = [];
-  const replayStore = { use: (jti: string) => { calls.push(jti); return true; } };
-  const { server, port } = await makeBroker(t, { replayStore });
-  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
-  try {
-    const c = claims();
-    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(c, SECRET), method: 'GET', path: '/x' });
-    assert.equal(r.status, 200);
-    assert.deepEqual(calls, [c.jti]); // the caller's spy store was consulted, not the DbReplayStore default
-  } finally {
-    up.restore();
-    server.close();
   }
 });
 
@@ -674,6 +700,57 @@ test('#101 readyz: 200 with a working db, 503 (bare {ok:false}) when the db is u
   }
 });
 
+test('#212 readyz: 503 when the cluster-wide replay relation is missing', async (t) => {
+  const { server, db, port } = await makeBroker(t);
+  try {
+    assert.equal((await get(port, '/readyz')).status, 200);
+    await db.exec('DROP TABLE broker_jti');
+    const notReady = await get(port, '/readyz');
+    assert.equal(notReady.status, 503);
+    assert.deepEqual(notReady.json, { ok: false });
+  } finally {
+    server.close();
+  }
+});
+
+test('#212 readyz: 503 when the replay conflict arbiter is missing', async (t) => {
+  const { server, db, port } = await makeBroker(t);
+  try {
+    assert.equal((await get(port, '/readyz')).status, 200);
+    await db.exec('ALTER TABLE broker_jti DROP CONSTRAINT broker_jti_pkey');
+    const notReady = await get(port, '/readyz');
+    assert.equal(notReady.status, 503);
+    assert.deepEqual(notReady.json, { ok: false });
+  } finally {
+    server.close();
+  }
+});
+
+test('#212 readyz: 503 when the replay expiry column is missing', async (t) => {
+  const { server, db, port } = await makeBroker(t);
+  try {
+    assert.equal((await get(port, '/readyz')).status, 200);
+    await db.exec('ALTER TABLE broker_jti DROP COLUMN exp');
+    const notReady = await get(port, '/readyz');
+    assert.equal(notReady.status, 503);
+    assert.deepEqual(notReady.json, { ok: false });
+  } finally {
+    server.close();
+  }
+});
+
+test('#212 createBroker rejects the removed custom replayStore at runtime', async (t) => {
+  const db = await openTestDb(t);
+  assert.throws(
+    () => createBroker({
+      providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db,
+      identitySecret: identityConfig(SECRET),
+      replayStore: { use: () => true, ready: async () => {} },
+    } as any),
+    /replayStore is not configurable; PostgreSQL replay protection is required/,
+  );
+});
+
 test('#101 probes need no auth and leak no secrets even behind a brokerToken gate', async (t) => {
   const { server, port } = await makeBroker(t, { brokerToken: 'perimeter-secret' });
   try {
@@ -700,7 +777,7 @@ async function makeBrokerOn(t: TestContext, build: (db: any, vault: Vault, audit
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, ...build(db, vault, audit) });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...build(db, vault, audit) });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, db, audit, port: (server.address() as any).port };
 }
@@ -862,7 +939,7 @@ async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user') {
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
   }
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, port: (server.address() as any).port };
 }
@@ -1014,7 +1091,7 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
   // Expired token so both concurrent requests trigger a refresh; a slow /token keeps both in the
   // refresh window at once, so a per-request inflight map would fire TWO /token calls.
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: Date.now() - 1000, externalAccount: null });
-  const server = createBroker({ providers: [refreshing], vault, audit, db, identitySecret: SECRET });
+  const server = createBroker({ providers: [refreshing], vault, audit, db, identitySecret: identityConfig(SECRET) });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   const real = globalThis.fetch;
@@ -1118,7 +1195,7 @@ async function makeOauthBroker(t: TestContext, extra: Partial<Parameters<typeof 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const server = createBroker({
-    providers: [acme, svc], vault, audit, db, identitySecret: SECRET,
+    providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback', ...extra,
   });
   await new Promise<void>((r) => server.listen(0, r));
@@ -1258,7 +1335,7 @@ async function makeAdminBroker(t: TestContext, extra: Partial<Parameters<typeof 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, channelConfig, ...extra });
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig, ...extra });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, channelConfig, port: (server.address() as any).port };
 }
@@ -1377,7 +1454,7 @@ async function makeMultiBroker(t: TestContext, extra: Partial<Parameters<typeof 
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme, other, svc], vault, audit, db, identitySecret: SECRET, ...extra });
+  const server = createBroker({ providers: [acme, other, svc], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, db, port: (server.address() as any).port };
 }
@@ -1437,7 +1514,7 @@ async function makeRefBroker(t: TestContext, extra: Partial<Parameters<typeof cr
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: SECRET, ...extra });
+  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, port: (server.address() as any).port };
 }

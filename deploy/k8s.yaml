@@ -60,9 +60,11 @@ spec:
           image: REPLACE_ME/vouchr-broker:latest # pin to your registry + immutable tag
           ports:
             - { name: http, containerPort: 3000 }
-          # Secrets (VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, provider client
-          # secrets, optional VOUCHR_BROKER_TOKEN) come from a Secret your secret manager syncs
-          # (e.g. externalSecrets → this Secret). Non-secret config can go in a ConfigMap envFrom.
+          # Secrets (VOUCHR_IDENTITY_SECRET, optional VOUCHR_IDENTITY_SECRET_PREVIOUS,
+          # VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, provider client secrets, optional
+          # VOUCHR_BROKER_TOKEN) come from a Secret your secret manager syncs (e.g.
+          # externalSecrets → this Secret). Keep identity keys distinct from every other secret.
+          # Non-secret deployment identity/issuer can come from a ConfigMap or explicit env below.
           # This VOUCHR_DATABASE_URL is the DML-only runtime credential (no CREATE) — distinct from
           # the schema-owner URL the vouchr-migrate Job uses. Put sslmode=require in the URL for TLS;
           # size the pool with VOUCHR_PG_POOL_MAX (a positive integer) if pg's default doesn't fit.
@@ -73,14 +75,19 @@ spec:
             - secretRef: { name: vouchr-broker }
           env:
             - { name: VOUCHR_PORT, value: "3000" }
+            # REQUIRED on every broker replica and trusted minter; replace with one stable id for this
+            # deployment. Changing it invalidates every in-flight assertion from the previous id.
+            - { name: VOUCHR_DEPLOYMENT_ID, value: "" } # intentionally fails closed until set
+            # Optional; defaults to "vouchr" and must match every trusted minter.
+            # - { name: VOUCHR_IDENTITY_ISSUER, value: "vouchr" }
             # Recommended for multi-instance / production: Postgres (VOUCHR_DATABASE_URL) AND a KMS
             # envelope. To enable KMS, uncomment VOUCHR_KMS_KEY_ID AND add @aws-sdk/client-kms to the
             # image (see Dockerfile) together. Vouchr does not enforce this — the host decides.
             # - { name: VOUCHR_KMS_KEY_ID, value: "<kms-key-arn>" }
             # - { name: VOUCHR_PROVIDERS_FILE, value: "/etc/vouchr/providers.json" }
-          # Readiness hits /readyz (a SELECT 1 round-trip) so a pod drains from the Service when
-          # Postgres is unreachable. Liveness hits /healthz (a bare process-serving check, no DB) — a
-          # DB blip must NOT restart the whole fleet.
+          # Readiness hits /readyz (schema + shared replay-store checks) so a pod drains from the
+          # Service when Postgres or replay protection is unusable. Liveness hits /healthz (a bare
+          # process-serving check, no DB) — a DB blip must NOT restart the whole fleet.
           readinessProbe:
             httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 5

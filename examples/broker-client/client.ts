@@ -9,7 +9,8 @@
  *
  *   export VOUCHR_MASTER_KEY=$(openssl rand -base64 32)
  *   export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
- *   export VOUCHR_IDENTITY_SECRET=dev-secret
+ *   export VOUCHR_IDENTITY_SECRET=$(openssl rand -base64 32)   # >= 32 bytes, not the master key
+ *   export VOUCHR_DEPLOYMENT_ID=local-dev                       # binds assertions to this deployment
  *
  *   # terminal A — seed a credential for user T1/U1, then start the broker:
  *   VOUCHR_SEED_ACCESS_TOKEN=ghp_xxx node --import tsx bin/broker-seed.ts key \
@@ -21,7 +22,7 @@
  *
  * See `npm run seed` in guides/DEPLOYMENT.md for reference vs key modes.
  */
-import { mintIdentity } from '../../src'; // published package: from '@vouchr/core'
+import { mintIdentity, loadIdentityConfig, type IdentityConfig } from '../../src'; // published package: from '@vouchr/core'
 
 export interface Acting {
   teamId: string;
@@ -41,18 +42,20 @@ export interface BrokerCall {
 }
 
 /**
- * Mint a fresh token for `acting` and POST one request through the broker. `secret` is the shared
- * HS256 identity secret (VOUCHR_IDENTITY_SECRET); `brokerToken` is the optional coarse perimeter
+ * Mint a fresh token for `acting` and POST one request through the broker. `identity` is the
+ * deployment-bound `IdentityConfig` built from `loadIdentityConfig(process.env)`, so the assertion is
+ * bound to one issuer/audience and signed with the active key. Your trusted minter and every broker
+ * replica must share the same verification key set. `brokerToken` is the optional coarse perimeter
  * bearer if your broker sets one. Returns the broker's JSON response.
  */
 export async function fetchThroughBroker(
   brokerUrl: string,
-  secret: string,
+  identity: IdentityConfig,
   acting: Acting,
   call: BrokerCall,
   brokerToken?: string,
 ): Promise<{ status: number; body: unknown }> {
-  const identityToken = mintIdentity(acting, secret); // fresh jti + short exp, per call
+  const identityToken = mintIdentity(acting, identity); // fresh jti + short exp, per call
 
   const res = await fetch(`${brokerUrl}/v1/fetch`, {
     method: 'POST',
@@ -76,11 +79,14 @@ export async function fetchThroughBroker(
 
 if (require.main === module) {
   const brokerUrl = process.env.BROKER_URL ?? 'http://localhost:3000';
-  const secret = process.env.VOUCHR_IDENTITY_SECRET ?? 'dev-secret';
+  // Build the SAME deployment-bound config the broker uses (#212): reads VOUCHR_IDENTITY_SECRET +
+  // VOUCHR_DEPLOYMENT_ID from env, so the minted token's issuer/audience/kid match what the broker
+  // expects. A mismatch (or a bare-secret token against a config-mode broker) is rejected.
+  const identity = loadIdentityConfig(process.env);
   // In a real agent these come from the event you already authenticated, not from user input.
   const acting: Acting = { teamId: 'T1', userId: 'U1', channel: 'C1' };
 
-  fetchThroughBroker(brokerUrl, secret, acting, {
+  fetchThroughBroker(brokerUrl, identity, acting, {
     provider: 'github',
     method: 'GET',
     path: '/user',

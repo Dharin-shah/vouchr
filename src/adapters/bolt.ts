@@ -141,7 +141,7 @@ export function safeUserMessage(e: unknown): string {
 /**
  * The adapter half of invariant 6, ONE implementation for every mutation path: fetch the channel
  * class (null on any error → fails closed) and apply the core rule (channelIneligibleReason), so a
- * future sidecar + thin clients enforce the same rule rather than re-implementing it. Throws a
+ * packaged broker + thin clients enforce the same rule rather than re-implementing it. Throws a
  * UserFacingError naming the reason — no audit row, exactly like ConnectContext.setChannelMode's
  * eligibility refusal (the audit-on-denial convention is for authz denials, reason 'not-admin').
  */
@@ -240,8 +240,8 @@ export interface VouchrOptions {
   /**
    * Pluggable store for the per-(owner, provider) token buckets behind `provider.rateLimit`. The
    * default is in-memory per-process — a multi-instance deployment multiplies the effective limit by
-   * replica count unless a shared store is supplied (same upgrade shape as the broker's replayStore).
-   * Providers without `rateLimit` are never limited, store or not.
+   * replica count unless a shared store is supplied. Providers without `rateLimit` are never limited,
+   * store or not.
    */
   rateLimitStore?: RateLimitStore;
   /**

@@ -1,10 +1,10 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
 import { STATE_TTL_MS } from './consent';
-import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from './crypto';
+import { seal, open, toBuffer, toKeyring, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
 export interface StoredToken {
@@ -235,6 +235,16 @@ export class Vault {
   /** #116: whether at-rest writes go through an external KMS envelope. Dry-run refuses one at
    *  startup (its wrap/unwrap are real network calls, breaking the offline guarantee). */
   get usesEnvelope(): boolean { return !!this.envelope; }
+
+  /**
+   * No-secret purpose-separation predicate for broker construction (#212). It exposes only equality,
+   * never the master-key bytes, and checks every active/legacy key in a rotation ring.
+   */
+  usesMasterKeyMaterial(material: string | Buffer): boolean {
+    const candidate = Buffer.isBuffer(material) ? material : Buffer.from(material, 'utf8');
+    return toKeyring(this.key).legacy.some(({ key }) =>
+      key.length === candidate.length && timingSafeEqual(key, candidate));
+  }
 
   /**
    * Store a REFERENCED credential: the secret stays in an external manager (e.g. AWS

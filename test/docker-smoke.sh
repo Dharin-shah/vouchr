@@ -16,6 +16,7 @@ NET=vouchr-smoke-net
 PORT=3010 # avoid clashing with a local dev broker on 3000
 # Distinctive secret values so the log-leak check below is meaningful (not real secrets).
 SECRET="smoke-identity-secret-DO-NOT-LOG-$$"
+DEPLOYMENT_ID="smoke-deployment" # #212 required: binds identity assertions to this deployment
 MASTER_KEY="$(openssl rand -base64 32)"
 PROVIDERS='[{"id":"smoke","credential":"key","egressAllow":["api.example.com"]}]'
 
@@ -55,6 +56,7 @@ docker run --rm --network "$NET" \
 echo "==> run the broker with minimal env (one key provider), pointed at the migrated Postgres"
 docker run -d --name "$NAME" --network "$NET" \
   -e VOUCHR_IDENTITY_SECRET="$SECRET" \
+  -e VOUCHR_DEPLOYMENT_ID="$DEPLOYMENT_ID" \
   -e VOUCHR_MASTER_KEY="$MASTER_KEY" \
   -e VOUCHR_PROVIDERS="$PROVIDERS" \
   -e VOUCHR_PORT="$PORT" \

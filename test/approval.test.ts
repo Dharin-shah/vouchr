@@ -15,7 +15,7 @@ import { sweepExpired } from '../src/core/sweep';
 import { createVouchr } from '../src/adapters/bolt';
 import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION } from '../src/adapters/blocks';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity } from './support/identity';
 
 // #113 human-in-the-loop approval for sensitive writes: the full state machine (prompt → approve →
 // consume → re-prompt; deny; TTL expiry; the double-consume race), gate ordering (egress beats
@@ -659,7 +659,7 @@ test('broker: unapproved write → 403 { error: "approval_required", approvalId 
   const audit = new Audit(db);
   const provider = approvalProvider();
   await vault.upsert(userOwner(ID), 'acme', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: SECRET, allowWrites: true });
+  const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   const tok = () => signIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID() }, SECRET);

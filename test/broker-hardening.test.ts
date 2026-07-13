@@ -12,7 +12,7 @@ import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { VouchrEvent } from '../src/core/injector';
 import { createBroker } from '../src/adapters/http/broker';
-import { signIdentity, type IdentityClaims } from '../src/adapters/http/identity';
+import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -81,7 +81,7 @@ test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', 
   const channelConfig = new ChannelConfig(db);
   await channelConfig.setMode('T1', 'C1', 'acme', 'session');
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   const port = await listen(server);
   const up = mockUpstream();
   try {
@@ -107,7 +107,7 @@ test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', asy
   await channelConfig.setMode('T1', 'C1', 'acme', 'session');
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await sessions.grant(U1, 'C1', '111.222', 'acme', 60_000); // approve exactly this thread
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   const port = await listen(server);
   const up = mockUpstream();
   try {
@@ -125,7 +125,7 @@ test('session-mode is opt-in: with NO channelConfig the user credential serves a
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET }); // no channelConfig
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // no channelConfig
   const port = await listen(server);
   const up = mockUpstream();
   try {
@@ -145,7 +145,7 @@ test('/v1/status: one listForUser call, no per-provider vault.get decrypts', asy
   let getCalls = 0;
   const realGet = vault.get.bind(vault);
   (vault as any).get = (...a: any[]) => { getCalls++; return (realGet as any)(...a); };
-  const server = createBroker({ providers: [acme, beta, svc], vault, audit, db, identitySecret: SECRET });
+  const server = createBroker({ providers: [acme, beta, svc], vault, audit, db, identitySecret: identityConfig(SECRET) });
   const port = await listen(server);
   try {
     const r = await post(port, '/v1/status', { identityToken: token() });
@@ -165,7 +165,7 @@ test('/v1/status: a past-idle-TTL connection reports needs_consent, not connecte
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // Age the row past the idle window (mirrors what vault.get would treat as expired → null).
   await db.run(`UPDATE connection SET last_used_at=?, created_at=? WHERE provider='acme'`, [Date.now() - 5000, Date.now() - 5000]);
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
   const port = await listen(server);
   try {
     const r = await post(port, '/v1/status', { identityToken: token() });
@@ -186,7 +186,7 @@ test('policy_denied event fires on a policy-denied fetch (parity with the Bolt p
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events: VouchrEvent[] = [];
   const server = createBroker({
-    providers: [acme], vault, audit, db, identitySecret: SECRET,
+    providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
     policy: new Policy({}, { defaultDeny: true }), // no rule for acme + defaultDeny → denied
     onEvent: (e) => events.push(e),
   });
@@ -206,7 +206,7 @@ test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({
-    providers: [acme], vault, audit, db, identitySecret: SECRET,
+    providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
     policy: new Policy({}, { defaultDeny: true }), // acme denied → emits policy_denied
     onEvent: () => { throw new Error('sink boom'); }, // a broken sink must never affect the request
   });
@@ -226,7 +226,7 @@ test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async (
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET }); // allowWrites unset
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // allowWrites unset
   const port = await listen(server);
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'POST', path: '/x', body: '{}' });

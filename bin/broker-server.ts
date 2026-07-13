@@ -4,7 +4,7 @@
  *
  * Reads config from env, wires the same core (openDb → Vault → Audit → createBroker) the Bolt path
  * uses, and serves /v1/fetch, /v1/resolve, and the /healthz + /readyz probes. Postgres + KMS + the
- * default shared jti store (DbReplayStore) make it multi-replica safe; see DEPLOYMENT.md.
+ * required shared jti store (DbReplayStore) make it multi-replica safe; see DEPLOYMENT.md.
  * Run: `node dist/bin/broker-server.js`.
  */
 import http from 'node:http';
@@ -12,6 +12,7 @@ import { openDb, type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
+import { loadIdentityConfig, type IdentityConfig } from '../src/adapters/http/identity';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
@@ -42,23 +43,75 @@ export interface BuiltBroker {
 }
 
 /**
+ * The standalone builder owns every security/configuration value derived from env. A thin wrapper may
+ * inject only code hooks that cannot replace that identity, database, provider, replay, or egress
+ * configuration. Direct-construction users who need full BrokerOptions use createBroker instead.
+ */
+export type BrokerServerOverrides = Pick<
+  BrokerOptions,
+  'authorize' | 'resolvers' | 'onEvent' | 'auditSink' | 'onCredentialHealth'
+>;
+
+const BROKER_SERVER_OVERRIDE_KEYS = new Set<keyof BrokerServerOverrides>([
+  'authorize', 'resolvers', 'onEvent', 'auditSink', 'onCredentialHealth',
+]);
+
+function assertBrokerServerOverrides(overrides: BrokerServerOverrides): void {
+  if (!overrides || typeof overrides !== 'object' || Array.isArray(overrides)) {
+    fail('buildBrokerServer: overrides must be an object containing only supported hook fields');
+  }
+  for (const key of Reflect.ownKeys(overrides)) {
+    if (typeof key !== 'string' || !BROKER_SERVER_OVERRIDE_KEYS.has(key as keyof BrokerServerOverrides)) {
+      // Never echo an unknown key: externally supplied object keys can themselves contain secrets.
+      fail(`buildBrokerServer: unsupported override; allowed hooks: ${[...BROKER_SERVER_OVERRIDE_KEYS].join(', ')}`);
+    }
+  }
+  for (const key of ['authorize', 'onEvent', 'auditSink', 'onCredentialHealth'] as const) {
+    if (overrides[key] !== undefined && typeof overrides[key] !== 'function') {
+      fail(`buildBrokerServer: ${key} override must be a function`);
+    }
+  }
+  if (overrides.resolvers !== undefined) {
+    if (!overrides.resolvers || typeof overrides.resolvers !== 'object' || Array.isArray(overrides.resolvers)
+      || Object.values(overrides.resolvers).some((resolver) => typeof resolver !== 'function')) {
+      fail('buildBrokerServer: resolvers override must be an object of functions');
+    }
+  }
+}
+
+/**
  * Build (but do not listen on) the broker from `env`. Exported so tests drive it with an injected env
- * and no process side effects. `overrides` lets a deployer inject non-declarative bits (e.g. an
- * `authorize` hook) from a thin wrapper without forking this file.
+ * and no process side effects. `overrides` lets a deployer inject the explicit non-declarative hook
+ * allowlist (authorize, resolvers, observability/audit/health sinks) from a thin wrapper without
+ * letting that wrapper replace env-owned identity, replay, provider, database, or egress config.
  */
 export async function buildBrokerServer(
   env: NodeJS.ProcessEnv = process.env,
-  overrides: Partial<BrokerOptions> = {},
+  overrides: BrokerServerOverrides = {},
 ): Promise<BuiltBroker> {
-  const identitySecret = env.VOUCHR_IDENTITY_SECRET;
-  if (!identitySecret || !identitySecret.trim()) {
-    fail('VOUCHR_IDENTITY_SECRET is required (the HS256 secret shared with the identity-token minter)');
-  }
+  // Validate before reading secrets or opening Postgres. In JavaScript, the exported TypeScript type
+  // is not a runtime boundary; a caller must not smuggle identitySecret/replayStore/providers through
+  // an `as any` object and replace the fail-closed env configuration below.
+  assertBrokerServerOverrides(overrides);
   // Master key(s): VOUCHR_MASTER_KEY and/or VOUCHR_MASTER_KEYS (#115). loadKeyring reads the
   // injected env for testability; its errors already name the variable and the 32-byte rule.
   let masterKey: Keyring;
   try {
     masterKey = loadKeyring(env);
+  } catch (e: any) {
+    fail(e?.message ?? String(e));
+  }
+  // #212 deployment-bound identity: build the issuer/audience/key set from env and fail closed on a
+  // weak/missing secret, a missing deployment id, or a secret reused for ANOTHER purpose — Slack
+  // signing, the master key (both env forms), the broker bearer, AND every provider OAuth client
+  // secret (a value shared with a third party must never double as the identity trust root). The resulting
+  // IdentityConfig — not a bare secret — is what makes an assertion minted for another deployment
+  // un-acceptable here.
+  let identityConfig: IdentityConfig;
+  try {
+    // The shared loader inventories Slack/broker/provider env secrets itself (STR-2). Pass the
+    // already-decoded keyring too: purpose separation compares actual key bytes, not base64 text.
+    identityConfig = loadIdentityConfig(env, masterKey.legacy.map(({ key }) => key));
   } catch (e: any) {
     fail(e?.message ?? String(e));
   }
@@ -112,8 +165,8 @@ export async function buildBrokerServer(
   // sweep-written rows (revoke reason 'expired') carry meta.dry_run too — createBroker only wraps
   // its own copy, which would leave the sweep writing unmarked rows.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
-  // Multi-replica safety is now the createBroker default: with a db configured it uses DbReplayStore
-  // (shared jti table), so a scaled fleet gets cluster-wide single-use with no wiring here. #100.
+  // createBroker always uses DbReplayStore (shared jti table), so a scaled fleet gets cluster-wide
+  // single-use with no alternate replay path to wire here. #100/#212.
 
   // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
   // default (user-only broker). The caller supplies eligibility facts as signed claims; the store
@@ -126,14 +179,18 @@ export async function buildBrokerServer(
     vault,
     audit,
     db,
-    identitySecret,
+    identitySecret: identityConfig,
     allowWrites,
     brokerToken,
     channelConfig,
     baseUrl,
     callbackPath,
     dryRun,
-    ...overrides,
+    authorize: overrides.authorize,
+    resolvers: overrides.resolvers,
+    onEvent: overrides.onEvent,
+    auditSink: overrides.auditSink,
+    onCredentialHealth: overrides.onCredentialHealth,
   });
 
   // #54 TTL sweep, wired the same way the Bolt path does (core sweepExpired + session-grant sweep).
@@ -162,9 +219,12 @@ const USAGE = `vouchr-broker — standalone headless Vouchr credential broker (n
 Usage: vouchr-broker            start the broker, config from env
        vouchr-broker --help     show this message
 
-Required env: VOUCHR_IDENTITY_SECRET, VOUCHR_MASTER_KEY (base64 of 32 bytes).
-Optional env: VOUCHR_PORT (3000), VOUCHR_DATABASE_URL (PostgreSQL; required), VOUCHR_KMS_KEY_ID,
-              VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN, VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
+Required env: VOUCHR_IDENTITY_SECRET (>= 32 random bytes; distinct from every other secret),
+              VOUCHR_DEPLOYMENT_ID (binds every identity assertion to this deployment),
+              VOUCHR_MASTER_KEY (base64 of 32 bytes), VOUCHR_DATABASE_URL (PostgreSQL).
+Optional env: VOUCHR_IDENTITY_SECRET_PREVIOUS (rolling key rotation), VOUCHR_IDENTITY_ISSUER (default
+              'vouchr'), VOUCHR_PORT (3000), VOUCHR_KMS_KEY_ID, VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN,
+              VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);

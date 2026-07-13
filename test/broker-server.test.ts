@@ -6,13 +6,19 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
-import { randomUUID } from 'node:crypto';
 import { loadProviders } from '../bin/providerConfig';
 import { buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
-import { signIdentity } from '../src/adapters/http/identity';
+import { mintIdentity, loadIdentityConfig } from '../src/adapters/http/identity';
+
+// #212 the packaged broker verifies deployment-bound assertions: a strong identity secret + a
+// deployment id, minted in config mode. loadIdentityConfig with the same secret/id yields the same
+// issuer/audience/kid, so a token minted here verifies against the broker built from baseEnv.
+const IDENTITY_SECRET = 'test-identity-secret-at-least-32-bytes-long!!';
+const DEPLOYMENT_ID = 'test-deployment';
+const idConfig = () => loadIdentityConfig({ VOUCHR_IDENTITY_SECRET: IDENTITY_SECRET, VOUCHR_DEPLOYMENT_ID: DEPLOYMENT_ID } as any);
 import { defineProvider } from '../src/core/providers';
 
 const KEY_B64 = Buffer.alloc(32, 7).toString('base64');
@@ -270,7 +276,8 @@ test('#211 loadProviders: errors never reflect hostile ids, keys, or nested valu
 
 async function baseEnv(t: TestContext, extra: Record<string, string> = {}): Promise<any> {
   return {
-    VOUCHR_IDENTITY_SECRET: 'shhh',
+    VOUCHR_IDENTITY_SECRET: IDENTITY_SECRET,
+    VOUCHR_DEPLOYMENT_ID: DEPLOYMENT_ID,
     VOUCHR_MASTER_KEY: KEY_B64,
     VOUCHR_DATABASE_URL: await testDbUrl(t), // PostgreSQL-only; a fresh isolated schema per broker
     VOUCHR_PROVIDERS: JSON.stringify([{ id: 'internal', credential: 'key', egressAllow: ['api.internal.example'] }]),
@@ -313,7 +320,7 @@ test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp en
     await new Vault(built.db, Buffer.from(KEY_B64, 'base64')).upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
       accessToken: 'tok_mcp_secret', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
-    const identityToken = signIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID() }, 'shhh');
+    const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, idConfig());
     const body = JSON.stringify({
       handle: { provider: 'internal', owner: 'user' }, identityToken, path: '/mcp',
       body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
@@ -412,6 +419,63 @@ test('buildBrokerServer: fails fast naming the missing secret', async (t) => {
   await assert.rejects(buildBrokerServer(noSecret), /VOUCHR_IDENTITY_SECRET/);
   await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_MASTER_KEY: undefined }), /VOUCHR_MASTER_KEY/);
   await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_MASTER_KEY: 'dG9vc2hvcnQ=' }), /32 bytes/);
+});
+
+// #212: the packaged broker fails closed at startup on a weak/placeholder identity secret, a missing
+// deployment id, or a secret reused as the master key — before it ever accepts an assertion.
+test('buildBrokerServer: fails closed on a weak/placeholder/reused identity secret and a missing deployment id', async (t) => {
+  await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_IDENTITY_SECRET: 'short' }), /at least 32 bytes/);
+  // An obvious placeholder is rejected with a placeholder-specific message (case-insensitive).
+  await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_IDENTITY_SECRET: 'ChangeMe' }), /placeholder/);
+  const { VOUCHR_DEPLOYMENT_ID, ...noDeploy } = await baseEnv(t);
+  await assert.rejects(buildBrokerServer(noDeploy), /VOUCHR_DEPLOYMENT_ID/);
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), VOUCHR_DEPLOYMENT_ID: 'REPLACE_ME-vouchr-production' }),
+    /placeholder/,
+  );
+  // Reused-purpose: identity secret == the base64 master key value.
+  await assert.rejects(buildBrokerServer({ ...await baseEnv(t), VOUCHR_IDENTITY_SECRET: KEY_B64 }), /distinct from the master key/);
+  // Reused-purpose: identity secret == a provider OAuth client secret (a value shared with a third party).
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), VOUCHR_PROVIDER_GITHUB_CLIENT_SECRET: IDENTITY_SECRET }),
+    /provider client secrets/,
+  );
+  // Compare KEY MATERIAL, not only equal env text: the identity secret below is the raw 32-byte
+  // ASCII value whose base64 form is used as the encryption master key.
+  const sameKeyBytes = 'M7vouchrMasterKey2026abcdef12345';
+  await assert.rejects(
+    buildBrokerServer({
+      ...await baseEnv(t),
+      VOUCHR_IDENTITY_SECRET: sameKeyBytes,
+      VOUCHR_MASTER_KEY: Buffer.from(sameKeyBytes).toString('base64'),
+    }),
+    /distinct from the master key/,
+  );
+  // A leaked Slack signing/provider OAuth secret must not also mint broker identities.
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), SLACK_SIGNING_SECRET: IDENTITY_SECRET }),
+    /Slack signing secret/,
+  );
+  await assert.rejects(
+    buildBrokerServer({ ...await baseEnv(t), GITHUB_CLIENT_SECRET: IDENTITY_SECRET }),
+    /provider client secrets/,
+  );
+});
+
+test('buildBrokerServer: hook overrides cannot replace identity/replay/provider security configuration', async (t) => {
+  const env = await baseEnv(t);
+  await assert.rejects(
+    buildBrokerServer(env, { identitySecret: 'weak-legacy-secret' } as any),
+    /unsupported override; allowed hooks:/,
+  );
+  const sentinel = 'ghp_unknown_override_secret';
+  await assert.rejects(
+    buildBrokerServer(env, { [sentinel]: true } as any),
+    (e: Error) => /unsupported override; allowed hooks:/.test(e.message) && !e.message.includes(sentinel),
+  );
+  // The intentional wrapper hook remains supported.
+  const built = await buildBrokerServer(env, { authorize: () => undefined });
+  await built.db.close();
 });
 
 // ── T8: seed CLI ─────────────────────────────────────────────────────────────

@@ -9,7 +9,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { defineProvider } from '../src/core/providers';
 import { userOwner, channelOwner, type Owner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
-import { mintIdentity } from '../src/adapters/http/identity';
+import { identityConfig, mintIdentity } from './support/identity';
 
 // #51 owner-binding invariant — the cross-tenant guard in resolveOwner. This EXHAUSTIVELY enumerates
 // the small tuple space (deterministic — better than random here) and asserts fail-closed behavior:
@@ -63,7 +63,7 @@ async function makeBroker(t: TestContext, channelConfigSet: boolean) {
     await channelConfig.setMode('T1', 'C1', 'acme', 'shared'); // the channel owns one shared credential
   }
 
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET, channelConfig });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   await new Promise<void>((r) => server.listen(0, r));
   const port = (server.address() as any).port;
   return { server, port, reads, reset: () => { reads.length = 0; } };
