@@ -279,4 +279,13 @@ test('CLI revoke does not echo a token-shaped positional or unknown-flag secret 
   const recognized = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', secret, '--dry-run'], { env, encoding: 'utf8' });
   assert.equal(recognized.status, 0);
   assert.doesNotMatch(recognized.stderr + recognized.stdout, /ghp_TOPSECRET/);
+
+  // The command itself is untrusted argv too. A credential pasted in that position must get a
+  // useful but static usage error, never be reflected back into terminal logs.
+  const unknownCommand = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', secret], {
+    env, encoding: 'utf8',
+  });
+  assert.equal(unknownCommand.status, 2);
+  assert.match(unknownCommand.stderr, /Unknown command/);
+  assert.doesNotMatch(unknownCommand.stderr + unknownCommand.stdout, /ghp_TOPSECRET/);
 });

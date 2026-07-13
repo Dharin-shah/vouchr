@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { Client, Pool } from 'pg';
 import { migrate, openDb, assertSchemaCurrent, SCHEMA_VERSION, type Db } from '../src/core/db';
@@ -92,6 +93,24 @@ test('openDb() succeeds after migrate()', async (t) => {
   t.after(() => db.close());
   // A trivial query proves the handle is live against the migrated schema.
   assert.equal((await db.all('SELECT COUNT(*)::int AS n FROM connection'))[0].n, 0);
+});
+
+test('CLI top-level failures never serialize database-provided error text (SEC-1)', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+  const secret = 'ghp_DATABASE_ERROR_MUST_NOT_REACH_OUTPUT';
+  await raw.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+  await raw.run('INSERT INTO meta (key, value) VALUES ($1, $2)', ['schema_version', secret]);
+
+  const result = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', 'bin/vouchr.ts', 'inventory', '--db', url],
+    { encoding: 'utf8' },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /^vouchr: command failed\s*$/);
+  assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
 });
 
 test('two migrate() calls racing on the same schema both succeed (advisory lock serializes, no pg_type 23505)', async (t) => {

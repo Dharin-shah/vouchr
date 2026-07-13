@@ -231,14 +231,14 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   let registry: ProviderRegistry | undefined;
   try {
     registry = new ProviderRegistry(loadProviders(process.env));
-  } catch (e: any) {
-    console.error(`revoke: provider config unavailable (${e?.message ?? e}); upstream revoke disabled — local deletion will proceed`);
+  } catch {
+    console.error('revoke: provider config unavailable; upstream revoke disabled — local deletion will proceed');
   }
   let key: Buffer | Keyring;
   try {
     key = loadKeyring(); // full ring, so post-rotation rows (keyed scheme) still decrypt for upstream revoke
-  } catch (e: any) {
-    console.error(`revoke: master key unavailable (${e?.message ?? e}); token decrypt + upstream revoke disabled — local deletion will proceed`);
+  } catch {
+    console.error('revoke: master key unavailable; token decrypt + upstream revoke disabled — local deletion will proceed');
     key = Buffer.alloc(32); // never used to decrypt successfully; vault.delete needs no key
   }
   const vault = new Vault(db, key);
@@ -288,8 +288,8 @@ async function cmdRekey(db: Db, f: Flags): Promise<number> {
   let ring: Keyring;
   try {
     ring = loadKeyring();
-  } catch (e: any) {
-    console.error(`rekey: ${e?.message ?? e}`);
+  } catch {
+    console.error('rekey: master key configuration is invalid');
     return 2;
   }
   const dryRun = 'dry-run' in f.values;
@@ -329,8 +329,8 @@ async function cmdDoctor(f: Flags): Promise<number> {
     // Single id-less key → today's exact output (UX-2); a keyring reports count + primary id.
     if (ring.primary.id === null && ring.legacy.length === 1) pass('master key', '32 bytes');
     else pass('master key', `${ring.legacy.length} keys; new writes under '${ring.primary.id}'`);
-  } catch (e: any) {
-    fail('master key', e?.message ?? 'invalid');
+  } catch {
+    fail('master key', 'invalid');
   }
 
   // 2. Backend in use (informational).
@@ -346,8 +346,8 @@ async function cmdDoctor(f: Flags): Promise<number> {
     const consents = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM consent_request');
     console.log(`INFO connections: ${conns?.n ?? 0}`);
     console.log(`INFO consent_requests: ${consents?.n ?? 0}`);
-  } catch (e: any) {
-    fail('db reachable', e?.message ?? 'open failed');
+  } catch {
+    fail('db reachable', 'open failed');
   } finally {
     await db?.close();
   }
@@ -565,7 +565,8 @@ async function main(): Promise<number> {
       usage();
       return 0;
     default:
-      console.error(`Unknown command: ${cmd}\n`);
+      // `cmd` is raw argv and may be a credential pasted in the wrong position (SEC-1).
+      console.error('Unknown command.\n');
       usage();
       return 2;
   }
@@ -573,7 +574,10 @@ async function main(): Promise<number> {
 
 main()
   .then((code) => process.exit(code))
-  .catch((e) => {
-    console.error(`vouchr: ${e?.message ?? e}`);
+  .catch(() => {
+    // Database drivers and extension points can put connection strings, provider payloads, or
+    // credential material in thrown values. The command-specific paths above already print safe
+    // usage diagnostics; an unexpected top-level failure must stay deliberately opaque (SEC-1).
+    console.error('vouchr: command failed');
     process.exit(1);
   });
