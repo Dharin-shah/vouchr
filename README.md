@@ -347,6 +347,12 @@ issuer, audience, and bounded active/overlap key set so assertions cannot cross 
   database and key still need normal production controls. To rotate the master key without
   orphaning rows, set `VOUCHR_MASTER_KEYS` (first entry encrypts new writes, all entries decrypt)
   and run `vouchr rekey` — see the deployment guide's key-rotation runbook.
+- **Resource bounds are finite and tunable.** Every upstream call has a deadline
+  (`VOUCHR_FETCH_DEADLINE_MS`), the broker enforces per-process global + per-provider in-flight
+  ceilings (`VOUCHR_MAX_INFLIGHT` / `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` → `503` + `Retry-After`, caught
+  as the exported `OverloadedError`), and inbound header/request/keep-alive timeouts are set. Ceilings
+  are per-process — fleet capacity is `replicas × VOUCHR_MAX_INFLIGHT`. See the deployment guide's
+  *Resource bounds and the scaling envelope* section (`npm run bench:perf` reproduces it).
 - **Follow the [deployment guide](./guides/DEPLOYMENT.md)** for Postgres, multi-workspace, KMS, and
   the production readiness checklist.
 

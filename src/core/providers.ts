@@ -714,6 +714,41 @@ export function defineProvider(spec: Provider): Provider {
   });
 }
 
+/** Deadline for a built-in userinfo probe (#209). A probe runs during the OAuth callback to label the
+ *  stored credential; a hung provider endpoint must not stall the connect flow. Matches the token
+ *  round-trip bound (`TOKEN_FETCH_TIMEOUT_MS` in tokens.ts) — the same class of trusted OAuth call. */
+const PROBE_TIMEOUT_MS = 10_000;
+
+/**
+ * Shared implementation for the built-in `accountProbe`s (#209): ONE finite deadline and ONE
+ * socket-release discipline for all providers, instead of four hand-rolled fetches. On a non-OK
+ * response the unread body is cancelled (undici otherwise pins the socket to it until GC, #172) and
+ * on any timeout / network throw the probe resolves to null — the account label is a nicety, never a
+ * reason to fail or hang the connect flow. `pick` reads the display field from the parsed JSON.
+ */
+async function probeAccount(
+  url: string,
+  headers: Record<string, string>,
+  pick: (json: any) => string | null,
+): Promise<string | null> {
+  let r: Response;
+  try {
+    r = await fetch(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
+  } catch {
+    return null; // timeout or network failure — treat as "account unknown", same as a non-OK probe
+  }
+  if (!r.ok) {
+    r.body?.cancel().catch(() => undefined);
+    return null;
+  }
+  try {
+    return pick(await r.json());
+  } catch {
+    r.body?.cancel().catch(() => undefined);
+    return null;
+  }
+}
+
 /** Built-in GitHub provider. Classic OAuth tokens are long-lived (no refresh). */
 export function github(cfg: ProviderConfig = {}): Provider {
   return defineProvider({
@@ -748,15 +783,8 @@ export function github(cfg: ProviderConfig = {}): Provider {
       });
       if (!r.ok && r.status !== 404) throw new Error(`GitHub token revoke returned HTTP ${r.status}`); // 404 = already gone
     },
-    accountProbe: async (token) => {
-      const r = await fetch('https://api.github.com/user', {
-        headers: { Authorization: `Bearer ${token}`, 'User-Agent': 'vouchr' },
-        redirect: 'manual',
-      });
-      if (!r.ok) return null;
-      const j: any = await r.json();
-      return j.login ?? null;
-    },
+    accountProbe: (token) =>
+      probeAccount('https://api.github.com/user', { Authorization: `Bearer ${token}`, 'User-Agent': 'vouchr' }, (j) => j.login ?? null),
   });
 }
 
@@ -788,15 +816,8 @@ export function google(cfg: ProviderConfig = {}): Provider {
     revokeUrl: 'https://oauth2.googleapis.com/revoke', // form token=<token>, no client auth
     clientId: cfg.clientId ?? process.env.GOOGLE_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? '',
-    accountProbe: async (token) => {
-      const r = await fetch('https://www.googleapis.com/oauth2/v2/userinfo', {
-        headers: { Authorization: `Bearer ${token}` },
-        redirect: 'manual',
-      });
-      if (!r.ok) return null;
-      const j: any = await r.json();
-      return j.email ?? null;
-    },
+    accountProbe: (token) =>
+      probeAccount('https://www.googleapis.com/oauth2/v2/userinfo', { Authorization: `Bearer ${token}` }, (j) => j.email ?? null),
   });
 }
 
@@ -819,15 +840,8 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     revokeAuth: 'body',
     clientId: cfg.clientId ?? process.env.GITLAB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITLAB_CLIENT_SECRET ?? '',
-    accountProbe: async (token) => {
-      const r = await fetch('https://gitlab.com/api/v4/user', {
-        headers: { Authorization: `Bearer ${token}` },
-        redirect: 'manual',
-      });
-      if (!r.ok) return null;
-      const j: any = await r.json();
-      return j.username ?? null;
-    },
+    accountProbe: (token) =>
+      probeAccount('https://gitlab.com/api/v4/user', { Authorization: `Bearer ${token}` }, (j) => j.username ?? null),
   });
 }
 
@@ -851,15 +865,12 @@ export function notion(cfg: ProviderConfig = {}): Provider {
     authorizeParams: { owner: 'user' },
     clientId: cfg.clientId ?? process.env.NOTION_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.NOTION_CLIENT_SECRET ?? '',
-    accountProbe: async (token) => {
-      const r = await fetch('https://api.notion.com/v1/users/me', {
-        headers: { Authorization: `Bearer ${token}`, 'Notion-Version': '2022-06-28' },
-        redirect: 'manual',
-      });
-      if (!r.ok) return null;
-      const j: any = await r.json();
-      return j?.bot?.owner?.user?.name ?? j?.name ?? null;
-    },
+    accountProbe: (token) =>
+      probeAccount(
+        'https://api.notion.com/v1/users/me',
+        { Authorization: `Bearer ${token}`, 'Notion-Version': '2022-06-28' },
+        (j) => j?.bot?.owner?.user?.name ?? j?.name ?? null,
+      ),
   });
 }
 

@@ -163,6 +163,23 @@ export function normalizeContentType(ct: string | null): string {
   return (ct ?? '').split(';')[0].trim().toLowerCase();
 }
 
+/**
+ * Default wall-clock deadline for an ordinary provider fetch (#209). A signal-less caller (a Bolt
+ * tool, direct handle use) gets this as a safety net inside `send`; the HTTP broker's /v1/fetch door
+ * composes its own configurable deadline + client-disconnect signal and passes it explicitly, so this
+ * default only applies where no signal was supplied. Bounds the whole fetch (headers AND body): the
+ * signal aborts a still-draining response body too.
+ */
+export const DEFAULT_FETCH_DEADLINE_MS = 30_000;
+
+/** HTTP methods safe to auto-replay after a 401-triggered token refresh: side-effect-free or
+ *  idempotent per RFC 9110. A non-idempotent write (POST/PATCH, or any unknown method) is NEVER
+ *  auto-replayed — a provider may have applied it before returning 401 (#209). */
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE']);
+function isIdempotentMethod(method: string): boolean {
+  return IDEMPOTENT_METHODS.has(method);
+}
+
 export class ConnectionHandle {
   constructor(
     private provider: Provider,
@@ -516,7 +533,11 @@ export class ConnectionHandle {
       else headers.set('Authorization', `Bearer ${t}`);
       try {
         // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
-        return await fetch(input, { ...init, headers, redirect: 'manual' });
+        // #209 finite deadline: use the caller's signal when supplied (the broker composes its
+        // configurable deadline + client-disconnect there); otherwise a default AbortSignal.timeout is
+        // the safety net so a signal-less caller (Bolt tool, direct handle) can't hang on a dead
+        // provider. The signal bounds the whole fetch — a still-draining response body aborts too.
+        return await fetch(input, { ...init, headers, redirect: 'manual', signal: init.signal ?? AbortSignal.timeout(DEFAULT_FETCH_DEADLINE_MS) });
       } catch (e) {
         // Network-level throw (DNS/connection refused): fire the no-secret failure signal, then re-throw
         // so the broker still maps it to 502 — the signal is emitted, not swallowed.
@@ -539,7 +560,11 @@ export class ConnectionHandle {
         res.body?.cancel().catch(() => undefined);
         throw e;
       }
-      if (refreshed) {
+      // #209: the refresh runs so the NEXT request carries a live token, but the failed request is
+      // REPLAYED only for an idempotent method. A non-idempotent write (POST/PATCH) that returned 401
+      // may already have side-effected upstream; blindly resending it could double-apply. Such a 401
+      // is returned to the caller AS-IS (body intact), for the caller to retry if it is safe to.
+      if (refreshed && isIdempotentMethod(method)) {
         // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
         res.body?.cancel().catch(() => undefined);
         res = await send(refreshed);

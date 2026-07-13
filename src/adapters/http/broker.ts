@@ -9,8 +9,9 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
+import { InflightLimiter, OverloadedError } from '../../core/inflight';
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
@@ -177,6 +178,37 @@ export interface BrokerOptions {
    */
   maxStreamMs?: number;
   /**
+   * #209 wall-clock deadline for a /v1/fetch upstream request (headers AND body). A hung provider
+   * must not hold a request — a timer aborts the upstream fetch and, composed with client disconnect,
+   * releases the provider socket. /v1/mcp uses maxStreamMs instead (streams run longer). Default 30s.
+   * Must be a finite number > 0 (validated at createBroker).
+   */
+  fetchDeadlineMs?: number;
+  /**
+   * #209 per-process GLOBAL in-flight ceiling: the max number of /v1/fetch + /v1/mcp requests that may
+   * be in flight at once. Over the ceiling, a request is refused 503 + Retry-After BEFORE its body is
+   * buffered, so peak memory is bounded (body cap × this). NOT a rate limit (that's provider.rateLimit,
+   * requests-per-window). Per-process: fleet capacity is replicas × this (see guides/DEPLOYMENT.md).
+   * Default 200. Must be a finite integer > 0 (validated at createBroker).
+   */
+  maxInflight?: number;
+  /**
+   * #209 per-PROVIDER in-flight ceiling: the max concurrent upstream requests for any single provider,
+   * so one slow provider can't consume the whole global budget. Over it → 503 + Retry-After. Default
+   * 40. Must be a finite integer > 0 and ≤ maxInflight (validated at createBroker).
+   */
+  maxInflightPerProvider?: number;
+  /**
+   * #209 inbound server timeouts (ms), set on the http.Server. `headersTimeoutMs` bounds how long a
+   * client may take to send request headers; `requestTimeoutMs` bounds the whole request (headers +
+   * body) — a slow-loris drip is cut here; `keepAliveTimeoutMs` bounds an idle keep-alive socket.
+   * Defaults 15s / 30s / 10s. Each must be a finite number > 0; requestTimeoutMs must be ≥
+   * headersTimeoutMs (Node requires it). Validated at createBroker.
+   */
+  headersTimeoutMs?: number;
+  requestTimeoutMs?: number;
+  keepAliveTimeoutMs?: number;
+  /**
    * Optional coarse network gate (a shared `Authorization: Bearer <token>` on /v1/*). This is a
    * perimeter check ONLY, NOT identity — identity comes from the signed token. Documented per #22.
    */
@@ -228,6 +260,13 @@ const WRITE_REQUEST_CAP = WRITE_BODY_CAP + READ_REQUEST_CAP;
 // #65 /v1/mcp stream ceilings (see BrokerOptions.maxStreamBytes / maxStreamMs).
 const DEFAULT_MAX_STREAM_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_STREAM_MS = 5 * 60_000;
+// #209 in-flight ceilings and inbound server timeouts (see BrokerOptions for each). In-process by
+// design: fleet capacity is replicas × DEFAULT_MAX_INFLIGHT (guides/DEPLOYMENT.md).
+const DEFAULT_MAX_INFLIGHT = 200;
+const DEFAULT_MAX_INFLIGHT_PER_PROVIDER = 40;
+const DEFAULT_HEADERS_TIMEOUT_MS = 15_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_KEEPALIVE_TIMEOUT_MS = 10_000;
 // #65 default RESPONSE media types for /v1/mcp when `provider.mcp.allowContentTypes` is unset —
 // the two MCP Streamable-HTTP transport types. Anything else is withheld unread (see handleMcp).
 const DEFAULT_MCP_ALLOWED_CT = ['application/json', 'text/event-stream'];
@@ -293,6 +332,10 @@ function responseHasNoBody(res: Response): boolean {
 }
 
 async function readJson(req: http.IncomingMessage, cap = READ_REQUEST_CAP): Promise<any> {
+  // #209 fast-reject an oversize body on its declared Content-Length, before reading a single chunk —
+  // a lying/absent header still can't get past the streamed byte counter below (fail-closed).
+  const declared = Number(req.headers['content-length']);
+  if (Number.isFinite(declared) && declared > cap) throw new HttpError(413, { error: 'request body too large' });
   const chunks: Buffer[] = [];
   let total = 0;
   for await (const chunk of req) {
@@ -493,6 +536,33 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   if (opts.maxStreamMs !== undefined && !(Number.isFinite(opts.maxStreamMs) && opts.maxStreamMs > 0)) {
     throw new Error('createBroker: invalid maxStreamMs: must be a finite number > 0.');
   }
+  // #209 resource bounds: the same fail-closed define-time discipline (a NaN/Infinity/<=0 bound would
+  // silently disable the ceiling). Deadlines/timeouts are finite ms > 0; ceilings are integers > 0.
+  for (const [name, v] of [['fetchDeadlineMs', opts.fetchDeadlineMs], ['headersTimeoutMs', opts.headersTimeoutMs], ['requestTimeoutMs', opts.requestTimeoutMs], ['keepAliveTimeoutMs', opts.keepAliveTimeoutMs]] as const) {
+    if (v !== undefined && !(Number.isFinite(v) && v > 0)) throw new Error(`createBroker: invalid ${name}: must be a finite number > 0.`);
+  }
+  for (const [name, v] of [['maxInflight', opts.maxInflight], ['maxInflightPerProvider', opts.maxInflightPerProvider]] as const) {
+    if (v !== undefined && !(Number.isInteger(v) && v > 0)) throw new Error(`createBroker: invalid ${name}: must be an integer > 0.`);
+  }
+  const fetchDeadlineMs = opts.fetchDeadlineMs ?? DEFAULT_FETCH_DEADLINE_MS;
+  const headersTimeoutMs = opts.headersTimeoutMs ?? DEFAULT_HEADERS_TIMEOUT_MS;
+  const requestTimeoutMs = opts.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+  const keepAliveTimeoutMs = opts.keepAliveTimeoutMs ?? DEFAULT_KEEPALIVE_TIMEOUT_MS;
+  // Node aborts a request whose headers arrive but whose body doesn't within requestTimeout; it
+  // requires requestTimeout >= headersTimeout (else the header phase could outlive the whole-request
+  // phase). Reject the contradiction at construction rather than let Node clamp it silently.
+  if (requestTimeoutMs < headersTimeoutMs) throw new Error('createBroker: requestTimeoutMs must be >= headersTimeoutMs.');
+  const maxInflight = opts.maxInflight ?? DEFAULT_MAX_INFLIGHT;
+  // The per-provider ceiling can never exceed the global one. Default it to min(default, global) so a
+  // small configured global stays coherent without the operator also lowering the per-provider knob;
+  // an EXPLICIT per-provider > global is a config contradiction and fails closed.
+  const maxInflightPerProvider = opts.maxInflightPerProvider ?? Math.min(DEFAULT_MAX_INFLIGHT_PER_PROVIDER, maxInflight);
+  if (opts.maxInflightPerProvider !== undefined && opts.maxInflightPerProvider > maxInflight) {
+    throw new Error('createBroker: maxInflightPerProvider must be <= maxInflight.');
+  }
+  // #209 ONE limiter shared by every request (like the refresh `inflight` map and the rate-limit
+  // store): live counters admit/reject at entry so a burst of slow upstreams can't pin sockets/memory.
+  const limiter = new InflightLimiter(maxInflight, maxInflightPerProvider);
   const registry = new ProviderRegistry(opts.providers);
   const allowedCt = (opts.allowedContentTypes ?? DEFAULT_ALLOWED_CT).map((c) => c.toLowerCase());
   const maxBytes = opts.maxResponseBytes ?? DEFAULT_MAX_BYTES;
@@ -709,7 +779,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     return { handle, provider, acting };
   }
 
-  async function handleFetch(body: BrokerFetchRequest, trace: Record<string, string> = {}): Promise<{ status: number; payload: Record<string, unknown> }> {
+  async function handleFetch(body: BrokerFetchRequest, trace: Record<string, string> = {}, clientRes?: http.ServerResponse): Promise<{ status: number; payload: Record<string, unknown> }> {
     const method = requestMethod(body.method);
     // Default fail-closed read-only. Reject non-GET/HEAD with 405 BEFORE identity/vault/upstream.
     if (!opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
@@ -729,27 +799,52 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     // ponytail: forward as-is rather than minting a child span — span management is the host's job.
     const headers = { ...pickHeaders(body.headers, FETCH_FORWARD_HEADERS), ...trace };
 
-    let res: Response;
+    // #209 per-provider in-flight admission (the route already admitted against the global ceiling).
+    // Admit BEFORE arming the timer/listener so an OverloadedError leaks neither (→ 503, top-level catch).
+    const releaseProvider = limiter.enterProvider(provider.id);
+    // #209 one composed signal bounds the whole operation: a deadline timer (headers AND body — it
+    // aborts a still-draining response) plus caller cancellation (the client dropping the connection
+    // releases the provider socket at once). Cleared in finally AFTER readCapped.
+    const abort = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; abort.abort(); }, fetchDeadlineMs);
+    const onClose = () => abort.abort();
+    clientRes?.once('close', onClose);
     try {
-      res = await handle.fetch(url.toString(), { method, headers, body: outboundBody });
-    } catch (e) {
-      mapUpstreamError(e);
-    }
+      let res: Response;
+      try {
+        res = await handle.fetch(url.toString(), { method, headers, body: outboundBody, signal: abort.signal });
+      } catch (e) {
+        if (timedOut) throw new HttpError(504, { error: 'upstream timed out' });
+        mapUpstreamError(e);
+      }
 
-    const contentType = res.headers.get('content-type') ?? '';
-    // HEAD/no-content responses have no body to guard or relay; return status + content-type only.
-    if (method === 'HEAD' || responseHasNoBody(res)) {
-      res.body?.cancel().catch(() => undefined);
-      return { status: 200, payload: { status: res.status, contentType, body: '' } };
+      const contentType = res.headers.get('content-type') ?? '';
+      // HEAD/no-content responses have no body to guard or relay; return status + content-type only.
+      if (method === 'HEAD' || responseHasNoBody(res)) {
+        res.body?.cancel().catch(() => undefined);
+        return { status: 200, payload: { status: res.status, contentType, body: '' } };
+      }
+      // #26: content-type allowlist checked BEFORE the body is read (charset stripped, case-folded).
+      if (!allowedCt.includes(normalizeContentType(contentType))) {
+        res.body?.cancel().catch(() => undefined);
+        throw new HttpError(502, { error: `disallowed content-type: ${normalizeContentType(contentType) || 'unknown'}` });
+      }
+      // #26: size cap -> 413, never a truncated partial body. A slow-drip body that outruns the
+      // deadline aborts the reader here too — surface it as the same stable 504 as a headers timeout.
+      let text: string;
+      try {
+        text = await readCapped(res, maxBytes);
+      } catch (e) {
+        if (timedOut) throw new HttpError(504, { error: 'upstream timed out' });
+        throw e;
+      }
+      return { status: 200, payload: { status: res.status, contentType, body: text } };
+    } finally {
+      clearTimeout(timer);
+      clientRes?.removeListener('close', onClose);
+      releaseProvider();
     }
-    // #26: content-type allowlist checked BEFORE the body is read (charset stripped, case-folded).
-    if (!allowedCt.includes(normalizeContentType(contentType))) {
-      res.body?.cancel().catch(() => undefined);
-      throw new HttpError(502, { error: `disallowed content-type: ${normalizeContentType(contentType) || 'unknown'}` });
-    }
-    // #26: size cap -> 413, never a truncated partial body.
-    const text = await readCapped(res, maxBytes);
-    return { status: 200, payload: { status: res.status, contentType, body: text } };
   }
 
   /**
@@ -809,6 +904,10 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       throw new HttpError(403, { error: 'path is not in the provider mcp.paths allowlist' });
     }
     const headers = { ...pickHeaders(body.headers, MCP_FORWARD_HEADERS), ...trace };
+    // #209 per-provider in-flight admission (global admission ran at the route). After the deny gates
+    // above, so a refused request never consumes a slot. Over the ceiling → 503 (top-level catch);
+    // admit before arming the timer so a rejection leaks nothing. Released in the finally below.
+    const releaseProvider = limiter.enterProvider(provider.id);
     // ONE AbortController covers the upstream fetch AND the relay: the maxStreamMs timer fires it,
     // a client disconnect fires it, and a byte-ceiling breach fires it — the upstream socket never
     // outlives the request it was serving.
@@ -837,6 +936,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       await relayMcpResponse(upstream, res, abort, maxStreamBytes);
     } finally {
       clearTimeout(timer);
+      releaseProvider();
     }
   }
 
@@ -1222,7 +1322,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
   }
 
-  return http.createServer((req, res) => {
+  const server = http.createServer((req, res) => {
     void (async () => {
       const send = (status: number, payload: Record<string, unknown>, headers?: Record<string, string>) => {
         res.writeHead(status, { 'content-type': 'application/json', ...headers });
@@ -1274,13 +1374,26 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         }
         if (req.method === 'POST' && url === '/v1/fetch') {
           await perimeter(req);
-          const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req));
-          return send(r.status, r.payload);
+          // #209 GLOBAL admission BEFORE the body is buffered — over the ceiling, 503 + Retry-After
+          // (top-level catch) before any memory is spent. Held for the whole request; released after.
+          const releaseGlobal = limiter.enter();
+          try {
+            const r = await handleFetch(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req), res);
+            return send(r.status, r.payload);
+          } finally {
+            releaseGlobal();
+          }
         }
         if (req.method === 'POST' && url === '/v1/mcp') {
           await perimeter(req);
-          // Streams the upstream response straight onto `res` (SSE passthrough) — no send() envelope.
-          return await handleMcp(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req), res);
+          // #209 GLOBAL admission before buffering the JSON-RPC body (see /v1/fetch above).
+          const releaseGlobal = limiter.enter();
+          try {
+            // Streams the upstream response straight onto `res` (SSE passthrough) — no send() envelope.
+            return await handleMcp(await readJson(req, opts.allowWrites ? WRITE_REQUEST_CAP : READ_REQUEST_CAP), traceHeaders(req), res);
+          } finally {
+            releaseGlobal();
+          }
         }
         if (url === '/v1/mcp') {
           // #65 MCP spec: a server that doesn't offer the optional GET listening stream or
@@ -1344,6 +1457,11 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         // instead of crashing on a second writeHead.
         if (res.headersSent) return res.destroy();
         if (e instanceof HttpError) return send(e.status, e.payload, e.headers);
+        // #209 in-flight ceiling full → 503 + Retry-After (whole seconds; ms also rides the payload).
+        // The scope ('global'/'provider') is a non-secret operator signal, never request content.
+        if (e instanceof OverloadedError) {
+          return send(503, { error: 'overloaded', scope: e.scope, retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
+        }
         // Log the error CLASS NAME only — never the message/stack/payload. An extension point (e.g. a
         // custom provider.inject) can throw AFTER touching the secret, so the message could carry the
         // token; logging it would break the "tokens never enter logs" invariant. The type still triages.
@@ -1352,4 +1470,12 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       }
     })();
   });
+  // #209 inbound server timeouts: bound how long a client may take to send headers, then the whole
+  // request (a slow-loris drip is cut here — server.close on shutdown then completes without waiting on
+  // it), and how long an idle keep-alive socket lingers. maxHeadersCount caps header count/size.
+  server.headersTimeout = headersTimeoutMs;
+  server.requestTimeout = requestTimeoutMs;
+  server.keepAliveTimeout = keepAliveTimeoutMs;
+  server.maxHeadersCount = 100;
+  return server;
 }

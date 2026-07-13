@@ -26,6 +26,17 @@ function fail(msg: string): never {
   throw new Error(msg);
 }
 
+/** #209 parse an optional positive-number env knob (a resource bound), failing closed with the var
+ *  name on a non-number / <= 0 (or non-integer when `integer`). Unset → undefined (createBroker default). */
+function posNumEnv(raw: string | undefined, name: string, integer = false): number | undefined {
+  if (raw === undefined || raw === '') return undefined;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || (integer && !Number.isInteger(n))) {
+    fail(`${name} must be a ${integer ? 'positive integer' : 'positive number'}, got "${raw}".`);
+  }
+  return n;
+}
+
 export interface BuiltBroker {
   server: http.Server;
   db: Db;
@@ -186,6 +197,14 @@ export async function buildBrokerServer(
     baseUrl,
     callbackPath,
     dryRun,
+    // #209 resource bounds (all optional; createBroker defaults + validates). Per-process ceilings:
+    // fleet capacity is replicas × VOUCHR_MAX_INFLIGHT (see guides/DEPLOYMENT.md).
+    fetchDeadlineMs: posNumEnv(env.VOUCHR_FETCH_DEADLINE_MS, 'VOUCHR_FETCH_DEADLINE_MS'),
+    maxInflight: posNumEnv(env.VOUCHR_MAX_INFLIGHT, 'VOUCHR_MAX_INFLIGHT', true),
+    maxInflightPerProvider: posNumEnv(env.VOUCHR_MAX_INFLIGHT_PER_PROVIDER, 'VOUCHR_MAX_INFLIGHT_PER_PROVIDER', true),
+    headersTimeoutMs: posNumEnv(env.VOUCHR_HEADERS_TIMEOUT_MS, 'VOUCHR_HEADERS_TIMEOUT_MS'),
+    requestTimeoutMs: posNumEnv(env.VOUCHR_REQUEST_TIMEOUT_MS, 'VOUCHR_REQUEST_TIMEOUT_MS'),
+    keepAliveTimeoutMs: posNumEnv(env.VOUCHR_KEEPALIVE_TIMEOUT_MS, 'VOUCHR_KEEPALIVE_TIMEOUT_MS'),
     authorize: overrides.authorize,
     resolvers: overrides.resolvers,
     onEvent: overrides.onEvent,
@@ -224,7 +243,11 @@ Required env: VOUCHR_IDENTITY_SECRET (>= 32 random bytes; distinct from every ot
               VOUCHR_MASTER_KEY (base64 of 32 bytes), VOUCHR_DATABASE_URL (PostgreSQL).
 Optional env: VOUCHR_IDENTITY_SECRET_PREVIOUS (rolling key rotation), VOUCHR_IDENTITY_ISSUER (default
               'vouchr'), VOUCHR_PORT (3000), VOUCHR_KMS_KEY_ID, VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN,
-              VOUCHR_SWEEP_INTERVAL_MS. See DEPLOYMENT.md.`;
+              VOUCHR_SWEEP_INTERVAL_MS.
+Resource bounds (#209): VOUCHR_FETCH_DEADLINE_MS (30000), VOUCHR_MAX_INFLIGHT (200),
+              VOUCHR_MAX_INFLIGHT_PER_PROVIDER (40), VOUCHR_HEADERS_TIMEOUT_MS (15000),
+              VOUCHR_REQUEST_TIMEOUT_MS (30000), VOUCHR_KEEPALIVE_TIMEOUT_MS (10000). Per-process
+              ceilings: fleet capacity is replicas × VOUCHR_MAX_INFLIGHT. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -265,6 +288,10 @@ async function main(): Promise<void> {
     built.server.close(() => {
       built.db.close().catch(() => undefined).finally(() => process.exit(0));
     });
+    // #209 stop accepting new work AND drop idle keep-alive sockets so close() completes on the
+    // in-flight requests alone, instead of blocking on idle sockets until keepAliveTimeout (or the
+    // hard-kill below). In-flight requests keep their connection until they finish.
+    built.server.closeIdleConnections();
     // Don't hang forever on a stuck connection.
     setTimeout(() => process.exit(1), 10_000).unref();
   };

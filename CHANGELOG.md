@@ -7,6 +7,24 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Bounded network, memory, and concurrency at the HTTP boundary** (#209). The broker now bounds
+  every runtime resource so slow, malformed, cancelled, or oversized traffic can't pin memory,
+  sockets, or the connection pool. `/v1/fetch` upstream calls carry a finite, configurable deadline
+  (`VOUCHR_FETCH_DEADLINE_MS`, default 30s) composed with client-disconnect cancellation — a hung
+  provider is cut with `504` and the upstream socket released; the injector applies the same default
+  as a safety net to any signal-less caller (Bolt/direct), and the four built-in `accountProbe`s now
+  carry a deadline and drain their socket on a non-OK response. New per-process in-flight ceilings —
+  global (`VOUCHR_MAX_INFLIGHT`, default 200) and per-provider (`VOUCHR_MAX_INFLIGHT_PER_PROVIDER`,
+  default 40) — shed excess load with `503` + `Retry-After` before a body is buffered, and are
+  in-process by design (fleet capacity = replicas × per-process, see DEPLOYMENT.md; no Redis or
+  distributed semaphore). Inbound requests gain a `Content-Length` fast-reject plus server
+  `headersTimeout`/`requestTimeout`/`keepAliveTimeout` (`VOUCHR_HEADERS_TIMEOUT_MS` /
+  `VOUCHR_REQUEST_TIMEOUT_MS` / `VOUCHR_KEEPALIVE_TIMEOUT_MS`), and shutdown now
+  `closeIdleConnections()` so drain completes on in-flight work alone. A 401-triggered refresh still
+  updates the credential but replays only idempotent methods — a non-idempotent write is never
+  auto-resent. New exports: `OverloadedError`; new `BrokerOptions`: `fetchDeadlineMs`, `maxInflight`,
+  `maxInflightPerProvider`, `headersTimeoutMs`, `requestTimeoutMs`, `keepAliveTimeoutMs`. Opt-in load
+  harness: `npm run bench:perf`.
 - **Deployment-bound, replay-safe broker identity assertions** (#212). A signed identity token is now
   bound to one deployment: the packaged broker builds an `IdentityConfig` from env
   (`loadIdentityConfig`) with a verified issuer (`VOUCHR_IDENTITY_ISSUER`, default `vouchr`) and

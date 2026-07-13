@@ -690,6 +690,40 @@ The KMS envelope is a recommendation, not an enforced precondition: Vouchr will 
 Enabling KMS in the reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding
 `@aws-sdk/client-kms` to the image together.
 
+### Resource bounds and the scaling envelope (#209)
+
+The broker bounds every runtime resource so slow, malformed, cancelled, or oversized traffic cannot
+pin memory, sockets, or database connections. All bounds are finite by default and tunable via env;
+each is a positive number (ms) or a positive integer (a count), validated at boot.
+
+| Env | Default | What it bounds |
+|---|---|---|
+| `VOUCHR_FETCH_DEADLINE_MS` | `30000` | Wall-clock deadline for a `/v1/fetch` upstream call (headers **and** body). A hung provider is cut → `504`; a client disconnect aborts the upstream fetch immediately. `/v1/mcp` streams use `maxStreamMs` instead. |
+| `VOUCHR_MAX_INFLIGHT` | `200` | Per-process **global** concurrent-request ceiling. Over it → `503` + `Retry-After`, refused **before** the body is buffered (so peak inbound memory ≤ body-cap × this). |
+| `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` | `40` | Per-**provider** concurrent ceiling, so one slow provider can't consume the whole global budget. Over it → `503` (`scope: "provider"`). Clamped to ≤ `VOUCHR_MAX_INFLIGHT`. |
+| `VOUCHR_HEADERS_TIMEOUT_MS` | `15000` | Max time a client may take to send request headers. |
+| `VOUCHR_REQUEST_TIMEOUT_MS` | `30000` | Max time for the whole inbound request (a slow-loris body drip is cut here). Must be ≥ headers timeout. |
+| `VOUCHR_KEEPALIVE_TIMEOUT_MS` | `10000` | Idle keep-alive socket lifetime. On `SIGTERM`/`SIGINT` the broker also `closeIdleConnections()` so drain completes on in-flight requests alone. |
+
+These are **per-process** ceilings — by design (no Redis, no distributed semaphore). Fleet capacity is
+therefore simply:
+
+```
+fleet concurrent in-flight capacity = replicas × VOUCHR_MAX_INFLIGHT
+```
+
+Scale throughput by adding replicas; each adds `VOUCHR_MAX_INFLIGHT` in-flight slots linearly. Beyond
+the fleet ceiling the broker sheds load with `503` + `Retry-After` and latency stays bounded rather
+than degrading unboundedly. The token bucket (`provider.rateLimit`) is orthogonal — it limits
+requests-per-window per (owner, provider); the in-flight ceiling limits simultaneous work.
+
+Reproduce the envelope with the opt-in two-replica load harness (`npm run bench:perf`, needs
+`VOUCHR_TEST_PG_URL`; tune `BENCH_REPLICAS`/`BENCH_MAX_INFLIGHT`/`BENCH_CONCURRENCY`). A reference run
+(2 replicas × 50 in-flight = 100-slot fleet, 8 ms provider latency):
+
+- **60 callers (under the ceiling):** ~705 req/s served, P50/P95/P99 = 80/131/161 ms, 0 × `503`.
+- **120 callers (over the ceiling):** ceiling engages (`503` back-pressure), P50/P95/P99 = 163/213/231 ms — latency **stays bounded**, not runaway.
+
 ## Slack app + OAuth install flow
 
 Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)

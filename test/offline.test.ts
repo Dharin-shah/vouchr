@@ -380,8 +380,11 @@ test('injector: the /token refresh fetch is given a bounded (10s) abort signal',
 
   const realFetch = globalThis.fetch;
   const realTimeout = AbortSignal.timeout;
-  let tokenSignalMs = -1;
-  (AbortSignal as any).timeout = (ms: number) => { tokenSignalMs = ms; return realTimeout.call(AbortSignal, ms); };
+  // Every outbound fetch is now bounded (#209): the provider call carries the injector's 30s default
+  // deadline, the /token refresh carries the 10s TOKEN_FETCH_TIMEOUT_MS. Collect all and assert the
+  // 10s token bound is present — the provider fetches (30s) no longer mask it as the "last" call.
+  const timeoutMs: number[] = [];
+  (AbortSignal as any).timeout = (ms: number) => { timeoutMs.push(ms); return realTimeout.call(AbortSignal, ms); };
   globalThis.fetch = (async (url: any, init: any) => {
     if (String(url) === 'https://acme.example/token') {
       assert.ok(init.signal instanceof AbortSignal); // the refresh fetch carries an abort signal
@@ -394,7 +397,7 @@ test('injector: the /token refresh fetch is given a bounded (10s) abort signal',
   try {
     const res = await new ConnectionHandle(provider, O1, ID, vault, audit).fetch('https://api.acme.example/thing');
     assert.equal(res.status, 200);
-    assert.equal(tokenSignalMs, 10_000); // TOKEN_FETCH_TIMEOUT_MS — bounded, not unbounded
+    assert.ok(timeoutMs.includes(10_000), `the /token refresh must be bounded at 10s; saw ${timeoutMs.join(',')}`);
   } finally {
     globalThis.fetch = realFetch;
     (AbortSignal as any).timeout = realTimeout;
