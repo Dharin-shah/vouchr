@@ -9,6 +9,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { CONFIG_CALLBACK, DISCONNECT_ACTION } from '../src/adapters/blocks';
 import { userOwner } from '../src/core/owner';
+import type { Db } from '../src/core/db';
 
 // #109: no-arg `/vouchr` opens a config modal. Bolt-fake tests over the real registered handlers
 // (command / view / action). The submit diffs each control against the OPEN-TIME state carried in the
@@ -20,10 +21,16 @@ const mkProvider = (id: string): Provider => defineProvider({
 });
 const provider = mkProvider('mcp');
 
-async function harness(t: TestContext, opts: { slackAdmin?: boolean; providers?: Provider[]; policy?: Policy } = {}) {
+async function harness(t: TestContext, opts: {
+  slackAdmin?: boolean;
+  providers?: Provider[];
+  policy?: Policy;
+  db?: Db;
+  usersInfo?: () => Promise<unknown>;
+} = {}) {
   const { slackAdmin = false, providers = [provider], policy } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
-  const lan = await createVouchr({ providers, baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t), policy });
+  const lan = await createVouchr({ providers, baseUrl: 'http://127.0.0.1:1', db: opts.db ?? await openTestDb(t), policy });
   let command: any;
   const views: Record<string, any> = {};
   const actions: Record<string, any> = {};
@@ -35,7 +42,7 @@ async function harness(t: TestContext, opts: { slackAdmin?: boolean; providers?:
   let opened: any = null;
   let updated: any = null;
   const client = {
-    users: { info: async () => ({ user: { is_admin: slackAdmin } }) },
+    users: { info: opts.usersInfo ?? (async () => ({ user: { is_admin: slackAdmin } })) },
     conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_OTHER' } }) },
     views: { open: async (a: any) => (opened = a), update: async (a: any) => (updated = a) },
     chat: { postMessage: async () => undefined },
@@ -77,6 +84,34 @@ test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable cont
   assert.equal(view.submit?.text?.text ?? view.submit?.text, 'Save');
   assert.ok(view.blocks.some((b: any) => b.block_id === 'mode:mcp'));
   assert.ok(view.blocks.some((b: any) => b.block_id === 'tool:mcp'));
+});
+
+test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', async (t) => {
+  const base = await openTestDb(t);
+  let started = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const db: Db = {
+    get: (sql, params) => base.get(sql, params),
+    all: async (sql, params) => { started++; await gate; return base.all(sql, params); },
+    run: (sql, params) => base.run(sql, params),
+    exec: (sql) => base.exec(sql),
+    close: () => base.close(),
+  };
+  const h = await harness(t, {
+    slackAdmin: true,
+    db,
+    usersInfo: async () => { started++; await gate; return { user: { is_admin: true } }; },
+  });
+
+  const opening = h.openModal();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  // Connection metadata + three manifest snapshots + Slack's admin check all start together.
+  assert.equal(started, 5);
+  release();
+  const view = await opening;
+  assert.equal(view?.callback_id, CONFIG_CALLBACK);
+  assert.equal(started, 5, 'admin rows must reuse the manifest snapshot, not start a sixth read');
 });
 
 test('no-arg falls back to status text when views.open fails (never silent)', async (t) => {

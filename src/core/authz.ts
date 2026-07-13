@@ -1,8 +1,8 @@
 import { userOwner, channelOwner, type Owner } from './owner';
 import type { SlackIdentity } from './identity';
-import type { ChannelMode, ChannelConfig } from './channelConfig';
+import { ChannelConfig, type ChannelMode, type PreviewVisibility } from './channelConfig';
 import type { Policy } from './policy';
-import type { ChannelTools, ToolManifestEntry } from './tools';
+import { ChannelTools, type ToolManifestEntry } from './tools';
 import type { ProviderRegistry } from './providers';
 
 /**
@@ -24,6 +24,91 @@ import type { ProviderRegistry } from './providers';
 export type AuthzDenial = 'policy' | 'tool-disabled';
 
 /**
+ * The authorization VERDICT from the two already-resolved bits (pure, no I/O): Policy first, then the
+ * channel tool allowlist. `policyAllows` = Policy permits this provider in this channel; `toolAllowed` =
+ * the channel allowlist permits it (true where nothing restricts). `authorizeProvider` resolves the two
+ * bits for ONE provider (a query); `buildToolManifest` resolves them for ALL providers in one batch —
+ * both fold the ordering/mapping through HERE, so the manifest's `enabled` can never disagree with the
+ * runtime gate or with which denial reason wins.
+ */
+export function authorizeVerdict(policyAllows: boolean, toolAllowed: boolean): AuthzDenial | null {
+  if (!policyAllows) return 'policy';
+  if (!toolAllowed) return 'tool-disabled';
+  return null;
+}
+
+/** Whether a store's batch method is safe to use without bypassing an existing customization in the
+ * legacy single-provider call chain. Plain shipped stores keep every relevant prototype method. A
+ * custom batch method is authoritative; otherwise any legacy override forces the compatibility path,
+ * or the manifest can disagree with runtime authorization. */
+function usableBatchMethod(batch: unknown, baseBatch: unknown, baseMethodsUnchanged: boolean): batch is (...args: any[]) => Promise<any> {
+  return typeof batch === 'function' && (batch !== baseBatch || baseMethodsUnchanged);
+}
+
+/** Resolve the raw tool-allowlist bits for a channel. Shipped stores take one read; legacy/custom
+ * stores that only implement or override `isEnabled` retain their existing behavior. */
+export async function snapshotToolAllowlist(
+  store: ChannelTools,
+  teamId: string,
+  channel: string,
+  providerIds: readonly string[],
+): Promise<(provider: string) => boolean> {
+  if (providerIds.length === 0) return () => true;
+  const batch = (store as Partial<ChannelTools>).enabledSnapshot;
+  const single = (store as Partial<ChannelTools>).isEnabled;
+  const configured = (store as Partial<ChannelTools>).isConfigured;
+  if (usableBatchMethod(
+    batch,
+    ChannelTools.prototype.enabledSnapshot,
+    single === ChannelTools.prototype.isEnabled && configured === ChannelTools.prototype.isConfigured,
+  )) {
+    return batch.call(store, teamId, channel);
+  }
+  if (typeof single !== 'function') throw new Error('channel tools store must implement isEnabled');
+  const values = new Map<string, boolean>();
+  for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
+  return (provider) => values.get(provider) ?? false;
+}
+
+/** Batched mode resolver with the same compatibility rule as {@link snapshotToolAllowlist}. */
+export async function snapshotChannelModes(
+  store: ChannelConfig,
+  teamId: string,
+  channel: string,
+  providerIds: readonly string[],
+): Promise<(provider: string) => ChannelMode | null> {
+  if (providerIds.length === 0) return () => null;
+  const batch = (store as Partial<ChannelConfig>).modeSnapshot;
+  const single = (store as Partial<ChannelConfig>).getMode;
+  if (usableBatchMethod(batch, ChannelConfig.prototype.modeSnapshot, single === ChannelConfig.prototype.getMode)) {
+    return batch.call(store, teamId, channel);
+  }
+  if (typeof single !== 'function') throw new Error('channel config store must implement getMode');
+  const values = new Map<string, ChannelMode | null>();
+  for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
+  return (provider) => values.get(provider) ?? null;
+}
+
+/** Batched preview resolver with the same compatibility rule as {@link snapshotToolAllowlist}. */
+export async function snapshotPreviewVisibility(
+  store: ChannelConfig,
+  teamId: string,
+  channel: string,
+  providerIds: readonly string[],
+): Promise<(provider: string) => PreviewVisibility> {
+  if (providerIds.length === 0) return () => 'public';
+  const batch = (store as Partial<ChannelConfig>).visibilitySnapshot;
+  const single = (store as Partial<ChannelConfig>).getVisibility;
+  if (usableBatchMethod(batch, ChannelConfig.prototype.visibilitySnapshot, single === ChannelConfig.prototype.getVisibility)) {
+    return batch.call(store, teamId, channel);
+  }
+  if (typeof single !== 'function') throw new Error('channel config store must implement getVisibility');
+  const values = new Map<string, PreviewVisibility>();
+  for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
+  return (provider) => values.get(provider) ?? 'public';
+}
+
+/**
  * The credential-use authorization gate, identical for both adapters: Policy first, then the per-channel
  * tool allowlist (backward-compat: an unconfigured channel allows all — see ChannelTools.isEnabled). The
  * channel/team are the VERIFIED ones (Slack event or signed claim), never a request body. Returns the
@@ -37,12 +122,13 @@ export async function authorizeProvider(
   channel: string | null,
   provider: string,
 ): Promise<AuthzDenial | null> {
-  if (policy && !policy.check(provider, channel)) return 'policy';
-  // Tool allowlist is channel-scoped; with no channel there is nothing to restrict (matches both adapters).
-  if (channel && channelTools && !(await channelTools.isEnabled(principal.teamId, channel, provider))) {
-    return 'tool-disabled';
-  }
-  return null;
+  const policyAllows = !policy || policy.check(provider, channel);
+  // Resolve the tool-allowlist bit only when policy would allow AND there's a channel + store to
+  // restrict against — so a policy-deny still never runs the allowlist query (unchanged short-circuit).
+  const toolAllowed = policyAllows && channel && channelTools
+    ? await channelTools.isEnabled(principal.teamId, channel, provider)
+    : true;
+  return authorizeVerdict(policyAllows, toolAllowed);
 }
 
 /**
@@ -54,7 +140,7 @@ export async function authorizeProvider(
  * broker shipped without ANY channel-scoped manifest at first, which is this file's failure mode).
  * With no channel (or no store opted in): mode null, visibility 'public', no allowlist restriction.
  */
-export async function buildToolManifest(o: {
+export interface ToolManifestBuildOptions {
   providerIds: string[];
   registry: ProviderRegistry;
   policy?: Policy;
@@ -62,21 +148,50 @@ export async function buildToolManifest(o: {
   channelConfig?: ChannelConfig;
   principal: SlackIdentity;
   channel: string | null;
-}): Promise<ToolManifestEntry[]> {
-  const out: ToolManifestEntry[] = [];
-  for (const provider of o.providerIds) {
-    const enabled = (await authorizeProvider(o.policy, o.channelTools, o.principal, o.channel, provider)) === null;
-    const mode = o.channel && o.channelConfig
-      ? await o.channelConfig.getMode(o.principal.teamId, o.channel, provider)
-      : null;
-    const visibility = o.channel && o.channelConfig
-      ? await o.channelConfig.getVisibility(o.principal.teamId, o.channel, provider)
-      : 'public';
-    // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
-    const identity = o.registry.get(provider).identity ?? 'acting_human';
-    out.push({ provider, mode, enabled, identity, visibility });
-  }
-  return out;
+}
+
+/** Build the public manifest and retain the raw allowlist predicate used to produce it. Admin
+ * renderers reuse that predicate instead of querying the same channel twice; the public manifest
+ * wrapper below deliberately returns only the serializable rows. */
+export async function buildToolManifestSnapshot(o: ToolManifestBuildOptions): Promise<{
+  tools: ToolManifestEntry[];
+  toolAllowed: (provider: string) => boolean;
+}> {
+  if (o.providerIds.length === 0) return { tools: [], toolAllowed: () => true };
+  // Three channel-scoped batch reads (tool allowlist, mode, visibility) — a fixed query count regardless
+  // of provider count, replacing the per-provider isEnabled/getMode/getVisibility fan-out (#209). With no
+  // channel (or no store) there is nothing channel-scoped to read: tools unrestricted, mode null, public.
+  // These facts are independent. Dispatch their reads together so a slow database costs one
+  // round-trip window, not three serial windows (important before Slack trigger_id expiry).
+  const [toolAllowed, modeOf, visibilityOf] = await Promise.all([
+    o.channel && o.channelTools
+      ? snapshotToolAllowlist(o.channelTools, o.principal.teamId, o.channel, o.providerIds)
+      : Promise.resolve((_provider: string) => true),
+    o.channel && o.channelConfig
+      ? snapshotChannelModes(o.channelConfig, o.principal.teamId, o.channel, o.providerIds)
+      : Promise.resolve((_provider: string): ChannelMode | null => null),
+    o.channel && o.channelConfig
+      ? snapshotPreviewVisibility(o.channelConfig, o.principal.teamId, o.channel, o.providerIds)
+      : Promise.resolve((_provider: string): PreviewVisibility => 'public'),
+  ]);
+  const tools = o.providerIds.map((provider) => {
+    const policyAllows = !o.policy || o.policy.check(provider, o.channel);
+    return {
+      provider,
+      mode: modeOf(provider),
+      // `enabled` = exactly authorizeProvider's verdict (via the shared authorizeVerdict), so the manifest
+      // can never disagree with what connect()/fetch enforce in this channel.
+      enabled: authorizeVerdict(policyAllows, toolAllowed(provider)) === null,
+      // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
+      identity: o.registry.get(provider).identity ?? 'acting_human',
+      visibility: visibilityOf(provider),
+    };
+  });
+  return { tools, toolAllowed };
+}
+
+export async function buildToolManifest(o: ToolManifestBuildOptions): Promise<ToolManifestEntry[]> {
+  return (await buildToolManifestSnapshot(o)).tools;
 }
 
 // ── Owner resolution ──────────────────────────────────────────────────────────────────────────────

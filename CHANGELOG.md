@@ -82,6 +82,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Bounded per-channel manifest queries** (#209). Building a channel's tool manifest (Bolt's `tools`
+  command, the broker's `POST /v1/manifest`) and the App Home admin console now issue a fixed number of
+  channel-scoped batch reads instead of several queries per configured provider, so database round-trips
+  no longer grow with the provider count. Independent reads are dispatched together, empty provider sets
+  skip them, admin rows reuse the manifest's raw allowlist snapshot, and existing custom stores that only
+  implement the original single-provider methods keep their behavior. Production-path App Home and broker
+  regressions assert the bound as providers grow and prove that rendering connection metadata performs no
+  KMS unwraps.
+
 - **Breaking — headless broker identity configuration** (#212). The packaged broker now requires
   `VOUCHR_DEPLOYMENT_ID` and a strong purpose-distinct identity secret. Direct `createBroker`
   construction requires a validated deployment-bound `IdentityConfig`, not a bare string.

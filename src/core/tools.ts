@@ -110,6 +110,24 @@ export class ChannelTools {
     );
   }
 
+  /**
+   * The tool-allowlist verdict for EVERY provider in one channel-scoped read — the batched form of
+   * {@link isEnabled}, same backward-compat rule applied once, returning a predicate. A channel with no
+   * rows is unconfigured → every provider enabled; the moment any row exists the channel is an allowlist
+   * → only a provider with an explicit `enabled` row is on (an explicit-off or unlisted provider is off).
+   * `buildToolManifest` and the App Home admin console fold through this so their query count is bounded
+   * by the channel, not the configured-provider count (#209).
+   */
+  async enabledSnapshot(teamId: string, channel: string): Promise<(provider: string) => boolean> {
+    const rows = (await this.db.all(
+      `SELECT provider, enabled FROM channel_tool WHERE team_id=? AND channel=?`,
+      [teamId, channel],
+    )) as { provider: string; enabled: number }[];
+    if (rows.length === 0) return () => true; // unconfigured → all enabled (backward compat), like isEnabled
+    const on = new Set(rows.filter((r) => !!r.enabled).map((r) => r.provider));
+    return (provider) => on.has(provider); // configured = allowlist; explicit-off / unlisted → disabled
+  }
+
   /** Providers explicitly enabled in this channel. Empty array means either "unconfigured"
    *  (→ all enabled, see the rule above) or "configured but everything off", callers that need
    *  to tell them apart use `isEnabled`, which applies the backward-compat rule. */
