@@ -138,7 +138,8 @@ Admins govern this in Slack with `/vouchr`: `mode <provider> <mode>`, `enable`/`
 (per-channel tool allowlist enforced by `connect()`), `configure <provider>` (private modal for
 shared credentials), `tools` (list the channel's manifest), `status`, and `disconnect`. Admin
 commands are workspace-admin-only by default (`allowChannelCreatorConfig: true` extends them to the
-channel's creator).
+channel's creator). `/vouchr help` lists the supported commands, and an unrecognized subcommand points back
+to it instead of silently doing nothing.
 
 Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees their connected
 accounts (with a Disconnect button each) and the channel's tool manifest; admins additionally get a

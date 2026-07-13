@@ -226,7 +226,7 @@ function pendingWhere(f: RevokeFilter): { where: string; params: unknown[] } {
 
 /**
  * Pending OAuth consents + thread session grants a {@link RevokeFilter} matches — counted, NOT deleted
- * (for the dry-run). These exist INDEPENDENTLY of a live connection row: a `/vouchr connect` click that
+ * (for the dry-run). These exist INDEPENDENTLY of a live connection row: a Connect-button click that
  * never completed, or a thread grant that outlived its connection, both match the provider but not
  * `selectRevocations`, so break-glass must report + clear them separately or they resurrect access.
  */

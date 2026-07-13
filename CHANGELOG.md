@@ -82,6 +82,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Truthful, safe `/vouchr` command surface** (#194, commands & rendering). Added `/vouchr help`
+  (lists the retained command surface without promoting private previews); an unrecognized subcommand now returns an actionable hint instead
+  of silently falling through to the account list. `/vouchr disconnect` validates the provider **before**
+  any delete, audit `revoke` row, or `revoked` event (SEC-4), and reports the outcome truthfully —
+  distinguishing "nothing was connected" and "removed locally, but the upstream token revoke could not
+  be confirmed" from a clean disconnect, instead of always claiming success; dependency failures return
+  safe status-based recovery instead of going silent. Every known command rejects unsupported trailing
+  arguments before I/O or mutation. Unknown command/provider
+  arguments are never reflected (they may be credential-shaped); registry-validated provider ids and
+  modes in confirmations and the `tools` list are escaped at render (SEC-1/SEC-5). The public
+  `consentDeniedBlocks` keeps its optional reason argument for source compatibility but renders stable
+  copy rather than arbitrary provider/error text. Removed the last references
+  to a non-existent `/vouchr connect` command from the status and consent-denied renderers, so no surface
+  advertises a command that does not exist.
+
 - **Bounded per-channel manifest queries** (#209). Building a channel's tool manifest (Bolt's `tools`
   command, the broker's `POST /v1/manifest`) and the App Home admin console now issue a fixed number of
   channel-scoped batch reads instead of several queries per configured provider, so database round-trips
