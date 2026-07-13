@@ -11,6 +11,9 @@ import {
   HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
 } from '../src/adapters/blocks';
 import { userOwner, channelOwner } from '../src/core/owner';
+import type { Db } from '../src/core/db';
+import type { EnvelopeProvider } from '../src/core/crypto';
+import { countingDb } from './support/counting-db';
 
 // #111 App Home console: bolt-fake tests over the real registered handlers (event/action/command).
 // The published view is role-dependent; every mutation routes through the SAME helpers as the slash
@@ -27,11 +30,16 @@ const CRED = { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: nu
 async function harness(t: TestContext, opts: {
   slackAdmin?: boolean; allowCreator?: boolean; creator?: string;
   channelInfo?: Record<string, unknown>; infoThrows?: boolean; providers?: Provider[];
+  db?: Db; envelope?: EnvelopeProvider;
 } = {}) {
   const { slackAdmin = false, allowCreator = false, creator = 'U_OTHER', providers = [provider] } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
-    providers, baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t), allowChannelCreatorConfig: allowCreator,
+    providers,
+    baseUrl: 'http://127.0.0.1:1',
+    db: opts.db ?? await openTestDb(t),
+    envelope: opts.envelope,
+    allowChannelCreatorConfig: allowCreator,
   });
   let command: any;
   const actions: Record<string, any> = {};
@@ -118,6 +126,35 @@ test('app_home_opened: non-admin sees connections only; admin gets the governanc
   s = JSON.stringify(admin.published().view.blocks);
   assert.ok(s.includes(HOME_CHANNEL_ACTION)); // channel picker present
   assert.ok(!s.includes(HOME_MODE_ACTION)); // no control rows until a channel is picked
+});
+
+test('selected App Home keeps production-path reads fixed and performs zero KMS unwraps (#209)', async (t) => {
+  const render = async (providerCount: number) => {
+    const base = await openTestDb(t);
+    const counted = countingDb(base);
+    let unwraps = 0;
+    const envelope: EnvelopeProvider = {
+      wrapDataKey: async (dek) => Buffer.from(dek),
+      unwrapDataKey: async (wrapped) => { unwraps++; return Buffer.from(wrapped); },
+    };
+    const providers = Array.from({ length: providerCount }, (_, i) => mkProvider(`p${i}`));
+    const h = await harness(t, { slackAdmin: true, providers, db: counted.db, envelope });
+    // Make the no-decrypt claim meaningful: a real envelope-encrypted row is listed in the view.
+    await h.lan.vault.upsert(userOwner(ID), providers[0].id, { ...CRED, accessToken: `TOK_${providerCount}` });
+    counted.reset();
+    unwraps = 0;
+    await h.openHome('C_FIN');
+    assert.match(JSON.stringify(h.published().view.blocks), /octo/);
+    return { counts: { ...counted.counts }, unwraps };
+  };
+
+  const few = await render(2);
+  const many = await render(51);
+  // One metadata-only connection list + three manifest snapshots; admin rows reuse the raw allowlist.
+  assert.deepEqual(few.counts, { get: 0, all: 4 });
+  assert.deepEqual(many.counts, few.counts);
+  assert.equal(few.unwraps, 0);
+  assert.equal(many.unwraps, 0);
 });
 
 test('creator flag: creator gets rows for their channel; a foreign channel degrades to a note', async (t) => {

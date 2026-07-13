@@ -1,8 +1,8 @@
 import { userOwner, channelOwner, type Owner } from './owner';
 import type { SlackIdentity } from './identity';
-import type { ChannelMode, ChannelConfig, PreviewVisibility } from './channelConfig';
+import { ChannelConfig, type ChannelMode, type PreviewVisibility } from './channelConfig';
 import type { Policy } from './policy';
-import type { ChannelTools, ToolManifestEntry } from './tools';
+import { ChannelTools, type ToolManifestEntry } from './tools';
 import type { ProviderRegistry } from './providers';
 
 /**
@@ -37,6 +37,77 @@ export function authorizeVerdict(policyAllows: boolean, toolAllowed: boolean): A
   return null;
 }
 
+/** Whether a store's batch method is safe to use without bypassing an existing customization in the
+ * legacy single-provider call chain. Plain shipped stores keep every relevant prototype method. A
+ * custom batch method is authoritative; otherwise any legacy override forces the compatibility path,
+ * or the manifest can disagree with runtime authorization. */
+function usableBatchMethod(batch: unknown, baseBatch: unknown, baseMethodsUnchanged: boolean): batch is (...args: any[]) => Promise<any> {
+  return typeof batch === 'function' && (batch !== baseBatch || baseMethodsUnchanged);
+}
+
+/** Resolve the raw tool-allowlist bits for a channel. Shipped stores take one read; legacy/custom
+ * stores that only implement or override `isEnabled` retain their existing behavior. */
+export async function snapshotToolAllowlist(
+  store: ChannelTools,
+  teamId: string,
+  channel: string,
+  providerIds: readonly string[],
+): Promise<(provider: string) => boolean> {
+  if (providerIds.length === 0) return () => true;
+  const batch = (store as Partial<ChannelTools>).enabledSnapshot;
+  const single = (store as Partial<ChannelTools>).isEnabled;
+  const configured = (store as Partial<ChannelTools>).isConfigured;
+  if (usableBatchMethod(
+    batch,
+    ChannelTools.prototype.enabledSnapshot,
+    single === ChannelTools.prototype.isEnabled && configured === ChannelTools.prototype.isConfigured,
+  )) {
+    return batch.call(store, teamId, channel);
+  }
+  if (typeof single !== 'function') throw new Error('channel tools store must implement isEnabled');
+  const values = new Map<string, boolean>();
+  for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
+  return (provider) => values.get(provider) ?? false;
+}
+
+/** Batched mode resolver with the same compatibility rule as {@link snapshotToolAllowlist}. */
+export async function snapshotChannelModes(
+  store: ChannelConfig,
+  teamId: string,
+  channel: string,
+  providerIds: readonly string[],
+): Promise<(provider: string) => ChannelMode | null> {
+  if (providerIds.length === 0) return () => null;
+  const batch = (store as Partial<ChannelConfig>).modeSnapshot;
+  const single = (store as Partial<ChannelConfig>).getMode;
+  if (usableBatchMethod(batch, ChannelConfig.prototype.modeSnapshot, single === ChannelConfig.prototype.getMode)) {
+    return batch.call(store, teamId, channel);
+  }
+  if (typeof single !== 'function') throw new Error('channel config store must implement getMode');
+  const values = new Map<string, ChannelMode | null>();
+  for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
+  return (provider) => values.get(provider) ?? null;
+}
+
+/** Batched preview resolver with the same compatibility rule as {@link snapshotToolAllowlist}. */
+export async function snapshotPreviewVisibility(
+  store: ChannelConfig,
+  teamId: string,
+  channel: string,
+  providerIds: readonly string[],
+): Promise<(provider: string) => PreviewVisibility> {
+  if (providerIds.length === 0) return () => 'public';
+  const batch = (store as Partial<ChannelConfig>).visibilitySnapshot;
+  const single = (store as Partial<ChannelConfig>).getVisibility;
+  if (usableBatchMethod(batch, ChannelConfig.prototype.visibilitySnapshot, single === ChannelConfig.prototype.getVisibility)) {
+    return batch.call(store, teamId, channel);
+  }
+  if (typeof single !== 'function') throw new Error('channel config store must implement getVisibility');
+  const values = new Map<string, PreviewVisibility>();
+  for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
+  return (provider) => values.get(provider) ?? 'public';
+}
+
 /**
  * The credential-use authorization gate, identical for both adapters: Policy first, then the per-channel
  * tool allowlist (backward-compat: an unconfigured channel allows all — see ChannelTools.isEnabled). The
@@ -69,7 +140,7 @@ export async function authorizeProvider(
  * broker shipped without ANY channel-scoped manifest at first, which is this file's failure mode).
  * With no channel (or no store opted in): mode null, visibility 'public', no allowlist restriction.
  */
-export async function buildToolManifest(o: {
+export interface ToolManifestBuildOptions {
   providerIds: string[];
   registry: ProviderRegistry;
   policy?: Policy;
@@ -77,20 +148,33 @@ export async function buildToolManifest(o: {
   channelConfig?: ChannelConfig;
   principal: SlackIdentity;
   channel: string | null;
-}): Promise<ToolManifestEntry[]> {
+}
+
+/** Build the public manifest and retain the raw allowlist predicate used to produce it. Admin
+ * renderers reuse that predicate instead of querying the same channel twice; the public manifest
+ * wrapper below deliberately returns only the serializable rows. */
+export async function buildToolManifestSnapshot(o: ToolManifestBuildOptions): Promise<{
+  tools: ToolManifestEntry[];
+  toolAllowed: (provider: string) => boolean;
+}> {
+  if (o.providerIds.length === 0) return { tools: [], toolAllowed: () => true };
   // Three channel-scoped batch reads (tool allowlist, mode, visibility) — a fixed query count regardless
   // of provider count, replacing the per-provider isEnabled/getMode/getVisibility fan-out (#209). With no
   // channel (or no store) there is nothing channel-scoped to read: tools unrestricted, mode null, public.
-  const toolAllowed: (provider: string) => boolean = o.channel && o.channelTools
-    ? await o.channelTools.enabledSnapshot(o.principal.teamId, o.channel)
-    : () => true;
-  const modeOf: (provider: string) => ChannelMode | null = o.channel && o.channelConfig
-    ? await o.channelConfig.modeSnapshot(o.principal.teamId, o.channel)
-    : () => null;
-  const visibilityOf: (provider: string) => PreviewVisibility = o.channel && o.channelConfig
-    ? await o.channelConfig.visibilitySnapshot(o.principal.teamId, o.channel)
-    : () => 'public';
-  return o.providerIds.map((provider) => {
+  // These facts are independent. Dispatch their reads together so a slow database costs one
+  // round-trip window, not three serial windows (important before Slack trigger_id expiry).
+  const [toolAllowed, modeOf, visibilityOf] = await Promise.all([
+    o.channel && o.channelTools
+      ? snapshotToolAllowlist(o.channelTools, o.principal.teamId, o.channel, o.providerIds)
+      : Promise.resolve((_provider: string) => true),
+    o.channel && o.channelConfig
+      ? snapshotChannelModes(o.channelConfig, o.principal.teamId, o.channel, o.providerIds)
+      : Promise.resolve((_provider: string): ChannelMode | null => null),
+    o.channel && o.channelConfig
+      ? snapshotPreviewVisibility(o.channelConfig, o.principal.teamId, o.channel, o.providerIds)
+      : Promise.resolve((_provider: string): PreviewVisibility => 'public'),
+  ]);
+  const tools = o.providerIds.map((provider) => {
     const policyAllows = !o.policy || o.policy.check(provider, o.channel);
     return {
       provider,
@@ -103,6 +187,11 @@ export async function buildToolManifest(o: {
       visibility: visibilityOf(provider),
     };
   });
+  return { tools, toolAllowed };
+}
+
+export async function buildToolManifest(o: ToolManifestBuildOptions): Promise<ToolManifestEntry[]> {
+  return (await buildToolManifestSnapshot(o)).tools;
 }
 
 // ── Owner resolution ──────────────────────────────────────────────────────────────────────────────

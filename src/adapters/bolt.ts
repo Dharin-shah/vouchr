@@ -10,7 +10,12 @@ import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
 import { userOwner, channelOwner } from '../core/owner';
-import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../core/authz';
+import {
+  authorizeProvider,
+  resolveCredentialOwner,
+  buildToolManifest,
+  buildToolManifestSnapshot,
+} from '../core/authz';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
@@ -1268,6 +1273,18 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
+  /** The manifest plus its raw allowlist snapshot for admin renderers. Keeping the raw predicate lets
+   *  them show policy-denied-but-allowlisted tools correctly without reading channel_tool twice. */
+  const manifestSnapshotFor = (identity: SlackIdentity, channel: string) => buildToolManifestSnapshot({
+    providerIds,
+    registry,
+    policy,
+    channelTools,
+    channelConfig,
+    principal: identity,
+    channel,
+  });
+
   /**
    * Register the `/vouchr` slash command (`status`, `disconnect <provider>`,
    * `configure <provider>`), the channel-credential modal submit, and — when the app exposes
@@ -1483,16 +1500,22 @@ export async function createVouchr(opts: VouchrOptions) {
     // disconnect. Service tools are shown read-only but excluded from the admin controls: Vouchr doesn't
     // broker them, so channel-credential mode is meaningless and setChannelMode would refuse them.
     async function buildConfigModal(identity: SlackIdentity, channelId: string | null, client: WebClient): Promise<unknown> {
-      const connections = await listBrokeredConnections(identity);
-      const tools = channelId ? await contextFor(identity, channelId, client).toolManifest() : [];
-      const isAdmin = channelId ? await commandAdmin(client, identity, channelId) : false;
+      // These are independent and all sit before Slack's short-lived trigger_id is consumed by
+      // views.open. Dispatch them together rather than spending one DB/network window per fact.
+      const [connections, manifest, isAdmin] = await Promise.all([
+        listBrokeredConnections(identity),
+        channelId
+          ? manifestSnapshotFor(identity, channelId)
+          : Promise.resolve({ tools: [], toolAllowed: (_provider: string) => true }),
+        channelId ? commandAdmin(client, identity, channelId) : Promise.resolve(false),
+      ]);
       // The modal keeps its pre-#111 contract: service tools are read-only there (its row shape is
       // mode+enabled+preview checkboxes, meaningless for them). The App Home instead renders every
       // row and per-row picks which controls a service tool gets (Enable/Disable only).
       const admin = isAdmin && channelId
-        ? (await adminToolRows(identity, channelId, tools)).filter((r) => isBrokeredProvider(r))
+        ? adminToolRows(manifest.tools, manifest.toolAllowed).filter((r) => isBrokeredProvider(r))
         : undefined;
-      return configModal({ channel: channelId, connections, tools, admin });
+      return configModal({ channel: channelId, connections, tools: manifest.tools, admin });
     }
 
     /**
@@ -1506,10 +1529,12 @@ export async function createVouchr(opts: VouchrOptions) {
      * disable (config-modal findings 3/1); the manifest keeps the intersected value for the
      * read-only displays.
      */
-    async function adminToolRows(identity: SlackIdentity, channel: string, tools: ToolManifestEntry[]): Promise<ConfigAdminRow[]> {
-      // Raw tool-allowlist bit (NOT the manifest's policy-intersected `enabled`) for every provider in ONE
-      // channel-scoped read, instead of an isEnabled query per provider (#209).
-      const toolAllowed = await channelTools.enabledSnapshot(identity.teamId, channel);
+    function adminToolRows(
+      tools: ToolManifestEntry[],
+      toolAllowed: (provider: string) => boolean,
+    ): ConfigAdminRow[] {
+      // Raw tool-allowlist bit (NOT the manifest's policy-intersected `enabled`) reuses the manifest's
+      // channel snapshot, so admin rendering adds no query and cannot drift to a second DB window.
       return tools.map((t) => ({
         provider: t.provider,
         mode: t.mode,
@@ -1637,12 +1662,14 @@ export async function createVouchr(opts: VouchrOptions) {
      * channelIneligibleReason rule) or was deleted since last render degrades to a note, never an error.
      */
     async function buildHomeView(identity: SlackIdentity, client: WebClient, selected: string | null): Promise<unknown> {
-      const connections = await listBrokeredConnections(identity);
+      const [connections, workspaceAdmin] = await Promise.all([
+        listBrokeredConnections(identity),
+        commandAdmin(client, identity, ''), // '' → the creator path can't match here
+      ]);
       // "Available providers" advertises connect-on-demand, so it lists only providers Vouchr
       // actually brokers a user credential for — a service tool must not be advertised as
       // connectable. Governance rows are separate (adminToolRows, same brokered filter as the modal).
       const connectable = providerIds.filter((p) => isBrokeredProvider(registry.get(p)));
-      const workspaceAdmin = await commandAdmin(client, identity, ''); // '' → the creator path can't match here
       const showGovernance = workspaceAdmin || (!opts.isAdmin && allowChannelCreatorConfig);
 
       let governance: { channel: string | null; note?: string; tools?: ConfigAdminRow[] } | undefined;
@@ -1657,8 +1684,8 @@ export async function createVouchr(opts: VouchrOptions) {
           } else if (!(workspaceAdmin || (await commandAdmin(client, identity, selected)))) {
             governance = { channel: selected, note: adminOnly(allowChannelCreatorConfig, 'configure this channel') };
           } else {
-            const tools = await contextFor(identity, selected, client).toolManifest();
-            governance = { channel: selected, tools: await adminToolRows(identity, selected, tools) };
+            const manifest = await manifestSnapshotFor(identity, selected);
+            governance = { channel: selected, tools: adminToolRows(manifest.tools, manifest.toolAllowed) };
           }
         }
       }

@@ -8,10 +8,12 @@ import { Audit } from '../src/core/audit';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { channelOwner } from '../src/core/owner';
-import { defineProvider } from '../src/core/providers';
+import { defineProvider, type Provider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { createVouchr } from '../src/adapters/bolt';
 import { identityConfig, signIdentity, IDENTITY_SKEW_MS, type IdentityClaims } from './support/identity';
+import type { Db } from '../src/core/db';
+import { countingDb } from './support/counting-db';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -63,15 +65,23 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
 }
 
-/** A broker with BOTH channel config stores wired to the SAME in-memory db, so a config write via
+/** A broker with BOTH channel config stores wired to the SAME real test database, so a config write via
  *  the admin routes is reflected by a subsequent GET /v1/admin/config read (and vice versa). */
-async function makeConfigBroker(t: TestContext) {
-  const db = await openTestDb(t);
+async function makeConfigBroker(t: TestContext, opts: { providers?: Provider[]; db?: Db } = {}) {
+  const db = opts.db ?? await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
-  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig, channelTools });
+  const server = createBroker({
+    providers: opts.providers ?? [acme, svc],
+    vault,
+    audit,
+    db,
+    identitySecret: identityConfig(SECRET),
+    channelConfig,
+    channelTools,
+  });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, db, vault, channelConfig, channelTools, port: (server.address() as any).port };
 }
@@ -200,6 +210,40 @@ test('admin/mode: an admin claim sets the channel mode; GET /v1/admin/config ref
   } finally {
     server.close();
   }
+});
+
+test('GET /v1/admin/config keeps real-route reads fixed as providers grow and skips empty work (#209)', async (t) => {
+  const read = async (providerCount: number) => {
+    const base = await openTestDb(t);
+    const counted = countingDb(base);
+    const providers = providerCount === 0
+      ? [svc]
+      : Array.from({ length: providerCount }, (_, i) => defineProvider({
+          id: `perf${i}`,
+          authorizeUrl: 'https://perf.example/auth',
+          tokenUrl: 'https://perf.example/token',
+          scopesDefault: [],
+          egressAllow: ['api.perf.example'],
+          refresh: 'none',
+          pkce: false,
+          clientId: 'id',
+          clientSecret: 'sec',
+        }));
+    const { server, port } = await makeConfigBroker(t, { providers, db: counted.db });
+    counted.reset();
+    try {
+      const response = await getConfig(port, admin());
+      assert.equal(response.status, 200);
+      assert.equal(response.json.providers.length, providerCount);
+      return { ...counted.counts };
+    } finally {
+      server.close();
+    }
+  };
+
+  assert.deepEqual(await read(2), { get: 0, all: 2 });
+  assert.deepEqual(await read(51), { get: 0, all: 2 });
+  assert.deepEqual(await read(0), { get: 0, all: 0 });
 });
 
 // (b) an admin token can toggle a provider in the channel's tool allowlist.

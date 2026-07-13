@@ -10,9 +10,10 @@ import { ChannelTools } from '../src/core/tools';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
-import { buildToolManifest } from '../src/core/authz';
-import type { Db } from '../src/core/db';
+import { authorizeProvider, buildToolManifest } from '../src/core/authz';
 import { ConnectContext } from '../src/adapters/bolt';
+import { countingDb } from './support/counting-db';
+import type { Db } from '../src/core/db';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -243,20 +244,6 @@ function mkProvider(id: string) {
   });
 }
 
-/** Wrap a Db counting only its READ calls (get/all). run/exec pass through — writes are fixture setup,
- *  not what we're bounding — so counts reflect exactly the reads the code under test issued. */
-function countingDb(db: Db): { db: Db; counts: { get: number; all: number } } {
-  const counts = { get: 0, all: 0 };
-  const wrapped = {
-    get: (sql: string, params?: any[]) => { counts.get++; return db.get(sql, params); },
-    all: (sql: string, params?: any[]) => { counts.all++; return db.all(sql, params); },
-    run: (sql: string, params?: any[]) => db.run(sql, params),
-    exec: (sql: string) => db.exec(sql),
-    close: () => db.close(),
-  } as unknown as Db;
-  return { db: wrapped, counts };
-}
-
 test('buildToolManifest issues a fixed 3 reads regardless of provider count (#209)', async (t) => {
   const base = await openTestDb(t);
   // Configure the channel so all three tables have rows — exercises the real batched read paths.
@@ -305,6 +292,92 @@ test('buildToolManifest issues a fixed 3 reads regardless of provider count (#20
     offManifest.map((e) => [e.enabled, e.mode, e.visibility]),
     [[true, null, 'public'], [true, null, 'public']],
   );
+
+  // No registered providers means no channel facts can be consumed, so do not touch Postgres.
+  const empty = countingDb(base);
+  assert.deepEqual(await buildToolManifest({
+    providerIds: [], registry: new ProviderRegistry([]), channelTools: new ChannelTools(empty.db),
+    channelConfig: new ChannelConfig(empty.db), principal: ID, channel: 'C_FIN',
+  }), []);
+  assert.deepEqual(empty.counts, { get: 0, all: 0 });
+});
+
+test('buildToolManifest dispatches its three independent channel reads together', async () => {
+  let started = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const channelTools = {
+    isEnabled: async () => true,
+    enabledSnapshot: async () => { started++; await gate; return () => true; },
+  } as unknown as ChannelTools;
+  const channelConfig = {
+    getMode: async () => null,
+    getVisibility: async () => 'public' as const,
+    modeSnapshot: async () => { started++; await gate; return () => null; },
+    visibilitySnapshot: async () => { started++; await gate; return () => 'public' as const; },
+  } as unknown as ChannelConfig;
+
+  const pending = buildToolManifest({
+    providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools, channelConfig,
+    principal: ID, channel: 'C_FIN',
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(started, 3, 'all batch reads must be dispatched before any one resolves');
+  release();
+  await pending;
+});
+
+test('batched manifests preserve legacy/custom store overrides and runtime parity', async () => {
+  // No DB methods on purpose: inherited batch methods would fail, proving the compatibility path
+  // really delegates to the pre-existing overrides instead of merely producing the same values.
+  const db = {} as Db;
+  class CustomTools extends ChannelTools {
+    override async isEnabled(): Promise<boolean> { return false; }
+  }
+  class CustomConfig extends ChannelConfig {
+    override async getMode(): Promise<'session'> { return 'session'; }
+    override async getVisibility(): Promise<'private'> { return 'private'; }
+  }
+  const tools = new CustomTools(db);
+  const config = new CustomConfig(db);
+  const manifest = await buildToolManifest({
+    providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: tools,
+    channelConfig: config, principal: ID, channel: 'C_FIN',
+  });
+  assert.equal(await authorizeProvider(undefined, tools, ID, 'C_FIN', 'mcp'), 'tool-disabled');
+  assert.deepEqual(manifest[0], {
+    provider: 'mcp', mode: 'session', enabled: false, identity: 'acting_human', visibility: 'private',
+  });
+
+  // isEnabled also delegates to the older public isConfigured hook. Overriding only that hook must
+  // likewise force the compatibility path; the inherited batch would read this disabled row and lie.
+  const disabledRowDb = {
+    all: async () => [{ provider: 'mcp', enabled: 0 }],
+  } as unknown as Db;
+  class CustomConfiguredTools extends ChannelTools {
+    override async isConfigured(): Promise<boolean> { return false; }
+  }
+  const configuredTools = new CustomConfiguredTools(disabledRowDb);
+  const configuredManifest = await buildToolManifest({
+    providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: configuredTools,
+    principal: ID, channel: 'C_FIN',
+  });
+  assert.equal(await authorizeProvider(undefined, configuredTools, ID, 'C_FIN', 'mcp'), null);
+  assert.equal(configuredManifest[0].enabled, true);
+
+  // Existing JavaScript wrappers may implement only the pre-batch public methods. They remain valid.
+  const legacyTools = { isEnabled: async () => true } as unknown as ChannelTools;
+  const legacyConfig = {
+    getMode: async () => 'per-user' as const,
+    getVisibility: async () => 'public' as const,
+  } as unknown as ChannelConfig;
+  const legacy = await buildToolManifest({
+    providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: legacyTools,
+    channelConfig: legacyConfig, principal: ID, channel: 'C_FIN',
+  });
+  assert.deepEqual(legacy[0], {
+    provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'public',
+  });
 });
 
 test('enabledSnapshot is one read and matches isEnabled per provider (App Home admin batch, #209)', async (t) => {

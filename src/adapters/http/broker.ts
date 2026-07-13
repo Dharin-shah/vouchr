@@ -18,7 +18,13 @@ import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
 import { userOwner, channelOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
-import { authorizeProvider, resolveCredentialOwner, buildToolManifest } from '../../core/authz';
+import {
+  authorizeProvider,
+  resolveCredentialOwner,
+  buildToolManifest,
+  snapshotChannelModes,
+  snapshotToolAllowlist,
+} from '../../core/authz';
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
@@ -1231,18 +1237,26 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
     await requireAdmin(claims, 'config');
+    const providerIds = opts.providers
+      .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
+      .map((p) => p.id);
+    if (providerIds.length === 0) return { providers: [] };
     // Two channel-scoped batch reads (mode + tool allowlist) instead of getMode/isEnabled per provider,
     // so the query count is bounded by the channel, not the provider count (#209). `enabled` is the raw
     // allowlist bit — same backward-compat rule ChannelTools.isEnabled applies — mode null when unset.
-    const modeOf: (provider: string) => ChannelMode | null = opts.channelConfig
-      ? await opts.channelConfig.modeSnapshot(claims.teamId, claims.channel)
-      : () => null;
-    const toolAllowed: (provider: string) => boolean = opts.channelTools
-      ? await opts.channelTools.enabledSnapshot(claims.teamId, claims.channel)
-      : () => true;
-    const providers = opts.providers
-      .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
-      .map((p) => ({ provider: p.id, mode: modeOf(p.id), enabled: toolAllowed(p.id) }));
+    const [modeOf, toolAllowed] = await Promise.all([
+      opts.channelConfig
+        ? snapshotChannelModes(opts.channelConfig, claims.teamId, claims.channel, providerIds)
+        : Promise.resolve((_provider: string): ChannelMode | null => null),
+      opts.channelTools
+        ? snapshotToolAllowlist(opts.channelTools, claims.teamId, claims.channel, providerIds)
+        : Promise.resolve((_provider: string) => true),
+    ]);
+    const providers = providerIds.map((provider) => ({
+      provider,
+      mode: modeOf(provider),
+      enabled: toolAllowed(provider),
+    }));
     return { providers };
   }
 
