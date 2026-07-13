@@ -93,9 +93,6 @@ export type { Resolvers, EventSink, VouchrEvent } from './core/injector';
 // the store type lets a scaled deployment plug a shared backend via BrokerOptions.rateLimitStore.
 export { RateLimitedError } from './core/rateLimit';
 export type { RateLimitStore } from './core/rateLimit';
-// #209 in-flight admission: OverloadedError → 503 + Retry-After when a per-process global/per-provider
-// concurrency ceiling (BrokerOptions.maxInflight[PerProvider]) is full. Per-process by design.
-export { OverloadedError } from './core/inflight';
 // #117 credential health: BrokerOptions.onCredentialHealth fires refresh_dead; pass the same hook
 // to sweepExpired for expiring_soon/expired. NotificationState is the persistent 24h debounce a
 // headless notifier should use (reconnect/delete clear it). All core — no @slack in the graph.

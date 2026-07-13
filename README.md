@@ -238,6 +238,7 @@ const linear = defineProvider({
   egressAllow: ['api.linear.app'],
   refresh: 'none',
   pkce: false,
+  oauthTimeoutMs: 10_000, // token exchange/refresh, revoke, and account-probe deadline
   clientId: process.env.LINEAR_CLIENT_ID!,
   clientSecret: process.env.LINEAR_CLIENT_SECRET!,
 });
@@ -347,12 +348,13 @@ issuer, audience, and bounded active/overlap key set so assertions cannot cross 
   database and key still need normal production controls. To rotate the master key without
   orphaning rows, set `VOUCHR_MASTER_KEYS` (first entry encrypts new writes, all entries decrypt)
   and run `vouchr rekey` — see the deployment guide's key-rotation runbook.
-- **Resource bounds are finite and tunable.** Every upstream call has a deadline
-  (`VOUCHR_FETCH_DEADLINE_MS`), the broker enforces per-process global + per-provider in-flight
-  ceilings (`VOUCHR_MAX_INFLIGHT` / `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` → `503` + `Retry-After`, caught
-  as the exported `OverloadedError`), and inbound header/request/keep-alive timeouts are set. Ceilings
-  are per-process — fleet capacity is `replicas × VOUCHR_MAX_INFLIGHT`. See the deployment guide's
-  *Resource bounds and the scaling envelope* section (`npm run bench:perf` reproduces it).
+- **Resource bounds are finite and tunable.** Ordinary provider calls have deadlines, the HTTP
+  broker enforces per-instance global + per-provider in-flight ceilings
+  (`VOUCHR_MAX_INFLIGHT` / `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` → `503` + `Retry-After`), and inbound
+  header/request/keep-alive plus graceful-shutdown limits are set. The global fleet upper bound is
+  `replicas × VOUCHR_MAX_INFLIGHT`; one provider is additionally bounded by
+  `replicas × VOUCHR_MAX_INFLIGHT_PER_PROVIDER`. See the deployment guide's *Resource bounds and
+  the scaling envelope* section (`npm run bench:perf` measures the configured envelope).
 - **Follow the [deployment guide](./guides/DEPLOYMENT.md)** for Postgres, multi-workspace, KMS, and
   the production readiness checklist.
 

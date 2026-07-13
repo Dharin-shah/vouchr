@@ -45,6 +45,24 @@ The worker then calls `POST /v1/fetch`:
 The broker resolves the user from the signed token, performs the provider request inside Vouchr, and
 returns only the provider response.
 
+### Bounded failure and retry contract
+
+The exported `BrokerError` type describes functional-route JSON errors (`/readyz` deliberately uses
+only `{ "ok": false }`). Resource-bound responses that a worker should handle explicitly are:
+
+| HTTP | Body | Caller action |
+| --- | --- | --- |
+| `413` | `{ "error": "request body too large" }`, `{ "error": "response too large; narrow your query or endpoint" }`, or `{ "error": "response blocked" }` | Do not retry unchanged. Reduce the request or choose a narrower provider endpoint. |
+| `429` | `{ "error": "rate limited", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry if the operation itself is safe to retry. |
+| `503` | `{ "error": "overloaded", "scope": "global", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
+| `504` | `{ "error": "upstream timed out" }` | Treat the outcome as unknown. Retry reads if appropriate; never automatically replay a non-idempotent write. |
+
+Identity assertions are single-use. **Mint a fresh `identityToken` for every retry**, including a
+retry after `429`, `503`, or `504`; never infer from the error scope whether the earlier assertion
+was consumed. This rule keeps clients correct if admission moves or another gate consumes the token
+before returning. A `Retry-After` value is a back-pressure hint, not a guarantee that capacity will
+be available at that instant.
+
 ## Capability matrix: Bolt vs headless
 
 One core, two front doors — both reach the same credential boundary.
@@ -211,6 +229,13 @@ raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
   The replay store is not configurable; the exported in-memory `ReplayGuard` is only for direct
   verifier unit tests, never broker construction or production.
 - **Not connected yet?** Route the user back through the Slack connect/approval flow.
+- **OAuth dependency deadline.** Set `oauthTimeoutMs` on a provider definition when its token,
+  revoke, or account endpoint legitimately needs longer than the 10-second default. The same finite
+  bound applies to token exchange/refresh, revoke, and built-in account probes on both front doors.
+- **Extension cancellation.** Custom `authorize` hooks and external-secret `Resolvers` receive an
+  optional `AbortSignal`; use it to cancel their own network work when the caller disconnects or the
+  fetch deadline expires. Vouchr also races the signal at its boundary, so a legacy hook that ignores
+  it cannot retain an in-flight admission slot forever.
 - **Credential health.** There is no Slack client here, so nothing is DM'd for you: pass
   `onCredentialHealth` (a `BrokerOptions` field, e.g. `buildBrokerServer(env, { onCredentialHealth })`)
   to hear `refresh_dead` — a DEFINITIVELY dead refresh token (`invalid_grant`, or a bare 400/401

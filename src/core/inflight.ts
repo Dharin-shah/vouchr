@@ -5,12 +5,30 @@
  * memory. This is NOT the rate limiter (`rateLimit.ts`, requests-per-window per owner+provider): this
  * counts SIMULTANEOUS in-flight work and admits/rejects at the moment of entry.
  *
- * ponytail: deliberately in-process — a fleet of N replicas admits up to N × the per-process ceiling,
+ * Deliberately in-process: a fleet of N replicas admits up to N × the per-process ceiling,
  * and that product IS the documented capacity envelope (guides/DEPLOYMENT.md). #209 explicitly rules
  * out Redis / distributed semaphores / cluster-wide admission; per-process counters are the whole
- * design. Upgrade path (only if a shared ceiling is ever proven necessary): a pluggable async store
- * behind this same `enter()`/`enterProvider()` shape, like `RateLimitStore`.
+ * design.
  */
+
+import { MAX_TIMER_MS } from './options';
+
+/** One runtime invariant for every in-flight limiter construction path (STR-2). */
+export function assertInflightLimits(
+  globalMax: number,
+  providerMax: number,
+  label = 'InflightLimiter',
+): void {
+  if (!Number.isSafeInteger(globalMax) || globalMax <= 0) {
+    throw new Error(`${label}: maxInflight must be a positive safe integer.`);
+  }
+  if (!Number.isSafeInteger(providerMax) || providerMax <= 0) {
+    throw new Error(`${label}: maxInflightPerProvider must be a positive safe integer.`);
+  }
+  if (providerMax > globalMax) {
+    throw new Error(`${label}: maxInflightPerProvider must be <= maxInflight.`);
+  }
+}
 
 /**
  * Thrown when an in-flight ceiling is full. Carries a NO-SECRET scope + retry hint so each surface
@@ -48,7 +66,12 @@ export class InflightLimiter {
     /** Retry-After hint returned on rejection (ms). We can't know when a slot frees, so this is a
      *  small fixed nudge, not a promise. */
     private readonly retryAfterMs = 1_000,
-  ) {}
+  ) {
+    assertInflightLimits(globalMax, providerMax);
+    if (!Number.isSafeInteger(retryAfterMs) || retryAfterMs <= 0 || retryAfterMs > MAX_TIMER_MS) {
+      throw new Error(`InflightLimiter: retryAfterMs must be a positive safe integer no greater than ${MAX_TIMER_MS}.`);
+    }
+  }
 
   /** Admit one unit against the GLOBAL ceiling, or throw {@link OverloadedError}. */
   enter(): () => void {

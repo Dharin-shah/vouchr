@@ -1,3 +1,11 @@
+import {
+  cancelResponseBody,
+  DEFAULT_OAUTH_TIMEOUT_MS,
+  disposableDeadline,
+  readResponseJsonCapped,
+} from './httpBounds';
+import { MAX_TIMER_MS } from './options';
+
 export type RefreshStrategy = 'rotating' | 'static' | 'none';
 
 /** A provider is declarative OAuth2 + a refresh strategy + an egress allowlist. */
@@ -133,8 +141,13 @@ export interface Provider {
    * client authentication at all. Confidential clients (with a secret) leave this unset.
    */
   publicClient?: boolean;
-  /** Optional: fetch a human-readable account label after connecting. */
-  accountProbe?: (accessToken: string) => Promise<string | null>;
+  /** Optional: fetch a human-readable account label after connecting. The optional signal lets the
+   *  callback cancel this cosmetic round-trip when its client disconnects; one-argument custom hooks
+   *  remain source- and runtime-compatible. */
+  accountProbe?: (accessToken: string, signal?: AbortSignal) => Promise<string | null>;
+  /** Shared deadline for trusted OAuth dependency calls: token exchange/refresh, revoke, and built-in
+   *  account probes. Defaults to 10 seconds; custom hooks must honor their supplied AbortSignal. */
+  oauthTimeoutMs?: number;
 }
 
 /**
@@ -159,10 +172,12 @@ export interface ProviderConfig {
   rateLimit?: { perMinute: number; burst?: number };
   /** Optional human-in-the-loop approval for sensitive writes (see Provider). */
   approval?: Provider['approval'];
+  /** Shared token/revoke/account-probe deadline (default 10 seconds). */
+  oauthTimeoutMs?: number;
 }
 
-/** The per-config injection-boundary gates (egress + rate limit + approval), passed through to a built-in. */
-function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit' | 'approval'> {
+/** The common per-config controls passed through to every built-in provider. */
+function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit' | 'approval' | 'oauthTimeoutMs'> {
   return {
     egressPaths: cfg.egressPaths,
     egressMethods: cfg.egressMethods,
@@ -170,6 +185,7 @@ function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egr
     egressResponse: cfg.egressResponse,
     rateLimit: cfg.rateLimit,
     approval: cfg.approval,
+    oauthTimeoutMs: cfg.oauthTimeoutMs,
   };
 }
 
@@ -186,6 +202,12 @@ export function isCanonicalPath(p: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** RFC 6749 `scope-token`: printable ASCII except DQUOTE and backslash. Shared by configured
+ * requested scopes and provider-returned granted-scope normalization (STR-2). */
+export function isOAuthScopeToken(scope: string): boolean {
+  return /^[\x21\x23-\x5b\x5d-\x7e]+$/.test(scope);
 }
 
 const ENCODED_PATH_SEPARATOR = /%2f|%5c/i;
@@ -439,7 +461,7 @@ const PROVIDER_FIELDS = new Set([
   'scopeDescriptions', 'egressAllow', 'egressPaths', 'egressMethods', 'egressValidate',
   'egressResponse', 'mcp', 'rateLimit', 'approval', 'inject', 'refresh', 'pkce',
   'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth', 'revoke',
-  'clientId', 'clientSecret', 'publicClient', 'accountProbe',
+  'clientId', 'clientSecret', 'publicClient', 'accountProbe', 'oauthTimeoutMs',
 ]);
 const MAX_PROVIDER_ITEMS = 128;
 const MAX_PROVIDER_SCOPES = 48; // intro + one worst-case section per scope + actions = Slack's 50-block ceiling
@@ -562,13 +584,17 @@ export function defineProvider(spec: Provider): Provider {
   const revokeAuth = optionalEnum(spec.revokeAuth, 'revokeAuth', ['none', 'body'], 'none') as NonNullable<Provider['revokeAuth']>;
   const pkce = optionalBoolean(spec.pkce, 'pkce');
   const publicClient = optionalBoolean(spec.publicClient, 'publicClient');
+  const oauthTimeoutMs = spec.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
+  if (!Number.isSafeInteger(oauthTimeoutMs) || oauthTimeoutMs <= 0 || oauthTimeoutMs > MAX_TIMER_MS) {
+    providerError('oauthTimeoutMs', `must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
+  }
 
   const scopesDefault = stringArray(spec.scopesDefault === undefined ? [] : spec.scopesDefault, 'scopesDefault', true);
   if (scopesDefault.length > MAX_PROVIDER_SCOPES) providerError('scopesDefault', 'must fit the bounded consent surface');
   if (scopesDefault.some((scope) => scope.trim() !== scope)) providerError('scopesDefault', 'must contain canonical values without surrounding whitespace');
   // RFC 6749 `scope-token`: printable ASCII except DQUOTE and backslash. In particular, one array
   // item may not contain whitespace and silently turn into multiple grants when joined with spaces.
-  if (scopesDefault.some((scope) => !/^[\x21\x23-\x5b\x5d-\x7e]+$/.test(scope))) {
+  if (scopesDefault.some((scope) => !isOAuthScopeToken(scope))) {
     providerError('scopesDefault', 'must contain one OAuth scope token per item');
   }
   const scopeDescriptions = cloneStringRecord(spec.scopeDescriptions, 'scopeDescriptions', false);
@@ -710,14 +736,28 @@ export function defineProvider(spec: Provider): Provider {
     bodyFormat,
     revokeAuth,
     publicClient,
+    oauthTimeoutMs,
     clientSecret: publicClient ? undefined : spec.clientSecret,
   });
 }
 
-/** Deadline for a built-in userinfo probe (#209). A probe runs during the OAuth callback to label the
- *  stored credential; a hung provider endpoint must not stall the connect flow. Matches the token
- *  round-trip bound (`TOKEN_FETCH_TIMEOUT_MS` in tokens.ts) — the same class of trusted OAuth call. */
-const PROBE_TIMEOUT_MS = 10_000;
+const MAX_ACCOUNT_LABEL_BYTES = 512;
+
+/**
+ * Account labels are untrusted provider output that is persisted and copied into audit metadata.
+ * Keep the cosmetic value one-line and bounded; malformed labels become `null` rather than making a
+ * successful OAuth connection fail. Rendering still escapes every accepted label (SEC-5).
+ */
+export function normalizeAccountLabel(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const label = value.trim();
+  if (!label || Buffer.byteLength(label, 'utf8') > MAX_ACCOUNT_LABEL_BYTES) return null;
+  for (const character of label) {
+    const point = character.codePointAt(0)!;
+    if (point <= 0x1f || (point >= 0x7f && point <= 0x9f) || point === 0x2028 || point === 0x2029) return null;
+  }
+  return label;
+}
 
 /**
  * Shared implementation for the built-in `accountProbe`s (#209): ONE finite deadline and ONE
@@ -730,27 +770,34 @@ async function probeAccount(
   url: string,
   headers: Record<string, string>,
   pick: (json: any) => string | null,
+  timeoutMs: number,
+  callerSignal?: AbortSignal,
 ): Promise<string | null> {
-  let r: Response;
+  const deadline = disposableDeadline(timeoutMs, callerSignal);
+  let r: Response | undefined;
   try {
-    r = await fetch(url, { headers, redirect: 'manual', signal: AbortSignal.timeout(PROBE_TIMEOUT_MS) });
-  } catch {
+    r = await fetch(url, { headers, redirect: 'manual', signal: deadline.signal });
+    if (!r.ok) {
+      await cancelResponseBody(r);
+      return null;
+    }
+    return normalizeAccountLabel(pick(await readResponseJsonCapped(r)));
+  } catch (error) {
+    // A probe's own timeout/network failure is cosmetic. Request cancellation is different: letting
+    // the callback continue would persist a credential after its client has already gone away.
+    if (callerSignal?.aborted) throw error;
     return null; // timeout or network failure — treat as "account unknown", same as a non-OK probe
-  }
-  if (!r.ok) {
-    r.body?.cancel().catch(() => undefined);
-    return null;
-  }
-  try {
-    return pick(await r.json());
-  } catch {
-    r.body?.cancel().catch(() => undefined);
-    return null;
+  } finally {
+    // On an over-cap/read error, cancellation releases the socket. On a fully-read success this is a
+    // harmless no-op and makes future helper changes safe by construction.
+    await cancelResponseBody(r);
+    deadline.dispose();
   }
 }
 
 /** Built-in GitHub provider. Classic OAuth tokens are long-lived (no refresh). */
 export function github(cfg: ProviderConfig = {}): Provider {
+  const oauthTimeoutMs = cfg.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
   return defineProvider({
     id: 'github',
     authorizeUrl: 'https://github.com/login/oauth/authorize',
@@ -781,15 +828,22 @@ export function github(cfg: ProviderConfig = {}): Provider {
         body: JSON.stringify({ access_token: token }),
         signal, // GHSA-25m2: a hung revoke endpoint must not stall offboarding
       });
-      if (!r.ok && r.status !== 404) throw new Error(`GitHub token revoke returned HTTP ${r.status}`); // 404 = already gone
+      try {
+        if (!r.ok && r.status !== 404) throw new Error(`GitHub token revoke returned HTTP ${r.status}`); // 404 = already gone
+      } finally {
+        // This custom revoke hook owns the Response. Always release its unread body, including 200,
+        // already-gone 404, and error statuses; otherwise undici pins one socket per revoke until GC.
+        await cancelResponseBody(r);
+      }
     },
-    accountProbe: (token) =>
-      probeAccount('https://api.github.com/user', { Authorization: `Bearer ${token}`, 'User-Agent': 'vouchr' }, (j) => j.login ?? null),
+    accountProbe: (token, signal) =>
+      probeAccount('https://api.github.com/user', { Authorization: `Bearer ${token}`, 'User-Agent': 'vouchr' }, (j) => j.login ?? null, oauthTimeoutMs, signal),
   });
 }
 
 /** Built-in Google provider. Needs access_type=offline + prompt=consent for a refresh token. */
 export function google(cfg: ProviderConfig = {}): Provider {
+  const oauthTimeoutMs = cfg.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
   return defineProvider({
     id: 'google',
     authorizeUrl: 'https://accounts.google.com/o/oauth2/v2/auth',
@@ -816,13 +870,14 @@ export function google(cfg: ProviderConfig = {}): Provider {
     revokeUrl: 'https://oauth2.googleapis.com/revoke', // form token=<token>, no client auth
     clientId: cfg.clientId ?? process.env.GOOGLE_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? '',
-    accountProbe: (token) =>
-      probeAccount('https://www.googleapis.com/oauth2/v2/userinfo', { Authorization: `Bearer ${token}` }, (j) => j.email ?? null),
+    accountProbe: (token, signal) =>
+      probeAccount('https://www.googleapis.com/oauth2/v2/userinfo', { Authorization: `Bearer ${token}` }, (j) => j.email ?? null, oauthTimeoutMs, signal),
   });
 }
 
 /** Built-in GitLab.com provider (rotating refresh tokens, PKCE). */
 export function gitlab(cfg: ProviderConfig = {}): Provider {
+  const oauthTimeoutMs = cfg.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
   return defineProvider({
     id: 'gitlab',
     authorizeUrl: 'https://gitlab.com/oauth/authorize',
@@ -840,8 +895,8 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     revokeAuth: 'body',
     clientId: cfg.clientId ?? process.env.GITLAB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITLAB_CLIENT_SECRET ?? '',
-    accountProbe: (token) =>
-      probeAccount('https://gitlab.com/api/v4/user', { Authorization: `Bearer ${token}` }, (j) => j.username ?? null),
+    accountProbe: (token, signal) =>
+      probeAccount('https://gitlab.com/api/v4/user', { Authorization: `Bearer ${token}` }, (j) => j.username ?? null, oauthTimeoutMs, signal),
   });
 }
 
@@ -851,6 +906,7 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
  * sent per-request). This is exactly what the tokenAuth/bodyFormat knobs are for.
  */
 export function notion(cfg: ProviderConfig = {}): Provider {
+  const oauthTimeoutMs = cfg.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
   return defineProvider({
     id: 'notion',
     authorizeUrl: 'https://api.notion.com/v1/oauth/authorize',
@@ -865,11 +921,13 @@ export function notion(cfg: ProviderConfig = {}): Provider {
     authorizeParams: { owner: 'user' },
     clientId: cfg.clientId ?? process.env.NOTION_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.NOTION_CLIENT_SECRET ?? '',
-    accountProbe: (token) =>
+    accountProbe: (token, signal) =>
       probeAccount(
         'https://api.notion.com/v1/users/me',
         { Authorization: `Bearer ${token}`, 'Notion-Version': '2022-06-28' },
         (j) => j?.bot?.owner?.user?.name ?? j?.name ?? null,
+        oauthTimeoutMs,
+        signal,
       ),
   });
 }
@@ -931,6 +989,7 @@ export function databricks(cfg: DatabricksConfig): Provider {
     egressResponse: cfg.egressResponse,
     rateLimit: cfg.rateLimit,
     approval: cfg.approval, // databricks builds its fields by hand (no egressOptions spread), so thread it explicitly
+    oauthTimeoutMs: cfg.oauthTimeoutMs,
     refresh: 'rotating', // offline_access → refresh token; Databricks rotates it (single-flight guards the swap)
     pkce: true, // U2M requires PKCE
     scopeDescriptions: {

@@ -18,6 +18,7 @@ const ALLOWED = new Set([
   'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault', 'scopeDescriptions',
   'egressAllow', 'egressPaths', 'egressMethods', 'egressResponse', 'rateLimit', 'refresh', 'pkce',
   'publicClient', 'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth',
+  'oauthTimeoutMs', // #209 shared token exchange/refresh, revoke, and built-in probe deadline
   'mcp', // #65 /v1/mcp opt-in: { paths: string[], allowContentTypes?: string[] }
   'approval', // #113 human-in-the-loop approval: { methods?, paths?, approver: 'self'|'admin', ttlMs? }
 ]);

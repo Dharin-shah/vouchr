@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
 import { loadProviders } from '../bin/providerConfig';
-import { buildBrokerServer } from '../bin/broker-server';
+import { beginBrokerDrain, buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
@@ -38,7 +38,7 @@ function get(port: number, path: string): Promise<number> {
 
 test('loadProviders: parses an OAuth provider, resolving client creds from per-provider env', () => {
   const env = {
-    VOUCHR_PROVIDERS: JSON.stringify([CONFLUENCE]),
+    VOUCHR_PROVIDERS: JSON.stringify([{ ...CONFLUENCE, oauthTimeoutMs: 2_500 }]),
     VOUCHR_PROVIDER_CONFLUENCE_CLIENT_ID: 'cid',
     VOUCHR_PROVIDER_CONFLUENCE_CLIENT_SECRET: 'csecret',
   } as any;
@@ -46,6 +46,7 @@ test('loadProviders: parses an OAuth provider, resolving client creds from per-p
   assert.equal(p.id, 'confluence');
   assert.equal(p.clientId, 'cid');
   assert.equal(p.egressMethods, undefined); // unset -> broker default-denies non-GET/HEAD
+  assert.equal(p.oauthTimeoutMs, 2_500); // declarative JSON reaches the canonical core validator
 });
 
 test('loadProviders: rejects an unknown/non-declarative field (fail closed)', () => {
@@ -368,15 +369,98 @@ test('#54 buildBrokerServer.sweep removes an expired connection (headless TTL sw
 test('#54 sweep interval: default is hourly; VOUCHR_SWEEP_INTERVAL_MS=0 disables it', async (t) => {
   const dflt = await buildBrokerServer(await baseEnv(t));
   assert.equal(dflt.sweepIntervalMs, 60 * 60 * 1000);
+  assert.equal(dflt.shutdownTimeoutMs, 10_000);
   await dflt.db.close();
-  const off = await buildBrokerServer(await baseEnv(t, { VOUCHR_SWEEP_INTERVAL_MS: '0' }));
+  const off = await buildBrokerServer(await baseEnv(t, {
+    VOUCHR_SWEEP_INTERVAL_MS: '0',
+    VOUCHR_SHUTDOWN_TIMEOUT_MS: '2500',
+  }));
   assert.equal(off.sweepIntervalMs, 0);
+  assert.equal(off.shutdownTimeoutMs, 2500);
   await off.db.close();
   await assert.rejects(buildBrokerServer(await baseEnv(t, { VOUCHR_SWEEP_INTERVAL_MS: 'nope' })), /VOUCHR_SWEEP_INTERVAL_MS/);
 });
 
+test('#209 graceful drain stops accepts, closes idle sockets, clears a clean deadline, and times out if stuck', async () => {
+  const calls: string[] = [];
+  let closeCallback!: () => void;
+  let drained = 0;
+  let timedOut = 0;
+  const server = {
+    close(callback: () => void) {
+      calls.push('close');
+      closeCallback = callback;
+      return this;
+    },
+    closeIdleConnections() { calls.push('closeIdleConnections'); },
+  } as unknown as http.Server;
+
+  const cleanTimer = beginBrokerDrain(server, 1_000, () => { drained++; }, () => { timedOut++; });
+  assert.deepEqual(calls, ['close', 'closeIdleConnections'], 'stop accepting before dropping idle connections');
+  closeCallback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, 1);
+  assert.equal(timedOut, 0);
+  assert.equal(cleanTimer.hasRef(), false, 'the hard deadline never keeps the process alive by itself');
+
+  const stuckServer = {
+    close() { return this; },
+    closeIdleConnections() {},
+  } as unknown as http.Server;
+  await new Promise<void>((resolve) => {
+    const timer = beginBrokerDrain(stuckServer, 5, () => assert.fail('a stuck drain must not report clean'), () => {
+      timedOut++;
+      resolve();
+    });
+    timer.ref(); // The production deadline is unref'd; this focused test keeps Node alive to observe it.
+  });
+  assert.equal(timedOut, 1, 'a stuck active connection reaches the hard deadline exactly once');
+});
+
+test('#209 resource config is canonical, secret-safe, and rejected before Postgres acquisition', async (t) => {
+  const base = await baseEnv(t, {
+    // A syntactically valid but unreachable database proves each configuration failure wins before
+    // openDb can attempt a connection. The test stays fast and deterministic only in that order.
+    VOUCHR_DATABASE_URL: 'postgres://vouchr:vouchr@127.0.0.1:1/vouchr',
+  });
+  const sentinel = 'ghp_RESOURCE_CONFIG_MUST_NOT_BE_ECHOED';
+  for (const name of [
+    'VOUCHR_FETCH_DEADLINE_MS',
+    'VOUCHR_MAX_INFLIGHT',
+    'VOUCHR_MAX_INFLIGHT_PER_PROVIDER',
+    'VOUCHR_HEADERS_TIMEOUT_MS',
+    'VOUCHR_REQUEST_TIMEOUT_MS',
+    'VOUCHR_KEEPALIVE_TIMEOUT_MS',
+    'VOUCHR_SHUTDOWN_TIMEOUT_MS',
+    'VOUCHR_SWEEP_INTERVAL_MS',
+    'VOUCHR_TTL_IDLE_MS',
+    'VOUCHR_PORT',
+    'VOUCHR_ALLOW_WRITES',
+    'VOUCHR_DRY_RUN',
+    'VOUCHR_CHANNEL_MODES',
+  ]) {
+    await assert.rejects(
+      buildBrokerServer({ ...base, [name]: sentinel }),
+      (error: Error) => error.message.includes(name) && !error.message.includes(sentinel),
+    );
+  }
+
+  await assert.rejects(
+    buildBrokerServer({ ...base, VOUCHR_MAX_INFLIGHT: '1', VOUCHR_MAX_INFLIGHT_PER_PROVIDER: '2' }),
+    /maxInflightPerProvider must be <= maxInflight/,
+  );
+  await assert.rejects(
+    buildBrokerServer({ ...base, VOUCHR_HEADERS_TIMEOUT_MS: '20', VOUCHR_REQUEST_TIMEOUT_MS: '10' }),
+    /requestTimeoutMs must be >= headersTimeoutMs/,
+  );
+  await assert.rejects(
+    buildBrokerServer({ ...base, VOUCHR_FETCH_DEADLINE_MS: '2147483648' }),
+    /VOUCHR_FETCH_DEADLINE_MS/,
+  );
+});
+
 test('#116 VOUCHR_DRY_RUN: parses like VOUCHR_ALLOW_WRITES and hard-fails boot on a real vault', async (t) => {
-  // Parse + wire-through: 1/true → on, absent/anything else → off (production behavior).
+  // Parse + wire-through: 1/true → on, 0/false/absent → off; typos fail during config validation.
   const on = await buildBrokerServer(await baseEnv(t, { VOUCHR_DRY_RUN: '1' }));
   try {
     assert.equal(on.dryRun, true);

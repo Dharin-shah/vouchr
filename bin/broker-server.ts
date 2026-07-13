@@ -11,7 +11,7 @@ import http from 'node:http';
 import { openDb, type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
+import { createBroker, normalizeBrokerResourceBounds, type BrokerOptions } from '../src/adapters/http/broker';
 import { loadIdentityConfig, type IdentityConfig } from '../src/adapters/http/identity';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
@@ -21,20 +21,10 @@ import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
 import { loadProviders } from './providerConfig';
+import { booleanEnv, MAX_TIMER_MS, nonNegativeIntegerEnv, optionalPositiveEnv } from '../src/core/options';
 
 function fail(msg: string): never {
   throw new Error(msg);
-}
-
-/** #209 parse an optional positive-number env knob (a resource bound), failing closed with the var
- *  name on a non-number / <= 0 (or non-integer when `integer`). Unset → undefined (createBroker default). */
-function posNumEnv(raw: string | undefined, name: string, integer = false): number | undefined {
-  if (raw === undefined || raw === '') return undefined;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n <= 0 || (integer && !Number.isInteger(n))) {
-    fail(`${name} must be a ${integer ? 'positive integer' : 'positive number'}, got "${raw}".`);
-  }
-  return n;
 }
 
 export interface BuiltBroker {
@@ -51,6 +41,35 @@ export interface BuiltBroker {
   sweep: () => Promise<number>;
   /** #54 sweep interval (ms); 0 disables the timer (VOUCHR_SWEEP_INTERVAL_MS). Default hourly. */
   sweepIntervalMs: number;
+  /** #209 graceful-drain deadline (ms; VOUCHR_SHUTDOWN_TIMEOUT_MS). Default 10s. */
+  shutdownTimeoutMs: number;
+}
+
+/**
+ * Start one bounded graceful drain. `close()` first stops new accepts, idle keep-alive sockets are
+ * dropped immediately, and active requests keep their connections until they settle. The hard
+ * deadline is cleared on a clean drain. Exported so this production ordering has a deterministic
+ * regression instead of living only inside signal-handler glue.
+ */
+export function beginBrokerDrain(
+  server: http.Server,
+  timeoutMs: number,
+  onDrained: () => void,
+  onTimeout: () => void,
+): NodeJS.Timeout {
+  const timer = setTimeout(onTimeout, timeoutMs);
+  timer.unref();
+  try {
+    server.close(() => {
+      clearTimeout(timer);
+      onDrained();
+    });
+    server.closeIdleConnections();
+    return timer;
+  } catch (error) {
+    clearTimeout(timer);
+    throw error;
+  }
 }
 
 /**
@@ -127,13 +146,12 @@ export async function buildBrokerServer(
     fail(e?.message ?? String(e));
   }
 
-  const port = Number(env.VOUCHR_PORT ?? 3000);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) fail(`VOUCHR_PORT invalid: ${env.VOUCHR_PORT}`);
+  const port = nonNegativeIntegerEnv(env.VOUCHR_PORT, 'VOUCHR_PORT', 3000, 65_535);
 
-  const allowWrites = env.VOUCHR_ALLOW_WRITES === '1' || env.VOUCHR_ALLOW_WRITES === 'true';
+  const allowWrites = booleanEnv(env.VOUCHR_ALLOW_WRITES, 'VOUCHR_ALLOW_WRITES');
   // #116 dry-run: real gates, stubbed network edges (see BrokerOptions.dryRun). Same env style as
-  // VOUCHR_ALLOW_WRITES; anything but an explicit 1/true stays off (production behavior).
-  const dryRun = env.VOUCHR_DRY_RUN === '1' || env.VOUCHR_DRY_RUN === 'true';
+  // VOUCHR_ALLOW_WRITES; explicit 1/true enables and 0/false disables, while typos fail boot.
+  const dryRun = booleanEnv(env.VOUCHR_DRY_RUN, 'VOUCHR_DRY_RUN');
   const brokerToken = env.VOUCHR_BROKER_TOKEN || undefined;
   // #52 setting VOUCHR_BASE_URL mounts the OAuth connect flow (/v1/connect + the callback). Unset →
   // the historical use-only broker (no consent kickoff).
@@ -143,8 +161,47 @@ export async function buildBrokerServer(
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
 
+  // Parse and cross-check EVERY pure resource setting before KMS or Postgres is acquired. Values are
+  // canonical decimal integers and errors name only the variable/contract — never the supplied text,
+  // which may be a credential pasted into the wrong variable (SEC-1). createBroker reuses the exact
+  // same normalizer at its public boundary (STR-2).
+  const timerEnv = (raw: string | undefined, name: string) =>
+    optionalPositiveEnv(raw, name, { integer: true, max: MAX_TIMER_MS });
+  const countEnv = (raw: string | undefined, name: string) =>
+    optionalPositiveEnv(raw, name, { integer: true });
+  const resourceBounds = normalizeBrokerResourceBounds({
+    fetchDeadlineMs: timerEnv(env.VOUCHR_FETCH_DEADLINE_MS, 'VOUCHR_FETCH_DEADLINE_MS'),
+    maxInflight: countEnv(env.VOUCHR_MAX_INFLIGHT, 'VOUCHR_MAX_INFLIGHT'),
+    maxInflightPerProvider: countEnv(env.VOUCHR_MAX_INFLIGHT_PER_PROVIDER, 'VOUCHR_MAX_INFLIGHT_PER_PROVIDER'),
+    headersTimeoutMs: timerEnv(env.VOUCHR_HEADERS_TIMEOUT_MS, 'VOUCHR_HEADERS_TIMEOUT_MS'),
+    requestTimeoutMs: timerEnv(env.VOUCHR_REQUEST_TIMEOUT_MS, 'VOUCHR_REQUEST_TIMEOUT_MS'),
+    keepAliveTimeoutMs: timerEnv(env.VOUCHR_KEEPALIVE_TIMEOUT_MS, 'VOUCHR_KEEPALIVE_TIMEOUT_MS'),
+  });
+  const shutdownTimeoutMs = timerEnv(env.VOUCHR_SHUTDOWN_TIMEOUT_MS, 'VOUCHR_SHUTDOWN_TIMEOUT_MS') ?? 10_000;
+
+  // #54 TTL policy: 0 disables one dimension. TTLs are stored timestamps, not Node timers, so they
+  // may exceed MAX_TIMER_MS but must still be canonical non-negative safe integers.
+  const ttlDim = (raw: string | undefined, name: string, dflt: number): number | undefined => {
+    const n = nonNegativeIntegerEnv(raw, name, dflt);
+    return n === 0 ? undefined : n;
+  };
+  const ttl = {
+    idleMs: ttlDim(env.VOUCHR_TTL_IDLE_MS, 'VOUCHR_TTL_IDLE_MS', 7 * 24 * 60 * 60 * 1000),
+    maxAgeMs: ttlDim(env.VOUCHR_TTL_MAX_AGE_MS, 'VOUCHR_TTL_MAX_AGE_MS', 30 * 24 * 60 * 60 * 1000),
+  };
+  const sweepIntervalMs = nonNegativeIntegerEnv(
+    env.VOUCHR_SWEEP_INTERVAL_MS,
+    'VOUCHR_SWEEP_INTERVAL_MS',
+    60 * 60 * 1000,
+    MAX_TIMER_MS,
+  );
+
   const url = env.VOUCHR_DATABASE_URL; // explicit only — no generic DATABASE_URL fallback (#204)
   const backend = 'postgres' as const; // PostgreSQL-only (#204); openDb fails closed if url unset/non-PG
+
+  // #51 opt-in channel gate. Parse this pure switch with the rest of boot configuration so a typo
+  // fails before KMS loading or Postgres acquisition; the store itself is created after openDb.
+  const channelModes = booleanEnv(env.VOUCHR_CHANNEL_MODES, 'VOUCHR_CHANNEL_MODES');
 
   // Optional KMS envelope — only when configured.
   let envelope: EnvelopeProvider | undefined;
@@ -152,20 +209,6 @@ export async function buildBrokerServer(
     const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms.js');
     envelope = kmsEnvelope(env.VOUCHR_KMS_KEY_ID, await awsKmsClient({ region: env.AWS_REGION }));
   }
-
-  // #54 TTL policy: without one, get()-time expiry and the sweep are both no-ops (a credential lives
-  // forever). Default matches the Bolt path (7d idle / 30d max), so the two front doors behave the
-  // same on a shared database. Override per-dimension via env; set a var to 0 to disable that limit.
-  const ttlDim = (raw: string | undefined, dflt: number): number | undefined => {
-    if (raw === undefined) return dflt;
-    const n = Number(raw);
-    if (!Number.isFinite(n) || n < 0) fail(`invalid TTL env value: ${raw}`);
-    return n === 0 ? undefined : n; // 0 → disable this dimension (null in TtlPolicy)
-  };
-  const ttl = {
-    idleMs: ttlDim(env.VOUCHR_TTL_IDLE_MS, 7 * 24 * 60 * 60 * 1000),
-    maxAgeMs: ttlDim(env.VOUCHR_TTL_MAX_AGE_MS, 30 * 24 * 60 * 60 * 1000),
-  };
 
   const db = await openDb({ databaseUrl: url });
   try {
@@ -182,7 +225,6 @@ export async function buildBrokerServer(
   // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
   // default (user-only broker). The caller supplies eligibility facts as signed claims; the store
   // here only maps (team, channel, provider) → mode.
-  const channelModes = env.VOUCHR_CHANNEL_MODES === '1' || env.VOUCHR_CHANNEL_MODES === 'true';
   const channelConfig = channelModes ? new ChannelConfig(db) : undefined;
 
   const server = createBroker({
@@ -197,14 +239,7 @@ export async function buildBrokerServer(
     baseUrl,
     callbackPath,
     dryRun,
-    // #209 resource bounds (all optional; createBroker defaults + validates). Per-process ceilings:
-    // fleet capacity is replicas × VOUCHR_MAX_INFLIGHT (see guides/DEPLOYMENT.md).
-    fetchDeadlineMs: posNumEnv(env.VOUCHR_FETCH_DEADLINE_MS, 'VOUCHR_FETCH_DEADLINE_MS'),
-    maxInflight: posNumEnv(env.VOUCHR_MAX_INFLIGHT, 'VOUCHR_MAX_INFLIGHT', true),
-    maxInflightPerProvider: posNumEnv(env.VOUCHR_MAX_INFLIGHT_PER_PROVIDER, 'VOUCHR_MAX_INFLIGHT_PER_PROVIDER', true),
-    headersTimeoutMs: posNumEnv(env.VOUCHR_HEADERS_TIMEOUT_MS, 'VOUCHR_HEADERS_TIMEOUT_MS'),
-    requestTimeoutMs: posNumEnv(env.VOUCHR_REQUEST_TIMEOUT_MS, 'VOUCHR_REQUEST_TIMEOUT_MS'),
-    keepAliveTimeoutMs: posNumEnv(env.VOUCHR_KEEPALIVE_TIMEOUT_MS, 'VOUCHR_KEEPALIVE_TIMEOUT_MS'),
+    ...resourceBounds,
     authorize: overrides.authorize,
     resolvers: overrides.resolvers,
     onEvent: overrides.onEvent,
@@ -222,11 +257,18 @@ export async function buildBrokerServer(
     await sessions.sweepExpired();
     return n;
   };
-  const rawInterval = env.VOUCHR_SWEEP_INTERVAL_MS;
-  const sweepIntervalMs = rawInterval !== undefined ? Number(rawInterval) : 60 * 60 * 1000;
-  if (!Number.isFinite(sweepIntervalMs) || sweepIntervalMs < 0) fail(`VOUCHR_SWEEP_INTERVAL_MS invalid: ${rawInterval}`);
-
-  return { server, db, port, backend, providerIds: providers.map((p) => p.id), allowWrites, dryRun, sweep, sweepIntervalMs };
+  return {
+    server,
+    db,
+    port,
+    backend,
+    providerIds: providers.map((p) => p.id),
+    allowWrites,
+    dryRun,
+    sweep,
+    sweepIntervalMs,
+    shutdownTimeoutMs,
+  };
   } catch (e) {
     await db.close().catch(() => undefined); // boot failed after the pool opened — don't leak it
     throw e;
@@ -246,8 +288,9 @@ Optional env: VOUCHR_IDENTITY_SECRET_PREVIOUS (rolling key rotation), VOUCHR_IDE
               VOUCHR_SWEEP_INTERVAL_MS.
 Resource bounds (#209): VOUCHR_FETCH_DEADLINE_MS (30000), VOUCHR_MAX_INFLIGHT (200),
               VOUCHR_MAX_INFLIGHT_PER_PROVIDER (40), VOUCHR_HEADERS_TIMEOUT_MS (15000),
-              VOUCHR_REQUEST_TIMEOUT_MS (30000), VOUCHR_KEEPALIVE_TIMEOUT_MS (10000). Per-process
-              ceilings: fleet capacity is replicas × VOUCHR_MAX_INFLIGHT. See DEPLOYMENT.md.`;
+              VOUCHR_REQUEST_TIMEOUT_MS (30000), VOUCHR_KEEPALIVE_TIMEOUT_MS (10000),
+              VOUCHR_SHUTDOWN_TIMEOUT_MS (10000). Limits are per process; the global fleet upper
+              bound is replicas × VOUCHR_MAX_INFLIGHT, with an additional per-provider cap. See DEPLOYMENT.md.`;
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
@@ -285,15 +328,15 @@ async function main(): Promise<void> {
     closing = true;
     if (sweepTimer) clearInterval(sweepTimer);
     console.log(`[vouchr] ${sig} received; draining connections`);
-    built.server.close(() => {
-      built.db.close().catch(() => undefined).finally(() => process.exit(0));
-    });
     // #209 stop accepting new work AND drop idle keep-alive sockets so close() completes on the
     // in-flight requests alone, instead of blocking on idle sockets until keepAliveTimeout (or the
     // hard-kill below). In-flight requests keep their connection until they finish.
-    built.server.closeIdleConnections();
-    // Don't hang forever on a stuck connection.
-    setTimeout(() => process.exit(1), 10_000).unref();
+    beginBrokerDrain(
+      built.server,
+      built.shutdownTimeoutMs,
+      () => { built.db.close().catch(() => undefined).finally(() => process.exit(0)); },
+      () => process.exit(1),
+    );
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));

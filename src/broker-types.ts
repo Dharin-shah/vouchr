@@ -14,12 +14,16 @@ import type { ToolManifestEntry } from './core/tools';
 /** Coarse per-provider consent state — no secret, existence + state only. */
 export type BrokerConsentState = 'connected' | 'needs_consent';
 
-/** Any 4xx/5xx JSON body from the broker: `{ "error": "..." }`. */
+/** Any functional-route 4xx/5xx JSON body: `{ "error": "..." }`. Readiness is the deliberate
+ *  exception: `/readyz` returns only `{ ok: false }`, with no diagnostic text. */
 export interface BrokerError {
   error: string;
-  /** On a 429 (`provider.rateLimit` exceeded): ms until one request's budget refills. The same
-   *  value, in whole seconds rounded up, rides the `Retry-After` response header. */
+  /** On a 429 (rate limit) or 503 (in-flight ceiling): the broker's retry hint in milliseconds.
+   *  The same value, rounded up to whole seconds, rides the `Retry-After` response header. */
   retryAfterMs?: number;
+  /** Present only on an in-flight-overload 503. `global` is the broker-wide admission ceiling;
+   *  `provider` is the per-provider ceiling. It never contains a provider id or request value. */
+  scope?: 'global' | 'provider';
 }
 
 /** `POST /v1/fetch` — the brokered upstream response (status + content-type + verbatim body). */

@@ -1,11 +1,11 @@
 import { randomUUID } from 'node:crypto';
-import type { ProviderRegistry } from './providers';
+import { normalizeAccountLabel, type ProviderRegistry } from './providers';
 import type { Vault } from './vault';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import type { Consent } from './consent';
 import type { SlackIdentity } from './identity';
 import { userOwner } from './owner';
-import { exchangeCode, type TokenResponse } from './tokens';
+import { exchangeCode, normalizeGrantedScopes, type TokenResponse } from './tokens';
 import { DRY_RUN_ACCOUNT, DRY_RUN_CODE, DryRunVaultError, dryRunTokenResponse } from './dryRun';
 import { safeEmit } from './safe-emit';
 
@@ -61,6 +61,7 @@ export async function handleOAuthCallback(
   code: string | undefined,
   state: string | undefined,
   error?: string,
+  signal?: AbortSignal,
 ): Promise<CallbackResult> {
   // State is required even on the error path: without it there's no identity to attribute the denial
   // to. Consuming it on a denial is correct — state is single-use, so this also prevents replay.
@@ -76,7 +77,9 @@ export async function handleOAuthCallback(
     // Authoritative table copy: attribute the denial to the CONSUMED-state identity (never the request).
     await deps.audit.record('denied', row.identity, provider.id, { reason: 'consent_denied' });
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 400);
-    return { ok: false, status: 400, error: `OAuth error: ${error}` };
+    // The provider-controlled query value can contain markup or credential material. It is useful
+    // only as a branch signal; never reflect it into the browser, Slack, logs, or audit output.
+    return { ok: false, status: 400, error: 'OAuth authorization was denied. Please try again.' };
   }
   if (!code) return { ok: false, status: 400, error: 'Missing code/state.' };
   try {
@@ -93,14 +96,46 @@ export async function handleOAuthCallback(
       tok = dryRunTokenResponse();
       account = DRY_RUN_ACCOUNT;
     } else {
-      tok = await exchangeCode(provider, code, deps.redirectUri, row.pkceVerifier);
-      account = provider.accountProbe
-        ? await provider.accountProbe(tok.accessToken).catch(() => null)
+      tok = await exchangeCode(provider, code, deps.redirectUri, row.pkceVerifier, signal);
+      const probed = provider.accountProbe
+        ? await provider.accountProbe(tok.accessToken, signal).catch((probeError) => {
+            if (signal?.aborted) throw probeError;
+            return null;
+          })
         : null;
+      // Provider hooks are JavaScript extension points: their TypeScript return type is not a runtime
+      // boundary. Normalize before BOTH persistence and the connect audit row so objects, control text,
+      // whitespace-only, and overlong labels cannot become stored/audited external values (SEC-4).
+      const normalized = normalizeAccountLabel(probed);
+      // A buggy/malicious hook sees the access token and could return it as the cosmetic account
+      // label, which is persisted, audited, and rendered. Drop labels containing any credential or
+      // one-time flow secret already known at this boundary; a missing label is always safer than a
+      // secret copied into output (SEC-1).
+      const sensitive = [
+        tok.accessToken,
+        tok.refreshToken,
+        provider.clientSecret,
+        code,
+        state,
+        row.pkceVerifier,
+      ].filter((value): value is string => typeof value === 'string' && value.length > 0);
+      account = normalized && sensitive.some((value) => normalized.includes(value)) ? null : normalized;
     }
+    // A custom one-argument probe may ignore the optional signal. Recheck at the mutation boundary so
+    // a callback cancelled during that hook cannot persist or audit a newly connected credential.
+    signal?.throwIfAborted();
     // The scopes actually granted (token response), falling back to what we requested if the provider
-    // doesn't echo them — this is what the post-connect confirmation shows the user.
-    const scopes = tok.scopes ?? provider.scopesDefault.join(' ');
+    // doesn't echo a canonical, bounded, non-secret value — this is what the post-connect
+    // confirmation shows the user. Re-normalize through the ONE helper with callback-only secrets
+    // (`state` is never sent to the token endpoint).
+    const scopes = normalizeGrantedScopes(tok.scopes, [
+      tok.accessToken,
+      tok.refreshToken,
+      provider.clientSecret,
+      code,
+      state,
+      row.pkceVerifier,
+    ]) ?? provider.scopesDefault.join(' ');
     const token = { accessToken: tok.accessToken, refreshToken: tok.refreshToken, scopes, expiresAt: tok.expiresAt, externalAccount: account };
     if (deps.dryRun) {
       // ATOMIC no-clobber: one conditional statement that only overwrites an existing SYNTHETIC row,

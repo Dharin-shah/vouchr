@@ -10,9 +10,13 @@ import { safeEmit } from './safe-emit';
 import type { CredentialHealthHook } from './health';
 import { ApprovalRequiredError, queryDigest, type Approvals } from './approval';
 import { randomUUID } from 'node:crypto';
+import { awaitWithSignal, disposableDeadline, responseWithCleanup } from './httpBounds';
+import { MAX_TIMER_MS } from './options';
 
-/** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided. */
-export type Resolvers = Record<string, (ref: string) => Promise<string>>;
+/** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided.
+ * Existing one-argument resolvers remain compatible; implementations should use the optional signal
+ * to cancel secret-manager I/O when the caller disconnects or Vouchr's fetch deadline expires. */
+export type Resolvers = Record<string, (ref: string, signal?: AbortSignal) => Promise<string>>;
 
 /**
  * A structured, NO-SECRET observability event. Operators wire a single `EventSink` to feed
@@ -172,6 +176,17 @@ export function normalizeContentType(ct: string | null): string {
  */
 export const DEFAULT_FETCH_DEADLINE_MS = 30_000;
 
+interface RefreshFlight {
+  controller: AbortController;
+  waiters: number;
+  settled: boolean;
+}
+
+/** Metadata for the Promise stored in the existing public/shared single-flight map. Keeping it in a
+ * WeakMap preserves that map's API while letting cancellation abort the underlying refresh only when
+ * every waiter is gone; one cancelled caller must not break a still-live peer request. */
+const refreshFlights = new WeakMap<Promise<string | null>, RefreshFlight>();
+
 /** HTTP methods safe to auto-replay after a 401-triggered token refresh: side-effect-free or
  *  idempotent per RFC 9110. A non-idempotent write (POST/PATCH, or any unknown method) is NEVER
  *  auto-replayed — a provider may have applied it before returning 401 (#209). */
@@ -221,7 +236,20 @@ export class ConnectionHandle {
     // NOT carrying the dry-run marker is refused per-request (fetch). Every gate above the network
     // — egress, rate limit, vault read, header injection, AND the #113 approval gate — still runs.
     private dryRun = false,
-  ) {}
+    // #209 direct handles keep the finite default; HTTP adapters pass their validated route deadline.
+    private fetchDeadlineMs = DEFAULT_FETCH_DEADLINE_MS,
+    // Optional transport ceiling (the HTTP /v1/fetch envelope cap). Enforced at the injector's FIRST
+    // body read so a larger provider egressResponse.maxBytes cannot buffer past the transport bound.
+    private transportResponseMaxBytes?: number,
+  ) {
+    if (!Number.isSafeInteger(fetchDeadlineMs) || fetchDeadlineMs <= 0 || fetchDeadlineMs > MAX_TIMER_MS) {
+      throw new Error(`ConnectionHandle: fetchDeadlineMs must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
+    }
+    if (transportResponseMaxBytes !== undefined
+      && (!Number.isSafeInteger(transportResponseMaxBytes) || transportResponseMaxBytes <= 0)) {
+      throw new Error('ConnectionHandle: transportResponseMaxBytes must be a positive safe integer');
+    }
+  }
 
   /** The identity key for this handle's (owner, provider) pair — the single-flight refresh map and
    *  the rate-limit buckets key on the same fact. */
@@ -305,8 +333,12 @@ export class ConnectionHandle {
       }
     }
     let body: BodyInit | null = res.body;
-    if (er?.maxBytes !== undefined && res.body) {
-      const cap = er.maxBytes;
+    const cap = er?.maxBytes === undefined
+      ? this.transportResponseMaxBytes
+      : this.transportResponseMaxBytes === undefined
+        ? er.maxBytes
+        : Math.min(er.maxBytes, this.transportResponseMaxBytes);
+    if (cap !== undefined && res.body) {
       const message = `Response blocked: response exceeds ${cap} bytes for provider "${this.provider.id}"`;
       const declared = Number(res.headers.get('content-length'));
       if (Number.isFinite(declared) && declared > cap) {
@@ -361,10 +393,13 @@ export class ConnectionHandle {
   /** refreshAndStore + a no-secret failure signal on throw: refresh breakage must not be a silent 502.
    *  host = the OAuth TOKEN endpoint (where a refresh actually fails), not the target API host — matching
    *  the refresh-SUCCESS audit. tokenUrl is always present here (only OAuth providers refresh). */
-  private async refreshSignalled(): Promise<string | null> {
+  private async refreshSignalled(signal?: AbortSignal): Promise<string | null> {
     try {
-      return await this.refreshAndStore();
+      return await this.refreshAndStore(signal);
     } catch (e) {
+      // Caller cancellation/deadline is not a provider outage. It already has a stable transport
+      // outcome; do not write a false refresh_failed audit/event for it.
+      if (signal?.aborted) throw e;
       await this.egressError(new URL(this.provider.tokenUrl).hostname, 'refresh_failed');
       throw e;
     }
@@ -519,8 +554,14 @@ export class ConnectionHandle {
     if (this.dryRun && !cred.dryRun) throw new DryRunVaultError();
     const vaulted = cred.source === 'vault';
 
-    let token = vaulted ? await this.vaultToken(cred) : await this.resolveRef(cred);
-    const send = async (t: string) => {
+    // One disposable deadline spans proactive refresh, provider fetch, 401 refresh/replay, and the
+    // returned response body. It ALWAYS composes caller cancellation with Vouchr's finite bound.
+    const deadline = disposableDeadline(this.fetchDeadlineMs, init.signal ?? undefined);
+    let responseHandedOff = false;
+    try {
+      deadline.signal.throwIfAborted();
+      let token = vaulted ? await this.vaultToken(cred, deadline.signal) : await this.resolveRef(cred, deadline.signal);
+      const send = async (t: string) => {
       // #116 dry-run: the outbound-fetch edge, stubbed at the exact point the network call would
       // happen — every gate above (egress, rate limit, vault read) has already run. Returned BEFORE
       // the production inject so the provider's inject hook runs EXACTLY ONCE (inside dryRunEcho,
@@ -533,12 +574,11 @@ export class ConnectionHandle {
       else headers.set('Authorization', `Bearer ${t}`);
       try {
         // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
-        // #209 finite deadline: use the caller's signal when supplied (the broker composes its
-        // configurable deadline + client-disconnect there); otherwise a default AbortSignal.timeout is
-        // the safety net so a signal-less caller (Bolt tool, direct handle) can't hang on a dead
-        // provider. The signal bounds the whole fetch — a still-draining response body aborts too.
-        return await fetch(input, { ...init, headers, redirect: 'manual', signal: init.signal ?? AbortSignal.timeout(DEFAULT_FETCH_DEADLINE_MS) });
+        // The composed signal covers headers + the still-streaming body, proactive/401 refresh, and
+        // client cancellation. It is disposed when the returned body finishes/cancels (below).
+        return await fetch(input, { ...init, headers, redirect: 'manual', signal: deadline.signal });
       } catch (e) {
+        if (deadline.signal.aborted) throw e; // cancellation/timeout is not a provider-outage event
         // Network-level throw (DNS/connection refused): fire the no-secret failure signal, then re-throw
         // so the broker still maps it to 502 — the signal is emitted, not swallowed.
         await this.egressError(url.hostname, 'fetch_failed');
@@ -552,7 +592,7 @@ export class ConnectionHandle {
     if (res.status === 401 && vaulted && this.provider.refresh !== 'none') {
       let refreshed: string | null;
       try {
-        refreshed = await this.refreshSignalled();
+        refreshed = await this.refreshSignalled(deadline.signal);
       } catch (e) {
         // #168: a refresh throw abandons the 401 too — drain it, or undici pins the socket to the
         // unread body until GC. Best-effort: cancelling must never mask the refresh error. (Not a
@@ -596,11 +636,17 @@ export class ConnectionHandle {
     // strip: enforced HERE, after the outbound call is booked (the call DID happen — its inject
     // audit/event stay truthful) and before the Response is handed back, so both doors (Bolt
     // handle + HTTP broker) inherit them. A breach throws; the caller never sees a partial body.
-    return this.guardResponse(res, url.hostname);
+      const guarded = await this.guardResponse(res, url.hostname);
+      const response = responseWithCleanup(guarded, deadline.dispose);
+      responseHandedOff = true;
+      return response;
+    } finally {
+      if (!responseHandedOff) deadline.dispose();
+    }
   }
 
   /** Resolve an external-ref secret JIT. Never persisted, never cached, never logged. */
-  private async resolveRef(cred: StoredCredential): Promise<string> {
+  private async resolveRef(cred: StoredCredential, signal: AbortSignal): Promise<string> {
     const resolver = this.resolvers[cred.source];
     if (!resolver) {
       throw new Error(`No resolver registered for secret source "${cred.source}"`);
@@ -609,17 +655,20 @@ export class ConnectionHandle {
       throw new Error(`Referenced connection for "${this.provider.id}" has no secret_ref`);
     }
     try {
-      return await resolver(cred.secretRef);
+      // Pass cancellation to cooperative resolvers, but also race it here: an older/custom resolver
+      // may ignore the optional signal and must not pin admission slots beyond the request deadline.
+      return await awaitWithSignal(resolver(cred.secretRef, signal), signal);
     } catch (e) {
+      if (signal.aborted) throw e;
       this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
       throw e;
     }
   }
 
-  private async vaultToken(cred: StoredCredential): Promise<string> {
+  private async vaultToken(cred: StoredCredential, signal?: AbortSignal): Promise<string> {
     const expiringSoon = cred.expiresAt != null && cred.expiresAt < Date.now() + 30_000;
     if (expiringSoon && cred.refreshToken && this.provider.refresh !== 'none') {
-      const refreshed = await this.refreshSignalled();
+      const refreshed = await this.refreshSignalled(signal);
       if (refreshed) return refreshed;
     }
     if (cred.accessToken == null) throw new Error(`Vaulted connection for "${this.provider.id}" has no token`);
@@ -628,20 +677,60 @@ export class ConnectionHandle {
 
   // Single-flight: concurrent fetches for the same owner+provider share one refresh. Without this,
   // rotating-refresh-token providers (the second refresh sees a consumed token) brick the connection.
-  private async refreshAndStore(): Promise<string | null> {
+  // Each caller can still cancel its own wait; the underlying refresh is aborted only after ALL live
+  // waiters cancel, so one disconnected request cannot break a peer sharing the rotation.
+  private async refreshAndStore(signal?: AbortSignal): Promise<string | null> {
     const key = this.ownerKey();
-    const existing = this.inflight.get(key);
-    if (existing) return existing;
-    const p = this.doRefresh();
-    this.inflight.set(key, p);
-    try {
-      return await p;
-    } finally {
-      this.inflight.delete(key);
+    let p = this.inflight.get(key);
+    if (!p) {
+      const controller = new AbortController();
+      p = this.doRefresh(controller.signal);
+      const flight: RefreshFlight = { controller, waiters: 0, settled: false };
+      refreshFlights.set(p, flight);
+      this.inflight.set(key, p);
+      const cleanup = () => {
+        flight.settled = true;
+        if (this.inflight.get(key) === p) this.inflight.delete(key);
+        refreshFlights.delete(p!);
+      };
+      // Both handlers resolve the derived promise, so a refresh rejection is never left unhandled.
+      void p.then(cleanup, cleanup);
     }
+    return this.waitForRefresh(p, signal);
   }
 
-  private async doRefresh(): Promise<string | null> {
+  private waitForRefresh(p: Promise<string | null>, signal?: AbortSignal): Promise<string | null> {
+    const flight = refreshFlights.get(p);
+    return new Promise((resolve, reject) => {
+      if (flight) flight.waiters++;
+      let finished = false;
+      const leave = () => {
+        if (finished) return false;
+        finished = true;
+        signal?.removeEventListener('abort', onAbort);
+        if (flight) flight.waiters--;
+        return true;
+      };
+      const onAbort = () => {
+        if (!leave()) return;
+        if (flight && !flight.settled && flight.waiters === 0) {
+          flight.controller.abort(signal?.reason);
+        }
+        reject(signal?.reason ?? new DOMException('The operation was aborted', 'AbortError'));
+      };
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      p.then(
+        (token) => { if (leave()) resolve(token); },
+        (error) => { if (leave()) reject(error); },
+      );
+    });
+  }
+
+  private async doRefresh(signal?: AbortSignal): Promise<string | null> {
     // Count real KMS/envelope DEK unwraps on BOTH refresh-path reads (the pre-lock read and the
     // re-read under the lock) so the kms_decrypt volume metric isn't understated on a refresh.
     let kms = 0;
@@ -680,7 +769,7 @@ export class ConnectionHandle {
       }
       if (lockWait) this.emit({ type: 'refresh_lock_wait', provider: this.provider.id, waitMs, reused: false });
       const r0 = Date.now();
-      const refreshed = await refreshToken(this.provider, stored.refreshToken);
+      const refreshed = await refreshToken(this.provider, stored.refreshToken, signal);
       // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
       await vault.updateTokens(this.owner, this.provider.id, {
         accessToken: refreshed.accessToken,

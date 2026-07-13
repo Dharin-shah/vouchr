@@ -2,6 +2,7 @@ import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
+import net from 'node:net';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
@@ -10,8 +11,13 @@ import { defineProvider, github } from '../src/core/providers';
 import { InflightLimiter, OverloadedError } from '../src/core/inflight';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
-import { createBroker, type BrokerOptions } from '../src/adapters/http/broker';
+import {
+  createBroker,
+  normalizeBrokerResourceBounds,
+  type BrokerOptions,
+} from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { MAX_TIMER_MS } from '../src/core/options';
 
 // #209 resource bounds at the HTTP boundary: finite upstream deadlines + client-cancel propagation,
 // inbound Content-Length/streamed caps, per-process global + per-provider in-flight ceilings (503 +
@@ -56,11 +62,18 @@ function post(port: number, path: string, body: unknown): Promise<{ status: numb
 
 /** POST with NO Content-Length → Node sends the body chunked (Transfer-Encoding: chunked), so the
  *  broker's streamed byte counter — not the Content-Length fast-reject — is what must cut it. */
-function chunkedPost(port: number, path: string, bodyStr: string): Promise<{ status: number }> {
+function chunkedPost(
+  port: number,
+  path: string,
+  bodyStr: string,
+): Promise<{ status: number; headers: http.IncomingHttpHeaders }> {
   return new Promise((resolve, reject) => {
     const req = http.request(
       { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json' } },
-      (res) => { res.resume(); res.on('end', () => resolve({ status: res.statusCode ?? 0 })); },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers }));
+      },
     );
     req.on('error', reject);
     req.write(bodyStr);
@@ -79,6 +92,44 @@ async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {
     if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
     await new Promise((r) => setTimeout(r, 5));
   }
+}
+
+/** Send an intentionally incomplete HTTP/1.1 request and resolve only when the server closes it. */
+function rawUntilClose(port: number, request: string, timeoutMs = 2_000): Promise<{ text: string; ms: number }> {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    let text = '';
+    const socket = net.connect(port, '127.0.0.1', () => socket.write(request));
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error('raw HTTP connection was not closed within its resource bound'));
+    }, timeoutMs);
+    socket.setEncoding('utf8');
+    socket.on('data', (chunk) => { text += chunk; });
+    socket.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    socket.on('close', () => {
+      clearTimeout(timer);
+      resolve({ text, ms: Date.now() - started });
+    });
+  });
+}
+
+function get(port: number, path: string): Promise<{ status: number; json: any }> {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port, path }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        let json: any = null;
+        try { json = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { /* leave null */ }
+        resolve({ status: res.statusCode ?? 0, json });
+      });
+    });
+    req.on('error', reject);
+  });
 }
 
 async function buildBroker(t: TestContext, over: Partial<BrokerOptions> = {}) {
@@ -128,6 +179,37 @@ function hangingUpstream() {
 
 const fetchBody = (over: Record<string, unknown> = {}) => ({ handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x', ...over });
 
+test('normalizeBrokerResourceBounds: every byte/count/timer bound is a safe representable integer (#209)', () => {
+  const defaults = normalizeBrokerResourceBounds({});
+  assert.equal(defaults.maxResponseBytes, 1024 * 1024);
+  assert.equal(defaults.maxInflight, 200);
+  assert.equal(defaults.maxInflightPerProvider, 40);
+  assert.ok(Object.isFrozen(defaults));
+
+  for (const name of ['maxResponseBytes', 'maxStreamBytes', 'maxInflight', 'maxInflightPerProvider'] as const) {
+    for (const value of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => normalizeBrokerResourceBounds({ [name]: value }), /positive safe integer/);
+    }
+  }
+  for (const name of ['fetchDeadlineMs', 'maxStreamMs', 'headersTimeoutMs', 'requestTimeoutMs', 'keepAliveTimeoutMs'] as const) {
+    assert.throws(() => normalizeBrokerResourceBounds({ [name]: 1.5 }), /positive safe integer/);
+    assert.throws(() => normalizeBrokerResourceBounds({ [name]: MAX_TIMER_MS + 1 }), /2147483647/);
+  }
+  assert.throws(
+    () => normalizeBrokerResourceBounds({ maxInflight: 2, maxInflightPerProvider: 3 }),
+    /maxInflightPerProvider must be <= maxInflight/,
+  );
+  assert.throws(
+    () => normalizeBrokerResourceBounds({ headersTimeoutMs: 200, requestTimeoutMs: 100 }),
+    /requestTimeoutMs must be >= headersTimeoutMs/,
+  );
+  assert.equal(
+    normalizeBrokerResourceBounds({ maxInflight: 3 }).maxInflightPerProvider,
+    3,
+    'the default per-provider ceiling coheres with a smaller explicit global ceiling',
+  );
+});
+
 // ── InflightLimiter (unit) ────────────────────────────────────────────────────
 
 test('InflightLimiter: admits to the ceiling, rejects past it, releases, and double-release is a no-op (#209)', () => {
@@ -157,6 +239,7 @@ test('/v1/fetch: an oversize Content-Length is fast-rejected 413 before the body
   const r = await post(port, '/v1/fetch', fetchBody({ query: { pad: 'A'.repeat(70_000) } }));
   assert.equal(r.status, 413);
   assert.equal(r.json.error, 'request body too large');
+  assert.equal(r.headers.connection, 'close', 'an over-cap request is never reusable');
 });
 
 test('/v1/fetch: an oversize chunked body (no Content-Length) is cut by the streamed counter 413 (#209)', async (t) => {
@@ -164,6 +247,19 @@ test('/v1/fetch: an oversize chunked body (no Content-Length) is cut by the stre
   const big = JSON.stringify(fetchBody({ query: { pad: 'A'.repeat(70_000) } }));
   const r = await chunkedPost(port, '/v1/fetch', big);
   assert.equal(r.status, 413);
+  assert.equal(r.headers.connection, 'close', 'a streamed over-cap request is never reusable');
+});
+
+test('/v1/fetch: declared oversize is answered and closed without waiting for the unread body (#209)', async (t) => {
+  const { port } = await buildBroker(t, { requestTimeoutMs: 2_000, headersTimeoutMs: 1_000 });
+  const result = await rawUntilClose(
+    port,
+    'POST /v1/fetch HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 70000\r\n\r\n',
+    1_000,
+  );
+  assert.match(result.text, /HTTP\/1\.1 413/);
+  assert.match(result.text.toLowerCase(), /connection: close/);
+  assert.ok(result.ms < 1_000, `unread oversize connection closed in ${result.ms}ms`);
 });
 
 // ── upstream deadline + client cancellation ───────────────────────────────────
@@ -198,7 +294,127 @@ test('/v1/fetch: a client disconnect aborts the in-flight upstream fetch (#209)'
   }
 });
 
+test('/v1/fetch: rejected upstream metadata is never reflected in the wire error (SEC-1)', async (t) => {
+  const { port } = await buildBroker(t);
+  const realFetch = globalThis.fetch;
+  const secretInHeader = 'ghp_header_value_must_not_leak';
+  globalThis.fetch = (async () => new Response('{}', {
+    status: 200,
+    headers: { 'content-type': `application/${secretInHeader}` },
+  })) as typeof fetch;
+  try {
+    const response = await post(port, '/v1/fetch', fetchBody());
+    assert.equal(response.status, 502);
+    assert.equal(response.json.error, 'disallowed content-type');
+    assert.doesNotMatch(JSON.stringify(response.json), new RegExp(secretInHeader));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 // ── concurrency ceilings ──────────────────────────────────────────────────────
+
+test('/v1/fetch: global admission runs before an asynchronous perimeter hook (#209)', async (t) => {
+  let authorizeCalls = 0;
+  let releaseAuthorize!: () => void;
+  const authorizeGate = new Promise<void>((resolve) => { releaseAuthorize = resolve; });
+  const { port } = await buildBroker(t, {
+    maxInflight: 1,
+    authorize: async () => {
+      authorizeCalls++;
+      await authorizeGate;
+    },
+  });
+  const up = barrierUpstream();
+  try {
+    const first = post(port, '/v1/fetch', fetchBody());
+    await waitFor(() => authorizeCalls === 1);
+    const second = await post(port, '/v1/fetch', fetchBody());
+    assert.equal(second.status, 503);
+    assert.equal(second.json.scope, 'global');
+    assert.equal(authorizeCalls, 1, 'rejected work never enters the async authorizer');
+    releaseAuthorize();
+    await waitFor(() => up.calls() === 1);
+    up.release();
+    assert.equal((await first).status, 200);
+  } finally {
+    releaseAuthorize();
+    up.release();
+    up.restore();
+  }
+});
+
+test('/v1/fetch: disconnect escapes an authorizer that ignores cancellation and releases admission (#209)', async (t) => {
+  let authorizeCalls = 0;
+  const { port } = await buildBroker(t, {
+    maxInflight: 1,
+    authorize: async (_req, _signal) => {
+      authorizeCalls++;
+      // Deliberately ignore the supplied signal on the first call. The broker's shared abort race
+      // must still escape this extension point; a cooperative authorizer can stop its own I/O too.
+      if (authorizeCalls === 1) await new Promise<void>(() => {});
+    },
+  });
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as typeof fetch;
+  try {
+    const data = Buffer.from(JSON.stringify(fetchBody()));
+    const req = http.request({
+      host: '127.0.0.1', port, path: '/v1/fetch', method: 'POST',
+      headers: { 'content-type': 'application/json', 'content-length': data.length },
+    });
+    req.on('error', () => { /* deliberate disconnect */ });
+    req.end(data);
+    await waitFor(() => authorizeCalls === 1);
+    req.destroy();
+    await waitFor(() => authorizeCalls === 1 && upstreamCalls === 0, 500);
+    assert.equal(upstreamCalls, 0, 'a request closed before authorization completed never reaches egress');
+
+    const healthy = await post(port, '/v1/fetch', fetchBody());
+    assert.equal(healthy.status, 200, 'the disconnected request released its only global slot');
+    assert.equal(authorizeCalls, 2, 'the next request reaches the authorizer instead of remaining overloaded');
+    assert.equal(upstreamCalls, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('/v1/fetch: a resolver that ignores cancellation is cut at the deadline and releases both slots (#209)', async (t) => {
+  let resolverCalls = 0;
+  const { port, vault } = await buildBroker(t, {
+    maxInflight: 1,
+    maxInflightPerProvider: 1,
+    fetchDeadlineMs: 80,
+    resolvers: {
+      ext: async (_ref, _signal) => {
+        resolverCalls++;
+        if (resolverCalls === 1) return await new Promise<string>(() => {});
+        return SECRET_TOKEN;
+      },
+    },
+  });
+  await vault.reference(O1, 'acme', { source: 'ext', secretRef: 'opaque-reference' });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('{"ok":true}', {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })) as typeof fetch;
+  try {
+    const timedOut = await post(port, '/v1/fetch', fetchBody());
+    assert.equal(timedOut.status, 504);
+    assert.equal(timedOut.json.error, 'upstream timed out');
+
+    const healthy = await post(port, '/v1/fetch', fetchBody());
+    assert.equal(healthy.status, 200, 'a hung resolver released the global and provider leases');
+    assert.equal(resolverCalls, 2);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
 
 test('/v1/fetch: the global in-flight ceiling returns 503 + Retry-After (#209)', async (t) => {
   const { port } = await buildBroker(t, { maxInflight: 1 });
@@ -306,6 +522,68 @@ test('createBroker: inbound server timeouts are set from the configured values (
   assert.equal(server.headersTimeout, 12_000);
   assert.equal(server.requestTimeout, 21_000);
   assert.equal(server.keepAliveTimeout, 7_000);
+  assert.equal((server as http.Server & { connectionsCheckingInterval: number }).connectionsCheckingInterval, 1_000);
+  assert.equal(server.timeout, 5 * 60_000, 'general socket inactivity is finite and preserves MCP duration');
+});
+
+test('createBroker: real slow headers and slow bodies are closed near their configured bounds (#209)', async (t) => {
+  const { port } = await buildBroker(t, {
+    headersTimeoutMs: 100,
+    requestTimeoutMs: 200,
+    keepAliveTimeoutMs: 100,
+  });
+
+  const slowHeaders = await rawUntilClose(
+    port,
+    'POST /v1/fetch HTTP/1.1\r\nHost: localhost',
+    1_000,
+  );
+  assert.match(slowHeaders.text, /HTTP\/1\.1 408/);
+  assert.ok(slowHeaders.ms < 1_000, `slow headers closed in ${slowHeaders.ms}ms`);
+
+  const slowBody = await rawUntilClose(
+    port,
+    'POST /v1/fetch HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{',
+    1_000,
+  );
+  assert.ok(slowBody.ms < 1_000, `slow body closed in ${slowBody.ms}ms`);
+});
+
+test('/readyz: concurrent probes share both DB checks until both settle (#209)', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  let queryCalls = 0;
+  let releaseHeld!: () => void;
+  const held = new Promise<void>((resolve) => { releaseHeld = resolve; });
+  const readinessDb = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === 'get' || property === 'all') {
+        return async (...args: [string, any[]?]) => {
+          queryCalls++;
+          if (queryCalls === 1) throw new Error('synthetic schema failure');
+          if (queryCalls === 2) await held;
+          return target[property](...args);
+        };
+      }
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const server = createBroker({
+    providers: [acme], vault, audit: new Audit(db), db: readinessDb,
+    identitySecret: identityConfig(SECRET),
+  });
+  const port = await listen(server);
+  t.after(() => server.close());
+
+  const first = get(port, '/readyz');
+  await waitFor(() => queryCalls === 2);
+  const second = get(port, '/readyz');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(queryCalls, 2, 'an immediate failure does not clear ownership while its sibling is live');
+  releaseHeld();
+  assert.equal((await first).status, 503);
+  assert.equal((await second).status, 503);
 });
 
 // ── account probe socket release ──────────────────────────────────────────────

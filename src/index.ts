@@ -38,10 +38,6 @@ export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
 // deployment can plug a shared backend via VouchrOptions/BrokerOptions.rateLimitStore.
 export { RateLimitedError } from './core/rateLimit';
 export type { RateLimitStore } from './core/rateLimit';
-// #209 in-flight admission control: the broker maps OverloadedError to 503 + Retry-After when a
-// per-process global or per-provider concurrency ceiling (BrokerOptions.maxInflight[PerProvider]) is
-// full. Exported so callers can catch/branch on an overload the same way they do a rate limit.
-export { OverloadedError } from './core/inflight';
 // #117 credential-health notifications: the hook types for VouchrOptions/BrokerOptions
 // `onCredentialHealth`, the persistent per-(owner, provider, type) DM debounce store for custom
 // notifiers, and the typed token-endpoint error carrying the definitive-vs-transient classification.

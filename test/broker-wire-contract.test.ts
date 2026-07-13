@@ -254,6 +254,43 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
       // U2 has no seeded acme credential → resolves owner, injector 409s (not connected).
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken({ userId: 'U2' }), method: 'GET', path: '/data' }); } finally { server.close(); }
   } },
+  { name: 'error.fetch.timeout.504', run: async (t) => {
+      const { server, port } = await makeBroker(t, { fetchDeadlineMs: 20 });
+      const real = globalThis.fetch;
+      globalThis.fetch = ((_url: unknown, init: RequestInit) => new Promise((_resolve, reject) => {
+        const signal = init.signal;
+        const abort = () => reject(signal?.reason ?? new DOMException('aborted', 'AbortError'));
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+      })) as any;
+      try {
+        return await request(port, 'POST', '/v1/fetch', {
+          handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'GET', path: '/data',
+        });
+      } finally {
+        globalThis.fetch = real;
+        server.close();
+      }
+  } },
+  { name: 'error.overloaded.503', run: async (t) => {
+      let entered!: () => void;
+      let release!: () => void;
+      const enteredAuthorize = new Promise<void>((resolve) => { entered = resolve; });
+      const authorizeGate = new Promise<void>((resolve) => { release = resolve; });
+      const { server, port } = await makeBroker(t, {
+        maxInflight: 1,
+        authorize: async () => { entered(); await authorizeGate; },
+      });
+      const first = request(port, 'GET', '/v1/manifest');
+      await enteredAuthorize;
+      try {
+        return await request(port, 'GET', '/v1/manifest');
+      } finally {
+        release();
+        await first;
+        server.close();
+      }
+  } },
   { name: 'error.admin.mode.forbidden.403', run: async (t) => {
       const { server, port } = await makeBroker(t);
       // Non-admin token; a forged body `isAdmin` must be ignored (authority = signed claim only).
