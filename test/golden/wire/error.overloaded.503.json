@@ -1,0 +1,8 @@
+{
+  "status": 503,
+  "shape": {
+    "error": "string",
+    "retryAfterMs": "number",
+    "scope": "string"
+  }
+}

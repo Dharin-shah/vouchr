@@ -391,9 +391,9 @@ POST /v1/admin/reference
 | `VOUCHR_SWEEP_INTERVAL_MS` | no | TTL sweep interval (#54). Default hourly; `0` defers to an external scheduler. |
 | `VOUCHR_BASE_URL` | for OAuth | public HTTPS origin of this broker; setting it mounts `POST /v1/connect` + the OAuth callback (#52). |
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
-| `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`). |
-| `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116): real gates, no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
-| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51). Off → user-only broker. |
+| `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
+| `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
+| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
@@ -418,7 +418,8 @@ egress, or supported behavior. Secrets come from the per-provider env vars above
     "scopesDefault": ["read:confluence-content.all"],
     "egressAllow": ["api.atlassian.com"],
     "refresh": "rotating",
-    "pkce": true
+    "pkce": true,
+    "oauthTimeoutMs": 10000
   }
 ]
 ```
@@ -433,6 +434,10 @@ The validator is strict and fail-fast at config load:
   exchange and revoke POSTs are not behind the egress gate, so a downgraded endpoint would leak the
   code / client secret / token in cleartext — hence the check. Token, refresh, revoke, and built-in
   account-probe requests also refuse redirects rather than forwarding credentials to another URL.
+- **`oauthTimeoutMs`** — one provider-level deadline for token exchange, token refresh, upstream
+  revoke, and the built-in account probe. It defaults to `10000` and must be a positive safe integer
+  within Node's timer range. Configure it on the provider definition/JSON, not as a process-global
+  environment variable, so a deliberately slow OAuth provider does not weaken every other provider.
 - **`egressAllow`** hosts are lower-cased and must be bare hostnames (no scheme/port/path);
   **`egressPaths`** must be absolute (`/repos`); **`egressMethods`** are normalized (`" post "` →
   `POST`). Canonicalizing once at load means the value the injector compares at egress is exactly what
@@ -444,7 +449,7 @@ The validator is strict and fail-fast at config load:
   `redirect_uri` would defeat the single-use CSRF `state`.
 - The full declarative surface also includes `scopeDescriptions` (non-blank, escaped per-scope
   consent copy; scope ids/descriptions are at most 512 characters and the default list at most 48),
-  `publicClient` (PKCE-only, no secret), `revokeAuth` (`none`/`body`), `egressResponse`
+  `publicClient` (PKCE-only, no secret), `revokeAuth` (`none`/`body`), `oauthTimeoutMs`, `egressResponse`
   (`maxBytes` / `allowContentTypes` / `stripHeaders`), and `rateLimit` (`perMinute` / `burst`) —
   each validated identically to its in-code form.
 
@@ -689,6 +694,54 @@ recommend:
 The KMS envelope is a recommendation, not an enforced precondition: Vouchr will boot without it.
 Enabling KMS in the reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding
 `@aws-sdk/client-kms` to the image together.
+
+### Resource bounds and the scaling envelope (#209)
+
+The broker applies finite defaults to HTTP admission, bodies, responses, network time, and graceful
+shutdown so slow, malformed, cancelled, or oversized traffic cannot grow work without a configured
+bound. The packaged broker validates each override at boot.
+
+| Env | Default | What it bounds |
+|---|---|---|
+| `VOUCHR_FETCH_DEADLINE_MS` | `30000` | Wall-clock deadline for a `/v1/fetch` upstream call (headers **and** body). A hung provider is cut → `504`; a client disconnect aborts the upstream fetch immediately. `/v1/mcp` streams use `maxStreamMs` instead. |
+| `VOUCHR_MAX_INFLIGHT` | `200` | Per-instance **global** concurrent HTTP-work ceiling. Over it → `503` + `Retry-After`, refused before the request body is buffered. |
+| `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` | `40` | Per-**provider** concurrent ceiling, so one slow provider cannot consume the whole global budget. Over it → `503` (`scope: "provider"`). An explicit value must be ≤ `VOUCHR_MAX_INFLIGHT`; when omitted, it defaults to `min(40, global)`. |
+| `VOUCHR_HEADERS_TIMEOUT_MS` | `15000` | Max time a client may take to send request headers. |
+| `VOUCHR_REQUEST_TIMEOUT_MS` | `30000` | Max time for the whole inbound request (a slow-loris body drip is cut here). Must be ≥ headers timeout. |
+| `VOUCHR_KEEPALIVE_TIMEOUT_MS` | `10000` | Idle keep-alive socket lifetime. On `SIGTERM`/`SIGINT` the broker also `closeIdleConnections()` so drain completes on in-flight requests alone. |
+| `VOUCHR_SHUTDOWN_TIMEOUT_MS` | `10000` | Graceful-drain deadline after `SIGTERM`/`SIGINT`. At the deadline remaining connections are terminated and the process exits non-zero. |
+
+OAuth control-plane calls use the provider definition's `oauthTimeoutMs` (default `10000`), shared
+by token exchange/refresh, revoke, and built-in account probes. This applies to both Bolt and the
+headless broker; the environment table above contains only packaged-broker process bounds.
+
+These are **per broker instance** — normally one instance per process — by design (no Redis and no
+distributed semaphore). For `R` replicas, global limit `G`, per-provider limit `P`, and `N` providers
+receiving work at once, the instantaneous fleet upper bound is:
+
+```
+fleet upper bound = R × min(G, N × P)
+one-provider upper bound = R × min(G, P)
+```
+
+`R × G` is therefore an absolute upper bound, not a throughput promise: one hot provider reaches its
+own `R × P` bound first, and database, KMS, CPU, provider latency, and the load balancer determine
+served throughput. Beyond either applicable ceiling the broker sheds load with `503` + `Retry-After`.
+The token bucket (`provider.rateLimit`) is orthogonal — it limits requests per window per
+(owner, provider); the in-flight ceiling limits simultaneous work.
+
+Admission makes buffered memory scale with configured body/response caps and admitted work instead
+of request count without limit. Do not treat `cap × in-flight` as an exact RSS figure: parsing,
+serialization, protocol buffers, and the host runtime create additional copies. Measure the exact
+image and workload before setting pod memory limits.
+
+Measure the envelope with the opt-in harness (`npm run bench:perf`, needs `VOUCHR_TEST_PG_URL`). It
+uses one PostgreSQL pool per simulated replica, honours `Retry-After`, and reports successful
+throughput, successful/all-attempt P50/P95/P99 latency, overloads, peak process RSS, aggregate pool
+sessions, and local KMS-shaped envelope call counts. Tune `BENCH_REPLICAS`, `BENCH_MAX_INFLIGHT`,
+`BENCH_MAX_INFLIGHT_PER_PROVIDER`, `BENCH_CONCURRENCY`, `BENCH_DURATION_MS`, and `PROVIDER_MS`.
+The KMS adapter in this harness is local and records call count only; the production-deployment proof
+must repeat representative load with the real configured KMS and exact container image.
 
 ## Slack app + OAuth install flow
 

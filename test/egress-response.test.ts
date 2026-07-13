@@ -324,8 +324,8 @@ test('response: a compliant response under maxBytes+allowContentTypes passes; .j
   }
 });
 
-test('response: no knob + no set-cookie returns the untouched original Response (zero behavior change)', async (t) => {
-  let original: Response | null = null;
+test('response: no knob + no set-cookie preserves the response contract while retaining deadline cleanup', async (t) => {
+  let original!: Response;
   const up = stubFetch(() => {
     original = new Response('{"a":1}', { status: 200, headers: { 'content-type': 'application/json' } });
     return original;
@@ -333,7 +333,14 @@ test('response: no knob + no set-cookie returns the untouched original Response 
   try {
     const { handle } = await makeHandle(t, provider('untouched'));
     const res = await handle.fetch('https://api.acme.example/rows');
-    assert.equal(res, original, 'a compliant response with nothing to strip must pass through untouched');
+    // The injector may wrap the body so its finite deadline remains active until the caller consumes
+    // or cancels it. Object identity is not part of the fetch contract; status, headers, URL, and bytes
+    // are. Keep this regression focused on those observable semantics.
+    assert.equal(res.status, original.status);
+    assert.equal(res.statusText, original.statusText);
+    assert.equal(res.headers.get('content-type'), original.headers.get('content-type'));
+    assert.equal(res.url, original.url);
+    assert.equal(await res.text(), '{"a":1}');
   } finally {
     up.restore();
   }

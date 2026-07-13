@@ -1227,10 +1227,9 @@ export async function createVouchr(opts: VouchrOptions) {
           state == null ? undefined : String(state),
           error == null ? undefined : String(error),
         );
-        // SEC-5 (#177): the error path can echo the provider-controlled `error` query param
-        // (`OAuth error: <x>`). Express defaults a string `send()` to text/html, so serve it as
-        // text/plain + nosniff — injected markup renders as inert text instead of executing. The
-        // success path below opts into text/html explicitly for the rendered landing page.
+        // SEC-1/SEC-5 (#177): core returns a static error and never reflects the provider-controlled
+        // query value. Keep text/plain + nosniff as defense in depth; the success path below opts
+        // into text/html explicitly for the rendered landing page.
         if (!result.ok) {
           return res
             .status(result.status)

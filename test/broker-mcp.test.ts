@@ -367,6 +367,26 @@ test('#65 mcp: maxStreamMs aborts a stream that never ends', async (t) => {
   }
 });
 
+test('#209 mcp: maxStreamMs returns 504 when upstream never produces headers', async (t) => {
+  const { server, port } = await makeMcpBroker(t, { maxStreamMs: 80 });
+  const up = mockUpstream((_url, init) => new Promise<Response>((_resolve, reject) => {
+    const signal = init.signal as AbortSignal;
+    const abort = () => reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  }));
+  try {
+    const r = await postRaw(port, '/v1/mcp', envelope());
+    assert.equal(r.status, 504);
+    assert.equal(r.clean, true, 'a pre-header timeout is a complete JSON error, not a torn stream');
+    assert.deepEqual(JSON.parse(r.raw), { error: 'upstream timed out' });
+    assert.equal(up.seen[0].signal?.aborted, true, 'the deadline closes the upstream request');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 // ── #110 composition: a provider egressResponse.maxBytes stricter than the stream ceiling wins ──
 
 test('#65 mcp: provider egressResponse.maxBytes (stricter) denies with 413 before any byte is relayed', async (t) => {
@@ -514,7 +534,7 @@ test('#65 mcp: a text/plain upstream reflecting the injected Authorization is wi
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
     assert.equal(r.status, 502);
-    assert.equal(JSON.parse(r.raw).error, 'disallowed content-type: text/plain');
+    assert.equal(JSON.parse(r.raw).error, 'disallowed content-type');
     assert.ok(!r.raw.includes(SECRET_TOKEN), 'the reflected credential never reaches the caller');
   } finally {
     up.restore();
@@ -553,7 +573,7 @@ test('#65 mcp: createBroker rejects NaN/Infinity/zero/negative stream ceilings; 
 
 // ── MCP spec: unsupported GET listening stream / DELETE termination answer 405, not 404 ──
 
-test('#65 mcp: GET and DELETE on /v1/mcp -> 405 with Allow: POST, no gates run, zero upstream hits', async (t) => {
+test('#65 mcp: GET and DELETE on /v1/mcp -> 405 with Allow: POST, no provider gates, zero upstream hits', async (t) => {
   const { server, port } = await makeMcpBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {

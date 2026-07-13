@@ -7,6 +7,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Bounded network, memory, and concurrency at the HTTP boundary** (#209). The broker now applies
+  finite admission, request, response, and time limits so slow, malformed, cancelled, or oversized
+  HTTP traffic cannot grow work without a configured bound. `/v1/fetch` upstream calls carry a finite, configurable deadline
+  (`VOUCHR_FETCH_DEADLINE_MS`, default 30s) composed with client-disconnect cancellation — a hung
+  provider is cut with `504` and the upstream socket released; the injector applies the same default
+  to Bolt/direct callers and composes it with any caller cancellation, and the four built-in
+  `accountProbe`s now carry a deadline, bounded response, and socket cleanup. Provider definitions
+  gain one validated `oauthTimeoutMs` (default 10s) shared by token exchange/refresh, revoke, and
+  built-in account probes. New per-process in-flight ceilings —
+  global (`VOUCHR_MAX_INFLIGHT`, default 200) and per-provider (`VOUCHR_MAX_INFLIGHT_PER_PROVIDER`,
+  default 40) — shed excess load with `503` + `Retry-After` before a body is buffered, and are
+  in-process by design (the global fleet upper bound is replicas × per-process global; each
+  provider is also capped separately; no Redis or distributed semaphore). Inbound requests gain a
+  `Content-Length` fast-reject plus server
+  `headersTimeout`/`requestTimeout`/`keepAliveTimeout` (`VOUCHR_HEADERS_TIMEOUT_MS` /
+  `VOUCHR_REQUEST_TIMEOUT_MS` / `VOUCHR_KEEPALIVE_TIMEOUT_MS`), and shutdown now
+  `closeIdleConnections()` so drain completes on in-flight work alone. A 401-triggered refresh still
+  updates the credential but replays only idempotent methods — a non-idempotent write is never
+  auto-resent. The exported `BrokerError` wire type now describes overload `scope` and retry hints;
+  new `BrokerOptions` configure fetch, admission, and inbound timeout bounds, while the packaged
+  broker exposes a separate graceful-shutdown deadline. Opt-in load harness: `npm run bench:perf`.
 - **Deployment-bound, replay-safe broker identity assertions** (#212). A signed identity token is now
   bound to one deployment: the packaged broker builds an `IdentityConfig` from env
   (`loadIdentityConfig`) with a verified issuer (`VOUCHR_IDENTITY_ISSUER`, default `vouchr`) and

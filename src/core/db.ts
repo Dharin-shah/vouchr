@@ -1,5 +1,5 @@
 import { Pool, types, type PoolClient } from 'pg';
-import { isPostgresUrl } from './options';
+import { isPostgresUrl, optionalPositiveEnv } from './options';
 
 /**
  * Minimal async data handle over the store. Vouchr is PostgreSQL-only (#204): multi-replica
@@ -366,13 +366,7 @@ function schema(): string {
 /** Validated pool size from `VOUCHR_PG_POOL_MAX` (pg's default when unset). A non-integer or < 1
  *  value fails closed rather than silently becoming NaN/0 and starving the pool. */
 function poolMax(): number | undefined {
-  const raw = process.env.VOUCHR_PG_POOL_MAX;
-  if (raw === undefined || raw === '') return undefined;
-  const n = Number(raw);
-  if (!Number.isInteger(n) || n < 1) {
-    throw new Error(`vouchr: VOUCHR_PG_POOL_MAX must be a positive integer, got "${raw}".`);
-  }
-  return n;
+  return optionalPositiveEnv(process.env.VOUCHR_PG_POOL_MAX, 'VOUCHR_PG_POOL_MAX', { integer: true });
 }
 
 /** Resolve + validate the connection string and build a pool. No DDL, no schema check — the shared

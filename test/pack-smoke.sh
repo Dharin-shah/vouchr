@@ -34,6 +34,7 @@ echo "==> require() every published entrypoint (CJS exports map)"
     for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity']) {
       if (typeof surface[name] !== 'function') throw new Error('missing packed identity export: ' + name);
     }
+    if ('OverloadedError' in surface) throw new Error('internal overload error leaked into public API');
   }
   const identity = headless.loadIdentityConfig({
     VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
@@ -59,7 +60,7 @@ cat > "$CONSUMER/consumer.ts" <<'TS'
 import { createVouchr } from '@vouchr/core';
 import {
   createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
-  type BrokerFetchResponse, type BrokerOptions, type IdentityConfig,
+  type BrokerError, type BrokerFetchResponse, type BrokerOptions, type IdentityConfig,
 } from '@vouchr/core/headless';
 
 const identity: IdentityConfig = loadIdentityConfig({
@@ -74,6 +75,8 @@ const noReplayOverride: false = null as unknown as HasReplayOverride;
 const noSkewKnob: false = null as unknown as HasSkewKnob;
 void noReplayOverride;
 void noSkewKnob;
+const overload: BrokerError = { error: 'overloaded', scope: 'provider', retryAfterMs: 1000 };
+void overload;
 
 // Type-level only — never executed. Proves the type entrypoints resolve and the shapes exist.
 export function _smoke(r: BrokerFetchResponse): number {

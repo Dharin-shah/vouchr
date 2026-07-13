@@ -366,9 +366,9 @@ test('injector: an audit failure during refresh does NOT roll back or fail the r
   }
 });
 
-test('injector: the /token refresh fetch is given a bounded (10s) abort signal', async (t) => {
-  // A refresh runs while holding the advisory lock + refresh-pool connection; without a timeout a hung
-  // /token endpoint would pin both. Assert the signal is armed (~10s) — captured, not waited on.
+test('injector: the /token refresh fetch carries the composed abort signal', async (t) => {
+  // A refresh runs while holding the advisory lock + refresh-pool connection; without a signal a hung
+  // /token endpoint would pin both. http-bounds tests exercise the actual caller/deadline abort paths.
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -379,9 +379,6 @@ test('injector: the /token refresh fetch is given a bounded (10s) abort signal',
   await vault.upsert(O1, 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: null, externalAccount: null });
 
   const realFetch = globalThis.fetch;
-  const realTimeout = AbortSignal.timeout;
-  let tokenSignalMs = -1;
-  (AbortSignal as any).timeout = (ms: number) => { tokenSignalMs = ms; return realTimeout.call(AbortSignal, ms); };
   globalThis.fetch = (async (url: any, init: any) => {
     if (String(url) === 'https://acme.example/token') {
       assert.ok(init.signal instanceof AbortSignal); // the refresh fetch carries an abort signal
@@ -394,10 +391,56 @@ test('injector: the /token refresh fetch is given a bounded (10s) abort signal',
   try {
     const res = await new ConnectionHandle(provider, O1, ID, vault, audit).fetch('https://api.acme.example/thing');
     assert.equal(res.status, 200);
-    assert.equal(tokenSignalMs, 10_000); // TOKEN_FETCH_TIMEOUT_MS — bounded, not unbounded
+    await res.body?.cancel(); // releases the injector's disposable response deadline
   } finally {
     globalThis.fetch = realFetch;
-    (AbortSignal as any).timeout = realTimeout;
+  }
+});
+
+test('injector: refresh cancellation rolls back and releases the dedicated Postgres pool client', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const provider = defineProvider({
+    id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+    scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
+    clientId: 'id', clientSecret: 'sec', oauthTimeoutMs: 1_000,
+  });
+  await vault.upsert(O1, 'acme', {
+    accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: Date.now(), externalAccount: null,
+  });
+
+  const caller = new AbortController();
+  const realFetch = globalThis.fetch;
+  let started!: () => void;
+  const tokenStarted = new Promise<void>((resolve) => { started = resolve; });
+  globalThis.fetch = ((_url: unknown, init: RequestInit) => new Promise((_resolve, reject) => {
+    const signal = init.signal as AbortSignal;
+    started();
+    const abort = () => reject(signal.reason);
+    if (signal.aborted) abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  })) as any;
+  try {
+    const pending = new ConnectionHandle(provider, O1, ID, vault, new Audit(db))
+      .fetch('https://api.acme.example/thing', { signal: caller.signal });
+    await tokenStarted; // the refresh transaction holds one checked-out client here
+    caller.abort(new DOMException('caller left', 'AbortError'));
+    await assert.rejects(pending, (error: any) => error?.name === 'AbortError');
+
+    const refreshPool = (db as any).refreshPool as {
+      totalCount: number;
+      idleCount: number;
+      waitingCount: number;
+    };
+    for (let attempt = 0; attempt < 100 && refreshPool.idleCount !== refreshPool.totalCount; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.ok(refreshPool.totalCount > 0, 'the regression must exercise the real refresh pool');
+    assert.equal(refreshPool.idleCount, refreshPool.totalCount, 'no refresh client remains checked out');
+    assert.equal(refreshPool.waitingCount, 0, 'no refresh caller remains queued');
+    assert.equal((await vault.get(O1, 'acme'))?.accessToken, 'old', 'the cancelled rotation rolled back');
+  } finally {
+    globalThis.fetch = realFetch;
   }
 });
 

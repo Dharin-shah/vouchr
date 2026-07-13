@@ -133,8 +133,8 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
 
 test('integration: OAuth callback error is served as inert text/plain, not text/html (#177)', async (t) => {
   // A hostile provider can redirect the victim back with ?error=<markup> holding a valid in-flight
-  // state; the callback echoes it into `OAuth error: <x>`. Express would default a string send to
-  // text/html and execute the markup on the Vouchr host origin. The route must serve it as text/plain.
+  // state. Core must not reflect that provider-controlled value at all; text/plain + nosniff remains
+  // defense in depth for every static callback failure.
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const mock = await startMockProvider();
   try {
@@ -162,7 +162,8 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
     assert.equal(res.statusCode, 400);
     assert.match(String(res.headers['content-type']), /text\/plain/); // never text/html
     assert.equal(res.headers['x-content-type-options'], 'nosniff'); // and no content sniffing back to html
-    assert.ok(res.body.includes(evil)); // the value is present, but as inert text under text/plain
+    assert.equal(res.body, 'OAuth authorization was denied. Please try again.');
+    assert.ok(!res.body.includes(evil), 'provider-controlled error text must never reach output');
   } finally {
     await mock.close();
   }
