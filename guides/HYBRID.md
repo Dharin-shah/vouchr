@@ -5,29 +5,6 @@ a separate process, service, or language. The public Slack/Bolt service handles 
 configuration, Slack interactions, and offboarding. A private headless broker resolves and injects
 credentials for the worker.
 
-> [!WARNING]
-> This is Vouchr's intended split-process architecture, but Vouchr is still **Alpha** and the stock
-> deployment does not yet enforce every control end to end. In particular:
->
-> - [#240](https://github.com/Dharin-shah/vouchr/issues/240): the packaged broker does not yet load
->   and enforce the channel tool allowlist written by the Slack UI;
-> - [#236](https://github.com/Dharin-shah/vouchr/issues/236): the packaged broker cannot yet load a
->   declarative, default-deny channel `Policy`;
-> - [#53](https://github.com/Dharin-shah/vouchr/issues/53): the headless secret-reference contract is
->   still inconsistent with the validated Slack path;
-> - [#209](https://github.com/Dharin-shah/vouchr/issues/209): the AWS Secrets Manager example does not
->   yet propagate request cancellation into the underlying SDK call;
-> - [#194](https://github.com/Dharin-shah/vouchr/issues/194): the complete recovery bridge between
->   broker errors and Slack prompts is not finished, especially for session and write approvals;
-> - [#239](https://github.com/Dharin-shah/vouchr/issues/239): fleet-wide containment, invalidation,
->   and recovery must prevent stale assertions or restored backups from resurrecting access; and
-> - [#241](https://github.com/Dharin-shah/vouchr/issues/241): multi-workspace Slack installation
->   tokens still use direct master-key encryption rather than the required KMS envelope.
->
-> Until those issues close, do not claim that Slack's Enable/Disable control is enforced by the
-> packaged broker, do not expose headless reference-administration routes, and do not call this shape
-> production-ready. Use the Slack credential modal for references and verify every gate in staging.
-
 This guide describes both the target architecture and the honest current behavior. The canonical
 product boundaries remain in [`vision.md`](../vision.md); the security model remains in
 [`SECURITY.md`](../SECURITY.md).
