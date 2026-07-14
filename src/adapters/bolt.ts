@@ -1298,12 +1298,41 @@ export async function createVouchr(opts: VouchrOptions) {
     action: (id: string, handler: (args: any) => Promise<void>) => void;
     event?: (name: string, handler: (args: any) => Promise<void>) => void;
   }): void {
+    // The command reference. ONLY subcommands that actually exist appear here (#194: never advertise a
+    // command that doesn't exist). Plain text + code spans — legible without colour or emoji, so it
+    // reads the same for keyboard and screen-reader users.
+    const HELP_TEXT = [
+      '*Vouchr commands*',
+      '• `/vouchr` — open the settings panel for this channel',
+      '• `/vouchr help` — show this command reference',
+      '• `/vouchr status` — your connected accounts',
+      '• `/vouchr tools` — the providers an agent may use in this channel',
+      '• `/vouchr disconnect <provider>` — remove your connection to a provider',
+      '• `/vouchr audit` — where your credentials have been used',
+      '',
+      '*Admin (this channel)*',
+      '• `/vouchr enable <provider>` — allow a provider here',
+      '• `/vouchr disable <provider>` — block a provider here',
+      '• `/vouchr mode <provider> <shared|per-user|session>` — set the credential model',
+      '• `/vouchr configure <provider>` — set a channel-shared credential (opens a private modal)',
+      '• `/vouchr stats` — 30-day usage for this channel',
+      '• `/vouchr audit channel` — this channel’s shared-credential usage',
+    ].join('\n');
+    // Raw command arguments can be credential-shaped (for example, a token pasted in the provider
+    // position). SEC-1 therefore forbids reflecting an unknown value even after mrkdwn escaping:
+    // escaping prevents injection, not disclosure. Keep one static, actionable response for every
+    // provider-taking command.
+    const UNKNOWN_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr tools` to see the registered providers.';
+    const UNKNOWN_DISCONNECT_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr status` to see your connected accounts.';
+
     app.command('/vouchr', async ({ command, ack, respond, client }: any) => {
       await ack();
       const identity = resolveIdentity({ body: command });
       if (!identity) return respond('Could not resolve your Slack identity.');
 
-      const [sub, arg, arg2] = String(command.text ?? '').trim().split(/\s+/);
+      const text = String(command.text ?? '').trim();
+      const words = text ? text.split(/\s+/) : [];
+      const [sub, arg, arg2] = words;
 
       // No subcommand → open the interactive config modal (#109). `/vouchr status` (and any other
       // subcommand) keeps its text output below, so scripts and muscle memory are unaffected. A modal
@@ -1320,11 +1349,12 @@ export async function createVouchr(opts: VouchrOptions) {
 
       // List the channel's tool manifest (which providers an agent may use here + their mode).
       if (sub === 'tools') {
+        if (words.length !== 1) return respond('Usage: `/vouchr tools`');
         if (!command.channel_id) return respond('Run `/vouchr tools` from inside a channel.');
         const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
         if (!manifest.length) return respond('No providers are registered.');
         const lines = manifest
-          .map((m) => `• *${m.provider}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${m.mode})` : ''}${m.visibility === 'private' ? ' · :lock: private previews' : ''}`)
+          .map((m) => `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${escapeMrkdwn(m.mode)})` : ''}${m.visibility === 'private' ? ' · private previews (:lock:)' : ''}`)
           .join('\n');
         return respond(`Tools for <#${command.channel_id}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`);
       }
@@ -1333,6 +1363,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // used, by how many distinct humans, and which are idle dead-weight to prune. Admin-gated (same
       // gate as enable/mode) + audited on refusal. Service tools aren't brokered, so they're excluded.
       if (sub === 'stats') {
+        if (words.length !== 1) return respond('Usage: `/vouchr stats`');
         if (!command.channel_id) return respond('Run `/vouchr stats` from inside a channel.');
         if (!(await commandAdmin(client, identity, command.channel_id))) {
           await audit.record('denied', identity, 'stats', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
@@ -1350,9 +1381,9 @@ export async function createVouchr(opts: VouchrOptions) {
       // An ineligible channel class (archived / ext-shared / DM) throws a UserFacingError inside the
       // helper, surfaced like the `mode` branch does.
       if (sub === 'enable' || sub === 'disable') {
-        if (!arg) return respond(`Usage: \`/vouchr ${sub} <provider>\``);
+        if (words.length !== 2) return respond(`Usage: \`/vouchr ${sub} <provider>\``);
         if (!command.channel_id) return respond(`Run \`/vouchr ${sub}\` from inside the channel you want to configure.`);
-        if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
+        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         const on = sub === 'enable';
         try {
           if ((await setChannelToolEnabled(client, identity, command.channel_id, arg, on)) === 'denied') {
@@ -1361,32 +1392,32 @@ export async function createVouchr(opts: VouchrOptions) {
         } catch (e) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
-        return respond(`${on ? 'Enabled' : 'Disabled'} *${arg}* in <#${command.channel_id}>.`);
+        return respond(`${on ? 'Enabled' : 'Disabled'} *${escapeMrkdwn(arg)}* in <#${command.channel_id}>.`);
       }
 
       // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant).
       // Admin-gated + audited in setChannelMode.
       if (sub === 'mode') {
-        if (!arg || !isChannelMode(arg2)) {
+        if (words.length !== 3 || !arg || !isChannelMode(arg2)) {
           return respond('Usage: `/vouchr mode <provider> <shared|per-user|session>`');
         }
-        if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
+        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');
         try {
           await contextFor(identity, command.channel_id, client).setChannelMode(arg, arg2);
         } catch (e) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
-        return respond(`Set *${arg}* to *${arg2}* in <#${command.channel_id}>.`);
+        return respond(`Set *${escapeMrkdwn(arg)}* to *${escapeMrkdwn(arg2)}* in <#${command.channel_id}>.`);
       }
 
       // Per-channel preview visibility: private = agent output goes only to the requester, with an
       // explicit Share button. Admin-gated + audited in setChannelVisibility (same gate as `mode`).
       if (sub === 'preview') {
-        if (!arg || !isPreviewVisibility(arg2)) {
+        if (words.length !== 3 || !arg || !isPreviewVisibility(arg2)) {
           return respond('Usage: `/vouchr preview <provider> <public|private>`');
         }
-        if (!registry.has(arg)) return respond(`Unknown provider "${arg}". See \`/vouchr tools\` for the registered ones.`);
+        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         if (!command.channel_id) return respond('Run `/vouchr preview` from inside the channel you want to configure.');
         try {
           await contextFor(identity, command.channel_id, client).setChannelVisibility(arg, arg2);
@@ -1394,18 +1425,18 @@ export async function createVouchr(opts: VouchrOptions) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
         return respond(arg2 === 'private'
-          ? `Set *${arg}* previews to *private* in <#${command.channel_id}>: results go only to whoever asked, with a Share button.`
-          : `Set *${arg}* previews to *public* in <#${command.channel_id}>.`);
+          ? `Set *${escapeMrkdwn(arg)}* previews to *private* in <#${command.channel_id}>: results go only to whoever asked, with a Share button.`
+          : `Set *${escapeMrkdwn(arg)}* previews to *public* in <#${command.channel_id}>.`);
       }
 
       if (sub === 'configure') {
-        if (!arg) return respond('Usage: `/vouchr configure <provider>`');
+        if (words.length !== 2) return respond('Usage: `/vouchr configure <provider>`');
         if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
         // Validate the provider BEFORE recording a denial or opening the modal (parity with enable/disable):
         // otherwise an unvalidated arg — potentially a credential-shaped typo — lands raw in the audit
         // `provider` column and could be reflected back into a `/vouchr audit` view. The gate + denial
         // audit + modal open is openConfigureModal, shared with the App Home Configure button (STR-3).
-        if (!registry.has(arg)) return respond(`Unknown provider "${arg}".`);
+        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         try {
           if ((await openConfigureModal(client, identity, command.channel_id, arg, command.trigger_id)) === 'denied') {
             return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
@@ -1416,18 +1447,36 @@ export async function createVouchr(opts: VouchrOptions) {
         return;
       }
       if (sub === 'disconnect') {
-        if (!arg) return respond('Usage: `/vouchr disconnect <provider>`');
+        if (words.length !== 2) return respond('Usage: `/vouchr disconnect <provider>`');
+        // SEC-4: validate BEFORE the delete + audit `revoke` row + `revoked` event, so an unknown/typo
+        // provider (potentially credential-shaped) never lands raw in an audit column or an event.
+        if (!registry.has(arg)) return respond(UNKNOWN_DISCONNECT_PROVIDER_TEXT);
+        const p = escapeMrkdwn(arg); // SEC-5, even for a registry-validated id
         // Shared with the headless broker's /v1/disconnect (core disconnectProvider): local delete
-        // FIRST, then best-effort upstream revoke — a revoke failure is non-fatal.
-        const { ok } = await disconnectProvider(vault, audit, registry, identity, arg);
+        // FIRST, then best-effort upstream revoke — a revoke failure is non-fatal. `removed` = a row
+        // actually existed; `ok` = no upstream revocation debt was left. Report both truthfully (#194).
+        let removed: boolean;
+        let ok: boolean;
+        try {
+          ({ removed, ok } = await disconnectProvider(vault, audit, registry, identity, arg));
+        } catch {
+          // DELETE and audit failures are deliberately indistinguishable here: the former may have
+          // left the credential in place, while the latter happens after deletion. Never echo a DB/
+          // KMS error; give one state-agnostic way to discover the committed outcome (#194 UX-1/5).
+          return respond('Could not confirm whether the account was disconnected. Run `/vouchr status` to check; if it is still listed, try again.');
+        }
         emit({ type: 'revoked', provider: arg, ok });
-        return respond(`Disconnected *${arg}*. The agent can no longer act as you on ${arg}.`);
+        if (!removed) return respond(`You have no connected *${p}* account, so there was nothing to disconnect.`);
+        return respond(ok
+          ? `Disconnected *${p}*. The agent can no longer act as you on ${p}.`
+          : `Disconnected *${p}* locally, but the upstream token revoke could not be confirmed. Revoke or rotate Vouchr’s access in ${p} directly.`);
       }
 
       // Self-service transparency: where your credential was used. `audit channel` (admin-gated) shows
       // this channel's channel-owned usage. Strictly scoped by the SELECT — a non-admin only ever sees
       // rows attributed to their own user id, never another user's or another channel's.
       if (sub === 'audit') {
+        if (words.length > 2 || (arg && arg !== 'channel')) return respond('Usage: `/vouchr audit [channel]`');
         if (arg === 'channel') {
           if (!command.channel_id) return respond('Run `/vouchr audit channel` from inside the channel.');
           if (!(await commandAdmin(client, identity, command.channel_id))) {
@@ -1439,6 +1488,21 @@ export async function createVouchr(opts: VouchrOptions) {
         }
         const rows = await audit.listByOwnerUser(identity, 20);
         return respond({ text: 'Your credential usage', blocks: auditBlocks(rows, 'Your credential usage') as any });
+      }
+
+      // Explicit `help` — the command reference. Lists only commands that actually exist (#194).
+      if (sub === 'help') {
+        if (words.length !== 1) return respond('Usage: `/vouchr help`');
+        return respond(HELP_TEXT);
+      }
+
+      if (sub === 'status' && words.length !== 1) return respond('Usage: `/vouchr status`');
+
+      // `status` (and a bare `/vouchr` whose modal open failed) → the connected-accounts view below.
+      // Any OTHER leftover token is an unrecognized subcommand (a typo): guide to `help` without
+      // reflecting the raw token. It may be a credential pasted in the wrong position (SEC-1).
+      if (sub && sub !== 'status') {
+        return respond('Unknown subcommand. Run `/vouchr help` to see what you can do.');
       }
 
       // Never list a service-to-service tool as a "connected account": Vouchr doesn't broker those,

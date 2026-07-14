@@ -634,20 +634,25 @@ export function connectedDmText(provider: string, account: string | null): strin
 
 /** Message shown when a user declines consent (or consent is required and not granted). */
 export function consentDeniedBlocks(provider: string, reason?: string): unknown[] {
-  const why = reason ?? `You haven't allowed ${provider} for this request.`;
+  const p = escapeMrkdwn(provider);
+  // Keep the optional parameter for source compatibility, but never render arbitrary caller text:
+  // it may be a raw provider/OAuth error containing credential material. Stable copy is the only
+  // safe contract until the typed safe-message mapper in the remaining #194 API slice owns it.
+  void reason;
+  const why = `You haven't allowed ${p} for this request.`;
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text:
-          `:no_entry: *${provider} not authorized*\n` +
+          `:no_entry: *${p} not authorized*\n` +
           `${why} Nothing was sent on your behalf.`,
       },
     },
     {
       type: 'context',
-      elements: [{ type: 'mrkdwn', text: `Re-run the request to be prompted again, or connect with \`/vouchr connect ${provider}\`.` }],
+      elements: [{ type: 'mrkdwn', text: 'Re-run the request to be prompted to connect again.' }],
     },
   ];
 }
@@ -658,7 +663,7 @@ export function statusBlocks(connections: Connection[]): unknown[] {
     return [
       {
         type: 'section',
-        text: { type: 'mrkdwn', text: ":information_source: *No connections yet*\nUse `/vouchr connect <provider>` to get started." },
+        text: { type: 'mrkdwn', text: ':information_source: *No connections yet*\nConnections are created on demand — an agent prompts you to connect when it needs one.' },
       },
     ];
   }
@@ -671,15 +676,16 @@ export function statusBlocks(connections: Connection[]): unknown[] {
 /** Ephemeral confirm-prompt: a destructive button to disconnect `provider`.
  *  `provider` rides in the button value so the action handler removes the exact credential. */
 export function disconnectConfirmBlocks(provider: string): unknown[] {
+  const p = escapeMrkdwn(provider);
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text:
-          `:warning: *Disconnect ${provider}?*\n` +
-          `Vouchr will delete your stored ${provider} credential. The agent won't be able to act as ` +
-          `you on ${provider} until you connect again.`,
+          `:warning: *Disconnect ${p}?*\n` +
+          `Vouchr will delete your stored ${p} credential. The agent won't be able to act as ` +
+          `you on ${p} until you connect again.`,
       },
     },
     {

@@ -154,18 +154,31 @@ test('consentDeniedBlocks: states provider, default reason, and next step', () =
   assert.equal(b[0].type, 'section');
   assert.match(b[0].text.text, /stripe not authorized/i);
   assert.match(j(b), /nothing was sent/i);
-  assert.match(j(b), /\/vouchr connect stripe/);
+  assert.match(j(b), /re-run the request/i); // truthful recovery (on-demand), not a phantom command
+  assert.doesNotMatch(j(b), /\/vouchr connect/); // #194: never advertise a command that doesn't exist
 });
 
-test('consentDeniedBlocks: uses a supplied reason', () => {
-  const b = consentDeniedBlocks('stripe', 'You clicked deny.') as any[];
-  assert.match(j(b), /You clicked deny\./);
+test('consentDeniedBlocks: never renders an arbitrary supplied reason', () => {
+  const sentinel = 'ghp_RAW_PROVIDER_ERROR_MUST_NOT_REACH_SLACK';
+  const b = consentDeniedBlocks('stripe', `Provider failed: ${sentinel} <!channel>`) as any[];
+  const rendered = j(b);
+  assert.ok(!rendered.includes(sentinel));
+  assert.doesNotMatch(rendered, /Provider failed|<!channel>/);
+  assert.match(rendered, /haven't allowed stripe/);
 });
 
-test('statusBlocks: empty state prompts to connect', () => {
+test('consentDeniedBlocks: escapes provider in mrkdwn', () => {
+  const rendered = j(consentDeniedBlocks('<!channel>'));
+  assert.doesNotMatch(rendered, /<!channel>/);
+  assert.match(rendered, /&lt;!channel&gt;/);
+});
+
+test('statusBlocks: empty state explains on-demand connection without a phantom command', () => {
   const b = statusBlocks([]) as any[];
   assert.equal(b.length, 1);
   assert.match(b[0].text.text, /no connections/i);
+  assert.match(b[0].text.text, /on demand/i);
+  assert.doesNotMatch(b[0].text.text, /\/vouchr connect/); // #194: no guidance for a command that doesn't exist
 });
 
 test('statusBlocks: lists each connection with channel + mode', () => {
@@ -191,6 +204,17 @@ test('disconnectConfirmBlocks: destructive button carries provider in value', ()
   assert.equal(btn.action_id, DISCONNECT_ACTION);
   assert.equal(btn.value, 'github');
   assert.equal(btn.style, 'danger');
+});
+
+test('disconnectConfirmBlocks: provider is inert in mrkdwn but literal in plain_text/value', () => {
+  const provider = '<@U123>';
+  const b = disconnectConfirmBlocks(provider) as any[];
+  const section = b.find((x) => x.type === 'section');
+  const button = b.find((x) => x.type === 'actions').elements[0];
+  assert.doesNotMatch(section.text.text, /<@U123>/);
+  assert.match(section.text.text, /&lt;@U123&gt;/);
+  assert.equal(button.text.text, `Disconnect ${provider}`);
+  assert.equal(button.value, provider);
 });
 
 test('homeView: returns a home view listing connections and available providers', () => {
