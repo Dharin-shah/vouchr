@@ -164,7 +164,10 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
 7. **Offboard / revoke** (`src/core/offboard.ts`, `src/core/tokens.ts`). On Slack
    deactivation (or `/vouchr disconnect`, or a SCIM hook), the local credential is deleted
    first (the security-meaningful action), pending consent and thread session grants are
-   purged, and an upstream revoke is attempted best-effort. The Grid/SCIM
+   purged, and an upstream revoke is attempted best-effort only for a real row when the provider
+   supports it and the claim supplies a usable vaulted token. A real revocable external reference
+   or unreadable token is still removed locally but leaves upstream revocation unconfirmed;
+   non-revocable and trusted dry-run rows are intentional skips. The Grid/SCIM
    `offboardUserEverywhere` sweep applies the same cleanup across every team. Channel/shared
    credentials are intentionally left for an admin to review.
 

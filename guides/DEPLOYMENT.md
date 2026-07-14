@@ -573,6 +573,9 @@ The headless broker can **revoke** credentials, not just inject them — the two
   when that exact user-owned row exists; an unknown, unstored provider returns a static `404` before
   mutation or audit. The wire shape remains `{ ok, revoked: string[] }`: a committed local delete stays
   in `revoked`, while `ok` is false if upstream revocation or authoritative auditing was unconfirmed.
+  In particular, a revocable external-reference row has no vaulted token to send to the provider: it
+  is deleted locally and returned in `revoked`, but `ok` is false and the reference must be rotated in
+  its source manager.
 - `POST /v1/admin/offboard` — body `{ identityToken, targetUserId }`. Removes ALL of the target's
   connections + pending consent + thread grants (wire it to your directory/deprovision hook). Admin
   authority comes from the **signed `isAdmin` claim** — the broker can't verify workspace admin itself,

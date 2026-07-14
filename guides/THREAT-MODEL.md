@@ -256,9 +256,12 @@ agent keep acting as them.
   `registerOffboarding`). Local delete happens first (the security-meaningful action);
   upstream revoke is best-effort.
 - **Honest limit:** disconnect/offboard guarantees local deletion first, but upstream
-  provider revocation is best-effort only. The Slack event path is scoped to the
-  `(team_id, user_id)` the event carries; org-wide Grid deprovisioning should go
-  through SCIM (SECURITY.md, "Disconnect/offboard revoke is best-effort"; offboarding
+  provider revocation is best-effort only. A real revocable external-reference row (or an unreadable
+  vaulted token) cannot supply a token to the revoke endpoint; Vouchr treats the result as
+  unconfirmed and, when auditing succeeds, records the upstream skip. The reference must be rotated
+  in its source manager. Non-revocable and trusted dry-run rows are intentional skips. The Slack
+  event path is scoped to the `(team_id, user_id)` the event carries; org-wide Grid deprovisioning
+  should go through SCIM (SECURITY.md, "Disconnect/offboard revoke is best-effort"; offboarding
   scoping note in `bolt.ts`).
 
 ### Slack Connect cross-org exposure

@@ -156,6 +156,12 @@ server-side on submit). The ordinary text-subcommand responses are unchanged. Th
 
 ### Private previews
 
+> [!WARNING]
+> This is a transitional alpha surface scheduled for removal under
+> [#194](https://github.com/Dharin-shah/vouchr/issues/194). Hosts own provider-output rendering in
+> the supported product direction; do not build new integrations that depend on Vouchr retaining
+> private provider responses or process-local preview state.
+
 Orthogonal to the credential mode, each channel can set a provider's **preview visibility**
 (`/vouchr preview <provider> <public|private>`, or the checkbox in the config modal). In a
 `private` channel, output the agent posts through `context.vouchr.preview(provider, { title,
