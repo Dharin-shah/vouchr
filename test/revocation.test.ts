@@ -1,5 +1,5 @@
 import { test } from 'node:test';
-import { openTestDb } from './support/pg';
+import { openTestDb, testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
@@ -12,6 +12,7 @@ import { offboardUser, offboardUserEverywhere, disconnectProvider } from '../src
 import { userOwner } from '../src/core/owner';
 import type { EnvelopeProvider } from '../src/core/crypto';
 import type { SlackIdentity } from '../src/core/identity';
+import { openDb } from '../src/core/db';
 
 const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -262,17 +263,17 @@ test('offboardUser throws when a credential deletion fails, after attempting the
   // DELETEs against the connection table fail for the FIRST provider only.
   let failed = 0;
   const flakyDb = {
-    get: db.get.bind(db),
-    all: db.all.bind(db),
-    exec: db.exec.bind(db),
-    close: db.close.bind(db),
-    run: (sql: string, params?: unknown[]) => {
+    get: (sql: string, params?: unknown[]) => {
       if (sql.includes('DELETE FROM connection') && (params as any[])?.includes('revocable') && failed === 0) {
         failed++;
         return Promise.reject(new Error('connection table down'));
       }
-      return db.run(sql, params as any[]);
+      return db.get(sql, params as any[]);
     },
+    all: db.all.bind(db),
+    exec: db.exec.bind(db),
+    close: db.close.bind(db),
+    run: db.run.bind(db),
   } as any;
   const vault = new Vault(flakyDb, KEY);
   await assert.rejects(offboardUser(vault, new Audit(db), new Consent(db), ID), /credential deletion\(s\) failed/);
@@ -311,14 +312,165 @@ test('disconnectProvider revokes an expired-here token upstream and reports remo
     return new Response('', { status: 200 });
   }) as any;
   try {
-    const { removed, ok } = await disconnectProvider(vault, new Audit(db), registry, ID, 'revocable');
-    assert.equal(removed, true);
-    assert.equal(ok, true);
+    const outcome = await disconnectProvider(vault, new Audit(db), registry, ID, 'revocable');
+    assert.deepEqual(outcome, { recognized: true, removed: true, ok: true, audited: true });
   } finally {
     globalThis.fetch = realFetch;
   }
   assert.equal(sawToken, 'SECRET_TOK'); // the upstream revoke still happened
   assert.equal(await countConnections(db), 0);
+});
+
+test('concurrent disconnects atomically claim one row, upstream revoke, and audit', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([openDb({ databaseUrl: url }), openDb({ databaseUrl: url })]);
+  const vaultA = new Vault(dbA, KEY);
+  const vaultB = new Vault(dbB, KEY);
+  await vaultA.upsert(O1, 'revocable', {
+    accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  // Two distinct pools model separate replicas. Hold both callers immediately before the production
+  // DELETE ... RETURNING claim so they contend on the same committed row rather than arriving serially.
+  let arrivals = 0;
+  let release!: () => void;
+  const together = new Promise<void>((resolve) => { release = resolve; });
+  for (const vault of [vaultA, vaultB]) {
+    const claim = vault.deleteForRevoke.bind(vault);
+    vault.deleteForRevoke = async (...args: Parameters<Vault['deleteForRevoke']>) => {
+      arrivals++;
+      if (arrivals === 2) release();
+      await together;
+      return claim(...args);
+    };
+  }
+
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  try {
+    const registry = new ProviderRegistry([revocable]);
+    const outcomes = await Promise.all([
+      disconnectProvider(vaultA, new Audit(dbA), registry, ID, 'revocable'),
+      disconnectProvider(vaultB, new Audit(dbB), registry, ID, 'revocable'),
+    ]);
+    assert.deepEqual(outcomes.map((o) => o.removed).sort(), [false, true]);
+    assert.ok(outcomes.every((o) => o.recognized && o.audited));
+    assert.equal(upstreamCalls, 1);
+    assert.equal(await countConnections(dbA), 0);
+    assert.equal(((await dbA.get(`SELECT COUNT(*) AS n FROM audit WHERE action='revoke'`)) as any).n, 1);
+  } finally {
+    globalThis.fetch = realFetch;
+    await Promise.all([dbA.close(), dbB.close()]);
+  }
+});
+
+test('disconnectProvider rejects an unregistered, unstored provider before any mutation or audit', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const provider = 'untrusted-provider';
+  // The atomic DELETE claim must not purge satellites when no credential row authorizes the stale id.
+  // Keeping this row proves the untrusted value reached no committed mutation or audit.
+  await db.run(
+    `INSERT INTO notification_state
+       (team_id, owner_kind, owner_id, provider, type, last_notified_at)
+     VALUES (?, 'user', ?, ?, 'refresh_dead', ?)`,
+    [ID.teamId, ID.userId, provider, Date.now()],
+  );
+
+  const outcome = await disconnectProvider(vault, new Audit(db), new ProviderRegistry([]), ID, provider);
+  assert.deepEqual(outcome, { recognized: false, removed: false, ok: false, audited: false });
+  assert.equal(await countConnections(db), 0);
+  assert.equal(((await db.get(`SELECT COUNT(*) AS n FROM audit`)) as any).n, 0);
+  assert.equal(((await db.get(`SELECT COUNT(*) AS n FROM notification_state WHERE provider=?`, [provider])) as any).n, 1);
+});
+
+test('disconnectProvider deletes a stale stored provider without decrypting and reports upstream debt', async (t) => {
+  const kmsDown: EnvelopeProvider = {
+    async wrapDataKey(dek) { return Buffer.from(dek); },
+    async unwrapDataKey() { throw new Error('stale credential must not be decrypted'); },
+  };
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY, {}, kmsDown);
+  const provider = 'retired-provider';
+  await vault.upsert(O1, provider, {
+    accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  assert.equal(await vault.has(O1, provider), true);
+
+  const outcome = await disconnectProvider(vault, new Audit(db), new ProviderRegistry([]), ID, provider);
+  assert.deepEqual(outcome, { recognized: true, removed: true, ok: false, audited: true });
+  assert.equal(await vault.has(O1, provider), false);
+  const row = (await db.get(`SELECT provider, meta FROM audit WHERE action='revoke'`)) as any;
+  assert.equal(row.provider, provider);
+  assert.deepEqual(JSON.parse(row.meta), { ok: false, upstream: 'skipped' });
+  assert.ok(!row.meta.includes('SECRET_TOK'));
+});
+
+test('disconnectProvider removes a stale dry-run row without decrypting or inventing upstream debt', async (t) => {
+  const kmsDown: EnvelopeProvider = {
+    async wrapDataKey(dek) { return Buffer.from(dek); },
+    async unwrapDataKey() { throw new Error('synthetic stale credential must not be decrypted'); },
+  };
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY, {}, kmsDown);
+  const provider = 'retired-dry-run';
+  await vault.upsertDryRun(O1, provider, {
+    accessToken: 'SYNTHETIC_SECRET', refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'dry-run',
+  });
+
+  const realFetch = globalThis.fetch;
+  let fetched = false;
+  globalThis.fetch = (async () => { fetched = true; return new Response('', { status: 200 }); }) as any;
+  try {
+    const outcome = await disconnectProvider(vault, new Audit(db), new ProviderRegistry([]), ID, provider);
+    assert.deepEqual(outcome, { recognized: true, removed: true, ok: true, audited: true });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+  assert.equal(fetched, false);
+  assert.equal(await vault.has(O1, provider), false);
+  const row = (await db.get(`SELECT meta FROM audit WHERE action='revoke' AND provider=?`, [provider])) as any;
+  assert.deepEqual(JSON.parse(row.meta), { ok: true, upstream: 'skipped' });
+  assert.ok(!row.meta.includes('SYNTHETIC_SECRET'));
+});
+
+test('disconnectProvider preserves revoke failure and local removal when audit also fails', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'revocable', {
+    accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const auditError = 'ghp_AUDIT_FAILURE_MUST_NOT_ESCAPE';
+  const badAudit = { record: async () => { throw new Error(auditError); } } as unknown as Audit;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('upstream unavailable', { status: 503 })) as any;
+  let outcome: Awaited<ReturnType<typeof disconnectProvider>> | undefined;
+  try {
+    outcome = await disconnectProvider(vault, badAudit, new ProviderRegistry([revocable]), ID, 'revocable');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.deepEqual(outcome, { recognized: true, removed: true, ok: false, audited: false });
+  assert.equal(await vault.has(O1, 'revocable'), false);
+  assert.ok(!JSON.stringify(outcome).includes(auditError));
+});
+
+test('disconnectProvider keeps upstream ok separate from an audit failure', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'norevoke', {
+    accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const badAudit = { record: async () => { throw new Error('audit db down'); } } as unknown as Audit;
+
+  const outcome = await disconnectProvider(vault, badAudit, new ProviderRegistry([norevoke]), ID, 'norevoke');
+  assert.deepEqual(outcome, { recognized: true, removed: true, ok: true, audited: false });
+  assert.equal(await vault.has(O1, 'norevoke'), false);
 });
 
 // GHSA-25m2 review: EVERY revoke implementation is bounded — including a custom hook that never
@@ -413,6 +565,48 @@ test('vault.delete removes the credential even when the satellite purge fails', 
   assert.equal(await countConnections(db), 0); // the delete committed despite the failed purge
 });
 
+test('vault.delete fallback never removes a reconnect that lands after satellite rollback', async (t) => {
+  const db = await openTestDb(t);
+  const seeder = new Vault(db, KEY);
+  await seeder.upsert(O1, 'revocable', {
+    accessToken: 'OLD_SECRET', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  let reconnected = false;
+  const racyDb = {
+    get: async (sql: string, params?: unknown[]) => {
+      // claimDelete reaches this generation-bound fallback only after the failed transaction rolled
+      // back. Land a reconnect first; the retry must not delete that newer row.
+      if (!reconnected && sql.includes('DELETE FROM connection') && sql.includes('AND id=?')) {
+        reconnected = true;
+        await seeder.upsert(O1, 'revocable', {
+          accessToken: 'NEW_SECRET', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+        });
+      }
+      return db.get(sql, params as any[]);
+    },
+    all: db.all.bind(db),
+    run: db.run.bind(db),
+    exec: db.exec.bind(db),
+    close: db.close.bind(db),
+    transaction: (fn: (tx: any) => Promise<unknown>) => db.transaction!((tx) => fn({
+      get: tx.get.bind(tx),
+      all: tx.all.bind(tx),
+      exec: tx.exec.bind(tx),
+      close: tx.close.bind(tx),
+      transaction: tx.transaction?.bind(tx),
+      run: (sql: string, params?: unknown[]) =>
+        sql.includes('notification_state')
+          ? Promise.reject(new Error('satellite table down'))
+          : tx.run(sql, params as any[]),
+    })),
+  } as any;
+
+  const vault = new Vault(racyDb, KEY);
+  await assert.rejects(vault.delete(O1, 'revocable'), /could not be confirmed/);
+  assert.equal(reconnected, true);
+  assert.equal((await vault.get(O1, 'revocable'))?.accessToken, 'NEW_SECRET');
+});
+
 // GHSA-25m2 r3: if the purge fails AND the credential DELETE cannot be re-committed, that is a
 // genuinely stranded credential — delete() must reject, never report the strand as a success.
 test('vault.delete propagates when both the purge and the delete re-run fail', async (t) => {
@@ -421,13 +615,17 @@ test('vault.delete propagates when both the purge and the delete re-run fail', a
   await seeder.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   let deletes = 0;
   const failingDb = {
-    get: db.get.bind(db),
+    get: (sql: string, params?: unknown[]) => {
+      if (sql.includes('DELETE FROM connection') && deletes++ > 0) {
+        return Promise.reject(new Error('connection table down')); // credential-only re-run fails
+      }
+      return db.get(sql, params as any[]);
+    },
     all: db.all.bind(db),
     exec: db.exec.bind(db),
     close: db.close.bind(db),
     run: (sql: string, params?: unknown[]) => {
       if (sql.includes('notification_state')) return Promise.reject(new Error('satellite table down'));
-      if (sql.includes('DELETE FROM connection') && deletes++ > 0) return Promise.reject(new Error('connection table down')); // re-run fails
       return db.run(sql, params as any[]);
     },
   } as any;
@@ -562,11 +760,11 @@ test('offboardUserEverywhere surfaces a per-team failure and still offboards the
   await seeder.upsert(T2, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // DELETEs against T1's connection fail; T2's succeed.
   const flakyDb = {
-    get: db.get.bind(db), all: db.all.bind(db), exec: db.exec.bind(db), close: db.close.bind(db),
-    run: (sql: string, params?: unknown[]) =>
+    get: (sql: string, params?: unknown[]) =>
       sql.includes('DELETE FROM connection') && (params as any[])?.includes('T1')
         ? Promise.reject(new Error('T1 connection table down'))
-        : db.run(sql, params as any[]),
+        : db.get(sql, params as any[]),
+    all: db.all.bind(db), exec: db.exec.bind(db), close: db.close.bind(db), run: db.run.bind(db),
   } as any;
   const vault = new Vault(flakyDb, KEY);
   const summary = await offboardUserEverywhere(db, vault, new Audit(db), new Consent(db), { userId: ID.userId });

@@ -27,6 +27,7 @@ async function harness(t: TestContext, opts: {
   policy?: Policy;
   db?: Db;
   usersInfo?: () => Promise<unknown>;
+  updateThrows?: boolean;
 } = {}) {
   const { slackAdmin = false, providers = [provider], policy } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
@@ -41,16 +42,23 @@ async function harness(t: TestContext, opts: {
   });
   let opened: any = null;
   let updated: any = null;
+  const dms: string[] = [];
   const client = {
     users: { info: opts.usersInfo ?? (async () => ({ user: { is_admin: slackAdmin } })) },
     conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_OTHER' } }) },
-    views: { open: async (a: any) => (opened = a), update: async (a: any) => (updated = a) },
-    chat: { postMessage: async () => undefined },
+    views: {
+      open: async (a: any) => (opened = a),
+      update: async (a: any) => {
+        if (opts.updateThrows) throw new Error('view_not_found');
+        updated = a;
+      },
+    },
+    chat: { postMessage: async (a: any) => { dms.push(String(a?.text ?? '')); } },
   };
   const body = { team: { id: 'T1' }, user: { id: ID.userId } };
   const defaultMeta = JSON.stringify({ channel: 'C_FIN', open: [] });
   return {
-    lan, client,
+    lan, client, dms,
     /** Run no-arg `/vouchr`, return the opened modal view (with its real private_metadata). */
     openModal: async () => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
     runCommand: (text: string, respond?: any) => command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text }, ack: async () => {}, respond: respond ?? (async () => {}), client }),
@@ -114,12 +122,33 @@ test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', 
   assert.equal(started, 5, 'admin rows must reuse the manifest snapshot, not start a sixth read');
 });
 
-test('no-arg falls back to status text when views.open fails (never silent)', async (t) => {
+test('no-arg gives truthful command recovery when views.open fails (never silent)', async (t) => {
   const h = await harness(t, { slackAdmin: true });
   h.client.views.open = async () => { throw new Error('expired_trigger_id'); };
   let responded = '';
   await h.runCommand('', async (m: string) => { responded = m; });
-  assert.match(responded, /No connected accounts|connected accounts/); // fell through to status text
+  assert.equal(responded, 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
+});
+
+test('no-arg gives the same recovery when a supported registry exceeds the modal block limit', async (t) => {
+  const providers = Array.from({ length: 34 }, (_, i) => mkProvider(`provider-${i}`));
+  const h = await harness(t, { slackAdmin: true, providers });
+  let responded = '';
+  await h.runCommand('', async (m: string) => { responded = m; });
+  assert.equal(responded, 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
+  assert.equal(h.opened(), null, 'an invalid over-limit modal must never be sent to Slack');
+});
+
+test('no-arg gives recovery when valid provider ids exceed Slack private_metadata', async (t) => {
+  const providers = Array.from({ length: 29 }, (_, i) => {
+    const prefix = `p${String(i).padStart(2, '0')}`;
+    return mkProvider(prefix + 'x'.repeat(63 - prefix.length));
+  });
+  const h = await harness(t, { slackAdmin: true, providers });
+  let responded = '';
+  await h.runCommand('', async (m: string) => { responded = m; });
+  assert.equal(responded, 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
+  assert.equal(h.opened(), null);
 });
 
 test('forged non-admin submission is rejected by the same authz path (no mutation, audited denied)', async (t) => {
@@ -212,6 +241,53 @@ test('disconnect button removes the user connection and refreshes the modal view
   assert.equal(h.updated()?.view_id, 'V1');
 });
 
+test('disconnect button sends one committed receipt even when the modal refresh fails', async (t) => {
+  const h = await harness(t, { slackAdmin: false, updateThrows: true });
+  await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) });
+  assert.equal(await h.lan.vault.get(userOwner(ID), 'mcp'), null);
+  assert.deepEqual(h.dms, ['Disconnected *mcp*. The agent can no longer act as you on mcp.']);
+  assert.equal(h.updated(), null);
+});
+
+test('duplicate disconnect click sends one idempotent receipt when the modal refresh fails', async (t) => {
+  const h = await harness(t, { slackAdmin: false, updateThrows: true });
+  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) });
+  assert.deepEqual(h.dms, ['No *mcp* account was connected, so there was nothing to disconnect.']);
+  assert.equal(h.updated(), null);
+  assert.deepEqual(await auditActions(h.lan.db), []);
+});
+
+test('disconnect button removes a retired provider that is still visible in the user connection list', async (t) => {
+  const h = await harness(t, { slackAdmin: false, providers: [] });
+  await h.lan.vault.upsert(userOwner(ID), 'retired', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const view = await h.openModal();
+  assert.match(JSON.stringify(view.blocks), /retired/);
+
+  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) }, 'retired');
+
+  assert.equal(await h.lan.vault.has(userOwner(ID), 'retired'), false);
+  assert.equal(h.updated()?.view_id, 'V1');
+  assert.deepEqual(await auditActions(h.lan.db), ['revoke']);
+});
+
+test('concurrent retired Disconnect clicks each get one safe receipt when refresh fails', async (t) => {
+  const h = await harness(t, { slackAdmin: false, providers: [], updateThrows: true });
+  await h.lan.vault.upsert(userOwner(ID), 'retired', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const view = { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) };
+
+  await Promise.all([
+    h.disconnect(async () => {}, view, 'retired'),
+    h.disconnect(async () => {}, view, 'retired'),
+  ]);
+
+  assert.equal(await h.lan.vault.has(userOwner(ID), 'retired'), false);
+  assert.equal(h.dms.length, 2);
+  assert.ok(h.dms.some((text) => /upstream token revoke could not be confirmed/.test(text)));
+  assert.ok(h.dms.includes('That connection no longer exists. Run `/vouchr status` to see your current connections.'));
+  assert.deepEqual(await auditActions(h.lan.db), ['revoke']);
+});
+
 // Finding 4/6: the exported DISCONNECT_ACTION must NOT act when the click came from a foreign view
 // (a host embedding disconnectConfirmBlocks in their own modal) — else it double-fires + clobbers.
 test('disconnect action ignores a non-Vouchr view (no double-fire, no clobber)', async (t) => {
@@ -226,6 +302,9 @@ test('disconnect action ignores a non-Vouchr view (no double-fire, no clobber)',
 // Finding 5: an unknown/forged provider value must not be revoked or written to the audit column.
 test('disconnect action rejects an unknown provider (no audit pollution)', async (t) => {
   const h = await harness(t, { slackAdmin: false });
-  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) }, 'not-a-provider');
+  const untrusted = 'not-a-provider';
+  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) }, untrusted);
   assert.deepEqual(await auditActions(h.lan.db), []); // nothing audited for the bogus provider
+  assert.deepEqual(h.dms, ['That connection no longer exists. Run `/vouchr status` to see your current connections.']);
+  assert.ok(!h.dms[0].includes(untrusted));
 });

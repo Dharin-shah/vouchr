@@ -30,7 +30,7 @@ const CRED = { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: nu
 async function harness(t: TestContext, opts: {
   slackAdmin?: boolean; allowCreator?: boolean; creator?: string;
   channelInfo?: Record<string, unknown>; infoThrows?: boolean; providers?: Provider[];
-  db?: Db; envelope?: EnvelopeProvider;
+  db?: Db; envelope?: EnvelopeProvider; publishThrows?: boolean;
 } = {}) {
   const { slackAdmin = false, allowCreator = false, creator = 'U_OTHER', providers = [provider] } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
@@ -63,7 +63,14 @@ async function harness(t: TestContext, opts: {
         return { channel: { id: channel, is_channel: true, creator, ...(opts.channelInfo ?? {}) } };
       },
     },
-    views: { publish: async (a: any) => (published = a), open: async (a: any) => (opened = a), update: async () => undefined },
+    views: {
+      publish: async (a: any) => {
+        if (opts.publishThrows) throw new Error('slack_unavailable');
+        published = a;
+      },
+      open: async (a: any) => (opened = a),
+      update: async () => undefined,
+    },
     chat: { postMessage: async (a: any) => { dms.push(String(a?.text ?? '')); } },
   };
   const body = { team: { id: 'T1' }, user: { id: ID.userId } };
@@ -280,6 +287,17 @@ test('home Disconnect removes the connection and re-publishes the view without t
   await h.disconnect('mcp');
   assert.equal(await h.lan.vault.get(userOwner(ID), 'mcp'), null);
   assert.match(JSON.stringify(h.published().view.blocks), /None yet/); // the re-published home reflects it
+});
+
+test('home Disconnect reports a retired credential outcome even when Home re-publish fails', async (t) => {
+  const h = await harness(t, { slackAdmin: false, providers: [], publishThrows: true });
+  await h.lan.vault.upsert(userOwner(ID), 'retired', CRED);
+  await h.disconnect('retired');
+  assert.equal(await h.lan.vault.has(userOwner(ID), 'retired'), false);
+  assert.equal(h.published(), null);
+  assert.deepEqual(h.dms, [
+    'Disconnected *retired* locally, but the upstream token revoke could not be confirmed. Revoke or rotate Vouchr’s access in retired directly.',
+  ]);
 });
 
 test('app_home_opened defers to a foreign (host-published) Home view; first open still publishes', async (t) => {

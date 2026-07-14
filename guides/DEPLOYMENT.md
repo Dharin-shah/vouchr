@@ -569,7 +569,10 @@ The headless broker can **revoke** credentials, not just inject them — the two
 
 - `POST /v1/disconnect` — body `{ handle: { provider }, identityToken }`. The acting user revokes their
   OWN connection for one provider (identity from the signed token; a forged body can't disconnect
-  someone else). Local delete first, best-effort upstream revoke. Returns `{ ok, revoked: string[] }`.
+  someone else). Local delete first, best-effort upstream revoke. A retired provider remains removable
+  when that exact user-owned row exists; an unknown, unstored provider returns a static `404` before
+  mutation or audit. The wire shape remains `{ ok, revoked: string[] }`: a committed local delete stays
+  in `revoked`, while `ok` is false if upstream revocation or authoritative auditing was unconfirmed.
 - `POST /v1/admin/offboard` — body `{ identityToken, targetUserId }`. Removes ALL of the target's
   connections + pending consent + thread grants (wire it to your directory/deprovision hook). Admin
   authority comes from the **signed `isAdmin` claim** — the broker can't verify workspace admin itself,
@@ -583,7 +586,9 @@ The headless broker can **revoke** credentials, not just inject them — the two
   forever will start expiring them; set both TTL vars to `0` to preserve unbounded lifetime.
 
 For in-process control, `offboardUser`, `sweepExpired`, and `disconnectProvider` are exported from the
-package root.
+package root. `disconnectProvider` returns `{ recognized, removed, ok, audited }`; delete failures still
+reject, while an audit failure preserves the already-committed local/upstream outcome as
+`audited: false`.
 
 ### Replay (multi-replica)
 

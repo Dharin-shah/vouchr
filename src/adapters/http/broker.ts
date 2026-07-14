@@ -1071,8 +1071,11 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     const claims = await verify(body.identityToken);
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    const { removed, ok } = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId);
-    return { ok, revoked: removed ? [providerId] : [] };
+    const outcome = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId);
+    if (!outcome.recognized) throw new HttpError(404, { error: 'unknown provider' });
+    // Preserve the established wire shape. A committed local delete stays in `revoked`; `ok` is
+    // false when either upstream revocation or authoritative auditing could not be confirmed.
+    return { ok: outcome.ok && outcome.audited, revoked: outcome.removed ? [providerId] : [] };
   }
 
   /**

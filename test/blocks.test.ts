@@ -1,19 +1,60 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  auditBlocks,
+  blocksFallbackText,
+  configModal,
+  configureModal,
   connectBlocks,
   connectedBlocks,
   connectedDmText,
   connectedHtml,
+  connectionLine,
   consentDeniedBlocks,
   statusBlocks,
   disconnectConfirmBlocks,
   homeView,
+  keySetupBlocks,
+  sessionApprovalBlocks,
+  statsBlocks,
+  userKeyModal,
   DISCONNECT_ACTION,
 } from '../src/adapters/blocks';
 
 // Block Kit is untyped here (unknown[]); cast to any for structural probing.
 const j = (b: unknown) => JSON.stringify(b);
+
+const mrkdwnTexts = (value: unknown): string[] => {
+  const out: string[] = [];
+  const visit = (item: unknown): void => {
+    if (Array.isArray(item)) {
+      for (const child of item) visit(child);
+      return;
+    }
+    if (!item || typeof item !== 'object') return;
+    const object = item as Record<string, unknown>;
+    if (object.type === 'mrkdwn' && typeof object.text === 'string') out.push(object.text);
+    for (const child of Object.values(object)) visit(child);
+  };
+  visit(value);
+  return out;
+};
+
+const sectionTexts = (blocks: unknown[]): string[] =>
+  (blocks as any[])
+    .filter((block) => block.type === 'section' && block.text?.type === 'mrkdwn')
+    .map((block) => block.text.text as string);
+
+const assertPackedRows = (blocks: unknown[], providers: string[]): void => {
+  const sections = sectionTexts(blocks);
+  assert.ok(sections.length > 0);
+  assert.ok(sections.every((text) => text.length <= 3000));
+  const rows = sections.flatMap((text) => text.split('\n')).filter((line) => line.startsWith('• '));
+  assert.equal(rows.length, providers.length);
+  providers.forEach((provider, index) => {
+    assert.ok(rows[index].includes(provider), `row ${index} lost or reordered`);
+  });
+};
 
 test('connectedBlocks: interpolates provider + channel and shows how to disconnect', () => {
   const b = connectedBlocks('github', { channel: 'C123', scope: 'repo' }) as any[];
@@ -149,6 +190,43 @@ test('connectBlocks: a direct caller cannot construct an oversized Slack section
   );
 });
 
+test('credential and session renderers escape mrkdwn but preserve literal interaction data', () => {
+  const provider = '<!channel> & <https://evil.example|click>';
+  const escaped = '&lt;!channel&gt; &amp; &lt;https://evil.example|click&gt;';
+  const configure = configureModal(provider, 'C1') as any;
+  const userKey = userKeyModal(provider) as any;
+  const keySetup = keySetupBlocks(provider) as any[];
+  const session = sessionApprovalBlocks(provider, 'TH1') as any[];
+
+  for (const [name, rendered] of [
+    ['configureModal', configure],
+    ['userKeyModal', userKey],
+    ['keySetupBlocks', keySetup],
+    ['sessionApprovalBlocks', session],
+  ] as const) {
+    const mrkdwn = mrkdwnTexts(rendered).join('\n');
+    assert.ok(!mrkdwn.includes(provider), `${name} rendered live provider mrkdwn`);
+    assert.ok(mrkdwn.includes(escaped), `${name} dropped or altered the escaped provider`);
+  }
+
+  // Modal routing data and interactive controls are not mrkdwn: keep the exact literal provider so
+  // escaping cannot change which registry entry a valid submission/click targets.
+  assert.equal(JSON.parse(configure.private_metadata).provider, provider);
+  assert.equal(JSON.parse(userKey.private_metadata).provider, provider);
+  const keyButton = keySetup.find((block) => block.type === 'actions').elements[0];
+  assert.equal(keyButton.text.text, `Set up ${provider}`);
+  assert.equal(keyButton.value, provider);
+  const sessionButton = session.find((block) => block.type === 'actions').elements[0];
+  assert.equal(sessionButton.text.text, `Allow ${provider} here`);
+  assert.deepEqual(JSON.parse(sessionButton.value), { provider, thread: 'TH1' });
+});
+
+test('auditBlocks escapes a caller-supplied heading when the empty state renders it as mrkdwn', () => {
+  const text = sectionTexts(auditBlocks([], '<!channel> & usage'))[0];
+  assert.doesNotMatch(text, /<!channel>/);
+  assert.match(text, /&lt;!channel&gt; &amp; usage/);
+});
+
 test('consentDeniedBlocks: states provider, default reason, and next step', () => {
   const b = consentDeniedBlocks('stripe') as any[];
   assert.equal(b[0].type, 'section');
@@ -195,6 +273,114 @@ test('statusBlocks: lists each connection with channel + mode', () => {
   assert.match(list, /per-user/);
 });
 
+test('connectionLine preserves a maximum account label losslessly while escaping mrkdwn', () => {
+  const account = '&'.repeat(512);
+  const line = connectionLine({ provider: 'mcp', channel: null, account });
+  assert.ok(line.includes('&amp;'.repeat(512)));
+  assert.doesNotMatch(line, /…/);
+});
+
+test('shared row packer accepts 3000 chars, splits 3001 losslessly, and rejects one oversized row', () => {
+  const connectionWithLength = (length: number, provider: string) => {
+    const fixed = connectionLine({ provider, channel: null }).length - provider.length;
+    const connection = { provider: provider + 'x'.repeat(length - fixed - provider.length), channel: null };
+    assert.equal(connectionLine(connection).length, length);
+    return connection;
+  };
+
+  const atLimit = connectionWithLength(3000, 'a');
+  assert.deepEqual(sectionTexts(statusBlocks([atLimit])), [connectionLine(atLimit)]);
+  assert.throws(() => statusBlocks([connectionWithLength(3001, 'b')]), /Slack section limit/);
+
+  const first = connectionWithLength(1500, 'c');
+  const secondAtLimit = connectionWithLength(1499, 'd');
+  const exactly = sectionTexts(statusBlocks([first, secondAtLimit]));
+  assert.equal(exactly.length, 1);
+  assert.equal(exactly[0].length, 3000); // 1500 + newline + 1499
+
+  const secondOver = connectionWithLength(1500, 'e');
+  const split = sectionTexts(statusBlocks([first, secondOver]));
+  assert.deepEqual(split, [connectionLine(first), connectionLine(secondOver)]);
+});
+
+test('max registry tables stay section-bounded and preserve all rows in order', () => {
+  const providers = Array.from({ length: 128 }, (_, index) => {
+    const prefix = `p${String(index).padStart(3, '0')}`;
+    return prefix + 'x'.repeat(63 - prefix.length);
+  });
+
+  assertPackedRows(statsBlocks(providers, [], 30), providers);
+  const statusProviders = providers.slice(0, 14);
+  const status = statusBlocks(statusProviders.map((provider) => ({
+    provider,
+    channel: null,
+    mode: 'per-user',
+    account: '&'.repeat(512), // supported stored-label maximum; escaping expands this fivefold
+  })), { page: 1, totalPages: 10 });
+  assertPackedRows(status, statusProviders);
+  assert.ok(status.length <= 50);
+
+  const modal = configModal({
+    channel: 'C1',
+    connections: [],
+    tools: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
+  }) as any;
+  assertPackedRows(modal.blocks, providers);
+  assert.ok(modal.blocks.length <= 100);
+
+  // Audit's production callers request at most 20 rows; that caller bound still needs lossless
+  // section packing when conservative maximum provider ids make the joined table exceed 3000.
+  const auditProviders = providers.slice(0, 20);
+  assertPackedRows(auditBlocks(auditProviders.map((provider, index) => ({
+    provider,
+    action: 'approval_consumed',
+    actor: `U${index}`,
+    channel: `C${index}`,
+    at: 1_750_000_000_000 + index,
+  })), 'Your credential usage'), auditProviders);
+});
+
+test('configModal rejects an over-block view before Slack can truncate or reject it', () => {
+  const providers = Array.from({ length: 128 }, (_, index) => `p${index}`);
+  assert.throws(() => configModal({
+    channel: 'C1',
+    connections: [],
+    tools: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
+    admin: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user', visibility: 'public' })),
+  }), /Slack modal block limit/);
+});
+
+test('configModal enforces Slack private_metadata independently of the block count', () => {
+  const providers = Array.from({ length: 28 }, (_, index) => {
+    const prefix = `p${String(index).padStart(2, '0')}`;
+    return prefix + 'x'.repeat(63 - prefix.length);
+  });
+  const build = (ids: string[]) => configModal({
+    channel: 'C1',
+    connections: [],
+    tools: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
+    admin: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user', visibility: 'public' })),
+  }) as any;
+
+  const withinLimit = build(providers.slice(0, 27));
+  assert.ok(withinLimit.blocks.length <= 100);
+  assert.ok(withinLimit.private_metadata.length <= 3_000);
+  assert.throws(() => build(providers), /Slack modal private_metadata limit/);
+});
+
+test('configModal bounds connection buttons and points every omitted row to paged status', () => {
+  const connections = Array.from({ length: 25 }, (_, i) => ({
+    provider: `retired-${String(i).padStart(2, '0')}`,
+    channel: null,
+  }));
+  const modal = configModal({ channel: 'C1', connections, tools: [] }) as any;
+  const disconnects = modal.blocks.filter((block: any) => block.accessory?.action_id === DISCONNECT_ACTION);
+  assert.equal(disconnects.length, 10);
+  assert.match(JSON.stringify(modal.blocks), /\+15 more/);
+  assert.ok(JSON.stringify(modal.blocks).includes('`/vouchr status`'));
+  assert.ok(modal.blocks.length <= 100);
+});
+
 test('disconnectConfirmBlocks: destructive button carries provider in value', () => {
   const b = disconnectConfirmBlocks('github') as any[];
   const actions = b.find((x) => x.type === 'actions');
@@ -237,4 +423,55 @@ test('homeView: empty connections still renders a valid home view', () => {
   const v = homeView({ connections: [], providers: ['github'] }) as any;
   assert.equal(v.type, 'home');
   assert.match(j(v.blocks), /None yet/i);
+});
+
+test('blocksFallbackText includes visible copy only and safely promotes plain_text into mrkdwn', () => {
+  const hidden = 'HIDDEN_URL_VALUE_METADATA_OR_INPUT';
+  const fallback = blocksFallbackText([
+    { type: 'header', text: { type: 'plain_text', text: '<Header &>' }, private_metadata: hidden },
+    {
+      type: 'section',
+      text: { type: 'mrkdwn', text: '*Body* &lt;safe&gt;' },
+      fields: [{ type: 'mrkdwn', text: 'Field copy' }],
+      accessory: {
+        type: 'button', text: { type: 'plain_text', text: '<Open>' }, url: hidden, value: hidden,
+      },
+    },
+    { type: 'context', elements: [{ type: 'mrkdwn', text: 'Context copy' }] },
+    {
+      type: 'actions',
+      elements: [
+        { type: 'button', text: { type: 'plain_text', text: '<Approve>' }, url: hidden, value: hidden },
+        { type: 'button', text: { type: 'plain_text', text: 'Deny & close' }, value: hidden },
+      ],
+    },
+    {
+      type: 'input',
+      label: { type: 'plain_text', text: hidden },
+      element: { type: 'plain_text_input', action_id: hidden, initial_value: hidden },
+    },
+  ]);
+
+  assert.equal(fallback, [
+    '&lt;Header &amp;&gt;',
+    '*Body* &lt;safe&gt;',
+    'Field copy',
+    '&lt;Open&gt;',
+    'Context copy',
+    '&lt;Approve&gt;',
+    'Deny &amp; close',
+  ].join('\n'));
+  assert.ok(!fallback.includes(hidden));
+});
+
+test('blocksFallbackText accepts exactly 40000 chars and rejects truncation-prone output', () => {
+  const blocksForLength = (length: number): unknown[] => {
+    const full = Array.from({ length: 13 }, () => 'x'.repeat(3000));
+    const tail = 'x'.repeat(length - full.join('\n').length - 1);
+    return [...full, tail].map((text) => ({ type: 'section', text: { type: 'mrkdwn', text } }));
+  };
+
+  assert.equal(blocksFallbackText(blocksForLength(40_000)).length, 40_000);
+  assert.throws(() => blocksFallbackText(blocksForLength(40_001)), /top-level message limit/);
+  assert.throws(() => blocksFallbackText([{ type: 'divider' }]), /no visible block copy/);
 });
