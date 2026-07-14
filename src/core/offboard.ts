@@ -49,8 +49,11 @@ async function removeUserConnection(
       } catch {
         ok = false; // network/HTTP failure: local access is already gone; nothing is faked
       }
-    } else if (revocable && removed && claimed.readFailed) {
-      ok = false; // revocation was due, but the token could not be read to hand upstream
+    } else if (revocable && removed && !claimed.dryRun) {
+      // A real revocable row with no usable token is unresolved upstream debt whether decryption
+      // failed OR the row intentionally stores only an external reference. Neither case made a
+      // revoke attempt, so reporting clean success would be false.
+      ok = false;
     }
   }
   return { removed, ok, attempted };

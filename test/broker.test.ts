@@ -1147,6 +1147,39 @@ test('#54 /v1/disconnect acts only on the token identity (a different user is un
   }
 });
 
+test('/v1/disconnect reports a referenced revocable credential as only locally removed', async (t) => {
+  const provider = defineProvider({
+    ...acme,
+    revokeUrl: 'https://acme.example/revoke',
+  });
+  const { server, port, vault, db } = await makeBroker(t, { providers: [provider] });
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vault.reference(owner, 'acme', { source: 'external', secretRef: 'TEST_EXTERNAL_REFERENCE' });
+
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  try {
+    const r = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: false, revoked: ['acme'] });
+    assert.equal(upstreamCalls, 0);
+    assert.equal(await vault.has(owner, 'acme'), false);
+    const row = (await db.get(
+      `SELECT meta FROM audit WHERE action='revoke' AND provider='acme'`,
+    )) as { meta: string };
+    assert.deepEqual(JSON.parse(row.meta), { ok: false, upstream: 'skipped' });
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
+});
+
 test('/v1/disconnect returns a static 404 for an unregistered, unstored provider and writes no audit', async (t) => {
   const { server, port, db } = await makeBroker(t);
   const untrusted = 'ghp_UNTRUSTED_PROVIDER_MUST_NOT_BE_REFLECTED';

@@ -321,6 +321,41 @@ test('disconnectProvider revokes an expired-here token upstream and reports remo
   assert.equal(await countConnections(db), 0);
 });
 
+test('disconnectProvider reports a referenced revocable credential as unresolved upstream debt', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const reference = 'TEST_EXTERNAL_REFERENCE';
+  await vault.reference(O1, 'revocable', { source: 'external', secretRef: reference });
+
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  let outcome: Awaited<ReturnType<typeof disconnectProvider>>;
+  try {
+    outcome = await disconnectProvider(
+      vault,
+      new Audit(db),
+      new ProviderRegistry([revocable]),
+      ID,
+      'revocable',
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  assert.deepEqual(outcome, { recognized: true, removed: true, ok: false, audited: true });
+  assert.equal(upstreamCalls, 0, 'an unresolved external reference cannot be sent to the provider');
+  assert.equal(await vault.has(O1, 'revocable'), false);
+  const row = (await db.get(
+    `SELECT meta FROM audit WHERE action='revoke' AND provider='revocable'`,
+  )) as { meta: string };
+  assert.deepEqual(JSON.parse(row.meta), { ok: false, upstream: 'skipped' });
+  assert.ok(!row.meta.includes(reference));
+});
+
 test('concurrent disconnects atomically claim one row, upstream revoke, and audit', async (t) => {
   const url = await testDbUrl(t);
   const [dbA, dbB] = await Promise.all([openDb({ databaseUrl: url }), openDb({ databaseUrl: url })]);
