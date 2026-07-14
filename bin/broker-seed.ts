@@ -1,22 +1,17 @@
 #!/usr/bin/env node
 /**
- * broker-seed: provision a credential into the vault WITHOUT Slack — the consent path for the
- * headless broker's shared/referenced credentials.
+ * broker-seed: provision an encrypted static credential into the vault WITHOUT Slack.
  *
- *   broker-seed reference --provider confluence --team T1 --user U1 \
- *       --source aws-sm --secret-ref arn:aws:secretsmanager:...:secret/xyz [--scopes read,write]
  *   broker-seed key --provider internal --team T1 --channel C1 [--scopes a,b]  (token in env)
  *
  * For `key` mode, prefer the VOUCHR_SEED_ACCESS_TOKEN env var — a `--access-token` FLAG lands in
  * process argv, visible via `ps`/`/proc` to co-tenants. The flag is kept only for interactive use.
  *
- * `reference` stores a POINTER to an external secret manager (nothing sensitive at rest here).
  * `key` stores a static token, encrypted at rest by VOUCHR_MASTER_KEY (+ envelope if configured).
  *
- * PER-USER credentials are NOT this tool's job: run the Bolt control-plane Vouchr against the SAME
- * Postgres DB and let users connect via Slack; the broker then reads what they consented to. This
- * CLI covers only operator-provisioned shared/referenced creds. Reads DB + key from env (see
- * DEPLOYMENT.md): VOUCHR_DATABASE_URL (PostgreSQL), VOUCHR_MASTER_KEY.
+ * Operators may seed a static user or channel credential. Interactive per-user consent remains the
+ * Bolt/OAuth flow against the same Postgres database. Reads DB + key from env (see DEPLOYMENT.md):
+ * VOUCHR_DATABASE_URL (PostgreSQL), VOUCHR_MASTER_KEY.
  */
 import { openDb } from '../src/core/db';
 import { loadKeyring } from '../src/core/crypto';
@@ -41,11 +36,9 @@ function die(msg: string): never {
   process.exit(1);
 }
 
-const USAGE = `vouchr-seed — provision an operator/shared credential into the vault (no Slack)
+const USAGE = `vouchr-seed — provision an operator-managed static credential (no Slack)
 
-Usage: vouchr-seed reference --provider <id> --team <T> (--user <U>|--channel <C>) \\
-                   --source <secret-manager-id> --secret-ref <ref> [--scopes a,b]
-       vouchr-seed key --provider <id> --team <T> (--user <U>|--channel <C>) [--scopes a,b]
+Usage: vouchr-seed key --provider <id> --team <T> (--user <U>|--channel <C>) [--scopes a,b]
                    (token from VOUCHR_SEED_ACCESS_TOKEN env; --access-token is visible in ps)
        vouchr-seed --help
 
@@ -57,8 +50,11 @@ async function main(): Promise<void> {
     console.log(USAGE);
     return;
   }
-  if (mode !== 'reference' && mode !== 'key') {
-    die('usage: broker-seed <reference|key> --provider <id> --team <T> (--user <U>|--channel <C>) ...');
+  if (mode === 'reference') {
+    die('reference mode was removed; use POST /v1/admin/reference or /v1/user/reference');
+  }
+  if (mode !== 'key') {
+    die('usage: broker-seed key --provider <id> --team <T> (--user <U>|--channel <C>) ...');
   }
   const f = parseFlags(rest);
   if (!f.provider) die('--provider is required');
@@ -82,23 +78,17 @@ async function main(): Promise<void> {
   const db = await openDb({ databaseUrl: url }); // PostgreSQL-only; openDb fails closed if unset/non-PG
   const vault = new Vault(db, loadKeyring(), {}, envelope);
   try {
-    if (mode === 'reference') {
-      if (!f.source) die('--source is required for reference mode (the secret manager id)');
-      if (!f['secret-ref']) die('--secret-ref is required for reference mode');
-      await vault.reference(owner, f.provider, { source: f.source, secretRef: f['secret-ref'], scopes });
-    } else {
-      // Prefer the env var (not visible in `ps`); fall back to the argv flag for interactive use.
-      const accessToken = process.env.VOUCHR_SEED_ACCESS_TOKEN || f['access-token'];
-      if (!accessToken) die('key mode needs a token: set VOUCHR_SEED_ACCESS_TOKEN (preferred) or --access-token');
-      await vault.upsert(owner, f.provider, {
-        accessToken,
-        refreshToken: f['refresh-token'] ?? null,
-        scopes: scopes ?? '',
-        expiresAt: null,
-        externalAccount: null,
-      });
-    }
-    console.log(`[vouchr] seeded ${mode} credential provider=${f.provider} owner=${f.user ? 'user' : 'channel'}`);
+    // Prefer the env var (not visible in `ps`); fall back to the argv flag for interactive use.
+    const accessToken = process.env.VOUCHR_SEED_ACCESS_TOKEN || f['access-token'];
+    if (!accessToken) die('key mode needs a token: set VOUCHR_SEED_ACCESS_TOKEN (preferred) or --access-token');
+    await vault.upsert(owner, f.provider, {
+      accessToken,
+      refreshToken: f['refresh-token'] ?? null,
+      scopes: scopes ?? '',
+      expiresAt: null,
+      externalAccount: null,
+    });
+    console.log(`[vouchr] seeded key credential provider=${f.provider} owner=${f.user ? 'user' : 'channel'}`);
   } finally {
     await db.close();
   }

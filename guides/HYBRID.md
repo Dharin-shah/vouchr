@@ -316,10 +316,11 @@ envelope until [#241](https://github.com/Dharin-shah/vouchr/issues/241) closes.
 > parsing, complete lifecycle, readiness, and shutdown wiring supplied by the packaged path. Do not
 > describe Slack Enable/Disable as an enforced stock-broker boundary until both issues close.
 
-Until #53 closes, deny both exact paths—`/v1/admin/reference` and `/v1/user/reference`—at the private
-ingress, while leaving credential entry on Bolt. Merely choosing not to call the routes is not a
-control. A custom `authorize` hook can enforce the deny, but it **replaces** `VOUCHR_BROKER_TOKEN`;
-that hook must perform caller authentication and route denial together.
+Both `/v1/admin/reference` and `/v1/user/reference` enforce the reference-only boundary before any
+credential, mode, or audit write: the broker validates a bounded supported reference form, derives its
+source, and confirms that an own resolver function is configured without invoking it. Raw values,
+unknown or malformed schemes, source mismatches, scopes outside the provider's declaration, and
+missing resolvers fail with fixed errors that do not reflect caller input.
 
 ### External-secret resolver hook
 
@@ -641,8 +642,9 @@ The ARN stored by Vouchr should point to the bearer/API key expected by the inte
 broker resolves it just in time, so rotating the AWS secret changes the next request without a Vouchr
 database update.
 
-- configure the ARN through the Bolt modal while #53 remains open;
-- run the resolver in the broker, because the broker performs egress;
+- configure the ARN through the Bolt modal or the appropriate headless reference route;
+- register the matching resolver function in every process that accepts references (the Bolt
+  control plane and broker here), but grant network/IAM access only where egress resolves it;
 - give the broker workload role `secretsmanager:GetSecretValue` only on the exact ARNs and
   `kms:Decrypt` only when the secret uses a customer-managed KMS key; and
 - smoke-test an actual resolution—saving the ARN proves persistence, not IAM access or secret shape.
@@ -662,7 +664,7 @@ generic bearer/key injector does not implement AWS SigV4 request signing.
 | Slack signing secret/bot tokens | yes | no | Public Slack ingress only |
 | `PUBLIC_URL`/provider callback | yes | no | OAuth callback stays on Bolt in hybrid |
 | Broker perimeter auth | no | yes | mTLS/mesh, `authorize`, or a coarse bearer alternative; `authorize` replaces the bearer check |
-| External-secret resolver and IAM | only if this process also performs egress | yes | Required where egress resolves the reference; the modal only classifies the reference scheme |
+| External-secret resolver and IAM | resolver entry wherever references are accepted; IAM only where egress runs | resolver entry + IAM | Saving validates that a matching resolver function is configured but does not invoke it; the egress process resolves JIT and needs network/IAM access |
 | Resource bounds | control HTTP server | yes | Finite ingress, egress, pool, stream, and shutdown limits |
 
 Do not give PostgreSQL ownership/DDL rights to either runtime. Budget database connections as
@@ -786,10 +788,11 @@ Run this proof against at least two broker replicas and one shared PostgreSQL da
 8. Replay one assertion against two replicas and prove exactly one succeeds.
 9. Exercise provider timeout after dispatch; prove no automatic write retry occurs.
 10. Deactivate/offboard a user while OAuth is in flight and prove the credential cannot reappear.
-11. While #53 is open, prove ingress denies both `/v1/admin/reference` and `/v1/user/reference` while
-    Bolt modal reference storage still works. Deny resolver/KMS IAM and prove there is no plaintext
-    fallback and no secret in output/audit. Cancel one resolver call and prove the underlying SDK work
-    ends; this currently exposes #209 in the repository example.
+11. Prove both reference routes reject raw, malformed, mismatched-source, invalid-scope, and
+    unconfigured-resolver input without creating a credential, channel mode, or audit row. Then deny
+    resolver/KMS IAM and prove there is no plaintext fallback and no secret in output/audit. Cancel
+    one resolver call and prove the underlying SDK work ends; this currently exposes #209 in the
+    repository example.
 12. Drive a remote `approval_required` through the private Slack decision, denial, expiry,
     double-click, fresh-assertion retry, and single-use grant paths required by #194.
 13. Drain one broker under load, restore PostgreSQL from backup, prove #239's containment state

@@ -200,11 +200,11 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
   } },
   { name: 'admin.reference.ok', run: async (t) => {
       const { server, port } = await makeBroker(t);
-      try { return await request(port, 'POST', '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz' }); } finally { server.close(); }
+      try { return await request(port, 'POST', '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken(), secretRef: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/channel' }); } finally { server.close(); }
   } },
   { name: 'user.reference.ok', run: async (t) => {
       const { server, port } = await makeBroker(t);
-      try { return await request(port, 'POST', '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: userToken(), source: 'aws-sm', secretRef: 'arn:user' }); } finally { server.close(); }
+      try { return await request(port, 'POST', '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: userToken(), secretRef: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/user' }); } finally { server.close(); }
   } },
   { name: 'health.ok', run: async (t) => {
       // /healthz and /health share one handler — liveness only: a bare {ok:true}, no DB touch.

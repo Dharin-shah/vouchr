@@ -14,6 +14,7 @@ import { userOwner } from '../src/core/owner';
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_MAYA' };
 const SECRET = 'test-user-key-7777';
+const AWS_REF = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/user-key';
 
 // A key-based provider: no OAuth client; the user pastes their own key.
 const keyProvider = defineProvider({
@@ -22,14 +23,19 @@ const keyProvider = defineProvider({
   inject: (h, s) => h.set('x-api-key', s),
 });
 
-async function ctx(t: TestContext, channel: string | null = 'C1', client: any = {}) {
+async function ctx(
+  t: TestContext,
+  channel: string | null = 'C1',
+  client: any = {},
+  resolvers: any = { 'aws-sm': async () => SECRET },
+) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const c = new ConnectContext({
     identity: ID, channel, client, registry: new ProviderRegistry([keyProvider]), vault, audit,
     consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
-    channelConfig: new ChannelConfig(db),
+    channelConfig: new ChannelConfig(db), resolvers,
   });
   return { c, db, vault, audit };
 }
@@ -66,12 +72,36 @@ test('setUserSecret: secret never leaks to audit/return', async (t) => {
 
 // referenceUserSecret stores a non-secret pointer under the user.
 test('referenceUserSecret: external ref under the user, no secret stored', async (t) => {
-  const { c, vault } = await ctx(t);
-  await c.referenceUserSecret('customdb', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:r:k' });
+  const { c, db, vault } = await ctx(t);
+  await c.referenceUserSecret('customdb', { secretRef: AWS_REF });
   const cred = await vault.get(userOwner(ID), 'customdb');
   assert.equal(cred?.source, 'aws-sm');
-  assert.equal(cred?.secretRef, 'arn:aws:secretsmanager:r:k');
+  assert.equal(cred?.secretRef, AWS_REF);
+  assert.equal(cred?.scopes, '');
   assert.equal(cred?.accessToken, null);
+  assert.deepEqual(JSON.parse((await auditRows(db))[0].meta), { owner: 'user', kind: 'ref', source: 'aws-sm' });
+});
+
+test('referenceUserSecret: invalid input or missing resolver writes no connection or audit', async (t) => {
+  const sentinel = 'sk_live_USER_REFERENCE_SENTINEL';
+  const cases = [
+    { value: { secretRef: sentinel }, resolvers: undefined },
+    { value: { secretRef: ` ${AWS_REF}` }, resolvers: undefined },
+    { value: { secretRef: AWS_REF, source: 'gcp-sm' }, resolvers: undefined },
+    { value: { secretRef: AWS_REF, scopes: sentinel }, resolvers: undefined },
+    { value: { secretRef: AWS_REF, scopes: 'read  write' }, resolvers: undefined },
+    { value: { secretRef: AWS_REF }, resolvers: {} },
+  ];
+
+  for (const entry of cases) {
+    const { c, db, vault } = await ctx(t, 'C1', {}, entry.resolvers);
+    await assert.rejects(
+      () => c.referenceUserSecret('customdb', entry.value),
+      (error: Error) => !error.message.includes(sentinel),
+    );
+    assert.equal(await vault.get(userOwner(ID), 'customdb'), null);
+    assert.deepEqual(await auditRows(db), []);
+  }
 });
 
 // connect() on a key provider with no cred → posts the key-setup prompt (NOT OAuth), then stops.

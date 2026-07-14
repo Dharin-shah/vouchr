@@ -19,8 +19,14 @@ test('azure resolver returns the secret value', async () => {
 });
 
 test('azure resolver throws on a malformed reference', async () => {
-  const fetch = (async () => { throw new Error('should not be called'); }) as unknown as typeof globalThis.fetch;
-  await assert.rejects(() => azureKeyVault({ fetch })['azure-kv']('azure-kv://only-vault'), /Malformed/);
+  let calls = 0;
+  const fetch = (async () => { calls++; throw new Error('should not be called'); }) as unknown as typeof globalThis.fetch;
+  const sentinel = 'ghp_AZURE_REFERENCE_SENTINEL';
+  await assert.rejects(
+    () => azureKeyVault({ fetch })['azure-kv'](`azure-kv://${sentinel}`),
+    (error: Error) => /Malformed/.test(error.message) && !error.message.includes(sentinel),
+  );
+  assert.equal(calls, 0);
 });
 
 test('azure resolver rejects a host-injecting reference before any fetch (SSRF guard)', async () => {

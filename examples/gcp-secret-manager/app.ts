@@ -1,8 +1,8 @@
 import { createVouchr, github } from '../../src';
 import { gcpSecretManager } from './resolver';
 
-// Wire the GCP Secret Manager resolver into Vouchr. The 'gcp-sm' source id matches
-// what bolt's refSource() assigns to a `gcp-sm://` reference.
+// Wire the GCP Secret Manager resolver into Vouchr. Its 'gcp-sm' key matches the source Vouchr
+// derives from a supported GCP reference; configuration checks presence without resolving.
 //
 // An admin then runs, from inside the channel they want to configure:
 //

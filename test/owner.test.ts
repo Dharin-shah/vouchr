@@ -36,13 +36,14 @@ test('referenced secret-source: resolved JIT, injected, never persisted', async 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const owner = channelOwner('T1', 'C_FIN');
-  await vault.reference(owner, 'mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:...:k' });
+  const reference = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/owner-test';
+  await vault.reference(owner, 'mcp', { source: 'aws-sm', secretRef: reference });
 
   // The secret itself appears nowhere in the row. Only the ARN ref does.
   const row = await db.get('SELECT access_token_enc, secret_ref, source FROM connection') as any;
   assert.equal(row.access_token_enc, null);
   assert.equal(row.source, 'aws-sm');
-  assert.equal(row.secret_ref, 'arn:aws:secretsmanager:...:k');
+  assert.equal(row.secret_ref, reference);
 
   const provider = defineProvider({
     id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
@@ -61,7 +62,7 @@ test('referenced secret-source: resolved JIT, injected, never persisted', async 
     const acting = { enterpriseId: null, teamId: 'T1', userId: 'Uacting' };
     const handle = new ConnectionHandle(provider, owner, acting, vault, audit, resolvers);
     await handle.fetch('https://api.test/thing');
-    assert.equal(resolvedWith, 'arn:aws:secretsmanager:...:k'); // resolver got the ref
+    assert.equal(resolvedWith, reference); // resolver got the ref
     assert.equal(seenAuth, 'Bearer SECRET_FROM_AWS'); // resolved secret injected at the boundary
     // The resolved secret was never written back to the DB.
     const after = await db.get('SELECT access_token_enc FROM connection') as any;

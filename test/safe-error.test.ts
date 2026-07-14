@@ -9,6 +9,7 @@ import {
   SessionApprovalRequiredError,
 } from '../src/adapters/bolt';
 import { EgressBlockedError, NoConnectionError, ResponseBlockedError } from '../src/core/injector';
+import { SecretReferenceError } from '../src/core/reference';
 import { defineProvider } from '../src/core/providers';
 import { USER_KEY_CALLBACK, CONFIGURE_CALLBACK } from '../src/adapters/blocks';
 
@@ -46,6 +47,7 @@ test("safeUserMessage: Vouchr's own error classes keep their message", () => {
     new EgressBlockedError('Egress blocked: host not allowed'),
     new ResponseBlockedError('Response blocked: content-type is not allowed for provider "github"', 'content_type'),
     new NoConnectionError('No connection for github'),
+    new SecretReferenceError('invalid_reference'),
   ]) {
     assert.equal(safeUserMessage(e), (e as Error).message);
   }
@@ -99,6 +101,48 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
   const shown = JSON.stringify(acked);
   assert.ok(!shown.includes('ghp_abc'), 'secret must not reach the modal error');
   assert.match(acked.errors.raw, /Something went wrong \(KmsWrapError\)\./);
+});
+
+test('modal reference submits share the core validator and reject whitespace before state or audit', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const db = await openTestDb(t);
+  const provider = acme();
+  const reference = ' arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/modal';
+  const vouchr = await createVouchr({
+    providers: [provider], baseUrl: 'http://127.0.0.1:1', db,
+    resolvers: { 'aws-sm': async () => SECRET },
+  });
+  const views: Record<string, any> = {};
+  vouchr.registerCommands({
+    command: () => undefined,
+    view: (id: string, handler: any) => { views[id] = handler; },
+    action: () => undefined,
+  });
+  const client = {
+    users: { info: async () => ({ user: { is_admin: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    chat: { postMessage: async () => ({}) },
+  };
+
+  for (const [callback, channel] of [[CONFIGURE_CALLBACK, 'C1'], [USER_KEY_CALLBACK, '']] as const) {
+    let acked: any = null;
+    await views[callback]({
+      ack: async (value: any) => { acked = value; },
+      body: { team: { id: 'T1' }, user: { id: 'U1' } },
+      view: {
+        private_metadata: JSON.stringify({ channel, provider: 'acme' }),
+        state: { values: { raw: { v: { value: '' } }, ref: { v: { value: reference } } } },
+      },
+      client,
+    });
+    assert.equal(acked.response_action, 'errors');
+    assert.equal(acked.errors.ref, 'Invalid secret reference. Use a bounded supported external-reference form.');
+    assert.ok(!JSON.stringify(acked).includes(reference));
+  }
+
+  assert.equal((await db.get<any>('SELECT COUNT(*) n FROM connection')).n, 0);
+  assert.equal((await db.get<any>('SELECT COUNT(*) n FROM channel_config')).n, 0);
+  assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
 });
 
 // Regression (#97 issue #132): the deliberate admin-denial for `/vouchr mode` is thrown as a plain

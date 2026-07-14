@@ -13,6 +13,7 @@ import { ConnectContext } from '../src/adapters/bolt';
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
 const SECRET = 'sk-super-secret-value-9999';
+const AWS_REF = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/channel-key';
 
 const provider = defineProvider({
   id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
@@ -20,7 +21,14 @@ const provider = defineProvider({
 });
 
 // `convo` shapes the mocked conversations.info: a class object (default normal), or a thrower.
-async function ctx(t: TestContext, isAdmin: boolean, channel: string | null = 'C_FIN', convo: any = {}, policy = new Policy()) {
+async function ctx(
+  t: TestContext,
+  isAdmin: boolean,
+  channel: string | null = 'C_FIN',
+  convo: any = {},
+  policy = new Policy(),
+  resolvers: any = { 'aws-sm': async () => SECRET },
+) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -36,6 +44,7 @@ async function ctx(t: TestContext, isAdmin: boolean, channel: string | null = 'C
   const c = new ConnectContext({
     identity: ID, channel, client, registry: new ProviderRegistry([provider]), vault, audit,
     consent: new Consent(db), policy, redirectUri: 'http://x', channelConfig: new ChannelConfig(db),
+    resolvers,
   });
   return { c, db, vault, audit };
 }
@@ -82,7 +91,7 @@ test('per-user lock refuses shared creds (invariant 7)', async (t) => {
   await c.setChannelMode('mcp', 'per-user');
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /per-user/);
   await assert.rejects(
-    () => c.referenceChannelSecret('mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:x' }),
+    () => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }),
     /per-user/,
   );
 });
@@ -90,13 +99,40 @@ test('per-user lock refuses shared creds (invariant 7)', async (t) => {
 // referenceChannelSecret stores only the non-secret ref + source; rotation stays external.
 test('referenceChannelSecret stores the ARN pointer, not a secret', async (t) => {
   const { c, db, vault } = await ctx(t, true);
-  await c.referenceChannelSecret('mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:r:k' });
+  await c.referenceChannelSecret('mcp', { secretRef: AWS_REF });
   const cred = await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp');
   assert.equal(cred?.source, 'aws-sm');
-  assert.equal(cred?.secretRef, 'arn:aws:secretsmanager:r:k');
+  assert.equal(cred?.secretRef, AWS_REF);
+  assert.equal(cred?.scopes, '');
   assert.equal(cred?.accessToken, null); // no secret material in the row
   const row = await db.get('SELECT access_token_enc FROM connection') as any;
   assert.equal(row.access_token_enc, null);
+  assert.deepEqual(JSON.parse((await auditRows(db))[0].meta), {
+    owner: 'channel', channel: 'C_FIN', mode: 'shared', kind: 'ref', source: 'aws-sm',
+  });
+});
+
+test('referenceChannelSecret rejects invalid input before connection, mode, or audit state', async (t) => {
+  const sentinel = 'sk_live_CHANNEL_REFERENCE_SENTINEL';
+  const cases = [
+    { value: { secretRef: sentinel }, resolvers: undefined },
+    { value: { secretRef: `${AWS_REF} ` }, resolvers: undefined },
+    { value: { secretRef: AWS_REF, source: 'gcp-sm' }, resolvers: undefined },
+    { value: { secretRef: AWS_REF, scopes: sentinel }, resolvers: undefined },
+    { value: { secretRef: AWS_REF, scopes: 'read\nwrite' }, resolvers: undefined },
+    { value: { secretRef: AWS_REF }, resolvers: {} },
+  ];
+
+  for (const entry of cases) {
+    const { c, db, vault } = await ctx(t, true, 'C_FIN', {}, new Policy(), entry.resolvers);
+    await assert.rejects(
+      () => c.referenceChannelSecret('mcp', entry.value),
+      (error: Error) => !error.message.includes(sentinel),
+    );
+    assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
+    assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'mcp'), null);
+    assert.deepEqual(await auditRows(db), []);
+  }
 });
 
 // connectChannel returns a handle for the shared cred; per-user lock & missing cred both refuse.
@@ -141,7 +177,7 @@ test('T2 channel-class restriction: disallowed classes refuse config (invariant 
     const { c, vault } = await ctx(t, true, 'C_FIN', convo);
     await assert.rejects(() => c.setChannelSecret('mcp', SECRET), reason);
     await assert.rejects(
-      () => c.referenceChannelSecret('mcp', { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:x' }),
+      () => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }),
       reason,
     );
     await assert.rejects(() => c.setChannelMode('mcp', 'shared'), reason);

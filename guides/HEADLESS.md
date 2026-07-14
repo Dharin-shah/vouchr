@@ -10,8 +10,7 @@ If Slack should remain the built-in human/admin experience, start with the
 > [!WARNING]
 > On the current stock packaged broker, Slack-written channel tool settings are not enforced
 > ([#240](https://github.com/Dharin-shah/vouchr/issues/240)), declarative static channel policy is not
-> loaded ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), reference-route validation remains
-> open ([#53](https://github.com/Dharin-shah/vouchr/issues/53)), and broker denials do not automatically
+> loaded ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), and broker denials do not automatically
 > render Slack recovery prompts ([#194](https://github.com/Dharin-shah/vouchr/issues/194)). The low-level
 > `createBroker()` API exposes the relevant stores/hooks, but do not mistake that programmatic surface
 > for complete packaged hybrid behavior.
@@ -105,8 +104,8 @@ One core, two front doors — both reach the same credential boundary.
 | Read the channel's modes + tool allowlist | ✅ (implicit) | ⚠️ route exists, but packaged broker has no persisted tool store (#240) |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
-| Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ⚠️ intended reference-only boundary; current validation gap is #53, so path-block the routes |
-| Point a credential at a secret-manager **reference** | ✅ | ⚠️ routes exist; reference validation parity/readiness remains #53 |
+| Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ rejected; reference routes never accept raw values |
+| Point a credential at a secret-manager **reference** | ✅ | ✅ `POST /v1/admin/reference` (channel) · `POST /v1/user/reference` (self) |
 | Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons for in-process use | ⚠️ broker enforces 403 `approval_required`; no automatic Slack bridge (#194) |
 | Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
@@ -251,12 +250,14 @@ unavailable and it cannot enforce rows written by Bolt; see
 [#240](https://github.com/Dharin-shah/vouchr/issues/240). It also does not load static `Policy`; see
 [#236](https://github.com/Dharin-shah/vouchr/issues/236).
 
-The intended boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
+The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).
-Current validation does not yet enforce that boundary completely. Until
-[#53](https://github.com/Dharin-shah/vouchr/issues/53) closes, use the Bolt modal and deny both routes
-at broker ingress. Bolt restricts recognized schemes, but a successful save still does not prove
-resolver/IAM readiness.
+Both routes validate a bounded supported reference form, derive its source server-side, and require an
+own configured resolver function before any credential, mode, or audit write. A compatibility
+`source` field may be supplied only when it exactly matches that derived source; optional scopes
+must be a bounded unique subset of the provider's declared scopes. Saving does not invoke the
+resolver or prove IAM, network, or secret availability; resolution remains just in time at
+credential use.
 
 ## Operations
 

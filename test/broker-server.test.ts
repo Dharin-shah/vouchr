@@ -1,7 +1,7 @@
 import { test, type TestContext } from 'node:test';
 import { testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -564,20 +564,23 @@ test('buildBrokerServer: hook overrides cannot replace identity/replay/provider 
 
 // ── T8: seed CLI ─────────────────────────────────────────────────────────────
 
-test('broker-seed: reference mode writes a credential the broker can resolve', async (t) => {
+test('broker-seed: removed reference mode rejects before writing or reflecting input', async (t) => {
   const _dir = mkdtempSync(join(tmpdir(), 'vouchr-seed-'));
   const dbPath = await testDbUrl(t);
   const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: KEY_B64 };
-  execFileSync(process.execPath, [
+  const sentinel = 'ghp_SEED_REFERENCE_SENTINEL';
+  const result = spawnSync(process.execPath, [
     '--import', 'tsx', 'bin/broker-seed.ts', 'reference',
     '--provider', 'confluence', '--team', 'T1', '--user', 'U1',
-    '--source', 'aws-sm', '--secret-ref', 'arn:aws:secretsmanager:xyz',
-  ], { env, stdio: 'pipe' });
+    '--source', 'aws-sm', '--secret-ref', sentinel,
+  ], { env, encoding: 'utf8' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /reference mode was removed/);
+  assert.ok(!`${result.stdout}${result.stderr}`.includes(sentinel));
 
   const db = await openDb({ databaseUrl: dbPath });
   try {
-    const cred = await new Vault(db, Buffer.from(KEY_B64, 'base64')).get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'confluence');
-    assert.equal(cred?.secretRef, 'arn:aws:secretsmanager:xyz'); // provisioned without Slack
+    assert.equal((await db.get<{ n: number }>('SELECT COUNT(*) n FROM connection'))?.n, 0);
   } finally {
     await db.close();
   }

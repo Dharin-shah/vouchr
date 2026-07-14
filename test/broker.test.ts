@@ -11,6 +11,7 @@ import { defineProvider, type Provider } from '../src/core/providers';
 import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { ChannelConfig } from '../src/core/channelConfig';
+import { MAX_SECRET_REFERENCE_BYTES } from '../src/core/reference';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
 import { identityKid, normalizeIdentityConfig } from '../src/adapters/http/identity';
 import {
@@ -26,6 +27,9 @@ import {
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
 const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK'; // the vaulted token that must never escape
+const AWS_ADMIN_REF = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/channel';
+const AWS_USER_REF = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/user';
+const VAULT_USER_REF = 'vault://secret/vouchr/user#token';
 
 const acme = defineProvider({
   id: 'acme',
@@ -1422,7 +1426,11 @@ async function makeAdminBroker(t: TestContext, extra: Partial<Parameters<typeof 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig, ...extra });
+  const server = createBroker({
+    providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
+    resolvers: { 'aws-sm': async () => SECRET_TOKEN },
+    ...extra,
+  });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, channelConfig, port: (server.address() as any).port };
 }
@@ -1432,20 +1440,33 @@ function adminToken(over: Partial<IdentityClaims> = {}): string {
 }
 
 test('#53 admin reference stores a channel ref, flips to shared; a member fetch resolves it at egress', async (t) => {
-  const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:xyz' ? SECRET_TOKEN : 'WRONG') };
-  const { server, port, channelConfig } = await makeAdminBroker(t, { resolvers });
+  let resolverCalls = 0;
+  const resolvers = { 'aws-sm': async (ref: string) => { resolverCalls++; return ref === AWS_ADMIN_REF ? SECRET_TOKEN : 'WRONG'; } };
+  const { server, port, channelConfig, vault, db } = await makeAdminBroker(t, { resolvers });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
+      handle: { provider: 'acme' }, identityToken: adminToken(), secretRef: AWS_ADMIN_REF, scopes: 'x',
     });
     assert.equal(r.status, 200);
     assert.equal(r.json.ok, true);
+    assert.equal(resolverCalls, 0, 'configuration validates resolver presence without reading the secret');
     assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), 'shared');
+    const stored = await vault.get(channelOwner('T1', 'C1'), 'acme');
+    assert.equal(stored?.source, 'aws-sm');
+    assert.equal(stored?.secretRef, AWS_ADMIN_REF);
+    assert.equal(stored?.scopes, 'x');
+    assert.equal(stored?.accessToken, null);
+    const configAudit = await db.get<any>(`SELECT meta FROM audit WHERE action='config'`);
+    assert.deepEqual(JSON.parse(configAudit.meta), {
+      owner: 'channel', channel: 'C1', mode: 'shared', kind: 'ref', source: 'aws-sm',
+    });
     // A channel member's fetch now injects the JIT-resolved secret (never stored raw).
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x' });
     assert.equal(f.status, 200);
+    assert.equal(resolverCalls, 1);
     assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+    assert.ok(!r.raw.includes(SECRET_TOKEN) && !f.raw.includes(SECRET_TOKEN));
   } finally {
     up.restore();
     server.close();
@@ -1456,7 +1477,7 @@ test('#53 non-admin signed token -> refused (nothing configured)', async (t) => 
   const { server, port, channelConfig } = await makeAdminBroker(t);
   try {
     const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET), source: 'aws-sm', secretRef: 'arn:xyz',
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
     assert.equal(r.status, 403);
     assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
@@ -1470,7 +1491,7 @@ test('#53 forged body admin flag (no signed isAdmin claim) -> refused', async (t
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET),
-      source: 'aws-sm', secretRef: 'arn:xyz', isAdmin: true,
+      source: 'aws-sm', secretRef: AWS_ADMIN_REF, isAdmin: true,
     } as any);
     assert.equal(r.status, 403);
   } finally {
@@ -1482,7 +1503,7 @@ test('#53 ineligible channel (signed eligibility false) -> refused', async (t) =
   const { server, port, channelConfig } = await makeAdminBroker(t);
   try {
     const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: adminToken({ channelEligible: false }), source: 'aws-sm', secretRef: 'arn:xyz',
+      handle: { provider: 'acme' }, identityToken: adminToken({ channelEligible: false }), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
     assert.equal(r.status, 403);
     assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
@@ -1495,7 +1516,7 @@ test('#53 refused when channel modes are not enabled (no channelConfig)', async 
   const { server, port } = await makeBroker(t); // no channelConfig
   try {
     const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
+      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
     assert.equal(r.status, 403);
   } finally {
@@ -1503,13 +1524,68 @@ test('#53 refused when channel modes are not enabled (no channelConfig)', async 
   }
 });
 
-test('#53 no raw secret is accepted (source + secretRef are required, not a token)', async (t) => {
+test('#53 no raw secret is accepted in place of a supported reference', async (t) => {
   const { server, port } = await makeAdminBroker(t);
   try {
-    const r = await post(port, '/v1/admin/reference', { handle: { provider: 'acme' }, identityToken: adminToken() } as any);
+    const r = await post(port, '/v1/admin/reference', {
+      handle: { provider: 'acme' }, identityToken: adminToken(), secretRef: SECRET_TOKEN,
+    });
     assert.equal(r.status, 400);
+    assert.ok(!r.raw.includes(SECRET_TOKEN));
   } finally {
     server.close();
+  }
+});
+
+test('#53 both reference routes reject non-object JSON with a fixed 400 and no state', async (t) => {
+  const { server, port, vault, db, channelConfig } = await makeAdminBroker(t);
+  try {
+    for (const path of ['/v1/admin/reference', '/v1/user/reference']) {
+      for (const body of [null, [], 'reference', 53]) {
+        const response = await post(port, path, body);
+        assert.equal(response.status, 400);
+        assert.deepEqual(response.json, { error: 'JSON body must be an object' });
+      }
+    }
+    assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+    assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('#53 admin reference rejects invalid input before connection, mode, or audit state', async (t) => {
+  const sentinel = 'sk_live_ADMIN_REFERENCE_SENTINEL';
+  const cases: Array<{ body: Record<string, unknown>; noResolver?: boolean }> = [
+    { body: { secretRef: sentinel } },
+    { body: { secretRef: `${AWS_ADMIN_REF} ${sentinel}` } },
+    { body: { secretRef: 'gcp-sm://projects/../secrets/s/versions/latest' } },
+    { body: { secretRef: AWS_ADMIN_REF, source: sentinel } },
+    { body: { secretRef: AWS_ADMIN_REF, scopes: sentinel } },
+    { body: { secretRef: AWS_ADMIN_REF, scopes: `${sentinel}\nread` } },
+    { body: { secretRef: AWS_ADMIN_REF + 'x'.repeat(MAX_SECRET_REFERENCE_BYTES) } },
+    { body: { secretRef: { sentinel } } },
+    { body: { secretRef: AWS_ADMIN_REF }, noResolver: true },
+  ];
+
+  for (const entry of cases) {
+    const { server, port, vault, db, channelConfig } = await makeAdminBroker(
+      t,
+      entry.noResolver ? { resolvers: {} } : {},
+    );
+    try {
+      const r = await post(port, '/v1/admin/reference', {
+        handle: { provider: 'acme' }, identityToken: adminToken(), ...entry.body,
+      });
+      assert.equal(r.status, 400);
+      assert.ok(!r.raw.includes(sentinel), 'fixed validation response must not reflect caller input');
+      assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
+      assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+      assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
+    } finally {
+      server.close();
+    }
   }
 });
 
@@ -1518,7 +1594,7 @@ test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async (t
   await channelConfig.setMode('T1', 'C1', 'acme', 'per-user');
   try {
     const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: 'arn:xyz',
+      handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
     assert.equal(r.status, 409);
   } finally {
@@ -1601,27 +1677,39 @@ async function makeRefBroker(t: TestContext, extra: Partial<Parameters<typeof cr
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const server = createBroker({ providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
+  const server = createBroker({
+    providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
+    resolvers: { 'aws-sm': async () => SECRET_TOKEN },
+    ...extra,
+  });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, port: (server.address() as any).port };
 }
 
 test('#58 user reference stores the acting user\'s ref; their fetch resolves it at egress', async (t) => {
-  const resolvers = { 'aws-sm': async (ref: string) => (ref === 'arn:user' ? SECRET_TOKEN : 'WRONG') };
-  const { server, port, vault } = await makeRefBroker(t, { resolvers });
+  let resolverCalls = 0;
+  const resolvers = { 'aws-sm': async (ref: string) => { resolverCalls++; return ref === AWS_USER_REF ? SECRET_TOKEN : 'WRONG'; } };
+  const { server, port, vault, db } = await makeRefBroker(t, { resolvers });
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/user/reference', {
-      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn:user',
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), secretRef: AWS_USER_REF,
     });
     assert.equal(r.status, 200);
     assert.equal(r.json.ok, true);
-    // Stored against the acting user (U1) as a reference — no raw secret persisted.
+    assert.equal(resolverCalls, 0, 'saving a reference must not read the external secret');
+    // Stored against the acting user (U1) as a validated reference — no raw secret persisted.
     const cred = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
-    assert.equal(cred?.secretRef, 'arn:user');
+    assert.equal(cred?.source, 'aws-sm');
+    assert.equal(cred?.secretRef, AWS_USER_REF);
+    assert.equal(cred?.accessToken, null);
+    const configAudit = await db.get<any>(`SELECT meta FROM audit WHERE action='config'`);
+    assert.deepEqual(JSON.parse(configAudit.meta), { owner: 'user', kind: 'ref', source: 'aws-sm' });
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(f.status, 200);
+    assert.equal(resolverCalls, 1);
     assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+    assert.ok(!r.raw.includes(SECRET_TOKEN) && !f.raw.includes(SECRET_TOKEN));
   } finally {
     up.restore();
     server.close();
@@ -1631,10 +1719,108 @@ test('#58 user reference stores the acting user\'s ref; their fetch resolves it 
 test('#58 user reference is bound to the token identity (a forged body can\'t reference into another slot)', async (t) => {
   const { server, port, vault } = await makeRefBroker(t);
   try {
-    await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET), source: 'aws-sm', secretRef: 'arn:user' });
+    await post(port, '/v1/user/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET),
+      source: 'aws-sm', secretRef: AWS_USER_REF,
+      userId: 'U2', teamId: 'T2', enterpriseId: 'E2',
+      identity: { teamId: 'T2', userId: 'U2' },
+    } as any);
     assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), 'stored for the token user U1');
     assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), null, 'never for another user');
+    assert.equal(await vault.get(userOwner({ enterpriseId: 'E2', teamId: 'T2', userId: 'U2' }), 'acme'), null, 'body identity is ignored');
   } finally {
+    server.close();
+  }
+});
+
+test('#53 user reference rejects invalid input before connection or audit state', async (t) => {
+  const sentinel = 'sk_live_USER_ROUTE_REFERENCE_SENTINEL';
+  const cases: Array<{ body: Record<string, unknown>; noResolver?: boolean }> = [
+    { body: { secretRef: sentinel } },
+    { body: { secretRef: ` ${AWS_USER_REF}` } },
+    { body: { secretRef: 'gcp-sm://projects/../secrets/s/versions/latest' } },
+    { body: { secretRef: AWS_USER_REF, source: sentinel } },
+    { body: { secretRef: AWS_USER_REF, scopes: sentinel } },
+    { body: { secretRef: AWS_USER_REF, scopes: `read  ${sentinel}` } },
+    { body: { secretRef: AWS_USER_REF + 'x'.repeat(MAX_SECRET_REFERENCE_BYTES) } },
+    { body: { secretRef: null } },
+    { body: { secretRef: AWS_USER_REF }, noResolver: true },
+  ];
+
+  for (const entry of cases) {
+    const { server, port, vault, db } = await makeRefBroker(
+      t,
+      entry.noResolver ? { resolvers: {} } : {},
+    );
+    try {
+      const r = await post(port, '/v1/user/reference', {
+        handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), ...entry.body,
+      });
+      assert.equal(r.status, 400);
+      assert.ok(!r.raw.includes(sentinel), 'fixed validation response must not reflect caller input');
+      assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
+      assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
+    } finally {
+      server.close();
+    }
+  }
+});
+
+test('#53 vault:// reference reaches the configured HashiCorp resolver instead of the local vault path', async (t) => {
+  let resolvedWith: string | null = null;
+  const { server, port, vault } = await makeRefBroker(t, {
+    resolvers: { vault: async (ref: string) => { resolvedWith = ref; return SECRET_TOKEN; } },
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const configured = await post(port, '/v1/user/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), secretRef: VAULT_USER_REF,
+    });
+    assert.equal(configured.status, 200);
+    const stored = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+    assert.equal(stored?.source, 'vault');
+    assert.equal(stored?.secretRef, VAULT_USER_REF);
+    assert.equal(stored?.accessToken, null);
+    assert.equal(resolvedWith, null);
+
+    const fetched = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/x',
+    });
+    assert.equal(fetched.status, 200);
+    assert.equal(resolvedWith, VAULT_USER_REF);
+    assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
+    assert.ok(!configured.raw.includes(SECRET_TOKEN) && !fetched.raw.includes(SECRET_TOKEN));
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#53 malformed legacy vault:// row is quarantined before resolver or provider I/O', async (t) => {
+  const sentinel = 'ghp_LEGACY_REFERENCE_SENTINEL';
+  const legacyRef = `vault://secret/foo/../../../other/data/target#${sentinel}`;
+  let resolverCalls = 0;
+  const { server, port, vault } = await makeRefBroker(t, {
+    resolvers: { vault: async () => { resolverCalls++; return SECRET_TOKEN; } },
+  });
+  await vault.reference(
+    userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+    'acme',
+    { source: 'vault', secretRef: legacyRef },
+  );
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const fetched = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/x',
+    });
+    assert.equal(fetched.status, 502);
+    assert.equal(resolverCalls, 0);
+    assert.equal(up.seen.length, 0);
+    assert.ok(!fetched.raw.includes(sentinel));
+  } finally {
+    up.restore();
     server.close();
   }
 });
@@ -1642,8 +1828,8 @@ test('#58 user reference is bound to the token identity (a forged body can\'t re
 test('#58 user reference rejects a tampered token, service tools, and a missing secretRef', async (t) => {
   const { server, port } = await makeRefBroker(t);
   try {
-    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: 'nope', source: 'aws-sm', secretRef: 'arn' })).status, 401);
-    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: 'arn' })).status, 403);
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: 'nope', source: 'aws-sm', secretRef: AWS_USER_REF })).status, 401);
+    assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'svc' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm', secretRef: AWS_USER_REF })).status, 403);
     assert.equal((await post(port, '/v1/user/reference', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), source: 'aws-sm' } as any)).status, 400);
   } finally {
     server.close();

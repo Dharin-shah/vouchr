@@ -20,7 +20,8 @@
  *   # terminal B — call through the broker as that user:
  *   BROKER_URL=http://localhost:3000 node --import tsx examples/broker-client/client.ts
  *
- * See `npm run seed` in guides/DEPLOYMENT.md for reference vs key modes.
+ * See `npm run seed` in guides/DEPLOYMENT.md for static-key provisioning; external references use
+ * the validated admin/user routes.
  */
 import { mintIdentity, loadIdentityConfig, type IdentityConfig } from '../../src'; // published package: from '@vouchr/core'
 

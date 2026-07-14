@@ -108,9 +108,11 @@ tenant- and owner-isolation boundary.
 
 Token columns (`access_token_enc`, `refresh_token_enc`) and the installation
 `bot_token`/`data` are encrypted; the rest of each row is plaintext (see
-[SECURITY.md](../SECURITY.md) for at-rest caveats). A `source` of `vault` means Vouchr
-holds the encrypted secret; any other `source` means the row stores a non-secret
-`secret_ref` resolved just-in-time.
+[SECURITY.md](../SECURITY.md) for at-rest caveats). On validated public paths, a null `secret_ref`
+means Vouchr holds an encrypted secret and a non-null value is an external reference resolved just
+in time. Legacy/privileged low-level rows are treated as untrusted metadata: inventory never prints
+the value, and advertised source ids are revalidated before resolver I/O. A reference's `source`
+may also be `vault` for HashiCorp Vault, so `source` alone does not distinguish the two forms.
 
 ## Provider model
 
@@ -135,7 +137,9 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
 - **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
   an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
   non-secret ref and resolves it JIT at injection time. The **resolved secret value** is
-  never persisted, cached, or logged. Rotation stays where the secret lives.
+  never persisted, cached, or logged. Public Bolt/headless configuration paths derive the source
+  from a bounded supported reference form and require a configured resolver before persistence or
+  audit; they do not invoke the resolver until injection. Rotation stays where the secret lives.
 
 ## Lifecycle
 

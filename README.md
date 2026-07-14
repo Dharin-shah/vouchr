@@ -331,10 +331,14 @@ const identity = loadIdentityConfig(process.env); // strong key + issuer + deplo
 const identityToken = mintIdentity({ teamId, userId, channel }, identity); // fresh per broker call
 ```
 
-Read-only by default (writes are a double opt-in), with an intended reference-only headless secret
-boundary (use the Bolt modal and path-block both reference routes until #53 closes). Programmatic
-channel-governance routes sit behind a signed admin claim. Providers that ship as MCP servers over
-Streamable HTTP get a dedicated stateless proxy, `POST /v1/mcp` — the same gates that are actually
+Read-only by default (writes are a double opt-in), with an enforced reference-only headless secret
+boundary. Both reference routes accept only bounded, structurally valid AWS Secrets Manager, GCP
+Secret Manager, Azure Key Vault, or HashiCorp Vault reference forms, derive the resolver source
+server-side, and require that resolver to be configured before any credential, channel mode, or
+audit row is written. Raw secret values are rejected; the configured resolver is invoked only when
+the credential is used. Programmatic channel-governance routes sit behind a signed admin claim.
+Providers that ship as MCP servers over Streamable HTTP get a dedicated stateless proxy,
+`POST /v1/mcp` — the same gates that are actually
 wired on the chosen broker path, plus credential injection, SSE passthrough, and `Mcp-Session-Id` relay.
 It is opt-in per provider (the declarative `mcp: { paths, allowContentTypes? }` knob locks the
 endpoint and response types) and bounded by the `maxStreamBytes`/`maxStreamMs` broker options.

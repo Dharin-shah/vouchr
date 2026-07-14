@@ -373,28 +373,33 @@ channels are **not** reachable this way — those are user-owned modes, so the c
 
 #### Admin channel-credential config (`POST /v1/admin/reference`, #53)
 
-The intended headless contract lets an admin point a channel's **shared** credential at an external
-secret manager when channel modes are enabled (`VOUCHR_CHANNEL_MODES=1`). The current routes do not
-yet enforce complete reference-validation parity, so a value presented as `secretRef` must not be
-treated as proven non-secret. Until [#53](https://github.com/Dharin-shah/vouchr/issues/53) closes,
-deny both `/v1/admin/reference` and `/v1/user/reference` at broker ingress and use the Bolt private
-modal. The intended route shape is:
+The headless contract lets an admin point a channel's **shared** credential at an external secret
+manager when channel modes are enabled (`VOUCHR_CHANNEL_MODES=1`). The route shape is:
 
 ```
 POST /v1/admin/reference
 { "handle": { "provider": "<id>" }, "identityToken": "<signed>",
-  "source": "aws-sm", "secretRef": "arn:aws:secretsmanager:…" }
+  "secretRef": "arn:aws:secretsmanager:…", "scopes": "optional declared scopes" }
 ```
 
+- `secretRef` must match the bounded supported form for an AWS Secrets Manager ARN, `gcp-sm://projects/.../secrets/.../versions/...`,
+  `azure-kv://<vault>/<secret>[/<version>]`, or `vault://<mount>/<path>#<field>` reference. The broker
+  derives the resolver source. A legacy `source` field is compatibility-only and must match exactly.
+- The derived source must name an own configured resolver function. This check does not invoke the
+  resolver or prove IAM, network, or secret availability; resolution happens JIT at egress.
+- `secretRef` is limited to 2,048 UTF-8 bytes. Optional `scopes` is limited to 4,096 bytes and 128
+  unique, single-space-separated OAuth tokens, each of which must appear in the provider's
+  `scopesDefault`. Omit `scopes` for providers that declare none.
+- Raw values, malformed/unknown references, mismatched sources, invalid scopes, and missing resolvers
+  are rejected before any credential, channel mode, or audit row is written. Errors use fixed copy
+  and never echo the rejected value.
 - Admin authority comes from the **signed `isAdmin` claim** (your minter sets it after its own
   workspace-admin check — the broker can't verify Slack admin itself); fail closed.
 - Channel eligibility is enforced on the signed `channelEligible` claim (shared creds refused on
   ineligible / externally-shared channels).
-- After #53 supplies the required validation, it stores only the non-secret reference
-  (`vault.reference`) and flips the channel to `shared`; configured `resolvers` resolve it JIT at
-  egress. A headless host wanting static keys should point at a secret manager rather than send the
-  value over this route. A successful Bolt save recognizes the reference scheme but still does not
-  prove resolver/IAM readiness. The route returns `{ ok: true }`.
+- It stores only the validated non-secret reference (`vault.reference`) and flips the channel to
+  `shared`. A headless host wanting static keys should point at a secret manager rather than send the
+  value over this route. The route returns `{ ok: true }`.
 
 ### Environment contract
 
@@ -534,14 +539,14 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
 
 ### Provisioning (how credentials get in)
 
-- **Shared / referenced credential** (channel- or team-owned): seed it without Slack.
+- **Operator-managed static credential** (channel- or user-owned): seed it without Slack.
   ```bash
-  # a pointer to an external secret manager (nothing sensitive stored by Vouchr):
-  npm run seed -- reference --provider confluence --team T1 --channel C1 \
-      --source aws-sm --secret-ref arn:aws:secretsmanager:…:secret/confluence
-  # or a static token — pass it in the environment, NOT on the command line:
+  # pass the static token in the environment, NOT on the command line:
   VOUCHR_SEED_ACCESS_TOKEN="$TOKEN" npm run seed -- key --provider internal --team T1 --channel C1
   ```
+  Reference seed mode was removed because the standalone process cannot truthfully inspect
+  code-injected broker resolvers. Configure references through the validated admin/user routes;
+  low-level hosts that call `Vault.reference()` directly own that trusted escape hatch.
   Prefer `VOUCHR_SEED_ACCESS_TOKEN`: a `--access-token` flag lands in `process.argv`, visible via
   `ps`/`/proc` to any co-tenant. The flag exists only for interactive use.
 - **Per-user credentials** (each human's own account): either mount the headless OAuth flow
@@ -558,9 +563,11 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
   > (`callbackPath` on `createVouchr`, `VOUCHR_CALLBACK_PATH` on the broker) and register the one path.
 - **Per-user *referenced* credentials** (a user's own key for a non-OAuth provider): the user points
   their credential at an external secret-manager reference with `POST /v1/user/reference` (#58) —
-  body `{ handle: { provider }, identityToken, source, secretRef, scopes? }`. Self-service (identity
-  from the signed token), **reference only** — no raw secret crosses the broker; the configured
-  `resolvers` resolve it JIT at egress. Raw-key ingest stays out of the broker by design.
+  body `{ handle: { provider }, identityToken, secretRef, scopes? }`. It has the same supported-form,
+  derived-source, optional legacy-source match, and configured-resolver checks as the admin route.
+  Self-service authority comes from the signed identity token; **reference only** — no raw secret
+  crosses the broker, and configured `resolvers` resolve JIT at egress. Raw-key ingest stays out of
+  the broker by design.
 
 ### Lifecycle: disconnect, offboard, TTL sweep (#54)
 
@@ -859,7 +866,7 @@ Rotation is instead built in via `VOUCHR_MASTER_KEYS` (#115):
   under the primary. It is idempotent, interrupt-safe (row-at-a-time writes; a crash
   leaves a mixed but fully readable table), never clobbers a row a live refresh
   touched mid-run, and prints counts only, never secrets. External-reference rows
-  (`source != 'vault'`) hold no ciphertext and are unaffected; envelope (KMS) rows are
+  (`secret_ref` is present) hold no ciphertext and are unaffected; envelope (KMS) rows are
   skipped — their rotation happens in the KMS.
 
 **Rotation procedure** (no maintenance window needed; every step keeps all rows readable):
@@ -978,8 +985,9 @@ The credential store and the key that protects it must be backed up **separately
   backup. In a current multi-workspace deployment, installation rows remain direct-
   master encrypted (#241), so the matching direct key must also be backed up separately.
   Treat scheduled KEK deletion or direct-key loss as a backup-invalidating event.
-- **External-reference rows** contain no secret at all (only an ARN-style `secret_ref`);
-  the secret lives in the external manager and is backed up there, on its own policy.
+- **Validated external-reference rows** created through Bolt/headless contain no secret at all
+  (only a supported `secret_ref`); the secret lives in the external manager and is backed up there,
+  on its own policy. Privileged low-level `Vault.reference()` callers must preserve that invariant.
 - **Never commit `VOUCHR_MASTER_KEY`** (or any key) to source control or bake it into
   an image. Keep it in a secret manager; the DB backup goes to encrypted, access-
   controlled storage.

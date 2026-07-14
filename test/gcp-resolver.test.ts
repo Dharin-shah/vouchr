@@ -19,8 +19,14 @@ test('gcp resolver returns the decoded secret value', async () => {
 });
 
 test('gcp resolver throws on a malformed reference', async () => {
-  const fetch = (async () => { throw new Error('should not be called'); }) as unknown as typeof globalThis.fetch;
+  let calls = 0;
+  const fetch = (async () => { calls++; throw new Error('should not be called'); }) as unknown as typeof globalThis.fetch;
   await assert.rejects(() => gcpSecretManager({ fetch })['gcp-sm']('gcp-sm://nope'), /Malformed/);
+  await assert.rejects(
+    () => gcpSecretManager({ fetch })['gcp-sm']('gcp-sm://projects/../secrets/s/versions/latest'),
+    /Malformed/,
+  );
+  assert.equal(calls, 0);
 });
 
 test('gcp resolver throws (never resolves empty) on a failed access', async () => {

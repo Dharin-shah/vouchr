@@ -32,8 +32,8 @@ and pastes a reference into the private modal:
 vault://secret/vouchr/github-bot#token
 ```
 
-Vouchr's `refSource()` maps any `vault://` reference to the `'vault'` source id, which
-this resolver handles.
+Vouchr validates the supported reference form, derives the `'vault'` source id, and confirms this
+resolver is configured before saving it. The resolver itself is not invoked until credential use.
 
 ## Reference format
 

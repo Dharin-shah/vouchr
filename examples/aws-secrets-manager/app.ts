@@ -1,8 +1,8 @@
 import { createVouchr, github } from '../../src';
 import { awsSecretsManager } from './resolver';
 
-// Wire the AWS Secrets Manager resolver into Vouchr. The 'aws-sm' source id matches
-// what bolt's refSource() assigns to an `arn:aws:secretsmanager:` reference.
+// Wire the AWS Secrets Manager resolver into Vouchr. Its 'aws-sm' key matches the source Vouchr
+// derives from a supported Secrets Manager ARN; configuration checks presence without resolving.
 //
 // An admin then runs, from inside the channel they want to configure:
 //

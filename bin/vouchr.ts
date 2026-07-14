@@ -11,8 +11,8 @@
  * the primary master key and prints counts only; `prune` DELETES old `audit` rows
  * (retention, #208). `revoke` and `prune` are dry-run by default and require an exact
  * bare `--yes` to delete.
- * `secret_ref` (an external manager ARN/pointer, non-secret by design) is the only
- * ref any command surfaces.
+ * Caller-controlled reference/source values are never selected or printed; inventory exposes only
+ * a reference-presence marker and an allowlisted built-in source kind (otherwise `custom`).
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
@@ -25,6 +25,7 @@ import { Vault } from '../src/core/vault';
 import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
+import { SECRET_REFERENCE_SOURCES } from '../src/core/reference';
 import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
 import { loadProviders } from './providerConfig';
 
@@ -151,18 +152,22 @@ async function cmdInventory(db: Db, f: Flags): Promise<void> {
   const params: any[] = [];
   if (f.values.team) { where.push('team_id=?'); params.push(f.values.team); }
   if (f.values.provider) { where.push('provider=?'); params.push(f.values.provider); }
-  // Metadata columns only. Token ciphertext columns are never selected.
+  const sourcePlaceholders = SECRET_REFERENCE_SOURCES.map(() => '?').join(', ');
+  // Metadata columns only. Neither token ciphertext nor raw reference/source values are selected:
+  // legacy rows can predate validation, so even fields intended as metadata are untrusted output.
   const rows = await db.all<any>(
-    `SELECT team_id, owner_kind, owner_id, provider, source, secret_ref, created_at, last_used_at, expires_at
+    `SELECT team_id, owner_kind, owner_id, provider,
+            CASE WHEN source IN (${sourcePlaceholders}) THEN source ELSE 'custom' END AS source_kind,
+            (secret_ref IS NOT NULL) AS has_reference, created_at, last_used_at, expires_at
      FROM connection ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
      ORDER BY team_id, provider, owner_kind, owner_id`,
-    params,
+    [...SECRET_REFERENCE_SOURCES, ...params],
   );
   printTable(
-    ['team', 'owner_kind', 'owner_id', 'provider', 'source', 'secret_ref', 'created_at', 'last_used_at', 'expires_at'],
+    ['team', 'owner_kind', 'owner_id', 'provider', 'source', 'reference', 'created_at', 'last_used_at', 'expires_at'],
     rows.map((r) => [
-      r.team_id, r.owner_kind, r.owner_id, r.provider, r.source,
-      r.secret_ref ?? '-', ts(r.created_at), ts(r.last_used_at), ts(r.expires_at),
+      r.team_id, r.owner_kind, r.owner_id, r.provider, r.source_kind,
+      r.has_reference ? 'yes' : 'no', ts(r.created_at), ts(r.last_used_at), ts(r.expires_at),
     ]),
   );
 }

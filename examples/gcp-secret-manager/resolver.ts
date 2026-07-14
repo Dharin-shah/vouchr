@@ -11,16 +11,15 @@
 //
 // Reference format: gcp-sm://projects/<project>/secrets/<secret>/versions/<version|latest>
 import type { Resolvers } from '../../src';
-
-const REF = /^gcp-sm:\/\/projects\/([^/]+)\/secrets\/([^/]+)\/versions\/([^/]+)$/;
+import { GCP_SECRET_REFERENCE } from '../../src/core/reference';
 
 export function gcpSecretManager(opts: { fetch?: typeof fetch } = {}): Resolvers {
   const f = opts.fetch ?? fetch;
 
   return {
     'gcp-sm': async (ref: string): Promise<string> => {
-      const m = REF.exec(ref);
-      if (!m) throw new Error(`Malformed GCP Secret Manager reference: "${ref}".`);
+      const m = GCP_SECRET_REFERENCE.exec(ref);
+      if (!m) throw new Error('Malformed GCP Secret Manager reference.');
       const [, project, secret, version] = m;
 
       // Ambient service-account access token from the metadata server.

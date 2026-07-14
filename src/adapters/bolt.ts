@@ -30,6 +30,13 @@ import { SessionGrants } from '../core/session';
 import { Approvals, ApprovalRequiredError, DEFAULT_APPROVAL_TTL_MS } from '../core/approval';
 import { NotificationState, type CredentialHealthEvent, type CredentialHealthHook } from '../core/health';
 import {
+  normalizeSecretReference,
+  referenceChannelCredential,
+  referenceUserCredential,
+  secretReferenceSource,
+  SecretReferenceError,
+} from '../core/reference';
+import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,
@@ -49,16 +56,14 @@ const PREVIEW_TTL_MS = 10 * 60_000;
  *  how long a single approval can live before the user must re-approve in the thread. */
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 
-/** Map an external ref to its resolver source id. Add resolvers → extend this. */
+/** @deprecated The mutation paths derive and validate source through the core reference boundary. */
 export function refSource(ref: string): string {
-  if (/^arn:aws:secretsmanager:/.test(ref)) return 'aws-sm';
-  if (/^gcp-sm:\/\//.test(ref)) return 'gcp-sm';
-  if (/^azure-kv:\/\//.test(ref)) return 'azure-kv';
-  if (/^vault:\/\//.test(ref)) return 'vault';
-  throw new UserFacingError(
-    'Unsupported secret reference. Expected one of: an AWS Secrets Manager ARN (arn:aws:secretsmanager:…), ' +
-      'gcp-sm://…, azure-kv://…, or vault://….',
-  );
+  try {
+    return secretReferenceSource(ref);
+  } catch (error) {
+    if (error instanceof SecretReferenceError) throw new UserFacingError(error.message);
+    throw error;
+  }
 }
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
@@ -135,6 +140,7 @@ export function safeUserMessage(e: unknown): string {
     e instanceof ResponseBlockedError ||
     e instanceof NoConnectionError ||
     e instanceof RateLimitedError ||
+    e instanceof SecretReferenceError ||
     e instanceof UserFacingError
   ) {
     return e.message;
@@ -642,10 +648,15 @@ export class ConnectContext {
   }
 
   /** Point the acting user's OWN credential at an external secret manager (self-service). */
-  async referenceUserSecret(providerId: string, r: { source: string; secretRef: string; scopes?: string }): Promise<void> {
-    this.brokerable(providerId);
-    await this.vault.reference(userOwner(this.identity), providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
-    await this.audit.record('config', this.identity, providerId, { owner: 'user', kind: 'ref', source: r.source });
+  async referenceUserSecret(
+    providerId: string,
+    r: { source?: string; secretRef: string; scopes?: string },
+  ): Promise<void> {
+    const provider = this.brokerable(providerId);
+    const reference = normalizeSecretReference(r, this.resolvers, provider.scopesDefault);
+    await referenceUserCredential({
+      vault: this.vault, audit: this.audit, identity: this.identity, providerId, reference,
+    });
   }
 
   /** Whether the user already has a stored connection (no prompt side-effect). A service-to-service
@@ -720,19 +731,22 @@ export class ConnectContext {
    */
   async referenceChannelSecret(
     providerId: string,
-    r: { source: string; secretRef: string; scopes?: string },
+    r: { source?: string; secretRef: string; scopes?: string },
   ): Promise<void> {
-    this.brokerable(providerId);
-    const { cfg, owner, channel } = this.channelTarget();
-    await this.requireAdmin(providerId);
-    await this.assertChannelEligible();
-    const cm = await cfg.getMode(owner.teamId, channel, providerId);
-    if (cm != null && cm !== 'shared') {
-      throw new UserFacingError(`Channel is set to ${escapeMrkdwn(cm)} for "${escapeMrkdwn(providerId)}"; shared references are not allowed.`);
-    }
-    await this.vault.reference(owner, providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
-    await cfg.setMode(owner.teamId, channel, providerId, 'shared');
-    await this.audit.record('config', this.identity, providerId, { owner: 'channel', channel, mode: 'shared', kind: 'ref', source: r.source });
+    const provider = this.brokerable(providerId);
+    const { cfg, channel } = this.channelTarget();
+    const reference = normalizeSecretReference(r, this.resolvers, provider.scopesDefault);
+    await referenceChannelCredential({
+      vault: this.vault, audit: this.audit, channelConfig: cfg, identity: this.identity,
+      channel, providerId, reference,
+      authorize: () => this.requireAdmin(providerId),
+      assertEligible: () => this.assertChannelEligible(),
+      modeConflict: (mode) => {
+        throw new UserFacingError(
+          `Channel is set to ${escapeMrkdwn(mode)} for "${escapeMrkdwn(providerId)}"; shared references are not allowed.`,
+        );
+      },
+    });
   }
 
   /**
@@ -1606,7 +1620,7 @@ export async function createVouchr(opts: VouchrOptions) {
       } catch {
         return ack({ response_action: 'errors', errors: { ref: 'Malformed request. Please reopen the modal.' } });
       }
-      const ref = view.state?.values?.ref?.v?.value?.trim() || '';
+      const ref = view.state?.values?.ref?.v?.value || '';
       const raw = view.state?.values?.raw?.v?.value || '';
       if (!identity) return ack({ response_action: 'errors', errors: { ref: 'Could not resolve your Slack identity.' } });
       if ((ref && raw) || (!ref && !raw)) {
@@ -1615,10 +1629,10 @@ export async function createVouchr(opts: VouchrOptions) {
       const ctx = contextFor(identity, kind === 'channel' ? channel : null, client);
       try {
         if (kind === 'channel') {
-          if (ref) await ctx.referenceChannelSecret(provider, { source: refSource(ref), secretRef: ref });
+          if (ref) await ctx.referenceChannelSecret(provider, { secretRef: ref });
           else await ctx.setChannelSecret(provider, raw);
         } else {
-          if (ref) await ctx.referenceUserSecret(provider, { source: refSource(ref), secretRef: ref });
+          if (ref) await ctx.referenceUserSecret(provider, { secretRef: ref });
           else await ctx.setUserSecret(provider, raw);
         }
       } catch (e) {

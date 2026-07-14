@@ -163,6 +163,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Removed
 
+- **Unsafe `vouchr-seed reference` mode** (#246, breaking). The standalone seed process cannot
+  truthfully inspect code-injected broker resolvers, so accepting arbitrary source/reference flags
+  would preserve a plaintext-metadata bypass around #53. Configure external references through the
+  validated admin/user routes; static encrypted-key seed mode remains available.
+
 - **Union credential-borrowing removed from the production surface** (#196, breaking). The `union`
   channel mode — where any connected member's account could satisfy another member's request — is
   gone: `union` is now rejected at the config boundary (slash command, modal, broker
@@ -402,6 +407,20 @@ All notable changes to this project are documented here. This project adheres to
   `GET /v1/manifest` is unchanged. New wire type `BrokerChannelManifestResponse`.
 
 ### Fixed
+
+- **External-reference configuration now enforces its reference-only boundary** (#53). The Bolt
+  key-reference flow and both headless routes (`/v1/admin/reference`, `/v1/user/reference`) share one
+  core validator: only bounded supported AWS Secrets Manager, GCP Secret Manager, Azure Key Vault,
+  and HashiCorp Vault references are accepted; the resolver source is derived server-side; an
+  optional legacy `source` must match; scopes must be a bounded unique subset of the provider's
+  declared scopes; and an own configured resolver function is required without being invoked during
+  configuration. Reference-validation failures use fixed non-reflective errors and create no
+  credential, channel mode, or audit row. HashiCorp
+  `vault://` references are now distinguished from locally encrypted rows by `secret_ref`, so they
+  reach their resolver just in time instead of being misread as local ciphertext. Built-in source
+  ids are revalidated at use to quarantine malformed legacy rows, and `vouchr inventory` reports
+  only an allowlisted source kind plus reference presence rather than printing legacy source/ref
+  values.
 
 - **Offboarding could strand credentials** (GHSA-25m2-c458-8gmw). `offboardUser` read (and
   decrypted) each token before deleting it, so a KMS/envelope decrypt failure — or an audit-write
