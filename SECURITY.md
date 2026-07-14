@@ -62,11 +62,14 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   in metadata. Don't.
 - **Audit completeness is best-effort, not guaranteed.** Audit writes on the injection path are
   swallowed on failure so a bookkeeping error can't fail or roll back a provider call that already
-  executed; wire an `EventSink` (the `injected` event is a redundant independent signal) as a durable
-  backstop. See the [threat model](./guides/THREAT-MODEL.md#audit-completeness-is-best-effort-by-design).
-- **The Postgres database is not wholly encrypted at rest.** Token columns are encrypted; the rest of
-  the row and the database are not. Use disk/database encryption and access control at the infra layer
-  (envelope encryption via an `EnvelopeProvider` raises the bar on the token columns).
+  executed; wire an `EventSink` (the `injected` event is a redundant independent signal) into a
+  durable operator-owned pipeline. The callback itself is fire-and-forget and can be lost, so it is
+  not the durable backstop by itself. See the
+  [threat model](./guides/THREAT-MODEL.md#audit-completeness-is-best-effort-by-design).
+- **The Postgres database is not wholly encrypted at rest.** Credential-bearing columns are
+  encrypted; the rest of the row and the database are not. Use disk/database encryption and access
+  control at the infra layer (envelope encryption via an `EnvelopeProvider` raises the bar on Vault
+  connection tokens; multi-workspace installation tokens remain direct-master encrypted until #241).
 
 ## Operator responsibilities
 

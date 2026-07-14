@@ -213,8 +213,8 @@ export interface VouchrOptions {
   /**
    * Custom admin check for channel-credential config (governance). When set, `requireAdmin` uses
    * it INSTEAD of the built-in gate, e.g. to defer to your own RBAC or an allow-list. When omitted,
-   * the default gate is "workspace admin OR channel creator" (a channel owner can self-serve without
-   * waiting for IT); set `isAdmin: (c,u)=>isSlackAdmin(c,u)` for strict workspace-only. The
+   * the default gate is workspace admin/owner only. Use `allowChannelCreatorConfig: true` when a
+   * channel's creator should self-serve without waiting for IT. The
    * default-deny + audit-on-denial behavior is identical regardless of which check runs. Fail closed
    * yourself: a thrown override is treated as "not admin".
    */

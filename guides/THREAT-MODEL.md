@@ -65,10 +65,11 @@ Boundaries, and what crosses each:
 - **Agent app ↔ Vouchr.** The hard boundary. The agent (and therefore the LLM and
   any tool runtime) receives a `ConnectionHandle`, never the secret
   (`src/core/injector.ts`). The handle exposes `fetch()` and `account()` only.
-- **Vouchr ↔ database.** Token material is stored encrypted (AES-256-GCM, optional
-  KMS envelope); the rest of the row and the Postgres database are not encrypted by
-  Vouchr (`src/core/crypto.ts`, `src/core/db.ts`). At-rest protection of the database
-  itself is the operator's job.
+- **Vouchr ↔ database.** Token material is stored encrypted with AES-256-GCM. The runtime supports
+  direct master-key encryption, while the production vision requires a KMS envelope for Vault
+  connection tokens. The rest of each row and the Postgres database are not encrypted by Vouchr
+  (`src/core/crypto.ts`, `src/core/db.ts`). At-rest protection of the database itself is the
+  operator's job.
 - **Vouchr ↔ external secret manager.** Two distinct integrations: `EnvelopeProvider`
   wraps/unwraps per-secret data keys (`crypto.ts`); `Resolvers` resolve a non-secret
   `secretRef` (e.g. an AWS Secrets Manager ARN) to a secret just-in-time, never
@@ -158,10 +159,13 @@ or buggy.
 
 An attacker with read access to the Postgres database.
 
-- **Mitigated for token material.** `access_token_enc` / `refresh_token_enc` and the
-  installation `bot_token`/`data` columns are AES-256-GCM encrypted with the master
-  key; with an `EnvelopeProvider`, each secret has its own DEK wrapped by an external
-  KEK (`crypto.ts:seal`, `vault.ts`, `installationStore.ts`).
+- **Mitigated for token material, with a current multi-workspace gap.**
+  `access_token_enc` / `refresh_token_enc` are AES-256-GCM encrypted; with an
+  `EnvelopeProvider`, each Vault secret has its own DEK wrapped by an external KEK
+  (`crypto.ts:seal`, `vault.ts`). Installation `bot_token`/`data` are encrypted under
+  the direct master key today—`DbInstallationStore` does not yet accept the envelope.
+  [#241](https://github.com/Dharin-shah/vouchr/issues/241) tracks closing that production
+  boundary; do not claim KMS protects multi-workspace Slack installation tokens yet.
 - **Not mitigated by Vouchr:** the rest of each row (provider id, scopes, owner key,
   `secret_ref`, timestamps) and the Postgres database as a whole are plaintext. The master
   key in memory/env is also out of scope here. Operator must encrypt the database at rest

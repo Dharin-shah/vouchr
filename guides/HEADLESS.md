@@ -4,6 +4,18 @@ Use `createBroker()` when your Slack-facing service and agent worker are separat
 The Slack-facing service verifies the user, mints a short-lived identity token, and workers call
 Vouchr over HTTP. The token stays inside Vouchr.
 
+If Slack should remain the built-in human/admin experience, start with the
+[hybrid Slack control-plane guide](./HYBRID.md). This document is the lower-level HTTP/API contract.
+
+> [!WARNING]
+> On the current stock packaged broker, Slack-written channel tool settings are not enforced
+> ([#240](https://github.com/Dharin-shah/vouchr/issues/240)), declarative static channel policy is not
+> loaded ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), reference-route validation remains
+> open ([#53](https://github.com/Dharin-shah/vouchr/issues/53)), and broker denials do not automatically
+> render Slack recovery prompts ([#194](https://github.com/Dharin-shah/vouchr/issues/194)). The low-level
+> `createBroker()` API exposes the relevant stores/hooks, but do not mistake that programmatic surface
+> for complete packaged hybrid behavior.
+
 Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 
 ```ts
@@ -55,7 +67,7 @@ only `{ "ok": false }`). Resource-bound responses that a worker should handle ex
 | `413` | `{ "error": "request body too large" }`, `{ "error": "response too large; narrow your query or endpoint" }`, or `{ "error": "response blocked" }` | Do not retry unchanged. Reduce the request or choose a narrower provider endpoint. |
 | `429` | `{ "error": "rate limited", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry if the operation itself is safe to retry. |
 | `503` | `{ "error": "overloaded", "scope": "global", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
-| `504` | `{ "error": "upstream timed out" }` | Treat the outcome as unknown. Retry reads if appropriate; never automatically replay a non-idempotent write. |
+| `504` | `{ "error": "upstream timed out" }` | Treat the outcome as unknown. Retry only a known-idempotent operation; never automatically replay an uncertain write. |
 
 Identity assertions are single-use. **Mint a fresh `identityToken` for every retry**, including a
 retry after `429`, `503`, or `504`; never infer from the error scope whether the earlier assertion
@@ -72,13 +84,13 @@ One core, two front doors — both reach the same credential boundary.
 | Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
 | Use a `shared` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
 | Set the channel mode (`shared`/`per-user`/`session`) | ✅ `/vouchr mode` | ✅ `POST /v1/admin/mode` (admin claim) |
-| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (admin claim) |
-| Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` (admin claim) |
+| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ⚠️ route exists with injected `ChannelTools`, but first-write parity and packaged wiring both remain #240 |
+| Read the channel's modes + tool allowlist | ✅ (implicit) | ⚠️ route exists, but packaged broker has no persisted tool store (#240) |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
-| Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ reference-only |
-| Point a credential at a secret-manager **reference** | ✅ | ✅ `/v1/admin/reference` (channel, admin) · `/v1/user/reference` (user, self-service) |
-| Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons | ⚠️ enforced (403 `approval_required`) — the approval **surface** is the Slack app |
+| Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ⚠️ intended reference-only boundary; current validation gap is #53, so path-block the routes |
+| Point a credential at a secret-manager **reference** | ✅ | ⚠️ routes exist; reference validation parity/readiness remains #53 |
+| Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons for in-process use | ⚠️ broker enforces 403 `approval_required`; no automatic Slack bridge (#194) |
 | Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
 ## Writes are opt-in
@@ -116,10 +128,12 @@ render Approve/Deny buttons**, so the split is deliberate:
   { "error": "approval_required", "approvalId": "…" }   // HTTP 403
   ```
 
-- The approval **surface is the Bolt app** (Approve/Deny buttons, approver eligibility re-checked
-  server-side at the click): the Slack-facing service routes the human there, then the worker
-  retries with a fresh identity token. A host with no Bolt surface can drive its own approve/deny
-  with the exported `Approvals` store (`./headless`), re-checking approver eligibility itself.
+- The Bolt adapter renders Approve/Deny automatically only when its own in-process handle starts the
+  write. A headless 403 does not trigger that UI. The Slack-facing host must implement the bridge,
+  re-check approver eligibility, and retry with a fresh identity token; the complete supported bridge
+  remains [#194](https://github.com/Dharin-shah/vouchr/issues/194). A host can use the exported
+  `Approvals` store, but the current package does not export the Bolt approval blocks/action IDs as a
+  ready-made headless surface.
 
 The grant matches ONLY the exact (method, host, path) it was minted for, expires after `ttlMs`
 (default 5 minutes), and is consumed atomically on first use — a second identical call returns a
@@ -214,9 +228,18 @@ channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool al
 authority comes only from the verified identity token, never the request body — and are scoped to
 the signed channel.
 
-What stays Bolt-only is ingesting a **raw** key/secret: the headless broker takes secret-manager
-**references** (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service), never a
-raw key over the wire. Raw-key ingest remains the Bolt private modal's job.
+Those routes require their stores to be supplied to `createBroker()`. The packaged
+`buildBrokerServer()` currently wires `ChannelConfig` but not `ChannelTools`, so its tools route is
+unavailable and it cannot enforce rows written by Bolt; see
+[#240](https://github.com/Dharin-shah/vouchr/issues/240). It also does not load static `Policy`; see
+[#236](https://github.com/Dharin-shah/vouchr/issues/236).
+
+The intended boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
+secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).
+Current validation does not yet enforce that boundary completely. Until
+[#53](https://github.com/Dharin-shah/vouchr/issues/53) closes, use the Bolt modal and deny both routes
+at broker ingress. Bolt restricts recognized schemes, but a successful save still does not prove
+resolver/IAM readiness.
 
 ## Operations
 

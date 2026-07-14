@@ -9,6 +9,9 @@ the LLM, the chat transcript, logs, or the audit table. Credentials are owner-sc
 (per-user by default, per-channel when an admin configures it) and isolated per Slack
 tenant.
 
+For the split-process version of this architecture—public Slack control plane plus a private
+headless data plane—see the [hybrid deployment guide](./HYBRID.md).
+
 ## Component / data flow
 
 ```mermaid
@@ -124,14 +127,15 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
 - **Revoke** is declarative (RFC 7009 `revokeUrl` + optional `revokeAuth: 'body'`) with a
   `revoke` function escape hatch for non-standard endpoints (GitHub's DELETE + Basic
   auth). Honest no-op when a provider has no documented endpoint (Notion).
-- **Envelope encryption** is optional (`EnvelopeProvider`, `src/core/crypto.ts`): a fresh
-  per-secret data key encrypts the secret and is wrapped by an external KEK (KMS/Vault).
-  Without it, secrets are encrypted directly under the master key (legacy format, no
-  version byte). Reads dispatch on the stored format, so both modes read existing rows.
+- **Envelope encryption** is runtime-optional and backward-compatible (`EnvelopeProvider`,
+  `src/core/crypto.ts`): a fresh per-secret data key encrypts the secret and is wrapped by an external
+  KEK (KMS/Vault). The production vision requires it for Vault connection tokens. Without it,
+  secrets use direct master-key encryption; reads dispatch on the stored format, so both modes remain
+  readable during migration. Slack installation tokens still use direct encryption pending #241.
 - **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
   an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
-  non-secret ref and resolves it JIT at injection time. The ref is never persisted,
-  cached, or logged. Rotation stays where the secret lives.
+  non-secret ref and resolves it JIT at injection time. The **resolved secret value** is
+  never persisted, cached, or logged. Rotation stays where the secret lives.
 
 ## Lifecycle
 
