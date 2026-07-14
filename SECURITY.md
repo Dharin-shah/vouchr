@@ -54,9 +54,13 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   payload. Vouchr never echoes, logs, or stores it unsafely, but an external secret reference (an
   ARN resolved just in time) avoids putting the secret in Slack at all. Prefer it.
 - **Disconnect/offboard revoke is best-effort.** Removing a connection deletes Vouchr's stored
-  credential first; Vouchr then attempts upstream provider revocation when the provider declares a
-  revoke path. A network/provider failure cannot keep local access alive, but upstream revocation is
-  not guaranteed.
+  credential first. For a real (non-dry-run) row, when the provider declares a revoke path and the
+  claimed row contains a usable vaulted token, Vouchr then attempts upstream revocation. If that
+  revocable row is an external reference or its token cannot be read, local removal still commits but
+  Disconnect reports upstream revocation as unconfirmed; a successful audit write records the skip.
+  Rotate referenced credentials in their source manager. Providers without revocation support and
+  trusted dry-run rows are intentional skips. A network/provider failure likewise cannot keep local
+  access alive, but upstream revocation is not guaranteed.
 - **Audit metadata is caller-supplied.** Vouchr's own code keeps secrets out of `audit.meta`
   (and tests enforce it), but a custom provider/`accountProbe` or caller could put sensitive data
   in metadata. Don't.

@@ -101,9 +101,12 @@ All notable changes to this project are documented here. This project adheres to
   HTTP reflection. The shared `disconnectProvider` result adds `recognized` and `audited`, preserving a
   committed local delete and upstream-revoke result even when the audit store fails; the headless
   `/v1/disconnect` route keeps its `{ ok, revoked }` success shape and returns a static `404` for an
-  unknown, unstored provider. Slack status/tools/stats/audit reads now fail visibly with fixed retry
-  guidance after acknowledgement, without retrying a failed Slack response or exposing dependency
-  errors. Remaining provider-bearing mrkdwn renderers and parsed fallback text are escaped; screen-reader
+  unknown, unstored provider. A real revocable external-reference row is removed locally but never
+  reported as a clean upstream revoke when no vaulted token was available: the result is partial
+  (`ok: false`, audit `upstream: 'skipped'`) and dry-run/non-revocable rows retain their intentional
+  skip behavior. Slack status/tools/stats/audit reads now fail visibly with fixed retry guidance after
+  acknowledgement, without retrying a failed Slack response or exposing dependency errors. Remaining
+  provider-bearing mrkdwn renderers and parsed fallback text are escaped; screen-reader
   fallbacks carry the same visible prompt/table facts; and status, stats, audit, connect, and configuration
   tables are packed into Slack-sized sections with explicit message/view bounds instead of oversized
   payloads or silently dropped rows. Ordinary `/vouchr status` keeps its established text response;

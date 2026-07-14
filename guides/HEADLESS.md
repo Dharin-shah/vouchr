@@ -75,6 +75,23 @@ was consumed. This rule keeps clients correct if admission moves or another gate
 before returning. A `Retry-After` value is a back-pressure hint, not a guarantee that capacity will
 be available at that instant.
 
+### Disconnecting a credential
+
+`POST /v1/disconnect` accepts `{ "handle": { "provider": "github" }, "identityToken": "…" }`.
+Identity comes from the verified assertion, so the caller can remove only its own user credential.
+The response keeps committed local deletion separate from upstream/audit confirmation:
+
+| Response | Meaning |
+| --- | --- |
+| `200 { "ok": true, "revoked": ["github"] }` | The local row was removed and every applicable upstream/audit obligation was confirmed. |
+| `200 { "ok": false, "revoked": ["github"] }` | The local row was removed, but upstream revocation or authoritative auditing is unconfirmed. A revocable external reference is one such case because no vaulted token is available to send to the provider; rotate it at its source. |
+| `200 { "ok": true, "revoked": [] }` | The registered provider already had no user credential; this is an idempotent no-op. |
+| `404 { "error": "unknown provider" }` | The id is neither registered nor an exact stored row owned by the caller; nothing was mutated or audited. |
+
+`revoked` therefore means “removed from Vouchr”, not “every possible provider-side credential was
+invalidated”. Error text never includes the submitted provider value, a credential reference, or a
+raw dependency error.
+
 ## Capability matrix: Bolt vs headless
 
 One core, two front doors — both reach the same credential boundary.

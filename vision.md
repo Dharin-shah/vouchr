@@ -213,8 +213,10 @@ parallel when it does not create conflicting foundations.
 - [#196](https://github.com/Dharin-shah/vouchr/issues/196) is complete: `union` is removed.
 - [#204](https://github.com/Dharin-shah/vouchr/issues/204) is complete: PostgreSQL is the only
   runtime database and migration/runtime roles are separated.
-- [#194](https://github.com/Dharin-shah/vouchr/issues/194): remove private previews and complete the
-  retained Slack, OAuth, and API recovery experience.
+- [#194](https://github.com/Dharin-shah/vouchr/issues/194): the commands/rendering/disconnect slice
+  landed in [PR #244](https://github.com/Dharin-shah/vouchr/pull/244); remove private previews and
+  complete pending-interaction state, OAuth/API recovery, typed errors, and the trusted
+  broker-to-Slack recovery bridge.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility
 project would require a new explicit product decision backed by a concrete deployed lineage; it is
@@ -224,23 +226,28 @@ it does not gate independent storage or broker-security changes.
 
 ### 3. Finish the retained security and performance boundary
 
-After the PostgreSQL-only foundation, these issues may proceed independently where their
-files and state machines do not conflict. #211 and #212 must finish before the production
-deployment proof; #208 and #209 provide its measured storage/resource envelope.
+After the PostgreSQL-only foundation, these issues may proceed independently where their files and
+state machines do not conflict. #192, #208, #211, and #212 are complete. #209 must finish the
+measured resource envelope for the deployment proof; #241 must close the documented KMS boundary
+before a multi-workspace production claim.
 
-- [#192](https://github.com/Dharin-shah/vouchr/issues/192): make the credential lifecycle atomic and
-  idempotent across replicas and retries.
-- [#208](https://github.com/Dharin-shah/vouchr/issues/208): add measured audit indexes and bounded
-  retention.
+- [#192](https://github.com/Dharin-shah/vouchr/issues/192) is complete: credential lifecycle
+  mutations are atomic and idempotent across replicas and retries.
+- [#208](https://github.com/Dharin-shah/vouchr/issues/208) is complete: audit indexes are measured and
+  retention pruning is bounded.
 - [#209](https://github.com/Dharin-shah/vouchr/issues/209): bound network, memory, database, and
   concurrency work and remove N+1 behavior.
-- [#211](https://github.com/Dharin-shah/vouchr/issues/211): enforce one provider, OAuth, and egress
-  validation boundary.
-- [#212](https://github.com/Dharin-shah/vouchr/issues/212): bind short-lived broker identity to one
-  deployment and make rotation/replay behavior safe.
+- [#211](https://github.com/Dharin-shah/vouchr/issues/211) is complete: one strict provider, OAuth,
+  and egress validation boundary is enforced.
+- [#212](https://github.com/Dharin-shah/vouchr/issues/212) is complete: short-lived broker identity is
+  deployment-bound with safe rotation and cross-replica replay protection.
+- [#241](https://github.com/Dharin-shah/vouchr/issues/241): extend the KMS-envelope boundary to
+  multi-workspace Slack installation tokens and prove migration/rotation behavior.
 
 ### 4. Prove one production deployment
 
+- [#239](https://github.com/Dharin-shah/vouchr/issues/239): add deployment-wide containment and
+  credential invalidation before exercising the compromise/recovery drill below.
 - [#216](https://github.com/Dharin-shah/vouchr/issues/216): ship and exercise the exact image with
   PostgreSQL, KMS, two replicas, restore/failover, rolling upgrade, dependency failure, graceful
   drain, and representative load.
