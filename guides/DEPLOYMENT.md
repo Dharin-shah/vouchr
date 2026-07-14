@@ -4,8 +4,14 @@ Concrete recipes for the deployments Vouchr actually supports. Every option name
 (`src/adapters/bolt.ts` → `VouchrOptions`). For the security model and what
 Vouchr does *not* protect against, see [SECURITY.md](../SECURITY.md), which is not repeated here.
 
-Common to every deploy: a 32-byte `VOUCHR_MASTER_KEY` (`openssl rand -base64 32`) and a public
-HTTPS `baseUrl` reachable at the OAuth callback (`$baseUrl/vouchr/oauth/callback`).
+For a public Slack/Bolt control service paired with a private broker, read the
+[hybrid architecture guide](./HYBRID.md) first; this guide supplies its lower-level database,
+container, migration, resource, and rotation runbooks.
+
+Every deployment needs a 32-byte `VOUCHR_MASTER_KEY` (`openssl rand -base64 32`). A Bolt or
+OAuth-capable headless service also needs a public HTTPS `baseUrl` reachable at its OAuth callback.
+A private use-only broker in the hybrid shape leaves `VOUCHR_BASE_URL` unset because the callback
+belongs to the public Bolt control service.
 
 ## PostgreSQL (required)
 
@@ -123,12 +129,22 @@ Multi-instance notes:
 
 A single-workspace app just sets `botToken` (or `SLACK_BOT_TOKEN`). For multi-workspace / org-wide,
 construct one `DbInstallationStore` over the shared DB handle and master key, and pass the **same
-instance** to both Bolt's OAuth `installationStore` and `createVouchr`:
+instance** to both Bolt's OAuth `installationStore` and `createVouchr`. When using a custom
+`ExpressReceiver`, the OAuth installer configuration belongs on the receiver; `new App({ receiver })`
+does not consume installer options placed on `App`:
 
 ```ts
 const store = new DbInstallationStore(db, masterKey);
 
-const app = new App({ /* ...OAuth config... */, installationStore: store });
+const receiver = new ExpressReceiver({
+  signingSecret: process.env.SLACK_SIGNING_SECRET!,
+  clientId: process.env.SLACK_CLIENT_ID!,
+  clientSecret: process.env.SLACK_CLIENT_SECRET!,
+  stateSecret: process.env.SLACK_STATE_SECRET!,
+  scopes: ['chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+  installationStore: store,
+});
+const app = new App({ receiver });
 
 const vouchr = await createVouchr({
   providers: [github()],
@@ -142,7 +158,10 @@ const vouchr = await createVouchr({
 
 Instead of storing a raw secret, point a credential at a secret-manager **reference**; Vouchr stores
 the reference and calls a resolver just-in-time at the HTTP boundary. Resolvers are keyed by source
-id (`Resolvers = Record<string, (ref) => Promise<string>>`).
+id (`Resolvers = Record<string, (ref, signal?) => Promise<string>>`). A production resolver must pass
+the supplied `AbortSignal` into its SDK/network call so timeout and disconnect stop the underlying
+work, not only Vouchr's wait. The repository AWS example does not yet do this; see
+[#209](https://github.com/Dharin-shah/vouchr/issues/209).
 
 ```ts
 import { awsSecretsManager } from './examples/aws-secrets-manager/resolver';
@@ -159,12 +178,13 @@ auth (ambient IAM role, no static creds), and the least-privilege policy
 (`secretsmanager:GetSecretValue` scoped to the specific ARNs, `kms:Decrypt` if the secret uses a CMK)
 are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manager/README.md).
 
-## KMS envelope encryption (optional)
+## KMS envelope encryption (production)
 
-By default token columns are encrypted directly with `VOUCHR_MASTER_KEY`. Supply an
-`EnvelopeProvider` and new writes instead wrap a fresh per-secret data key (DEK) with your KMS key
-(KEK), storing the wrapped DEK alongside the ciphertext. It's **optional and back-compatible**:
-existing rows still decrypt either way.
+The runtime supports direct encryption with `VOUCHR_MASTER_KEY`, which remains useful for development,
+transition, and backward reads. The adopted production vision requires an `EnvelopeProvider` for
+Vault connection tokens: new writes wrap a fresh per-secret data key (DEK) with your KMS key (KEK),
+storing the wrapped DEK alongside the ciphertext. Enabling the envelope is backward-compatible, so
+existing direct rows still decrypt during migration.
 
 The interface (`src/core/crypto.ts`) is two async methods:
 
@@ -353,8 +373,12 @@ channels are **not** reachable this way — those are user-owned modes, so the c
 
 #### Admin channel-credential config (`POST /v1/admin/reference`, #53)
 
-With channel modes enabled (`VOUCHR_CHANNEL_MODES=1`), an admin can point a channel's **shared**
-credential at an external secret manager over HTTP — **reference only, never a raw secret**:
+The intended headless contract lets an admin point a channel's **shared** credential at an external
+secret manager when channel modes are enabled (`VOUCHR_CHANNEL_MODES=1`). The current routes do not
+yet enforce complete reference-validation parity, so a value presented as `secretRef` must not be
+treated as proven non-secret. Until [#53](https://github.com/Dharin-shah/vouchr/issues/53) closes,
+deny both `/v1/admin/reference` and `/v1/user/reference` at broker ingress and use the Bolt private
+modal. The intended route shape is:
 
 ```
 POST /v1/admin/reference
@@ -366,10 +390,11 @@ POST /v1/admin/reference
   workspace-admin check — the broker can't verify Slack admin itself); fail closed.
 - Channel eligibility is enforced on the signed `channelEligible` claim (shared creds refused on
   ineligible / externally-shared channels).
-- It stores only the non-secret reference (`vault.reference`) and flips the channel to `shared`; the
-  configured `resolvers` resolve it JIT at egress. **No raw secret ever crosses the broker** — the
-  broker deliberately has no raw-key HTTP ingest. A headless host wanting static keys points at a
-  secret manager instead. Returns `{ ok: true }`.
+- After #53 supplies the required validation, it stores only the non-secret reference
+  (`vault.reference`) and flips the channel to `shared`; configured `resolvers` resolve it JIT at
+  egress. A headless host wanting static keys should point at a secret manager rather than send the
+  value over this route. A successful Bolt save recognizes the reference scheme but still does not
+  prove resolver/IAM readiness. The route returns `{ ok: true }`.
 
 ### Environment contract
 
@@ -688,12 +713,13 @@ Postgres (`VOUCHR_DATABASE_URL`) is **required** — Vouchr fails closed at boot
 stateless, so `replicas > 1` is safe out of the box. Beyond that, for a **production** deployment we
 recommend:
 
-- **A KMS envelope** (`VOUCHR_KMS_KEY_ID`) — per-secret KMS-wrapped data keys, not just
-  storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA ServiceAccount.
+- **A KMS envelope** (`VOUCHR_KMS_KEY_ID`) — per-secret KMS-wrapped data keys for Vault connection
+  tokens, not just storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA
+  ServiceAccount. Multi-workspace installation tokens remain direct-master encrypted until #241.
 
-The KMS envelope is a recommendation, not an enforced precondition: Vouchr will boot without it.
-Enabling KMS in the reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding
-`@aws-sdk/client-kms` to the image together.
+The runtime will boot without KMS, but the adopted production vision requires it. Enabling KMS in the
+reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding `@aws-sdk/client-kms` to the
+image together; a multi-workspace production claim additionally waits for #241.
 
 ### Resource bounds and the scaling envelope (#209)
 
@@ -748,13 +774,16 @@ must repeat representative load with the real configured KMS and exact container
 Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)
 (api.slack.com/apps → From a manifest), replacing `YOUR_PUBLIC_URL`. The manifest sets:
 
-- **Bot scopes:** `app_mentions:read`, `chat:write`, `commands`, `users:read`.
-- **Events:** `app_mention`, `user_change` (the latter drives auto-revoke on deactivation).
+- **Bot scopes:** `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`;
+  additionally `app_mentions:read` when this app receives the agent's mentions.
+- **Events:** `app_home_opened`, `user_change` (the latter drives auto-revoke on deactivation);
+  additionally `app_mention` when this app is also the agent.
 - **Interactivity:** enabled, and **required** for the Connect button and the key/configure modals.
-- **Slash command:** `/vouchr` — full surface: `status` (default), `disconnect <provider>`,
-  `configure <provider>` (admin channel-credential modal), `mode <provider> <shared|per-user|session>`
-  (admin), `tools` (list the channel's tool manifest), and `enable <provider>` / `disable <provider>`
-  (admin: the per-channel tool allowlist `connect()` enforces).
+- **Slash command:** bare `/vouchr` opens the settings modal (with a truthful status fallback if
+  Slack cannot open it); `/vouchr help` is the canonical current command list. It includes personal
+  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and admin `configure <provider>`,
+  `mode <provider> <shared|per-user|session>`, `enable`/`disable <provider>`, `stats`, and
+  `audit channel`.
 - **Who may configure:** by default the `configure`/`mode`/`enable`/`disable` commands are
   **workspace-admin-only**. Set `allowChannelCreatorConfig: true` to also let a channel's **creator**
   self-serve their own channel's config (off by default — in Slack anyone can create a public channel,
@@ -778,6 +807,10 @@ in both Bolt's OAuth config and `createVouchr` (see *Multi-workspace install* ab
 Honest pre-launch list. "Vouchr helps" = the library does part of the work; "operator" = entirely
 yours. Don't go live until each holds.
 
+Hybrid deployments also have current product blockers. Complete the end-to-end proof in
+[`HYBRID.md`](./HYBRID.md#end-to-end-staging-proof), including separate-broker channel-tool and
+static-policy enforcement, rather than assuming a Slack control write reaches every data-plane gate.
+
 | Item | Owner |
 |---|---|
 | Strong `VOUCHR_MASTER_KEY` (32 random bytes) in a secret manager, never in source control | operator |
@@ -787,10 +820,10 @@ yours. Don't go live until each holds.
 | Slack scopes / events / interactivity applied from the manifest | operator (manifest provided) |
 | TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; Bolt: schedule it. Headless: `broker-server` runs it automatically (#54) |
 | Offboarding wired so deactivated users lose access | Vouchr provides; Bolt: `registerOffboarding`. Headless: `POST /v1/admin/offboard` from your deprovision hook (#54) |
-| Envelope encryption considered for token columns (`EnvelopeProvider` + KMS) | Vouchr provides hook; operator opts in |
+| KMS envelope configured for production Vault token columns; multi-workspace installation-token gap #241 closed before launch | Vouchr/operator; currently blocked for multi-workspace |
 | Backups of the credential store (and a restore drill) | operator |
 | Monitoring/alerting on resolver and KMS failures, and on auth/refresh errors | operator |
-| `EventSink` wired to durable metrics/logging (redundant signal for best-effort audit writes — see [SECURITY.md](../SECURITY.md#what-vouchr-does-not-protect-against)) | operator (Vouchr provides the hook) |
+| No-secret event callbacks feed operator-owned telemetry; callbacks remain best-effort/lossy and do not replace the audit table | operator (Vouchr provides hooks) |
 | Multi-instance? Postgres + `DbInstallationStore` wired into Bolt and Vouchr | Vouchr provides; operator wires |
 
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as
@@ -843,19 +876,20 @@ Rotation is instead built in via `VOUCHR_MASTER_KEYS` (#115):
 master key means the ciphertext may already be decrypted. Revoke the affected provider
 tokens upstream (`vouchr revoke`) regardless; rekeying does not un-leak them.
 
-**Direct vs envelope — which to run?** Direct multi-key mode is zero-dependency and
-fine when the DB and the env-managed key live in separate trust domains and rotations
-are occasional, operator-driven events (each rotation rewrites every row). Choose
-envelope mode when you already run a KMS, want rotation without touching rows, need
-per-secret keys/audit at the KMS level, or must satisfy "keys never appear in process
-env" requirements. For any deployment where you expect frequent rotation, prefer
-envelope mode below.
+**Direct vs envelope — which to run?** Direct multi-key mode is the local/development
+and transition path. It is zero-dependency, but each rotation rewrites every direct
+row. The adopted production vision requires envelope mode for Vault connection
+tokens. Multi-workspace Slack installation rows still require the direct key until
+#241 closes, so a current mixed deployment must protect and rotate both boundaries.
 
-### Envelope mode (KMS-wrapped data keys): recommended for rotatable deploys
+### Envelope mode (KMS-wrapped data keys): required by the production vision
 
 With an `EnvelopeProvider`, each secret has its own data key (DEK) wrapped by your
 external key-encryption key (KEK) in KMS/Vault. Scheme `0x01` rows store the *wrapped*
 DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`).
+
+This currently applies to Vault connection rows only. `DbInstallationStore` still
+uses direct master-key encryption for Slack installation `bot_token`/`data`; see #241.
 
 - **Rotate the KEK in KMS, not the rows.** AWS KMS (and equivalents) version the key
   under a stable key id / alias: rotation creates a new backing key while the old
@@ -931,10 +965,11 @@ The credential store and the key that protects it must be backed up **separately
   backup.** A backup that contains both the ciphertext and the key is a single point
   of compromise that leaks everything; a DB backup without the key is useless to an
   attacker (and useless to you for restore, hence "separately", not "not at all").
-- **Envelope mode:** token DEKs are wrapped by the KMS KEK, so a DB backup is inert
-  without KMS access. Back up nothing key-related yourself: just ensure the KEK
-  (and every version any backed-up row was wrapped under) is retained in KMS for the
-  life of the backup. Treat scheduled KEK deletion as a backup-invalidating event.
+- **Envelope mode:** Vault connection-token DEKs are wrapped by the KMS KEK, so those
+  ciphertexts need KMS access. Retain the KEK and every backing version needed by the
+  backup. In a current multi-workspace deployment, installation rows remain direct-
+  master encrypted (#241), so the matching direct key must also be backed up separately.
+  Treat scheduled KEK deletion or direct-key loss as a backup-invalidating event.
 - **External-reference rows** contain no secret at all (only an ARN-style `secret_ref`);
   the secret lives in the external manager and is backed up there, on its own policy.
 - **Never commit `VOUCHR_MASTER_KEY`** (or any key) to source control or bake it into

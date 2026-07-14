@@ -10,6 +10,7 @@
   <a href="#credential-modes">Credential Modes</a> |
   <a href="#providers">Providers</a> |
   <a href="#headless">Headless</a> |
+  <a href="./guides/HYBRID.md">Hybrid</a> |
   <a href="./guides/DEPLOYMENT.md">Deployment</a>
 </p>
 </div>
@@ -75,8 +76,9 @@ modals ([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. The
 tab is a config console**: everyone manages their own connections there, and admins (plus channel
 creators when `allowChannelCreatorConfig` is on) pick a channel and set per-provider modes, tool
 availability, and shared credentials — the same server-side gates and audit rows as the `/vouchr`
-equivalents. All Block Kit surfaces are exported for customization (`connectedBlocks`,
-`statusBlocks`, `homeView`, …).
+equivalents. Selected renderers are exported for customization (`connectedBlocks`, `statusBlocks`,
+`homeView`, …); approval/session builders and action IDs are not a turnkey composition API, so a
+host-owned Home or headless approval UI must own its handlers.
 
 To run it: Vouchr uses **your agent's Slack app** — enable bot scopes `app_mentions:read`,
 `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`, events `app_mention` +
@@ -120,8 +122,8 @@ setInterval(() => vouchr.sweepExpired(), 3_600_000);
 **Security boundary:** tokens live in Vouchr's encrypted store and the provider request. They never
 enter the model, Slack transcript, tool schema, or application logs.
 
-Deeper dives: [architecture](./guides/ARCHITECTURE.md) · [threat model](./guides/THREAT-MODEL.md) ·
-[deployment](./guides/DEPLOYMENT.md).
+Deeper dives: [architecture](./guides/ARCHITECTURE.md) · [hybrid Slack + headless](./guides/HYBRID.md) ·
+[threat model](./guides/THREAT-MODEL.md) · [deployment](./guides/DEPLOYMENT.md).
 
 ## Credential Modes
 
@@ -205,11 +207,11 @@ audit row. Absent = unchanged behavior (bar the unconditional cookie strip).
 `approval: { methods?, paths?, approver: 'self' | 'admin', ttlMs? }` adds **human-in-the-loop
 approval** for sensitive writes at the same boundary. Between "never allowed" (egress) and "always
 allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
-method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons in
-Slack — to the acting user for `'self'`, to eligible admins for `'admin'` (the same eligibility
-gate as the channel config commands) — showing the provider, method, host+path, and the COUNT of
-query parameters (names and values are both caller-controlled and can carry secrets/PII, so
-neither is displayed; the exact query string is bound byte-for-byte), never the request body. It
+method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons on the
+in-process Bolt path—to the acting user for `'self'`, to eligible admins for `'admin'` (the same
+eligibility gate as the channel config commands)—showing the provider, method, host+path, and the
+COUNT of query parameters (names and values are both caller-controlled and can carry secrets/PII,
+so neither is displayed; the exact query string is bound byte-for-byte), never the request body. It
 then throws the exported `ApprovalRequiredError` (catch and stop the turn,
 exactly like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and
 executes. A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only
@@ -222,9 +224,11 @@ purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval ru
 egress gate (an additional gate, never a bypass) and **before** the secret is read; every step —
 requested, approved, denied, consumed, expired — is audited with the approver as the actor. The
 headless broker enforces the same gate and returns `403 { "error": "approval_required",
-"approvalId" }`; the approval surface stays the Slack app. Enable it on a built-in via typed config
-(`github({ approval: { approver: 'admin' } })`) or on any `defineProvider`. Absent = unchanged
-behavior.
+"approvalId" }`, but it does not post Slack buttons. The trusted Slack-facing host must bridge that
+denial to a private decision UI, re-check the approver, and retry with a fresh identity assertion;
+the complete built-in bridge remains [#194](https://github.com/Dharin-shah/vouchr/issues/194). Enable
+the gate on a built-in via typed config (`github({ approval: { approver: 'admin' } })`) or on any
+`defineProvider`. Absent = unchanged behavior.
 
 Any OAuth2 provider can be declared with `defineProvider` (hosts outside a built-in's egress
 allowlist, e.g. `docs.googleapis.com`, need this too); non-OAuth APIs use `credential: 'key'` and
@@ -305,8 +309,10 @@ no-external-network `node:test` suite of a Bolt handler lives in
 
 ## Headless
 
-Slack-facing service and agent workers in separate processes? The same core exposes an HTTP broker:
-a verified Slack identity goes in, a provider response comes out, and the token stays inside Vouchr.
+Slack-facing service and agent workers in separate processes? Use the
+[hybrid architecture](./guides/HYBRID.md): the Bolt service remains the public Slack control plane,
+while a private HTTP broker performs credential use. A verified Slack identity goes in, a provider
+response comes out, and the token stays inside Vouchr.
 
 ```ts
 import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/headless'; // Bolt-free
@@ -315,10 +321,11 @@ const identity = loadIdentityConfig(process.env); // strong key + issuer + deplo
 const identityToken = mintIdentity({ teamId, userId, channel }, identity); // fresh per broker call
 ```
 
-Read-only by default (writes are a double opt-in), reference-only for secrets (raw keys stay in the
-Bolt modal), with channel governance mirrored behind a signed admin claim. Providers that ship as
-MCP servers over Streamable HTTP get a dedicated stateless proxy, `POST /v1/mcp` — the same gates
-and credential injection as `/v1/fetch`, plus SSE stream passthrough and `Mcp-Session-Id` relay.
+Read-only by default (writes are a double opt-in), with an intended reference-only headless secret
+boundary (use the Bolt modal and path-block both reference routes until #53 closes). Programmatic
+channel-governance routes sit behind a signed admin claim. Providers that ship as MCP servers over
+Streamable HTTP get a dedicated stateless proxy, `POST /v1/mcp` — the same gates that are actually
+wired on the chosen broker path, plus credential injection, SSE passthrough, and `Mcp-Session-Id` relay.
 It is opt-in per provider (the declarative `mcp: { paths, allowContentTypes? }` knob locks the
 endpoint and response types) and bounded by the `maxStreamBytes`/`maxStreamMs` broker options.
 Full details — capability matrix vs Bolt, wire format, replay protection, health probes, and the
@@ -326,12 +333,18 @@ HTTP contract for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 packaged broker requires `VOUCHR_DEPLOYMENT_ID`; every trusted minter and broker replica uses the same
 issuer, audience, and bounded active/overlap key set so assertions cannot cross deployments.
 
+The stock broker does not yet load Bolt-written tool allowlists or declarative static channel policy;
+[#240](https://github.com/Dharin-shah/vouchr/issues/240) and
+[#236](https://github.com/Dharin-shah/vouchr/issues/236) are release blockers for packaged hybrid
+“only these channels” enforcement. The hybrid guide keeps those limitations explicit.
+
 ## Production Notes
 
-- **Consent and approval prompts are control flow.** `ConsentRequiredError` /
-  `SessionApprovalRequiredError` / `ApprovalRequiredError` mean Vouchr already prompted the user —
-  catch them and stop the turn; don't log them as failures. For `ApprovalRequiredError` the human
-  clicks Approve and asks again; the grant is single-use and covers only the exact
+- **Consent and approval prompts are control flow.** On the in-process Bolt handle,
+  `ConsentRequiredError` / `SessionApprovalRequiredError` / `ApprovalRequiredError` mean Vouchr
+  already prompted the user—catch them and stop the turn; don't log them as failures. A headless
+  broker 403 does not automatically render that Slack UI. For in-process `ApprovalRequiredError`, the
+  human clicks Approve and asks again; the grant is single-use and covers only the exact
   method+host+path+query that was prompted (the request body is not inspected).
 - **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
   bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
