@@ -1147,6 +1147,93 @@ test('#54 /v1/disconnect acts only on the token identity (a different user is un
   }
 });
 
+test('/v1/disconnect reports a referenced revocable credential as only locally removed', async (t) => {
+  const provider = defineProvider({
+    ...acme,
+    revokeUrl: 'https://acme.example/revoke',
+  });
+  const { server, port, vault, db } = await makeBroker(t, { providers: [provider] });
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vault.reference(owner, 'acme', { source: 'external', secretRef: 'TEST_EXTERNAL_REFERENCE' });
+
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  try {
+    const r = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: false, revoked: ['acme'] });
+    assert.equal(upstreamCalls, 0);
+    assert.equal(await vault.has(owner, 'acme'), false);
+    const row = (await db.get(
+      `SELECT meta FROM audit WHERE action='revoke' AND provider='acme'`,
+    )) as { meta: string };
+    assert.deepEqual(JSON.parse(row.meta), { ok: false, upstream: 'skipped' });
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
+});
+
+test('/v1/disconnect returns a static 404 for an unregistered, unstored provider and writes no audit', async (t) => {
+  const { server, port, db } = await makeBroker(t);
+  const untrusted = 'ghp_UNTRUSTED_PROVIDER_MUST_NOT_BE_REFLECTED';
+  try {
+    const r = await post(port, '/v1/disconnect', {
+      handle: { provider: untrusted }, identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(r.status, 404);
+    assert.deepEqual(r.json, { error: 'unknown provider' });
+    assert.ok(!r.raw.includes(untrusted));
+    assert.equal(((await db.get(`SELECT COUNT(*) AS n FROM audit WHERE action='revoke'`)) as any).n, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('/v1/disconnect removes a stale stored provider and preserves the success wire shape', async (t) => {
+  const { server, port, vault, db } = await makeBroker(t);
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vault.upsert(owner, 'retired', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    const r = await post(port, '/v1/disconnect', {
+      handle: { provider: 'retired' }, identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: false, revoked: ['retired'] });
+    assert.equal(await vault.has(owner, 'retired'), false);
+    const row = (await db.get(`SELECT meta FROM audit WHERE action='revoke' AND provider='retired'`)) as any;
+    assert.deepEqual(JSON.parse(row.meta), { ok: false, upstream: 'skipped' });
+  } finally {
+    server.close();
+  }
+});
+
+test('/v1/disconnect reports a committed delete when auditing fails without exposing the error', async (t) => {
+  const auditError = 'ghp_AUDIT_FAILURE_MUST_NOT_REACH_HTTP';
+  const badAudit = { record: async () => { throw new Error(auditError); } } as unknown as Audit;
+  const { server, port, vault } = await makeBroker(t, { audit: badAudit });
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  try {
+    const r = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: false, revoked: ['acme'] });
+    assert.equal(await vault.has(owner, 'acme'), false);
+    assert.ok(!r.raw.includes(auditError));
+  } finally {
+    server.close();
+  }
+});
+
 test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user', async (t) => {
   const { server, port, vault } = await makeBroker(t);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {

@@ -85,6 +85,8 @@ test('connect: key provider, no cred → ephemeral key-setup prompt + ConsentReq
   const json = JSON.stringify(ephemeral.blocks);
   assert.ok(json.includes('vouchr_setup_key'));
   assert.ok(!json.includes('authorizeUrl') && !json.includes('"url"'));
+  assert.match(ephemeral.text, /stored encrypted/i);
+  assert.match(ephemeral.text, /never shown to the agent/i);
 });
 
 // Once the user has set their key, connect() returns a handle (no prompt).

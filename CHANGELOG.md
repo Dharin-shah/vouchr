@@ -96,6 +96,22 @@ All notable changes to this project are documented here. This project adheres to
   copy rather than arbitrary provider/error text. Removed the last references
   to a non-existent `/vouchr connect` command from the status and consent-denied renderers, so no surface
   advertises a command that does not exist.
+  A follow-up now keeps retired-provider rows removable by treating the acting user's exact stored row
+  as an owner-scoped allowlist entry; arbitrary unknown values still reach no delete, audit, event, or
+  HTTP reflection. The shared `disconnectProvider` result adds `recognized` and `audited`, preserving a
+  committed local delete and upstream-revoke result even when the audit store fails; the headless
+  `/v1/disconnect` route keeps its `{ ok, revoked }` success shape and returns a static `404` for an
+  unknown, unstored provider. Slack status/tools/stats/audit reads now fail visibly with fixed retry
+  guidance after acknowledgement, without retrying a failed Slack response or exposing dependency
+  errors. Remaining provider-bearing mrkdwn renderers and parsed fallback text are escaped; screen-reader
+  fallbacks carry the same visible prompt/table facts; and status, stats, audit, connect, and configuration
+  tables are packed into Slack-sized sections with explicit message/view bounds instead of oversized
+  payloads or silently dropped rows. Ordinary `/vouchr status` keeps its established text response;
+  only results that exceed Slack's message limit switch to stable `/vouchr status [page]` blocks, so
+  retired rows remain reachable across registry churn. Exceptionally large valid OAuth prompts let
+  Slack synthesize accessibility text instead of exceeding its top-level limit. The settings modal
+  bounds connection buttons, blocks, and private metadata with explicit text-command recovery, and
+  modal/Home Disconnect clicks send one outcome receipt even when the view refresh fails.
 
 - **Bounded per-channel manifest queries** (#209). Building a channel's tool manifest (Bolt's `tools`
   command, the broker's `POST /v1/manifest`) and the App Home admin console now issue a fixed number of

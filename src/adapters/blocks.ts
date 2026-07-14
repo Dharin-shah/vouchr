@@ -8,13 +8,105 @@ import { isBrokeredProvider } from '../core/providers';
  *  view must not turn a stored string into a forged `<…|link>` or `<@user>` mention. */
 export const escapeMrkdwn = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
+/** Slack's hard bounds for one mrkdwn section and a top-level message fallback. The latter is the
+ *  truncation boundary documented by Slack, so fail before a caller posts a partial accessibility
+ *  description. */
+const SLACK_SECTION_TEXT_MAX = 3000;
+const SLACK_TOP_LEVEL_TEXT_MAX = 40_000;
+const SLACK_VIEW_PRIVATE_METADATA_MAX = 3000;
+
+type SectionPackOptions = {
+  firstPrefix?: string;
+  continuationPrefix?: string;
+  maxSections?: number;
+  sectionError?: string;
+  blockError?: string;
+};
+
+/** Pack complete, already-rendered rows into Slack-valid mrkdwn sections. Rows are never clipped,
+ *  split, or dropped: an individually oversized row (or an excessive section count) is rejected so
+ *  the caller can fail visibly rather than post a misleading partial table. */
+function mrkdwnSections(lines: string[], o: SectionPackOptions = {}): unknown[] {
+  if (!lines.length) return [];
+  const sectionError = o.sectionError ?? 'Rendered row exceeds the Slack section limit.';
+  const blockError = o.blockError ?? 'Rendered rows exceed the Slack block limit.';
+  const sections: string[] = [];
+  let current = o.firstPrefix ?? '';
+
+  for (const line of lines) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length <= SLACK_SECTION_TEXT_MAX) {
+      current = candidate;
+      continue;
+    }
+    // A prefix with no row is not useful content; if even the first row cannot fit beside it,
+    // reject it instead of emitting a prefix-only section or splitting the row.
+    if (!current || current === o.firstPrefix) throw new Error(sectionError);
+    sections.push(current);
+    current = o.continuationPrefix ? `${o.continuationPrefix}\n${line}` : line;
+    if (current.length > SLACK_SECTION_TEXT_MAX) throw new Error(sectionError);
+  }
+  if (current) sections.push(current);
+  if (o.maxSections !== undefined && sections.length > o.maxSections) throw new Error(blockError);
+  return sections.map((text) => ({ type: 'section', text: { type: 'mrkdwn', text } }));
+}
+
+/** Build the parsed top-level `text` Slack uses for notifications and screen readers from exactly
+ *  the copy displayed in supported message blocks. Only visible text is read: URLs, action values,
+ *  metadata, input fields, and other payload data are deliberately ignored. `plain_text` labels are
+ *  escaped because the resulting top-level string is parsed as mrkdwn; mrkdwn copy was escaped by
+ *  its renderer already. */
+export function blocksFallbackText(blocks: unknown[]): string {
+  const out: string[] = [];
+  const addText = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    const text = value as { type?: unknown; text?: unknown };
+    if (typeof text.text !== 'string' || !text.text) return;
+    if (text.type === 'mrkdwn') out.push(text.text);
+    else if (text.type === 'plain_text') out.push(escapeMrkdwn(text.text));
+  };
+  const addActionLabel = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    addText((value as { text?: unknown }).text);
+  };
+
+  for (const value of blocks) {
+    if (!value || typeof value !== 'object') continue;
+    const block = value as {
+      type?: unknown;
+      text?: unknown;
+      fields?: unknown;
+      elements?: unknown;
+      accessory?: unknown;
+    };
+    if (block.type === 'header') {
+      addText(block.text);
+    } else if (block.type === 'section') {
+      addText(block.text);
+      if (Array.isArray(block.fields)) for (const field of block.fields) addText(field);
+      addActionLabel(block.accessory);
+    } else if (block.type === 'context') {
+      if (Array.isArray(block.elements)) for (const element of block.elements) addText(element);
+    } else if (block.type === 'actions') {
+      if (Array.isArray(block.elements)) for (const element of block.elements) addActionLabel(element);
+    }
+  }
+
+  const fallback = out.join('\n');
+  if (!fallback) throw new Error('Slack fallback text has no visible block copy.');
+  if (fallback.length > SLACK_TOP_LEVEL_TEXT_MAX) {
+    throw new Error('Slack fallback text exceeds the top-level message limit.');
+  }
+  return fallback;
+}
+
 /** `/vouchr audit`: a compact, read-only view of credential usage. Renders ONLY the non-secret
  *  columns (provider/action/actor/channel/time) — never `meta`, which the query already omits.
  *  Timestamps use Slack's `<!date^…>` token so each viewer sees their own locale/timezone.
  *  `heading` is caller-supplied constant text, never a stored value — safe as a plain_text header. */
 export function auditBlocks(rows: AuditRow[], heading: string): unknown[] {
   if (!rows.length) {
-    return [{ type: 'section', text: { type: 'mrkdwn', text: `:information_source: *${heading}*\nNothing recorded yet.` } }];
+    return [{ type: 'section', text: { type: 'mrkdwn', text: `:information_source: *${escapeMrkdwn(heading)}*\nNothing recorded yet.` } }];
   }
   const lines = rows.map((r) => {
     const secs = Math.floor(r.at / 1000);
@@ -27,7 +119,7 @@ export function auditBlocks(rows: AuditRow[], heading: string): unknown[] {
   });
   return [
     { type: 'header', text: { type: 'plain_text', text: heading, emoji: true } },
-    { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+    ...mrkdwnSections(lines, { maxSections: 49 }),
   ];
 }
 
@@ -49,7 +141,7 @@ export function statsBlocks(enabled: string[], stats: StatsRow[], windowDays: nu
   });
   return [
     { type: 'header', text: { type: 'plain_text', text: `Tool usage — last ${windowDays} days`, emoji: true } },
-    { type: 'section', text: { type: 'mrkdwn', text: lines.join('\n') } },
+    ...mrkdwnSections(lines, { maxSections: 48 }),
     { type: 'context', elements: [{ type: 'mrkdwn', text: 'Idle tools can be removed with `/vouchr disable <provider>`.' }] },
   ];
 }
@@ -62,7 +154,6 @@ export function connectBlocks(
   authorizeUrl: string,
   scopes?: { list: string[]; describe?: Record<string, string> },
 ): unknown[] {
-  const MAX_SECTION_TEXT = 3000;
   const MAX_SCOPE_SECTIONS = 48; // intro + scope sections + actions must stay within 50 message blocks
   // SEC-5 (#178): escape the provider id like every other mrkdwn renderer — no exception for a
   // registry-validated id. One escape site, used everywhere `provider` hits mrkdwn below.
@@ -87,26 +178,13 @@ export function connectBlocks(
       const label = typeof description === 'string' && description.trim() ? description : s;
       return `• ${escapeMrkdwn(label)}`;
     });
-    const firstPrefix = 'Connecting grants the agent, acting as you:';
-    const continuationPrefix = 'Additional granted scopes:';
-    const sections: string[] = [];
-    let current = firstPrefix;
-    for (const line of lines) {
-      const candidate = `${current}\n${line}`;
-      if (candidate.length <= MAX_SECTION_TEXT) {
-        current = candidate;
-        continue;
-      }
-      if (current === firstPrefix) throw new Error('Provider scope copy exceeds the Slack section limit.');
-      sections.push(current);
-      current = `${continuationPrefix}\n${line}`;
-      if (current.length > MAX_SECTION_TEXT) throw new Error('Provider scope copy exceeds the Slack section limit.');
-    }
-    sections.push(current);
-    if (sections.length > MAX_SCOPE_SECTIONS) throw new Error('Provider scopes exceed the Slack message block limit.');
-    for (const text of sections) {
-      blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
-    }
+    blocks.push(...mrkdwnSections(lines, {
+      firstPrefix: 'Connecting grants the agent, acting as you:',
+      continuationPrefix: 'Additional granted scopes:',
+      maxSections: MAX_SCOPE_SECTIONS,
+      sectionError: 'Provider scope copy exceeds the Slack section limit.',
+      blockError: 'Provider scopes exceed the Slack message block limit.',
+    }));
   }
   blocks.push({
     type: 'actions',
@@ -179,38 +257,41 @@ function secretModal(o: { callbackId: string; meta: object; title: string; intro
 
 /** Admin modal: set the CHANNEL's shared credential (invariant 7, admin-gated upstream). */
 export function configureModal(provider: string, channel: string): unknown {
+  const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: CONFIGURE_CALLBACK,
     meta: { channel, provider },
     title: 'Channel credential',
     intro:
-      `Set the *${provider}* credential for this channel. Only you can see what you ` +
+      `Set the *${p}* credential for this channel. Only you can see what you ` +
       `type here. It is never posted to the channel.`,
   });
 }
 
 /** Self-service modal: a user sets their OWN credential for a key-based provider. */
 export function userKeyModal(provider: string): unknown {
+  const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: USER_KEY_CALLBACK,
     meta: { provider },
     title: 'Your credential',
     intro:
-      `Set your own *${provider}* key. Only you can see this; it is stored encrypted and used ` +
+      `Set your own *${p}* key. Only you can see this; it is stored encrypted and used ` +
       `only when you ask the agent, never shown to the agent or posted in Slack.`,
   });
 }
 
 /** Ephemeral JIT prompt: a button that opens the per-user key modal (for key providers). */
 export function keySetupBlocks(provider: string): unknown[] {
+  const p = escapeMrkdwn(provider);
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text:
-          `:key: *Set up your ${provider} access*\n` +
-          `I need a ${provider} key to act for you. Add yours. It is stored encrypted on this ` +
+          `:key: *Set up your ${p} access*\n` +
+          `I need a ${p} key to act for you. Add yours. It is stored encrypted on this ` +
           `server and is never shown to the agent or posted in Slack.`,
       },
     },
@@ -232,14 +313,15 @@ export function keySetupBlocks(provider: string): unknown[] {
 /** Ephemeral in-thread prompt: a button granting the agent use of `provider` for THIS thread only.
  *  `thread` is carried in the button value so the action handler grants the exact thread. */
 export function sessionApprovalBlocks(provider: string, thread: string): unknown[] {
+  const p = escapeMrkdwn(provider);
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
         text:
-          `:lock: *Allow ${provider} in this thread?*\n` +
-          `The agent will be able to act as you on ${provider} only inside this thread, until the ` +
+          `:lock: *Allow ${p} in this thread?*\n` +
+          `The agent will be able to act as you on ${p} only inside this thread, until the ` +
           `session expires. This approval does not apply to any other thread or channel.`,
       },
     },
@@ -444,9 +526,12 @@ export type ConfigAdminRow = {
   identity?: 'service' | 'acting_human';
 };
 
+const CONFIG_CONNECTION_ROWS_MAX = 10;
+
 /**
  * No-arg `/vouchr` config modal (#109). Three sections:
- *  - "Your connections" (EVERYONE): the user's own connections, each with a Disconnect button.
+ *  - "Your connections" (EVERYONE): a bounded first set with Disconnect buttons, plus explicit
+ *    `/vouchr status [page]` guidance when more rows exist.
  *  - "Tools in this channel" (EVERYONE): the read-only manifest (which providers are usable here).
  *  - "Channel settings" (ADMINS ONLY, `admin` present): per-provider mode select + Enabled checkbox,
  *    whose submit routes to the SAME mode/enable/disable mutations as the slash commands.
@@ -467,7 +552,16 @@ export function configModal(o: {
     { type: 'header', text: { type: 'plain_text', text: 'Your connections', emoji: true } },
   ];
   if (o.connections.length) {
-    for (const c of o.connections) blocks.push(connectionRow(c));
+    for (const c of o.connections.slice(0, CONFIG_CONNECTION_ROWS_MAX)) blocks.push(connectionRow(c));
+    if (o.connections.length > CONFIG_CONNECTION_ROWS_MAX) {
+      blocks.push({
+        type: 'context',
+        elements: [{
+          type: 'mrkdwn',
+          text: `+${o.connections.length - CONFIG_CONNECTION_ROWS_MAX} more — use \`/vouchr status\` to browse every connection, then \`/vouchr disconnect <provider>\`.`,
+        }],
+      });
+    }
   } else {
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No connected accounts yet. They are created on demand when an agent needs one.' }] });
   }
@@ -479,10 +573,7 @@ export function configModal(o: {
   } else if (!o.tools.length) {
     blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No providers are registered.' }] });
   } else {
-    blocks.push({
-      type: 'section',
-      text: { type: 'mrkdwn', text: o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}${t.visibility === 'private' ? ' · :lock: private previews' : ''}`).join('\n') },
-    });
+    blocks.push(...mrkdwnSections(o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}${t.visibility === 'private' ? ' · :lock: private previews' : ''}`), { maxSections: 96 }));
   }
 
   if (o.admin && o.admin.length) {
@@ -544,10 +635,15 @@ export function configModal(o: {
   // deliberately-changed control from an untouched one that merely re-submits its initial value — the
   // basis for not reverting a concurrent admin's change and not writing spurious rows. Non-secret.
   const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled, v: p.visibility }));
+  if (blocks.length > 100) throw new Error('Vouchr configuration exceeds the Slack modal block limit.');
+  const privateMetadata = JSON.stringify({ channel: o.channel, open });
+  if (privateMetadata.length > SLACK_VIEW_PRIVATE_METADATA_MAX) {
+    throw new Error('Vouchr configuration exceeds the Slack modal private_metadata limit.');
+  }
   return {
     type: 'modal',
     callback_id: CONFIG_CALLBACK,
-    private_metadata: JSON.stringify({ channel: o.channel, open }),
+    private_metadata: privateMetadata,
     title: { type: 'plain_text', text: 'Vouchr' },
     ...(o.admin && o.admin.length ? { submit: { type: 'plain_text', text: 'Save' } } : {}),
     close: { type: 'plain_text', text: 'Close' },
@@ -658,7 +754,10 @@ export function consentDeniedBlocks(provider: string, reason?: string): unknown[
 }
 
 /** `/vouchr status`: a user's current connections and per-channel modes. */
-export function statusBlocks(connections: Connection[]): unknown[] {
+export function statusBlocks(
+  connections: Connection[],
+  pagination?: { page: number; totalPages: number },
+): unknown[] {
   if (connections.length === 0) {
     return [
       {
@@ -669,7 +768,16 @@ export function statusBlocks(connections: Connection[]): unknown[] {
   }
   return [
     { type: 'header', text: { type: 'plain_text', text: 'Your Vouchr connections', emoji: true } },
-    { type: 'section', text: { type: 'mrkdwn', text: connections.map(connectionLine).join('\n') } },
+    ...mrkdwnSections(connections.map(connectionLine), { maxSections: 48 }),
+    {
+      type: 'context',
+      elements: [{
+        type: 'mrkdwn',
+        text: pagination
+          ? `Page ${pagination.page} of ${pagination.totalPages}. Browse with \`/vouchr status <page>\`. Disconnect with \`/vouchr disconnect <provider>\`.`
+          : 'Disconnect with `/vouchr disconnect <provider>`.',
+      }],
+    },
   ];
 }
 
@@ -754,7 +862,7 @@ export function homeView(o: {
   ];
   for (const c of o.connections.slice(0, HOME_MAX_ROWS)) blocks.push(connectionRow(c));
   if (o.connections.length > HOME_MAX_ROWS) {
-    blocks.push(note(`+${o.connections.length - HOME_MAX_ROWS} more — see \`/vouchr\` for the full list.`));
+    blocks.push(note(`+${o.connections.length - HOME_MAX_ROWS} more — browse them with \`/vouchr status\`.`));
   }
   if (available.length) {
     blocks.push({ type: 'divider' });

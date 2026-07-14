@@ -141,14 +141,18 @@ Admins govern this in Slack with `/vouchr`: `mode <provider> <mode>`, `enable`/`
 shared credentials), `tools` (list the channel's manifest), `status`, and `disconnect`. Admin
 commands are workspace-admin-only by default (`allowChannelCreatorConfig: true` extends them to the
 channel's creator). `/vouchr help` lists the supported commands, and an unrecognized subcommand points back
-to it instead of silently doing nothing.
+to it instead of silently doing nothing. A provider removed from the current registry remains
+disconnectable while its user-owned credential exists. The exported `disconnectProvider` reports
+`{ recognized, removed, ok, audited }`, so callers can distinguish unknown input, committed local
+deletion, upstream-revocation uncertainty, and an audit-store failure without inspecting raw errors.
 
-Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees their connected
-accounts (with a Disconnect button each) and the channel's tool manifest; admins additionally get a
-per-provider mode select, Enabled checkbox, and Private-previews checkbox that route to the same
-mutations as the commands above (authorization is re-checked server-side on submit). The text
-subcommands are unchanged. The Block Kit builder (`configModal`) and its callback id
-(`CONFIG_CALLBACK`) are exported for headless hosts.
+Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees a bounded first
+set of connected accounts with Disconnect buttons and the channel's tool manifest; paged
+`/vouchr status [page]` reaches every connection when the complete status exceeds Slack's message
+limit. Admins additionally get a per-provider mode select, Enabled checkbox, and Private-previews
+checkbox that route to the same mutations as the commands above (authorization is re-checked
+server-side on submit). The ordinary text-subcommand responses are unchanged. The Block Kit builder
+(`configModal`) and its callback id (`CONFIG_CALLBACK`) are exported for headless hosts.
 
 ### Private previews
 

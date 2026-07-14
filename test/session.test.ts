@@ -108,6 +108,8 @@ test('connect(): covered provider with no grant posts an in-thread approval and 
   assert.equal(posted.length, 1);
   assert.equal(posted[0].thread_ts, 'TH_A');
   assert.equal(posted[0].user, 'U1');
+  assert.match(posted[0].text, /only inside this thread/i);
+  assert.match(posted[0].text, /session expires/i);
   const sessionRows = (await auditRows()).filter((r) => r.action === 'session');
   assert.equal(sessionRows.length, 1);
   assert.match(sessionRows[0].meta, /prompt/);

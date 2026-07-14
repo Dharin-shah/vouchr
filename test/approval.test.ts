@@ -208,9 +208,15 @@ test('state machine: prompt → approve → consume exactly once → re-prompt',
     const rendered = JSON.stringify(ephemerals[0].blocks);
     assert.match(rendered, /POST/);
     assert.match(rendered, /api\.acme\.test\/repos/);
+    assert.match(ephemerals[0].text, /POST/);
+    assert.match(ephemerals[0].text, /api\.acme\.test\/repos/);
+    assert.match(ephemerals[0].text, /once/);
+    assert.match(ephemerals[0].text, /request body is not inspected/i);
     // SEC-1: the prompt shows method+host+path, NEVER the body and never the token.
     assert.ok(!rendered.includes(BODY_SENTINEL));
     assert.ok(!rendered.includes(TOKEN));
+    assert.ok(!ephemerals[0].text.includes(BODY_SENTINEL));
+    assert.ok(!ephemerals[0].text.includes(TOKEN));
 
     // Approve (self = the requester), then the retried fetch consumes the grant and executes.
     await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);

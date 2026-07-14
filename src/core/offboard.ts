@@ -9,12 +9,13 @@ import { userOwner, type Owner } from './owner';
 import { SessionGrants } from './session';
 
 /**
- * The ONE read → local-delete → upstream-revoke sequence for a user-owned credential, shared by
+ * The ONE local-delete/claim → decode → upstream-revoke sequence for a user-owned credential, shared by
  * {@link disconnectProvider} and {@link offboardUser} (STR-3). Hardened per GHSA-25m2 so the local
  * delete — the security-meaningful action — always runs:
- *  - the token read is TTL-independent (a row expired here may still be live upstream) and a
- *    decrypt/KMS failure only skips the upstream revoke, never the delete;
- *  - `removed` comes from the delete result, not from whether the token was readable.
+ *  - DELETE ... RETURNING atomically claims the row, so only the delete winner can revoke upstream;
+ *  - decoding is TTL-independent (a row expired here may still be live upstream) and happens after
+ *    the delete, so a decrypt/KMS failure only skips the upstream revoke;
+ *  - `removed` comes from the committed delete claim, not from whether the token was readable.
  */
 async function removeUserConnection(
   vault: Vault,
@@ -23,37 +24,36 @@ async function removeUserConnection(
   provider: string,
 ): Promise<{ removed: boolean; ok: boolean; attempted: boolean }> {
   const owner = userOwner(identity);
-  let cred: { accessToken: string | null; dryRun: boolean } | null = null;
-  let readFailed = false;
-  if (registry?.has(provider)) {
-    try {
-      cred = await vault.getForRevoke(owner, provider);
-    } catch {
-      readFailed = true; // decrypt/KMS failure: the revoke is skipped, the local delete still happens
-    }
-  }
-  const removed = await vault.delete(owner, provider); // local delete FIRST
+  const current = registry?.has(provider) ? registry.get(provider) : null;
+  const registered = current != null;
+  // The atomic delete returns token material only to its winner. Stale/unregistered rows are never
+  // decrypted; their trusted dry_run bit is enough to distinguish synthetic state from real debt.
+  const claimed = await vault.deleteForRevoke(owner, provider, registered);
+  const removed = claimed.removed;
   // `ok` = "no upstream revocation debt was left behind"; `attempted` = a real revoke call was made.
   // A revocation that was DUE (revocable provider, row existed) but couldn't run because the token
   // was unreadable is ok:false — the upstream token may still be live, and reporting ok:true for a
   // revoke that never happened would be a lie (GHSA-25m2 review r3).
-  let ok = true;
+  let ok = !removed || registered || claimed.dryRun;
   let attempted = false;
-  if (registry?.has(provider)) {
-    const p = registry.get(provider);
+  if (current) {
+    const p = current;
     const revocable = !!(p.revoke || p.revokeUrl);
     // #116: a dry-run credential is synthetic — an upstream revoke would be a REAL network call
     // POSTing it to the provider. Keyed off the trusted dry_run column (no flag here), so the CLI
     // is covered too, and a REAL account labelled "dry-run" still revokes normally.
-    if (revocable && cred?.accessToken && !cred.dryRun) {
+    if (revocable && claimed.accessToken && !claimed.dryRun) {
       attempted = true;
       try {
-        await revokeToken(p, cred.accessToken);
+        await revokeToken(p, claimed.accessToken);
       } catch {
         ok = false; // network/HTTP failure: local access is already gone; nothing is faked
       }
-    } else if (revocable && removed && readFailed) {
-      ok = false; // revocation was due, but the token could not be read to hand upstream
+    } else if (revocable && removed && !claimed.dryRun) {
+      // A real revocable row with no usable token is unresolved upstream debt whether decryption
+      // failed OR the row intentionally stores only an external reference. Neither case made a
+      // revoke attempt, so reporting clean success would be false.
+      ok = false;
     }
   }
   return { removed, ok, attempted };
@@ -64,7 +64,13 @@ async function removeUserConnection(
  * FIRST, then best-effort upstream token revocation. A revoke failure is non-fatal — local access is
  * already gone. Audited as 'revoke' (never the token). Transport-agnostic, so the Bolt `/vouchr
  * disconnect` command and the headless broker's `/v1/disconnect` route share ONE implementation.
- * Returns whether a credential row was actually deleted and whether the upstream revoke succeeded.
+ * A provider is recognized when it is registered now OR is the id of an exact stored connection
+ * owned by the acting user. The latter keeps removed-from-config providers locally removable without
+ * letting arbitrary external values reach a mutation or audit row (SEC-4).
+ *
+ * `ok` means no upstream revocation debt remains; `audited` reports whether the audit obligation is
+ * complete (a committed delete was recorded, or no row existed so no revoke audit was due). Audit
+ * failure never discards an already-committed delete/revoke outcome.
  */
 export async function disconnectProvider(
   vault: Vault,
@@ -72,12 +78,27 @@ export async function disconnectProvider(
   registry: ProviderRegistry | undefined,
   identity: SlackIdentity,
   provider: string,
-): Promise<{ removed: boolean; ok: boolean }> {
-  const { removed, ok, attempted } = await removeUserConnection(vault, registry, identity, provider);
+): Promise<{ recognized: boolean; removed: boolean; ok: boolean; audited: boolean }> {
+  const registered = registry?.has(provider) ?? false;
+  const outcome = await removeUserConnection(vault, registry, identity, provider);
+  // For an unregistered value, the atomic delete claim IS the secondary allowlist check. No matching
+  // owned row means no satellite purge, audit, reflection, or other committed mutation (SEC-4).
+  if (!registered && !outcome.removed) {
+    return { recognized: false, removed: false, ok: false, audited: false };
+  }
+  const ok = outcome.ok;
+  // A no-op is not a revoke event. Keep duplicate/idempotent calls quiet: there is no committed
+  // mutation to audit, and adapters use `removed` to suppress the matching metrics event (#226).
+  if (!outcome.removed) return { recognized: true, removed: false, ok, audited: true };
   // meta.ok keeps its shape; upstream:'skipped' (same key as revokeConnection, STR-4) marks that no
   // real revoke call was made — so ok:false + skipped is legible as "token unreadable, revoke due".
-  await audit.record('revoke', identity, provider, { ok, ...(attempted ? {} : { upstream: 'skipped' }) }); // never the token
-  return { removed, ok };
+  let audited = true;
+  try {
+    await audit.record('revoke', identity, provider, { ok, ...(outcome.attempted ? {} : { upstream: 'skipped' }) }); // never the token
+  } catch {
+    audited = false; // the structured mutation/revoke outcome must survive an audit-store failure
+  }
+  return { recognized: true, removed: outcome.removed, ok, audited };
 }
 
 /**
@@ -131,7 +152,8 @@ export async function offboardUser(
       deleteFailures++; // this row's DELETE failed (transient DB error): keep going, surface below
       continue;
     }
-    if (outcome.removed) removed.push(provider);
+    if (!outcome.removed) continue; // a concurrent winner owns the revoke + audit for this row
+    removed.push(provider);
     const meta: Record<string, unknown> = { reason };
     if (registry) {
       meta.ok = outcome.ok; // never the token, just whether upstream revocation debt remains
@@ -268,22 +290,24 @@ export async function revokeConnection(
   provider: string,
 ): Promise<RevokeOutcome> {
   const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
-  // Read the token for the upstream revoke — TTL-independent (GHSA-25m2: an expired-here row may
-  // still be live upstream) — but a decrypt failure must NEVER block the local delete.
-  let token: string | null = null;
-  try { token = (await vault.getForRevoke(owner, provider))?.accessToken ?? null; } catch { /* still delete locally */ }
-  let removed = false;
-  try { removed = await vault.delete(owner, provider); } catch { /* removed stays false */ } // local delete FIRST
+  const current = registry?.has(provider) ? registry.get(provider) : null;
+  const registered = current != null;
+  // Atomically claim the row before decoding: a concurrent revoke loser receives no token and cannot
+  // double-call the provider. A decrypt/delete failure stays per-row best-effort for the bulk loop.
+  let claimed = { removed: false, accessToken: null as string | null, dryRun: false, readFailed: false };
+  try { claimed = await vault.deleteForRevoke(owner, provider, registered); } catch { /* removed stays false */ }
+  const removed = claimed.removed;
+  if (!removed) return { ...row, removed: false, upstreamAttempted: false, upstreamOk: true };
   // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
   // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success. A dry-run
   // row (#116) is always SKIPPED: its token is synthetic and must never be POSTed to a real endpoint.
   let upstreamAttempted = false;
   let upstreamOk = true;
-  if (registry?.has(provider) && token && !row.dryRun) {
-    const p = registry.get(provider);
+  if (current && claimed.accessToken && !claimed.dryRun) {
+    const p = current;
     if (p.revoke || p.revokeUrl) {
       upstreamAttempted = true;
-      try { await revokeToken(p, token); } catch { upstreamOk = false; }
+      try { await revokeToken(p, claimed.accessToken); } catch { upstreamOk = false; }
     }
   }
   // Attribute the audit row to the OWNER (team + owner id); a channel row has no Slack user actor.
@@ -298,7 +322,7 @@ export async function revokeConnection(
     try { await consent.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
     try { await sessions.clearForProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
   }
-  return { ...row, removed, upstreamAttempted, upstreamOk };
+  return { ...row, ...(removed ? { dryRun: claimed.dryRun } : {}), removed, upstreamAttempted, upstreamOk };
 }
 
 /**

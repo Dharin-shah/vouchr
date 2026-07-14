@@ -102,11 +102,15 @@ test('/vouchr stats (admin): shows used providers with counts and flags an enabl
   await audit.record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U2' }, 'github', { channel: 'C_FIN' });
   await audit.record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U1' }, 'gitlab', { channel: 'C_FIN' });
 
-  const json = JSON.stringify(await run('stats'));
+  const response = await run('stats');
+  const json = JSON.stringify(response);
   assert.match(json, /github.*2 injections · 2 people/);
   assert.match(json, /gitlab.*1 injection ·/);
   assert.match(json, /idle.*never used/);              // idle tool surfaced for pruning
   assert.match(json, /disable <provider>/);            // prune hint present
+  assert.match(response.text, /github.*2 injections · 2 people/);
+  assert.match(response.text, /idle.*never used/);
+  assert.match(response.text, /disable <provider>/);
 });
 
 test('/vouchr stats: a non-admin is refused via the admin gate and the denial is audited', async (t) => {

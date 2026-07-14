@@ -89,6 +89,20 @@ export class Vault {
     return row ? this.decode(row) : null;
   }
 
+  /**
+   * TTL-independent, metadata-only existence check for one exact owned connection. Used when a
+   * provider has been removed from the runtime registry: the stored row itself is the allowlist
+   * entry that lets its owner delete it, without decrypting token material or listing other rows.
+   */
+  async has(owner: Owner, provider: string): Promise<boolean> {
+    const row = await this.db.get(
+      `SELECT 1 AS present FROM connection
+       WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+      [owner.teamId, owner.kind, owner.id, provider],
+    );
+    return row != null;
+  }
+
   private async fetchRow(owner: Owner, provider: string): Promise<any> {
     return this.db.get(
       `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
@@ -142,6 +156,95 @@ export class Vault {
     return this.db.transaction ? this.db.transaction(fn) : fn(this.db);
   }
 
+  /**
+   * Atomically claim one exact connection for deletion and return only the columns needed to inspect
+   * its trusted provenance or decode it for best-effort upstream revocation. `DELETE ... RETURNING`
+   * is the concurrency boundary: only the caller that actually removes the row receives token
+   * material, so duplicate disconnects cannot both revoke upstream.
+   *
+   * The happy path keeps the credential delete and satellite purge in one transaction. If the DELETE
+   * ran but satellite cleanup fails, retry the same credential-only claim outside the rolled-back
+   * transaction, preserving delete()'s fail-closed fallback. A backend without transactions is only a
+   * minimal test stub: its first DELETE already committed, so retain that claim when the retry sees no
+   * row. A DELETE failure itself still propagates.
+   */
+  private async claimDelete(
+    owner: Owner,
+    provider: string,
+  ): Promise<{
+    id: string;
+    access_token_enc: unknown;
+    refresh_token_enc: unknown;
+    secret_ref: string | null;
+    dry_run: unknown;
+  } | null> {
+    const returning = 'RETURNING id, access_token_enc, refresh_token_enc, secret_ref, dry_run';
+    const sql = `DELETE FROM connection
+      WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?
+      ${returning}`;
+    const params = [owner.teamId, owner.kind, owner.id, provider];
+    let claimed: {
+      id: string;
+      access_token_enc: unknown;
+      refresh_token_enc: unknown;
+      secret_ref: string | null;
+      dry_run: unknown;
+    } | null | undefined;
+    try {
+      return await this.mutation(async (tx) => {
+        claimed = (await tx.get(sql, params)) ?? null;
+        if (claimed) await this.clearSatellites(tx, owner, provider);
+        return claimed;
+      });
+    } catch (e) {
+      // `undefined` means the DELETE statement itself never completed. Do not hide a genuinely
+      // stranded credential behind the satellite-cleanup fallback.
+      if (claimed === undefined) throw e;
+      // Current reconnects write a fresh row-generation id; the ciphertext/reference fingerprint
+      // also protects rolling overlap with an older writer that preserved id. Bind the fallback to
+      // the exact row whose transaction rolled back, never a newer reconnect or refresh.
+      const retry = claimed
+        ? (await this.db.get(
+            `DELETE FROM connection
+             WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND id=?
+               AND access_token_enc IS NOT DISTINCT FROM ?
+               AND refresh_token_enc IS NOT DISTINCT FROM ?
+               AND secret_ref IS NOT DISTINCT FROM ?
+             ${returning}`,
+            [...params, claimed.id, claimed.access_token_enc, claimed.refresh_token_enc, claimed.secret_ref],
+          )) ?? null
+        : null;
+      // Without a real transaction, the first DELETE was already committed before cleanup failed.
+      if (retry) return retry;
+      if (!this.db.transaction) return claimed;
+      throw new Error('credential deletion could not be confirmed after cleanup failure; retry');
+    }
+  }
+
+  /**
+   * Delete one connection for the revocation path and, only for the winning caller, optionally decode
+   * its access token after the local delete committed. Unregistered/stale providers pass
+   * `decrypt=false`: their trusted `dry_run` bit remains available without touching ciphertext.
+   */
+  async deleteForRevoke(
+    owner: Owner,
+    provider: string,
+    decrypt: boolean,
+  ): Promise<{ removed: boolean; accessToken: string | null; dryRun: boolean; readFailed: boolean }> {
+    const row = await this.claimDelete(owner, provider);
+    if (!row) return { removed: false, accessToken: null, dryRun: false, readFailed: false };
+    const dryRun = row.dry_run === 1;
+    if (!decrypt || dryRun) return { removed: true, accessToken: null, dryRun, readFailed: false };
+    try {
+      const accessToken = row.access_token_enc
+        ? await open(toBuffer(row.access_token_enc), this.key, this.envelope)
+        : null;
+      return { removed: true, accessToken, dryRun, readFailed: false };
+    } catch {
+      return { removed: true, accessToken: null, dryRun, readFailed: true };
+    }
+  }
+
   /** Store a vaulted credential (Vouchr encrypts and owns refresh). A production write is always
    *  REAL: `dry_run=0` on insert AND on conflict, so overwriting a dry-run row re-marks it real
    *  (zero-behavior-change — production ignores dry-run provenance entirely).
@@ -178,7 +281,7 @@ export class Vault {
       const { changes } = await tx.run(
         `INSERT INTO connection ${cols} ${src}
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-           source='vault', enterprise_id=excluded.enterprise_id,
+           id=excluded.id, source='vault', enterprise_id=excluded.enterprise_id,
            access_token_enc=excluded.access_token_enc,
            refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
            scopes=excluded.scopes, expires_at=excluded.expires_at,
@@ -213,7 +316,7 @@ export class Vault {
             external_account, dry_run, created_at, updated_at, last_used_at)
          VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 1, ?, ?, ?)
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-           source='vault', enterprise_id=excluded.enterprise_id,
+           id=excluded.id, source='vault', enterprise_id=excluded.enterprise_id,
            access_token_enc=excluded.access_token_enc,
            refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
            scopes=excluded.scopes, expires_at=excluded.expires_at,
@@ -265,7 +368,7 @@ export class Vault {
             external_account, dry_run, created_at, updated_at, last_used_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, 0, ?, ?, ?)
          ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-           source=excluded.source, enterprise_id=excluded.enterprise_id,
+           id=excluded.id, source=excluded.source, enterprise_id=excluded.enterprise_id,
            access_token_enc=NULL, refresh_token_enc=NULL,
            secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
            external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
@@ -464,7 +567,7 @@ export class Vault {
   }
 
   /**
-   * Returns whether a row actually existed, so callers derive a truthful `removed` from the
+   * Returns whether a row was atomically claimed, so callers derive a truthful `removed` from the
    * delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2).
    *
    * Satellite handling differs from the WRITE paths (upsert/reference, where a satellite-purge
@@ -474,33 +577,14 @@ export class Vault {
    * two modes are told apart (GHSA-25m2 review): if the DELETE statement itself never ran the
    * credential is genuinely stranded, so the error PROPAGATES (offboardUser reports the offboarding
    * incomplete, never as success); if only the satellite purge failed after a successful DELETE the
-   * credential delete is re-run alone and the delete result stands. A missed purge in that fallback
-   * is fail-closed anyway: a grant without its connection cannot reach a secret (consume precedes
-   * the vault read, which then throws NoConnectionError), a reconnect purges satellites inside
-   * upsert/reference BEFORE the new credential is usable, and the TTL sweep reclaims expired rows.
+   * credential delete is re-run alone, guarded to the same row generation. A generation mismatch is
+   * surfaced for retry instead of deleting a concurrent reconnect. A missed purge after a successful
+   * fallback is fail-closed anyway: a grant without its connection cannot reach a secret (consume
+   * precedes the vault read, which then throws NoConnectionError), a reconnect purges satellites
+   * inside upsert/reference BEFORE the new credential is usable, and the TTL sweep reclaims expired
+   * rows.
    */
   async delete(owner: Owner, provider: string): Promise<boolean> {
-    const sql = `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`;
-    const params = [owner.teamId, owner.kind, owner.id, provider];
-    let removed: boolean | undefined; // set once the DELETE statement itself succeeds
-    try {
-      return await this.mutation(async (tx) => {
-        removed = (await tx.run(sql, params)).changes > 0; // DELETE first; its own failure leaves `removed` unset
-        await this.clearSatellites(tx, owner, provider); // notification_state (#117) + approval grants (#113)
-        return removed;
-      });
-    } catch (e) {
-      // Distinguish the two failure modes (GHSA-25m2 review r3): a DELETE that never ran means the
-      // credential is genuinely stranded — surface it so offboardUser reports the offboarding
-      // incomplete, never as success. `removed` is still unset in that case.
-      if (removed === undefined) throw e;
-      // Only the satellite purge failed after a successful DELETE. On a transactional backend the
-      // txn rolled the DELETE back, so re-run it — and let ITS failure PROPAGATE: if the credential
-      // delete cannot be re-committed the credential is genuinely stranded (never report that as
-      // success, GHSA-25m2 r3). On a minimal non-transactional stub the row is already gone and this
-      // re-run is a harmless 0-row no-op. A missed purge is fail-closed (see the doc comment).
-      await this.db.run(sql, params);
-      return removed;
-    }
+    return (await this.claimDelete(owner, provider)) != null;
   }
 }

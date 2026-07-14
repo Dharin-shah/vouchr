@@ -49,6 +49,8 @@ test('audit: a user sees only their own credential usage, never another user\'s'
   const json = JSON.stringify(res);
   assert.match(json, /github/);       // A's own row is shown
   assert.doesNotMatch(json, /gitlab/); // B's row must never leak into A's view
+  assert.match(res.text, /github/);    // screen-reader/top-level fallback carries the actual row
+  assert.doesNotMatch(res.text, /gitlab/);
 });
 
 test('audit: empty state when the caller has no rows', async (t) => {
@@ -62,6 +64,7 @@ test('audit: meta contents are never rendered in the Slack view', async (t) => {
   await audit.record('inject', id('U_A'), 'github', { host: 'api.github.com', label: 'TOPSECRETLABEL' });
   const res = await run('audit', 'U_A');
   assert.doesNotMatch(JSON.stringify(res), /TOPSECRETLABEL/);
+  assert.doesNotMatch(res.text, /TOPSECRETLABEL/);
 });
 
 test('audit: a stored value cannot forge a mrkdwn link/mention (escaped in the view)', async (t) => {

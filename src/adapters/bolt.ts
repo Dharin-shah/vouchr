@@ -32,12 +32,12 @@ import { NotificationState, type CredentialHealthEvent, type CredentialHealthHoo
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
-  sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks,
+  sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,
   approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
   previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
-  escapeMrkdwn, connectedDmText,
+  escapeMrkdwn, blocksFallbackText, connectedDmText,
   type Connection, type ConfigAdminRow,
 } from './blocks';
 
@@ -141,6 +141,18 @@ export function safeUserMessage(e: unknown): string {
   }
   const name = (e as Error)?.constructor?.name ?? 'Error';
   return `Something went wrong (${name}). Ask an admin to check the Vouchr logs.`;
+}
+
+/** Slack may synthesize accessible top-level text from blocks when complete visible copy exceeds its
+ *  40k fallback ceiling. Valid maximum-scope OAuth prompts can reach that case while every individual
+ *  section and the 50-block message remain valid; omit `text` rather than failing after consent state
+ *  was minted. Used only with renderers that always contain visible supported blocks. */
+function optionalBlockFallback(blocks: unknown[]): { text: string } | Record<string, never> {
+  try {
+    return { text: blocksFallbackText(blocks) };
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -455,7 +467,7 @@ export class ConnectContext {
       provider: e.provider, method: e.method, host: e.host, path: e.path, queryParamCount: e.queryParamCount,
       requester: this.identity.userId, id: e.approvalId, approver: e.approver,
     }) as any;
-    const text = `Approval needed for a ${e.provider} action`; // registry-validated id; neutral fallback
+    const text = blocksFallbackText(blocks);
     const threadArg = this.thread ? { thread_ts: this.thread } : {};
     if (e.approver === 'self') {
       if (this.channel) {
@@ -692,7 +704,7 @@ export class ConnectContext {
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
     if (cm != null && cm !== 'shared') {
-      throw new UserFacingError(`Channel is set to ${cm} for "${providerId}"; static keys are not allowed.`);
+      throw new UserFacingError(`Channel is set to ${escapeMrkdwn(cm)} for "${escapeMrkdwn(providerId)}"; static keys are not allowed.`);
     }
     await this.vault.upsert(owner, providerId, {
       accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -716,7 +728,7 @@ export class ConnectContext {
     await this.assertChannelEligible();
     const cm = await cfg.getMode(owner.teamId, channel, providerId);
     if (cm != null && cm !== 'shared') {
-      throw new UserFacingError(`Channel is set to ${cm} for "${providerId}"; shared references are not allowed.`);
+      throw new UserFacingError(`Channel is set to ${escapeMrkdwn(cm)} for "${escapeMrkdwn(providerId)}"; shared references are not allowed.`);
     }
     await this.vault.reference(owner, providerId, { source: r.source, secretRef: r.secretRef, scopes: r.scopes });
     await cfg.setMode(owner.teamId, channel, providerId, 'shared');
@@ -764,6 +776,7 @@ export class ConnectContext {
    */
   async preview(providerId: string, content: { title: string; lines: string[] }): Promise<'posted' | 'private'> {
     this.registry.get(providerId); // unknown provider ids never reach a message or the preview store
+    const p = escapeMrkdwn(providerId); // top-level Slack text is parsed mrkdwn too (SEC-5)
     // Output rides the SAME authorization as credential use (the shared CHECK, same audit/deny mapping
     // as connect()): a policy-denied or tool-disabled provider must not get its output posted through
     // Vouchr's preview surface either — otherwise the manifest's `enabled` would be a lie here.
@@ -787,7 +800,7 @@ export class ConnectContext {
           provider: providerId, title: c.title, lines: c.lines, id,
           where: this.thread ? 'thread' : 'channel', ttlMinutes: Math.round(PREVIEW_TTL_MS / 60_000),
         }) as any,
-        text: `Private ${providerId} preview (only visible to you)`,
+        text: `Private ${p} preview (only visible to you)`,
       });
       return 'private';
     }
@@ -797,7 +810,7 @@ export class ConnectContext {
       blocks: previewPostBlocks({ provider: providerId, title: c.title, lines: c.lines }) as any,
       // Fallback/notification text is PARSED mrkdwn, not blocks: a provider-derived title there could
       // fire a <!channel> or forge a mention (SEC-5). Neutral constant + the registry-validated id only.
-      text: `${providerId} preview`,
+      text: `${p} preview`,
     });
     return 'posted';
   }
@@ -878,14 +891,14 @@ export class ConnectContext {
       user: this.identity.userId,
       thread_ts: thread,
       blocks: blocks as any,
-      text: `Approve ${providerId} for this thread`,
+      text: blocksFallbackText(blocks),
     });
   }
 
   /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
   private async postKeySetupPrompt(providerId: string): Promise<void> {
     const blocks = keySetupBlocks(providerId);
-    const text = `Set up your ${providerId} access`;
+    const text = blocksFallbackText(blocks);
     if (this.channel) {
       await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, blocks: blocks as any, text });
     } else {
@@ -899,19 +912,19 @@ export class ConnectContext {
       list: provider.scopesDefault,
       describe: provider.scopeDescriptions,
     });
-    const text = `Connect your ${escapeMrkdwn(providerId)} account`; // SEC-5 #178: fallback notification text is mrkdwn too
+    const fallback = optionalBlockFallback(blocks);
     if (this.channel) {
       await this.client.chat.postEphemeral({
         channel: this.channel,
         user: this.identity.userId,
         blocks: blocks as any,
-        text,
+        ...fallback,
       });
     } else {
       await this.client.chat.postMessage({
         channel: this.identity.userId,
         blocks: blocks as any,
-        text,
+        ...fallback,
       });
     }
   }
@@ -1066,7 +1079,8 @@ export async function createVouchr(opts: VouchrOptions) {
   const listBrokeredConnections = async (identity: SlackIdentity): Promise<Connection[]> =>
     (await vault.listForUser(identity))
       .filter((c) => { try { return isBrokeredProvider(registry.get(c.provider)); } catch { return true; } })
-      .map((c) => ({ provider: c.provider, channel: null, account: c.externalAccount }));
+      .map((c) => ({ provider: c.provider, channel: null, account: c.externalAccount }))
+      .sort((a, b) => a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0);
 
   /** Best-effort DM to the acting user — the App Home has no ephemeral/inline-error surface, so
    *  click feedback goes here (the same channel the modal-submit confirmations use). */
@@ -1324,6 +1338,25 @@ export async function createVouchr(opts: VouchrOptions) {
     // provider-taking command.
     const UNKNOWN_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr tools` to see the registered providers.';
     const UNKNOWN_DISCONNECT_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr status` to see your connected accounts.';
+    const COMMAND_READ_FAILURE = {
+      status: 'Could not load your connected accounts. Try `/vouchr status` again in a moment.',
+      tools: 'Could not load this channel\'s tools. Try `/vouchr tools` again in a moment.',
+      stats: 'Could not load this channel\'s usage stats. Try `/vouchr stats` again in a moment.',
+      audit: 'Could not load your credential usage. Try `/vouchr audit` again in a moment.',
+      auditChannel: 'Could not load this channel\'s credential usage. Try `/vouchr audit channel` again in a moment.',
+    } as const;
+    // Keep dependency preparation separate from Slack delivery. If respond() itself rejects after
+    // Slack accepted the response, catching it here and responding again could duplicate the reply.
+    // Static fallback copy also ensures a DB/KMS/Slack error can never be reflected to the user.
+    const prepareCommandResponse = async <T>(prepare: () => Promise<T>): Promise<
+      { ok: true; value: T } | { ok: false }
+    > => {
+      try {
+        return { ok: true, value: await prepare() };
+      } catch {
+        return { ok: false };
+      }
+    };
 
     app.command('/vouchr', async ({ command, ack, respond, client }: any) => {
       await ack();
@@ -1337,26 +1370,31 @@ export async function createVouchr(opts: VouchrOptions) {
       // No subcommand → open the interactive config modal (#109). `/vouchr status` (and any other
       // subcommand) keeps its text output below, so scripts and muscle memory are unaffected. A modal
       // needs a trigger_id; without one (shouldn't happen for a slash command) fall back to the text.
-      // Building the modal makes several DB/Slack round-trips within Slack's ~3s trigger window; if the
-      // open fails (expired_trigger_id, a transient API error, a build error) DON'T return — fall through
-      // to the status text so a no-arg `/vouchr` is never silent (matches main's pre-modal behavior).
+      // Building the modal makes several DB/Slack round-trips within Slack's ~3s trigger window. A
+      // build/open failure gets fixed command guidance rather than silently substituting status for
+      // the settings surface the user requested; raw Slack/DB errors are never reflected.
       if (!sub && command.trigger_id) {
         try {
           await client.views.open({ trigger_id: command.trigger_id, view: await buildConfigModal(identity, command.channel_id ?? null, client) });
           return;
-        } catch { /* fall through to the status text below */ }
+        } catch {
+          return respond('Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
+        }
       }
 
       // List the channel's tool manifest (which providers an agent may use here + their mode).
       if (sub === 'tools') {
         if (words.length !== 1) return respond('Usage: `/vouchr tools`');
         if (!command.channel_id) return respond('Run `/vouchr tools` from inside a channel.');
-        const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
-        if (!manifest.length) return respond('No providers are registered.');
-        const lines = manifest
-          .map((m) => `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${escapeMrkdwn(m.mode)})` : ''}${m.visibility === 'private' ? ' · private previews (:lock:)' : ''}`)
-          .join('\n');
-        return respond(`Tools for <#${command.channel_id}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`);
+        const prepared = await prepareCommandResponse(async () => {
+          const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
+          if (!manifest.length) return 'No providers are registered.';
+          const lines = manifest
+            .map((m) => `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${escapeMrkdwn(m.mode)})` : ''}${m.visibility === 'private' ? ' · private previews (:lock:)' : ''}`)
+            .join('\n');
+          return `Tools for <#${escapeMrkdwn(command.channel_id)}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`;
+        });
+        return respond(prepared.ok ? prepared.value : COMMAND_READ_FAILURE.tools);
       }
 
       // Admin usage analytics for THIS channel over the last 30 days: which enabled tools are actually
@@ -1365,15 +1403,19 @@ export async function createVouchr(opts: VouchrOptions) {
       if (sub === 'stats') {
         if (words.length !== 1) return respond('Usage: `/vouchr stats`');
         if (!command.channel_id) return respond('Run `/vouchr stats` from inside a channel.');
-        if (!(await commandAdmin(client, identity, command.channel_id))) {
-          await audit.record('denied', identity, 'stats', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-          return respond(adminOnly(allowChannelCreatorConfig, 'view channel usage stats'));
-        }
-        const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
-        const enabled = manifest.filter((m) => m.enabled && isBrokeredProvider(m)).map((m) => m.provider);
-        const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
-        const stats = await audit.statsByChannel(identity.teamId, command.channel_id, since);
-        return respond({ text: 'Channel tool usage', blocks: statsBlocks(enabled, stats, 30) as any });
+        const prepared = await prepareCommandResponse(async () => {
+          if (!(await commandAdmin(client, identity, command.channel_id))) {
+            await audit.record('denied', identity, 'stats', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
+            return adminOnly(allowChannelCreatorConfig, 'view channel usage stats');
+          }
+          const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
+          const enabled = manifest.filter((m) => m.enabled && isBrokeredProvider(m)).map((m) => m.provider);
+          const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
+          const stats = await audit.statsByChannel(identity.teamId, command.channel_id, since);
+          const blocks = statsBlocks(enabled, stats, 30);
+          return { text: blocksFallbackText(blocks), blocks: blocks as any };
+        });
+        return respond(prepared.ok ? prepared.value : COMMAND_READ_FAILURE.stats);
       }
 
       // Enable/disable a provider in this channel. Admin-gated (default-deny) + audited as 'config'
@@ -1392,7 +1434,7 @@ export async function createVouchr(opts: VouchrOptions) {
         } catch (e) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
-        return respond(`${on ? 'Enabled' : 'Disabled'} *${escapeMrkdwn(arg)}* in <#${command.channel_id}>.`);
+        return respond(`${on ? 'Enabled' : 'Disabled'} *${escapeMrkdwn(arg)}* in <#${escapeMrkdwn(command.channel_id)}>.`);
       }
 
       // Per-channel auth mode: shared (channel cred) | per-user | session (per-user + thread grant).
@@ -1408,7 +1450,7 @@ export async function createVouchr(opts: VouchrOptions) {
         } catch (e) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
-        return respond(`Set *${escapeMrkdwn(arg)}* to *${escapeMrkdwn(arg2)}* in <#${command.channel_id}>.`);
+        return respond(`Set *${escapeMrkdwn(arg)}* to *${escapeMrkdwn(arg2)}* in <#${escapeMrkdwn(command.channel_id)}>.`);
       }
 
       // Per-channel preview visibility: private = agent output goes only to the requester, with an
@@ -1425,8 +1467,8 @@ export async function createVouchr(opts: VouchrOptions) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
         return respond(arg2 === 'private'
-          ? `Set *${escapeMrkdwn(arg)}* previews to *private* in <#${command.channel_id}>: results go only to whoever asked, with a Share button.`
-          : `Set *${escapeMrkdwn(arg)}* previews to *public* in <#${command.channel_id}>.`);
+          ? `Set *${escapeMrkdwn(arg)}* previews to *private* in <#${escapeMrkdwn(command.channel_id)}>: results go only to whoever asked, with a Share button.`
+          : `Set *${escapeMrkdwn(arg)}* previews to *public* in <#${escapeMrkdwn(command.channel_id)}>.`);
       }
 
       if (sub === 'configure') {
@@ -1448,26 +1490,25 @@ export async function createVouchr(opts: VouchrOptions) {
       }
       if (sub === 'disconnect') {
         if (words.length !== 2) return respond('Usage: `/vouchr disconnect <provider>`');
-        // SEC-4: validate BEFORE the delete + audit `revoke` row + `revoked` event, so an unknown/typo
-        // provider (potentially credential-shaped) never lands raw in an audit column or an event.
-        if (!registry.has(arg)) return respond(UNKNOWN_DISCONNECT_PROVIDER_TEXT);
-        const p = escapeMrkdwn(arg); // SEC-5, even for a registry-validated id
         // Shared with the headless broker's /v1/disconnect (core disconnectProvider): local delete
-        // FIRST, then best-effort upstream revoke — a revoke failure is non-fatal. `removed` = a row
-        // actually existed; `ok` = no upstream revocation debt was left. Report both truthfully (#194).
-        let removed: boolean;
-        let ok: boolean;
+        // FIRST, then best-effort upstream revoke. Core recognizes either a current registry entry or
+        // this user's exact stored stale row; arbitrary input reaches no mutation/audit/event (SEC-4).
+        let outcome: Awaited<ReturnType<typeof disconnectProvider>>;
         try {
-          ({ removed, ok } = await disconnectProvider(vault, audit, registry, identity, arg));
+          outcome = await disconnectProvider(vault, audit, registry, identity, arg);
         } catch {
-          // DELETE and audit failures are deliberately indistinguishable here: the former may have
-          // left the credential in place, while the latter happens after deletion. Never echo a DB/
-          // KMS error; give one state-agnostic way to discover the committed outcome (#194 UX-1/5).
+          // A thrown failure means the local delete itself is uncertain. Never echo DB/KMS/provider
+          // text; give one state-agnostic way to discover the committed outcome (#194 UX-1/5).
           return respond('Could not confirm whether the account was disconnected. Run `/vouchr status` to check; if it is still listed, try again.');
         }
-        emit({ type: 'revoked', provider: arg, ok });
-        if (!removed) return respond(`You have no connected *${p}* account, so there was nothing to disconnect.`);
-        return respond(ok
+        if (!outcome.recognized) return respond(UNKNOWN_DISCONNECT_PROVIDER_TEXT);
+        const p = escapeMrkdwn(arg); // recognized current/stored id; still escape at render (SEC-5)
+        if (!outcome.removed) return respond(`You have no connected *${p}* account, so there was nothing to disconnect.`);
+        emit({ type: 'revoked', provider: arg, ok: outcome.ok });
+        if (!outcome.audited && outcome.ok) {
+          return respond(`Disconnected *${p}* locally, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
+        }
+        return respond(outcome.ok
           ? `Disconnected *${p}*. The agent can no longer act as you on ${p}.`
           : `Disconnected *${p}* locally, but the upstream token revoke could not be confirmed. Revoke or rotate Vouchr’s access in ${p} directly.`);
       }
@@ -1479,15 +1520,23 @@ export async function createVouchr(opts: VouchrOptions) {
         if (words.length > 2 || (arg && arg !== 'channel')) return respond('Usage: `/vouchr audit [channel]`');
         if (arg === 'channel') {
           if (!command.channel_id) return respond('Run `/vouchr audit channel` from inside the channel.');
-          if (!(await commandAdmin(client, identity, command.channel_id))) {
-            await audit.record('denied', identity, 'audit', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
-            return respond(adminOnly(allowChannelCreatorConfig, 'view channel credential usage'));
-          }
-          const rows = await audit.listByChannel(identity.teamId, command.channel_id, 20);
-          return respond({ text: 'Channel credential usage', blocks: auditBlocks(rows, 'Credential usage in this channel') as any });
+          const prepared = await prepareCommandResponse(async () => {
+            if (!(await commandAdmin(client, identity, command.channel_id))) {
+              await audit.record('denied', identity, 'audit', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
+              return adminOnly(allowChannelCreatorConfig, 'view channel credential usage');
+            }
+            const rows = await audit.listByChannel(identity.teamId, command.channel_id, 20);
+            const blocks = auditBlocks(rows, 'Credential usage in this channel');
+            return { text: blocksFallbackText(blocks), blocks: blocks as any };
+          });
+          return respond(prepared.ok ? prepared.value : COMMAND_READ_FAILURE.auditChannel);
         }
-        const rows = await audit.listByOwnerUser(identity, 20);
-        return respond({ text: 'Your credential usage', blocks: auditBlocks(rows, 'Your credential usage') as any });
+        const prepared = await prepareCommandResponse(async () => {
+          const rows = await audit.listByOwnerUser(identity, 20);
+          const blocks = auditBlocks(rows, 'Your credential usage');
+          return { text: blocksFallbackText(blocks), blocks: blocks as any };
+        });
+        return respond(prepared.ok ? prepared.value : COMMAND_READ_FAILURE.audit);
       }
 
       // Explicit `help` — the command reference. Lists only commands that actually exist (#194).
@@ -1496,9 +1545,18 @@ export async function createVouchr(opts: VouchrOptions) {
         return respond(HELP_TEXT);
       }
 
-      if (sub === 'status' && words.length !== 1) return respond('Usage: `/vouchr status`');
+      let statusPage = 1;
+      if (sub === 'status') {
+        const parsed = arg === undefined ? 1 : Number(arg);
+        if (
+          words.length > 2 ||
+          (arg !== undefined && (!/^[1-9]\d*$/.test(arg) || !Number.isSafeInteger(parsed)))
+        ) return respond('Usage: `/vouchr status [page]`');
+        statusPage = parsed;
+      }
 
-      // `status` (and a bare `/vouchr` whose modal open failed) → the connected-accounts view below.
+      // `status` (plus the defensive bare-command path when Slack supplies no trigger id) → the
+      // connected-accounts view below.
       // Any OTHER leftover token is an unrecognized subcommand (a typo): guide to `help` without
       // reflecting the raw token. It may be a credential pasted in the wrong position (SEC-1).
       if (sub && sub !== 'status') {
@@ -1507,12 +1565,33 @@ export async function createVouchr(opts: VouchrOptions) {
 
       // Never list a service-to-service tool as a "connected account": Vouchr doesn't broker those,
       // so they don't belong in the user's Vouchr connection status (defensive — storage is blocked).
-      // Rendered through connectionLine — the ONE escaped renderer shared with the modal and the
-      // App Home (SEC-5: the account label is provider-reported and must never hit mrkdwn raw).
-      const conns = await listBrokeredConnections(identity);
-      if (!conns.length) return respond('No connected accounts. They are created on demand when an agent needs one.');
-      const lines = conns.map(connectionLine).join('\n');
-      return respond(`Your connected accounts:\n${lines}\n\nDisconnect with \`/vouchr disconnect <provider>\`.`);
+      // Rendered through statusBlocks → connectionLine, the ONE escaped row renderer shared with
+      // the modal and App Home (SEC-5: provider-reported account labels never hit mrkdwn raw).
+      const prepared = await prepareCommandResponse(async () => {
+        const conns = await listBrokeredConnections(identity);
+        if (!conns.length) return statusPage === 1
+          ? 'No connected accounts. They are created on demand when an agent needs one.'
+          : 'No such status page. Run `/vouchr status` to start at page 1.';
+        const legacyText = `Your connected accounts:\n${conns.map(connectionLine).join('\n')}\n\nDisconnect with \`/vouchr disconnect <provider>\`.`;
+        if (arg === undefined) {
+          try {
+            // Preserve the stable text-command interface whenever the complete result fits. Paging
+            // is a boundary fallback, not a behavior change for an otherwise valid text response.
+            blocksFallbackText([{ type: 'section', text: { type: 'mrkdwn', text: legacyText } }]);
+            return legacyText;
+          } catch { /* the complete text exceeds Slack's top-level limit; page it below */ }
+        }
+        // Fourteen worst-case rows (63-char provider + a 512-byte account label whose `&` escaping
+        // expands fivefold) keep both sections and the complete accessibility fallback under Slack's
+        // limits without shortening any identity.
+        const pageSize = 14;
+        const totalPages = Math.ceil(conns.length / pageSize);
+        if (statusPage > totalPages) return 'No such status page. Run `/vouchr status` to start at page 1.';
+        const page = conns.slice((statusPage - 1) * pageSize, statusPage * pageSize);
+        const blocks = statusBlocks(page, { page: statusPage, totalPages });
+        return { text: blocksFallbackText(blocks), blocks: blocks as any };
+      });
+      return respond(prepared.ok ? prepared.value : COMMAND_READ_FAILURE.status);
     });
 
     // Modal submit (channel-shared OR per-user). One handler so both paths stay leak-safe and both
@@ -1549,9 +1628,10 @@ export async function createVouchr(opts: VouchrOptions) {
       }
       await ack();
       // Private confirmation DM (no secret), just the fact it was set.
+      const p = escapeMrkdwn(provider);
       const text = kind === 'channel'
-        ? `✅ Saved the *${provider}* credential for <#${channel}>.`
-        : `✅ Your *${provider}* credential is set. Ask me again and I'll use it.`;
+        ? `✅ Saved the *${p}* credential for <#${escapeMrkdwn(channel)}>.`
+        : `✅ Your *${p}* credential is set. Ask me again and I'll use it.`;
       await client.chat.postMessage({ channel: identity.userId, text }).catch(() => undefined);
     };
     app.view(CONFIGURE_CALLBACK, (a: any) => handleSecretSubmit(a, 'channel'));
@@ -1681,7 +1761,7 @@ export async function createVouchr(opts: VouchrOptions) {
 
       if (Object.keys(errors).length) return ack({ response_action: 'errors', errors });
       await ack();
-      await client.chat.postMessage({ channel: identity.userId, text: `✅ Updated channel settings for <#${channel}>.` }).catch(() => undefined);
+      await client.chat.postMessage({ channel: identity.userId, text: `✅ Updated channel settings for <#${escapeMrkdwn(channel)}>.` }).catch(() => undefined);
     });
 
     // ── #111 App Home console ───────────────────────────────────────────────────────────────
@@ -1889,11 +1969,38 @@ export async function createVouchr(opts: VouchrOptions) {
       if (!surface) return; // not our view → the host owns this action
       const identity = resolveIdentity({ body });
       const provider = body.actions?.[0]?.value;
-      // Validate against the registry before writing anything: disconnectProvider records the provider
-      // into the audit `provider` column unconditionally, so a forged/unknown value would pollute audit.
-      if (!identity || typeof provider !== 'string' || !registry.has(provider)) return;
-      const { ok } = await disconnectProvider(vault, audit, registry, identity, provider);
-      emit({ type: 'revoked', provider, ok });
+      if (!identity || typeof provider !== 'string') return;
+      // Core accepts a current registry id or this user's exact stored stale row, and rejects every
+      // forged/unknown value before mutation/audit. That keeps retired credentials removable from
+      // status/config surfaces without trusting the button payload (SEC-3/SEC-4).
+      let outcome: Awaited<ReturnType<typeof disconnectProvider>> | undefined;
+      try {
+        outcome = await disconnectProvider(vault, audit, registry, identity, provider);
+      } catch {
+        await dmActor(client, identity, 'Could not confirm whether the account was disconnected. Run `/vouchr status` to check; if it is still listed, try again.');
+      }
+      if (outcome?.recognized) {
+        const p = escapeMrkdwn(provider);
+        if (outcome.removed) emit({ type: 'revoked', provider, ok: outcome.ok });
+        if (outcome.removed && !outcome.ok) {
+          await dmActor(client, identity, `Disconnected *${p}* locally, but the upstream token revoke could not be confirmed. Revoke or rotate Vouchr’s access in ${p} directly.`);
+        } else if (outcome.removed && !outcome.audited) {
+          await dmActor(client, identity, `Disconnected *${p}* locally, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
+        } else if (outcome.removed) {
+          // A modal/Home refresh is best effort and may fail after the destructive mutation has
+          // committed. Always send one explicit receipt so a failed refresh never leaves the click
+          // looking ignored (#194 UX-1/5).
+          await dmActor(client, identity, `Disconnected *${p}*. The agent can no longer act as you on ${p}.`);
+        } else {
+          // A duplicate click is still a valid interaction. It owns no mutation/event/audit, but it
+          // must receive one idempotent receipt even if the subsequent view refresh also fails.
+          await dmActor(client, identity, `No *${p}* account was connected, so there was nothing to disconnect.`);
+        }
+      } else if (outcome) {
+        // This is either a forged value or the losing half of a concurrent click on a retired row.
+        // Do not reflect the unvalidated value; one fixed receipt keeps the valid race non-silent.
+        await dmActor(client, identity, 'That connection no longer exists. Run `/vouchr status` to see your current connections.');
+      }
       const channel = homeSelectedChannel(body.view);
       if (surface === 'home') return publishHome(identity, client, channel);
       await client.views.update({ view_id: body.view.id, view: await buildConfigModal(identity, channel, client) }).catch(() => undefined);
@@ -1924,10 +2031,11 @@ export async function createVouchr(opts: VouchrOptions) {
       const { authorizeUrl } = await consent.begin(identity, provider, redirectUri, null);
       emit({ type: 'connect_prompted', provider: providerId });
       if (respond) {
+        const blocks = connectBlocks(providerId, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions });
         await respond({
           replace_original: true,
-          text: `Connect your ${escapeMrkdwn(providerId)} account`,
-          blocks: connectBlocks(providerId, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions }) as any,
+          ...optionalBlockFallback(blocks),
+          blocks: blocks as any,
         });
       }
     });
@@ -1944,7 +2052,7 @@ export async function createVouchr(opts: VouchrOptions) {
       if (!provider || !thread || !channel || !registry.has(provider)) return;
       await sessions.grant(identity, channel, thread, provider, sessionTtlMs);
       await audit.record('session', identity, provider, { channel, thread, event: 'grant' });
-      if (respond) await respond({ replace_original: true, text: `✅ Approved *${provider}* for this thread. Ask me again.` });
+      if (respond) await respond({ replace_original: true, text: `✅ Approved *${escapeMrkdwn(provider)}* for this thread. Ask me again.` });
     });
 
     // #113 Approve/Deny for a pending sensitive-write approval. The button value is ONLY the
@@ -2037,7 +2145,7 @@ export async function createVouchr(opts: VouchrOptions) {
         blocks: previewPostBlocks({ provider: p.provider, title: p.title, lines: p.lines, sharedBy: identity.userId }) as any,
         // Neutral fallback: the stored title is provider-derived and fallback text is parsed mrkdwn
         // (SEC-5). p.provider was registry-validated at preview() time; the user id is authenticated.
-        text: `${p.provider} preview shared by <@${identity.userId}>`,
+        text: `${escapeMrkdwn(p.provider)} preview shared by <@${escapeMrkdwn(identity.userId)}>`,
       });
       // The moment private data became public, by whose decision. p.provider is registry-validated
       // (preview() refuses unknown ids), so nothing unvalidated reaches the audit provider column.

@@ -101,6 +101,10 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
     });
     await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
 
+    assert.match(posts[0].text, /Connecting grants the agent/i);
+    assert.match(posts[0].text, /read/);
+    assert.match(posts[0].text, /never shown to the agent/i);
+
     // Extract the single-use state from the Connect button URL.
     const actions = posts[0].blocks.find((b: any) => b.type === 'actions');
     const url = new URL(actions.elements[0].url);
@@ -129,6 +133,52 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
   } finally {
     await mock.close();
   }
+});
+
+test('integration: maximum-valid OAuth scopes still produce one bounded connect prompt', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const scopes = Array.from({ length: 48 }, (_, i) => `scope-${i}`);
+  const provider = defineProvider({
+    id: 'max-scopes',
+    authorizeUrl: 'https://provider.test/authorize',
+    tokenUrl: 'https://provider.test/token',
+    scopesDefault: scopes,
+    scopeDescriptions: Object.fromEntries(scopes.map((scope) => [scope, '&'.repeat(512)])),
+    egressAllow: ['api.provider.test'],
+    refresh: 'none',
+    pkce: true,
+    clientId: 'cid',
+    clientSecret: 'csec',
+  });
+  const lan = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db: await openTestDb(t) });
+  const posts: any[] = [];
+  const client = {
+    chat: {
+      postEphemeral: async (args: any) => { posts.push(args); },
+      postMessage: async (args: any) => { posts.push(args); },
+    },
+  };
+  const context: any = {};
+  await lan.middleware({
+    context,
+    client,
+    event: { channel: 'C1', user: 'U1', team: 'T1' },
+    next: async () => {},
+  });
+
+  await assert.rejects(() => context.vouchr.connect('max-scopes'), ConsentRequiredError);
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].text, undefined, 'over-40k top-level text must be omitted so Slack synthesizes it');
+  assert.ok(posts[0].blocks.length <= 50);
+  for (const block of posts[0].blocks) {
+    if (block?.type === 'section') assert.ok(block.text.text.length <= 3_000);
+  }
+  const renderedScopeRows = posts[0].blocks
+    .filter((block: any) => block?.type === 'section')
+    .flatMap((block: any) => block.text.text.split('\n'))
+    .filter((line: string) => line.startsWith('• '));
+  assert.equal(renderedScopeRows.length, scopes.length, 'every configured scope needs one consent row');
+  assert.ok(renderedScopeRows.every((line: string) => line === `• ${'&amp;'.repeat(512)}`));
 });
 
 test('integration: OAuth callback error is served as inert text/plain, not text/html (#177)', async (t) => {
