@@ -1,7 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -560,28 +559,4 @@ test('buildBrokerServer: hook overrides cannot replace identity/replay/provider 
   // The intentional wrapper hook remains supported.
   const built = await buildBrokerServer(env, { authorize: () => undefined });
   await built.db.close();
-});
-
-// ── T8: seed CLI ─────────────────────────────────────────────────────────────
-
-test('broker-seed: removed reference mode rejects before writing or reflecting input', async (t) => {
-  const _dir = mkdtempSync(join(tmpdir(), 'vouchr-seed-'));
-  const dbPath = await testDbUrl(t);
-  const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: KEY_B64 };
-  const sentinel = 'ghp_SEED_REFERENCE_SENTINEL';
-  const result = spawnSync(process.execPath, [
-    '--import', 'tsx', 'bin/broker-seed.ts', 'reference',
-    '--provider', 'confluence', '--team', 'T1', '--user', 'U1',
-    '--source', 'aws-sm', '--secret-ref', sentinel,
-  ], { env, encoding: 'utf8' });
-  assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /reference mode was removed/);
-  assert.ok(!`${result.stdout}${result.stderr}`.includes(sentinel));
-
-  const db = await openDb({ databaseUrl: dbPath });
-  try {
-    assert.equal((await db.get<{ n: number }>('SELECT COUNT(*) n FROM connection'))?.n, 0);
-  } finally {
-    await db.close();
-  }
 });

@@ -359,6 +359,7 @@ export class Vault {
     owner: Owner,
     provider: string,
     r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
+    afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
     const now = Date.now();
     await this.mutation(async (tx) => {
@@ -380,6 +381,7 @@ export class Vault {
         ],
       );
       await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
+      await afterWrite?.(tx);
     });
   }
 

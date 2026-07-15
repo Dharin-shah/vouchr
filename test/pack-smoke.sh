@@ -47,7 +47,7 @@ echo "==> require() every published entrypoint (CJS exports map)"
 " )
 
 echo "==> every bin resolves and prints on --help"
-for bin in vouchr vouchr-broker vouchr-seed; do
+for bin in vouchr vouchr-broker; do
   out="$( cd "$CONSUMER" && npx --no-install "$bin" --help 2>&1 )" || {
     echo "FAIL: $bin --help exited non-zero"; echo "$out"; exit 1;
   }

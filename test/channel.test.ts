@@ -32,6 +32,7 @@ async function ctx(
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
+  const channelConfig = new ChannelConfig(db);
   const client = {
     users: { info: async () => ({ user: { is_admin: isAdmin } }) },
     conversations: {
@@ -43,10 +44,10 @@ async function ctx(
   } as any;
   const c = new ConnectContext({
     identity: ID, channel, client, registry: new ProviderRegistry([provider]), vault, audit,
-    consent: new Consent(db), policy, redirectUri: 'http://x', channelConfig: new ChannelConfig(db),
+    consent: new Consent(db), policy, redirectUri: 'http://x', channelConfig,
     resolvers,
   });
-  return { c, db, vault, audit };
+  return { c, db, vault, audit, channelConfig };
 }
 
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
@@ -110,6 +111,26 @@ test('referenceChannelSecret stores the ARN pointer, not a secret', async (t) =>
   assert.deepEqual(JSON.parse((await auditRows(db))[0].meta), {
     owner: 'channel', channel: 'C_FIN', mode: 'shared', kind: 'ref', source: 'aws-sm',
   });
+});
+
+test('referenceChannelSecret rolls back connection, mode, and audit on a mode-write failure', async (t) => {
+  const { c, db, vault, channelConfig } = await ctx(t, true);
+  channelConfig.setMode = async () => { throw new Error('mode unavailable'); };
+
+  await assert.rejects(() => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }), /mode unavailable/);
+  assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'mcp'), null);
+  assert.deepEqual(await auditRows(db), []);
+});
+
+test('referenceChannelSecret rolls back connection and mode on an audit failure', async (t) => {
+  const { c, db, vault, audit } = await ctx(t, true);
+  audit.record = async () => { throw new Error('audit unavailable'); };
+
+  await assert.rejects(() => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }), /audit unavailable/);
+  assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'mcp'), null);
+  assert.deepEqual(await auditRows(db), []);
 });
 
 test('referenceChannelSecret rejects invalid input before connection, mode, or audit state', async (t) => {

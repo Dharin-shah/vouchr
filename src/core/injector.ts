@@ -104,6 +104,15 @@ export class NoConnectionError extends Error {
   }
 }
 
+/** External secret resolution failed. Fixed text prevents a custom resolver from reflecting
+ * credential material, references, or provider SDK errors through direct handles or adapters. */
+export class ResolverFailedError extends Error {
+  constructor() {
+    super('External credential resolution failed.');
+    this.name = 'ResolverFailedError';
+  }
+}
+
 /**
  * The provider's RESPONSE violated a structural constraint (provider.egressResponse) — disallowed
  * content-type or an over-cap body — and was withheld from the caller. Unlike EgressBlockedError
@@ -653,10 +662,10 @@ export class ConnectionHandle {
   private async resolveRef(cred: StoredCredential, signal: AbortSignal): Promise<string> {
     const resolver = this.resolvers[cred.source];
     if (!resolver) {
-      throw new Error('No resolver registered for this secret source.');
+      throw new ResolverFailedError();
     }
     if (!cred.secretRef) {
-      throw new Error(`Referenced connection for "${this.provider.id}" has no secret_ref`);
+      throw new ResolverFailedError();
     }
     // Public configuration now validates before write, but legacy rows may predate that boundary.
     // Recheck the four advertised source ids before a previously inert row can trigger resolver I/O.
@@ -668,7 +677,7 @@ export class ConnectionHandle {
     } catch (e) {
       if (signal.aborted) throw e;
       this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
-      throw e;
+      throw new ResolverFailedError();
     }
   }
 

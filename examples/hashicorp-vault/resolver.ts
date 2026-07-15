@@ -34,11 +34,10 @@ export function hashicorpVault(
 
       const url = `${addr}/v1/${mount}/data/${path}`;
       const res = await f(url, { headers: { 'X-Vault-Token': token } });
-      // Error names the reference (non-secret) only, never any secret material.
-      if (!res.ok) throw new Error(`Vault read failed for "${ref}" (${res.status}).`);
+      if (!res.ok) throw new Error(`Vault read failed (${res.status}).`);
       const body = (await res.json()) as { data?: { data?: Record<string, string> } };
       const value = body.data?.data?.[field];
-      if (!value) throw new Error(`Vault returned no value for field "${field}" of "${ref}".`);
+      if (!value) throw new Error('Vault returned no value for the configured field.');
       return value;
     },
   };

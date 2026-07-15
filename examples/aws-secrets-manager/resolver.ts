@@ -27,8 +27,7 @@ export function awsSecretsManager(): Resolvers {
         return Buffer.from(out.SecretBinary as Uint8Array).toString('utf8');
       }
 
-      // Error names the ARN (non-secret) only, never any secret material.
-      throw new Error(`AWS Secrets Manager returned no value for "${arn}".`);
+      throw new Error('AWS Secrets Manager returned no value.');
     },
   };
 }

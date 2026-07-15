@@ -33,14 +33,13 @@ export function gcpSecretManager(opts: { fetch?: typeof fetch } = {}): Resolvers
 
       const url = `https://secretmanager.googleapis.com/v1/projects/${project}/secrets/${secret}/versions/${version}:access`;
       const res = await f(url, { headers: { Authorization: `Bearer ${access_token}` } });
-      // Error names the reference (non-secret) only, never any secret material.
-      if (!res.ok) throw new Error(`GCP Secret Manager access failed for "${ref}" (${res.status}).`);
+      if (!res.ok) throw new Error(`GCP Secret Manager access failed (${res.status}).`);
       const body = (await res.json()) as { payload?: { data?: string } };
       const data = body.payload?.data;
-      if (!data) throw new Error(`GCP Secret Manager returned no payload for "${ref}".`);
+      if (!data) throw new Error('GCP Secret Manager returned no payload.');
       // Fail closed on an empty decoded value too — base64 like "=" is truthy but decodes to "".
       const value = Buffer.from(data, 'base64').toString('utf8');
-      if (!value) throw new Error(`GCP Secret Manager returned an empty value for "${ref}".`);
+      if (!value) throw new Error('GCP Secret Manager returned an empty value.');
       return value;
     },
   };

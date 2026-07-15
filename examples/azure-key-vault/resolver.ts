@@ -36,10 +36,9 @@ export function azureKeyVault(opts: { fetch?: typeof fetch } = {}): Resolvers {
       const path = version ? `${secret}/${version}` : secret;
       const url = `https://${vault}.vault.azure.net/secrets/${path}?api-version=7.4`;
       const res = await f(url, { headers: { Authorization: `Bearer ${access_token}` } });
-      // Error names the reference (non-secret) only, never any secret material.
-      if (!res.ok) throw new Error(`Azure Key Vault access failed for "${ref}" (${res.status}).`);
+      if (!res.ok) throw new Error(`Azure Key Vault access failed (${res.status}).`);
       const body = (await res.json()) as { value?: string };
-      if (!body.value) throw new Error(`Azure Key Vault returned no value for "${ref}".`);
+      if (!body.value) throw new Error('Azure Key Vault returned no value.');
       return body.value;
     },
   };

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ConnectionHandle } from '../src/core/injector';
+import { ConnectionHandle, ResolverFailedError } from '../src/core/injector';
 import { offboardUser } from '../src/core/offboard';
 import { Consent } from '../src/core/consent';
 import { userOwner, channelOwner } from '../src/core/owner';
@@ -82,7 +82,43 @@ test('referenced secret-source: missing resolver fails closed (no silent skip)',
     egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
   });
   const handle = new ConnectionHandle(provider, owner, { enterpriseId: null, teamId: 'T1', userId: 'U' }, vault, new Audit(db), {});
-  await assert.rejects(() => handle.fetch('https://api.test/x'), /No resolver registered/);
+  await assert.rejects(
+    () => handle.fetch('https://api.test/x'),
+    (error: unknown) => error instanceof ResolverFailedError
+      && error.message === 'External credential resolution failed.',
+  );
+});
+
+test('referenced secret-source: resolver failures never expose resolver text or the reference', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const owner = channelOwner('T1', 'C1');
+  const reference = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/error-test';
+  const sentinel = 'ghp_RESOLVER_ERROR_SECRET_SENTINEL';
+  await vault.reference(owner, 'mcp', { source: 'aws-sm', secretRef: reference });
+  const provider = defineProvider({
+    id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+  });
+  const handle = new ConnectionHandle(
+    provider,
+    owner,
+    { enterpriseId: null, teamId: 'T1', userId: 'U' },
+    vault,
+    new Audit(db),
+    { 'aws-sm': async () => { throw new Error(`${sentinel}:${reference}`); } },
+  );
+
+  await assert.rejects(
+    () => handle.fetch('https://api.test/x'),
+    (error: unknown) => {
+      assert.ok(error instanceof ResolverFailedError);
+      assert.equal(error.message, 'External credential resolution failed.');
+      assert.ok(!error.message.includes(sentinel));
+      assert.ok(!error.message.includes(reference));
+      return true;
+    },
+  );
 });
 
 // T5: offboarding a member who linked a shared channel cred must NOT delete the channel's cred,

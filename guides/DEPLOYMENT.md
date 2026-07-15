@@ -425,7 +425,6 @@ POST /v1/admin/reference
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
-| `VOUCHR_SEED_ACCESS_TOKEN` | seed only | `broker-seed key` reads the token from here (preferred over the argv flag). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 
 Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
@@ -539,16 +538,11 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
 
 ### Provisioning (how credentials get in)
 
-- **Operator-managed static credential** (channel- or user-owned): seed it without Slack.
-  ```bash
-  # pass the static token in the environment, NOT on the command line:
-  VOUCHR_SEED_ACCESS_TOKEN="$TOKEN" npm run seed -- key --provider internal --team T1 --channel C1
-  ```
-  Reference seed mode was removed because the standalone process cannot truthfully inspect
-  code-injected broker resolvers. Configure references through the validated admin/user routes;
-  low-level hosts that call `Vault.reference()` directly own that trusted escape hatch.
-  Prefer `VOUCHR_SEED_ACCESS_TOKEN`: a `--access-token` flag lands in `process.argv`, visible via
-  `ps`/`/proc` to any co-tenant. The flag exists only for interactive use.
+- **Operator-managed static credential** (channel- or user-owned): configure a raw key through the
+  private Bolt modal. The packaged headless broker deliberately has no raw-secret ingestion route or
+  direct-database seeder; use the validated admin/user reference routes with an external secret
+  manager instead. Low-level library hosts that write through `Vault` own that trusted boundary and
+  must provide their own authorization, validation, and audit controls.
 - **Per-user credentials** (each human's own account): either mount the headless OAuth flow
   (`VOUCHR_BASE_URL`, #52) and drive users through `POST /v1/connect` → callback directly, **or** run
   the Bolt control-plane Vouchr against the **same Postgres database** so users connect in Slack and

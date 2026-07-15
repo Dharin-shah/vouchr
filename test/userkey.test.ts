@@ -82,6 +82,15 @@ test('referenceUserSecret: external ref under the user, no secret stored', async
   assert.deepEqual(JSON.parse((await auditRows(db))[0].meta), { owner: 'user', kind: 'ref', source: 'aws-sm' });
 });
 
+test('referenceUserSecret rolls back the connection when its audit write fails', async (t) => {
+  const { c, db, vault, audit } = await ctx(t);
+  audit.record = async () => { throw new Error('audit unavailable'); };
+
+  await assert.rejects(() => c.referenceUserSecret('customdb', { secretRef: AWS_REF }), /audit unavailable/);
+  assert.equal(await vault.get(userOwner(ID), 'customdb'), null);
+  assert.deepEqual(await auditRows(db), []);
+});
+
 test('referenceUserSecret: invalid input or missing resolver writes no connection or audit', async (t) => {
   const sentinel = 'sk_live_USER_REFERENCE_SENTINEL';
   const cases = [

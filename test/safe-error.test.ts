@@ -8,7 +8,7 @@ import {
   ConsentRequiredError,
   SessionApprovalRequiredError,
 } from '../src/adapters/bolt';
-import { EgressBlockedError, NoConnectionError, ResponseBlockedError } from '../src/core/injector';
+import { EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError } from '../src/core/injector';
 import { SecretReferenceError } from '../src/core/reference';
 import { defineProvider } from '../src/core/providers';
 import { USER_KEY_CALLBACK, CONFIGURE_CALLBACK } from '../src/adapters/blocks';
@@ -47,6 +47,7 @@ test("safeUserMessage: Vouchr's own error classes keep their message", () => {
     new EgressBlockedError('Egress blocked: host not allowed'),
     new ResponseBlockedError('Response blocked: content-type is not allowed for provider "github"', 'content_type'),
     new NoConnectionError('No connection for github'),
+    new ResolverFailedError(),
     new SecretReferenceError('invalid_reference'),
   ]) {
     assert.equal(safeUserMessage(e), (e as Error).message);

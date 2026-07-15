@@ -163,10 +163,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Removed
 
-- **Unsafe `vouchr-seed reference` mode** (#246, breaking). The standalone seed process cannot
-  truthfully inspect code-injected broker resolvers, so accepting arbitrary source/reference flags
-  would preserve a plaintext-metadata bypass around #53. Configure external references through the
-  validated admin/user routes; static encrypted-key seed mode remains available.
+- **`vouchr-seed` command** (#246, breaking). The direct-database seeder bypassed provider
+  validation and audit, and channel seeds did not configure the required shared mode. Raw static
+  keys remain available through the private Bolt modal; headless deployments use the validated
+  admin/user reference routes with an external secret manager.
 
 - **Union credential-borrowing removed from the production surface** (#196, breaking). The `union`
   channel mode — where any connected member's account could satisfy another member's request — is
@@ -414,8 +414,11 @@ All notable changes to this project are documented here. This project adheres to
   and HashiCorp Vault references are accepted; the resolver source is derived server-side; an
   optional legacy `source` must match; scopes must be a bounded unique subset of the provider's
   declared scopes; and an own configured resolver function is required without being invoked during
-  configuration. Reference-validation failures use fixed non-reflective errors and create no
-  credential, channel mode, or audit row. HashiCorp
+  configuration. The credential row, channel mode, and config audit now commit in one transaction,
+  so any failed step rolls the whole configuration back. Reference-validation and just-in-time
+  resolver failures use fixed non-reflective errors and cannot expose custom resolver text or the
+  stored reference through direct handles. Failed configuration creates no credential, channel
+  mode, or audit row. HashiCorp
   `vault://` references are now distinguished from locally encrypted rows by `secret_ref`, so they
   reach their resolver just in time instead of being misread as local ciphertext. Built-in source
   ids are revalidated at use to quarantine malformed legacy rows, and `vouchr inventory` reports

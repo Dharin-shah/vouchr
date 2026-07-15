@@ -60,13 +60,11 @@
   },
   "bin": {
     "vouchr": "dist/bin/vouchr.js",
-    "vouchr-broker": "dist/bin/broker-server.js",
-    "vouchr-seed": "dist/bin/broker-seed.js"
+    "vouchr-broker": "dist/bin/broker-server.js"
   },
   "scripts": {
     "cli": "node --import tsx bin/vouchr.ts",
     "broker": "node --import tsx bin/broker-server.ts",
-    "seed": "node --import tsx bin/broker-seed.ts",
     "prepack": "npm run build",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",

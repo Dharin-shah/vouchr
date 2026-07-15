@@ -1,6 +1,5 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { refSource, UserFacingError } from '../src/adapters/bolt';
 import {
   MAX_SECRET_REFERENCE_BYTES,
   MAX_SECRET_REFERENCE_SCOPE_BYTES,
@@ -20,17 +19,6 @@ const resolvers = {
   'azure-kv': async () => 'azure',
   vault: async () => 'vault',
 };
-
-test('refSource routes each supported scheme to its source id', () => {
-  assert.equal(refSource(AWS_REF), 'aws-sm');
-  assert.equal(refSource(GCP_REF), 'gcp-sm');
-  assert.equal(refSource(AZURE_REF), 'azure-kv');
-  assert.equal(refSource(VAULT_REF), 'vault');
-});
-
-test('refSource throws a UserFacingError on an unknown scheme', () => {
-  assert.throws(() => refSource('gopher://nope'), UserFacingError);
-});
 
 test('normalizeSecretReference derives one configured source without invoking its resolver', () => {
   let calls = 0;

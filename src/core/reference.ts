@@ -69,9 +69,8 @@ function hasAsciiWhitespaceOrControl(value: string): boolean {
 }
 
 /**
- * Validate one supported external-reference shape and derive its resolver source. This deliberately
- * does not inspect a resolver registry so the legacy `refSource()` helper can stay a pure mapping;
- * every mutation entry point uses `normalizeSecretReference()` below instead.
+ * Validate one supported external-reference shape and derive its resolver source. Resolver
+ * availability is checked separately by `normalizeSecretReference()` at every mutation entry point.
  */
 export function secretReferenceSource(value: unknown): SecretReferenceSource {
   if (
@@ -167,10 +166,14 @@ export async function referenceUserCredential(input: {
   providerId: string;
   reference: SecretReference;
 }): Promise<void> {
-  await input.vault.reference(userOwner(input.identity), input.providerId, input.reference);
-  await input.audit.record('config', input.identity, input.providerId, {
-    owner: 'user', kind: 'ref', source: input.reference.source,
-  });
+  await input.vault.reference(
+    userOwner(input.identity),
+    input.providerId,
+    input.reference,
+    (tx) => input.audit.record('config', input.identity, input.providerId, {
+      owner: 'user', kind: 'ref', source: input.reference.source,
+    }, undefined, tx),
+  );
 }
 
 /**
@@ -191,15 +194,28 @@ export async function referenceChannelCredential(input: {
 }): Promise<void> {
   await input.authorize();
   await input.assertEligible();
-  const mode = await input.channelConfig.getMode(input.identity.teamId, input.channel, input.providerId);
-  if (mode != null && mode !== 'shared') input.modeConflict(mode);
   await input.vault.reference(
     channelOwner(input.identity.teamId, input.channel),
     input.providerId,
     input.reference,
+    async (tx) => {
+      const mode = await input.channelConfig.getMode(
+        input.identity.teamId,
+        input.channel,
+        input.providerId,
+        tx,
+      );
+      if (mode != null && mode !== 'shared') input.modeConflict(mode);
+      await input.channelConfig.setMode(
+        input.identity.teamId,
+        input.channel,
+        input.providerId,
+        'shared',
+        tx,
+      );
+      await input.audit.record('config', input.identity, input.providerId, {
+        owner: 'channel', channel: input.channel, mode: 'shared', kind: 'ref', source: input.reference.source,
+      }, undefined, tx);
+    },
   );
-  await input.channelConfig.setMode(input.identity.teamId, input.channel, input.providerId, 'shared');
-  await input.audit.record('config', input.identity, input.providerId, {
-    owner: 'channel', channel: input.channel, mode: 'shared', kind: 'ref', source: input.reference.source,
-  });
 }

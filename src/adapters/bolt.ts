@@ -16,7 +16,7 @@ import {
   buildToolManifest,
   buildToolManifestSnapshot,
 } from '../core/authz';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
@@ -33,7 +33,6 @@ import {
   normalizeSecretReference,
   referenceChannelCredential,
   referenceUserCredential,
-  secretReferenceSource,
   SecretReferenceError,
 } from '../core/reference';
 import {
@@ -55,16 +54,6 @@ const PREVIEW_TTL_MS = 10 * 60_000;
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
  *  how long a single approval can live before the user must re-approve in the thread. */
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-
-/** @deprecated The mutation paths derive and validate source through the core reference boundary. */
-export function refSource(ref: string): string {
-  try {
-    return secretReferenceSource(ref);
-  } catch (error) {
-    if (error instanceof SecretReferenceError) throw new UserFacingError(error.message);
-    throw error;
-  }
-}
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
 const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 };
@@ -139,6 +128,7 @@ export function safeUserMessage(e: unknown): string {
     e instanceof EgressBlockedError ||
     e instanceof ResponseBlockedError ||
     e instanceof NoConnectionError ||
+    e instanceof ResolverFailedError ||
     e instanceof RateLimitedError ||
     e instanceof SecretReferenceError ||
     e instanceof UserFacingError

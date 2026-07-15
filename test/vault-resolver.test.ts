@@ -28,7 +28,10 @@ test('vault resolver throws on a malformed reference', async () => {
 
 test('vault resolver throws (never resolves empty) on a failed read', async () => {
   const fetch = (async () => fail(403)) as unknown as typeof globalThis.fetch;
-  await assert.rejects(() => hashicorpVault({ ...OPTS, fetch }).vault(REF), /read failed/);
+  await assert.rejects(
+    () => hashicorpVault({ ...OPTS, fetch }).vault(REF),
+    (error: Error) => /read failed/.test(error.message) && !error.message.includes(REF),
+  );
 });
 
 test('vault resolver throws when the field is missing (no empty-string success)', async () => {
