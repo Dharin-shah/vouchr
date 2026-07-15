@@ -380,6 +380,34 @@ test('#240 packaged broker shares and enforces channel governance across every d
       secretRef: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:mcp-governed',
     });
 
+    // Force the latest possible failure in the admin mutation: both allowlist statements run, then
+    // PostgreSQL rejects the config audit insert. The route must report failure AND leave no live
+    // governance state, proving materialization, final upsert, and audit share one transaction.
+    const storedTools = new ChannelTools(built.db);
+    await built.db.exec(
+      `ALTER TABLE audit ADD CONSTRAINT issue240_reject_config_audit CHECK (action <> 'config')`,
+    );
+    const auditRejected = await requestJson(port, 'POST', '/v1/admin/tools', {
+      provider: 'fetcher', enabled: false, identityToken: adminToken(),
+    });
+    assert.equal(auditRejected.status, 500);
+    assert.deepEqual(auditRejected.json, { error: 'internal error' });
+    const rolledBackTools = await built.db.get<{ n: number }>(
+      `SELECT count(*)::int AS n FROM channel_tool WHERE team_id=? AND channel=?`,
+      ['T1', 'C1'],
+    );
+    const rolledBackAudits = await built.db.get<{ n: number }>(
+      `SELECT count(*)::int AS n FROM audit
+       WHERE team_id=? AND channel=? AND provider=? AND action='config'`,
+      ['T1', 'C1', 'fetcher'],
+    );
+    assert.equal(rolledBackTools?.n, 0);
+    assert.equal(rolledBackAudits?.n, 0);
+    assert.equal(await storedTools.isConfigured('T1', 'C1'), false);
+    assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), true);
+    await built.db.exec(`ALTER TABLE audit DROP CONSTRAINT issue240_reject_config_audit`);
+
+    // Once the audit sink recovers, the same route commits the full allowlist and audit together.
     const disabled = await requestJson(port, 'POST', '/v1/admin/tools', {
       provider: 'fetcher',
       enabled: false,
@@ -390,9 +418,16 @@ test('#240 packaged broker shares and enforces channel governance across every d
       isAdmin: false,
     });
     assert.equal(disabled.status, 200);
-    const storedTools = new ChannelTools(built.db);
     assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), false);
     assert.equal(await storedTools.isConfigured('TEVIL', 'CEVIL'), false);
+    const committedAudit = await built.db.get<{ meta: string }>(
+      `SELECT meta FROM audit
+       WHERE team_id=? AND channel=? AND provider=? AND action='config' ORDER BY at DESC LIMIT 1`,
+      ['T1', 'C1', 'fetcher'],
+    );
+    assert.deepEqual(JSON.parse(committedAudit?.meta ?? 'null'), {
+      owner: 'channel', channel: 'C1', tool: 'disabled',
+    });
 
     const config = await requestJson(
       port,

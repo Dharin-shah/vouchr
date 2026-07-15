@@ -11,10 +11,11 @@ All notable changes to this project are documented here. This project adheres to
   PostgreSQL-backed `ChannelTools` store, so Bolt/App Home and headless admin changes have one
   persisted meaning across `GET /v1/admin/config`, the channel-scoped manifest, `/v1/fetch`, and
   `/v1/mcp`. Headless writes use the same first-write-safe full-allowlist materialization and audit
-  shape as Bolt: changing one provider cannot silently disable untouched providers, including under
-  concurrent first writes. Service tools remain host-authenticated, but their Enable/Disable bit is
-  now consistently writable and visible in admin config and manifests for the trusted host to
-  enforce. Static packaged policy configuration remains tracked by #236.
+  shape as Bolt, committed in one transaction: a failed request cannot leave a live governance
+  change without its audit row, and changing one provider cannot silently disable untouched
+  providers, including under concurrent first writes. Service tools remain host-authenticated, but
+  their Enable/Disable bit is now consistently writable and visible in admin config and manifests
+  for the trusted host to enforce. Static packaged policy configuration remains tracked by #236.
 - **Bounded network, memory, and concurrency at the HTTP boundary** (#209). The broker now applies
   finite admission, request, response, and time limits so slow, malformed, cancelled, or oversized
   HTTP traffic cannot grow work without a configured bound. `/v1/fetch` upstream calls carry a finite, configurable deadline

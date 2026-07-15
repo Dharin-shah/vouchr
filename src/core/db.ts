@@ -26,8 +26,9 @@ export interface Db {
    * Run `fn`'s statements atomically (BEGIN … COMMIT, ROLLBACK on throw), with `fn`'s Db bound to
    * the transaction. Used where one logical mutation spans two tables (e.g. a connection write +
    * its notification_state purge, #117) so a mid-sequence failure can't half-commit. Optional only
-   * so minimal test stubs keep compiling — the shipped backend implements it; callers without it
-   * fall back to sequential statements.
+   * so minimal test stubs keep compiling — the shipped backend implements it. Logical mutations
+   * that require atomicity fail closed when it is absent; narrower test-only paths may fall back
+   * only where their own semantics explicitly permit it.
    */
   transaction?<T>(fn: (txDb: Db) => Promise<T>): Promise<T>;
 }

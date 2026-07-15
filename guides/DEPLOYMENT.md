@@ -354,8 +354,9 @@ assertion; same-named request-body fields have no authority.
 A channel with no `channel_tool` rows remains backward-compatible: every registered provider is
 enabled. The first admin mutation atomically materializes the full provider list before applying the
 requested changes, so toggling one provider cannot silently disable its bystanders, including under
-concurrent first writes. A disabled brokered provider is refused before credential resolution or
-upstream I/O. Service tools carry the same stored and rendered Enable/Disable bit, but Vouchr never
+concurrent first writes. The materialization, final changes, and canonical config audit rows commit
+as one transaction. A disabled brokered provider is refused before credential resolution or upstream
+I/O. Service tools carry the same stored and rendered Enable/Disable bit, but Vouchr never
 executes their service-authenticated egress; the trusted host must enforce a disabled service row.
 
 `VOUCHR_CHANNEL_MODES` is independent: it controls channel-owned credential mode/reference/use, not

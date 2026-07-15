@@ -153,9 +153,9 @@ test('null channel → no tool restriction; manifest all enabled', async (t) => 
 });
 
 // ── #111 ChannelTools.applyEnabled: atomic first-write allowlist materialization ─────────────────
-// The configured-ness decision lives INSIDE the materialization statement (NOT EXISTS), and each
-// statement is engine-atomic, so concurrent first-writers and mid-sequence failures can never leave
-// a PARTIAL allowlist that silently disables bystander providers.
+// The configured-ness decision lives INSIDE the materialization statement (NOT EXISTS), while both
+// statements share one transaction, so concurrent first-writers converge and mid-sequence failures
+// roll back without leaving a governance change or a partial allowlist.
 const ALL3 = ['mcp', 'other', 'third'];
 
 async function freshTools(t: TestContext) {
@@ -196,7 +196,7 @@ test('applyEnabled: concurrent first writes converge — both targets land, byst
 // is single statements instead of a client-side loop); the PG execution of the same statements is
 // covered by the opt-in postgres suite (TEST-4).
 function flakyDb(db: any, failOn: () => RegExp | null) {
-  return {
+  const wrapped: any = {
     get: db.get.bind(db),
     all: db.all.bind(db),
     exec: db.exec.bind(db),
@@ -207,6 +207,11 @@ function flakyDb(db: any, failOn: () => RegExp | null) {
       return db.run(sql, params);
     },
   };
+  if (db.transaction) {
+    wrapped.transaction = (fn: (tx: any) => Promise<unknown>) =>
+      db.transaction((tx: any) => fn(flakyDb(tx, failOn)));
+  }
+  return wrapped;
 }
 
 test('applyEnabled: failing materialization writes NOTHING (channel stays all-enabled)', async (t) => {
@@ -222,13 +227,12 @@ test('applyEnabled: failing materialization writes NOTHING (channel stays all-en
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
 });
 
-test('applyEnabled: failure after materialization still leaves a COMPLETE allowlist with the change applied', async (t) => {
+test('applyEnabled: failure after materialization rolls the complete allowlist back', async (t) => {
   const { db } = await freshTools(t);
   const tools = new ChannelTools(flakyDb(db, () => /DO UPDATE/) as any);
   await assert.rejects(() => tools.applyEnabled('T1', 'C1', [['mcp', false]], ALL3), /injected/);
-  // The materialization statement already carried the desired bit, so the intermediate state is the
-  // final state — complete, never a partial allowlist that disables bystanders.
-  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
+  assert.equal(await tools.isConfigured('T1', 'C1'), false);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true);
   assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true);
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
 });
