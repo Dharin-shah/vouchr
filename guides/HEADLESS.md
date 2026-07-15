@@ -8,12 +8,11 @@ If Slack should remain the built-in human/admin experience, start with the
 [hybrid Slack control-plane guide](./HYBRID.md). This document is the lower-level HTTP/API contract.
 
 > [!WARNING]
-> On the current stock packaged broker, Slack-written channel tool settings are not enforced
-> ([#240](https://github.com/Dharin-shah/vouchr/issues/240)), declarative static channel policy is not
-> loaded ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), and broker denials do not automatically
-> render Slack recovery prompts ([#194](https://github.com/Dharin-shah/vouchr/issues/194)). The low-level
-> `createBroker()` API exposes the relevant stores/hooks, but do not mistake that programmatic surface
-> for complete packaged hybrid behavior.
+> The stock packaged broker enforces Slack-written channel tool settings from shared PostgreSQL.
+> Declarative static channel policy is not loaded
+> ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), and broker denials do not automatically
+> render Slack recovery prompts ([#194](https://github.com/Dharin-shah/vouchr/issues/194)). Do not
+> mistake the now-shared runtime allowlist for the remaining default-deny policy or recovery bridge.
 
 Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 
@@ -102,8 +101,8 @@ One core, two front doors — both reach the same credential boundary.
 | Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
 | Use a `shared` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
 | Set the channel mode (`shared`/`per-user`/`session`) | ✅ `/vouchr mode` | ✅ `POST /v1/admin/mode` (admin claim) |
-| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ⚠️ route exists with injected `ChannelTools`, but first-write parity and packaged wiring both remain #240 |
-| Read the channel's modes + tool allowlist | ✅ (implicit) | ⚠️ route exists, but packaged broker has no persisted tool store (#240) |
+| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (signed admin; packaged broker or injected `ChannelTools`) |
+| Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` · channel-scoped `POST /v1/manifest` |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ rejected; reference routes never accept raw values |
@@ -246,10 +245,14 @@ channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool al
 authority comes only from the verified identity token, never the request body — and are scoped to
 the signed channel.
 
-Those routes require their stores to be supplied to `createBroker()`. The packaged
-`buildBrokerServer()` currently wires `ChannelConfig` but not `ChannelTools`, so its tools route is
-unavailable and it cannot enforce rows written by Bolt; see
-[#240](https://github.com/Dharin-shah/vouchr/issues/240). It also does not load static `Policy`; see
+Direct `createBroker()` callers opt into the mutable gate by supplying `channelTools`. The packaged
+`buildBrokerServer()` constructs `ChannelTools` from its existing PostgreSQL handle unconditionally,
+so Bolt and the admin API write through the same first-write-safe `applyEnabled` mutation, while
+admin config, the channel manifest, `/v1/fetch`, and `/v1/mcp` read and enforce that same state. No
+allowlist cache or additional environment switch is involved. Service tools are included in admin
+config and the channel manifest and may be enabled or disabled there; because Vouchr never executes
+their service-authenticated egress, the trusted host must refuse a service call when its manifest row
+has `enabled:false`. The packaged broker still does not load static `Policy`; see
 [#236](https://github.com/Dharin-shah/vouchr/issues/236).
 
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only

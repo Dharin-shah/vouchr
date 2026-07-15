@@ -176,14 +176,17 @@ export async function buildToolManifestSnapshot(o: ToolManifestBuildOptions): Pr
   ]);
   const tools = o.providerIds.map((provider) => {
     const policyAllows = !o.policy || o.policy.check(provider, o.channel);
+    const identity = o.registry.get(provider).identity ?? 'acting_human';
     return {
       provider,
-      mode: modeOf(provider),
+      // Service tools have no Vouchr-owned credential, so even a stale legacy config row cannot
+      // advertise a credential mode that the runtime will never honor.
+      mode: identity === 'service' ? null : modeOf(provider),
       // `enabled` = exactly authorizeProvider's verdict (via the shared authorizeVerdict), so the manifest
       // can never disagree with what connect()/fetch enforce in this channel.
       enabled: authorizeVerdict(policyAllows, toolAllowed(provider)) === null,
       // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
-      identity: o.registry.get(provider).identity ?? 'acting_human',
+      identity,
       visibility: visibilityOf(provider),
     };
   });

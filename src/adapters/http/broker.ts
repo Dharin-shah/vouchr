@@ -7,7 +7,7 @@ import { assertSchemaCurrent, type Db } from '../../core/db';
 import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
-import type { ChannelTools } from '../../core/tools';
+import { configureChannelTools, type ChannelTools } from '../../core/tools';
 import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
@@ -650,6 +650,8 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   // store): live counters admit/reject at entry so a burst of slow upstreams can't pin sockets/memory.
   const limiter = new InflightLimiter(maxInflight, maxInflightPerProvider);
   const registry = new ProviderRegistry(opts.providers);
+  const providerIds = opts.providers.map((provider) => provider.id);
+  const brokeredProviderIds = providerIds.filter((provider) => isBrokeredProvider(registry.get(provider)));
   const allowedCt = (opts.allowedContentTypes ?? DEFAULT_ALLOWED_CT).map((c) => c.toLowerCase());
   // #212: one supported replay path. Every broker replica consumes jtis through the shared
   // PostgreSQL table; there is no injectable/process-local alternative that can make readiness lie.
@@ -1177,14 +1179,17 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     return { ok: true };
   }
 
-  /**
-   * Provider must be a real, brokerable (non-service) provider. Verifies identity FIRST so an
-   * unauthenticated caller past the perimeter can't enumerate providers via distinct 404/403s.
-   * Shared by the admin config write routes below; mirrors the check in handleAdminReference.
-   */
-  async function verifyBrokerableProvider(providerId: string, token: string): Promise<IdentityClaims> {
+  /** Verify identity before registry membership so an unauthenticated caller cannot enumerate
+   * providers. Tool governance accepts every registered provider; credential-mode writes add the
+   * brokerable check below because service tools never have a Vouchr-owned credential. */
+  async function verifyRegisteredProvider(providerId: string, token: string): Promise<IdentityClaims> {
     const claims = await verify(token);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    return claims;
+  }
+
+  async function verifyBrokerableProvider(providerId: string, token: string): Promise<IdentityClaims> {
+    const claims = await verifyRegisteredProvider(providerId, token);
     if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     return claims;
   }
@@ -1241,18 +1246,37 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   /**
    * `POST /v1/admin/tools` — enable/disable a provider in the channel's tool allowlist (the headless
    * analogue of `/vouchr enable|disable`). Body `{ provider, enabled }`; channel/team + admin authority
-   * from the SIGNED claims only. Calls the SAME core `ChannelTools.setEnabled` the Bolt path uses.
-   * Requires channelTools opt-in; fail closed. Config, NOT secret ingest.
+   * from the SIGNED claims only. Calls the SAME core first-write-safe mutation + audit helper the
+   * Bolt path uses. Service tools remain host-authenticated, but their manifest bit is governed here
+   * too so one channel setting has one meaning. Requires channelTools opt-in; fail closed.
    */
   async function handleAdminTools(body: { provider?: unknown; enabled?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
     if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
     if (typeof body.enabled !== 'boolean') throw new HttpError(400, { error: 'enabled must be a boolean' });
-    const claims = await verifyBrokerableProvider(providerId, body.identityToken);
-    const acting = await requireAdmin(claims, providerId);
-    await opts.channelTools.setEnabled(claims.teamId, claims.channel, providerId, body.enabled);
-    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, toolEnabled: body.enabled });
+    const claims = await verifyRegisteredProvider(providerId, body.identityToken);
+    const acting: SlackIdentity = {
+      enterpriseId: claims.enterpriseId ?? null,
+      teamId: claims.teamId,
+      userId: claims.userId,
+    };
+    await configureChannelTools({
+      channelTools: opts.channelTools,
+      audit: opts.audit,
+      identity: acting,
+      channel: claims.channel,
+      changes: [[providerId, body.enabled]],
+      allProviders: providerIds,
+      authorize: async () => {
+        await requireAdmin(claims, providerId);
+        return true;
+      },
+      // The headless admin contract is scoped by the signed team/channel/admin facts. Unlike Bolt,
+      // this transport has no Slack channel-class lookup at mutation time; channelEligible remains
+      // the separate credential-owner gate and is not silently broadened into a new API requirement.
+      assertEligible: async () => undefined,
+    });
     return { ok: true };
   }
 
@@ -1260,23 +1284,21 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * `GET /v1/admin/config` — the read side of the two write routes above: the caller's channel's
    * per-provider mode + tool-enabled state, so an agent can inspect before changing. Admin-gated
    * (SIGNED `isAdmin` only); the channel/team come from the signed claims (identity token in the
-   * `x-vouchr-identity` header — a GET carries no JSON body). Service tools are omitted (not brokered).
-   * NO secret: policy bits only. `mode` is null when channelConfig is unset; `enabled` defaults true
-   * when channelTools is unset (the same backward-compat rule ChannelTools.isEnabled applies).
+   * `x-vouchr-identity` header — a GET carries no JSON body). Service tools are included because the
+   * same allowlist governs their manifest bit, but their credential `mode` is always null. NO secret:
+   * policy bits only. `mode` is null when channelConfig is unset; `enabled` defaults true when
+   * channelTools is unset (the same backward-compat rule ChannelTools.isEnabled applies).
    */
   async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
     await requireAdmin(claims, 'config');
-    const providerIds = opts.providers
-      .filter((p) => isBrokeredProvider(registry.get(p.id))) // service tools aren't brokered by Vouchr
-      .map((p) => p.id);
     if (providerIds.length === 0) return { providers: [] };
     // Two channel-scoped batch reads (mode + tool allowlist) instead of getMode/isEnabled per provider,
     // so the query count is bounded by the channel, not the provider count (#209). `enabled` is the raw
     // allowlist bit — same backward-compat rule ChannelTools.isEnabled applies — mode null when unset.
     const [modeOf, toolAllowed] = await Promise.all([
-      opts.channelConfig
-        ? snapshotChannelModes(opts.channelConfig, claims.teamId, claims.channel, providerIds)
+      opts.channelConfig && brokeredProviderIds.length
+        ? snapshotChannelModes(opts.channelConfig, claims.teamId, claims.channel, brokeredProviderIds)
         : Promise.resolve((_provider: string): ChannelMode | null => null),
       opts.channelTools
         ? snapshotToolAllowlist(opts.channelTools, claims.teamId, claims.channel, providerIds)
@@ -1284,7 +1306,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     ]);
     const providers = providerIds.map((provider) => ({
       provider,
-      mode: modeOf(provider),
+      mode: isBrokeredProvider(registry.get(provider)) ? modeOf(provider) : null,
       enabled: toolAllowed(provider),
     }));
     return { providers };
@@ -1407,7 +1429,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     const claims = await verify(body.identityToken);
     const principal: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     const tools = await buildToolManifest({
-      providerIds: opts.providers.map((p) => p.id), registry,
+      providerIds, registry,
       policy: opts.policy, channelTools: opts.channelTools, channelConfig: opts.channelConfig,
       principal, channel: claims.channel || null, // '' (a channel-less token) behaves like Bolt's DM context
     });

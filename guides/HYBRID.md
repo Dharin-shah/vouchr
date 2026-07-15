@@ -309,12 +309,11 @@ custom package/image layer containing it. Multi-workspace installation tokens re
 envelope until [#241](https://github.com/Dharin-shah/vouchr/issues/241) closes.
 
 > [!CAUTION]
-> `VOUCHR_CHANNEL_MODES=1` lets the packaged broker resolve channel-owned credentials, but it does
-> not currently wire the `ChannelTools` allowlist ([#240](https://github.com/Dharin-shah/vouchr/issues/240))
-> or static `Policy` ([#236](https://github.com/Dharin-shah/vouchr/issues/236)). The public low-level
-> `createBroker()` API can inject those stores today, but then the operator re-owns the guarded env
-> parsing, complete lifecycle, readiness, and shutdown wiring supplied by the packaged path. Do not
-> describe Slack Enable/Disable as an enforced stock-broker boundary until both issues close.
+> The packaged broker shares and enforces PostgreSQL-backed `ChannelTools` state with Bolt;
+> `VOUCHR_CHANNEL_MODES=1` additionally permits channel-owned credential modes. It still does not
+> load static `Policy` ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), so Slack
+> Enable/Disable is now an enforced runtime boundary but not a default-deny “only these channels”
+> operator policy.
 
 Both `/v1/admin/reference` and `/v1/user/reference` enforce the reference-only boundary before any
 credential, mode, or audit write: the broker validates a bounded supported reference form, derives its
@@ -534,9 +533,9 @@ There are two honest designs:
 1. **Vouchr-enforced channel boundary.** Physically split read and write into different endpoints and
    provider IDs. The read credential/endpoint must be incapable of mutation. Apply default-deny
    static `Policy` to the write provider, keep the mutable channel enablement as a second admin
-   control, and use a least-privilege write credential. The packaged broker cannot enforce the two
-   Vouchr gates yet because [#236](https://github.com/Dharin-shah/vouchr/issues/236) and
-   [#240](https://github.com/Dharin-shah/vouchr/issues/240) remain open.
+   control, and use a least-privilege write credential. The packaged broker now enforces mutable
+   channel enablement; the default-deny outer gate remains blocked until it can load static policy
+   through [#236](https://github.com/Dharin-shah/vouchr/issues/236).
 2. **Host/MCP-server boundary.** Keep one MCP endpoint and let the trusted host/server classify tool
    names, authorize them, perform transaction-specific confirmation, and supply idempotency or
    reconciliation for consequential writes. Vouchr still protects the credential, owner, channel,
@@ -573,7 +572,9 @@ operator must still satisfy the Slack/admin predicate to use the built-in contro
 An `identity: 'service'` provider shows only Enable/Disable: its authentication belongs to the host.
 An internal MCP that should use a Vouchr-managed bearer/key must therefore be a brokered key provider,
 not a service provider. A service provider is outside Vouchr's credential/egress path, so its
-Enable/Disable bit is manifest metadata that the trusted host—not Vouchr—must enforce.
+Enable/Disable bit is manifest metadata that the trusted host—not Vouchr—must enforce. The packaged
+admin route persists that bit in the same table as Bolt, and admin config plus the channel manifest
+report it consistently; Vouchr's fetch/MCP routes still refuse service credentials outright.
 
 Enable/Disable is backward-compatible runtime state, not deny-by-default policy. A channel with no
 `channel_tool` rows treats all registered providers as enabled. Bolt's first toggle materializes the
@@ -666,6 +667,7 @@ generic bearer/key injector does not implement AWS SigV4 request signing.
 | Master key/keyring | yes | yes | Required even with envelope encryption; both planes must decrypt existing/direct-key rows |
 | KMS envelope (production) | explicit `envelope` option | `VOUCHR_KMS_KEY_ID` + SDK layer | Required by the production vision; same KMS key identity/region and compatible IAM, additional to the master keyring |
 | Provider IDs and credential semantics | yes | yes | Deploy from one versioned source; broker also needs refresh client credentials |
+| `ChannelTools` runtime state | writes through Bolt/App Home | reads, writes, and enforces the same PostgreSQL rows | Brokered manifest/fetch/MCP enforce it; service-tool egress remains host-enforced |
 | Identity deployment ID/issuer/keys | minter only | verifier | Same values and bounded rotation set |
 | Slack signing secret/bot tokens | yes | no | Public Slack ingress only |
 | `PUBLIC_URL`/provider callback | yes | no | OAuth callback stays on Bolt in hybrid |
@@ -786,8 +788,8 @@ Run this proof against at least two broker replicas and one shared PostgreSQL da
 4. Configure an AWS ARN as a channel credential; prove another eligible member can use it in that
    channel, a non-member is refused when membership is required, and a different channel cannot use
    it.
-5. Disable the provider in App Home and prove the **separate broker** refuses it. This test currently
-   exposes #240 on the packaged broker and must not be waived.
+5. Disable the provider in App Home and prove the **separate packaged broker** refuses it before
+   credential resolution or upstream I/O.
 6. Apply default-deny static policy and prove an unlisted channel is refused. This currently exposes
    #236 on the packaged broker.
 7. Prove Slack Connect, DM, archived, unverifiable, and forged-channel requests fail closed.
@@ -817,8 +819,9 @@ vision and the open blocker set above.
   `conversations.info` succeeds and the channel is internal and active.
 - **Admin is refused:** default checks Slack `is_admin`/`is_owner`; a custom `isAdmin` replaces that
   behavior entirely and fails closed on errors.
-- **Slack configuration changes but broker still permits use:** this is the known packaged-broker
-  gap in #240, not a cache delay.
+- **Slack configuration changes but broker still permits use:** verify both planes use the same
+  PostgreSQL database/schema and provider id, the assertion carries the intended signed team/channel,
+  and every broker runs the current release. There is no channel-allowlist cache to wait out.
 - **ARN saves but egress fails:** verify the resolver is wired on the broker, region/IAM/KMS rights,
   and the secret value is the exact credential shape the provider expects.
 - **Broker returns session/approval denial with no Slack prompt:** shared storage alone does not

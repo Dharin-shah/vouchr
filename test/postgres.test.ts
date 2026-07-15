@@ -331,3 +331,40 @@ test('postgres backend: applyEnabled materializes atomically, then upserts on th
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), true); // configured path: plain upsert
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // untouched
 });
+
+test('postgres backend: opposite provider orders cannot deadlock first or bulk tool writes', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const url = await testDbUrl(t);
+  const dbA = await openDb({ databaseUrl: url });
+  const dbB = await openDb({ databaseUrl: url });
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const toolsA = new ChannelTools(dbA);
+  const toolsB = new ChannelTools(dbB);
+  const forward = Array.from({ length: 500 }, (_, i) => `provider-${String(i).padStart(3, '0')}`);
+  const reverse = [...forward].reverse();
+
+  // Separate control/data-plane registries may declare the same providers in opposite order. Run
+  // enough fresh-channel races that preserving caller order reliably reproduces PostgreSQL's
+  // opposite-row-lock deadlock; canonical provider ordering makes every pair converge instead.
+  for (let i = 0; i < 12; i++) {
+    const channel = `C_FIRST_${i}`;
+    await Promise.all([
+      toolsA.applyEnabled('T_ORDER', channel, [[forward[0], false]], forward),
+      toolsB.applyEnabled('T_ORDER', channel, [[reverse[0], false]], reverse),
+    ]);
+    assert.equal(await toolsA.isEnabled('T_ORDER', channel, forward[0]), false);
+    assert.equal(await toolsA.isEnabled('T_ORDER', channel, reverse[0]), false);
+    assert.equal(await toolsA.isEnabled('T_ORDER', channel, forward[250]), true);
+  }
+
+  // The configured-channel upsert must use the same canonical row-lock order for bulk modal writes.
+  const bulkChannel = 'C_BULK';
+  await toolsA.applyEnabled('T_ORDER', bulkChannel, [[forward[0], true]], forward);
+  await Promise.all([
+    toolsA.applyEnabled('T_ORDER', bulkChannel, forward.map((provider) => [provider, false] as const), forward),
+    toolsB.applyEnabled('T_ORDER', bulkChannel, reverse.map((provider) => [provider, true] as const), reverse),
+  ]);
+  const verdict = await toolsA.enabledSnapshot('T_ORDER', bulkChannel);
+  const finalBits = new Set(forward.map(verdict));
+  assert.equal(finalBits.size, 1, 'one complete bulk write wins; no mixed partial outcome');
+});

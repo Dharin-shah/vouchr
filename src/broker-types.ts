@@ -72,7 +72,8 @@ export interface BrokerAdminOkResponse {
 }
 
 /** `GET /v1/admin/config` — the caller's channel's per-provider mode + tool-enabled state (read side
- *  of the admin config write routes). Policy bits only, NO secret. `mode` is null when unconfigured. */
+ *  of the admin config write routes). Policy bits only, NO secret. `mode` is null when unconfigured
+ *  and always null for a service tool, which has no Vouchr-owned credential. */
 export interface BrokerAdminConfigResponse {
   providers: { provider: string; mode: ChannelMode | null; enabled: boolean }[];
 }

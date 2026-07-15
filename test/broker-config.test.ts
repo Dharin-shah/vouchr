@@ -217,7 +217,7 @@ test('GET /v1/admin/config keeps real-route reads fixed as providers grow and sk
     const base = await openTestDb(t);
     const counted = countingDb(base);
     const providers = providerCount === 0
-      ? [svc]
+      ? []
       : Array.from({ length: providerCount }, (_, i) => defineProvider({
           id: `perf${i}`,
           authorizeUrl: 'https://perf.example/auth',
@@ -248,19 +248,61 @@ test('GET /v1/admin/config keeps real-route reads fixed as providers grow and sk
 
 // (b) an admin token can toggle a provider in the channel's tool allowlist.
 test('admin/tools: an admin claim toggles a provider on/off; GET /v1/admin/config reflects it', async (t) => {
-  const { server, port } = await makeConfigBroker(t);
+  const { server, port, db } = await makeConfigBroker(t);
   try {
-    // Disable acme -> the channel becomes an allowlist that does not include it.
+    // Disable acme on the first write. The channel becomes an explicit allowlist, but the service
+    // bystander must stay enabled rather than disappearing because it had no row of its own.
     const off = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: false, identityToken: admin() });
     assert.equal(off.status, 200);
     let cfg = await getConfig(port, admin());
     assert.equal(cfg.json.providers.find((p: any) => p.provider === 'acme').enabled, false);
+    assert.deepEqual(cfg.json.providers.find((p: any) => p.provider === 'svc'), {
+      provider: 'svc', mode: null, enabled: true,
+    });
+    const audited = (await db.get(
+      `SELECT meta FROM audit WHERE action='config' AND provider='acme' ORDER BY at DESC LIMIT 1`,
+    )) as { meta: string };
+    assert.deepEqual(JSON.parse(audited.meta), {
+      owner: 'channel', channel: 'C1', tool: 'disabled',
+    });
 
-    // Re-enable it.
+    // Re-enable it without altering the service tool's bit.
     const on = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: admin() });
     assert.equal(on.status, 200);
     cfg = await getConfig(port, admin());
     assert.equal(cfg.json.providers.find((p: any) => p.provider === 'acme').enabled, true);
+    assert.equal(cfg.json.providers.find((p: any) => p.provider === 'svc').enabled, true);
+
+    // Enabling an already-default-on provider as the first write in a different channel must also
+    // materialize the untouched bystander as enabled.
+    const freshOn = await post(port, '/v1/admin/tools', {
+      provider: 'acme', enabled: true, identityToken: admin({ channel: 'C2' }),
+    });
+    assert.equal(freshOn.status, 200);
+    const freshCfg = await getConfig(port, admin({ channel: 'C2' }));
+    assert.equal(freshCfg.json.providers.find((p: any) => p.provider === 'acme').enabled, true);
+    assert.equal(freshCfg.json.providers.find((p: any) => p.provider === 'svc').enabled, true);
+  } finally {
+    server.close();
+  }
+});
+
+test('admin/tools: concurrent first writes retain both changes and every bystander', async (t) => {
+  const peer = defineProvider({
+    id: 'peer', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [],
+    egressAllow: ['api.peer.example'], refresh: 'none', pkce: false,
+  });
+  const { server, port, channelTools } = await makeConfigBroker(t, { providers: [acme, svc, peer] });
+  try {
+    const [a, b] = await Promise.all([
+      post(port, '/v1/admin/tools', { provider: 'acme', enabled: false, identityToken: admin() }),
+      post(port, '/v1/admin/tools', { provider: 'svc', enabled: false, identityToken: admin() }),
+    ]);
+    assert.equal(a.status, 200);
+    assert.equal(b.status, 200);
+    assert.equal(await channelTools.isEnabled('T1', 'C1', 'acme'), false);
+    assert.equal(await channelTools.isEnabled('T1', 'C1', 'svc'), false);
+    assert.equal(await channelTools.isEnabled('T1', 'C1', 'peer'), true);
   } finally {
     server.close();
   }
@@ -412,8 +454,8 @@ test('admin/tools: channel comes from the signed claim, never the body (no spoof
   }
 });
 
-// P3(b): unknown provider -> 404, service-to-service provider -> 403, on both write routes.
-test('admin config write routes reject unknown (404) and service (403) providers', async (t) => {
+// P3(b): modes remain credential-only, while the service tool's manifest bit stays governable.
+test('admin config rejects unknown providers and governs service tools without a credential mode', async (t) => {
   const { server, port } = await makeConfigBroker(t);
   try {
     const unknownMode = await post(port, '/v1/admin/mode', { provider: 'nope', mode: 'shared', identityToken: admin() });
@@ -422,8 +464,16 @@ test('admin config write routes reject unknown (404) and service (403) providers
     assert.equal(unknownTools.status, 404);
     const svcMode = await post(port, '/v1/admin/mode', { provider: 'svc', mode: 'shared', identityToken: admin() });
     assert.equal(svcMode.status, 403);
-    const svcTools = await post(port, '/v1/admin/tools', { provider: 'svc', enabled: true, identityToken: admin() });
-    assert.equal(svcTools.status, 403);
+    const svcTools = await post(port, '/v1/admin/tools', { provider: 'svc', enabled: false, identityToken: admin() });
+    assert.equal(svcTools.status, 200);
+    const cfg = await getConfig(port, admin());
+    assert.deepEqual(cfg.json.providers.find((p: any) => p.provider === 'svc'), {
+      provider: 'svc', mode: null, enabled: false,
+    });
+    const manifest = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) });
+    assert.deepEqual(manifest.json.tools.find((p: any) => p.provider === 'svc'), {
+      provider: 'svc', mode: null, enabled: false, identity: 'service', visibility: 'public',
+    });
   } finally {
     server.close();
   }

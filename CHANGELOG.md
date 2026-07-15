@@ -7,6 +7,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Packaged channel-tool governance** (#240). `buildBrokerServer()` now wires the shared
+  PostgreSQL-backed `ChannelTools` store, so Bolt/App Home and headless admin changes have one
+  persisted meaning across `GET /v1/admin/config`, the channel-scoped manifest, `/v1/fetch`, and
+  `/v1/mcp`. Headless writes use the same first-write-safe full-allowlist materialization and audit
+  shape as Bolt: changing one provider cannot silently disable untouched providers, including under
+  concurrent first writes. Service tools remain host-authenticated, but their Enable/Disable bit is
+  now consistently writable and visible in admin config and manifests for the trusted host to
+  enforce. Static packaged policy configuration remains tracked by #236.
 - **Bounded network, memory, and concurrency at the HTTP boundary** (#209). The broker now applies
   finite admission, request, response, and time limits so slow, malformed, cancelled, or oversized
   HTTP traffic cannot grow work without a configured bound. `/v1/fetch` upstream calls carry a finite, configurable deadline
@@ -82,6 +90,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Breaking wire expansion — service-tool governance** (#240). `GET /v1/admin/config` now includes
+  registered `identity:'service'` providers with `mode:null` and their real channel `enabled` bit,
+  matching `POST /v1/manifest`. Clients that assumed every config row was a brokered credential
+  provider must branch on their provider manifest/identity instead; the row fields and exported
+  `BrokerAdminConfigResponse` union are otherwise unchanged.
 - **Credential setup and governance now acknowledge Slack before dependency work.** Secret and
   settings modals perform only pure payload validation before `ack`; database, KMS, Slack API, and
   admin lookups run afterward. A private pending view preserves unknown-state recovery if both the

@@ -21,7 +21,7 @@ import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
 import { configureChannelCredential, setChannelCredentialMode } from '../core/channelCredential';
-import { ChannelTools, type ToolManifestEntry } from '../core/tools';
+import { ChannelTools, configureChannelTools, type ToolManifestEntry } from '../core/tools';
 import { PendingPreviews } from '../core/preview';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser, disconnectProvider } from '../core/offboard';
@@ -1182,18 +1182,25 @@ export async function createVouchr(opts: VouchrOptions) {
   const setChannelToolEnabled = async (
     client: WebClient, identity: SlackIdentity, channel: string, provider: string, on: boolean,
   ): Promise<'ok' | 'denied'> => {
-    if (!(await commandAdmin(client, identity, channel))) {
-      await audit.record('denied', identity, provider, { reason: 'not-admin', owner: 'channel', channel });
-      return 'denied';
-    }
-    // Channel-class eligibility at the MUTATION, not just at render (SEC-3: the render hiding
-    // controls for an archived/ext-shared channel is UI, not authorization; a forged payload — or a
-    // slash command — must hit the same wall). Ordered after the admin gate and throwing a
-    // UserFacingError with no audit row, exactly mirroring setChannelMode.
-    await assertChannelEligible(client, channel);
-    await channelTools.applyEnabled(identity.teamId, channel, [[provider, on]], providerIds);
-    await audit.record('config', identity, provider, { owner: 'channel', channel, tool: on ? 'enabled' : 'disabled' });
-    return 'ok';
+    const configured = await configureChannelTools({
+      channelTools,
+      audit,
+      identity,
+      channel,
+      changes: [[provider, on]],
+      allProviders: providerIds,
+      authorize: async () => {
+        if (await commandAdmin(client, identity, channel)) return true;
+        await audit.record('denied', identity, provider, { reason: 'not-admin', owner: 'channel', channel });
+        return false;
+      },
+      // Channel-class eligibility at the MUTATION, not just at render (SEC-3: the render hiding
+      // controls for an archived/ext-shared channel is UI, not authorization; a forged payload — or
+      // a slash command — must hit the same wall). Ordered after the admin gate and throwing a
+      // UserFacingError with no audit row, exactly mirroring setChannelMode.
+      assertEligible: () => assertChannelEligible(client, channel),
+    });
+    return configured ? 'ok' : 'denied';
   };
 
   /** STR-3: the admin gate + denial audit in front of the channel-credential modal, shared by
@@ -1901,10 +1908,18 @@ export async function createVouchr(opts: VouchrOptions) {
       const enabledChanged = [...submittedEnabled].filter(([p]) => registry.has(p) && submittedEnabled.get(p) !== (openEnabled.get(p) ?? true));
       if (enabledChanged.length) {
         try {
-          await channelTools.applyEnabled(identity.teamId, channel, enabledChanged, providerIds);
-          for (const [p, e] of enabledChanged) {
-            await audit.record('config', identity, p, { owner: 'channel', channel, tool: e ? 'enabled' : 'disabled' });
-          }
+          await configureChannelTools({
+            channelTools,
+            audit,
+            identity,
+            channel,
+            changes: enabledChanged,
+            allProviders: providerIds,
+            // The modal's common gate above already proved current admin authority once for every
+            // submitted setting; the shared helper still owns the mutation/audit sequence.
+            authorize: async () => true,
+            assertEligible: () => assertChannelEligible(client, channel),
+          });
           confirmed += enabledChanged.length;
         } catch {
           unconfirmed += enabledChanged.length;

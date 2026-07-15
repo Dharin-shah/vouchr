@@ -14,6 +14,7 @@ import { Audit } from '../src/core/audit';
 import { createBroker, normalizeBrokerResourceBounds, type BrokerOptions } from '../src/adapters/http/broker';
 import { loadIdentityConfig, type IdentityConfig } from '../src/adapters/http/identity';
 import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelTools } from '../src/core/tools';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { sweepExpired } from '../src/core/sweep';
@@ -226,6 +227,10 @@ export async function buildBrokerServer(
   // default (user-only broker). The caller supplies eligibility facts as signed claims; the store
   // here only maps (team, channel, provider) → mode.
   const channelConfig = channelModes ? new ChannelConfig(db) : undefined;
+  // #240 runtime channel governance is always available on the packaged path. Bolt and the broker
+  // share this PostgreSQL table, so one signed admin toggle is reflected in the channel manifest and
+  // enforced by both credential-use doors without an additional process-local switch or cache.
+  const channelTools = new ChannelTools(db);
 
   const server = createBroker({
     providers,
@@ -236,6 +241,7 @@ export async function buildBrokerServer(
     allowWrites,
     brokerToken,
     channelConfig,
+    channelTools,
     baseUrl,
     callbackPath,
     dryRun,

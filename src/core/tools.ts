@@ -1,5 +1,7 @@
 import type { Db } from './db';
+import type { Audit } from './audit';
 import type { ChannelMode, PreviewVisibility } from './channelConfig';
+import type { SlackIdentity } from './identity';
 
 /** One row of a channel's tool manifest: a provider, its channel credential mode, and whether
  *  it's usable in this channel. This is the shape an agent / MCP gateway reads before planning. */
@@ -87,7 +89,12 @@ export class ChannelTools {
   ): Promise<void> {
     if (!changes.length) return;
     const desired = new Map(changes);
+    // Every replica acquires row locks in the same provider-id order. Front doors may declare the
+    // same registry in a different order; preserving caller order lets concurrent first writes (or
+    // bulk updates) deadlock while inserting/upserting the same rows in opposite directions.
+    const orderedChanges = [...desired.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
     const full = [...new Set([...allProviders, ...desired.keys()])]
+      .sort()
       .map((p) => [p, desired.get(p) ?? true] as const);
 
     const materialize = ChannelTools.rowsSql(full);
@@ -99,7 +106,7 @@ export class ChannelTools {
       [teamId, channel, ...materialize.params, teamId, channel],
     );
 
-    const upsert = ChannelTools.rowsSql(changes);
+    const upsert = ChannelTools.rowsSql(orderedChanges);
     await this.db.run(
       // WHERE TRUE disambiguates SQLite's upsert-after-SELECT parse (harmless on Postgres).
       `INSERT INTO channel_tool (team_id, channel, provider, enabled)
@@ -162,4 +169,38 @@ export class ChannelTools {
     )) as { enabled: number } | undefined;
     return row ? !!row.enabled : false; // configured channel = allowlist; unlisted provider → disabled
   }
+}
+
+/**
+ * One channel-tool authorization, mutation, and audit sequence shared by Bolt and headless.
+ * Transport adapters prove admin/channel eligibility through callbacks because only they can
+ * validate Slack state or signed claims; after those checks, the first-write-safe allowlist update
+ * and its canonical audit row cannot drift between front doors.
+ */
+export async function configureChannelTools(input: {
+  channelTools: ChannelTools;
+  audit: Audit;
+  identity: SlackIdentity;
+  channel: string;
+  changes: readonly (readonly [providerId: string, enabled: boolean])[];
+  allProviders: readonly string[];
+  authorize: () => Promise<boolean>;
+  assertEligible: () => Promise<void>;
+}): Promise<boolean> {
+  if (!(await input.authorize())) return false;
+  await input.assertEligible();
+  await input.channelTools.applyEnabled(
+    input.identity.teamId,
+    input.channel,
+    input.changes,
+    input.allProviders,
+  );
+  for (const [providerId, enabled] of input.changes) {
+    await input.audit.record('config', input.identity, providerId, {
+      owner: 'channel',
+      channel: input.channel,
+      tool: enabled ? 'enabled' : 'disabled',
+    });
+  }
+  return true;
 }
