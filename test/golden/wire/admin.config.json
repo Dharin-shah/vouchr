@@ -6,6 +6,11 @@
         "enabled": "boolean",
         "mode": "string",
         "provider": "string"
+      },
+      {
+        "enabled": "boolean",
+        "mode": "null",
+        "provider": "string"
       }
     ]
   }

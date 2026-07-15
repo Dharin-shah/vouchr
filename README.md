@@ -351,10 +351,11 @@ HTTP contract for Python/Go/Rust/MCP runtimes — in the [headless guide](./guid
 packaged broker requires `VOUCHR_DEPLOYMENT_ID`; every trusted minter and broker replica uses the same
 issuer, audience, and bounded active/overlap key set so assertions cannot cross deployments.
 
-The stock broker does not yet load Bolt-written tool allowlists or declarative static channel policy;
-[#240](https://github.com/Dharin-shah/vouchr/issues/240) and
-[#236](https://github.com/Dharin-shah/vouchr/issues/236) are release blockers for packaged hybrid
-“only these channels” enforcement. The hybrid guide keeps those limitations explicit.
+The packaged broker loads the same PostgreSQL-backed channel tool allowlist Bolt writes and enforces
+it on channel-scoped manifests, brokered fetches, and MCP calls. It still does not load declarative
+static channel policy; [#236](https://github.com/Dharin-shah/vouchr/issues/236) remains the release
+blocker for default-deny packaged hybrid “only these channels” enforcement. The hybrid guide keeps
+that remaining limitation explicit.
 
 ## Production Notes
 

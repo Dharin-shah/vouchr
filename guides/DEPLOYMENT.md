@@ -232,13 +232,14 @@ per-user consent end-to-end, so a headless host needs **no Slack app** to onboar
 *Provisioning* below for the other ways credentials get into the store.
 
 Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST /v1/fetch`,
-`POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `POST /v1/status`,
+`POST /v1/mcp`, `POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `POST /v1/status`,
 `POST /v1/audit` (the caller's own credential-usage trail), `POST /v1/user/reference`,
-`GET /v1/manifest`, `GET /healthz` (liveness, alias `/health`),
-`GET /readyz` (readiness), and — when channel
-modes are enabled — `POST /v1/admin/reference` and `POST /v1/admin/audit` (that channel's usage, admin claim), on `VOUCHR_PORT` (default 3000), and runs the TTL
-sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it additionally serves
-`POST /v1/connect` and the OAuth callback (below).
+`GET /v1/manifest`, `POST /v1/manifest`, `POST /v1/admin/tools`, `GET /v1/admin/config`,
+`POST /v1/admin/audit` (that channel's usage, admin claim), `GET /healthz` (liveness, alias
+`/health`), and `GET /readyz` (readiness). When channel modes are enabled it additionally makes
+`POST /v1/admin/mode` and `POST /v1/admin/reference` usable. The service listens on `VOUCHR_PORT`
+(default 3000) and runs the TTL sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it
+additionally serves `POST /v1/connect` and the OAuth callback (below).
 
 ### OAuth connect flow (headless consent, #52)
 
@@ -342,6 +343,25 @@ not hand-roll replay/expiry rules. Bare-secret signing is a low-level legacy com
 a broker deployment mode. See [`examples/broker-client/client.ts`](../examples/broker-client/client.ts)
 for the full call.
 
+### Channel tool governance
+
+The packaged broker always constructs `ChannelTools` from its existing PostgreSQL handle; there is
+no additional environment switch or process-local cache. Bolt/App Home and `POST /v1/admin/tools`
+therefore write the same rows that `GET /v1/admin/config`, `POST /v1/manifest`, `/v1/fetch`, and
+`/v1/mcp` read and enforce. Team, channel, and admin authority come only from the signed identity
+assertion; same-named request-body fields have no authority.
+
+A channel with no `channel_tool` rows remains backward-compatible: every registered provider is
+enabled. The first admin mutation atomically materializes the full provider list before applying the
+requested changes, so toggling one provider cannot silently disable its bystanders, including under
+concurrent first writes. The materialization, final changes, and canonical config audit rows commit
+as one transaction. A disabled brokered provider is refused before credential resolution or upstream
+I/O. Service tools carry the same stored and rendered Enable/Disable bit, but Vouchr never
+executes their service-authenticated egress; the trusted host must enforce a disabled service row.
+
+`VOUCHR_CHANNEL_MODES` is independent: it controls channel-owned credential mode/reference/use, not
+whether the channel tool allowlist is available.
+
 ### Channel-owned credentials headless (`owner: "channel"`)
 
 By default the broker is **user-only**: a `handle.owner` of `"channel"` is refused. Set
@@ -423,7 +443,7 @@ POST /v1/admin/reference
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
-| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. |
+| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 

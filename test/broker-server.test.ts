@@ -9,6 +9,8 @@ import { loadProviders } from '../bin/providerConfig';
 import { beginBrokerDrain, buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
+import { Audit } from '../src/core/audit';
+import { ChannelTools, configureChannelTools } from '../src/core/tools';
 import { userOwner } from '../src/core/owner';
 import { mintIdentity, loadIdentityConfig } from '../src/adapters/http/identity';
 
@@ -30,6 +32,39 @@ const CONFLUENCE = {
 function get(port: number, path: string): Promise<number> {
   return new Promise((resolve, reject) => {
     http.get({ port, path }, (res) => { res.resume(); resolve(res.statusCode!); }).on('error', reject);
+  });
+}
+
+function requestJson(
+  port: number,
+  method: string,
+  path: string,
+  body?: unknown,
+  headers: Record<string, string> = {},
+): Promise<{ status: number; json: any; raw: string }> {
+  return new Promise((resolve, reject) => {
+    const data = body === undefined ? undefined : Buffer.from(JSON.stringify(body));
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path,
+      method,
+      headers: {
+        ...(data ? { 'content-type': 'application/json', 'content-length': data.length } : {}),
+        ...headers,
+      },
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (chunk: Buffer) => chunks.push(chunk));
+      res.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        let json: any = null;
+        try { json = JSON.parse(raw); } catch { /* streamed/non-JSON responses stay null */ }
+        resolve({ status: res.statusCode ?? 0, json, raw });
+      });
+    });
+    req.on('error', reject);
+    req.end(data);
   });
 }
 
@@ -296,6 +331,178 @@ test('buildBrokerServer: boots on PostgreSQL and serves /healthz + /health + /re
     assert.equal(await get(port, '/health'), 200);
     assert.equal(await get(port, '/readyz'), 200); // readiness passes over the live Postgres db
   } finally {
+    built.server.close();
+    await built.db.close();
+  }
+});
+
+test('#240 packaged broker shares and enforces channel governance across every data-plane door', async (t) => {
+  const providerConfig = [
+    { id: 'fetcher', credential: 'key', egressAllow: ['api.fetcher.example'] },
+    {
+      id: 'mcp-governed', credential: 'key', egressAllow: ['mcp.governed.example'],
+      egressMethods: ['POST'], mcp: { paths: ['/mcp'] },
+    },
+    { id: 'service-tool', identity: 'service', credential: 'key', egressAllow: ['service.example'] },
+  ];
+  const env = await baseEnv(t, {
+    VOUCHR_ALLOW_WRITES: '1',
+    VOUCHR_PROVIDERS: JSON.stringify(providerConfig),
+  });
+  let resolverCalls = 0;
+  const built = await buildBrokerServer(env, {
+    resolvers: { 'aws-sm': async () => { resolverCalls++; return 'resolved-secret'; } },
+  });
+  await new Promise<void>((resolve) => built.server.listen(0, resolve));
+  const port = (built.server.address() as any).port;
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } });
+  }) as any;
+
+  const token = (over: Record<string, unknown> = {}) => mintIdentity({
+    teamId: 'T1', userId: 'U1', channel: 'C1', ...over,
+  }, idConfig());
+  const adminToken = () => token({ isAdmin: true, channelEligible: true });
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  const vault = new Vault(built.db, Buffer.from(KEY_B64, 'base64'));
+
+  try {
+    // References make a forbidden request observable if authorization ever drifts below resolution.
+    await vault.reference(owner, 'fetcher', {
+      source: 'aws-sm',
+      secretRef: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:fetcher',
+    });
+    await vault.reference(owner, 'mcp-governed', {
+      source: 'aws-sm',
+      secretRef: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:mcp-governed',
+    });
+
+    // Force the latest possible failure in the admin mutation: both allowlist statements run, then
+    // PostgreSQL rejects the config audit insert. The route must report failure AND leave no live
+    // governance state, proving materialization, final upsert, and audit share one transaction.
+    const storedTools = new ChannelTools(built.db);
+    await built.db.exec(
+      `ALTER TABLE audit ADD CONSTRAINT issue240_reject_config_audit CHECK (action <> 'config')`,
+    );
+    const auditRejected = await requestJson(port, 'POST', '/v1/admin/tools', {
+      provider: 'fetcher', enabled: false, identityToken: adminToken(),
+    });
+    assert.equal(auditRejected.status, 500);
+    assert.deepEqual(auditRejected.json, { error: 'internal error' });
+    const rolledBackTools = await built.db.get<{ n: number }>(
+      `SELECT count(*)::int AS n FROM channel_tool WHERE team_id=? AND channel=?`,
+      ['T1', 'C1'],
+    );
+    const rolledBackAudits = await built.db.get<{ n: number }>(
+      `SELECT count(*)::int AS n FROM audit
+       WHERE team_id=? AND channel=? AND provider=? AND action='config'`,
+      ['T1', 'C1', 'fetcher'],
+    );
+    assert.equal(rolledBackTools?.n, 0);
+    assert.equal(rolledBackAudits?.n, 0);
+    assert.equal(await storedTools.isConfigured('T1', 'C1'), false);
+    assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), true);
+    await built.db.exec(`ALTER TABLE audit DROP CONSTRAINT issue240_reject_config_audit`);
+
+    // Once the audit sink recovers, the same route commits the full allowlist and audit together.
+    const disabled = await requestJson(port, 'POST', '/v1/admin/tools', {
+      provider: 'fetcher',
+      enabled: false,
+      identityToken: adminToken(),
+      // Forgeable body scope has no authority; only the signed T1/C1 claims may be written.
+      teamId: 'TEVIL',
+      channel: 'CEVIL',
+      isAdmin: false,
+    });
+    assert.equal(disabled.status, 200);
+    assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), false);
+    assert.equal(await storedTools.isConfigured('TEVIL', 'CEVIL'), false);
+    const committedAudit = await built.db.get<{ meta: string }>(
+      `SELECT meta FROM audit
+       WHERE team_id=? AND channel=? AND provider=? AND action='config' ORDER BY at DESC LIMIT 1`,
+      ['T1', 'C1', 'fetcher'],
+    );
+    assert.deepEqual(JSON.parse(committedAudit?.meta ?? 'null'), {
+      owner: 'channel', channel: 'C1', tool: 'disabled',
+    });
+
+    const config = await requestJson(
+      port,
+      'GET',
+      '/v1/admin/config',
+      undefined,
+      { 'x-vouchr-identity': adminToken() },
+    );
+    assert.equal(config.status, 200);
+    assert.deepEqual(config.json.providers, [
+      { provider: 'fetcher', mode: null, enabled: false },
+      { provider: 'mcp-governed', mode: null, enabled: true },
+      { provider: 'service-tool', mode: null, enabled: true },
+    ]);
+
+    let manifest = await requestJson(port, 'POST', '/v1/manifest', { identityToken: token() });
+    assert.equal(manifest.status, 200);
+    assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'fetcher').enabled, false);
+    assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'mcp-governed').enabled, true);
+    assert.deepEqual(manifest.json.tools.find((tool: any) => tool.provider === 'service-tool'), {
+      provider: 'service-tool', mode: null, enabled: true, identity: 'service', visibility: 'public',
+    });
+
+    const fetchDenied = await requestJson(port, 'POST', '/v1/fetch', {
+      handle: { provider: 'fetcher', owner: 'user' },
+      identityToken: token(),
+      method: 'GET',
+      path: '/data',
+    });
+    assert.equal(fetchDenied.status, 403);
+    assert.equal(fetchDenied.json.error, 'provider is not enabled in this channel');
+    assert.equal(resolverCalls, 0);
+    assert.equal(upstreamCalls, 0);
+
+    // Simulate a separate trusted Slack control-plane process: a distinct pool writes through the
+    // same shared core mutation while the packaged broker keeps serving from its own pool.
+    const controlDb = await openDb({ databaseUrl: env.VOUCHR_DATABASE_URL });
+    try {
+      await configureChannelTools({
+        channelTools: new ChannelTools(controlDb),
+        audit: new Audit(controlDb),
+        identity: { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' },
+        channel: 'C1',
+        changes: [['mcp-governed', false]],
+        allProviders: providerConfig.map((provider) => provider.id),
+        authorize: async () => true,
+        assertEligible: async () => undefined,
+      });
+    } finally {
+      await controlDb.close();
+    }
+
+    manifest = await requestJson(port, 'POST', '/v1/manifest', { identityToken: token() });
+    assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'mcp-governed').enabled, false);
+    const mcpDenied = await requestJson(port, 'POST', '/v1/mcp', {
+      handle: { provider: 'mcp-governed', owner: 'user' },
+      identityToken: token(),
+      path: '/mcp',
+      body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+    });
+    assert.equal(mcpDenied.status, 403);
+    assert.equal(mcpDenied.json.error, 'provider is not enabled in this channel');
+    assert.equal(resolverCalls, 0);
+    assert.equal(upstreamCalls, 0);
+
+    // Service credentials never enter Vouchr, but their shared governance bit is writable and
+    // visible so the trusted host can enforce the same manifest decision on its own egress path.
+    const serviceDisabled = await requestJson(port, 'POST', '/v1/admin/tools', {
+      provider: 'service-tool', enabled: false, identityToken: adminToken(),
+    });
+    assert.equal(serviceDisabled.status, 200);
+    manifest = await requestJson(port, 'POST', '/v1/manifest', { identityToken: token() });
+    assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'service-tool').enabled, false);
+  } finally {
+    globalThis.fetch = realFetch;
     built.server.close();
     await built.db.close();
   }

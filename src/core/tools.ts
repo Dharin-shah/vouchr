@@ -1,5 +1,7 @@
 import type { Db } from './db';
+import type { Audit } from './audit';
 import type { ChannelMode, PreviewVisibility } from './channelConfig';
+import type { SlackIdentity } from './identity';
 
 /** One row of a channel's tool manifest: a provider, its channel credential mode, and whether
  *  it's usable in this channel. This is the shape an agent / MCP gateway reads before planning. */
@@ -51,8 +53,8 @@ export class ChannelTools {
   }
 
   /** One `SELECT provider, enabled UNION ALL …` table expression over `rows`, with the CASTs the
-   *  first branch needs for Postgres parameter-type inference (SQLite accepts them too), plus the
-   *  flattened parameter list. Shared by both applyEnabled statements. */
+   *  first branch needs for Postgres parameter-type inference, plus the flattened parameter list.
+   *  Shared by both applyEnabled statements. */
   private static rowsSql(rows: readonly (readonly [string, boolean])[]): { sql: string; params: (string | number)[] } {
     const sql = rows
       .map((_, i) => (i === 0
@@ -69,45 +71,56 @@ export class ChannelTools {
    * allowlist is materialized (every provider in `allProviders` at its desired state where given,
    * enabled otherwise) instead of a destructive partial one.
    *
-   * Concurrency + failure safety WITHOUT client-side transactions (the shared-connection SQLite Db
-   * cannot interleave two async BEGIN…COMMIT sequences): each statement is engine-atomic, and the
-   * configured-ness decision is the `NOT EXISTS` evaluated INSIDE the materialization statement.
+   * Concurrency safety comes from the configured-ness decision being evaluated INSIDE the
+   * materialization statement and every writer acquiring row locks in canonical provider order.
    *  - Statement 1 materializes if-and-only-if no rows exist, with `DO NOTHING` on conflicts so a
    *    concurrent materializer's explicit bits are never overwritten by our fillers.
    *  - Statement 2 upserts the caller's own changes, so they win regardless of who materialized.
-   * Any interleaving of concurrent callers converges (each caller's own bits stick; fillers stay
-   * enabled), and a failure between the statements leaves a COMPLETE materialized allowlist already
-   * carrying this caller's bits — never a partial one that silently disables bystanders.
+   * Both statements and `afterWrite` run in one PostgreSQL transaction. `afterWrite` composes trusted
+   * audit companions into that transaction, so a failed request cannot leave a live governance
+   * change without its audit row. Any concurrent interleaving converges, while any failure rolls the
+   * complete logical mutation back.
    */
   async applyEnabled(
     teamId: string,
     channel: string,
     changes: readonly (readonly [string, boolean])[],
     allProviders: readonly string[],
+    afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
     if (!changes.length) return;
     const desired = new Map(changes);
+    // Every replica acquires row locks in the same provider-id order. Front doors may declare the
+    // same registry in a different order; preserving caller order lets concurrent first writes (or
+    // bulk updates) deadlock while inserting/upserting the same rows in opposite directions.
+    const orderedChanges = [...desired.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
     const full = [...new Set([...allProviders, ...desired.keys()])]
+      .sort()
       .map((p) => [p, desired.get(p) ?? true] as const);
 
-    const materialize = ChannelTools.rowsSql(full);
-    await this.db.run(
-      `INSERT INTO channel_tool (team_id, channel, provider, enabled)
-       SELECT CAST(? AS TEXT), CAST(? AS TEXT), v.provider, v.enabled FROM (${materialize.sql}) AS v
-       WHERE NOT EXISTS (SELECT 1 FROM channel_tool WHERE team_id = ? AND channel = ?)
-       ON CONFLICT(team_id, channel, provider) DO NOTHING`,
-      [teamId, channel, ...materialize.params, teamId, channel],
-    );
+    if (!this.db.transaction) {
+      throw new Error('channel tool allowlist updates require database transaction support');
+    }
+    await this.db.transaction(async (tx) => {
+      const materialize = ChannelTools.rowsSql(full);
+      await tx.run(
+        `INSERT INTO channel_tool (team_id, channel, provider, enabled)
+         SELECT CAST(? AS TEXT), CAST(? AS TEXT), v.provider, v.enabled FROM (${materialize.sql}) AS v
+         WHERE NOT EXISTS (SELECT 1 FROM channel_tool WHERE team_id = ? AND channel = ?)
+         ON CONFLICT(team_id, channel, provider) DO NOTHING`,
+        [teamId, channel, ...materialize.params, teamId, channel],
+      );
 
-    const upsert = ChannelTools.rowsSql(changes);
-    await this.db.run(
-      // WHERE TRUE disambiguates SQLite's upsert-after-SELECT parse (harmless on Postgres).
-      `INSERT INTO channel_tool (team_id, channel, provider, enabled)
-       SELECT CAST(? AS TEXT), CAST(? AS TEXT), v.provider, v.enabled FROM (${upsert.sql}) AS v
-       WHERE TRUE
-       ON CONFLICT(team_id, channel, provider) DO UPDATE SET enabled = excluded.enabled`,
-      [teamId, channel, ...upsert.params],
-    );
+      const upsert = ChannelTools.rowsSql(orderedChanges);
+      await tx.run(
+        `INSERT INTO channel_tool (team_id, channel, provider, enabled)
+         SELECT CAST(? AS TEXT), CAST(? AS TEXT), v.provider, v.enabled FROM (${upsert.sql}) AS v
+         WHERE TRUE
+         ON CONFLICT(team_id, channel, provider) DO UPDATE SET enabled = excluded.enabled`,
+        [teamId, channel, ...upsert.params],
+      );
+      await afterWrite?.(tx);
+    });
   }
 
   /**
@@ -162,4 +175,40 @@ export class ChannelTools {
     )) as { enabled: number } | undefined;
     return row ? !!row.enabled : false; // configured channel = allowlist; unlisted provider → disabled
   }
+}
+
+/**
+ * One channel-tool authorization, mutation, and audit sequence shared by Bolt and headless.
+ * Transport adapters prove admin/channel eligibility through callbacks because only they can
+ * validate Slack state or signed claims; after those checks, the first-write-safe allowlist update
+ * and its canonical audit rows commit as one transaction and cannot drift between front doors.
+ */
+export async function configureChannelTools(input: {
+  channelTools: ChannelTools;
+  audit: Audit;
+  identity: SlackIdentity;
+  channel: string;
+  changes: readonly (readonly [providerId: string, enabled: boolean])[];
+  allProviders: readonly string[];
+  authorize: () => Promise<boolean>;
+  assertEligible: () => Promise<void>;
+}): Promise<boolean> {
+  if (!(await input.authorize())) return false;
+  await input.assertEligible();
+  await input.channelTools.applyEnabled(
+    input.identity.teamId,
+    input.channel,
+    input.changes,
+    input.allProviders,
+    async (tx) => {
+      for (const [providerId, enabled] of input.changes) {
+        await input.audit.record('config', input.identity, providerId, {
+          owner: 'channel',
+          channel: input.channel,
+          tool: enabled ? 'enabled' : 'disabled',
+        }, undefined, tx);
+      }
+    },
+  );
+  return true;
 }
