@@ -13,6 +13,7 @@ import {
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { Db } from '../src/core/db';
 import type { EnvelopeProvider } from '../src/core/crypto';
+import type { Resolvers } from '../src/core/injector';
 import { countingDb } from './support/counting-db';
 
 // #111 App Home console: bolt-fake tests over the real registered handlers (event/action/command).
@@ -30,7 +31,7 @@ const CRED = { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: nu
 async function harness(t: TestContext, opts: {
   slackAdmin?: boolean; allowCreator?: boolean; creator?: string;
   channelInfo?: Record<string, unknown>; infoThrows?: boolean; providers?: Provider[];
-  db?: Db; envelope?: EnvelopeProvider; publishThrows?: boolean;
+  db?: Db; envelope?: EnvelopeProvider; publishThrows?: boolean; resolvers?: Resolvers;
 } = {}) {
   const { slackAdmin = false, allowCreator = false, creator = 'U_OTHER', providers = [provider] } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
@@ -40,6 +41,7 @@ async function harness(t: TestContext, opts: {
     db: opts.db ?? await openTestDb(t),
     envelope: opts.envelope,
     allowChannelCreatorConfig: allowCreator,
+    resolvers: opts.resolvers,
   });
   let command: any;
   const actions: Record<string, any> = {};
@@ -246,6 +248,13 @@ test('home Configure opens the existing configureModal for an admin; a forged no
   assert.equal(admin.opened()?.trigger_id, 'trig');
   assert.equal(admin.opened()?.view?.callback_id, CONFIGURE_CALLBACK); // the EXISTING modal, not a new one
   assert.deepEqual(JSON.parse(admin.opened().view.private_metadata), { channel: 'C_FIN', provider: 'mcp' });
+  assert.equal(admin.opened().view.blocks.some((block: any) => block.block_id === 'ref'), false);
+
+  const withGcp = await harness(t, { slackAdmin: true, resolvers: { 'gcp-sm': async () => 'secret' } });
+  await withGcp.configure('mcp');
+  const ref = withGcp.opened().view.blocks.find((block: any) => block.block_id === 'ref');
+  assert.match(ref.hint.text, /GCP Secret Manager/);
+  assert.ok(!ref.hint.text.includes('AWS'));
 
   const nonAdmin = await harness(t, { slackAdmin: false });
   await nonAdmin.configure('mcp');

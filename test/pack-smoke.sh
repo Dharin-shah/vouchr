@@ -31,8 +31,8 @@ echo "==> require() every published entrypoint (CJS exports map)"
   const headless = require('@vouchr/core/headless');
   require('@vouchr/core/broker-server');
   for (const surface of [root, headless]) {
-    for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity']) {
-      if (typeof surface[name] !== 'function') throw new Error('missing packed identity export: ' + name);
+    for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity', 'SecretReferenceError', 'ResolverFailedError']) {
+      if (typeof surface[name] !== 'function') throw new Error('missing packed export: ' + name);
     }
     if ('OverloadedError' in surface) throw new Error('internal overload error leaked into public API');
   }
@@ -59,8 +59,9 @@ echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import { createVouchr } from '@vouchr/core';
 import {
-  createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
+  createBroker, loadIdentityConfig, mintIdentity, verifyIdentity, SecretReferenceError,
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type IdentityConfig,
+  type SecretReferenceErrorCode,
 } from '@vouchr/core/headless';
 
 const identity: IdentityConfig = loadIdentityConfig({
@@ -77,6 +78,9 @@ void noReplayOverride;
 void noSkewKnob;
 const overload: BrokerError = { error: 'overloaded', scope: 'provider', retryAfterMs: 1000 };
 void overload;
+const referenceCode: SecretReferenceErrorCode = new SecretReferenceError('invalid_reference').code;
+const referenceFailure: BrokerError = { error: 'invalid reference', code: referenceCode };
+void referenceFailure;
 
 // Type-level only — never executed. Proves the type entrypoints resolve and the shapes exist.
 export function _smoke(r: BrokerFetchResponse): number {

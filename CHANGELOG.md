@@ -82,6 +82,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Credential setup and governance now acknowledge Slack before dependency work.** Secret and
+  settings modals perform only pure payload validation before `ack`; database, KMS, Slack API, and
+  admin lookups run afterward, with private receipts that distinguish confirmed from unconfirmed
+  batch results. Credential modals advertise only external-reference sources configured in the Bolt
+  process (otherwise they show raw-key input only). Raw credential row, channel mode, and audit
+  writes now commit atomically, matching reference setup. Headless reference errors add stable
+  machine codes, including `resolver_failed`, without exposing resolver text or stored references.
+
 - **Truthful, safe `/vouchr` command surface** (#194, commands & rendering). Added `/vouchr help`
   (lists the retained command surface without promoting private previews); an unrecognized subcommand now returns an actionable hint instead
   of silently falling through to the account list. `/vouchr disconnect` validates the provider **before**

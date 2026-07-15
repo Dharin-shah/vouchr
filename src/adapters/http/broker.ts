@@ -9,7 +9,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import type { ChannelTools } from '../../core/tools';
 import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
 import { MAX_TIMER_MS } from '../../core/options';
@@ -516,6 +516,7 @@ function pickHeaders(headers: Record<string, string> | undefined, allow: string[
  *  - NoConnectionError → 409 (no stored credential for this owner+provider)
  *  - ResponseBlockedError → 413 over-cap / 502 disallowed type (provider.egressResponse withheld
  *    the response); the static message never carries the offending header value or body
+ *  - ResolverFailedError → 502 with a stable machine code; resolver text and references stay hidden
  *  - RateLimitedError → 429 + Retry-After (whole seconds, rounded up; retryAfterMs rides the
  *    payload for callers that want ms precision)
  *  - anything else → 502 upstream fetch failed
@@ -524,6 +525,9 @@ function mapUpstreamError(e: unknown): never {
   if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
   if (e instanceof ApprovalRequiredError) throw new HttpError(403, { error: 'approval_required', approvalId: e.approvalId });
   if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
+  if (e instanceof ResolverFailedError) {
+    throw new HttpError(502, { error: 'credential resolution failed', code: 'resolver_failed' });
+  }
   if (e instanceof ResponseBlockedError) {
     throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked' });
   }
@@ -1674,7 +1678,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         // instead of crashing on a second writeHead.
         if (res.headersSent) return res.destroy();
         if (e instanceof HttpError) return send(e.status, e.payload, e.headers, e.closeConnection);
-        if (e instanceof SecretReferenceError) return send(400, { error: e.message });
+        if (e instanceof SecretReferenceError) return send(400, { error: e.message, code: e.code });
         // #209 in-flight ceiling full → 503 + Retry-After (whole seconds; ms also rides the payload).
         // The scope ('global'/'provider') is a non-secret operator signal, never request content.
         if (e instanceof OverloadedError) {

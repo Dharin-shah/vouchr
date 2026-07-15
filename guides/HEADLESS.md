@@ -59,12 +59,14 @@ returns only the provider response.
 ### Bounded failure and retry contract
 
 The exported `BrokerError` type describes functional-route JSON errors (`/readyz` deliberately uses
-only `{ "ok": false }`). Resource-bound responses that a worker should handle explicitly are:
+only `{ "ok": false }`). Failures a worker should handle explicitly include:
 
 | HTTP | Body | Caller action |
 | --- | --- | --- |
+| `400` | `{ "error": "…", "code": "invalid_reference" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
 | `413` | `{ "error": "request body too large" }`, `{ "error": "response too large; narrow your query or endpoint" }`, or `{ "error": "response blocked" }` | Do not retry unchanged. Reduce the request or choose a narrower provider endpoint. |
 | `429` | `{ "error": "rate limited", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry if the operation itself is safe to retry. |
+| `502` | `{ "error": "credential resolution failed", "code": "resolver_failed" }` | Do not ask the user to reconnect. Check the configured resolver, workload identity/IAM, and secret-manager availability. |
 | `503` | `{ "error": "overloaded", "scope": "global", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
 | `504` | `{ "error": "upstream timed out" }` | Treat the outcome as unknown. Retry only a known-idempotent operation; never automatically replay an uncertain write. |
 
@@ -257,7 +259,8 @@ own configured resolver function before any credential, mode, or audit write. A 
 `source` field may be supplied only when it exactly matches that derived source; optional scopes
 must be a bounded unique subset of the provider's declared scopes. Saving does not invoke the
 resolver or prove IAM, network, or secret availability; resolution remains just in time at
-credential use.
+credential use. Validation errors include a stable `code` for recovery UI; JIT failures return
+`resolver_failed` without exposing the resolver's error text or stored reference.
 
 ## Operations
 

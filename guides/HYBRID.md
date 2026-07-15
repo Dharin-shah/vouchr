@@ -610,21 +610,27 @@ credential action or `/vouchr configure <provider>`.
 
 The private modal is titled **Channel credential** and accepts exactly one value:
 
-- **External secret reference** — an AWS Secrets Manager ARN is preferred; or
-- **…or paste a key directly**.
+- **External secret reference** — shown only for secret-manager resolvers configured in the Bolt
+  process, with the available sources named in the hint; or
+- **…or paste a key directly**. When Bolt has no resolver, this is the only field shown.
 
 ```text
 Channel credential
 Only you can see this input; it is never posted to the channel.
 
 External secret reference
-[ arn:aws:secretsmanager:...                         ]
+[ paste a reference supported by this deployment       ]
 
 ...or paste a key directly
 [                                                      ]
 
                                       [Cancel] [Save]
 ```
+
+In a split hybrid deployment, that modal can verify only the Bolt process's resolver configuration.
+If the broker owns resolution, configure references through `/v1/admin/reference` or
+`/v1/user/reference` so validation happens against the process that will use them. Do not register a
+resolver in Bolt merely to make the field appear when the broker lacks the same capability.
 
 Slack has no password/masked text input. Vouchr does not echo, post, or audit the submitted value,
 but a reference is safer than a raw key. If the channel is unconfigured, successfully saving a

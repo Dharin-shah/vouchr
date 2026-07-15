@@ -153,11 +153,28 @@ test('no-arg gives recovery when valid provider ids exceed Slack private_metadat
 
 test('forged non-admin submission is rejected by the same authz path (no mutation, audited denied)', async (t) => {
   const h = await harness(t, { slackAdmin: false }); // NOT an admin, but forges a mode-change submission
-  let acked: any = null;
-  await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } }, async (r: any) => (acked = r));
-  assert.equal(acked?.response_action, 'errors'); // rejected inline
+  let acked = false;
+  await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } }, async () => { acked = true; });
+  assert.equal(acked, true);
+  assert.match(h.dms[0], /Only a workspace admin/);
   assert.equal(await modeRow(h.lan.db), null); // nothing written
   assert.deepEqual(await auditActions(h.lan.db), ['denied']);
+});
+
+test('config modal acknowledges before its Slack admin lookup', async (t) => {
+  let acknowledged = false;
+  const h = await harness(t, {
+    usersInfo: async () => {
+      assert.equal(acknowledged, true, 'admin lookup started before Slack acknowledgement');
+      return { user: { is_admin: false } };
+    },
+  });
+  await h.submit(
+    { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
+    async () => { acknowledged = true; },
+  );
+  assert.equal(acknowledged, true);
+  assert.equal(await modeRow(h.lan.db), null);
 });
 
 test('admin mode change via the modal == /vouchr mode: same channel_config + audit', async (t) => {
@@ -172,6 +189,24 @@ test('admin mode change via the modal == /vouchr mode: same channel_config + aud
   assert.equal(acked, 'ack');
   assert.equal(await modeRow(viaModal.lan.db), 'per-user');
   assert.deepEqual(await auditActions(viaModal.lan.db), ['config']);
+});
+
+test('a partially applied config batch reports confirmed and unconfirmed counts truthfully', async (t) => {
+  const h = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
+  const record = h.lan.audit.record.bind(h.lan.audit);
+  (h.lan.audit as any).record = async (...args: any[]) => {
+    if (args[2] === 'a') throw new Error('audit unavailable');
+    return record(...args as Parameters<typeof record>);
+  };
+
+  await h.submit({
+    'mode:a': { mode: { selected_option: { value: 'per-user' } } },
+    'mode:b': { mode: { selected_option: { value: 'per-user' } } },
+  }, async () => {});
+
+  assert.match(h.dms[0], /Updated 1 channel setting/);
+  assert.match(h.dms[0], /1 setting could not be confirmed/);
+  assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
 test('forged invalid mode value is ignored server-side, never persisted', async (t) => {

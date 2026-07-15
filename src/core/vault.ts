@@ -256,8 +256,15 @@ export class Vault {
    *  conditional statement, not a recheck-then-write (which leaves a check/write race) — makes the
    *  final credential write refuse to resurrect an offboarded user. Same rule as
    *  {@link tombstoneBlocks}, expressed in SQL because it must be atomic with the INSERT. Returns
-   *  true when the credential was written; false only when the gate refused it (offboarded). */
-  async upsert(owner: Owner, provider: string, t: StoredToken, gate?: { mintedAt: number }): Promise<boolean> {
+   *  true when the credential was written; false only when the gate refused it (offboarded).
+   *  `afterWrite` composes trusted config/audit companions into the same transaction. */
+  async upsert(
+    owner: Owner,
+    provider: string,
+    t: StoredToken,
+    gate?: { mintedAt: number },
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<boolean> {
     const now = Date.now();
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
@@ -292,6 +299,7 @@ export class Vault {
       );
       if (gate && changes === 0) return false; // the tombstone gate refused the write — nothing landed
       await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
+      await afterWrite?.(tx);
       return true;
     });
   }

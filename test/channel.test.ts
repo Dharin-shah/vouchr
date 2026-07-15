@@ -86,6 +86,26 @@ test('T7 setChannelSecret: secret never leaks to audit/return/error', async (t) 
   assert.ok(msg && !msg.includes(SECRET));
 });
 
+test('setChannelSecret rolls back connection, mode, and audit on a mode-write failure', async (t) => {
+  const { c, db, vault, channelConfig } = await ctx(t, true);
+  channelConfig.setMode = async () => { throw new Error('mode unavailable'); };
+
+  await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /mode unavailable/);
+  assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'mcp'), null);
+  assert.deepEqual(await auditRows(db), []);
+});
+
+test('setChannelSecret rolls back connection and mode on an audit failure', async (t) => {
+  const { c, db, vault, audit } = await ctx(t, true);
+  audit.record = async () => { throw new Error('audit unavailable'); };
+
+  await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /audit unavailable/);
+  assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'mcp'), null);
+  assert.deepEqual(await auditRows(db), []);
+});
+
 // invariant 7: a per-user-locked channel refuses static keys and references.
 test('per-user lock refuses shared creds (invariant 7)', async (t) => {
   const { c } = await ctx(t, true);

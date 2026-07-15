@@ -65,6 +65,7 @@ test('safeUserMessage: handles a non-Error throw', () => {
 // "extension can throw with the token" case) must NOT leak into the ephemeral modal error.
 test('modal submit: a throwing KMS envelope never leaks the secret to the user', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  let acknowledged = false;
   const provider = defineProvider({
     id: 'customdb', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [],
     egressAllow: ['api.test'], refresh: 'none', pkce: false,
@@ -77,7 +78,10 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
     db: await openTestDb(t),
     // wrapDataKey runs inside vault.upsert, after the raw secret is in hand — a realistic leak vector.
     envelope: {
-      wrapDataKey: async () => { throw new KmsWrapError(`kms failed for ${SECRET}`); },
+      wrapDataKey: async () => {
+        assert.equal(acknowledged, true, 'Slack must be acknowledged before KMS work starts');
+        throw new KmsWrapError(`kms failed for ${SECRET}`);
+      },
       unwrapDataKey: async (b) => b,
     },
   });
@@ -88,20 +92,24 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
     action: () => undefined,
   });
 
-  let acked: any = null;
+  let ackValue: any = 'unset';
+  const dms: string[] = [];
   await viewHandler({
-    ack: async (a: any) => { acked = a; },
+    ack: async (value?: any) => { acknowledged = true; ackValue = value; },
     body: { team: { id: 'T1' }, user: { id: 'U1' } },
     view: {
       private_metadata: JSON.stringify({ channel: '', provider: 'customdb' }),
       state: { values: { raw: { v: { value: 'my-real-key' } }, ref: { v: { value: '' } } } },
     },
-    client: { chat: { postMessage: async () => ({}) } },
+    client: { chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } } },
   });
 
-  const shown = JSON.stringify(acked);
+  assert.equal(ackValue, undefined);
+  assert.equal(dms.length, 1);
+  const shown = JSON.stringify(dms);
   assert.ok(!shown.includes('ghp_abc'), 'secret must not reach the modal error');
-  assert.match(acked.errors.raw, /Something went wrong \(KmsWrapError\)\./);
+  assert.match(dms[0], /Could not save your \*customdb\* credential/);
+  assert.match(dms[0], /Something went wrong \(KmsWrapError\)\./);
 });
 
 test('modal reference submits share the core validator and reject whitespace before state or audit', async (t) => {
@@ -167,9 +175,8 @@ test('command: a non-admin /vouchr mode gets the real admin-denied message, not 
   assert.equal(said, 'Only a workspace admin can configure channel credentials.');
 });
 
-// Regression: a mode-locked channel rejecting a STATIC key in the modal submit. This denial is a
-// plain Vouchr refusal thrown from setChannelSecret and caught at the modal's masking catch — its
-// message must survive (it did not before the marker class).
+// Regression: a mode-locked channel rejecting a STATIC key after Slack has acknowledged the modal.
+// The safe refusal moves to the private recovery DM and must survive masking.
 test('modal submit: a mode-locked channel keeps the real "static keys are not allowed" message', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
@@ -180,9 +187,11 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
     action: () => undefined,
   });
   // Admin + a normal (eligible) channel: both mutations pass the admin gate + eligibility check.
+  const dms: string[] = [];
   const admin = {
     users: { info: async () => ({ user: { is_admin: true } }) },
     conversations: { info: async () => ({ channel: {} }) },
+    chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } },
   };
   // 1) Admin locks the channel to per-user.
   await cmd({
@@ -190,9 +199,9 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
     ack: async () => {}, respond: async () => {}, client: admin,
   });
   // 2) Admin then tries to save a STATIC key → refused by the mode lock; message must reach the modal.
-  let acked: any = null;
+  let acked = false;
   await configureView({
-    ack: async (a: any) => { acked = a; },
+    ack: async () => { acked = true; },
     body: { team: { id: 'T1' }, user: { id: 'U1' } },
     view: {
       private_metadata: JSON.stringify({ channel: 'C1', provider: 'acme' }),
@@ -200,8 +209,9 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
     },
     client: admin,
   });
-  assert.equal(acked.response_action, 'errors');
-  assert.equal(acked.errors.raw, 'Channel is set to per-user for "acme"; static keys are not allowed.');
+  assert.equal(acked, true);
+  assert.equal(dms.length, 1);
+  assert.match(dms[0], /Channel is set to per-user for "acme"; static keys are not allowed\./);
 });
 
 // Regression: the ConsentRequiredError path is unaffected — its user-facing message is preserved

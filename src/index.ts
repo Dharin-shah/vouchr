@@ -31,8 +31,15 @@ export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy } from
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
 export type { SlackIdentity } from './core/identity';
-export { ConnectionHandle } from './core/injector';
+export { ConnectionHandle, ResolverFailedError } from './core/injector';
 export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
+export { SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
+export type {
+  SecretReference,
+  SecretReferenceErrorCode,
+  SecretReferenceInput,
+  SecretReferenceSource,
+} from './core/reference';
 // Per-(owner, provider) rate limiting at the injection boundary (provider.rateLimit). The error is
 // exported so callers can catch/branch on a throttled fetch; the store type so a multi-instance
 // deployment can plug a shared backend via VouchrOptions/BrokerOptions.rateLimitStore.
