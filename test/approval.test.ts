@@ -675,6 +675,9 @@ test('broker: unapproved write → 403 { error: "approval_required", approvalId 
       const first = await post(port, '/v1/fetch', { ...fetchBody, identityToken: tok() });
       assert.equal(first.status, 403);
       assert.equal(first.json.error, 'approval_required');
+      assert.equal(first.json.code, 'approval_required');
+      assert.equal(first.json.retryable, false);
+      assert.equal(first.json.recovery, 'request_approval');
       assert.equal(typeof first.json.approvalId, 'string');
       assert.equal(calls.length, 0, 'nothing reached the wire');
 

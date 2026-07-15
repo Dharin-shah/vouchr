@@ -25,6 +25,7 @@ import {
 } from '../src/core/tokens';
 import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { ConnectionHandle } from '../src/core/injector';
+import { UpstreamTimeoutError } from '../src/core/errors';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -187,7 +188,9 @@ test('provider oauthTimeoutMs validates and configures token, revoke, and built-
       hangUntilAbort(init.signal ?? undefined, () => { tokenAborted = true; })) as any;
     await assert.rejects(
       exchangeCode(provider, 'code', 'https://app.example/callback', 'verifier'),
-      (error: any) => error?.name === 'TimeoutError',
+      (error: unknown) => error instanceof TokenEndpointError
+        && error.kind === 'transient'
+        && !error.definitive,
     );
     assert.equal(tokenAborted, true);
 
@@ -214,7 +217,9 @@ test('OAuth token responses: fixed/chunked bodies are capped and caller cancella
     }), { status: 200, headers: { 'content-length': String(OAUTH_RESPONSE_MAX_BYTES + 1) } })) as any;
     await assert.rejects(
       exchangeCode(provider, 'code', 'https://app.example/callback', 'verifier'),
-      ResponseBodyTooLargeError,
+      (error: unknown) => error instanceof TokenEndpointError
+        && error.kind === 'configuration'
+        && !error.message.includes(String(OAUTH_RESPONSE_MAX_BYTES)),
     );
     assert.equal(fixedCancelled, true);
 
@@ -225,7 +230,8 @@ test('OAuth token responses: fixed/chunked bodies are capped and caller cancella
     }), { status: 200 })) as any;
     await assert.rejects(
       exchangeCode(provider, 'code', 'https://app.example/callback', 'verifier'),
-      ResponseBodyTooLargeError,
+      (error: unknown) => error instanceof TokenEndpointError
+        && error.kind === 'configuration',
     );
     assert.equal(chunkedCancelled, true);
 
@@ -389,7 +395,7 @@ test('ConnectionHandle composes a supplied non-aborting caller signal with its f
     }) as any;
     await assert.rejects(
       connectionHandle(provider, fakeVault(), 25).fetch('https://api.acme.example/data', { signal: caller.signal }),
-      (error: any) => error?.name === 'TimeoutError',
+      (error: unknown) => error instanceof UpstreamTimeoutError,
     );
     assert.equal(caller.signal.aborted, false, 'the injector deadline must not abort its caller');
     assert.notEqual(upstreamSignal, caller.signal, 'the provider receives the composed signal');
@@ -433,6 +439,32 @@ test('ConnectionHandle caller cancellation reaches a proactive refresh token req
   }
 });
 
+test('ConnectionHandle maps its own proactive-refresh deadline to upstream_timeout (#194)', async () => {
+  const provider = oauthProvider();
+  const realFetch = globalThis.fetch;
+  let providerCalls = 0;
+  try {
+    globalThis.fetch = ((url: unknown, init: RequestInit) => {
+      if (String(url) === provider.tokenUrl) {
+        return hangUntilAbort(init.signal ?? undefined, () => {});
+      }
+      providerCalls++;
+      return Promise.resolve(new Response('{}', { status: 200 }));
+    }) as any;
+    await assert.rejects(
+      connectionHandle(
+        provider,
+        fakeVault({ refreshToken: 'refresh', expiresAt: Date.now() }),
+        25,
+      ).fetch('https://api.acme.example/data'),
+      (error: unknown) => error instanceof UpstreamTimeoutError,
+    );
+    assert.equal(providerCalls, 0, 'a timed-out proactive refresh never reaches provider egress');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('ConnectionHandle deadline reaches a hanging 401 refresh token request (#209)', async () => {
   const provider = oauthProvider();
   const realFetch = globalThis.fetch;
@@ -456,11 +488,35 @@ test('ConnectionHandle deadline reaches a hanging 401 refresh token request (#20
         fakeVault({ refreshToken: 'refresh' }),
         25,
       ).fetch('https://api.acme.example/data'),
-      (error: any) => error?.name === 'TimeoutError',
+      (error: unknown) => error instanceof UpstreamTimeoutError,
     );
     assert.equal(tokenSignal?.aborted, true);
     assert.equal(providerCalls, 1, 'a timed-out refresh must not replay the provider request');
     assert.equal(discarded401, true, 'the abandoned 401 body is released');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('ConnectionHandle maps its own post-header body deadline to upstream_timeout (#194)', async () => {
+  const provider = defineProvider({ ...oauthProvider(), refresh: 'none' });
+  const realFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = (async (_url: unknown, init: RequestInit) => new Response(
+      new ReadableStream({
+        start(controller) {
+          const signal = init.signal;
+          signal?.addEventListener('abort', () => controller.error(signal.reason), { once: true });
+        },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    )) as typeof fetch;
+    const response = await connectionHandle(provider, fakeVault(), 25)
+      .fetch('https://api.acme.example/data');
+    await assert.rejects(
+      () => response.text(),
+      (error: unknown) => error instanceof UpstreamTimeoutError,
+    );
   } finally {
     globalThis.fetch = realFetch;
   }

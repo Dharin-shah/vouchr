@@ -6,6 +6,8 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
+import { ChannelTools } from '../src/core/tools';
+import type { Db } from '../src/core/db';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
@@ -57,15 +59,44 @@ function envelope(over: Record<string, unknown> = {}) {
   };
 }
 
+/** The equivalent /v1/fetch POST envelope, used to prove both broker egress doors expose the same
+ * typed recovery metadata without matching their legacy `error` prose. */
+function fetchEnvelope(over: Record<string, unknown> = {}) {
+  return {
+    handle: { provider: 'acme', owner: 'user' },
+    identityToken: signIdentity(claims(), SECRET),
+    method: 'POST',
+    path: '/mcp',
+    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping' }),
+    ...over,
+  };
+}
+
+function recoveryFields(raw: string): Record<string, unknown> {
+  const value = JSON.parse(raw);
+  return {
+    code: value.code,
+    retryable: value.retryable,
+    recovery: value.recovery,
+    ...(value.retryAfterMs === undefined ? {} : { retryAfterMs: value.retryAfterMs }),
+  };
+}
+
 /** Broker with U1's acme credential seeded and the write path opted in (MCP rides POST). */
-async function makeMcpBroker(t: TestContext, extra: Partial<Parameters<typeof createBroker>[0]> = {}) {
+type BrokerExtra = Partial<Parameters<typeof createBroker>[0]>;
+
+async function makeMcpBroker(
+  t: TestContext,
+  extra: BrokerExtra | ((db: Db) => BrokerExtra | Promise<BrokerExtra>) = {},
+) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [mcpAcme], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true, ...extra });
+  const resolvedExtra = typeof extra === 'function' ? await extra(db) : extra;
+  const server = createBroker({ providers: [mcpAcme], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true, ...resolvedExtra });
   await new Promise<void>((r) => server.listen(0, r));
   return { server, vault, db, port: (server.address() as any).port };
 }
@@ -235,7 +266,15 @@ test('#65 mcp: non-allowlisted host -> 403 before any upstream request, denied a
   try {
     const r = await postRaw(port, '/v1/mcp', envelope({ host: 'evil.example.com' }));
     assert.equal(r.status, 403);
-    assert.equal(JSON.parse(r.raw).error, 'egress blocked');
+    assert.deepEqual(JSON.parse(r.raw), {
+      error: 'egress blocked',
+      code: 'egress_blocked',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope({ host: 'evil.example.com' }));
+    assert.equal(viaFetch.status, 403);
+    assert.deepEqual(recoveryFields(viaFetch.raw), recoveryFields(r.raw), 'fetch/MCP typed recovery drifted');
     assert.equal(up.seen.length, 0, 'the mock upstream got ZERO hits — denied before any request');
     const row = (await db.get(`SELECT meta FROM audit WHERE action='denied' ORDER BY at DESC LIMIT 1`)) as any;
     assert.deepEqual(Object.keys(JSON.parse(row.meta)).sort(), ['host', 'reason'], 'same denied meta shape as /v1/fetch (STR-4)');
@@ -298,6 +337,18 @@ test('#65 mcp: identity comes from the signed token, never the body (cross-tenan
       teamId: 'T1', userId: 'U1', channel: 'C1',
     }));
     assert.equal(r.status, 409, 'resolved the token owner (U2, not connected), never the body-supplied U1');
+    assert.deepEqual(JSON.parse(r.raw), {
+      error: 'not connected',
+      code: 'not_connected',
+      retryable: false,
+      recovery: 'connect',
+    });
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope({
+      identityToken: signIdentity(claims({ userId: 'U2' }), SECRET),
+      teamId: 'T1', userId: 'U1', channel: 'C1',
+    }));
+    assert.equal(viaFetch.status, 409);
+    assert.deepEqual(recoveryFields(viaFetch.raw), recoveryFields(r.raw), 'fetch/MCP typed recovery drifted');
     assert.equal(up.seen.length, 0);
   } finally {
     up.restore();
@@ -305,13 +356,49 @@ test('#65 mcp: identity comes from the signed token, never the body (cross-tenan
   }
 });
 
-test('#65 mcp: a Policy that denies the provider in this channel -> 403, credential never injected', async (t) => {
+test('#194 fetch/MCP: policy denial has stable admin recovery metadata before credential use', async (t) => {
   const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
   const { server, port } = await makeMcpBroker(t, { policy });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
-    const r = await postRaw(port, '/v1/mcp', envelope());
-    assert.equal(r.status, 403);
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 403);
+      assert.deepEqual(JSON.parse(response.raw), {
+        error: 'policy denies this provider in this channel',
+        code: 'policy_denied',
+        retryable: false,
+        recovery: 'contact_admin',
+      });
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 fetch/MCP: channel tool-disabled denial has stable admin recovery metadata', async (t) => {
+  const { server, port } = await makeMcpBroker(t, async (db) => {
+    const channelTools = new ChannelTools(db);
+    // Any row configures the channel as an allowlist; acme is deliberately absent/disabled.
+    await channelTools.setEnabled('T1', 'C1', 'other', true);
+    return { channelTools };
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 403);
+      assert.deepEqual(JSON.parse(response.raw), {
+        error: 'provider is not enabled in this channel',
+        code: 'tool_disabled',
+        retryable: false,
+        recovery: 'contact_admin',
+      });
+    }
     assert.equal(up.seen.length, 0);
   } finally {
     up.restore();
@@ -367,8 +454,11 @@ test('#65 mcp: maxStreamMs aborts a stream that never ends', async (t) => {
   }
 });
 
-test('#209 mcp: maxStreamMs returns 504 when upstream never produces headers', async (t) => {
-  const { server, port } = await makeMcpBroker(t, { maxStreamMs: 80 });
+test('#194 fetch/MCP: pre-header timeouts expose conservative unknown-outcome metadata', async (t) => {
+  const { server, port } = await makeMcpBroker(t, { maxStreamMs: 80, fetchDeadlineMs: 80 });
+  // Keep Node's general socket-idle guard above the route deadlines; this test targets the typed
+  // route timeout, not the server-level hard destroy that intentionally has no JSON response.
+  server.timeout = 1_000;
   const up = mockUpstream((_url, init) => new Promise<Response>((_resolve, reject) => {
     const signal = init.signal as AbortSignal;
     const abort = () => reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
@@ -376,11 +466,20 @@ test('#209 mcp: maxStreamMs returns 504 when upstream never produces headers', a
     else signal.addEventListener('abort', abort, { once: true });
   }));
   try {
-    const r = await postRaw(port, '/v1/mcp', envelope());
-    assert.equal(r.status, 504);
-    assert.equal(r.clean, true, 'a pre-header timeout is a complete JSON error, not a torn stream');
-    assert.deepEqual(JSON.parse(r.raw), { error: 'upstream timed out' });
-    assert.equal(up.seen[0].signal?.aborted, true, 'the deadline closes the upstream request');
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 504);
+      assert.equal(response.clean, true, 'a pre-header timeout is a complete JSON error, not a torn stream');
+      assert.deepEqual(JSON.parse(response.raw), {
+        error: 'upstream timed out',
+        code: 'upstream_timeout',
+        retryable: false,
+        recovery: 'retry_later',
+      });
+    }
+    assert.equal(up.seen.length, 2);
+    assert.ok(up.seen.every((seen) => seen.signal?.aborted), 'each deadline closes its upstream request');
   } finally {
     up.restore();
     server.close();
@@ -396,8 +495,344 @@ test('#65 mcp: provider egressResponse.maxBytes (stricter) denies with 413 befor
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
     assert.equal(r.status, 413, 'the injector withheld the over-cap response before the relay started');
-    assert.equal(JSON.parse(r.raw).error, 'response blocked');
+    assert.deepEqual(JSON.parse(r.raw), {
+      error: 'response blocked',
+      code: 'response_blocked',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    assert.equal(viaFetch.status, 413);
+    assert.deepEqual(recoveryFields(viaFetch.raw), recoveryFields(r.raw), 'fetch/MCP typed recovery drifted');
     assert.equal(r.clean, true, 'a pre-stream denial is a normal JSON error, not a torn stream');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: fetch and MCP keep resolver failure metadata identical and secret-free', async (t) => {
+  const resolverSecret = 'resolver failure with ghp_never_render_this';
+  const { server, port, vault } = await makeMcpBroker(t, {
+    resolvers: { 'aws-sm': async () => { throw new Error(resolverSecret); } },
+  });
+  await vault.reference(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    source: 'aws-sm',
+    secretRef: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/mcp',
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 502);
+      assert.deepEqual(recoveryFields(response.raw), {
+        code: 'resolver_failed', retryable: true, recovery: 'retry_later',
+      });
+      assert.ok(!response.raw.includes(resolverSecret));
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: malformed resolver configuration is distinct from a runtime outage on both routes', async (t) => {
+  const malformed = 'arn:aws:secretsmanager:malformed-ghp_reference_sentinel';
+  let resolverCalls = 0;
+  const { server, port, vault } = await makeMcpBroker(t, {
+    resolvers: { 'aws-sm': async () => { resolverCalls++; return SECRET_TOKEN; } },
+  });
+  await vault.reference(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    source: 'aws-sm',
+    secretRef: malformed,
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 502);
+      assert.deepEqual(recoveryFields(response.raw), {
+        code: 'resolver_configuration_error', retryable: false, recovery: 'fix_configuration',
+      });
+      assert.ok(!response.raw.includes(malformed));
+    }
+    assert.equal(resolverCalls, 0);
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: invalid fulfilled resolver values fail closed on fetch and MCP', async (t) => {
+  let resolved: unknown;
+  const { server, port, vault } = await makeMcpBroker(t, {
+    resolvers: { 'aws-sm': (async () => resolved) as any },
+  });
+  const reference = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/invalid-wire-output';
+  await vault.reference(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    source: 'aws-sm',
+    secretRef: reference,
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    for (const value of [undefined, 42, '', { secret: 'ghp_invalid_wire_resolver' }] as const) {
+      resolved = value;
+      const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+      const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+      for (const response of [viaFetch, viaMcp]) {
+        assert.equal(response.status, 502);
+        assert.deepEqual(recoveryFields(response.raw), {
+          code: 'resolver_configuration_error', retryable: false, recovery: 'fix_configuration',
+        });
+        assert.ok(!response.raw.includes(reference));
+        assert.ok(!response.raw.includes('ghp_invalid_wire_resolver'));
+      }
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: a resolver deadline is retryable on fetch/MCP because provider egress never began', async (t) => {
+  const { server, port, vault } = await makeMcpBroker(t, {
+    fetchDeadlineMs: 60,
+    maxStreamMs: 60,
+    resolvers: { 'aws-sm': async () => await new Promise<string>(() => undefined) },
+  });
+  server.timeout = 1_000;
+  await vault.reference(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    source: 'aws-sm',
+    secretRef: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/hung-wire-resolver',
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 502);
+      assert.deepEqual(JSON.parse(response.raw), {
+        error: 'credential resolution failed',
+        code: 'resolver_failed',
+        retryable: true,
+        recovery: 'retry_later',
+      });
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: token credential, configuration, and transient failures keep fetch/MCP parity', async (t) => {
+  const refreshing = { ...mcpAcme, refresh: 'rotating' as const } as Provider;
+  const { server, port, vault } = await makeMcpBroker(t, { providers: [refreshing] });
+  const refreshSecret = 'refresh_ghp_token_wire_secret';
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: 'expired_access_secret',
+    refreshToken: refreshSecret,
+    scopes: 'x',
+    expiresAt: Date.now() - 1_000,
+    externalAccount: null,
+  });
+  const networkSentinel = 'network_ghp_token_endpoint_sentinel';
+  let respond: () => Response | Promise<Response>;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL | Request) => {
+    assert.equal(String(url), 'https://acme.example/token', 'provider egress must not run after refresh failure');
+    return await respond();
+  }) as any;
+  try {
+    const cases = [
+      {
+        name: 'invalid_grant',
+        response: () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 }),
+        fields: { code: 'token_endpoint_failed', retryable: false, recovery: 'connect' },
+      },
+      {
+        name: 'invalid_client',
+        response: () => new Response(JSON.stringify({ error: 'invalid_client' }), { status: 400 }),
+        fields: { code: 'token_endpoint_failed', retryable: false, recovery: 'fix_configuration' },
+      },
+      {
+        name: '429',
+        response: () => new Response('slow down', { status: 429 }),
+        fields: { code: 'token_endpoint_failed', retryable: true, recovery: 'retry_later' },
+      },
+      {
+        name: '503',
+        response: () => new Response('unavailable', { status: 503 }),
+        fields: { code: 'token_endpoint_failed', retryable: true, recovery: 'retry_later' },
+      },
+      {
+        name: 'network',
+        response: async () => { throw new TypeError(networkSentinel); },
+        fields: { code: 'token_endpoint_failed', retryable: true, recovery: 'retry_later' },
+      },
+    ] as const;
+    for (const scenario of cases) {
+      respond = scenario.response;
+      const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+      const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+      for (const response of [viaFetch, viaMcp]) {
+        assert.equal(response.status, 502, scenario.name);
+        assert.deepEqual(recoveryFields(response.raw), scenario.fields, scenario.name);
+        assert.ok(!response.raw.includes(refreshSecret), scenario.name);
+        assert.ok(!response.raw.includes(networkSentinel), scenario.name);
+      }
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
+});
+
+test('#194 typed recovery: pre-handle database failures return fixed internal metadata on both routes', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const sentinel = 'postgres_ghp_internal_sentinel';
+  const failingDb = new Proxy(db, {
+    get(target, property) {
+      if (property === 'run') return async () => { throw new Error(sentinel); };
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const server = createBroker({
+    providers: [mcpAcme], vault, audit, db: failingDb, identitySecret: identityConfig(SECRET), allowWrites: true,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 500);
+      assert.deepEqual(JSON.parse(response.raw), {
+        error: 'internal error', code: 'internal_error', retryable: false, recovery: 'contact_admin',
+      });
+      assert.ok(!response.raw.includes(sentinel));
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: vault/KMS failures stay secret-free and aligned across both routes', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const sentinel = 'kms_ghp_internal_sentinel';
+  const failingVault = new Proxy(vault, {
+    get(target, property) {
+      if (property === 'get') return async () => { throw new Error(sentinel); };
+      const value = Reflect.get(target, property, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const server = createBroker({
+    providers: [mcpAcme], vault: failingVault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 502);
+      assert.deepEqual(recoveryFields(response.raw), {
+        code: 'internal_error', retryable: false, recovery: 'contact_admin',
+      });
+      assert.ok(!response.raw.includes(sentinel));
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: fetch and MCP keep approval metadata identical without exposing the body', async (t) => {
+  const approvalProvider = { ...mcpAcme, approval: { approver: 'self' as const } } as Provider;
+  const { server, port } = await makeMcpBroker(t, { providers: [approvalProvider] });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const bodySecret = 'request-body-ghp_never_render_this';
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope({ body: bodySecret }));
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope({ body: bodySecret }));
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 403);
+      const parsed = JSON.parse(response.raw);
+      assert.deepEqual(recoveryFields(response.raw), {
+        code: 'approval_required', retryable: false, recovery: 'request_approval',
+      });
+      assert.equal(typeof parsed.approvalId, 'string');
+      assert.ok(!response.raw.includes(bodySecret));
+    }
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: fetch and MCP keep rate-limit metadata aligned with millisecond hints', async (t) => {
+  const limited = { ...mcpAcme, rateLimit: { perMinute: 1, burst: 1 } } as Provider;
+  const { server, port } = await makeMcpBroker(t, { providers: [limited] });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  try {
+    const warm = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    assert.equal(warm.status, 200);
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 429);
+      const parsed = JSON.parse(response.raw);
+      assert.equal(parsed.code, 'rate_limited');
+      assert.equal(parsed.retryable, true);
+      assert.equal(parsed.recovery, 'retry_later');
+      assert.ok(Number.isSafeInteger(parsed.retryAfterMs) && parsed.retryAfterMs > 0);
+    }
+    assert.equal(up.seen.length, 1, 'both denied requests stopped before upstream');
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 typed recovery: fetch and MCP mask an extension throw behind the same internal code', async (t) => {
+  const extensionSecret = 'inject failure with ghp_never_render_this';
+  const throwing = {
+    ...mcpAcme,
+    inject: () => { throw new Error(extensionSecret); },
+  } as Provider;
+  const { server, port } = await makeMcpBroker(t, { providers: [throwing] });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 502);
+      assert.deepEqual(recoveryFields(response.raw), {
+        code: 'internal_error', retryable: false, recovery: 'contact_admin',
+      });
+      assert.ok(!response.raw.includes(extensionSecret));
+    }
+    assert.equal(up.seen.length, 0);
   } finally {
     up.restore();
     server.close();
@@ -494,7 +929,12 @@ test('#65 mcp: a POST-enabled provider WITHOUT the mcp knob is refused — /v1/m
   try {
     const r = await postRaw(port, '/v1/mcp', envelope());
     assert.equal(r.status, 403);
-    assert.equal(JSON.parse(r.raw).error, 'provider is not enabled for /v1/mcp');
+    assert.deepEqual(JSON.parse(r.raw), {
+      error: 'provider is not enabled for /v1/mcp',
+      code: 'egress_blocked',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
     assert.equal(up.seen.length, 0, 'denied before the vault/upstream — zero hits');
     const row = (await db.get(`SELECT meta FROM audit WHERE action='denied' ORDER BY at DESC LIMIT 1`)) as any;
     assert.deepEqual(JSON.parse(row.meta), { host: 'mcp.acme.example', reason: 'mcp-not-enabled' }, 'egress-denial meta shape (STR-4)');
@@ -511,6 +951,9 @@ test('#65 mcp: a path outside mcp.paths is refused — same matcher as egressPat
     for (const path of ['/admin', '/mcp-evil', '/mcp/..%2f..%2fsecrets', '/mcp/%252e%252e%252fadmin']) {
       const r = await postRaw(port, '/v1/mcp', envelope({ path }));
       assert.equal(r.status, 403, `path ${path} must be refused`);
+      assert.deepEqual(recoveryFields(r.raw), {
+        code: 'egress_blocked', retryable: false, recovery: 'fix_configuration',
+      });
     }
     assert.equal(up.seen.length, 0, 'path denials happen before anything goes upstream');
     // Prefix-rule sanity (shared matcher semantics): a subpath of the declared endpoint is allowed.
@@ -532,10 +975,18 @@ test('#65 mcp: a text/plain upstream reflecting the injected Authorization is wi
     { status: 200, headers: { 'content-type': 'text/plain' } },
   ));
   try {
-    const r = await postRaw(port, '/v1/mcp', envelope());
-    assert.equal(r.status, 502);
-    assert.equal(JSON.parse(r.raw).error, 'disallowed content-type');
-    assert.ok(!r.raw.includes(SECRET_TOKEN), 'the reflected credential never reaches the caller');
+    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    for (const response of [viaFetch, viaMcp]) {
+      assert.equal(response.status, 502);
+      assert.deepEqual(JSON.parse(response.raw), {
+        error: 'disallowed content-type',
+        code: 'response_blocked',
+        retryable: false,
+        recovery: 'fix_configuration',
+      });
+      assert.ok(!response.raw.includes(SECRET_TOKEN), 'the reflected credential never reaches the caller');
+    }
   } finally {
     up.restore();
     server.close();

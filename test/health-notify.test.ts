@@ -10,6 +10,7 @@ import { Consent } from '../src/core/consent';
 import { ConnectionHandle } from '../src/core/injector';
 import { sweepExpired } from '../src/core/sweep';
 import { refreshToken, revokeToken, TokenEndpointError } from '../src/core/tokens';
+import { mapSafeError } from '../src/core/errors';
 import { NotificationState, type CredentialHealthEvent } from '../src/core/health';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { userOwner, channelOwner } from '../src/core/owner';
@@ -79,36 +80,68 @@ function buttonUrl(blocks: any[]): string | undefined {
   return actions?.elements?.[0]?.url;
 }
 
-test('classification: 400/401 and invalid_grant are definitive; 5xx and other OAuth errors are not', async () => {
+test('classification: credential, configuration, and transient token failures stay distinct through the safe mapper', async () => {
   const provider = acme();
-  let next: () => Response;
+  let next: () => Response | Promise<Response>;
   const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () => next()) as any;
+  globalThis.fetch = (async () => await next()) as any;
   try {
-    const classify = async (): Promise<TokenEndpointError> => {
+    const classify = async (
+      kind: TokenEndpointError['kind'],
+      recovery: ReturnType<typeof mapSafeError>['recovery'],
+      retryable: boolean,
+    ): Promise<TokenEndpointError> => {
       try {
         await refreshToken(provider, 'r1');
         throw new Error('expected a throw');
       } catch (e) {
         assert.ok(e instanceof TokenEndpointError, `expected TokenEndpointError, got ${e}`);
+        assert.equal(e.kind, kind);
+        assert.equal(e.definitive, kind === 'credential');
+        assert.deepEqual(
+          { recovery: mapSafeError(e).recovery, retryable: mapSafeError(e).retryable },
+          { recovery, retryable },
+        );
         return e;
       }
     };
     next = () => new Response('nope', { status: 400 }); // bare/unparseable 4xx body → definitive
-    assert.equal((await classify()).definitive, true);
+    await classify('credential', 'connect', false);
     next = () => new Response('nope', { status: 401 });
-    assert.equal((await classify()).definitive, true);
+    await classify('credential', 'connect', false);
     next = () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 400 });
-    assert.equal((await classify()).definitive, true);
-    // invalid_client = the OPERATOR's client secret is broken; no user reconnect fixes it → transient.
+    await classify('credential', 'connect', false);
+    // invalid_client = the OPERATOR's client secret is broken; no user reconnect fixes it.
     next = () => new Response(JSON.stringify({ error: 'invalid_client' }), { status: 400 });
-    assert.equal((await classify()).definitive, false);
-    next = () => new Response('nope', { status: 500 });
-    assert.equal((await classify()).definitive, false);
+    await classify('configuration', 'fix_configuration', false);
+    next = () => new Response(JSON.stringify({ error: 'temporarily_unavailable' }), { status: 400 });
+    await classify('transient', 'retry_later', true);
+    next = () => new Response(JSON.stringify({ error: 'server_error' }), { status: 401 });
+    await classify('transient', 'retry_later', true);
+    next = () => new Response('', { status: 302, headers: { location: 'https://wrong.example/token' } });
+    await classify('configuration', 'fix_configuration', false);
+    next = () => new Response('forbidden', { status: 403 });
+    await classify('configuration', 'fix_configuration', false);
+    next = () => new Response('missing', { status: 404 });
+    await classify('configuration', 'fix_configuration', false);
+    next = () => new Response('request timed out', { status: 408 });
+    await classify('transient', 'retry_later', true);
+    next = () => new Response('slow down', { status: 429 });
+    await classify('transient', 'retry_later', true);
+    next = () => new Response('nope', { status: 503 });
+    await classify('transient', 'retry_later', true);
     next = () => new Response(JSON.stringify({ error: 'invalid_grant' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    assert.equal((await classify()).definitive, true);
+    await classify('credential', 'connect', false);
     next = () => new Response(JSON.stringify({ error: 'temporarily_unavailable' }), { status: 200, headers: { 'content-type': 'application/json' } });
-    assert.equal((await classify()).definitive, false);
+    await classify('transient', 'retry_later', true);
+    next = () => new Response(JSON.stringify({ error: 'server_error' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    await classify('transient', 'retry_later', true);
+    next = () => new Response(JSON.stringify({ expires_in: 3600 }), { status: 200, headers: { 'content-type': 'application/json' } });
+    await classify('configuration', 'fix_configuration', false);
+    next = async () => { throw new TypeError('network ghp_secret_sentinel'); };
+    assert.ok(!JSON.stringify(mapSafeError(await classify('transient', 'retry_later', true))).includes('ghp_secret_sentinel'));
+    next = async () => { throw new DOMException('timed out ghp_secret_sentinel', 'TimeoutError'); };
+    assert.ok(!JSON.stringify(mapSafeError(await classify('transient', 'retry_later', true))).includes('ghp_secret_sentinel'));
   } finally {
     globalThis.fetch = realFetch;
   }

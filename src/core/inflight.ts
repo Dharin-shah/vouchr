@@ -36,6 +36,8 @@ export function assertInflightLimits(
  * Vouchr-authored and secret-free.
  */
 export class OverloadedError extends Error {
+  readonly code = 'overloaded' as const;
+
   constructor(
     /** Which ceiling rejected the request — for the operator-facing metric, never a secret. */
     public scope: 'global' | 'provider',

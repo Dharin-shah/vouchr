@@ -9,11 +9,12 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import { configureChannelTools, type ChannelTools } from '../../core/tools';
 import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
 import { MAX_TIMER_MS } from '../../core/options';
 import { awaitWithSignal, disposableDeadline } from '../../core/httpBounds';
+import { mapSafeError, SessionApprovalRequiredError, UpstreamTimeoutError } from '../../core/errors';
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
 import { userOwner, type Owner } from '../../core/owner';
@@ -21,10 +22,12 @@ import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/
 import { setChannelCredentialMode } from '../../core/channelCredential';
 import {
   authorizeProvider,
+  PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
   snapshotChannelModes,
   snapshotToolAllowlist,
+  ToolDisabledError,
 } from '../../core/authz';
 import type { SlackIdentity } from '../../core/identity';
 import { Consent } from '../../core/consent';
@@ -517,25 +520,47 @@ function pickHeaders(headers: Record<string, string> | undefined, allow: string[
  *  - NoConnectionError → 409 (no stored credential for this owner+provider)
  *  - ResponseBlockedError → 413 over-cap / 502 disallowed type (provider.egressResponse withheld
  *    the response); the static message never carries the offending header value or body
- *  - ResolverFailedError → 502 with a stable machine code; resolver text and references stay hidden
+ *  - ResolverConfigurationError / ResolverFailedError → 502 with distinct configuration/runtime
+ *    machine recovery; resolver text and references stay hidden
  *  - RateLimitedError → 429 + Retry-After (whole seconds, rounded up; retryAfterMs rides the
  *    payload for callers that want ms precision)
  *  - anything else → 502 upstream fetch failed
  */
+function safeErrorFields(error: unknown): Record<string, string | boolean | number> {
+  const safe = mapSafeError(error);
+  return {
+    code: safe.code,
+    retryable: safe.retryable,
+    recovery: safe.recovery,
+    ...(safe.retryAfterMs === undefined ? {} : { retryAfterMs: safe.retryAfterMs }),
+  };
+}
+
+/** Preserve the historical HTTP status/prose while adding the one core-owned machine contract. */
+function typedHttpError(status: number, error: string, typed: unknown): HttpError {
+  return new HttpError(status, { error, ...safeErrorFields(typed) });
+}
+
 function mapUpstreamError(e: unknown): never {
-  if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked' });
-  if (e instanceof ApprovalRequiredError) throw new HttpError(403, { error: 'approval_required', approvalId: e.approvalId });
-  if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected' });
-  if (e instanceof ResolverFailedError) {
-    throw new HttpError(502, { error: 'credential resolution failed', code: 'resolver_failed' });
+  const fields = safeErrorFields(e);
+  if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked', ...fields });
+  if (e instanceof ApprovalRequiredError) {
+    throw new HttpError(403, { error: 'approval_required', approvalId: e.approvalId, ...fields });
+  }
+  if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected', ...fields });
+  if (e instanceof ResolverConfigurationError || e instanceof ResolverFailedError) {
+    throw new HttpError(502, { error: 'credential resolution failed', ...fields });
+  }
+  if (e instanceof UpstreamTimeoutError) {
+    throw new HttpError(504, { error: 'upstream timed out', ...fields });
   }
   if (e instanceof ResponseBlockedError) {
-    throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked' });
+    throw new HttpError(e.reason === 'size' ? 413 : 502, { error: 'response blocked', ...fields });
   }
   if (e instanceof RateLimitedError) {
-    throw new HttpError(429, { error: 'rate limited', retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
+    throw new HttpError(429, { error: 'rate limited', ...fields }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
   }
-  throw new HttpError(502, { error: 'upstream fetch failed' });
+  throw new HttpError(502, { error: 'upstream fetch failed', ...fields });
 }
 
 function isTimeoutError(error: unknown): boolean {
@@ -760,12 +785,20 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (denial === 'policy') {
       await opts.audit.record('denied', acting, provider, { channel });
       emit({ type: 'policy_denied', provider });
-      throw new HttpError(403, { error: 'policy denies this provider in this channel' });
+      throw typedHttpError(
+        403,
+        'policy denies this provider in this channel',
+        new PolicyDeniedError(),
+      );
     }
     if (denial === 'tool-disabled') {
       await opts.audit.record('denied', acting, provider, { channel, reason: 'tool-disabled' });
       emit({ type: 'policy_denied', provider });
-      throw new HttpError(403, { error: 'provider is not enabled in this channel' });
+      throw typedHttpError(
+        403,
+        'provider is not enabled in this channel',
+        new ToolDisabledError(),
+      );
     }
   }
 
@@ -804,7 +837,10 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       const r = resolveCredentialOwner({ path: 'user', mode, principal: acting, channel: claims.channel, thread, hasSessionGrant });
       if (r.status === 'needs_session') {
         await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, reason: r.reason });
-        throw new HttpError(403, { error: 'provider requires a thread-scoped session approval' });
+        throw new HttpError(403, {
+          error: 'provider requires a thread-scoped session approval',
+          ...safeErrorFields(new SessionApprovalRequiredError(ref.provider)),
+        });
       }
       // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
       // resolved owner here — the injector 409s later if the credential is missing.
@@ -916,8 +952,13 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       try {
         res = await handle.fetch(url.toString(), { method, headers, body: outboundBody, signal: deadline.signal });
       } catch (e) {
+        // Resolver work happens before provider egress. Its own bounded deadline is therefore a
+        // retryable resolver failure, never the unknown-provider-outcome timeout used after dispatch.
+        if (e instanceof ResolverFailedError || e instanceof ResolverConfigurationError) {
+          mapUpstreamError(e);
+        }
         if (deadline.timedOut() || isTimeoutError(e)) {
-          throw new HttpError(504, { error: 'upstream timed out' });
+          throw typedHttpError(504, 'upstream timed out', new UpstreamTimeoutError());
         }
         requestSignal.throwIfAborted();
         mapUpstreamError(e);
@@ -932,7 +973,11 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       // #26: content-type allowlist checked BEFORE the body is read (charset stripped, case-folded).
       if (!allowedCt.includes(normalizeContentType(contentType))) {
         await res.body?.cancel().catch(() => undefined);
-        throw new HttpError(502, { error: 'disallowed content-type' });
+        throw typedHttpError(
+          502,
+          'disallowed content-type',
+          new ResponseBlockedError('Response blocked: content-type is not allowed', 'content_type'),
+        );
       }
       // #26: size cap -> 413, never a truncated partial body. A slow-drip body that outruns the
       // deadline aborts the reader here too — surface it as the same stable 504 as a headers timeout.
@@ -941,7 +986,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         text = await readCapped(res, maxBytes);
       } catch (e) {
         if (deadline.timedOut() || isTimeoutError(e)) {
-          throw new HttpError(504, { error: 'upstream timed out' });
+          throw typedHttpError(504, 'upstream timed out', new UpstreamTimeoutError());
         }
         requestSignal.throwIfAborted();
         throw e;
@@ -1007,14 +1052,22 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (!mcp) {
       emit({ type: 'egress_denied', provider: provider.id, host: url.hostname, reason: 'mcp' });
       await opts.audit.record('denied', acting, provider.id, { host: url.hostname, reason: 'mcp-not-enabled' });
-      throw new HttpError(403, { error: 'provider is not enabled for /v1/mcp' });
+      throw typedHttpError(
+        403,
+        'provider is not enabled for /v1/mcp',
+        new EgressBlockedError('Egress blocked: provider is not enabled for /v1/mcp'),
+      );
     }
     // The declared MCP endpoint lock: the SAME matching semantics as egressPaths (shared matcher,
     // shared fail-closed encoded-separator rule — a path lock is a security boundary).
     if (hasAmbiguousPathEncoding(url.pathname) || !mcp.paths.some((p) => pathAllowed(url.pathname, p))) {
       emit({ type: 'egress_denied', provider: provider.id, host: url.hostname, reason: 'path' });
       await opts.audit.record('denied', acting, provider.id, { host: url.hostname, reason: 'path' });
-      throw new HttpError(403, { error: 'path is not in the provider mcp.paths allowlist' });
+      throw typedHttpError(
+        403,
+        'path is not in the provider mcp.paths allowlist',
+        new EgressBlockedError('Egress blocked: path is not in the provider mcp.paths allowlist'),
+      );
     }
     const headers = { ...pickHeaders(body.headers, MCP_FORWARD_HEADERS), ...trace };
     // #209 per-provider in-flight admission (global admission ran at the route). After the deny gates
@@ -1037,8 +1090,11 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         // events as a /v1/fetch — the audit trail cannot tell the two doors apart (STR-4).
         upstream = await handle.fetch(url.toString(), { method: 'POST', headers, body: outboundBody, signal: abort.signal });
       } catch (e) {
+        if (e instanceof ResolverFailedError || e instanceof ResolverConfigurationError) {
+          mapUpstreamError(e);
+        }
         if (deadline.timedOut() || isTimeoutError(e)) {
-          throw new HttpError(504, { error: 'upstream timed out' });
+          throw typedHttpError(504, 'upstream timed out', new UpstreamTimeoutError());
         }
         requestSignal.throwIfAborted();
         mapUpstreamError(e); // denials map to the same JSON errors as /v1/fetch — no stream started yet
@@ -1050,7 +1106,11 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       const ct = normalizeContentType(upstream.headers.get('content-type'));
       if (upstream.body !== null && !responseHasNoBody(upstream) && !(mcp.allowContentTypes ?? DEFAULT_MCP_ALLOWED_CT).some((c) => normalizeContentType(c) === ct)) {
         await upstream.body.cancel().catch(() => undefined);
-        throw new HttpError(502, { error: 'disallowed content-type' });
+        throw typedHttpError(
+          502,
+          'disallowed content-type',
+          new ResponseBlockedError('Response blocked: content-type is not allowed', 'content_type'),
+        );
       }
       await relayMcpResponse(upstream, res, abort, maxStreamBytes);
     } finally {
@@ -1705,16 +1765,25 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         // instead of crashing on a second writeHead.
         if (res.headersSent) return res.destroy();
         if (e instanceof HttpError) return send(e.status, e.payload, e.headers, e.closeConnection);
-        if (e instanceof SecretReferenceError) return send(400, { error: e.message, code: e.code });
+        if (e instanceof SecretReferenceError) {
+          return send(400, {
+            error: e.message,
+            ...safeErrorFields(e),
+          });
+        }
         // #209 in-flight ceiling full → 503 + Retry-After (whole seconds; ms also rides the payload).
         // The scope ('global'/'provider') is a non-secret operator signal, never request content.
         if (e instanceof OverloadedError) {
-          return send(503, { error: 'overloaded', scope: e.scope, retryAfterMs: e.retryAfterMs }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
+          return send(503, {
+            error: 'overloaded',
+            scope: e.scope,
+            ...safeErrorFields(e),
+          }, { 'retry-after': String(Math.ceil(e.retryAfterMs / 1000)) });
         }
         // Log no part of an unknown thrown value. An extension point (e.g. a custom provider.inject)
         // can throw AFTER touching the secret, and even constructor.name is attacker-overridable.
         console.error('[vouchr] request failed');
-        send(500, { error: 'internal error' }); // never echo internals to the client either
+        send(500, { error: 'internal error', ...safeErrorFields(e) }); // never echo internals to the client either
       } finally {
         markHandlerDone();
       }

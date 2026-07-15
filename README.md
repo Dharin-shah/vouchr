@@ -222,7 +222,8 @@ purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval ru
 egress gate (an additional gate, never a bypass) and **before** the secret is read; every step —
 requested, approved, denied, consumed, expired — is audited with the approver as the actor. The
 headless broker enforces the same gate and returns `403 { "error": "approval_required",
-"approvalId" }`, but it does not post Slack buttons. The trusted Slack-facing host must bridge that
+"approvalId": "…", "code": "approval_required", "retryable": false,
+"recovery": "request_approval" }`, but it does not post Slack buttons. The trusted Slack-facing host must bridge that
 denial to a private decision UI, re-check the approver, and retry with a fresh identity assertion;
 the complete built-in bridge remains [#194](https://github.com/Dharin-shah/vouchr/issues/194). Enable
 the gate on a built-in via typed config (`github({ approval: { approver: 'admin' } })`) or on any
@@ -255,6 +256,62 @@ More examples: [Google user credentials](./examples/google-user) ·
 [HashiCorp Vault](./examples/hashicorp-vault) ·
 [Postgres + KMS](./examples/postgres-kms) ·
 [headless broker client](./examples/broker-client)
+
+## Typed Errors and Recovery
+
+Both supported package entrypoints export the same Bolt-free error contract:
+
+```ts
+import {
+  mapSafeError,
+  type VouchrSafeError,
+} from '@vouchr/core'; // also available from @vouchr/core/headless
+
+try {
+  await handle.fetch(url);
+} catch (error) {
+  const safe: VouchrSafeError = mapSafeError(error);
+  // Branch on safe.code / safe.recovery, never safe.message.
+}
+```
+
+`mapSafeError()` returns `{ code, message, retryable, recovery, retryAfterMs? }`.
+`retryAfterMs` is always milliseconds. `recovery` is one of `connect`, `request_approval`,
+`retry_later`, `fix_configuration`, or `contact_admin`; the exported
+`VOUCHR_ERROR_CODES` / `VOUCHR_RECOVERY_ACTIONS` are the runtime registries. Token failures also
+publish the closed `TOKEN_ENDPOINT_FAILURE_KINDS` registry (`credential`, `configuration`, or
+`transient`). The fixed `message` is
+safe to render privately, but remains presentation text, not control flow. Foreign errors—including
+custom provider, resolver, KMS, and database messages—map to fixed `internal_error` copy without
+revealing their message or class name. `UserFacingError` is the deliberate exception: constructing
+it explicitly opts Vouchr-authored fixed text into rendering; never wrap a caught third-party error
+with it. JavaScript callers cannot extend the recovery vocabulary through `UserFacingError`: an
+invalid runtime recovery value fails closed to `internal_error`.
+
+| Exported error | Stable code | Recovery | Meaning |
+| --- | --- | --- | --- |
+| `ConsentRequiredError` | `consent_required` | `connect` | A private connection prompt was posted; stop the turn. |
+| `SessionApprovalRequiredError` | `session_approval_required` | `request_approval` | A thread-scoped session prompt was posted; stop the turn. |
+| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. |
+| `PolicyDeniedError` | `policy_denied` | `contact_admin` | Provider/channel policy denied the request; retrying cannot change governance. |
+| `ToolDisabledError` | `tool_disabled` | `contact_admin` | The channel allowlist disabled the provider; an eligible admin must change it. |
+| `NoConnectionError` | `not_connected` | `connect` for user credentials; `fix_configuration` for shared channel credentials | No usable credential exists for the resolved owner. |
+| `EgressBlockedError` | `egress_blocked` | `fix_configuration` | Host/path/method/validator policy refused the request before credential use. |
+| `ResponseBlockedError` | `response_blocked` | `fix_configuration` | Provider response policy withheld the response. |
+| `ResolverConfigurationError` | `resolver_configuration_error` | `fix_configuration` | Resolver wiring, a stored reference, or a fulfilled resolver value is missing/malformed; do not ask the user to reconnect. |
+| `ResolverFailedError` | `resolver_failed` | `retry_later` | A configured resolver threw or timed out before provider egress, so a later retry can be safe. |
+| `UpstreamTimeoutError` | `upstream_timeout` | `retry_later`, but `retryable: false` | Provider outcome may be unknown; never authorize an automatic replay. |
+| `RateLimitedError` | `rate_limited` | `retry_later` | Back pressure includes a millisecond retry hint. |
+| `SecretReferenceError` | `invalid_reference`, `source_mismatch`, `invalid_scopes`, or `resolver_unavailable` | `fix_configuration` | Reference input/configuration failed before persistence. Existing codes are unchanged. |
+| `TokenEndpointError` | `token_endpoint_failed` | `connect` for `credential`; `fix_configuration` for `configuration`; `retry_later` for `transient` | Distinguishes `invalid_grant`, OAuth client/configuration rejection, and RFC transient codes plus 408/429/5xx/network/timeout failures. The legacy `definitive` boolean remains true only for `credential`. |
+| `UserFacingError` | `user_facing` | chosen at construction (default `fix_configuration`) | Explicit opt-in for fixed Vouchr-authored refusal/validation copy. |
+
+`safeUserMessage(error)` remains the text-only convenience wrapper and delegates to the same core
+mapper. `retryable: true` means the condition can clear later; it never authorizes automatic replay
+of an uncertain or non-idempotent write. The HTTP broker additionally uses the same codes and
+recovery fields for typed `/v1/fetch` and `/v1/mcp` failures, including unknown-outcome timeouts,
+default response-type denials, MCP policy denials, and fixed internal failures; see the
+[headless error table](./guides/HEADLESS.md#bounded-failure-and-retry-contract).
 
 ## Test Your Integration
 
@@ -325,8 +382,13 @@ Secret Manager, Azure Key Vault, or HashiCorp Vault reference forms, derive the 
 server-side, and require that resolver to be configured before any credential, channel mode, or
 audit row is written. Raw secret values are rejected; the configured resolver is invoked only when
 the credential is used. Validation failures carry a stable `code`; a just-in-time resolver failure
-returns `resolver_failed` without exposing resolver text or the stored reference. Programmatic
-channel-governance routes sit behind a signed admin claim. Bolt and the packaged broker order
+returns `code: "resolver_failed"`, `retryable: true`, and `recovery: "retry_later"` without
+exposing resolver text or the stored reference; missing/malformed resolver configuration or an
+invalid fulfilled value instead returns `resolver_configuration_error`, non-retryable, with
+`fix_configuration`. Resolvers must fulfill with a non-empty string; invalid values fail closed and are never coerced or
+sent upstream. A resolver deadline is `resolver_failed`, not `upstream_timeout`, because provider
+egress has not begun. Programmatic channel-governance routes sit behind a signed admin claim. Bolt
+and the packaged broker order
 shared setup and mode changes through `Vault.withCredentialLock()`; custom low-level control planes
 should use the same owner/provider transaction boundary rather than calling the stores separately.
 Providers that ship as MCP servers over Streamable HTTP get a dedicated stateless proxy,

@@ -12,11 +12,13 @@ import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listCha
 import { userOwner, channelOwner } from '../core/owner';
 import {
   authorizeProvider,
+  PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
   buildToolManifestSnapshot,
+  ToolDisabledError,
 } from '../core/authz';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
@@ -34,8 +36,19 @@ import {
   referenceChannelCredential,
   referenceUserCredential,
   SECRET_REFERENCE_SOURCES,
-  SecretReferenceError,
 } from '../core/reference';
+import {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UserFacingError,
+  safeUserMessage,
+} from '../core/errors';
+export {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UserFacingError,
+  safeUserMessage,
+} from '../core/errors';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
@@ -115,64 +128,6 @@ async function adminEligible(
   return adminCheck
     ? await adminCheck(client, userId, teamId).catch(() => false)
     : (await isSlackAdmin(client, userId) || (allowCreator && await isChannelAdmin(client, channel, userId)));
-}
-
-/** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
-export class ConsentRequiredError extends Error {
-  constructor(public provider: string) {
-    super(`Consent required for "${provider}". A Connect prompt was posted to the user.`);
-    this.name = 'ConsentRequiredError';
-  }
-}
-
-/** Thrown by `connect()` when a thread-scoped session is required and not yet approved: an in-thread
- *  "Allow … here" button was posted. Stop this turn; the user approves and re-invokes. */
-export class SessionApprovalRequiredError extends Error {
-  constructor(public provider: string) {
-    super(`Session approval required for "${provider}": an approval button was posted in the thread.`);
-    this.name = 'SessionApprovalRequiredError';
-  }
-}
-
-/**
- * Marker for a deliberate, Vouchr-authored, secret-free denial/validation message that IS safe to
- * echo to the Slack user (an admin gate, a channel-eligibility or mode-lock refusal, a bad-input
- * message). These read identically to a foreign `new Error(...)` — which could carry a provider /
- * KMS / DB secret — so the throw site opts a message into the whitelist by using THIS class; a bare
- * Error stays masked to its class name. See safeUserMessage.
- */
-export class UserFacingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'UserFacingError';
-  }
-}
-
-/**
- * The only text safe to echo to a Slack user from a caught error. Mirrors the headless broker's
- * top-level catch (broker.ts), which returns the error CLASS NAME only: an extension point (a custom
- * `provider.inject`, KMS `wrapDataKey`, a DB driver) can throw AFTER touching a secret, so a raw
- * `e.message` could carry a token. We therefore show `e.message` ONLY for Vouchr's OWN error classes
- * — those are the messages Vouchr deliberately authored to be user-facing and secret-free. Any other
- * (unexpected) error is reduced to its class name; the type still triages in the logs.
- */
-export function safeUserMessage(e: unknown): string {
-  if (
-    e instanceof ConsentRequiredError ||
-    e instanceof SessionApprovalRequiredError ||
-    e instanceof ApprovalRequiredError ||
-    e instanceof EgressBlockedError ||
-    e instanceof ResponseBlockedError ||
-    e instanceof NoConnectionError ||
-    e instanceof ResolverFailedError ||
-    e instanceof RateLimitedError ||
-    e instanceof SecretReferenceError ||
-    e instanceof UserFacingError
-  ) {
-    return e.message;
-  }
-  const name = (e as Error)?.constructor?.name ?? 'Error';
-  return `Something went wrong (${name}). Ask an admin to check the Vouchr logs.`;
 }
 
 /** Slack may synthesize accessible top-level text from blocks when complete visible copy exceeds its
@@ -571,11 +526,11 @@ export class ConnectContext {
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
-      throw new Error(`Policy denies "${providerId}" in this channel.`);
+      throw new PolicyDeniedError();
     }
     if (denial === 'tool-disabled') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
-      throw new Error(`"${providerId}" is not enabled in this channel.`);
+      throw new ToolDisabledError();
     }
   }
 
@@ -812,11 +767,11 @@ export class ConnectContext {
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
       this.emit({ type: 'policy_denied', provider: providerId });
-      throw new Error(`Policy denies "${providerId}" in this channel.`);
+      throw new PolicyDeniedError();
     }
     if (denial === 'tool-disabled') {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'tool-disabled' });
-      throw new Error(`"${providerId}" is not enabled in this channel.`);
+      throw new ToolDisabledError();
     }
     const m = await cfg.getMode(owner.teamId, channel, providerId);
     if (m != null && m !== 'shared') {

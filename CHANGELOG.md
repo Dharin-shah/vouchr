@@ -7,6 +7,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Stable typed recovery contract** (#194, API/integrator slice). Both `@vouchr/core` and the
+  Bolt-free `@vouchr/core/headless` entrypoint now export the same operational error classes,
+  runtime machine-code/recovery registries, and one core `mapSafeError()` result:
+  `{ code, message, retryable, recovery, retryAfterMs? }` (`retryAfterMs` is milliseconds).
+  Recovery is a closed `connect` / `request_approval` / `retry_later` / `fix_configuration` /
+  `contact_admin` category, so trusted hosts no longer match prose. The Bolt `safeUserMessage()`
+  helper delegates to that mapper. Foreign provider/resolver/KMS/database messages and class names
+  collapse to fixed `internal_error` copy; exported error constructors that accept text are not
+  treated as a rendering trust boundary. `UserFacingError` remains the deliberate explicit opt-in
+  for fixed Vouchr-authored copy, with runtime validation that rejects recovery values outside the
+  published registry. Token endpoint errors retain the legacy `definitive` boolean and add a closed
+  `credential` / `configuration` / `transient` kind so `invalid_grant`, OAuth client/config errors,
+  and RFC transient codes plus 408/429/5xx/network/timeout failures cannot share false retry advice. Resolver configuration
+  failures and invalid fulfilled resolver values now use `resolver_configuration_error`;
+  configured runtime throws and deadlines retain `resolver_failed` and safely route to retry-later.
+  Resolvers must return a non-empty string, and all resolver failures occur before provider egress
+  without being misreported as unknown upstream outcomes. Policy and channel-tool governance denials now have
+  distinct non-retryable `policy_denied` / `tool_disabled` codes routed to `contact_admin`.
+  Packed Node 22 consumers import and `instanceof`
+  every documented class and exercise
+  the mapper from both supported entrypoints; the headless graph remains Slack/Bolt-free.
 - **Declarative packaged channel policy** (#236). The standalone broker now accepts static
   provider-by-channel policy through exactly one of `VOUCHR_POLICY` (inline JSON) or
   `VOUCHR_POLICY_FILE` (the same JSON from a file). Configuration is validated fail-closed at boot:
@@ -99,6 +120,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Breaking wire expansion — typed broker recovery metadata** (#194). Typed `/v1/fetch` and
+  `/v1/mcp` failures now add stable `code`, `retryable`, and `recovery` fields (plus the existing
+  millisecond `retryAfterMs` where applicable) while retaining established `error` prose and HTTP
+  status. This covers not-connected (with distinct user-connect vs shared-channel-configuration
+  recovery), session/human approval, egress/response policy, resolver configuration/runtime failure,
+  token endpoint classification, unknown-outcome timeouts, MCP opt-in/path policy, rate limiting,
+  overload, and masked pre-handle/extension failures; `approvalId` remains an opaque pending handle, not
+  authority. `BrokerError` now types those fields and `approvalId`. Clients that require an exact
+  JSON key set must accept the additive fields and branch on `code`/`recovery`, never `error` text.
 - **Breaking wire expansion — service-tool governance** (#240). `GET /v1/admin/config` now includes
   registered `identity:'service'` providers with `mode:null` and their real channel `enabled` bit,
   matching `POST /v1/manifest`. Clients that assumed every config row was a brokered credential

@@ -10,7 +10,13 @@ import { safeEmit } from './safe-emit';
 import type { CredentialHealthHook } from './health';
 import { ApprovalRequiredError, queryDigest, type Approvals } from './approval';
 import { randomUUID } from 'node:crypto';
-import { awaitWithSignal, disposableDeadline, responseWithCleanup } from './httpBounds';
+import {
+  awaitWithSignal,
+  disposableDeadline,
+  isVouchrDeadlineReason,
+  responseWithCleanup,
+  UpstreamTimeoutError,
+} from './httpBounds';
 import { MAX_TIMER_MS } from './options';
 import { assertStoredSecretReference } from './reference';
 
@@ -90,6 +96,8 @@ export type EventSink = (e: VouchrEvent) => void;
  * this is purely additive typing so the broker can switch its regex to an `instanceof` check.
  */
 export class EgressBlockedError extends Error {
+  readonly code = 'egress_blocked' as const;
+
   constructor(message: string) {
     super(message);
     this.name = 'EgressBlockedError';
@@ -98,15 +106,35 @@ export class EgressBlockedError extends Error {
 
 /** No stored credential for this owner+provider. The broker maps this to 409. Message TEXT preserved. */
 export class NoConnectionError extends Error {
-  constructor(message: string) {
+  readonly code = 'not_connected' as const;
+
+  constructor(
+    message: string,
+    /** Credential ownership determines whether recovery is personal connect or channel config. */
+    public readonly owner?: Owner['kind'],
+  ) {
     super(message);
     this.name = 'NoConnectionError';
   }
 }
 
-/** External secret resolution failed. Fixed text prevents a custom resolver from reflecting
- * credential material, references, or provider SDK errors through direct handles or adapters. */
+/** External secret resolution is misconfigured (missing resolver/reference, malformed stored
+ * reference, or invalid fulfilled output). Retrying cannot repair it; an operator must fix the
+ * deployment, stored row, or resolver implementation. */
+export class ResolverConfigurationError extends Error {
+  readonly code = 'resolver_configuration_error' as const;
+
+  constructor() {
+    super('External credential resolver is not configured correctly.');
+    this.name = 'ResolverConfigurationError';
+  }
+}
+
+/** A configured resolver failed at runtime before any provider request was made. Fixed text prevents
+ * a custom resolver from reflecting credential material, references, or SDK errors through callers. */
 export class ResolverFailedError extends Error {
+  readonly code = 'resolver_failed' as const;
+
   constructor() {
     super('External credential resolution failed.');
     this.name = 'ResolverFailedError';
@@ -117,10 +145,12 @@ export class ResolverFailedError extends Error {
  * The provider's RESPONSE violated a structural constraint (provider.egressResponse) — disallowed
  * content-type or an over-cap body — and was withheld from the caller. Unlike EgressBlockedError
  * this is thrown AFTER the request went out; the body is never returned, not even partially. The
- * message is Vouchr-authored and secret-free (safe for safeUserMessage); the broker maps this to
- * 413 (size) / 502 (content_type).
+ * core safe mapper derives fixed copy from the typed reason rather than trusting constructor text;
+ * the broker maps this to 413 (size) / 502 (content_type).
  */
 export class ResponseBlockedError extends Error {
+  readonly code = 'response_blocked' as const;
+
   constructor(
     message: string,
     public reason: 'content_type' | 'size',
@@ -555,7 +585,7 @@ export class ConnectionHandle {
     // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
     let kms = 0;
     const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
-    if (!cred) throw new NoConnectionError(`No connection for provider "${this.provider.id}"`);
+    if (!cred) throw new NoConnectionError(`No connection for provider "${this.provider.id}"`, this.owner.kind);
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     // #116 dry-run per-request rail: the startup vault check only sees rows that exist at boot —
     // a REAL row written afterward (a seeder, a sibling production process on the same database)
@@ -573,7 +603,19 @@ export class ConnectionHandle {
     let responseHandedOff = false;
     try {
       deadline.signal.throwIfAborted();
-      let token = vaulted ? await this.vaultToken(cred, deadline.signal) : await this.resolveRef(cred, deadline.signal);
+      let token: string;
+      if (vaulted) {
+        try {
+          token = await this.vaultToken(cred, deadline.signal);
+        } catch (error) {
+          if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+            throw new UpstreamTimeoutError();
+          }
+          throw error;
+        }
+      } else {
+        token = await this.resolveRef(cred, deadline.signal, deadline.timedOut);
+      }
       const send = async (t: string) => {
       // #116 dry-run: the outbound-fetch edge, stubbed at the exact point the network call would
       // happen — every gate above (egress, rate limit, vault read) has already run. Returned BEFORE
@@ -591,7 +633,10 @@ export class ConnectionHandle {
         // client cancellation. It is disposed when the returned body finishes/cancels (below).
         return await fetch(input, { ...init, headers, redirect: 'manual', signal: deadline.signal });
       } catch (e) {
-        if (deadline.signal.aborted) throw e; // cancellation/timeout is not a provider-outage event
+        if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+          throw new UpstreamTimeoutError();
+        }
+        if (deadline.signal.aborted) throw e; // caller cancellation/timeout keeps its original reason
         // Network-level throw (DNS/connection refused): fire the no-secret failure signal, then re-throw
         // so the broker still maps it to 502 — the signal is emitted, not swallowed.
         await this.egressError(url.hostname, 'fetch_failed');
@@ -611,6 +656,9 @@ export class ConnectionHandle {
         // unread body until GC. Best-effort: cancelling must never mask the refresh error. (Not a
         // finally: when the refresh yields nothing the 401 itself is returned, body intact.)
         res.body?.cancel().catch(() => undefined);
+        if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+          throw new UpstreamTimeoutError();
+        }
         throw e;
       }
       // #209: the refresh runs so the NEXT request carries a live token, but the failed request is
@@ -649,8 +697,22 @@ export class ConnectionHandle {
     // strip: enforced HERE, after the outbound call is booked (the call DID happen — its inject
     // audit/event stay truthful) and before the Response is handed back, so both doors (Bolt
     // handle + HTTP broker) inherit them. A breach throws; the caller never sees a partial body.
-      const guarded = await this.guardResponse(res, url.hostname);
-      const response = responseWithCleanup(guarded, deadline.dispose);
+      let guarded: Response;
+      try {
+        guarded = await this.guardResponse(res, url.hostname);
+      } catch (error) {
+        if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+          throw new UpstreamTimeoutError();
+        }
+        throw error;
+      }
+      const response = responseWithCleanup(
+        guarded,
+        deadline.dispose,
+        (error) => deadline.timedOut() || isVouchrDeadlineReason(error)
+          ? new UpstreamTimeoutError()
+          : error,
+      );
       responseHandedOff = true;
       return response;
     } finally {
@@ -659,27 +721,48 @@ export class ConnectionHandle {
   }
 
   /** Resolve an external-ref secret JIT. Never persisted, never cached, never logged. */
-  private async resolveRef(cred: StoredCredential, signal: AbortSignal): Promise<string> {
+  private async resolveRef(
+    cred: StoredCredential,
+    signal: AbortSignal,
+    deadlineTimedOut: () => boolean,
+  ): Promise<string> {
     const resolver = this.resolvers[cred.source];
     if (!resolver) {
-      throw new ResolverFailedError();
+      throw new ResolverConfigurationError();
     }
     if (!cred.secretRef) {
-      throw new ResolverFailedError();
+      throw new ResolverConfigurationError();
     }
+    // Public configuration validates before write, but legacy rows may predate that boundary.
+    // Keep malformed/configuration state distinct from a configured resolver's runtime outage.
     try {
-      // Public configuration now validates before write, but legacy rows may predate that boundary.
-      // Recheck before resolver I/O and normalize any malformed stored row to the same fixed
-      // resolver failure contract as a runtime secret-manager error.
       assertStoredSecretReference(cred.source, cred.secretRef);
+    } catch {
+      this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
+      throw new ResolverConfigurationError();
+    }
+    let secret: unknown;
+    try {
       // Pass cancellation to cooperative resolvers, but also race it here: an older/custom resolver
       // may ignore the optional signal and must not pin admission slots beyond the request deadline.
-      return await awaitWithSignal(resolver(cred.secretRef, signal), signal);
+      secret = await awaitWithSignal(resolver(cred.secretRef, signal), signal);
     } catch (e) {
-      if (signal.aborted) throw e;
+      // Caller-owned cancellation, including AbortSignal.timeout(), keeps its original reason.
+      // Only this handle's own deadline is a resolver outage before provider egress.
+      if (signal.aborted && !deadlineTimedOut() && !isVouchrDeadlineReason(signal.reason)) {
+        throw e;
+      }
       this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
       throw new ResolverFailedError();
     }
+    // TypeScript resolvers promise strings, but JavaScript/custom implementations can fulfill any
+    // value. Refuse undefined, non-strings, and empty strings before injection; never stringify or
+    // reflect the value because it may itself contain credential material.
+    if (typeof secret !== 'string' || secret.length === 0) {
+      this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
+      throw new ResolverConfigurationError();
+    }
+    return secret;
   }
 
   private async vaultToken(cred: StoredCredential, signal?: AbortSignal): Promise<string> {
@@ -804,7 +887,8 @@ export class ConnectionHandle {
       // released the advisory lock, mirroring the post-commit audit placement below: a hook must
       // never run inside the lock. The instanceof gate also means a rollback for any OTHER reason
       // (a DB write failure after a successful /token call, a lock timeout) never claims the token
-      // is dead, and transient failures (network throw, 5xx, timeout) never fire. safeEmit swallows
+      // is dead, and configuration/transient failures (invalid_client, network, 5xx, timeout) never
+      // fire. safeEmit swallows
       // a throwing hook; the original error always re-throws unchanged.
       if (e instanceof TokenEndpointError && e.definitive) {
         safeEmit(this.health, { type: 'refresh_dead', owner: this.owner, provider: this.provider.id });

@@ -4,11 +4,12 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ConnectionHandle, ResolverFailedError } from '../src/core/injector';
+import { ConnectionHandle, ResolverConfigurationError, ResolverFailedError } from '../src/core/injector';
 import { offboardUser } from '../src/core/offboard';
 import { Consent } from '../src/core/consent';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { defineProvider } from '../src/core/providers';
+import { mapSafeError, UpstreamTimeoutError } from '../src/core/errors';
 
 const KEY = randomBytes(32);
 const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -84,8 +85,8 @@ test('referenced secret-source: missing resolver fails closed (no silent skip)',
   const handle = new ConnectionHandle(provider, owner, { enterpriseId: null, teamId: 'T1', userId: 'U' }, vault, new Audit(db), {});
   await assert.rejects(
     () => handle.fetch('https://api.test/x'),
-    (error: unknown) => error instanceof ResolverFailedError
-      && error.message === 'External credential resolution failed.',
+    (error: unknown) => error instanceof ResolverConfigurationError
+      && error.message === 'External credential resolver is not configured correctly.',
   );
 });
 
@@ -119,6 +120,157 @@ test('referenced secret-source: resolver failures never expose resolver text or 
       return true;
     },
   );
+});
+
+test('referenced secret-source: invalid fulfilled resolver values fail closed before provider egress', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const owner = channelOwner('T1', 'C1');
+  const reference = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/invalid-output';
+  await vault.reference(owner, 'mcp', { source: 'aws-sm', secretRef: reference });
+  const provider = defineProvider({
+    id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+  });
+  let providerCalls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { providerCalls++; return new Response('unexpected'); }) as any;
+  try {
+    for (const value of [undefined, 42, '', { secret: 'ghp_invalid_resolver_value' }] as const) {
+      const handle = new ConnectionHandle(
+        provider,
+        owner,
+        { enterpriseId: null, teamId: 'T1', userId: 'U' },
+        vault,
+        new Audit(db),
+        { 'aws-sm': (async () => value) as any },
+      );
+      await assert.rejects(
+        () => handle.fetch('https://api.test/x'),
+        (error: unknown) => error instanceof ResolverConfigurationError
+          && error.message === 'External credential resolver is not configured correctly.'
+          && !error.message.includes('ghp_invalid_resolver_value'),
+      );
+    }
+    assert.equal(providerCalls, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('referenced secret-source: resolver deadline is retryable failure while explicit caller cancellation propagates', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const owner = channelOwner('T1', 'C1');
+  await vault.reference(owner, 'mcp', {
+    source: 'aws-sm',
+    secretRef: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/hung-resolver',
+  });
+  const provider = defineProvider({
+    id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+  });
+  let providerCalls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { providerCalls++; return new Response('unexpected'); }) as any;
+  const handle = (deadlineMs: number) => new ConnectionHandle(
+    provider,
+    owner,
+    { enterpriseId: null, teamId: 'T1', userId: 'U' },
+    vault,
+    new Audit(db),
+    { 'aws-sm': async () => await new Promise<string>(() => undefined) },
+    new Map(),
+    () => {},
+    () => {},
+    null,
+    undefined,
+    () => {},
+    null,
+    null,
+    false,
+    deadlineMs,
+  );
+  try {
+    await assert.rejects(
+      () => handle(25).fetch('https://api.test/x'),
+      (error: unknown) => error instanceof ResolverFailedError,
+    );
+
+    const caller = new AbortController();
+    const cancelled = handle(1_000).fetch('https://api.test/x', { signal: caller.signal });
+    await new Promise((resolve) => setImmediate(resolve));
+    caller.abort();
+    await assert.rejects(
+      cancelled,
+      (error: unknown) => error instanceof Error
+        && error.name === 'AbortError'
+        && !(error instanceof ResolverFailedError),
+    );
+
+    await assert.rejects(
+      () => handle(1_000).fetch('https://api.test/x', { signal: AbortSignal.timeout(25) }),
+      (error: unknown) => error instanceof Error
+        && error.name === 'TimeoutError'
+        && !(error instanceof ResolverFailedError),
+    );
+    assert.equal(providerCalls, 0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('direct handle maps only its own provider deadline to upstream_timeout', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const owner = channelOwner('T1', 'C1');
+  await vault.upsert(owner, 'mcp', tok('provider-token'));
+  const provider = defineProvider({
+    id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+  });
+  const handle = new ConnectionHandle(
+    provider,
+    owner,
+    { enterpriseId: null, teamId: 'T1', userId: 'U' },
+    vault,
+    new Audit(db),
+    {},
+    new Map(),
+    () => {},
+    () => {},
+    null,
+    undefined,
+    () => {},
+    null,
+    null,
+    false,
+    25,
+  );
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_input, init) => {
+    await new Promise((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason), { once: true });
+    });
+    return new Response('unreachable');
+  }) as typeof fetch;
+  try {
+    await assert.rejects(
+      () => handle.fetch('https://api.test/x'),
+      (error: unknown) => {
+        assert.ok(error instanceof UpstreamTimeoutError);
+        assert.deepEqual(mapSafeError(error), {
+          code: 'upstream_timeout',
+          message: 'The upstream request timed out. Its outcome may be unknown; do not retry automatically.',
+          retryable: false,
+          recovery: 'retry_later',
+        });
+        return true;
+      },
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 // T5: offboarding a member who linked a shared channel cred must NOT delete the channel's cred,

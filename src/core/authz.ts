@@ -23,6 +23,26 @@ import type { ProviderRegistry } from './providers';
  *  maps the reason to its own surface (audit meta, whether to emit policy_denied, error string/status). */
 export type AuthzDenial = 'policy' | 'tool-disabled';
 
+/** Static/provider policy refused this channel. The caller cannot repair governance by retrying. */
+export class PolicyDeniedError extends Error {
+  readonly code = 'policy_denied' as const;
+
+  constructor() {
+    super('Provider policy denies this request.');
+    this.name = 'PolicyDeniedError';
+  }
+}
+
+/** The channel's explicit tool allowlist disabled this provider. Retrying cannot change the bit. */
+export class ToolDisabledError extends Error {
+  readonly code = 'tool_disabled' as const;
+
+  constructor() {
+    super('Provider is disabled in this channel.');
+    this.name = 'ToolDisabledError';
+  }
+}
+
 /**
  * The authorization VERDICT from the two already-resolved bits (pure, no I/O): Policy first, then the
  * channel tool allowlist. `policyAllows` = Policy permits this provider in this channel; `toolAllowed` =

@@ -269,6 +269,9 @@ test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, up
     const denied = await call();
     assert.equal(denied.status, 429);
     assert.equal(denied.json.error, 'rate limited');
+    assert.equal(denied.json.code, 'rate_limited');
+    assert.equal(denied.json.retryable, true);
+    assert.equal(denied.json.recovery, 'retry_later');
     assert.ok(denied.json.retryAfterMs > 0 && denied.json.retryAfterMs <= 60_000);
     const retryAfter = Number(denied.headers['retry-after']);
     assert.ok(retryAfter >= 1 && retryAfter <= 60, `Retry-After ${denied.headers['retry-after']} not in (0, 60]s`);
@@ -312,8 +315,8 @@ test('bolt: a rate-limited fetch tells the acting user ephemerally and still thr
     assert.equal(posted[0].user, 'U1'); // only the acting user sees it
     assert.match(posted[0].text, /^Slow down: rl is limited to 1 requests\/min, try again in \d+s\.$/);
     assert.ok(!posted[0].text.includes(SECRET_TOKEN));
-    // And the error's own message is Vouchr-authored + secret-free, so safeUserMessage echoes it.
-    assert.equal(safeUserMessage(err), err.message);
+    // The core mapper derives fixed copy from the typed retry hint; it never trusts constructor text.
+    assert.match(safeUserMessage(err), /^The request rate limit was reached\. Try again in \d+s\.$/);
   } finally {
     up.restore();
   }

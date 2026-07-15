@@ -24,34 +24,50 @@ const SECRET = 'secret ghp_abc1234567890abcdef';
 
 // Unit: an unexpected/foreign error is reduced to its CLASS NAME — the raw message (which may carry
 // a leaked token) is never returned.
-test('safeUserMessage: masks an unexpected error, keeps only the class name', () => {
+test('safeUserMessage: masks an unexpected error with fixed copy', () => {
   const msg = safeUserMessage(new Error(SECRET));
   assert.ok(!msg.includes('ghp_abc'), 'token must not survive');
-  assert.match(msg, /Something went wrong \(Error\)\. Ask an admin to check the Vouchr logs\./);
+  assert.equal(msg, 'Something went wrong. Ask an admin to check the Vouchr logs.');
 });
 
-// A custom-named error (e.g. thrown by a provider.inject / KMS extension) still masks the message but
-// surfaces its class name for triage.
-test('safeUserMessage: shows a custom error class name, not its secret message', () => {
+// A custom-named error (e.g. thrown by a provider.inject / KMS extension) exposes neither its name
+// nor message; both are foreign and can be attacker-controlled.
+test('safeUserMessage: masks a custom error class and its secret message', () => {
   class ProviderInjectError extends Error {}
   const msg = safeUserMessage(new ProviderInjectError(SECRET));
   assert.ok(!msg.includes('ghp_abc'));
-  assert.match(msg, /Something went wrong \(ProviderInjectError\)\./);
+  assert.ok(!msg.includes('ProviderInjectError'));
+  assert.equal(msg, 'Something went wrong. Ask an admin to check the Vouchr logs.');
 });
 
-// Vouchr's OWN error classes are deliberately user-facing and secret-free → their message passes through.
-test("safeUserMessage: Vouchr's own error classes keep their message", () => {
-  for (const e of [
-    new ConsentRequiredError('github'),
-    new SessionApprovalRequiredError('github'),
-    new EgressBlockedError('Egress blocked: host not allowed'),
-    new ResponseBlockedError('Response blocked: content-type is not allowed for provider "github"', 'content_type'),
-    new NoConnectionError('No connection for github'),
-    new ResolverFailedError(),
-    new SecretReferenceError('invalid_reference'),
-  ]) {
-    assert.equal(safeUserMessage(e), (e as Error).message);
-  }
+// Typed errors map to Vouchr-owned fixed copy; constructor text is not a trust boundary.
+test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe copy", () => {
+  assert.equal(
+    safeUserMessage(new ConsentRequiredError('github')),
+    'Consent is required. Complete the private Connect prompt, then retry.',
+  );
+  assert.equal(
+    safeUserMessage(new SessionApprovalRequiredError('github')),
+    'Thread-scoped session approval is required. Approve the private prompt, then retry.',
+  );
+  assert.equal(
+    safeUserMessage(new EgressBlockedError('Egress blocked: host not allowed')),
+    'The request was blocked by Vouchr egress policy. Check the provider configuration.',
+  );
+  assert.equal(
+    safeUserMessage(new ResponseBlockedError('Response blocked: content-type is not allowed for provider "github"', 'content_type')),
+    'The provider response was blocked by Vouchr response policy. Check the provider configuration.',
+  );
+  assert.equal(
+    safeUserMessage(new NoConnectionError('No connection for github')),
+    'No credential is connected. Connect the provider, then retry.',
+  );
+  assert.equal(
+    safeUserMessage(new ResolverFailedError()),
+    'The external credential resolver is temporarily unavailable. Retry later.',
+  );
+  const reference = new SecretReferenceError('invalid_reference');
+  assert.equal(safeUserMessage(reference), reference.message);
 });
 
 // Non-Error values don't crash and don't echo their content.
@@ -110,7 +126,8 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
   const shown = JSON.stringify(dms);
   assert.ok(!shown.includes('ghp_abc'), 'secret must not reach the modal error');
   assert.match(dms[0], /Could not save your \*customdb\* credential/);
-  assert.match(dms[0], /Something went wrong \(KmsWrapError\)\./);
+  assert.match(dms[0], /Something went wrong\. Ask an admin to check the Vouchr logs\./);
+  assert.doesNotMatch(dms[0], /KmsWrapError/);
 });
 
 test('raw-only credential modal targets generic validation errors at its rendered raw block', async (t) => {
@@ -287,6 +304,6 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
 // (it is one of Vouchr's own classes), so the connect prompt still reads normally, not the generic form.
 test('regression: ConsentRequiredError still shows its own connect-prompt message', () => {
   const e = new ConsentRequiredError('github');
-  assert.equal(safeUserMessage(e), e.message);
-  assert.match(safeUserMessage(e), /Connect prompt was posted/);
+  assert.equal(safeUserMessage(e), 'Consent is required. Complete the private Connect prompt, then retry.');
+  assert.match(safeUserMessage(e), /Connect prompt/);
 });

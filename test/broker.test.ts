@@ -479,18 +479,23 @@ test('fetch: write requests still enforce host, path, validator, and replay chec
       method: 'POST', host: 'evil.example.com', path: '/allowed', query: { ok: '1' }, body: '{}',
     });
     assert.equal(blockedHost.status, 403);
+    assert.deepEqual(blockedHost.json, {
+      error: 'egress blocked', code: 'egress_blocked', retryable: false, recovery: 'fix_configuration',
+    });
 
     const blockedPath = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
       method: 'POST', path: '/blocked', query: { ok: '1' }, body: '{}',
     });
     assert.equal(blockedPath.status, 403);
+    assert.deepEqual(blockedPath.json, blockedHost.json);
 
     const blockedValidator = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
       method: 'POST', path: '/allowed', query: { ok: '0' }, body: '{}',
     });
     assert.equal(blockedValidator.status, 403);
+    assert.deepEqual(blockedValidator.json, blockedHost.json);
     assert.equal(up.seen.length, 0, 'egress denials happen before upstream');
 
     const token = signIdentity(claims(), SECRET);
@@ -604,6 +609,9 @@ test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the atta
     } as any);
     // U2 has no acme credential, so the broker resolves U2's owner (from the token) and finds nothing.
     assert.equal(r.status, 409, 'resolved the token owner (U2), not the body-supplied U1');
+    assert.deepEqual(r.json, {
+      error: 'not connected', code: 'not_connected', retryable: false, recovery: 'connect',
+    });
     assert.equal(up.seen.length, 0, 'U1\'s token was never read, so nothing went upstream');
   } finally {
     up.restore();
@@ -631,6 +639,12 @@ test('fetch: disallowed content-type is rejected before the body is returned', a
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(r.status, 502);
+    assert.deepEqual(r.json, {
+      error: 'disallowed content-type',
+      code: 'response_blocked',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
     assert.ok(!r.raw.includes('injection'), 'disallowed body never relayed');
   } finally {
     up.restore();
@@ -928,16 +942,51 @@ test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; f
   }
 });
 
+test('#194 session-mode broker denial has stable request-approval recovery metadata', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const channelConfig = new ChannelConfig(db);
+  await channelConfig.setMode('T1', 'C1', 'acme', 'session');
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const server = createBroker({
+    providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims({ threadTs: '1700000000.000001' }), SECRET),
+      method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 403);
+    assert.deepEqual(r.json, {
+      error: 'provider requires a thread-scoped session approval',
+      code: 'session_approval_required',
+      retryable: false,
+      recovery: 'request_approval',
+    });
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 // ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
 
 /** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
-async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user') {
+async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user', seedShared = true) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   await channelConfig.setMode('T1', 'C1', 'acme', mode);
-  if (mode === 'shared') {
+  if (mode === 'shared' && seedShared) {
     // The channel owns one credential every member injects.
     await vault.upsert(channelOwner('T1', 'C1'), 'acme', {
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -952,6 +1001,24 @@ async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user') {
 function channelToken(over: Partial<IdentityClaims> = {}): string {
   return signIdentity(claims({ ownerKind: 'channel', channelEligible: true, ...over }), SECRET);
 }
+
+test('#194 shared owner missing a credential returns configuration recovery, never personal connect', async (t) => {
+  const { server, port } = await makeChannelBroker(t, 'shared', false);
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 409);
+    assert.deepEqual(r.json, {
+      error: 'not connected', code: 'not_connected', retryable: false, recovery: 'fix_configuration',
+    });
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
 
 test('#51 shared: owner:"channel" resolves to the channel credential and injects it', async (t) => {
   const { server, db, port } = await makeChannelBroker(t, 'shared');
@@ -1735,7 +1802,12 @@ test('#58 resolver failure returns a stable code without resolver text or the re
       path: '/x',
     });
     assert.equal(response.status, 502);
-    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.deepEqual(response.json, {
+      error: 'credential resolution failed',
+      code: 'resolver_failed',
+      retryable: true,
+      recovery: 'retry_later',
+    });
     assert.ok(!response.raw.includes(sentinel));
     assert.ok(!response.raw.includes(AWS_USER_REF));
   } finally {
@@ -1743,7 +1815,7 @@ test('#58 resolver failure returns a stable code without resolver text or the re
   }
 });
 
-test('#58 malformed stored reference returns resolver_failed before resolver or provider I/O', async (t) => {
+test('#58 malformed stored reference returns resolver_configuration_error before resolver or provider I/O', async (t) => {
   const malformed = 'arn:aws:secretsmanager:malformed-reference-sentinel';
   let resolverCalls = 0;
   const { server, port, vault } = await makeRefBroker(t, {
@@ -1764,7 +1836,12 @@ test('#58 malformed stored reference returns resolver_failed before resolver or 
       path: '/x',
     });
     assert.equal(response.status, 502);
-    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.deepEqual(response.json, {
+      error: 'credential resolution failed',
+      code: 'resolver_configuration_error',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
     assert.equal(resolverCalls, 0);
     assert.equal(up.seen.length, 0);
     assert.ok(!response.raw.includes(malformed));

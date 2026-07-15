@@ -38,6 +38,8 @@ const PENDING_TTL_MS = 10 * 60 * 1000;
  * secret-free (method/host/path only — never the body, a token, or a query string).
  */
 export class ApprovalRequiredError extends Error {
+  readonly code = 'approval_required' as const;
+
   constructor(
     public provider: string,
     /** Who may decide: 'self' = the acting user; 'admin' = an eligible channel admin. */

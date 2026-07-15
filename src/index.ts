@@ -1,6 +1,19 @@
-export { createVouchr, ConsentRequiredError, SessionApprovalRequiredError, UserFacingError, ConnectContext } from './adapters/bolt';
+export { createVouchr, ConnectContext } from './adapters/bolt';
 export type { VouchrOptions } from './adapters/bolt';
 export type { ConnectContextDeps } from './adapters/bolt';
+// One Bolt-free typed-error contract feeds direct handles, Slack rendering, and the headless broker.
+// Unknown/foreign messages never cross this boundary.
+export {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UpstreamTimeoutError,
+  UserFacingError,
+  VOUCHR_ERROR_CODES,
+  VOUCHR_RECOVERY_ACTIONS,
+  mapSafeError,
+  safeUserMessage,
+} from './core/errors';
+export type { VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
 // Headless HTTP broker (non-Bolt agent runtimes): signed identity + fail-closed read-only egress.
 export { createBroker } from './adapters/http/broker';
 export type { BrokerOptions, BrokerFetchRequest, BrokerMcpRequest, ConnectionHandleRef } from './adapters/http/broker';
@@ -30,10 +43,18 @@ export { github, google, gitlab, notion, databricks, defineProvider, ProviderReg
 export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy } from './core/providers';
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
+export { PolicyDeniedError, ToolDisabledError } from './core/authz';
 export type { SlackIdentity } from './core/identity';
-export { ConnectionHandle, ResolverFailedError } from './core/injector';
+export {
+  ConnectionHandle,
+  EgressBlockedError,
+  NoConnectionError,
+  ResolverConfigurationError,
+  ResolverFailedError,
+  ResponseBlockedError,
+} from './core/injector';
 export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
-export { SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
+export { SECRET_REFERENCE_ERROR_CODES, SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
 export type {
   SecretReference,
   SecretReferenceErrorCode,
@@ -47,10 +68,11 @@ export { RateLimitedError } from './core/rateLimit';
 export type { RateLimitStore } from './core/rateLimit';
 // #117 credential-health notifications: the hook types for VouchrOptions/BrokerOptions
 // `onCredentialHealth`, the persistent per-(owner, provider, type) DM debounce store for custom
-// notifiers, and the typed token-endpoint error carrying the definitive-vs-transient classification.
+// notifiers, and the typed token-endpoint error carrying credential/configuration/transient kind.
 export { NotificationState, HEALTH_NOTIFY_DEBOUNCE_MS } from './core/health';
 export type { CredentialHealthEvent, CredentialHealthHook } from './core/health';
-export { TokenEndpointError } from './core/tokens';
+export { TOKEN_ENDPOINT_FAILURE_KINDS, TokenEndpointError } from './core/tokens';
+export type { TokenEndpointFailureKind } from './core/tokens';
 export type { VouchrAuditEvent, AuditSink } from './core/audit';
 export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';

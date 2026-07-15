@@ -10,7 +10,7 @@
 import type { ChannelMode } from './core/channelConfig';
 import type { AuditRow } from './core/audit';
 import type { ToolManifestEntry } from './core/tools';
-import type { SecretReferenceErrorCode } from './core/reference';
+import type { VouchrErrorCode, VouchrRecovery } from './core/errors';
 
 /** Coarse per-provider consent state — no secret, existence + state only. */
 export type BrokerConsentState = 'connected' | 'needs_consent';
@@ -19,14 +19,22 @@ export type BrokerConsentState = 'connected' | 'needs_consent';
  *  exception: `/readyz` returns only `{ ok: false }`, with no diagnostic text. */
 export interface BrokerError {
   error: string;
-  /** Stable machine-readable classification for reference configuration/resolution failures. */
-  code?: SecretReferenceErrorCode | 'resolver_failed';
+  /** Stable machine-readable classification. Present on typed operational failures; older/general
+   * validation routes retain their established prose-only shape. Branch on this, never `error`. */
+  code?: VouchrErrorCode;
+  /** Whether retrying later can resolve the same condition. This never authorizes an automatic
+   * replay of a non-idempotent or unknown-outcome request. */
+  retryable?: boolean;
+  /** Closed next-action category for trusted recovery UI; never inferred from `error` prose. */
+  recovery?: VouchrRecovery;
   /** On a 429 (rate limit) or 503 (in-flight ceiling): the broker's retry hint in milliseconds.
    *  The same value, rounded up to whole seconds, rides the `Retry-After` response header. */
   retryAfterMs?: number;
   /** Present only on an in-flight-overload 503. `global` is the broker-wide admission ceiling;
    *  `provider` is the per-provider ceiling. It never contains a provider id or request value. */
   scope?: 'global' | 'provider';
+  /** Present only on `approval_required`; an opaque pending-request handle, not authorization. */
+  approvalId?: string;
 }
 
 /** `POST /v1/fetch` — the brokered upstream response (status + content-type + verbatim body). */

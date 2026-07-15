@@ -9,6 +9,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext } from '../src/adapters/bolt';
+import { mapSafeError } from '../src/core/errors';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -204,7 +205,10 @@ test('connectChannel: refused + audited when policy denies the provider in this 
   const deny = new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } });
   const ok = await ctx(t, true, 'C_FIN', {}, deny);
   await ok.c.setChannelSecret('mcp', SECRET); // config is admin-gated, not policy-gated
-  await assert.rejects(async () => ok.c.connectChannel('mcp'), /Policy denies/);
+  await assert.rejects(
+    async () => ok.c.connectChannel('mcp'),
+    (error: unknown) => mapSafeError(error).code === 'policy_denied',
+  );
   assert.ok((await auditRows(ok.db)).some((r) => r.action === 'denied'));
 });
 

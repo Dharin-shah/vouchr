@@ -27,8 +27,8 @@ import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/hea
 (env → wired server), identity minting/verification, providers, the owner model, and the low-level
 building blocks (`openDb`, `Vault`, `Audit`, `Consent`, `SessionGrants`, `sweepExpired`, `Policy`,
 `ChannelTools`) — plus the typed wire response types (`BrokerFetchResponse`, `BrokerStatusResponse`,
-`BrokerAdminConfigResponse`, …). The root `@vouchr/core` entry still exports everything, including the
-Bolt adapter.
+`BrokerAdminConfigResponse`, …), typed operational errors, and the Bolt-free `mapSafeError` recovery
+mapper. The root `@vouchr/core` entry exports the same error contract plus the Bolt adapter.
 
 Headless is primarily the credential **use path**, not a replacement for Slack consent. Users still
 connect or approve access through the Slack app first (or through the headless OAuth flow when it is
@@ -65,12 +65,50 @@ only `{ "ok": false }`). Failures a worker should handle explicitly include:
 
 | HTTP | Body | Caller action |
 | --- | --- | --- |
-| `400` | `{ "error": "…", "code": "invalid_reference" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
-| `413` | `{ "error": "request body too large" }`, `{ "error": "response too large; narrow your query or endpoint" }`, or `{ "error": "response blocked" }` | Do not retry unchanged. Reduce the request or choose a narrower provider endpoint. |
-| `429` | `{ "error": "rate limited", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry if the operation itself is safe to retry. |
-| `502` | `{ "error": "credential resolution failed", "code": "resolver_failed" }` | Do not ask the user to reconnect. Check the configured resolver, workload identity/IAM, and secret-manager availability. |
-| `503` | `{ "error": "overloaded", "scope": "global", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
-| `504` | `{ "error": "upstream timed out" }` | Treat the outcome as unknown. Retry only a known-idempotent operation; never automatically replay an uncertain write. |
+| `400` | `{ "error": "…", "code": "invalid_reference", "retryable": false, "recovery": "fix_configuration" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
+| `403` | `{ "error": "egress blocked", "code": "egress_blocked", "retryable": false, "recovery": "fix_configuration" }` | Correct the provider/egress configuration; unchanged retries remain denied. |
+| `403` | `{ "error": "approval_required", "approvalId": "…", "code": "approval_required", "retryable": false, "recovery": "request_approval" }` | Bridge the opaque pending id to the trusted private approval surface; do not treat it as authority. |
+| `403` | `{ "error": "policy denies this provider in this channel", "code": "policy_denied", "retryable": false, "recovery": "contact_admin" }` | Static/channel policy denied use. Retrying cannot change governance; contact an eligible admin. |
+| `403` | `{ "error": "provider is not enabled in this channel", "code": "tool_disabled", "retryable": false, "recovery": "contact_admin" }` | The channel tool allowlist disabled the provider; contact an eligible admin. |
+| `409` | `{ "error": "not connected", "code": "not_connected", "retryable": false, "recovery": "connect" }` | Start personal connection recovery. For a shared-owner request, `recovery` is `fix_configuration` so an eligible admin configures the channel credential instead. |
+| `413` / `502` | `{ "error": "response blocked", "code": "response_blocked", "retryable": false, "recovery": "fix_configuration" }` | Provider response policy withheld the body. The broker's default content-type denial retains `error: "disallowed content-type"` but uses the same machine fields. Generic byte caps retain their established prose-only shape. |
+| `429` | `{ "error": "rate limited", "code": "rate_limited", "retryable": true, "recovery": "retry_later", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry only if the operation itself is safe to replay. |
+| `502` | `{ "error": "credential resolution failed", "code": "resolver_configuration_error", "retryable": false, "recovery": "fix_configuration" }` | Resolver wiring or the stored reference is missing/malformed. Correct configuration; do not ask the user to reconnect. |
+| `502` | `{ "error": "credential resolution failed", "code": "resolver_failed", "retryable": true, "recovery": "retry_later" }` | A configured resolver failed before provider egress. Retry later when replaying the requested operation is otherwise safe. |
+| `502` | `{ "error": "upstream fetch failed", "code": "token_endpoint_failed", "retryable": false, "recovery": "connect" }` | The stored grant is dead (`kind: credential`). Configuration failures use `fix_configuration`; RFC transient codes and 408/429/5xx/network/timeout failures use `retry_later` with `retryable: true`. In-process callers can inspect `TokenEndpointError.kind`. |
+| `502` | `{ "error": "upstream fetch failed", "code": "internal_error", "retryable": false, "recovery": "contact_admin" }` | Unknown extension/upstream throws are deliberately not guessed retryable; inspect private operator logs. |
+| `503` | `{ "error": "overloaded", "code": "overloaded", "scope": "global", "retryable": true, "recovery": "retry_later", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
+| `500` | `{ "error": "internal error", "code": "internal_error", "retryable": false, "recovery": "contact_admin" }` | Pre-handle database/KMS/internal failures use fixed metadata and never expose the foreign error. |
+| `504` | `{ "error": "upstream timed out", "code": "upstream_timeout", "retryable": false, "recovery": "retry_later" }` | Treat the outcome as unknown. Retry only a known-idempotent operation; never automatically replay an uncertain write. |
+
+Typed `/v1/fetch` and `/v1/mcp` failures use the same `code`, `retryable`, `recovery`, and
+`retryAfterMs` policy. Other validation/authentication routes retain their established prose-only
+errors where no exported typed outcome exists, so these `BrokerError` fields remain optional.
+`retryAfterMs` is explicitly milliseconds; the HTTP `Retry-After` header remains whole seconds.
+
+In-process hosts can use the identical contract without parsing HTTP prose:
+
+```ts
+import {
+  mapSafeError,
+  VOUCHR_ERROR_CODES,
+  VOUCHR_RECOVERY_ACTIONS,
+  type VouchrSafeError,
+} from '@vouchr/core/headless';
+
+const safe: VouchrSafeError = mapSafeError(caught);
+```
+
+Every exported typed error (`ConsentRequiredError`, `SessionApprovalRequiredError`,
+`ApprovalRequiredError`, `PolicyDeniedError`, `ToolDisabledError`, `NoConnectionError`,
+`EgressBlockedError`, `ResponseBlockedError`,
+`ResolverConfigurationError`, `ResolverFailedError`, `RateLimitedError`, `SecretReferenceError`,
+`TokenEndpointError`, `UpstreamTimeoutError`, and the explicit `UserFacingError` marker) is available
+from both package entrypoints. Unknown errors never
+expose their message or class name. `UserFacingError` is an explicit opt-in for fixed,
+Vouchr-authored copy—never wrap a caught resolver/provider/KMS/database error in it. See the root
+README's [typed error table](../README.md#typed-errors-and-recovery) for thrown control-flow vs
+operational meanings.
 
 Identity assertions are single-use. **Mint a fresh `identityToken` for every retry**, including a
 retry after `429`, `503`, or `504`; never infer from the error scope whether the earlier assertion
@@ -146,7 +184,13 @@ render Approve/Deny buttons**, so the split is deliberate:
   `approval_requested`, and returns:
 
   ```json
-  { "error": "approval_required", "approvalId": "…" }   // HTTP 403
+  {
+    "error": "approval_required",
+    "approvalId": "…",
+    "code": "approval_required",
+    "retryable": false,
+    "recovery": "request_approval"
+  }
   ```
 
 - The Bolt adapter renders Approve/Deny automatically only when its own in-process handle starts the
@@ -268,12 +312,16 @@ deny and a policy allow cannot override a disabled channel tool.
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).
 Both routes validate a bounded supported reference form, derive its source server-side, and require an
-own configured resolver function before any credential, mode, or audit write. A compatibility
+a configured resolver function before any credential, mode, or audit write. A compatibility
 `source` field may be supplied only when it exactly matches that derived source; optional scopes
 must be a bounded unique subset of the provider's declared scopes. Saving does not invoke the
 resolver or prove IAM, network, or secret availability; resolution remains just in time at
-credential use. Validation errors include a stable `code` for recovery UI; JIT failures return
-`resolver_failed` without exposing the resolver's error text or stored reference.
+credential use. Validation errors include a stable `code` for recovery UI. Missing/malformed
+resolver configuration or an invalid fulfilled value returns `resolver_configuration_error`; a
+configured resolver's throw or deadline returns retryable `resolver_failed`. Neither exposes resolver
+error text or the stored reference. Resolvers must fulfill with a non-empty string. Undefined,
+non-string, or empty results fail closed before provider egress; explicit caller cancellation still
+propagates.
 
 ## Operations
 

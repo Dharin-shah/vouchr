@@ -3,7 +3,7 @@ import { openTestDb, testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import http from 'node:http';
-import { createVouchr, createBroker, ConsentRequiredError } from '../src';
+import { createVouchr, createBroker, ConsentRequiredError, PolicyDeniedError } from '../src';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { Vault, type StoredToken } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
@@ -215,9 +215,10 @@ test('dry-run: egress and policy denials are exactly the production error class 
     // Policy denial at connect(): identical class + message too.
     const pp = await errOf(() => prodCtx.connect('denied'));
     const dp = await errOf(() => dryCtx.connect('denied'));
+    assert.ok(dp instanceof PolicyDeniedError);
     assert.equal(dp.constructor.name, pp.constructor.name);
     assert.equal(dp.message, pp.message);
-    assert.match(dp.message, /Policy denies "denied"/);
+    assert.equal(dp.message, 'Provider policy denies this request.');
   } finally {
     restore();
   }
@@ -636,6 +637,9 @@ test('dry-run broker: /v1/connect → local callback → /v1/fetch echo, fully o
     const denied = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: tok('shh'), method: 'GET', path: '/x', host: 'evil.example' });
     assert.equal(denied.status, 403);
     assert.equal(denied.json.error, 'egress blocked');
+    assert.equal(denied.json.code, 'egress_blocked');
+    assert.equal(denied.json.retryable, false);
+    assert.equal(denied.json.recovery, 'fix_configuration');
 
     // Every audit row (connect, inject, denied) carries the dry_run marker.
     const rows = (await db.all(`SELECT meta FROM audit`)) as any[];
@@ -695,7 +699,12 @@ test('dry-run broker: fails every request closed against a vault with real crede
     assert.equal((await get(port, '/readyz')).status, 503);
     const r = await post(port, '/v1/status', { identityToken: tok('shh') });
     assert.equal(r.status, 500); // DryRunVaultError: nothing below the probes is served
-    assert.deepEqual(r.json, { error: 'internal error' });
+    assert.deepEqual(r.json, {
+      error: 'internal error',
+      code: 'internal_error',
+      retryable: false,
+      recovery: 'contact_admin',
+    });
   } finally {
     server.close();
     await db.close();

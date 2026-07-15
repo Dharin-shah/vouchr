@@ -325,7 +325,12 @@ test('/v1/fetch: an extension throw cannot smuggle a secret through logs or the 
   try {
     const response = await post(port, '/v1/fetch', fetchBody());
     assert.equal(response.status, 502);
-    assert.deepEqual(response.json, { error: 'upstream fetch failed' });
+    assert.deepEqual(response.json, {
+      error: 'upstream fetch failed',
+      code: 'internal_error',
+      retryable: false,
+      recovery: 'contact_admin',
+    });
     assert.doesNotMatch(JSON.stringify(response.json), new RegExp(secret));
     assert.doesNotMatch(logged.join('\n'), new RegExp(secret));
     assert.deepEqual(logged, []);
@@ -427,8 +432,13 @@ test('/v1/fetch: a resolver that ignores cancellation is cut at the deadline and
   })) as typeof fetch;
   try {
     const timedOut = await post(port, '/v1/fetch', fetchBody());
-    assert.equal(timedOut.status, 504);
-    assert.equal(timedOut.json.error, 'upstream timed out');
+    assert.equal(timedOut.status, 502);
+    assert.deepEqual(timedOut.json, {
+      error: 'credential resolution failed',
+      code: 'resolver_failed',
+      retryable: true,
+      recovery: 'retry_later',
+    });
 
     const healthy = await post(port, '/v1/fetch', fetchBody());
     assert.equal(healthy.status, 200, 'a hung resolver released the global and provider leases');

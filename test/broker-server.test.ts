@@ -389,7 +389,12 @@ test('#236 packaged policy trusts the signed channel and denies before credentia
       channel: 'C_ALLOWED',
     });
     assert.equal(denied.status, 403);
-    assert.deepEqual(denied.json, { error: 'policy denies this provider in this channel' });
+    assert.deepEqual(denied.json, {
+      error: 'policy denies this provider in this channel',
+      code: 'policy_denied',
+      retryable: false,
+      recovery: 'contact_admin',
+    });
     assert.equal(resolverCalls, 0, 'policy must run before an external reference is resolved');
     assert.equal(upstreamCalls, 0, 'policy must run before provider I/O');
 
@@ -495,7 +500,12 @@ test('#240 packaged broker shares and enforces channel governance across every d
       provider: 'fetcher', enabled: false, identityToken: adminToken(),
     });
     assert.equal(auditRejected.status, 500);
-    assert.deepEqual(auditRejected.json, { error: 'internal error' });
+    assert.deepEqual(auditRejected.json, {
+      error: 'internal error',
+      code: 'internal_error',
+      retryable: false,
+      recovery: 'contact_admin',
+    });
     const rolledBackTools = await built.db.get<{ n: number }>(
       `SELECT count(*)::int AS n FROM channel_tool WHERE team_id=? AND channel=?`,
       ['T1', 'C1'],

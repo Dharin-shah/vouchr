@@ -1,8 +1,11 @@
 {
   "status": 503,
   "shape": {
+    "code": "string",
     "error": "string",
+    "recovery": "string",
     "retryAfterMs": "number",
+    "retryable": "boolean",
     "scope": "string"
   }
 }

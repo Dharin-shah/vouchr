@@ -33,6 +33,19 @@ export { Audit } from './core/audit';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';
 export { SessionGrants } from './core/session';
+// Shared typed operational failures + the single safe recovery mapper. These imports are all core,
+// so the headless graph stays independent of Bolt/Slack packages.
+export {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UpstreamTimeoutError,
+  UserFacingError,
+  VOUCHR_ERROR_CODES,
+  VOUCHR_RECOVERY_ACTIONS,
+  mapSafeError,
+  safeUserMessage,
+} from './core/errors';
+export type { VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
 // #113 human-in-the-loop approval: the broker maps ApprovalRequiredError to 403 approval_required;
 // the store is exported (like SessionGrants) so a headless host can drive its own approve/deny
 // surface and wire the sweep. All core — no @slack in the graph.
@@ -80,11 +93,18 @@ export type { ChannelMode } from './core/channelConfig';
 // BrokerOptions. All core/adapters-http — no @slack in the graph. ──
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
+export { PolicyDeniedError, ToolDisabledError } from './core/authz';
 export { ChannelTools } from './core/tools';
 export type { ToolManifestEntry } from './core/tools';
 export type { Resolvers, EventSink, VouchrEvent } from './core/injector';
-export { ResolverFailedError } from './core/injector';
-export { SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
+export {
+  EgressBlockedError,
+  NoConnectionError,
+  ResolverConfigurationError,
+  ResolverFailedError,
+  ResponseBlockedError,
+} from './core/injector';
+export { SECRET_REFERENCE_ERROR_CODES, SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
 export type {
   SecretReference,
   SecretReferenceErrorCode,
@@ -100,7 +120,8 @@ export type { RateLimitStore } from './core/rateLimit';
 // headless notifier should use (reconnect/delete clear it). All core — no @slack in the graph.
 export { NotificationState, HEALTH_NOTIFY_DEBOUNCE_MS } from './core/health';
 export type { CredentialHealthEvent, CredentialHealthHook } from './core/health';
-export { TokenEndpointError } from './core/tokens';
+export { TOKEN_ENDPOINT_FAILURE_KINDS, TokenEndpointError } from './core/tokens';
+export type { TokenEndpointFailureKind } from './core/tokens';
 
 // ── exported wire RESPONSE types (mirror the broker's HTTP responses) ──
 export type {

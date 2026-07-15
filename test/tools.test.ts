@@ -14,6 +14,7 @@ import { authorizeProvider, buildToolManifest } from '../src/core/authz';
 import { ConnectContext } from '../src/adapters/bolt';
 import { countingDb } from './support/counting-db';
 import type { Db } from '../src/core/db';
+import { mapSafeError } from '../src/core/errors';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -80,7 +81,10 @@ test("connect() refuses a disabled provider (audited 'tool-disabled') and allows
   const { c, db, vault, tools } = await ctx(t);
   await tools.setEnabled('T1', 'C_FIN', 'mcp', true); // mcp on → other off (allowlist)
 
-  await assert.rejects(() => c.connect('other'), /not enabled/);
+  await assert.rejects(
+    () => c.connect('other'),
+    (error: unknown) => mapSafeError(error).code === 'tool_disabled',
+  );
   const denied = (await auditRows(db)).filter((r) => r.action === 'denied');
   assert.equal(denied.length, 1);
   assert.match(denied[0].meta, /tool-disabled/);
@@ -100,7 +104,10 @@ test('connectChannel() refuses a disabled provider and allows an enabled one', a
 
   assert.ok(await c.connectChannel('mcp')); // enabled + shared cred → handle
   assert.equal((await vault.get(chOwner, 'mcp'))?.accessToken, 'sk-shared');
-  await assert.rejects(() => c.connectChannel('other'), /not enabled/);
+  await assert.rejects(
+    () => c.connectChannel('other'),
+    (error: unknown) => mapSafeError(error).code === 'tool_disabled',
+  );
 });
 
 // toolManifest(): one entry per registered provider, with enabled flag + channel mode.
@@ -141,7 +148,10 @@ test('toolManifest reflects a Policy deny (intersects channel tools and policy)'
   ]);
 
   // Consistency: connect() actually refuses the provider the manifest marks disabled.
-  await assert.rejects(() => c.connect('other'), /Policy denies/);
+  await assert.rejects(
+    () => c.connect('other'),
+    (error: unknown) => mapSafeError(error).code === 'policy_denied',
+  );
 });
 
 // A null channel (DM-less) keeps current behavior: no tool restriction, manifest all-enabled.

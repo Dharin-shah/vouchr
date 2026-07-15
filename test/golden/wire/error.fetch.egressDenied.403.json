@@ -1,6 +1,9 @@
 {
   "status": 403,
   "shape": {
-    "error": "string"
+    "code": "string",
+    "error": "string",
+    "recovery": "string",
+    "retryable": "boolean"
   }
 }

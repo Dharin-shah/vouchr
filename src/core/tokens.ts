@@ -20,21 +20,55 @@ export interface TokenResponse {
   expiresAt: number | null;
 }
 
+/** Closed token-endpoint failure classes. `credential` means reconnecting the owner is required;
+ * `configuration` means the operator's OAuth client/configuration was rejected; `transient` means
+ * the endpoint or network may recover. Keep this runtime list beside the type so every mapper and
+ * entry point validates the same discriminant (STR-2). */
+export const TOKEN_ENDPOINT_FAILURE_KINDS = Object.freeze([
+  'credential',
+  'configuration',
+  'transient',
+] as const);
+
+export type TokenEndpointFailureKind = (typeof TOKEN_ENDPOINT_FAILURE_KINDS)[number];
+
+/** One classifier for HTTP and OAuth-body signals. A bare/unparseable 400/401 stays credential for
+ * backward-compatible dead-grant handling; explicit RFC transient codes and timeout/back-pressure/
+ * server statuses override that default. All remaining parsed OAuth errors are configuration. */
+function classifyTokenEndpointFailure(
+  status: number,
+  oauthError?: string,
+): TokenEndpointFailureKind {
+  if (oauthError === 'invalid_grant') return 'credential';
+  if (oauthError === 'temporarily_unavailable' || oauthError === 'server_error') return 'transient';
+  if (oauthError !== undefined) return 'configuration';
+  if (status === 400 || status === 401) return 'credential';
+  if (status === 408 || status === 429 || status >= 500) return 'transient';
+  return 'configuration';
+}
+
 /**
- * Typed token-endpoint failure carrying the ONE definitive-vs-transient classification (#117).
- * `definitive` = the grant itself is dead — HTTP 400/401 (RFC 6749 §5.2: invalid_grant /
- * invalid_client come back as 400/401) or an explicit `invalid_grant` error body — so retrying is
- * pointless and only reconnecting fixes it. Everything else (5xx, 429, network throw, timeout) is
- * transient and must NEVER trigger owner-facing notifications. Message text is identical to the
- * previous bare Errors (callers string-match it) and never carries token material.
+ * Typed token-endpoint failure carrying the richer credential/configuration/transient split.
+ *
+ * The boolean constructor form remains supported for existing consumers: `true` maps to
+ * `credential`, `false` to `transient`. `definitive` is retained for the existing credential-health
+ * hook and is true only for `credential`; new recovery code should branch on `kind`.
  */
 export class TokenEndpointError extends Error {
+  readonly code = 'token_endpoint_failed' as const;
+  readonly kind: TokenEndpointFailureKind;
+  public definitive: boolean;
+
   constructor(
     message: string,
-    public definitive: boolean,
+    kindOrDefinitive: TokenEndpointFailureKind | boolean,
   ) {
     super(message);
     this.name = 'TokenEndpointError';
+    this.kind = typeof kindOrDefinitive === 'boolean'
+      ? (kindOrDefinitive ? 'credential' : 'transient')
+      : kindOrDefinitive;
+    this.definitive = this.kind === 'credential';
   }
 }
 
@@ -125,30 +159,44 @@ async function tokenRequest(
   // the refresh lock/pool promptly, while a caller that forgets a signal cannot make this unbounded.
   const deadline = disposableDeadline(provider.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS, callerSignal);
   try {
-    const res = await fetch(provider.tokenUrl, {
-      method: 'POST',
-      headers,
-      body,
-      // OAuth codes, refresh tokens, and client credentials are all replayable secrets. Fetch's
-      // default redirect mode would resend this POST body on a 307/308, potentially to a different
-      // origin. Token endpoints must be final destinations: surface every redirect as a failure.
-      redirect: 'manual',
-      signal: deadline.signal,
-    });
+    let res: Response;
+    try {
+      res = await fetch(provider.tokenUrl, {
+        method: 'POST',
+        headers,
+        body,
+        // OAuth codes, refresh tokens, and client credentials are all replayable secrets. Fetch's
+        // default redirect mode would resend this POST body on a 307/308, potentially to a different
+        // origin. Token endpoints must be final destinations: surface every redirect as a failure.
+        redirect: 'manual',
+        signal: deadline.signal,
+      });
+    } catch (error) {
+      // Preserve caller cancellation so request teardown remains silent. A provider deadline or
+      // network failure is otherwise a typed transient outcome with fixed text: fetch/SDK messages
+      // can contain endpoint query credentials and must never reach recovery metadata.
+      if (callerSignal?.aborted) throw error;
+      throw new TokenEndpointError('Token endpoint request failed', 'transient');
+    }
     if (!res.ok) {
       // 400/401 usually means the grant is dead (RFC 6749 §5.2) — but a parseable OAuth error code
       // that is NOT invalid_grant (e.g. invalid_client: the operator's client secret expired) is
       // operator-side breakage no amount of user reconnecting can fix, so telling every owner to
-      // reconnect would be pure spam: classify those transient. A bare/unparseable 400/401 stays
+      // reconnect would be pure spam: classify those as configuration. A bare/unparseable 400/401 stays
       // definitive. The body is bounded and only parsed here, never logged or put in the error.
-      let definitive = res.status === 400 || res.status === 401;
-      if (definitive) {
+      let kind = classifyTokenEndpointFailure(res.status);
+      if (kind === 'credential') {
         try {
           const json: any = await readResponseJsonCapped(res);
-          if (typeof json?.error === 'string' && json.error !== 'invalid_grant') definitive = false;
-        } catch {
-          // Unparseable/over-cap body: keep status classification and ensure the socket is released.
+          if (typeof json?.error === 'string') {
+            kind = classifyTokenEndpointFailure(res.status, json.error);
+          }
+        } catch (error) {
+          // Unparseable/over-cap body: keep the conservative status classification. Cancellation
+          // remains cancellation, while a provider deadline during the body read is transient.
           await cancelResponseBody(res);
+          if (callerSignal?.aborted) throw error;
+          if (deadline.signal.aborted) kind = 'transient';
         }
       } else {
         // Cancel the discarded body: undici pins the socket to an unread body until GC (#172), so
@@ -157,27 +205,44 @@ async function tokenRequest(
       }
       // The configured URL is external input and may contain credential-like query values. Identify
       // the field and status only; never reflect the endpoint itself into owner/operator error text.
-      throw new TokenEndpointError(`Token endpoint returned HTTP ${res.status}`, definitive);
+      throw new TokenEndpointError(`Token endpoint returned HTTP ${res.status}`, kind);
     }
-    const json = await readResponseJsonCapped(res);
+    let json: unknown;
+    try {
+      json = await readResponseJsonCapped(res);
+    } catch (error) {
+      if (callerSignal?.aborted) throw error;
+      if (deadline.signal.aborted) {
+        throw new TokenEndpointError('Token endpoint response timed out', 'transient');
+      }
+      throw new TokenEndpointError('Token endpoint returned an invalid response', 'configuration');
+    }
     if (json && typeof json === 'object' && !Array.isArray(json) && 'error' in json) {
       const error = (json as Record<string, unknown>).error;
       if (typeof error !== 'string' || error.length === 0) {
-        throw new Error('Token endpoint returned an invalid response');
+        throw new TokenEndpointError('Token endpoint returned an invalid response', 'configuration');
       }
       // Some providers return 200 with an error body; only invalid_grant is definitively dead.
       // Boundary: a provider that reports a dead grant as 200 + a bespoke code (e.g.
-      // bad_refresh_token) never classifies definitive → no owner DM, i.e. the pre-#117 status quo.
+      // bad_refresh_token) classifies as configuration rather than credential → no owner DM, i.e.
+      // the pre-#117 notification posture.
       // Fail-safe on purpose: a missed notification beats a false "reconnect now"; no per-provider
       // error-code list (the built-ins all use invalid_grant).
-      throw new TokenEndpointError('Token endpoint returned an OAuth error', error === 'invalid_grant');
+      throw new TokenEndpointError(
+        'Token endpoint returned an OAuth error',
+        classifyTokenEndpointFailure(res.status, error),
+      );
     }
-    return parseTokenResponse(json, [
-      provider.clientSecret,
-      params.code,
-      params.code_verifier,
-      params.refresh_token,
-    ]);
+    try {
+      return parseTokenResponse(json, [
+        provider.clientSecret,
+        params.code,
+        params.code_verifier,
+        params.refresh_token,
+      ]);
+    } catch {
+      throw new TokenEndpointError('Token endpoint returned an invalid response', 'configuration');
+    }
   } finally {
     deadline.dispose();
   }

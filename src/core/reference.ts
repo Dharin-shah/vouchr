@@ -23,11 +23,13 @@ export interface SecretReference {
   scopes?: string;
 }
 
-export type SecretReferenceErrorCode =
-  | 'invalid_reference'
-  | 'source_mismatch'
-  | 'invalid_scopes'
-  | 'resolver_unavailable';
+export const SECRET_REFERENCE_ERROR_CODES = Object.freeze([
+  'invalid_reference',
+  'source_mismatch',
+  'invalid_scopes',
+  'resolver_unavailable',
+] as const);
+export type SecretReferenceErrorCode = (typeof SECRET_REFERENCE_ERROR_CODES)[number];
 
 const ERROR_MESSAGES: Record<SecretReferenceErrorCode, string> = {
   invalid_reference: 'Invalid secret reference. Use a bounded supported external-reference form.',
