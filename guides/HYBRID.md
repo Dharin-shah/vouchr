@@ -593,10 +593,10 @@ The equivalent slash-command flow is:
 ```
 
 Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-only manifest; admins
-can edit mode, enabled state, and the current preview-visibility migration setting and press
-**Save**. Private previews are slated for removal by `vision.md`; do not build new hybrid behavior on
-that setting. The modal does not contain the shared-credential input; use App Home's Configure
-credential action or `/vouchr configure <provider>`.
+can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
+prevention belong to the trusted host; Vouchr does not retain provider responses or publish a
+preview-visibility policy. The modal does not contain the shared-credential input; use App Home's
+Configure credential action or `/vouchr configure <provider>`.
 
 ### Channel-member experience
 

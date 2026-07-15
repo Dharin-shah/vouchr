@@ -448,7 +448,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
     assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'fetcher').enabled, false);
     assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'mcp-governed').enabled, true);
     assert.deepEqual(manifest.json.tools.find((tool: any) => tool.provider === 'service-tool'), {
-      provider: 'service-tool', mode: null, enabled: true, identity: 'service', visibility: 'public',
+      provider: 'service-tool', mode: null, enabled: true, identity: 'service',
     });
 
     const fetchDenied = await requestJson(port, 'POST', '/v1/fetch', {

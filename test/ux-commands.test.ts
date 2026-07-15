@@ -232,8 +232,8 @@ test('status rejects invalid page syntax before reading connection state', async
   assert.equal(reads, 0);
 });
 
-// `help` lists the retained command surface, including itself, and does not promote private preview
-// state that vision.md/#194 removes from the production product.
+// `help` lists the retained command surface, including itself, and excludes the removed private
+// preview command.
 test('help lists the retained commands', async (t) => {
   const { run } = await harness(t);
   const msg = await run('help');
@@ -241,7 +241,7 @@ test('help lists the retained commands', async (t) => {
   for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr mode', '/vouchr configure', '/vouchr stats']) {
     assert.ok(msg.includes(c), `help is missing ${c}`);
   }
-  assert.ok(!msg.includes('/vouchr preview'), 'help must not promote the private-preview surface slated for removal');
+  assert.ok(!msg.includes('/vouchr preview'), 'help must not promote the removed private-preview surface');
 });
 
 // A typo / unknown subcommand gets an actionable hint, not a silent fall-through to the account list.
@@ -251,6 +251,13 @@ test('unknown subcommand guides to help instead of silently showing status', asy
   assert.match(msg, /Unknown subcommand/);
   assert.match(msg, /\/vouchr help/);
   assert.doesNotMatch(msg, /connected accounts/);
+});
+
+test('removed preview command is an unknown subcommand with no mutation or audit', async (t) => {
+  const { run, db } = await harness(t);
+  const msg = await run('preview mcp private');
+  assert.equal(msg, 'Unknown subcommand. Run `/vouchr help` to see what you can do.');
+  assert.equal((await db.all(`SELECT id FROM audit`)).length, 0);
 });
 
 // SEC-1: an unknown argument can be a credential pasted in the wrong position. Escaping would stop
@@ -298,7 +305,7 @@ test('every known command rejects unsupported arguments instead of silently wide
   const { run } = await harness(t);
   for (const input of [
     'help extra', 'status extra', 'tools extra', 'stats extra', 'enable mcp extra',
-    'disable mcp extra', 'mode mcp shared extra', 'preview mcp public extra',
+    'disable mcp extra', 'mode mcp shared extra',
     'configure mcp extra', 'audit channel extra', 'audit chanel',
   ]) {
     assert.match(await run(input), /Usage:/, input);

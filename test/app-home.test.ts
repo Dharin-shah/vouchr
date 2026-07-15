@@ -159,8 +159,8 @@ test('selected App Home keeps production-path reads fixed and performs zero KMS 
 
   const few = await render(2);
   const many = await render(51);
-  // One metadata-only connection list + three manifest snapshots; admin rows reuse the raw allowlist.
-  assert.deepEqual(few.counts, { get: 0, all: 4 });
+  // One metadata-only connection list + two manifest snapshots; admin rows reuse the raw allowlist.
+  assert.deepEqual(few.counts, { get: 0, all: 3 });
   assert.deepEqual(many.counts, few.counts);
   assert.equal(few.unwraps, 0);
   assert.equal(many.unwraps, 0);

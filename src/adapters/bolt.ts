@@ -19,10 +19,9 @@ import {
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
-import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
+import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import { configureChannelCredential, setChannelCredentialMode } from '../core/channelCredential';
 import { ChannelTools, configureChannelTools, type ToolManifestEntry } from '../core/tools';
-import { PendingPreviews } from '../core/preview';
 import { handleOAuthCallback } from '../core/oauthCallback';
 import { offboardUser, disconnectProvider } from '../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
@@ -45,18 +44,19 @@ import {
   approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
-  previewBlocks, previewPostBlocks, normalizePreviewContent, PREVIEW_SHARE_ACTION, PREVIEW_DISMISS_ACTION,
   escapeMrkdwn, blocksFallbackText, connectedDmText,
   type Connection, type ConfigAdminRow,
 } from './blocks';
 
-/** How long a private preview's Share button stays claimable. Short on purpose: the human is
- *  looking at the ephemeral message right now; a stale share re-posts stale data. */
-const PREVIEW_TTL_MS = 10 * 60_000;
-
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
  *  how long a single approval can live before the user must re-approve in the thread. */
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+
+// One-release tombstones for preview controls issued by a drained v7 replica. These handlers retain
+// no provider response, perform no share, and are deliberately not exported as a supported surface.
+const RETIRED_PREVIEW_ACTIONS = ['vouchr_preview_share', 'vouchr_preview_dismiss'] as const;
+const RETIRED_PREVIEW_MESSAGE =
+  'This preview expired because private previews were removed. Ask the agent again.';
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
 const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 };
@@ -69,7 +69,6 @@ interface ConfigOpenState {
   p: string;
   m: ChannelMode | null;
   e: boolean;
-  v?: PreviewVisibility;
 }
 
 /** Parse forgeable config-modal metadata into one bounded, canonical shape before iteration. */
@@ -90,7 +89,9 @@ function parseConfigMetadata(value: unknown): { channel: string; open: ConfigOpe
       typeof entry.p !== 'string' || !isValidProviderId(entry.p) || seen.has(entry.p) ||
       !(entry.m === null || isChannelMode(entry.m)) ||
       typeof entry.e !== 'boolean' ||
-      !(entry.v === undefined || isPreviewVisibility(entry.v))
+      // A pre-removal modal carries `v`. Reject it as stale so rolling-version overlap cannot
+      // silently confirm mode/tool changes from a form that also contained a removed preview toggle.
+      Object.hasOwn(entry, 'v')
     ) return null;
     seen.add(entry.p);
   }
@@ -372,10 +373,6 @@ export interface ConnectContextDeps {
   auditSink?: AuditSink;
   /** #117 credential-health hook threaded to every ConnectionHandle (see VouchrOptions). Default no-op. */
   health?: CredentialHealthHook;
-  /** Pending private previews awaiting Share/Dismiss. Must be the createVouchr-scoped instance so a
-   *  share click (a later request) finds the entry; a direct-constructed context gets its own (the
-   *  ephemeral still posts; the share button then reports expired unless the host wires the actions). */
-  previews?: PendingPreviews;
   /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
    *  VouchrOptions.dryRun). Default false: unchanged behavior. */
   dryRun?: boolean;
@@ -407,7 +404,6 @@ export class ConnectContext {
   private approvals: Approvals | null;
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
-  private previews: PendingPreviews;
   private dryRun: boolean;
 
   constructor(deps: ConnectContextDeps) {
@@ -435,7 +431,6 @@ export class ConnectContext {
     this.approvals = deps.approvals ?? null;
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
-    this.previews = deps.previews ?? new PendingPreviews(PREVIEW_TTL_MS);
     this.dryRun = deps.dryRun ?? false;
   }
 
@@ -569,12 +564,8 @@ export class ConnectContext {
     return provider;
   }
 
-  /**
-   * The Bolt-side deny mapping of the shared authorizeProvider CHECK (audit row + policy_denied emit
-   * + user-safe error) — ONE mapping for connect() and preview(), so the credential path and the
-   * output path enforce and report the same decision. connectChannel keeps its own variant of this
-   * mapping because its audit meta carries owner:'channel'.
-   */
+  /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own
+   * variant because its audit metadata carries `owner: 'channel'`. */
   private async requireProviderAuthorized(providerId: string): Promise<void> {
     const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
     if (denial === 'policy') {
@@ -805,71 +796,6 @@ export class ConnectContext {
       providerId,
       mode,
     });
-  }
-
-  /**
-   * Set the channel's preview visibility for a provider ('private' = agent output goes only to the
-   * requester, with a Share action). Admin-only, audited — the same gate as setChannelMode. A
-   * rendering policy, not a credential one, so no channel-eligibility check and no `brokerable`
-   * refusal: a service tool's output can leak in a thread exactly like a brokered one's.
-   */
-  async setChannelVisibility(providerId: string, visibility: PreviewVisibility): Promise<void> {
-    this.registry.get(providerId); // validate BEFORE persist/audit (SEC-4): throws on an unknown id
-    const { cfg, owner, channel } = this.channelTarget();
-    await this.requireAdmin(providerId);
-    await cfg.setVisibility(owner.teamId, channel, providerId, visibility);
-    await this.audit.record('config', this.identity, providerId, { owner: 'channel', channel, visibility });
-  }
-
-  /**
-   * Post provider-derived agent output ('title' + 'lines') honoring the channel's preview
-   * visibility for `providerId`:
-   *  - 'public' (default) → a normal message in the channel (threaded when in a thread).
-   *  - 'private'          → ephemeral to the requester with Share/Dismiss buttons; the rendered
-   *    content is held in memory (see PendingPreviews) so a Share click reposts exactly what the
-   *    human reviewed, publicly attributed to them.
-   * Outside a channel (a DM with the agent) there is no one to leak to: always a direct post.
-   * Returns which path ran so the host can stop its turn ('private') vs continue ('posted').
-   */
-  async preview(providerId: string, content: { title: string; lines: string[] }): Promise<'posted' | 'private'> {
-    this.registry.get(providerId); // unknown provider ids never reach a message or the preview store
-    const p = escapeMrkdwn(providerId); // top-level Slack text is parsed mrkdwn too (SEC-5)
-    // Output rides the SAME authorization as credential use (the shared CHECK, same audit/deny mapping
-    // as connect()): a policy-denied or tool-disabled provider must not get its output posted through
-    // Vouchr's preview surface either — otherwise the manifest's `enabled` would be a lie here.
-    await this.requireProviderAuthorized(providerId);
-    // Normalize ONCE to exactly what rendering shows (blank lines dropped, caps applied), so the
-    // pending store never retains provider text the recipient couldn't actually have reviewed.
-    const c = normalizePreviewContent(providerId, content);
-    const visibility = this.channel && this.channelConfig
-      ? await this.channelConfig.getVisibility(this.identity.teamId, this.channel, providerId)
-      : 'public';
-    if (visibility === 'private' && this.channel) {
-      const id = this.previews.put({
-        teamId: this.identity.teamId, userId: this.identity.userId, channel: this.channel,
-        thread: this.thread, provider: providerId, title: c.title, lines: c.lines,
-      });
-      await this.client.chat.postEphemeral({
-        channel: this.channel,
-        user: this.identity.userId,
-        ...(this.thread ? { thread_ts: this.thread } : {}),
-        blocks: previewBlocks({
-          provider: providerId, title: c.title, lines: c.lines, id,
-          where: this.thread ? 'thread' : 'channel', ttlMinutes: Math.round(PREVIEW_TTL_MS / 60_000),
-        }) as any,
-        text: `Private ${p} preview (only visible to you)`,
-      });
-      return 'private';
-    }
-    await this.client.chat.postMessage({
-      channel: this.channel ?? this.identity.userId,
-      ...(this.thread ? { thread_ts: this.thread } : {}),
-      blocks: previewPostBlocks({ provider: providerId, title: c.title, lines: c.lines }) as any,
-      // Fallback/notification text is PARSED mrkdwn, not blocks: a provider-derived title there could
-      // fire a <!channel> or forge a mention (SEC-5). Neutral constant + the registry-validated id only.
-      text: `${p} preview`,
-    });
-    return 'posted';
   }
 
   /**
@@ -1117,7 +1043,6 @@ export async function createVouchr(opts: VouchrOptions) {
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
   // Shared per-(owner, provider) rate-limit buckets (provider.rateLimit); per-process by default.
   const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
-  const previews = new PendingPreviews(PREVIEW_TTL_MS); // pending private previews (share/dismiss)
   const sink: EventSink = opts.onEvent ?? (() => {});
   // Optional audit stream sink (raw actor id). Separate from `sink`, which is deliberately actor-free.
   const auditSink: AuditSink = opts.auditSink ?? (() => {});
@@ -1296,7 +1221,6 @@ export async function createVouchr(opts: VouchrOptions) {
         approvals,
         auditSink,
         health,
-        previews,
         dryRun,
       });
     }
@@ -1373,7 +1297,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, approvals, auditSink, health, previews, dryRun,
+      thread: null, sessions, approvals, auditSink, health, dryRun,
     });
   }
 
@@ -1480,7 +1404,7 @@ export async function createVouchr(opts: VouchrOptions) {
           const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
           if (!manifest.length) return 'No providers are registered.';
           const lines = manifest
-            .map((m) => `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${escapeMrkdwn(m.mode)})` : ''}${m.visibility === 'private' ? ' · private previews (:lock:)' : ''}`)
+            .map((m) => `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${escapeMrkdwn(m.mode)})` : ''}`)
             .join('\n');
           return `Tools for <#${escapeMrkdwn(command.channel_id)}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`;
         });
@@ -1541,24 +1465,6 @@ export async function createVouchr(opts: VouchrOptions) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
         return respond(`Set *${escapeMrkdwn(arg)}* to *${escapeMrkdwn(arg2)}* in <#${escapeMrkdwn(command.channel_id)}>.`);
-      }
-
-      // Per-channel preview visibility: private = agent output goes only to the requester, with an
-      // explicit Share button. Admin-gated + audited in setChannelVisibility (same gate as `mode`).
-      if (sub === 'preview') {
-        if (words.length !== 3 || !arg || !isPreviewVisibility(arg2)) {
-          return respond('Usage: `/vouchr preview <provider> <public|private>`');
-        }
-        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
-        if (!command.channel_id) return respond('Run `/vouchr preview` from inside the channel you want to configure.');
-        try {
-          await contextFor(identity, command.channel_id, client).setChannelVisibility(arg, arg2);
-        } catch (e) {
-          return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
-        }
-        return respond(arg2 === 'private'
-          ? `Set *${escapeMrkdwn(arg)}* previews to *private* in <#${escapeMrkdwn(command.channel_id)}>: results go only to whoever asked, with a Share button.`
-          : `Set *${escapeMrkdwn(arg)}* previews to *public* in <#${escapeMrkdwn(command.channel_id)}>.`);
       }
 
       if (sub === 'configure') {
@@ -1779,7 +1685,7 @@ export async function createVouchr(opts: VouchrOptions) {
         channelId ? commandAdmin(client, identity, channelId) : Promise.resolve(false),
       ]);
       // The modal keeps its pre-#111 contract: service tools are read-only there (its row shape is
-      // mode+enabled+preview checkboxes, meaningless for them). The App Home instead renders every
+      // mode+enabled controls, meaningless for them). The App Home instead renders every
       // row and per-row picks which controls a service tool gets (Enable/Disable only).
       const admin = isAdmin && channelId
         ? adminToolRows(manifest.tools, manifest.toolAllowed).filter((r) => isBrokeredProvider(r))
@@ -1808,7 +1714,6 @@ export async function createVouchr(opts: VouchrOptions) {
         provider: t.provider,
         mode: t.mode,
         enabled: toolAllowed(t.provider),
-        visibility: t.visibility,
         identity: t.identity,
       }));
     }
@@ -1844,22 +1749,17 @@ export async function createVouchr(opts: VouchrOptions) {
       const { channel, open } = metadata;
       const openMode = new Map(open.map((o) => [o.p, o.m]));
       const openEnabled = new Map(open.map((o) => [o.p, o.e]));
-      const openVisibility = new Map(open.map((o) => [o.p, o.v ?? 'public']));
 
       // Collect the submitted state per provider up front, so mode + enabled are each diffed against
       // their OPEN-TIME value rather than the current store.
       const values = view.state?.values ?? {};
       const submittedMode = new Map<string, unknown>();
       const submittedEnabled = new Map<string, boolean>();
-      const submittedVisibility = new Map<string, PreviewVisibility>();
       for (const [blockId, v] of Object.entries<any>(values)) {
         if (blockId.startsWith('mode:')) submittedMode.set(blockId.slice(5), v?.mode?.selected_option?.value);
         else if (blockId.startsWith('tool:')) {
           const options = v?.enabled?.selected_options;
           submittedEnabled.set(blockId.slice(5), Array.isArray(options) && options.some((o: any) => o?.value === 'enabled'));
-        } else if (blockId.startsWith('preview:')) {
-          const options = v?.visibility?.selected_options;
-          submittedVisibility.set(blockId.slice(8), Array.isArray(options) && options.some((o: any) => o?.value === 'private') ? 'private' : 'public');
         }
       }
       await ack({
@@ -1891,13 +1791,6 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!registry.has(provider) || !isChannelMode(mode)) continue; // forged/invalid → ignore
         if (mode === (openMode.get(provider) ?? null)) continue; // untouched (or reset to the same) → skip
         try { await ctx.setChannelMode(provider, mode); confirmed++; } catch { unconfirmed++; }
-      }
-
-      // ── preview visibility: same open-time-diff contract as mode ──
-      for (const [provider, visibility] of submittedVisibility) {
-        if (!registry.has(provider)) continue; // forged/invalid → ignore
-        if (visibility === (openVisibility.get(provider) ?? 'public')) continue; // untouched → skip
-        try { await ctx.setChannelVisibility(provider, visibility); confirmed++; } catch { unconfirmed++; }
       }
 
       // ── enabled: the tool allowlist. Only the controls the admin actually changed (submitted !==
@@ -2326,45 +2219,15 @@ export async function createVouchr(opts: VouchrOptions) {
     app.action(APPROVAL_APPROVE_ACTION, (a: any) => handleApprovalDecision(a, 'approve'));
     app.action(APPROVAL_DENY_ACTION, (a: any) => handleApprovalDecision(a, 'deny'));
 
-    // Share a private preview to the channel/thread. The button value is ONLY the claim id; the
-    // authorization is the server-side claim in PendingPreviews.take (recipient + team + channel must
-    // match what was stored at issue time — SEC-3: every field of the interaction payload is forgeable,
-    // so nothing in it is trusted as content or authority). Single-use, like an OAuth `state`.
-    app.action(PREVIEW_SHARE_ACTION, async ({ ack, body, respond, client }: any) => {
+    // A pre-cutover ephemeral message can outlive the v7 process that created it. Ack its old
+    // controls before doing anything else, then replace the private message with fixed guidance.
+    // Never inspect/repost the old message body: v8 owns no preview data or share capability.
+    const expireRetiredPreview = async ({ ack, respond }: any) => {
       await ack();
-      const identity = resolveIdentity({ body });
-      if (!identity) return;
-      const id = typeof body.actions?.[0]?.value === 'string' ? body.actions[0].value : '';
-      const channel: string | undefined = body.channel?.id ?? body.container?.channel_id;
-      if (!id || !channel) return;
-      const p = previews.take(id, { userId: identity.userId, teamId: identity.teamId, channel });
-      if (!p) {
-        if (respond) await respond({ replace_original: true, text: 'This preview expired. Ask the agent again.' });
-        return;
-      }
-      await client.chat.postMessage({
-        channel: p.channel,
-        ...(p.thread ? { thread_ts: p.thread } : {}),
-        blocks: previewPostBlocks({ provider: p.provider, title: p.title, lines: p.lines, sharedBy: identity.userId }) as any,
-        // Neutral fallback: the stored title is provider-derived and fallback text is parsed mrkdwn
-        // (SEC-5). p.provider was registry-validated at preview() time; the user id is authenticated.
-        text: `${escapeMrkdwn(p.provider)} preview shared by <@${escapeMrkdwn(identity.userId)}>`,
-      });
-      // The moment private data became public, by whose decision. p.provider is registry-validated
-      // (preview() refuses unknown ids), so nothing unvalidated reaches the audit provider column.
-      await audit.record('preview', identity, p.provider, { channel: p.channel, thread: p.thread, event: 'shared' });
-      if (respond) await respond({ delete_original: true });
-    });
+      if (respond) await respond({ replace_original: true, text: RETIRED_PREVIEW_MESSAGE });
+    };
+    for (const action of RETIRED_PREVIEW_ACTIONS) app.action(action, expireRetiredPreview);
 
-    app.action(PREVIEW_DISMISS_ACTION, async ({ ack, body, respond }: any) => {
-      await ack();
-      const identity = resolveIdentity({ body });
-      if (!identity) return;
-      const id = typeof body.actions?.[0]?.value === 'string' ? body.actions[0].value : '';
-      const channel: string | undefined = body.channel?.id ?? body.container?.channel_id;
-      if (id && channel) previews.dismiss(id, { userId: identity.userId, teamId: identity.teamId, channel });
-      if (respond) await respond({ delete_original: true });
-    });
   }
 
   /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).

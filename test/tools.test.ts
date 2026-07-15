@@ -110,8 +110,8 @@ test('toolManifest returns the expected shape', async (t) => {
   // Unconfigured channel → every provider enabled, mode null.
   let m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human', visibility: 'public' },
-    { provider: 'other', mode: null, enabled: true, identity: 'acting_human', visibility: 'public' },
+    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: true, identity: 'acting_human' },
   ]);
 
   // After configuring: mcp enabled + shared, other implicitly disabled.
@@ -119,8 +119,8 @@ test('toolManifest returns the expected shape', async (t) => {
   await c.setChannelMode('mcp', 'per-user');
   m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'public' },
-    { provider: 'other', mode: null, enabled: false, identity: 'acting_human', visibility: 'public' },
+    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' },
   ]);
 });
 
@@ -136,8 +136,8 @@ test('toolManifest reflects a Policy deny (intersects channel tools and policy)'
 
   const m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human', visibility: 'public' },
-    { provider: 'other', mode: null, enabled: false, identity: 'acting_human', visibility: 'public' }, // tool-enabled but policy-denied
+    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' }, // tool-enabled but policy-denied
   ]);
 
   // Consistency: connect() actually refuses the provider the manifest marks disabled.
@@ -248,12 +248,11 @@ function mkProvider(id: string) {
   });
 }
 
-test('buildToolManifest issues a fixed 3 reads regardless of provider count (#209)', async (t) => {
+test('buildToolManifest issues a fixed 2 reads regardless of provider count (#209)', async (t) => {
   const base = await openTestDb(t);
-  // Configure the channel so all three tables have rows — exercises the real batched read paths.
+  // Configure the channel so both tables have rows — exercises the real batched read paths.
   await new ChannelTools(base).setEnabled('T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, rest off
   await new ChannelConfig(base).setMode('T1', 'C_FIN', 'mcp', 'per-user');
-  await new ChannelConfig(base).setVisibility('T1', 'C_FIN', 'mcp', 'private');
 
   const build = async (extra: number) => {
     const { db, counts } = countingDb(base);
@@ -269,23 +268,23 @@ test('buildToolManifest issues a fixed 3 reads regardless of provider count (#20
   const few = await build(1); // 2 providers
   const many = await build(50); // 51 providers
 
-  // Exactly three channel-scoped reads (tool allowlist + mode + visibility), no per-provider gets, and
+  // Exactly two channel-scoped reads (tool allowlist + mode), no per-provider gets, and
   // identical whether the channel has 2 or 51 providers.
-  assert.deepEqual(few.counts, { get: 0, all: 3 });
-  assert.deepEqual(many.counts, { get: 0, all: 3 });
+  assert.deepEqual(few.counts, { get: 0, all: 2 });
+  assert.deepEqual(many.counts, { get: 0, all: 2 });
 
-  // Batching preserved semantics: 'mcp' enabled+per-user+private; every unlisted provider disabled with
-  // the unconfigured defaults (mode null from modeSnapshot, visibility 'public' from visibilitySnapshot).
+  // Batching preserved semantics: 'mcp' enabled+per-user; every unlisted provider disabled with
+  // the unconfigured mode default (null from modeSnapshot).
   assert.deepEqual(
     many.manifest.find((e) => e.provider === 'mcp'),
-    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'private' },
+    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human' },
   );
   assert.ok(many.manifest
     .filter((e) => e.provider !== 'mcp')
-    .every((e) => e.enabled === false && e.mode === null && e.visibility === 'public'));
+    .every((e) => e.enabled === false && e.mode === null));
 
   // Off-channel (channel null): every snapshot short-circuits to its in-memory fallback — ZERO reads,
-  // every provider enabled with the null/'public' defaults. Pins that a manifest with no channel queries nothing.
+  // every provider enabled with the null mode default. Pins that a manifest with no channel queries nothing.
   const off = countingDb(base);
   const offManifest = await buildToolManifest({
     providerIds: ['mcp', 'other'], registry: new ProviderRegistry(['mcp', 'other'].map(mkProvider)),
@@ -293,8 +292,8 @@ test('buildToolManifest issues a fixed 3 reads regardless of provider count (#20
   });
   assert.deepEqual(off.counts, { get: 0, all: 0 });
   assert.deepEqual(
-    offManifest.map((e) => [e.enabled, e.mode, e.visibility]),
-    [[true, null, 'public'], [true, null, 'public']],
+    offManifest.map((e) => [e.enabled, e.mode]),
+    [[true, null], [true, null]],
   );
 
   // No registered providers means no channel facts can be consumed, so do not touch Postgres.
@@ -306,7 +305,7 @@ test('buildToolManifest issues a fixed 3 reads regardless of provider count (#20
   assert.deepEqual(empty.counts, { get: 0, all: 0 });
 });
 
-test('buildToolManifest dispatches its three independent channel reads together', async () => {
+test('buildToolManifest dispatches its two independent channel reads together', async () => {
   let started = 0;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => { release = resolve; });
@@ -316,9 +315,7 @@ test('buildToolManifest dispatches its three independent channel reads together'
   } as unknown as ChannelTools;
   const channelConfig = {
     getMode: async () => null,
-    getVisibility: async () => 'public' as const,
     modeSnapshot: async () => { started++; await gate; return () => null; },
-    visibilitySnapshot: async () => { started++; await gate; return () => 'public' as const; },
   } as unknown as ChannelConfig;
 
   const pending = buildToolManifest({
@@ -326,7 +323,7 @@ test('buildToolManifest dispatches its three independent channel reads together'
     principal: ID, channel: 'C_FIN',
   });
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(started, 3, 'all batch reads must be dispatched before any one resolves');
+  assert.equal(started, 2, 'all batch reads must be dispatched before any one resolves');
   release();
   await pending;
 });
@@ -340,7 +337,6 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
   }
   class CustomConfig extends ChannelConfig {
     override async getMode(): Promise<'session'> { return 'session'; }
-    override async getVisibility(): Promise<'private'> { return 'private'; }
   }
   const tools = new CustomTools(db);
   const config = new CustomConfig(db);
@@ -350,7 +346,7 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
   });
   assert.equal(await authorizeProvider(undefined, tools, ID, 'C_FIN', 'mcp'), 'tool-disabled');
   assert.deepEqual(manifest[0], {
-    provider: 'mcp', mode: 'session', enabled: false, identity: 'acting_human', visibility: 'private',
+    provider: 'mcp', mode: 'session', enabled: false, identity: 'acting_human',
   });
 
   // isEnabled also delegates to the older public isConfigured hook. Overriding only that hook must
@@ -373,14 +369,13 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
   const legacyTools = { isEnabled: async () => true } as unknown as ChannelTools;
   const legacyConfig = {
     getMode: async () => 'per-user' as const,
-    getVisibility: async () => 'public' as const,
   } as unknown as ChannelConfig;
   const legacy = await buildToolManifest({
     providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: legacyTools,
     channelConfig: legacyConfig, principal: ID, channel: 'C_FIN',
   });
   assert.deepEqual(legacy[0], {
-    provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'public',
+    provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human',
   });
 });
 

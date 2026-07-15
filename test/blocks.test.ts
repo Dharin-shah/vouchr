@@ -367,12 +367,12 @@ test('configModal rejects an over-block view before Slack can truncate or reject
     channel: 'C1',
     connections: [],
     tools: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
-    admin: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user', visibility: 'public' })),
+    admin: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
   }), /Slack modal block limit/);
 });
 
 test('configModal enforces Slack private_metadata independently of the block count', () => {
-  const providers = Array.from({ length: 28 }, (_, index) => {
+  const providers = Array.from({ length: 30 }, (_, index) => {
     const prefix = `p${String(index).padStart(2, '0')}`;
     return prefix + 'x'.repeat(63 - prefix.length);
   });
@@ -380,13 +380,16 @@ test('configModal enforces Slack private_metadata independently of the block cou
     channel: 'C1',
     connections: [],
     tools: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
-    admin: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user', visibility: 'public' })),
+    admin: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
   }) as any;
 
-  const withinLimit = build(providers.slice(0, 27));
+  const withinLimit = build(providers.slice(0, 30));
   assert.ok(withinLimit.blocks.length <= 100);
   assert.ok(withinLimit.private_metadata.length <= 3_000);
-  assert.throws(() => build(providers), /Slack modal private_metadata limit/);
+  assert.throws(() => build(Array.from({ length: 31 }, (_, index) => {
+    const prefix = `p${String(index).padStart(2, '0')}`;
+    return prefix + 'x'.repeat(63 - prefix.length);
+  })), /Slack modal private_metadata limit/);
 });
 
 test('configModal bounds connection buttons and points every omitted row to paged status', () => {

@@ -60,8 +60,8 @@ export interface BrokerManifestResponse {
 }
 
 /** `POST /v1/manifest` — the CHANNEL-SCOPED tool manifest for the verified identity: the same
- *  `ToolManifestEntry` Bolt's `toolManifest()` returns (one core builder feeds both), including the
- *  preview `visibility` the host must honor when posting output. Policy bits only, NO secret. */
+ *  `ToolManifestEntry` Bolt's `toolManifest()` returns (one core builder feeds both). Provider-output
+ *  rendering belongs to the host and is not part of this policy manifest. Policy bits only, NO secret. */
 export interface BrokerChannelManifestResponse {
   tools: ToolManifestEntry[];
 }

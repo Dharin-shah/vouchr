@@ -101,6 +101,8 @@ test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable cont
   assert.equal(view.submit?.text?.text ?? view.submit?.text, 'Save');
   assert.ok(view.blocks.some((b: any) => b.block_id === 'mode:mcp'));
   assert.ok(view.blocks.some((b: any) => b.block_id === 'tool:mcp'));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('preview:')));
+  assert.equal(Object.hasOwn(JSON.parse(view.private_metadata).open[0], 'v'), false);
 });
 
 test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', async (t) => {
@@ -123,12 +125,12 @@ test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', 
 
   const opening = h.openModal();
   await new Promise<void>((resolve) => setImmediate(resolve));
-  // Connection metadata + three manifest snapshots + Slack's admin check all start together.
-  assert.equal(started, 5);
+  // Connection metadata + two manifest snapshots + Slack's admin check all start together.
+  assert.equal(started, 4);
   release();
   const view = await opening;
   assert.equal(view?.callback_id, CONFIG_CALLBACK);
-  assert.equal(started, 5, 'admin rows must reuse the manifest snapshot, not start a sixth read');
+  assert.equal(started, 4, 'admin rows must reuse the manifest snapshot, not start a fifth read');
 });
 
 test('no-arg gives truthful command recovery when views.open fails (never silent)', async (t) => {
@@ -140,7 +142,7 @@ test('no-arg gives truthful command recovery when views.open fails (never silent
 });
 
 test('no-arg gives the same recovery when a supported registry exceeds the modal block limit', async (t) => {
-  const providers = Array.from({ length: 34 }, (_, i) => mkProvider(`provider-${i}`));
+  const providers = Array.from({ length: 47 }, (_, i) => mkProvider(`provider-${i}`));
   const h = await harness(t, { slackAdmin: true, providers });
   let responded = '';
   await h.runCommand('', async (m: string) => { responded = m; });
@@ -149,7 +151,7 @@ test('no-arg gives the same recovery when a supported registry exceeds the modal
 });
 
 test('no-arg gives recovery when valid provider ids exceed Slack private_metadata', async (t) => {
-  const providers = Array.from({ length: 29 }, (_, i) => {
+  const providers = Array.from({ length: 34 }, (_, i) => {
     const prefix = `p${String(i).padStart(2, '0')}`;
     return mkProvider(prefix + 'x'.repeat(63 - prefix.length));
   });
@@ -247,6 +249,26 @@ test('wrong-typed config metadata returns fixed recovery before admin lookup or 
     { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
     async (value: any) => { acked = value; },
     JSON.stringify({ channel: 'C_FIN', open: null }),
+  );
+
+  assert.equal(acked.response_action, 'update');
+  assert.match(JSON.stringify(acked.view), /stale or malformed/);
+  assert.equal(adminLookups, 0);
+  assert.equal(await modeRow(h.lan.db), null);
+  assert.deepEqual(await auditActions(h.lan.db), []);
+});
+
+test('a pre-removal modal carrying preview state is rejected as stale before any mutation', async (t) => {
+  let adminLookups = 0;
+  const h = await harness(t, {
+    slackAdmin: true,
+    usersInfo: async () => { adminLookups++; return { user: { is_admin: true } }; },
+  });
+  let acked: any = null;
+  await h.submit(
+    { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
+    async (value: any) => { acked = value; },
+    JSON.stringify({ channel: 'C_FIN', open: [{ p: 'mcp', m: null, e: true, v: 'private' }] }),
   );
 
   assert.equal(acked.response_action, 'update');

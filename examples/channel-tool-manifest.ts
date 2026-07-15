@@ -51,10 +51,13 @@ export const providers = [github(), jira, payments];
 //
 //   entry.identity === 'acting_human'  → await context.vouchr.connect(entry.provider)
 //   entry.identity === 'service'       → host's own service-to-service call
+//
+// Provider responses are deliberately absent from this policy shape: the trusted host owns
+// redaction, audience, data-loss prevention, and rendering for both identity classes.
 export const exampleManifest: ToolManifestEntry[] = [
-  { provider: 'github', mode: 'per-user', enabled: true, identity: 'acting_human', visibility: 'public' },
-  { provider: 'jira', mode: 'session', enabled: true, identity: 'acting_human', visibility: 'private' },
-  { provider: 'payments', mode: null, enabled: true, identity: 'service', visibility: 'public' },
+  { provider: 'github', mode: 'per-user', enabled: true, identity: 'acting_human' },
+  { provider: 'jira', mode: 'session', enabled: true, identity: 'acting_human' },
+  { provider: 'payments', mode: null, enabled: true, identity: 'service' },
 ];
 
 // Route each tool by its identity: Vouchr brokers the humans, the host runs services.

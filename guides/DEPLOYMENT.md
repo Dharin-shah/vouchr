@@ -72,6 +72,25 @@ npm run pg:down # tear it down
 The schema is owned by the `vouchr migrate` command, and the runtime is DML-only — a deliberate
 split so the long-running process holds no DDL privileges.
 
+### Required v7 → v8 drained cutover
+
+Schema v8 removes Vouchr's private-preview policy and storage. It is a maintenance cutover, not a
+mixed-version rolling upgrade:
+
+1. Update the trusted host first so provider-output redaction, audience, data-loss prevention, and
+   rendering no longer depend on `ToolManifestEntry.visibility` or Vouchr's preview API. Export any
+   policy you need before proceeding; migration permanently drops `channel_preview`.
+2. Quiesce Slack/broker traffic, drain in-flight interactions, and stop **every** v7 replica.
+3. Run the v8 `vouchr migrate` command with the schema-owner role.
+4. Start only v8 replicas, confirm readiness, and restore traffic.
+
+Do not migrate while any v7 process is live: it does not re-check the schema marker after startup
+and would query the table v8 drops. A v8 runtime refuses a v7 marker, and a v7 runtime refuses the v8
+marker, so mixed v7/v8 service and runtime-only rollback are unsupported. Rollback after migration
+requires stopping v8 and restoring the pre-migration database backup before starting v7. Old
+Share/Dismiss buttons cannot publish data after cutover; v8 acknowledges them with fixed expiry
+guidance.
+
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
   and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
@@ -85,8 +104,9 @@ split so the long-running process holds no DDL privileges.
 
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
-  if the database isn't migrated. Run the migrate step (a Job / initContainer) to completion
-  **before** the runtime rolls out.
+  if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
+  Job / initContainer) to completion before new runtime replicas start. For v7 → v8, use the drained
+  maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 

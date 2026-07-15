@@ -1419,11 +1419,11 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   /**
    * `POST /v1/manifest` — the CHANNEL-SCOPED tool manifest for the verified identity (the headless
    * analogue of Bolt's `toolManifest()`, via the SAME core builder so the two can't drift): per
-   * provider, whether it's usable in the claims' channel, its credential mode, who the agent acts as,
-   * and the preview VISIBILITY the host must honor when posting output ('private' → requester-only
-   * with an explicit share). Channel/team come ONLY from the signed claims. Not admin-gated — the
+   * provider, whether it's usable in the claims' channel, its credential mode, and who the agent acts
+   * as. Channel/team come ONLY from the signed claims. Not admin-gated — the
    * same non-secret policy bits `/vouchr tools` shows every channel member. The GET above stays: it
-   * is the channel-independent provider list; this is "what may I do HERE, and how must I post it".
+   * is the channel-independent provider list; this is "what may I do here". Provider-output
+   * rendering belongs to the host and is deliberately absent from Vouchr's manifest.
    */
   async function handleChannelManifest(body: { identityToken: string }): Promise<BrokerChannelManifestResponse> {
     const claims = await verify(body.identityToken);
