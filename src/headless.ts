@@ -89,6 +89,14 @@ export type { PolicyRule } from './core/policy';
 export { ChannelTools } from './core/tools';
 export type { ToolManifestEntry } from './core/tools';
 export type { Resolvers, EventSink, VouchrEvent } from './core/injector';
+export { ResolverFailedError } from './core/injector';
+export { SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
+export type {
+  SecretReference,
+  SecretReferenceErrorCode,
+  SecretReferenceInput,
+  SecretReferenceSource,
+} from './core/reference';
 // Rate limiting at the injection boundary: the broker maps RateLimitedError to 429 + Retry-After;
 // the store type lets a scaled deployment plug a shared backend via BrokerOptions.rateLimitStore.
 export { RateLimitedError } from './core/rateLimit';

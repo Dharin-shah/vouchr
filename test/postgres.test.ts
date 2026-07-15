@@ -11,6 +11,7 @@ import { sweepExpired } from '../src/core/sweep';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { github, defineProvider } from '../src/core/providers';
 import { ConnectionHandle } from '../src/core/injector';
+import { configureChannelCredential, setChannelCredentialMode } from '../src/core/channelCredential';
 import { openTestDb, testDbUrl, pgReachable } from './support/pg';
 
 // Runs the security-critical invariants against a REAL Postgres (not a mock).
@@ -23,6 +24,86 @@ import { openTestDb, testDbUrl, pgReachable } from './support/pg';
 const SKIP = 'Postgres not reachable. Run `npm run pg:up` to exercise the PG backend';
 const KEY = randomBytes(32);
 const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+
+test('postgres backend: channel setup and mode changes serialize in both race directions', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const url = await testDbUrl(t);
+  const dbA = await openDb({ databaseUrl: url });
+  const dbB = await openDb({ databaseUrl: url });
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+
+  const identity = { enterpriseId: null, teamId: 'TL', userId: 'UA' };
+  const channel = 'CL';
+  const vaultA = new Vault(dbA, KEY);
+  const vaultB = new Vault(dbB, KEY);
+  const auditA = new Audit(dbA);
+  const auditB = new Audit(dbB);
+  const conflict = (mode: 'per-user' | 'session'): never => { throw new Error(`mode conflict: ${mode}`); };
+
+  // Mode wins the lock: it deletes the old shared row and pauses before writing per-user. A setup
+  // on the other pool must wait, then observe per-user and refuse instead of resurrecting a row.
+  const modeFirst = 'mode-first';
+  const configA = new ChannelConfig(dbA);
+  const configB = new ChannelConfig(dbB);
+  await configureChannelCredential({
+    vault: vaultA, audit: auditA, channelConfig: configA, identity, channel, providerId: modeFirst,
+    credential: { kind: 'secret', token: tok('old-shared') }, modeConflict: conflict,
+  });
+  let modeEntered!: () => void;
+  let releaseMode!: () => void;
+  const atModeWrite = new Promise<void>((resolve) => { modeEntered = resolve; });
+  const modeGate = new Promise<void>((resolve) => { releaseMode = resolve; });
+  const setModeA = configA.setMode.bind(configA);
+  configA.setMode = async (...args) => {
+    if (args[2] === modeFirst && args[3] === 'per-user') { modeEntered(); await modeGate; }
+    return setModeA(...args);
+  };
+  const modeChange = setChannelCredentialMode({
+    vault: vaultA, audit: auditA, channelConfig: configA, identity, channel,
+    providerId: modeFirst, mode: 'per-user',
+  });
+  await atModeWrite;
+  let setupSettled = false;
+  const lateSetup = configureChannelCredential({
+    vault: vaultB, audit: auditB, channelConfig: configB, identity, channel, providerId: modeFirst,
+    credential: { kind: 'secret', token: tok('late-shared') }, modeConflict: conflict,
+  }).finally(() => { setupSettled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(setupSettled, false, 'setup did not wait for the in-flight mode transaction');
+  releaseMode();
+  await modeChange;
+  await assert.rejects(lateSetup, /mode conflict: per-user/);
+  assert.equal(await configB.getMode(identity.teamId, channel, modeFirst), 'per-user');
+  assert.equal(await vaultB.get(channelOwner(identity.teamId, channel), modeFirst), null);
+
+  // Setup wins the lock: mode waits until the shared row+mode commit, then atomically deletes that
+  // row while moving to per-user. The final state can never retain a dormant shared credential.
+  const setupFirst = 'setup-first';
+  let setupEntered!: () => void;
+  let releaseSetup!: () => void;
+  const atSetupModeWrite = new Promise<void>((resolve) => { setupEntered = resolve; });
+  const setupGate = new Promise<void>((resolve) => { releaseSetup = resolve; });
+  configA.setMode = async (...args) => {
+    if (args[2] === setupFirst && args[3] === 'shared') { setupEntered(); await setupGate; }
+    return setModeA(...args);
+  };
+  const setup = configureChannelCredential({
+    vault: vaultA, audit: auditA, channelConfig: configA, identity, channel, providerId: setupFirst,
+    credential: { kind: 'secret', token: tok('new-shared') }, modeConflict: conflict,
+  });
+  await atSetupModeWrite;
+  let modeSettled = false;
+  const lateMode = setChannelCredentialMode({
+    vault: vaultB, audit: auditB, channelConfig: configB, identity, channel,
+    providerId: setupFirst, mode: 'per-user',
+  }).finally(() => { modeSettled = true; });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  assert.equal(modeSettled, false, 'mode change did not wait for the in-flight setup transaction');
+  releaseSetup();
+  await Promise.all([setup, lateMode]);
+  assert.equal(await configB.getMode(identity.teamId, channel, setupFirst), 'per-user');
+  assert.equal(await vaultB.get(channelOwner(identity.teamId, channel), setupFirst), null);
+});
 
 test('postgres backend: isolation · crypto-at-rest · reference · ttl · consent · config', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);

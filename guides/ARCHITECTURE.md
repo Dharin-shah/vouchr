@@ -179,6 +179,9 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
 model `connect()` uses for a provider in a channel: `per-user` (the default), `shared` (route to the
 channel credential), or `session`. `connect()` resolves the mode and routes accordingly, so the
 model is configured in Slack (`/vouchr mode <provider> <mode>`), not hardcoded in the agent. In
+PostgreSQL, shared-credential setup and mode changes take the same owner/provider advisory lock and
+commit the credential row, mode, satellite cleanup, and audit together. A mode change to `per-user`
+or `session` therefore cannot race setup into leaving a dormant shared credential. In
 `session` mode `connect()` adds an authorization gate before the credential is resolved: the
 provider is usable only inside the Slack thread the user approved it in (a grant keyed
 `(team_id, channel, thread, user_id, provider)`), with a TTL ceiling. Grants live in `session_grant`,

@@ -256,8 +256,15 @@ export class Vault {
    *  conditional statement, not a recheck-then-write (which leaves a check/write race) — makes the
    *  final credential write refuse to resurrect an offboarded user. Same rule as
    *  {@link tombstoneBlocks}, expressed in SQL because it must be atomic with the INSERT. Returns
-   *  true when the credential was written; false only when the gate refused it (offboarded). */
-  async upsert(owner: Owner, provider: string, t: StoredToken, gate?: { mintedAt: number }): Promise<boolean> {
+   *  true when the credential was written; false only when the gate refused it (offboarded).
+   *  `afterWrite` composes trusted config/audit companions into the same transaction. */
+  async upsert(
+    owner: Owner,
+    provider: string,
+    t: StoredToken,
+    gate?: { mintedAt: number },
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<boolean> {
     const now = Date.now();
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
@@ -292,6 +299,7 @@ export class Vault {
       );
       if (gate && changes === 0) return false; // the tombstone gate refused the write — nothing landed
       await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
+      await afterWrite?.(tx);
       return true;
     });
   }
@@ -413,6 +421,23 @@ export class Vault {
   get crossProcessRefresh(): boolean { return !!this.db.withRefreshLock; }
 
   /**
+   * Serialize one credential's lifecycle across replicas and run `fn` in the same transaction as
+   * the advisory lock. Channel mode changes and credential setup use this boundary so neither can
+   * commit against a stale view of the other; refresh delegates to the same owner/provider key.
+   * A transaction-bound Vault has no lock method and simply reuses its current transaction.
+   */
+  async withCredentialLock<T>(
+    owner: Owner,
+    provider: string,
+    fn: (locked: Vault, tx: Db) => Promise<T>,
+  ): Promise<T> {
+    const run = (tx: Db) => fn(new Vault(tx, this.key, this.ttl, this.envelope), tx);
+    const key = `${owner.teamId}:${owner.kind}:${owner.id}:${provider}`;
+    if (this.db.withRefreshLock) return this.db.withRefreshLock(key, run);
+    return this.mutation(run);
+  }
+
+  /**
    * Run `fn` while holding the cross-process refresh lock for (owner, provider), with the vault
    * rebound to the locked transaction so `fn`'s reads/writes (get/updateTokens) see the same tx.
    * A Db without `withRefreshLock` (a tx-bound client already inside a transaction) is a passthrough
@@ -421,9 +446,7 @@ export class Vault {
    * agree on identity.
    */
   async withRefreshLock<T>(owner: Owner, provider: string, fn: (locked: Vault) => Promise<T>): Promise<T> {
-    if (!this.db.withRefreshLock) return fn(this);
-    const key = `${owner.teamId}:${owner.kind}:${owner.id}:${provider}`;
-    return this.db.withRefreshLock(key, (txDb) => fn(new Vault(txDb, this.key, this.ttl, this.envelope)));
+    return this.withCredentialLock(owner, provider, (locked) => fn(locked));
   }
 
   /** Mark a connection as used now (resets the idle timer). Called after each injection. */

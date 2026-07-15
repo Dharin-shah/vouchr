@@ -82,6 +82,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Credential setup and governance now acknowledge Slack before dependency work.** Secret and
+  settings modals perform only pure payload validation before `ack`; database, KMS, Slack API, and
+  admin lookups run afterward. A private pending view preserves unknown-state recovery if both the
+  result update and fallback DM fail; receipts distinguish confirmed from unconfirmed batch results.
+  `createVouchr` modals advertise only external-reference sources configured in that Bolt process
+  (otherwise they show raw-key input only), while the exported builders retain a reference-capable
+  default for custom control planes. Shared credential setup and mode changes now use one
+  owner/provider advisory transaction, so a user-owned mode cannot race into a live shared
+  credential. Headless reference errors add stable machine codes, including `resolver_failed`,
+  without exposing resolver text or stored references.
+
 - **Truthful, safe `/vouchr` command surface** (#194, commands & rendering). Added `/vouchr help`
   (lists the retained command surface without promoting private previews); an unrecognized subcommand now returns an actionable hint instead
   of silently falling through to the account list. `/vouchr disconnect` validates the provider **before**
@@ -414,8 +425,9 @@ All notable changes to this project are documented here. This project adheres to
   and HashiCorp Vault references are accepted; the resolver source is derived server-side; an
   optional legacy `source` must match; scopes must be a bounded unique subset of the provider's
   declared scopes; and an own configured resolver function is required without being invoked during
-  configuration. The credential row, channel mode, and config audit now commit in one transaction,
-  so any failed step rolls the whole configuration back. Reference-validation and just-in-time
+  configuration. The credential row, channel mode, and config audit now commit in one advisory-locked
+  transaction shared with mode changes, so any failed step rolls back and concurrent mode flips
+  cannot strand or reactivate a shared credential. Reference-validation and just-in-time
   resolver failures use fixed non-reflective errors and cannot expose custom resolver text or the
   stored reference through direct handles. Failed configuration creates no credential, channel
   mode, or audit row. HashiCorp

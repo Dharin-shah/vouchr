@@ -1,6 +1,7 @@
 import type { AuditRow, StatsRow } from '../core/audit';
 import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
 import { isBrokeredProvider } from '../core/providers';
+import { SECRET_REFERENCE_SOURCES, type SecretReferenceSource } from '../core/reference';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -208,34 +209,54 @@ export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
  *  dead after the 10-min state TTL, and the 24h DM debounce would leave no recovery path). */
 export const RECONNECT_ACTION = 'vouchr_reconnect';
 
-/** The two leak-safe secret-entry fields: an external reference (preferred) OR a raw key. */
-function secretFields(): unknown[] {
-  return [
-    {
+const REFERENCE_COPY: Record<SecretReferenceSource, { label: string; placeholder: string }> = {
+  'aws-sm': { label: 'AWS Secrets Manager ARN', placeholder: 'arn:aws:secretsmanager:…' },
+  'gcp-sm': { label: 'GCP Secret Manager', placeholder: 'gcp-sm://projects/…/versions/latest' },
+  'azure-kv': { label: 'Azure Key Vault', placeholder: 'azure-kv://vault-name/secret-name' },
+  vault: { label: 'HashiCorp Vault', placeholder: 'vault://mount/path#field' },
+};
+
+/** The leak-safe secret-entry fields. A reference is offered only when this Bolt process has a
+ * matching resolver; otherwise the modal truthfully presents raw-key storage as the only path. */
+function secretFields(referenceSources: readonly SecretReferenceSource[]): unknown[] {
+  const configured = SECRET_REFERENCE_SOURCES.filter((source) => referenceSources.includes(source));
+  const fields: unknown[] = [];
+  if (configured.length) {
+    fields.push({
       type: 'input',
       optional: true,
       block_id: 'ref',
       label: { type: 'plain_text', text: 'External secret reference' },
       hint: {
         type: 'plain_text',
-        text: 'Preferred: an AWS Secrets Manager ARN. Rotation stays in AWS; Vouchr stores only the pointer.',
+        text: `Preferred. Available here: ${configured.map((source) => REFERENCE_COPY[source].label).join(', ')}. Vouchr stores only the pointer.`,
       },
-      element: { type: 'plain_text_input', action_id: 'v', placeholder: { type: 'plain_text', text: 'arn:aws:secretsmanager:…' } },
-    },
-    {
-      type: 'input',
-      optional: true,
-      block_id: 'raw',
-      label: { type: 'plain_text', text: '…or paste a key directly' },
-      hint: {
-        type: 'plain_text',
-        // Note: Block Kit has no masked input. The value is never echoed back, posted, or
-        // logged, but a reference is still preferable.
-        text: 'Stored encrypted by Vouchr. Use a reference instead when your secret manager can hold it.',
+      element: {
+        type: 'plain_text_input',
+        action_id: 'v',
+        placeholder: {
+          type: 'plain_text',
+          text: configured.length === 1 ? REFERENCE_COPY[configured[0]].placeholder : 'Paste a supported reference',
+        },
       },
-      element: { type: 'plain_text_input', action_id: 'v' },
+    });
+  }
+  fields.push({
+    type: 'input',
+    optional: true,
+    block_id: 'raw',
+    label: { type: 'plain_text', text: configured.length ? '…or paste a key directly' : 'Paste a key directly' },
+    hint: {
+      type: 'plain_text',
+      // Note: Block Kit has no masked input. The value is never echoed back, posted, or
+      // logged, but a reference is still preferable when a resolver is available.
+      text: configured.length
+        ? 'Stored encrypted by Vouchr. Use a reference instead when your secret manager can hold it.'
+        : 'Stored encrypted by Vouchr. The value is never posted or shown to the agent.',
     },
-  ];
+    element: { type: 'plain_text_input', action_id: 'v' },
+  });
+  return fields;
 }
 
 /**
@@ -243,7 +264,13 @@ function secretFields(): unknown[] {
  * never posted, logged, or put in audit meta. `meta` rides in private_metadata so the submit
  * binds to the right owner (a channel for admin config, or nothing for a per-user key).
  */
-function secretModal(o: { callbackId: string; meta: object; title: string; intro: string }): unknown {
+function secretModal(o: {
+  callbackId: string;
+  meta: object;
+  title: string;
+  intro: string;
+  referenceSources: readonly SecretReferenceSource[];
+}): unknown {
   return {
     type: 'modal',
     callback_id: o.callbackId,
@@ -251,17 +278,32 @@ function secretModal(o: { callbackId: string; meta: object; title: string; intro
     title: { type: 'plain_text', text: o.title },
     submit: { type: 'plain_text', text: 'Save' },
     close: { type: 'plain_text', text: 'Cancel' },
-    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: o.intro } }, ...secretFields()],
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text: o.intro } }, ...secretFields(o.referenceSources)],
+  };
+}
+
+/** Private acknowledgement/result surface for work that must continue after Slack's 3s deadline. */
+export function privateStatusModal(title: string, text: string): unknown {
+  return {
+    type: 'modal',
+    title: { type: 'plain_text', text: title },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }],
   };
 }
 
 /** Admin modal: set the CHANNEL's shared credential (invariant 7, admin-gated upstream). */
-export function configureModal(provider: string, channel: string): unknown {
+export function configureModal(
+  provider: string,
+  channel: string,
+  referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
+): unknown {
   const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: CONFIGURE_CALLBACK,
     meta: { channel, provider },
     title: 'Channel credential',
+    referenceSources,
     intro:
       `Set the *${p}* credential for this channel. Only you can see what you ` +
       `type here. It is never posted to the channel.`,
@@ -269,12 +311,16 @@ export function configureModal(provider: string, channel: string): unknown {
 }
 
 /** Self-service modal: a user sets their OWN credential for a key-based provider. */
-export function userKeyModal(provider: string): unknown {
+export function userKeyModal(
+  provider: string,
+  referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
+): unknown {
   const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: USER_KEY_CALLBACK,
     meta: { provider },
     title: 'Your credential',
+    referenceSources,
     intro:
       `Set your own *${p}* key. Only you can see this; it is stored encrypted and used ` +
       `only when you ask the agent, never shown to the agent or posted in Slack.`,

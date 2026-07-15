@@ -70,6 +70,16 @@ test('setUserSecret: secret never leaks to audit/return', async (t) => {
   assert.deepEqual((await auditRows(db)).map((r) => r.action), ['config']);
 });
 
+test('setUserSecret preserves the prior credential when a replacement audit fails', async (t) => {
+  const { c, db, vault, audit } = await ctx(t);
+  await c.setUserSecret('customdb', 'previous-key');
+  audit.record = async () => { throw new Error('audit unavailable'); };
+
+  await assert.rejects(() => c.setUserSecret('customdb', SECRET), /audit unavailable/);
+  assert.equal((await vault.get(userOwner(ID), 'customdb'))?.accessToken, 'previous-key');
+  assert.deepEqual((await auditRows(db)).map((row) => row.action), ['config']);
+});
+
 // referenceUserSecret stores a non-secret pointer under the user.
 test('referenceUserSecret: external ref under the user, no secret stored', async (t) => {
   const { c, db, vault } = await ctx(t);

@@ -336,7 +336,11 @@ boundary. Both reference routes accept only bounded, structurally valid AWS Secr
 Secret Manager, Azure Key Vault, or HashiCorp Vault reference forms, derive the resolver source
 server-side, and require that resolver to be configured before any credential, channel mode, or
 audit row is written. Raw secret values are rejected; the configured resolver is invoked only when
-the credential is used. Programmatic channel-governance routes sit behind a signed admin claim.
+the credential is used. Validation failures carry a stable `code`; a just-in-time resolver failure
+returns `resolver_failed` without exposing resolver text or the stored reference. Programmatic
+channel-governance routes sit behind a signed admin claim. Bolt and the packaged broker order
+shared setup and mode changes through `Vault.withCredentialLock()`; custom low-level control planes
+should use the same owner/provider transaction boundary rather than calling the stores separately.
 Providers that ship as MCP servers over Streamable HTTP get a dedicated stateless proxy,
 `POST /v1/mcp` — the same gates that are actually
 wired on the chosen broker path, plus credential injection, SSE passthrough, and `Mcp-Session-Id` relay.

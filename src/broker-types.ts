@@ -10,6 +10,7 @@
 import type { ChannelMode } from './core/channelConfig';
 import type { AuditRow } from './core/audit';
 import type { ToolManifestEntry } from './core/tools';
+import type { SecretReferenceErrorCode } from './core/reference';
 
 /** Coarse per-provider consent state — no secret, existence + state only. */
 export type BrokerConsentState = 'connected' | 'needs_consent';
@@ -18,6 +19,8 @@ export type BrokerConsentState = 'connected' | 'needs_consent';
  *  exception: `/readyz` returns only `{ ok: false }`, with no diagnostic text. */
 export interface BrokerError {
   error: string;
+  /** Stable machine-readable classification for reference configuration/resolution failures. */
+  code?: SecretReferenceErrorCode | 'resolver_failed';
   /** On a 429 (rate limit) or 503 (in-flight ceiling): the broker's retry hint in milliseconds.
    *  The same value, rounded up to whole seconds, rides the `Retry-After` response header. */
   retryAfterMs?: number;

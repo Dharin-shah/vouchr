@@ -1531,6 +1531,7 @@ test('#53 no raw secret is accepted in place of a supported reference', async (t
       handle: { provider: 'acme' }, identityToken: adminToken(), secretRef: SECRET_TOKEN,
     });
     assert.equal(r.status, 400);
+    assert.equal(r.json.code, 'invalid_reference');
     assert.ok(!r.raw.includes(SECRET_TOKEN));
   } finally {
     server.close();
@@ -1557,16 +1558,16 @@ test('#53 both reference routes reject non-object JSON with a fixed 400 and no s
 
 test('#53 admin reference rejects invalid input before connection, mode, or audit state', async (t) => {
   const sentinel = 'sk_live_ADMIN_REFERENCE_SENTINEL';
-  const cases: Array<{ body: Record<string, unknown>; noResolver?: boolean }> = [
-    { body: { secretRef: sentinel } },
-    { body: { secretRef: `${AWS_ADMIN_REF} ${sentinel}` } },
-    { body: { secretRef: 'gcp-sm://projects/../secrets/s/versions/latest' } },
-    { body: { secretRef: AWS_ADMIN_REF, source: sentinel } },
-    { body: { secretRef: AWS_ADMIN_REF, scopes: sentinel } },
-    { body: { secretRef: AWS_ADMIN_REF, scopes: `${sentinel}\nread` } },
-    { body: { secretRef: AWS_ADMIN_REF + 'x'.repeat(MAX_SECRET_REFERENCE_BYTES) } },
-    { body: { secretRef: { sentinel } } },
-    { body: { secretRef: AWS_ADMIN_REF }, noResolver: true },
+  const cases: Array<{ body: Record<string, unknown>; code: string; noResolver?: boolean }> = [
+    { body: { secretRef: sentinel }, code: 'invalid_reference' },
+    { body: { secretRef: `${AWS_ADMIN_REF} ${sentinel}` }, code: 'invalid_reference' },
+    { body: { secretRef: 'gcp-sm://projects/../secrets/s/versions/latest' }, code: 'invalid_reference' },
+    { body: { secretRef: AWS_ADMIN_REF, source: sentinel }, code: 'source_mismatch' },
+    { body: { secretRef: AWS_ADMIN_REF, scopes: sentinel }, code: 'invalid_scopes' },
+    { body: { secretRef: AWS_ADMIN_REF, scopes: `${sentinel}\nread` }, code: 'invalid_scopes' },
+    { body: { secretRef: AWS_ADMIN_REF + 'x'.repeat(MAX_SECRET_REFERENCE_BYTES) }, code: 'invalid_reference' },
+    { body: { secretRef: { sentinel } }, code: 'invalid_reference' },
+    { body: { secretRef: AWS_ADMIN_REF }, code: 'resolver_unavailable', noResolver: true },
   ];
 
   for (const entry of cases) {
@@ -1579,6 +1580,7 @@ test('#53 admin reference rejects invalid input before connection, mode, or audi
         handle: { provider: 'acme' }, identityToken: adminToken(), ...entry.body,
       });
       assert.equal(r.status, 400);
+      assert.equal(r.json.code, entry.code);
       assert.ok(!r.raw.includes(sentinel), 'fixed validation response must not reflect caller input');
       assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
       assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
@@ -1710,6 +1712,62 @@ test('#58 user reference stores the acting user\'s ref; their fetch resolves it 
     assert.equal(resolverCalls, 1);
     assert.equal(up.seen[0].auth, `Bearer ${SECRET_TOKEN}`);
     assert.ok(!r.raw.includes(SECRET_TOKEN) && !f.raw.includes(SECRET_TOKEN));
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#58 resolver failure returns a stable code without resolver text or the reference', async (t) => {
+  const sentinel = 'ghp_RESOLVER_WIRE_SENTINEL';
+  const { server, port } = await makeRefBroker(t, {
+    resolvers: { 'aws-sm': async () => { throw new Error(`${sentinel}:${AWS_USER_REF}`); } },
+  });
+  try {
+    const configured = await post(port, '/v1/user/reference', {
+      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET), secretRef: AWS_USER_REF,
+    });
+    assert.equal(configured.status, 200);
+    const response = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'GET',
+      path: '/x',
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.ok(!response.raw.includes(sentinel));
+    assert.ok(!response.raw.includes(AWS_USER_REF));
+  } finally {
+    server.close();
+  }
+});
+
+test('#58 malformed stored reference returns resolver_failed before resolver or provider I/O', async (t) => {
+  const malformed = 'arn:aws:secretsmanager:malformed-reference-sentinel';
+  let resolverCalls = 0;
+  const { server, port, vault } = await makeRefBroker(t, {
+    resolvers: { 'aws-sm': async () => { resolverCalls++; return SECRET_TOKEN; } },
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    // Simulate a legacy row written before the public reference validator existed.
+    await vault.reference(
+      userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+      'acme',
+      { source: 'aws-sm', secretRef: malformed },
+    );
+    const response = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'GET',
+      path: '/x',
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.equal(resolverCalls, 0);
+    assert.equal(up.seen.length, 0);
+    assert.ok(!response.raw.includes(malformed));
   } finally {
     up.restore();
     server.close();

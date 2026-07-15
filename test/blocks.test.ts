@@ -221,6 +221,27 @@ test('credential and session renderers escape mrkdwn but preserve literal intera
   assert.deepEqual(JSON.parse(sessionButton.value), { provider, thread: 'TH1' });
 });
 
+test('credential modals advertise only reference sources available in their process', () => {
+  const compatibleDefault = configureModal('acme', 'C1') as any;
+  assert.equal(compatibleDefault.blocks.some((block: any) => block.block_id === 'ref'), true);
+
+  const rawOnly = configureModal('acme', 'C1', []) as any;
+  assert.equal(rawOnly.blocks.some((block: any) => block.block_id === 'ref'), false);
+  assert.equal(rawOnly.blocks.find((block: any) => block.block_id === 'raw').label.text, 'Paste a key directly');
+
+  const gcp = userKeyModal('acme', ['gcp-sm']) as any;
+  const gcpRef = gcp.blocks.find((block: any) => block.block_id === 'ref');
+  assert.match(gcpRef.hint.text, /GCP Secret Manager/);
+  assert.ok(!gcpRef.hint.text.includes('AWS'));
+  assert.equal(gcpRef.element.placeholder.text, 'gcp-sm://projects/…/versions/latest');
+
+  const multi = configureModal('acme', 'C1', ['azure-kv', 'vault']) as any;
+  const multiRef = multi.blocks.find((block: any) => block.block_id === 'ref');
+  assert.match(multiRef.hint.text, /Azure Key Vault/);
+  assert.match(multiRef.hint.text, /HashiCorp Vault/);
+  assert.equal(multiRef.element.placeholder.text, 'Paste a supported reference');
+});
+
 test('auditBlocks escapes a caller-supplied heading when the empty state renders it as mrkdwn', () => {
   const text = sectionTexts(auditBlocks([], '<!channel> & usage'))[0];
   assert.doesNotMatch(text, /<!channel>/);
