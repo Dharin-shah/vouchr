@@ -18,7 +18,10 @@ export class Policy {
   ) {}
 
   check(provider: string, channel: string | null): boolean {
-    const r = this.rules[provider];
+    // Provider ids such as "constructor" and "toString" are valid conservative identifiers. Only
+    // an OWN rule counts; inherited Object.prototype properties must use the documented no-rule
+    // fallback instead of being mistaken for policy configuration.
+    const r = Object.hasOwn(this.rules, provider) ? this.rules[provider] : undefined;
     if (!r) return !this.opts.defaultDeny;
     if (channel && r.denyChannels?.includes(channel)) return false;
     if (r.defaultAllow) return true;
