@@ -2,8 +2,9 @@ import { isOAuthScopeToken } from './providers';
 import type { Vault } from './vault';
 import type { Audit } from './audit';
 import type { SlackIdentity } from './identity';
-import { channelOwner, userOwner } from './owner';
+import { userOwner } from './owner';
 import type { ChannelConfig, ChannelMode } from './channelConfig';
+import { configureChannelCredential } from './channelCredential';
 
 export const SECRET_REFERENCE_SOURCES = ['aws-sm', 'gcp-sm', 'azure-kv', 'vault'] as const;
 export type SecretReferenceSource = (typeof SECRET_REFERENCE_SOURCES)[number];
@@ -194,28 +195,14 @@ export async function referenceChannelCredential(input: {
 }): Promise<void> {
   await input.authorize();
   await input.assertEligible();
-  await input.vault.reference(
-    channelOwner(input.identity.teamId, input.channel),
-    input.providerId,
-    input.reference,
-    async (tx) => {
-      const mode = await input.channelConfig.getMode(
-        input.identity.teamId,
-        input.channel,
-        input.providerId,
-        tx,
-      );
-      if (mode != null && mode !== 'shared') input.modeConflict(mode);
-      await input.channelConfig.setMode(
-        input.identity.teamId,
-        input.channel,
-        input.providerId,
-        'shared',
-        tx,
-      );
-      await input.audit.record('config', input.identity, input.providerId, {
-        owner: 'channel', channel: input.channel, mode: 'shared', kind: 'ref', source: input.reference.source,
-      }, undefined, tx);
-    },
-  );
+  await configureChannelCredential({
+    vault: input.vault,
+    audit: input.audit,
+    channelConfig: input.channelConfig,
+    identity: input.identity,
+    channel: input.channel,
+    providerId: input.providerId,
+    credential: { kind: 'ref', reference: input.reference },
+    modeConflict: input.modeConflict,
+  });
 }

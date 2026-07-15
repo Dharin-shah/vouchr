@@ -28,6 +28,7 @@ async function harness(t: TestContext, opts: {
   db?: Db;
   usersInfo?: () => Promise<unknown>;
   updateThrows?: boolean;
+  dmThrows?: boolean;
 } = {}) {
   const { slackAdmin = false, providers = [provider], policy } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
@@ -53,7 +54,10 @@ async function harness(t: TestContext, opts: {
         updated = a;
       },
     },
-    chat: { postMessage: async (a: any) => { dms.push(String(a?.text ?? '')); } },
+    chat: { postMessage: async (a: any) => {
+      if (opts.dmThrows) throw new Error('dm_failed');
+      dms.push(String(a?.text ?? ''));
+    } },
   };
   const body = { team: { id: 'T1' }, user: { id: ID.userId } };
   const defaultMeta = JSON.stringify({ channel: 'C_FIN', open: [] });
@@ -62,8 +66,13 @@ async function harness(t: TestContext, opts: {
     /** Run no-arg `/vouchr`, return the opened modal view (with its real private_metadata). */
     openModal: async () => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
     runCommand: (text: string, respond?: any) => command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text }, ack: async () => {}, respond: respond ?? (async () => {}), client }),
-    submit: (state: any, ack: any, privateMetadata: string = defaultMeta) => {
-      const view = { callback_id: CONFIG_CALLBACK, private_metadata: privateMetadata, state: { values: state } };
+    submit: (state: any, ack: any, privateMetadata: string = defaultMeta, viewId?: string) => {
+      const view = {
+        callback_id: CONFIG_CALLBACK,
+        private_metadata: privateMetadata,
+        state: { values: state },
+        ...(viewId ? { id: viewId } : {}),
+      };
       return views[CONFIG_CALLBACK]({ ack, body: { ...body, view }, view, client });
     },
     disconnect: (ack: any, view: any, value = 'mcp') => actions[DISCONNECT_ACTION]({ ack, body: { ...body, actions: [{ value }], view }, client }),
@@ -184,9 +193,10 @@ test('admin mode change via the modal == /vouchr mode: same channel_config + aud
   assert.deepEqual(await auditActions(viaCommand.lan.db), ['config']);
 
   const viaModal = await harness(t, { slackAdmin: true });
-  let acked = 'unset';
+  let acked: any = null;
   await viaModal.submit({ 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } }, async (r?: any) => (acked = r ?? 'ack'));
-  assert.equal(acked, 'ack');
+  assert.equal(acked.response_action, 'update');
+  assert.match(JSON.stringify(acked.view), /Updating settings/);
   assert.equal(await modeRow(viaModal.lan.db), 'per-user');
   assert.deepEqual(await auditActions(viaModal.lan.db), ['config']);
 });
@@ -209,11 +219,48 @@ test('a partially applied config batch reports confirmed and unconfirmed counts 
   assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
+test('config submit leaves private unknown-state recovery when result update and DM both fail', async (t) => {
+  const h = await harness(t, { slackAdmin: true, updateThrows: true, dmThrows: true });
+  let acked: any = null;
+  await h.submit(
+    { 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } },
+    async (value: any) => { acked = value; },
+    undefined,
+    'V_RESULT',
+  );
+
+  assert.equal(await modeRow(h.lan.db), 'per-user', 'the database mutation committed');
+  assert.equal(acked.response_action, 'update');
+  assert.match(JSON.stringify(acked.view), /If no result appears here/);
+  assert.deepEqual(h.dms, []);
+  assert.equal(h.updated(), null);
+});
+
+test('wrong-typed config metadata returns fixed recovery before admin lookup or mutation', async (t) => {
+  let adminLookups = 0;
+  const h = await harness(t, {
+    slackAdmin: true,
+    usersInfo: async () => { adminLookups++; return { user: { is_admin: true } }; },
+  });
+  let acked: any = null;
+  await h.submit(
+    { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
+    async (value: any) => { acked = value; },
+    JSON.stringify({ channel: 'C_FIN', open: null }),
+  );
+
+  assert.equal(acked.response_action, 'update');
+  assert.match(JSON.stringify(acked.view), /stale or malformed/);
+  assert.equal(adminLookups, 0);
+  assert.equal(await modeRow(h.lan.db), null);
+  assert.deepEqual(await auditActions(h.lan.db), []);
+});
+
 test('forged invalid mode value is ignored server-side, never persisted', async (t) => {
   const h = await harness(t, { slackAdmin: true });
-  let acked = 'unset';
+  let acked: any = null;
   await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'evil-mode' } } } }, async (r?: any) => (acked = r ?? 'ack'));
-  assert.equal(acked, 'ack');
+  assert.equal(acked.response_action, 'update');
   assert.equal(await modeRow(h.lan.db), null);
   assert.deepEqual(await auditActions(h.lan.db), []);
 });

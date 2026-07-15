@@ -11,7 +11,7 @@ import {
 import { EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError } from '../src/core/injector';
 import { SecretReferenceError } from '../src/core/reference';
 import { defineProvider } from '../src/core/providers';
-import { USER_KEY_CALLBACK, CONFIGURE_CALLBACK } from '../src/adapters/blocks';
+import { USER_KEY_CALLBACK, CONFIGURE_CALLBACK, SETUP_KEY_ACTION } from '../src/adapters/blocks';
 
 // A key provider that brokers (non-service) — enough to exercise the /vouchr command + channel modal.
 const acme = () => defineProvider({
@@ -104,12 +104,81 @@ test('modal submit: a throwing KMS envelope never leaks the secret to the user',
     client: { chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } } },
   });
 
-  assert.equal(ackValue, undefined);
+  assert.equal(ackValue.response_action, 'update');
+  assert.match(JSON.stringify(ackValue.view), /If no result appears here/);
   assert.equal(dms.length, 1);
   const shown = JSON.stringify(dms);
   assert.ok(!shown.includes('ghp_abc'), 'secret must not reach the modal error');
   assert.match(dms[0], /Could not save your \*customdb\* credential/);
   assert.match(dms[0], /Something went wrong \(KmsWrapError\)\./);
+});
+
+test('raw-only credential modal targets generic validation errors at its rendered raw block', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const provider = defineProvider({
+    id: 'customdb', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false,
+  });
+  const vouchr = await createVouchr({
+    providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t),
+  });
+  let submit: any;
+  vouchr.registerCommands({
+    command: () => undefined,
+    view: (id: string, h: any) => { if (id === USER_KEY_CALLBACK) submit = h; },
+    action: () => undefined,
+  });
+
+  for (const entry of [
+    { body: { team: { id: 'T1' }, user: { id: 'U1' } }, metadata: '{' },
+    { body: {}, metadata: JSON.stringify({ provider: 'customdb' }) },
+  ]) {
+    let acked: any = null;
+    await submit({
+      ack: async (value: any) => { acked = value; },
+      body: entry.body,
+      view: {
+        private_metadata: entry.metadata,
+        state: { values: { raw: { v: { value: 'synthetic-key' } } } },
+      },
+      client: {},
+    });
+    assert.equal(acked.response_action, 'errors');
+    assert.equal(typeof acked.errors.raw, 'string');
+    assert.equal(acked.errors.ref, undefined);
+  }
+});
+
+test('stale key-setup action returns fixed private recovery instead of disappearing', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const provider = defineProvider({
+    id: 'customdb', credential: 'key', authorizeUrl: '', tokenUrl: '', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false,
+  });
+  const vouchr = await createVouchr({
+    providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t),
+  });
+  let setup: any;
+  vouchr.registerCommands({
+    command: () => undefined,
+    view: () => undefined,
+    action: (id: string, h: any) => { if (id === SETUP_KEY_ACTION) setup = h; },
+  });
+  let acked = false;
+  const dms: string[] = [];
+  await setup({
+    ack: async () => { acked = true; },
+    body: {
+      team: { id: 'T1' }, user: { id: 'U1' }, trigger_id: 'old-trigger',
+      actions: [{ value: 'removed-provider' }],
+    },
+    client: {
+      views: { open: async () => { throw new Error('must not open'); } },
+      chat: { postMessage: async ({ text }: any) => { dms.push(text); } },
+    },
+  });
+  assert.equal(acked, true);
+  assert.deepEqual(dms, ['This credential setup button is no longer valid. Ask the agent to request setup again.']);
 });
 
 test('modal reference submits share the core validator and reject whitespace before state or audit', async (t) => {

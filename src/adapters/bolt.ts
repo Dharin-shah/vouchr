@@ -2,7 +2,7 @@ import { WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -20,6 +20,7 @@ import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailed
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, isPreviewVisibility, type ChannelInfo, type ChannelMode, type PreviewVisibility } from '../core/channelConfig';
+import { configureChannelCredential, setChannelCredentialMode } from '../core/channelCredential';
 import { ChannelTools, type ToolManifestEntry } from '../core/tools';
 import { PendingPreviews } from '../core/preview';
 import { handleOAuthCallback } from '../core/oauthCallback';
@@ -39,6 +40,7 @@ import {
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
+  privateStatusModal,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,
   approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
@@ -62,6 +64,38 @@ const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 *
 /** Denial message for the config gate, accurate to whether the channel-creator path is enabled. */
 const adminOnly = (allowCreator: boolean, action: string): string =>
   `Only a workspace admin${allowCreator ? ' or the channel creator' : ''} can ${action}.`;
+
+interface ConfigOpenState {
+  p: string;
+  m: ChannelMode | null;
+  e: boolean;
+  v?: PreviewVisibility;
+}
+
+/** Parse forgeable config-modal metadata into one bounded, canonical shape before iteration. */
+function parseConfigMetadata(value: unknown): { channel: string; open: ConfigOpenState[] } | null {
+  let parsed: any;
+  try { parsed = JSON.parse(String(value)); } catch { return null; }
+  if (
+    !parsed || typeof parsed !== 'object' ||
+    typeof parsed.channel !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,255}$/.test(parsed.channel) ||
+    !Array.isArray(parsed.open) || parsed.open.length > 100
+  ) return null;
+
+  const seen = new Set<string>();
+  for (const entry of parsed.open) {
+    if (
+      !entry || typeof entry !== 'object' ||
+      typeof entry.p !== 'string' || !isValidProviderId(entry.p) || seen.has(entry.p) ||
+      !(entry.m === null || isChannelMode(entry.m)) ||
+      typeof entry.e !== 'boolean' ||
+      !(entry.v === undefined || isPreviewVisibility(entry.v))
+    ) return null;
+    seen.add(entry.p);
+  }
+  return { channel: parsed.channel, open: parsed.open };
+}
 
 /**
  * THE admin-eligibility predicate (STR-2: one rule, every caller): a custom `isAdmin` override
@@ -707,25 +741,23 @@ export class ConnectContext {
    */
   async setChannelSecret(providerId: string, secret: string): Promise<void> {
     this.brokerable(providerId); // validate provider exists + refuse service tools
-    const { cfg, owner, channel } = this.channelTarget();
+    const { cfg, channel } = this.channelTarget();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    await this.vault.upsert(owner, providerId, {
-      accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-    }, undefined, async (tx) => {
-      const cm = await cfg.getMode(owner.teamId, channel, providerId, tx);
-      if (cm != null && cm !== 'shared') {
-        throw new UserFacingError(`Channel is set to ${escapeMrkdwn(cm)} for "${escapeMrkdwn(providerId)}"; static keys are not allowed.`);
-      }
-      await cfg.setMode(owner.teamId, channel, providerId, 'shared', tx);
-      await this.audit.record(
-        'config',
-        this.identity,
-        providerId,
-        { owner: 'channel', channel, mode: 'shared', kind: 'secret' },
-        undefined,
-        tx,
-      );
+    await configureChannelCredential({
+      vault: this.vault,
+      audit: this.audit,
+      channelConfig: cfg,
+      identity: this.identity,
+      channel,
+      providerId,
+      credential: {
+        kind: 'secret',
+        token: { accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null },
+      },
+      modeConflict: (mode) => {
+        throw new UserFacingError(`Channel is set to ${escapeMrkdwn(mode)} for "${escapeMrkdwn(providerId)}"; static keys are not allowed.`);
+      },
     });
   }
 
@@ -761,12 +793,18 @@ export class ConnectContext {
    */
   async setChannelMode(providerId: string, mode: ChannelMode): Promise<void> {
     this.brokerable(providerId);
-    const { cfg, owner, channel } = this.channelTarget();
+    const { cfg, channel } = this.channelTarget();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    if (mode !== 'shared') await this.vault.delete(owner, providerId); // user-owned: drop any shared cred
-    await cfg.setMode(owner.teamId, channel, providerId, mode);
-    await this.audit.record('config', this.identity, providerId, { owner: 'channel', channel, mode });
+    await setChannelCredentialMode({
+      vault: this.vault,
+      audit: this.audit,
+      channelConfig: cfg,
+      identity: this.identity,
+      channel,
+      providerId,
+      mode,
+    });
   }
 
   /**
@@ -1108,6 +1146,26 @@ export async function createVouchr(opts: VouchrOptions) {
    *  click feedback goes here (the same channel the modal-submit confirmations use). */
   const dmActor = async (client: WebClient, identity: SlackIdentity, text: string): Promise<void> => {
     await client.chat.postMessage({ channel: identity.userId, text }).catch(() => undefined);
+  };
+
+  /** Replace the private pending modal with its committed outcome. If the view is gone, fall back
+   *  to a DM; if both Slack deliveries fail, the already-acknowledged pending view still contains
+   *  truthful unknown-state recovery guidance. */
+  const deliverModalOutcome = async (
+    client: WebClient,
+    identity: SlackIdentity,
+    view: any,
+    title: string,
+    text: string,
+  ): Promise<void> => {
+    let updated = false;
+    if (typeof view?.id === 'string' && typeof (client as any).views?.update === 'function') {
+      try {
+        await (client as any).views.update({ view_id: view.id, view: privateStatusModal(title, text) });
+        updated = true;
+      } catch { /* the pending view remains; fall back to a private DM */ }
+    }
+    if (!updated) await dmActor(client, identity, text);
   };
 
   /**
@@ -1621,8 +1679,8 @@ export async function createVouchr(opts: VouchrOptions) {
 
     // Modal submit (channel-shared OR per-user). One handler keeps validation, acknowledgement,
     // mutation, and receipts identical across both paths. Pure validation can still render inline;
-    // Slack is acknowledged BEFORE any DB, KMS, resolver, or Slack API work (vision.md). Once the
-    // modal closes, a private DM reports the committed result or gives safe recovery guidance.
+    // Slack is acknowledged BEFORE any DB, KMS, resolver, or Slack API work (vision.md). A private
+    // pending view remains as unknown-state recovery if both result update and DM delivery fail.
     // The typed value is never echoed, posted, logged, or put in audit meta (invariant 8 / T7).
     const handleSecretSubmit = async ({ ack, body, view, client }: any, kind: 'channel' | 'user') => {
       const identity = resolveIdentity({ body });
@@ -1631,18 +1689,23 @@ export async function createVouchr(opts: VouchrOptions) {
       try {
         ({ channel = '', provider } = JSON.parse(view.private_metadata));
       } catch {
-        return ack({ response_action: 'errors', errors: { ref: 'Malformed request. Please reopen the modal.' } });
+        return ack({ response_action: 'errors', errors: { raw: 'Malformed request. Please reopen the modal.' } });
       }
-      const ref = view.state?.values?.ref?.v?.value || '';
-      const raw = view.state?.values?.raw?.v?.value || '';
-      if (!identity) return ack({ response_action: 'errors', errors: { ref: 'Could not resolve your Slack identity.' } });
+      const refValue = view.state?.values?.ref?.v?.value ?? '';
+      const rawValue = view.state?.values?.raw?.v?.value ?? '';
+      if (!identity) return ack({ response_action: 'errors', errors: { raw: 'Could not resolve your Slack identity.' } });
+      if (typeof refValue !== 'string' || typeof rawValue !== 'string') {
+        return ack({ response_action: 'errors', errors: { raw: 'Malformed request. Please reopen the modal.' } });
+      }
+      const ref = refValue;
+      const raw = rawValue;
       if ((ref && raw) || (!ref && !raw)) {
         return ack({ response_action: 'errors', errors: { raw: 'Provide exactly one: a reference or a key.' } });
       }
-      if (kind === 'channel' && !channel) {
+      if (kind === 'channel' && (typeof channel !== 'string' || !channel)) {
         return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: 'No channel was selected. Reopen the modal.' } });
       }
-      if (!registry.has(provider) || !isBrokeredProvider(registry.get(provider))) {
+      if (typeof provider !== 'string' || !registry.has(provider) || !isBrokeredProvider(registry.get(provider))) {
         return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: 'Credential setup is unavailable. Reopen the modal.' } });
       }
       if (ref) {
@@ -1653,7 +1716,13 @@ export async function createVouchr(opts: VouchrOptions) {
           return ack({ response_action: 'errors', errors: { ref: safeUserMessage(e) } });
         }
       }
-      await ack();
+      await ack({
+        response_action: 'update',
+        view: privateStatusModal(
+          'Saving credential',
+          'Vouchr is saving this credential. If no result appears here, reopen credential setup to review the current state before retrying.',
+        ),
+      });
 
       const ctx = contextFor(identity, kind === 'channel' ? channel : null, client);
       try {
@@ -1667,9 +1736,11 @@ export async function createVouchr(opts: VouchrOptions) {
       } catch (e) {
         const p = escapeMrkdwn(provider);
         const target = kind === 'channel' ? `the *${p}* channel credential` : `your *${p}* credential`;
-        await dmActor(
+        await deliverModalOutcome(
           client,
           identity,
+          view,
+          'Save not confirmed',
           `Could not save ${target}. ${safeUserMessage(e)} Reopen credential setup and try again.`,
         );
         return;
@@ -1677,9 +1748,9 @@ export async function createVouchr(opts: VouchrOptions) {
       // Private confirmation DM (no secret), just the fact it was set.
       const p = escapeMrkdwn(provider);
       const text = kind === 'channel'
-        ? `✅ Saved the *${p}* credential for <#${escapeMrkdwn(channel)}>.`
-        : `✅ Your *${p}* credential is set. Ask me again and I'll use it.`;
-      await dmActor(client, identity, text);
+        ? `Saved the *${p}* credential for <#${escapeMrkdwn(channel)}>.`
+        : `Your *${p}* credential is set. Ask me again and I'll use it.`;
+      await deliverModalOutcome(client, identity, view, 'Credential saved', text);
     };
     app.view(CONFIGURE_CALLBACK, (a: any) => handleSecretSubmit(a, 'channel'));
     app.view(USER_KEY_CALLBACK, (a: any) => handleSecretSubmit(a, 'user'));
@@ -1744,12 +1815,26 @@ export async function createVouchr(opts: VouchrOptions) {
     // metadata, not a later store read.
     app.view(CONFIG_CALLBACK, async ({ ack, body, view, client }: any) => {
       const identity = resolveIdentity({ body });
-      // A view_submission always carries user/team, so identity failure is near-impossible; ack (closing
-      // the modal, no mutation) beats keying an error to a block id that may not exist.
-      if (!identity) return ack();
-      let channel = '';
-      let open: { p: string; m: string | null; e: boolean; v?: string }[] = [];
-      try { ({ channel = '', open = [] } = JSON.parse(view.private_metadata)); } catch { channel = ''; }
+      if (!identity) {
+        return ack({
+          response_action: 'update',
+          view: privateStatusModal(
+            'Settings not applied',
+            'Could not verify your Slack identity. Reopen Vouchr settings and try again.',
+          ),
+        });
+      }
+      const metadata = parseConfigMetadata(view.private_metadata);
+      if (!metadata) {
+        return ack({
+          response_action: 'update',
+          view: privateStatusModal(
+            'Settings not applied',
+            'This settings view is stale or malformed. Reopen Vouchr settings and try again.',
+          ),
+        });
+      }
+      const { channel, open } = metadata;
       const openMode = new Map(open.map((o) => [o.p, o.m]));
       const openEnabled = new Map(open.map((o) => [o.p, o.e]));
       const openVisibility = new Map(open.map((o) => [o.p, o.v ?? 'public']));
@@ -1762,18 +1847,31 @@ export async function createVouchr(opts: VouchrOptions) {
       const submittedVisibility = new Map<string, PreviewVisibility>();
       for (const [blockId, v] of Object.entries<any>(values)) {
         if (blockId.startsWith('mode:')) submittedMode.set(blockId.slice(5), v?.mode?.selected_option?.value);
-        else if (blockId.startsWith('tool:')) submittedEnabled.set(blockId.slice(5), (v?.enabled?.selected_options ?? []).some((o: any) => o.value === 'enabled'));
-        else if (blockId.startsWith('preview:')) submittedVisibility.set(blockId.slice(8), (v?.visibility?.selected_options ?? []).some((o: any) => o.value === 'private') ? 'private' : 'public');
+        else if (blockId.startsWith('tool:')) {
+          const options = v?.enabled?.selected_options;
+          submittedEnabled.set(blockId.slice(5), Array.isArray(options) && options.some((o: any) => o?.value === 'enabled'));
+        } else if (blockId.startsWith('preview:')) {
+          const options = v?.visibility?.selected_options;
+          submittedVisibility.set(blockId.slice(8), Array.isArray(options) && options.some((o: any) => o?.value === 'private') ? 'private' : 'public');
+        }
       }
-      await ack();
+      await ack({
+        response_action: 'update',
+        view: privateStatusModal(
+          'Updating settings',
+          'Vouchr is applying these settings. If no result appears here, reopen Vouchr settings to review the current state before retrying.',
+        ),
+      });
 
-      if (!channel) {
-        await dmActor(client, identity, 'Could not apply channel settings. Reopen Vouchr settings and try again.');
-        return;
-      }
       if (!(await commandAdmin(client, identity, channel))) {
         await audit.record('denied', identity, 'config', { reason: 'not-admin', owner: 'channel', channel }).catch(() => undefined);
-        await dmActor(client, identity, adminOnly(allowChannelCreatorConfig, 'change channel settings'));
+        await deliverModalOutcome(
+          client,
+          identity,
+          view,
+          'Settings not applied',
+          `${adminOnly(allowChannelCreatorConfig, 'change channel settings')} Reopen Vouchr settings after an administrator grants access.`,
+        );
         return;
       }
 
@@ -1816,15 +1914,29 @@ export async function createVouchr(opts: VouchrOptions) {
       const destination = `<#${escapeMrkdwn(channel)}>`;
       if (unconfirmed) {
         const prefix = confirmed ? `Updated ${confirmed} channel setting${confirmed === 1 ? '' : 's'} for ${destination}. ` : '';
-        await dmActor(
+        await deliverModalOutcome(
           client,
           identity,
+          view,
+          'Review settings',
           `${prefix}${unconfirmed} setting${unconfirmed === 1 ? '' : 's'} could not be confirmed. Reopen Vouchr settings to review the current state.`,
         );
       } else if (confirmed) {
-        await dmActor(client, identity, `✅ Updated ${confirmed} channel setting${confirmed === 1 ? '' : 's'} for ${destination}.`);
+        await deliverModalOutcome(
+          client,
+          identity,
+          view,
+          'Settings updated',
+          `Updated ${confirmed} channel setting${confirmed === 1 ? '' : 's'} for ${destination}.`,
+        );
       } else {
-        await dmActor(client, identity, `No channel settings changed for ${destination}.`);
+        await deliverModalOutcome(
+          client,
+          identity,
+          view,
+          'No changes',
+          `No channel settings changed for ${destination}.`,
+        );
       }
     });
 
@@ -2073,17 +2185,20 @@ export async function createVouchr(opts: VouchrOptions) {
     // Per-user key setup: ephemeral button → private modal (self-service, not admin-gated).
     app.action(SETUP_KEY_ACTION, async ({ ack, body, client }: any) => {
       await ack();
+      const identity = resolveIdentity({ body });
       const provider = body.actions?.[0]?.value;
-      if (!provider || !body.trigger_id || !registry.has(provider)) return;
-      if (!isBrokeredProvider(registry.get(provider))) return;
+      const recover = () => identity
+        ? dmActor(client, identity, 'This credential setup button is no longer valid. Ask the agent to request setup again.')
+        : Promise.resolve();
+      if (typeof provider !== 'string' || !body.trigger_id || !registry.has(provider)) return recover();
+      if (!isBrokeredProvider(registry.get(provider))) return recover();
       try {
         await client.views.open({
           trigger_id: body.trigger_id,
           view: userKeyModal(provider, referenceSources),
         });
       } catch {
-        const identity = resolveIdentity({ body });
-        if (identity) await dmActor(client, identity, 'Could not open credential setup. Ask the agent to try again.');
+        await recover();
       }
     });
 

@@ -282,11 +282,21 @@ function secretModal(o: {
   };
 }
 
+/** Private acknowledgement/result surface for work that must continue after Slack's 3s deadline. */
+export function privateStatusModal(title: string, text: string): unknown {
+  return {
+    type: 'modal',
+    title: { type: 'plain_text', text: title },
+    close: { type: 'plain_text', text: 'Close' },
+    blocks: [{ type: 'section', text: { type: 'mrkdwn', text } }],
+  };
+}
+
 /** Admin modal: set the CHANNEL's shared credential (invariant 7, admin-gated upstream). */
 export function configureModal(
   provider: string,
   channel: string,
-  referenceSources: readonly SecretReferenceSource[] = [],
+  referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
 ): unknown {
   const p = escapeMrkdwn(provider);
   return secretModal({
@@ -301,7 +311,10 @@ export function configureModal(
 }
 
 /** Self-service modal: a user sets their OWN credential for a key-based provider. */
-export function userKeyModal(provider: string, referenceSources: readonly SecretReferenceSource[] = []): unknown {
+export function userKeyModal(
+  provider: string,
+  referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
+): unknown {
   const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: USER_KEY_CALLBACK,

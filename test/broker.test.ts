@@ -1743,6 +1743,37 @@ test('#58 resolver failure returns a stable code without resolver text or the re
   }
 });
 
+test('#58 malformed stored reference returns resolver_failed before resolver or provider I/O', async (t) => {
+  const malformed = 'arn:aws:secretsmanager:malformed-reference-sentinel';
+  let resolverCalls = 0;
+  const { server, port, vault } = await makeRefBroker(t, {
+    resolvers: { 'aws-sm': async () => { resolverCalls++; return SECRET_TOKEN; } },
+  });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    // Simulate a legacy row written before the public reference validator existed.
+    await vault.reference(
+      userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+      'acme',
+      { source: 'aws-sm', secretRef: malformed },
+    );
+    const response = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      method: 'GET',
+      path: '/x',
+    });
+    assert.equal(response.status, 502);
+    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.equal(resolverCalls, 0);
+    assert.equal(up.seen.length, 0);
+    assert.ok(!response.raw.includes(malformed));
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('#58 user reference is bound to the token identity (a forged body can\'t reference into another slot)', async (t) => {
   const { server, port, vault } = await makeRefBroker(t);
   try {

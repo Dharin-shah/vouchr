@@ -667,10 +667,11 @@ export class ConnectionHandle {
     if (!cred.secretRef) {
       throw new ResolverFailedError();
     }
-    // Public configuration now validates before write, but legacy rows may predate that boundary.
-    // Recheck the four advertised source ids before a previously inert row can trigger resolver I/O.
-    assertStoredSecretReference(cred.source, cred.secretRef);
     try {
+      // Public configuration now validates before write, but legacy rows may predate that boundary.
+      // Recheck before resolver I/O and normalize any malformed stored row to the same fixed
+      // resolver failure contract as a runtime secret-manager error.
+      assertStoredSecretReference(cred.source, cred.secretRef);
       // Pass cancellation to cooperative resolvers, but also race it here: an older/custom resolver
       // may ignore the optional signal and must not pin admission slots beyond the request deadline.
       return await awaitWithSignal(resolver(cred.secretRef, signal), signal);

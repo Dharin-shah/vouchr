@@ -16,8 +16,9 @@ import { MAX_TIMER_MS } from '../../core/options';
 import { awaitWithSignal, disposableDeadline } from '../../core/httpBounds';
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
-import { userOwner, channelOwner, type Owner } from '../../core/owner';
+import { userOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
+import { setChannelCredentialMode } from '../../core/channelCredential';
 import {
   authorizeProvider,
   resolveCredentialOwner,
@@ -1215,7 +1216,6 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
     const claims = await verifyBrokerableProvider(providerId, body.identityToken);
     const acting = await requireAdmin(claims, providerId);
-    const owner = channelOwner(claims.teamId, claims.channel);
     // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
     // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
     // channel from the SIGNED verdict. Fail closed + audited. resolveOwner re-checks at use, so this is
@@ -1224,12 +1224,17 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       await opts.audit.record('denied', acting, providerId, { reason: 'channel-ineligible', owner: 'channel', channel: claims.channel });
       throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
     }
-    // Flipping to a user-owned mode drops any live shared credential — the deliberate re-authorization
-    // boundary (mirrors Bolt setChannelMode): else a dormant shared cred silently reactivates on a later
-    // flip back to `shared` with no re-ingest/re-auth.
-    if (mode !== 'shared') await opts.vault.delete(owner, providerId);
-    await opts.channelConfig.setMode(claims.teamId, claims.channel, providerId, mode);
-    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, mode });
+    // The shared core lifecycle mutation serializes this mode flip with Bolt/headless credential
+    // setup across replicas. A user-owned mode and a live shared credential cannot both commit.
+    await setChannelCredentialMode({
+      vault: opts.vault,
+      audit: opts.audit,
+      channelConfig: opts.channelConfig,
+      identity: acting,
+      channel: claims.channel,
+      providerId,
+      mode,
+    });
     return { ok: true };
   }
 
