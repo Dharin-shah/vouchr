@@ -87,10 +87,13 @@ jobs:
           # Caveat: the action's entrypoint expands this string UNQUOTED (all_args=$@), so it only
           # parses via shell word-splitting — no values with spaces, and the `**` excludes survive
           # only while nothing in the workspace glob-matches them. Verified against the pinned SHA.
+          # npm audit is already a separate blocking job above. Disable Dependency-Check's duplicate
+          # network analyzer so an npm Audit API outage cannot fail a completed NVD/KEV/RetireJS scan.
           args: >
             --failOnCVSS 7
             --enableRetired
             --disableOssIndex
+            --disableNodeAudit
             --exclude **/node_modules/**
             --exclude **/dist/**
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
