@@ -7,6 +7,9 @@ import { migrate, openDb, assertSchemaCurrent, SCHEMA_VERSION, type Db } from '.
 import { isPostgresUrl } from '../src/core/options';
 import { github } from '../src/core/providers';
 import { createVouchr } from '../src/adapters/bolt';
+import { Vault } from '../src/core/vault';
+import { userOwner } from '../src/core/owner';
+import { SECRET_REFERENCE_SOURCES } from '../src/core/reference';
 import { TEST_PG_URL, pgReachable, openTestDb } from './support/pg';
 
 const SKIP = 'Postgres not reachable (run `npm run pg:up`)';
@@ -111,6 +114,45 @@ test('CLI top-level failures never serialize database-provided error text (SEC-1
   assert.equal(result.status, 1);
   assert.match(result.stderr, /^vouchr: command failed\s*$/);
   assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
+});
+
+test('CLI inventory never selects or prints legacy source/reference values (SEC-1)', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  await migrate({ databaseUrl: url });
+  const db = await openDb({ databaseUrl: url });
+  const sentinel = 'ghp_LEGACY_REFERENCE_MUST_NOT_REACH_INVENTORY';
+  const sourceSentinel = 'ghp_LEGACY_SOURCE_MUST_NOT_REACH_INVENTORY';
+  try {
+    const vault = new Vault(db, randomBytes(32));
+    await vault.reference(
+      userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+      'legacy',
+      { source: sourceSentinel, secretRef: sentinel },
+    );
+    for (const [index, source] of SECRET_REFERENCE_SOURCES.entries()) {
+      await vault.reference(
+        userOwner({ enterpriseId: null, teamId: 'T1', userId: `U${index + 2}` }),
+        `legacy-${index}`,
+        { source, secretRef: `legacy-ref-${index}` },
+      );
+    }
+  } finally {
+    await db.close();
+  }
+
+  const result = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', 'bin/vouchr.ts', 'inventory'],
+    { encoding: 'utf8', env: { ...process.env, VOUCHR_DATABASE_URL: url } },
+  );
+  assert.equal(result.status, 0);
+  assert.match(result.stdout, /reference/);
+  assert.match(result.stdout, /yes/);
+  assert.match(result.stdout, /custom/);
+  for (const source of SECRET_REFERENCE_SOURCES) assert.match(result.stdout, new RegExp(source));
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(sentinel));
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(sourceSentinel));
 });
 
 test('two migrate() calls racing on the same schema both succeed (advisory lock serializes, no pg_type 23505)', async (t) => {

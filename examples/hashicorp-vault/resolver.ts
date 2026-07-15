@@ -11,8 +11,7 @@
 //
 // Reference format: vault://<mount>/<path>#<field>
 import type { Resolvers } from '../../src';
-
-const REF = /^vault:\/\/([^/]+)\/(.+)#([^#]+)$/;
+import { HASHICORP_VAULT_REFERENCE, secretReferenceSource } from '../../src/core/reference';
 
 export function hashicorpVault(
   opts: { fetch?: typeof fetch; addr?: string; token?: string } = {},
@@ -24,17 +23,21 @@ export function hashicorpVault(
   return {
     vault: async (ref: string): Promise<string> => {
       if (!addr || !token) throw new Error('VAULT_ADDR and VAULT_TOKEN must be set.');
-      const m = REF.exec(ref);
-      if (!m) throw new Error(`Malformed Vault reference: "${ref}".`);
+      try {
+        if (secretReferenceSource(ref) !== 'vault') throw new Error();
+      } catch {
+        throw new Error('Malformed Vault reference.');
+      }
+      const m = HASHICORP_VAULT_REFERENCE.exec(ref);
+      if (!m) throw new Error('Malformed Vault reference.');
       const [, mount, path, field] = m;
 
       const url = `${addr}/v1/${mount}/data/${path}`;
       const res = await f(url, { headers: { 'X-Vault-Token': token } });
-      // Error names the reference (non-secret) only, never any secret material.
-      if (!res.ok) throw new Error(`Vault read failed for "${ref}" (${res.status}).`);
+      if (!res.ok) throw new Error(`Vault read failed (${res.status}).`);
       const body = (await res.json()) as { data?: { data?: Record<string, string> } };
       const value = body.data?.data?.[field];
-      if (!value) throw new Error(`Vault returned no value for field "${field}" of "${ref}".`);
+      if (!value) throw new Error('Vault returned no value for the configured field.');
       return value;
     },
   };

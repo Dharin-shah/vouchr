@@ -11,20 +11,17 @@
 //
 // Reference format: azure-kv://<vault-name>/<secret-name>[/<version>]
 import type { Resolvers } from '../../src';
-
-// Vault + secret + version are restricted to Azure's real naming charset (alphanumeric + hyphen).
-// This is SECURITY-CRITICAL, not cosmetic: `vault` is interpolated into the request AUTHORITY, and a
-// looser class like [^/]+ would let a reference such as `azure-kv://evil.com#/x` (`#`/`?`/`\` terminate
-// the authority in WHATWG URL parsing) redirect the fetch host and exfiltrate the Managed Identity token.
-const REF = /^azure-kv:\/\/([a-zA-Z0-9-]+)\/([a-zA-Z0-9-]+)(?:\/([a-zA-Z0-9-]+))?$/;
+import { AZURE_KEY_VAULT_REFERENCE } from '../../src/core/reference';
 
 export function azureKeyVault(opts: { fetch?: typeof fetch } = {}): Resolvers {
   const f = opts.fetch ?? fetch;
 
   return {
     'azure-kv': async (ref: string): Promise<string> => {
-      const m = REF.exec(ref);
-      if (!m) throw new Error(`Malformed Azure Key Vault reference: "${ref}".`);
+      // The shared pattern is security-critical: `vault` becomes the request authority, so URL
+      // delimiters must be rejected before the Managed Identity token can be sent.
+      const m = AZURE_KEY_VAULT_REFERENCE.exec(ref);
+      if (!m) throw new Error('Malformed Azure Key Vault reference.');
       const [, vault, secret, version] = m;
 
       // Ambient Managed Identity token from the Azure Instance Metadata Service.
@@ -39,10 +36,9 @@ export function azureKeyVault(opts: { fetch?: typeof fetch } = {}): Resolvers {
       const path = version ? `${secret}/${version}` : secret;
       const url = `https://${vault}.vault.azure.net/secrets/${path}?api-version=7.4`;
       const res = await f(url, { headers: { Authorization: `Bearer ${access_token}` } });
-      // Error names the reference (non-secret) only, never any secret material.
-      if (!res.ok) throw new Error(`Azure Key Vault access failed for "${ref}" (${res.status}).`);
+      if (!res.ok) throw new Error(`Azure Key Vault access failed (${res.status}).`);
       const body = (await res.json()) as { value?: string };
-      if (!body.value) throw new Error(`Azure Key Vault returned no value for "${ref}".`);
+      if (!body.value) throw new Error('Azure Key Vault returned no value.');
       return body.value;
     },
   };

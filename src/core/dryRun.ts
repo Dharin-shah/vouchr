@@ -107,8 +107,8 @@ export function dryRunTokenResponse(): TokenResponse {
  *  through the chain. If Audit ever adopts `#db`, replace this with an explicit forwarding subclass. */
 export function dryRunAudit(audit: Audit): Audit {
   const marked: Audit = Object.create(audit);
-  marked.record = (action, i, provider, meta, actor) =>
-    audit.record(action, i, provider, { ...meta, dry_run: true }, actor);
+  marked.record = (action, i, provider, meta, actor, db) =>
+    audit.record(action, i, provider, { ...meta, dry_run: true }, actor, db);
   return marked;
 }
 

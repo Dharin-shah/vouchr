@@ -16,13 +16,22 @@ test('vault resolver returns the field value', async () => {
 });
 
 test('vault resolver throws on a malformed reference', async () => {
-  const fetch = (async () => { throw new Error('should not be called'); }) as unknown as typeof globalThis.fetch;
+  let calls = 0;
+  const fetch = (async () => { calls++; throw new Error('should not be called'); }) as unknown as typeof globalThis.fetch;
   await assert.rejects(() => hashicorpVault({ ...OPTS, fetch }).vault('vault://secret/no-field'), /Malformed/);
+  await assert.rejects(
+    () => hashicorpVault({ ...OPTS, fetch }).vault('vault://secret/foo/../../../other/data/target#password'),
+    /Malformed/,
+  );
+  assert.equal(calls, 0);
 });
 
 test('vault resolver throws (never resolves empty) on a failed read', async () => {
   const fetch = (async () => fail(403)) as unknown as typeof globalThis.fetch;
-  await assert.rejects(() => hashicorpVault({ ...OPTS, fetch }).vault(REF), /read failed/);
+  await assert.rejects(
+    () => hashicorpVault({ ...OPTS, fetch }).vault(REF),
+    (error: Error) => /read failed/.test(error.message) && !error.message.includes(REF),
+  );
 });
 
 test('vault resolver throws when the field is missing (no empty-string success)', async () => {

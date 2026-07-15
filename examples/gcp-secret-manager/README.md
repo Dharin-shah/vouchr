@@ -32,8 +32,8 @@ and pastes a reference into the private modal:
 gcp-sm://projects/my-project/secrets/github-bot/versions/latest
 ```
 
-Vouchr's `refSource()` maps any `gcp-sm://` reference to the `'gcp-sm'` source id, which
-this resolver handles.
+Vouchr validates the supported reference form, derives the `'gcp-sm'` source id, and confirms this
+resolver is configured before saving it. The resolver itself is not invoked until credential use.
 
 ## Reference format
 

@@ -180,11 +180,12 @@ export class Audit {
     provider: string,
     meta: AuditMeta = {},
     actor?: string,
+    db: Db = this.db,
   ): Promise<void> {
     // Promote a channel id from meta to its own column so audit is queryable by channel (it stays in
     // meta too). A channel id isn't secret and never trips redact(), so reading it raw here is safe.
     const channel = typeof meta.channel === 'string' ? meta.channel : null;
-    await this.db.run(
+    await db.run(
       `INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at)
        VALUES (?,?,?,?,?,?,?,?,?)`,
       [randomUUID(), i.teamId, i.userId, provider, action, actor ?? null, channel, JSON.stringify(redact(meta)), Date.now()],

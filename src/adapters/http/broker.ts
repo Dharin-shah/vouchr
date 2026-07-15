@@ -32,6 +32,12 @@ import { Approvals, ApprovalRequiredError } from '../../core/approval';
 import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
 import { handleOAuthCallback } from '../../core/oauthCallback';
+import {
+  normalizeSecretReference,
+  referenceChannelCredential,
+  referenceUserCredential,
+  SecretReferenceError,
+} from '../../core/reference';
 import { verifyIdentity, IdentityError, normalizeIdentityConfig, assertIdentityPurposeDistinct, type IdentityClaims, type IdentityConfig } from './identity';
 import { DbReplayStore } from './replayStore';
 import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse, BrokerChannelManifestResponse } from '../../broker-types';
@@ -427,8 +433,13 @@ async function readJson(req: http.IncomingMessage, cap = READ_REQUEST_CAP): Prom
   }
   if (!chunks.length) return {};
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
+    const body: unknown = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      throw new HttpError(400, { error: 'JSON body must be an object' });
+    }
+    return body;
+  } catch (error) {
+    if (error instanceof HttpError) throw error;
     throw new HttpError(400, { error: 'invalid JSON body' });
   }
 }
@@ -1109,10 +1120,10 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
 
   /**
    * #53 `POST /v1/admin/reference` — configure a channel's SHARED credential as an external
-   * secret-manager REFERENCE (never a raw secret over the wire). Inlines the same core actions as the
-   * Bolt `referenceChannelSecret` (vault.reference + ChannelConfig.setMode('shared')) so NO @slack
-   * dependency enters the broker. Admin authority + eligibility come ONLY from signed claims; fail
-   * closed. Stores only the non-secret ref; the injector resolves it JIT at egress via `resolvers`.
+   * secret-manager REFERENCE (never a raw secret over the wire). Delegates the shared core mutation
+   * sequence also used by Bolt, so NO @slack dependency enters the broker. Admin authority +
+   * eligibility come ONLY from signed claims; fail closed. Stores only the non-secret ref; the
+   * injector resolves it JIT at egress via `resolvers`.
    */
   async function handleAdminReference(body: {
     handle?: { provider?: unknown };
@@ -1124,33 +1135,40 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
-    if (typeof body.source !== 'string' || typeof body.secretRef !== 'string' || !body.source || !body.secretRef) {
-      throw new HttpError(400, { error: 'source and secretRef are required' });
-    }
-    if (body.scopes !== undefined && typeof body.scopes !== 'string') throw new HttpError(400, { error: 'invalid scopes' });
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
-    if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    const provider = registry.get(providerId);
+    if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    // Derive the source and prove a resolver is configured before any mutation or denial audit.
+    // A legacy caller may still send `source`, but it has no authority and must match exactly.
+    const reference = normalizeSecretReference(body, opts.resolvers, provider.scopesDefault);
 
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    // Admin authority: SIGNED claim only (the broker can't verify Slack admin). Fail closed + audited.
-    if (claims.isAdmin !== true) {
-      await opts.audit.record('denied', acting, providerId, { reason: 'not-admin', owner: 'channel', channel: claims.channel });
-      throw new HttpError(403, { error: 'admin authority required' });
-    }
-    // Channel eligibility from the SIGNED verdict (shared creds refused on ineligible channels).
-    if ((opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
-      await opts.audit.record('denied', acting, providerId, { reason: 'channel-ineligible', owner: 'channel', channel: claims.channel });
-      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
-    }
-    const owner = channelOwner(claims.teamId, claims.channel);
-    // Refuse a channel locked to a user-owned mode (invariant 7) — mirrors referenceChannelSecret.
-    const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, providerId);
-    if (mode != null && mode !== 'shared') throw new HttpError(409, { error: `channel is ${mode} for this provider; shared references are not allowed` });
-    await opts.vault.reference(owner, providerId, { source: body.source, secretRef: body.secretRef, scopes: body.scopes });
-    await opts.channelConfig.setMode(claims.teamId, claims.channel, providerId, 'shared');
-    await opts.audit.record('config', acting, providerId, { owner: 'channel', channel: claims.channel, mode: 'shared', kind: 'ref', source: body.source });
+    await referenceChannelCredential({
+      vault: opts.vault, audit: opts.audit, channelConfig: opts.channelConfig,
+      identity: acting, channel: claims.channel, providerId, reference,
+      authorize: async () => {
+        // Admin authority: SIGNED claim only (the broker can't verify Slack admin).
+        if (claims.isAdmin === true) return;
+        await opts.audit.record('denied', acting, providerId, {
+          reason: 'not-admin', owner: 'channel', channel: claims.channel,
+        });
+        throw new HttpError(403, { error: 'admin authority required' });
+      },
+      assertEligible: async () => {
+        if (!(opts.requireChannelEligibility ?? true) || claims.channelEligible === true) return;
+        await opts.audit.record('denied', acting, providerId, {
+          reason: 'channel-ineligible', owner: 'channel', channel: claims.channel,
+        });
+        throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+      },
+      modeConflict: (mode) => {
+        throw new HttpError(409, {
+          error: `channel is ${mode} for this provider; shared references are not allowed`,
+        });
+      },
+    });
     return { ok: true };
   }
 
@@ -1403,19 +1421,18 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   }): Promise<Record<string, unknown>> {
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
-    if (typeof body.source !== 'string' || typeof body.secretRef !== 'string' || !body.source || !body.secretRef) {
-      throw new HttpError(400, { error: 'source and secretRef are required' });
-    }
-    if (body.scopes !== undefined && typeof body.scopes !== 'string') throw new HttpError(400, { error: 'invalid scopes' });
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
-    if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    const provider = registry.get(providerId);
+    if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
+    const reference = normalizeSecretReference(body, opts.resolvers, provider.scopesDefault);
     // Carry the signed enterpriseId so an enterprise offboard (Grid/SCIM) can discover this reference.
     const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // Owner is the VERIFIED acting user, never the body — a forged body can't reference into another's slot.
-    await opts.vault.reference(userOwner(identity), providerId, { source: body.source, secretRef: body.secretRef, scopes: body.scopes });
-    await opts.audit.record('config', identity, providerId, { owner: 'user', kind: 'ref', source: body.source });
+    await referenceUserCredential({
+      vault: opts.vault, audit: opts.audit, identity, providerId, reference,
+    });
     return { ok: true };
   }
 
@@ -1657,6 +1674,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         // instead of crashing on a second writeHead.
         if (res.headersSent) return res.destroy();
         if (e instanceof HttpError) return send(e.status, e.payload, e.headers, e.closeConnection);
+        if (e instanceof SecretReferenceError) return send(400, { error: e.message });
         // #209 in-flight ceiling full → 503 + Retry-After (whole seconds; ms also rides the payload).
         // The scope ('global'/'provider') is a non-secret operator signal, never request content.
         if (e instanceof OverloadedError) {

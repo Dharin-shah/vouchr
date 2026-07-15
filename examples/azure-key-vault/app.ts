@@ -1,8 +1,8 @@
 import { createVouchr, github } from '../../src';
 import { azureKeyVault } from './resolver';
 
-// Wire the Azure Key Vault resolver into Vouchr. The 'azure-kv' source id matches
-// what bolt's refSource() assigns to an `azure-kv://` reference.
+// Wire the Azure Key Vault resolver into Vouchr. Its 'azure-kv' key matches the source Vouchr
+// derives from a supported Azure reference; configuration checks presence without resolving.
 //
 // An admin then runs, from inside the channel they want to configure:
 //

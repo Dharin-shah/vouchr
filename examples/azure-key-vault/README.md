@@ -32,8 +32,8 @@ and pastes a reference into the private modal:
 azure-kv://my-vault/github-bot
 ```
 
-Vouchr's `refSource()` maps any `azure-kv://` reference to the `'azure-kv'` source id,
-which this resolver handles.
+Vouchr validates the supported reference form, derives the `'azure-kv'` source id, and confirms this
+resolver is configured before saving it. The resolver itself is not invoked until credential use.
 
 ## Reference format
 

@@ -16,9 +16,10 @@ export interface StoredToken {
 }
 
 /**
- * What `get` returns. `source==='vault'` → `accessToken` is the decrypted secret.
- * Otherwise the secret lives in an external manager: `secretRef` is a non-secret
- * pointer (e.g. an AWS Secrets Manager ARN) the injector resolves just-in-time.
+ * What `get` returns. A null `secretRef` marks a Vouchr-encrypted token; a non-null reference marks
+ * an external-manager pointer the injector resolves just-in-time. Most external source ids differ
+ * from `vault`; HashiCorp's advertised `vault://` source intentionally shares that historical name,
+ * so callers must use reference presence rather than source alone to distinguish the two.
  */
 export interface StoredCredential {
   source: string;
@@ -358,6 +359,7 @@ export class Vault {
     owner: Owner,
     provider: string,
     r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
+    afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
     const now = Date.now();
     await this.mutation(async (tx) => {
@@ -379,6 +381,7 @@ export class Vault {
         ],
       );
       await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
+      await afterWrite?.(tx);
     });
   }
 

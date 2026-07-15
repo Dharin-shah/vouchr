@@ -41,8 +41,10 @@ VOUCHR_DATABASE_URL=postgres://vouchr_owner:...@host:5432/vouchr vouchr migrate
 
 ### `inventory`
 Lists stored connections from the `connection` table: team, owner_kind, owner_id,
-provider, source (`vault` | `aws-sm` | …), secret_ref (non-secret external pointer),
-created_at, last_used_at, expires_at. Token ciphertext columns are never selected.
+provider, allowlisted source kind (`vault` | `aws-sm` | `gcp-sm` | `azure-kv` | `custom`), reference
+presence (`yes` | `no`), created_at, last_used_at, expires_at. Token ciphertext and raw
+reference/source values are never selected; this also keeps malformed legacy metadata out of
+terminal output.
 
 ```bash
 vouchr inventory --team T123 --provider github

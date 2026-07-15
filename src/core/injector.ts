@@ -12,6 +12,7 @@ import { ApprovalRequiredError, queryDigest, type Approvals } from './approval';
 import { randomUUID } from 'node:crypto';
 import { awaitWithSignal, disposableDeadline, responseWithCleanup } from './httpBounds';
 import { MAX_TIMER_MS } from './options';
+import { assertStoredSecretReference } from './reference';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided.
  * Existing one-argument resolvers remain compatible; implementations should use the optional signal
@@ -100,6 +101,15 @@ export class NoConnectionError extends Error {
   constructor(message: string) {
     super(message);
     this.name = 'NoConnectionError';
+  }
+}
+
+/** External secret resolution failed. Fixed text prevents a custom resolver from reflecting
+ * credential material, references, or provider SDK errors through direct handles or adapters. */
+export class ResolverFailedError extends Error {
+  constructor() {
+    super('External credential resolution failed.');
+    this.name = 'ResolverFailedError';
   }
 }
 
@@ -552,7 +562,10 @@ export class ConnectionHandle {
     // must never feed a dry-run request. Keyed off the trusted system-only dry_run column (never the
     // user/provider-controlled account label), off the row already in hand: zero extra reads.
     if (this.dryRun && !cred.dryRun) throw new DryRunVaultError();
-    const vaulted = cred.source === 'vault';
+    // `vault` is the historical marker for Vouchr-encrypted rows, but it is also the resolver id
+    // for an advertised `vault://` HashiCorp reference. A real local row never has `secret_ref`;
+    // its presence is therefore the disambiguator that lets the external resolver run JIT.
+    const vaulted = cred.source === 'vault' && cred.secretRef == null;
 
     // One disposable deadline spans proactive refresh, provider fetch, 401 refresh/replay, and the
     // returned response body. It ALWAYS composes caller cancellation with Vouchr's finite bound.
@@ -649,11 +662,14 @@ export class ConnectionHandle {
   private async resolveRef(cred: StoredCredential, signal: AbortSignal): Promise<string> {
     const resolver = this.resolvers[cred.source];
     if (!resolver) {
-      throw new Error(`No resolver registered for secret source "${cred.source}"`);
+      throw new ResolverFailedError();
     }
     if (!cred.secretRef) {
-      throw new Error(`Referenced connection for "${this.provider.id}" has no secret_ref`);
+      throw new ResolverFailedError();
     }
+    // Public configuration now validates before write, but legacy rows may predate that boundary.
+    // Recheck the four advertised source ids before a previously inert row can trigger resolver I/O.
+    assertStoredSecretReference(cred.source, cred.secretRef);
     try {
       // Pass cancellation to cooperative resolvers, but also race it here: an older/custom resolver
       // may ignore the optional signal and must not pin admission slots beyond the request deadline.
@@ -661,7 +677,7 @@ export class ConnectionHandle {
     } catch (e) {
       if (signal.aborted) throw e;
       this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
-      throw e;
+      throw new ResolverFailedError();
     }
   }
 

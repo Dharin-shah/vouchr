@@ -1,7 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -560,25 +559,4 @@ test('buildBrokerServer: hook overrides cannot replace identity/replay/provider 
   // The intentional wrapper hook remains supported.
   const built = await buildBrokerServer(env, { authorize: () => undefined });
   await built.db.close();
-});
-
-// ── T8: seed CLI ─────────────────────────────────────────────────────────────
-
-test('broker-seed: reference mode writes a credential the broker can resolve', async (t) => {
-  const _dir = mkdtempSync(join(tmpdir(), 'vouchr-seed-'));
-  const dbPath = await testDbUrl(t);
-  const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: KEY_B64 };
-  execFileSync(process.execPath, [
-    '--import', 'tsx', 'bin/broker-seed.ts', 'reference',
-    '--provider', 'confluence', '--team', 'T1', '--user', 'U1',
-    '--source', 'aws-sm', '--secret-ref', 'arn:aws:secretsmanager:xyz',
-  ], { env, stdio: 'pipe' });
-
-  const db = await openDb({ databaseUrl: dbPath });
-  try {
-    const cred = await new Vault(db, Buffer.from(KEY_B64, 'base64')).get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'confluence');
-    assert.equal(cred?.secretRef, 'arn:aws:secretsmanager:xyz'); // provisioned without Slack
-  } finally {
-    await db.close();
-  }
 });

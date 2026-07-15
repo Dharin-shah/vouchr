@@ -65,8 +65,8 @@ export function channelIneligibleReason(info: ChannelInfo | null | undefined): s
 export class ChannelConfig {
   constructor(private db: Db) {}
 
-  async getMode(teamId: string, channel: string, provider: string): Promise<ChannelMode | null> {
-    const row = (await this.db.get(
+  async getMode(teamId: string, channel: string, provider: string, db: Db = this.db): Promise<ChannelMode | null> {
+    const row = (await db.get(
       `SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?`,
       [teamId, channel, provider],
     )) as { mode: ChannelMode } | undefined;
@@ -84,11 +84,17 @@ export class ChannelConfig {
     return (provider) => m.get(provider) ?? null;
   }
 
-  async setMode(teamId: string, channel: string, provider: string, mode: ChannelMode): Promise<void> {
+  async setMode(
+    teamId: string,
+    channel: string,
+    provider: string,
+    mode: ChannelMode,
+    db: Db = this.db,
+  ): Promise<void> {
     // Defense-in-depth at the true sink: TypeScript's `ChannelMode` is compile-time only, so a value
     // arriving from an untrusted surface (modal/broker/slash) could still be a bogus string at runtime.
     if (!isChannelMode(mode)) throw new Error(`invalid channel mode: ${mode}`);
-    await this.db.run(
+    await db.run(
       `INSERT INTO channel_config (team_id, channel, provider, mode) VALUES (?,?,?,?)
        ON CONFLICT(team_id, channel, provider) DO UPDATE SET mode=excluded.mode`,
       [teamId, channel, provider, mode],

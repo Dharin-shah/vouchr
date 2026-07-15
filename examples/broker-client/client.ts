@@ -4,23 +4,22 @@
  * human is acting. The broker verifies the token and injects the real credential; your agent never
  * sees it.
  *
- * Run against a local broker. The seed and the broker must share the SAME PostgreSQL database AND
- * master key (a random key per process wouldn't decrypt what the seed wrote):
+ * Run against a local broker. First provision T1/U1 through a Bolt control plane sharing this
+ * database, or through the broker's validated `/v1/user/reference` route with a configured external
+ * secret resolver. The control plane and broker must share the SAME database and master key:
  *
  *   export VOUCHR_MASTER_KEY=$(openssl rand -base64 32)
  *   export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
  *   export VOUCHR_IDENTITY_SECRET=$(openssl rand -base64 32)   # >= 32 bytes, not the master key
  *   export VOUCHR_DEPLOYMENT_ID=local-dev                       # binds assertions to this deployment
  *
- *   # terminal A — seed a credential for user T1/U1, then start the broker:
- *   VOUCHR_SEED_ACCESS_TOKEN=ghp_xxx node --import tsx bin/broker-seed.ts key \
- *       --provider github --team T1 --user U1
+ *   # terminal A — after provisioning T1/U1, start the broker:
  *   VOUCHR_PROVIDERS='[{"id":"github","credential":"key","egressAllow":["api.github.com"]}]' npm run broker
  *
  *   # terminal B — call through the broker as that user:
  *   BROKER_URL=http://localhost:3000 node --import tsx examples/broker-client/client.ts
  *
- * See `npm run seed` in guides/DEPLOYMENT.md for reference vs key modes.
+ * See guides/DEPLOYMENT.md for the two supported provisioning paths.
  */
 import { mintIdentity, loadIdentityConfig, type IdentityConfig } from '../../src'; // published package: from '@vouchr/core'
 

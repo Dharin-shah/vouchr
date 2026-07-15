@@ -1,9 +1,9 @@
 import { createVouchr, github } from '../../src';
 import { hashicorpVault } from './resolver';
 
-// Wire the HashiCorp Vault resolver into Vouchr. The 'vault' source id matches what
-// bolt's refSource() assigns to a `vault://` reference. VAULT_ADDR and VAULT_TOKEN come
-// from the environment.
+// Wire the HashiCorp Vault resolver into Vouchr. Its 'vault' key matches the source Vouchr derives
+// from a supported Vault reference; configuration checks presence without resolving. VAULT_ADDR
+// and VAULT_TOKEN come from the environment.
 //
 // An admin then runs, from inside the channel they want to configure:
 //

@@ -30,8 +30,8 @@ and pastes an ARN into the private modal:
 arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/github-bot-AbCdEf
 ```
 
-Vouchr's `refSource()` maps any `arn:aws:secretsmanager:` reference to the `'aws-sm'`
-source id, which this resolver handles.
+Vouchr validates the bounded ARN form, derives the `'aws-sm'` source id, and confirms this resolver is
+configured before saving the reference. The resolver itself is not invoked until credential use.
 
 ## Authentication
 
