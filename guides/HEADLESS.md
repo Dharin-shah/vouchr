@@ -7,12 +7,15 @@ Vouchr over HTTP. The token stays inside Vouchr.
 If Slack should remain the built-in human/admin experience, start with the
 [hybrid Slack control-plane guide](./HYBRID.md). This document is the lower-level HTTP/API contract.
 
+> [!NOTE]
+> The stock packaged broker enforces both declarative static channel policy
+> (`VOUCHR_POLICY` / `VOUCHR_POLICY_FILE`) and Slack-written `ChannelTools` settings from shared
+> PostgreSQL. They are independent gates: both must allow a provider.
+>
 > [!WARNING]
-> The stock packaged broker enforces Slack-written channel tool settings from shared PostgreSQL.
-> Declarative static channel policy is not loaded
-> ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), and broker denials do not automatically
-> render Slack recovery prompts ([#194](https://github.com/Dharin-shah/vouchr/issues/194)). Do not
-> mistake the now-shared runtime allowlist for the remaining default-deny policy or recovery bridge.
+> Broker denials do not automatically render Slack recovery prompts
+> ([#194](https://github.com/Dharin-shah/vouchr/issues/194)); the trusted Slack-facing host still owns
+> that bridge.
 
 Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 
@@ -102,6 +105,7 @@ One core, two front doors — both reach the same credential boundary.
 | Use a `shared` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
 | Set the channel mode (`shared`/`per-user`/`session`) | ✅ `/vouchr mode` | ✅ `POST /v1/admin/mode` (admin claim) |
 | Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (signed admin; packaged broker or injected `ChannelTools`) |
+| Apply static provider-by-channel policy | ✅ `Policy` option | ✅ `Policy` option; packaged broker loads `VOUCHR_POLICY` or `VOUCHR_POLICY_FILE` |
 | Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` · channel-scoped `POST /v1/manifest` |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
@@ -252,8 +256,14 @@ admin config, the channel manifest, `/v1/fetch`, and `/v1/mcp` read and enforce 
 allowlist cache or additional environment switch is involved. Service tools are included in admin
 config and the channel manifest and may be enabled or disabled there; because Vouchr never executes
 their service-authenticated egress, the trusted host must refuse a service call when its manifest row
-has `enabled:false`. The packaged broker still does not load static `Policy`; see
-[#236](https://github.com/Dharin-shah/vouchr/issues/236).
+has `enabled:false`.
+
+The packaged broker separately loads static operator `Policy` from exactly one of `VOUCHR_POLICY`
+or `VOUCHR_POLICY_FILE`; see the deployment guide's
+[strict JSON contract](./DEPLOYMENT.md#static-channel-policy-declarative). Policy keys are validated
+against the configured provider registry at boot and evaluation uses only the signed channel claim.
+Static policy and mutable `ChannelTools` intersect, so an admin enable cannot override an operator
+deny and a policy allow cannot override a disabled channel tool.
 
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).

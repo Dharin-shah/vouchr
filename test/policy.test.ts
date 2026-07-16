@@ -29,3 +29,14 @@ test('policy: default-deny mode denies unruled providers but honors explicit rul
   assert.equal(p.check('payments', 'C1'), false); // allowChannels gates
   assert.equal(p.check('payments', 'C_FIN'), true);
 });
+
+test('policy: inherited object keys use the documented no-rule fallback unless explicitly configured', () => {
+  for (const provider of ['constructor', 'toString']) {
+    assert.equal(new Policy().check(provider, 'C1'), true);
+    assert.equal(new Policy({}, { defaultDeny: true }).check(provider, 'C1'), false);
+  }
+
+  const configured = new Policy({ constructor: { defaultAllow: false, allowChannels: ['C_ALLOWED'] } });
+  assert.equal(configured.check('constructor', 'C_ALLOWED'), true);
+  assert.equal(configured.check('constructor', 'C_OTHER'), false);
+});

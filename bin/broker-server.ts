@@ -22,6 +22,7 @@ import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
 import { loadProviders } from './providerConfig';
+import { loadPolicy } from './policyConfig';
 import { booleanEnv, MAX_TIMER_MS, nonNegativeIntegerEnv, optionalPositiveEnv } from '../src/core/options';
 
 function fail(msg: string): never {
@@ -161,6 +162,10 @@ export async function buildBrokerServer(
 
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
+  // #236 static operator policy is config, not an override hook. Parse it after providers so rule
+  // ids can be cross-checked, but before KMS/Postgres acquisition so malformed policy fails boot
+  // without touching external infrastructure.
+  const configuredPolicy = loadPolicy(providers, env);
 
   // Parse and cross-check EVERY pure resource setting before KMS or Postgres is acquired. Values are
   // canonical decimal integers and errors name only the variable/contract — never the supplied text,
@@ -242,6 +247,7 @@ export async function buildBrokerServer(
     brokerToken,
     channelConfig,
     channelTools,
+    policy: configuredPolicy?.policy,
     baseUrl,
     callbackPath,
     dryRun,
@@ -263,6 +269,9 @@ export async function buildBrokerServer(
     await sessions.sweepExpired();
     return n;
   };
+  if (configuredPolicy?.defaultDeny && configuredPolicy.ruleCount === 0) {
+    console.warn('[vouchr] static policy has defaultDeny=true and zero rules; all providers are denied');
+  }
   return {
     server,
     db,
@@ -291,7 +300,8 @@ Required env: VOUCHR_IDENTITY_SECRET (>= 32 random bytes; distinct from every ot
               VOUCHR_MASTER_KEY (base64 of 32 bytes), VOUCHR_DATABASE_URL (PostgreSQL).
 Optional env: VOUCHR_IDENTITY_SECRET_PREVIOUS (rolling key rotation), VOUCHR_IDENTITY_ISSUER (default
               'vouchr'), VOUCHR_PORT (3000), VOUCHR_KMS_KEY_ID, VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN,
-              VOUCHR_SWEEP_INTERVAL_MS.
+              VOUCHR_SWEEP_INTERVAL_MS, VOUCHR_POLICY (inline JSON), VOUCHR_POLICY_FILE (JSON path;
+              mutually exclusive with VOUCHR_POLICY).
 Resource bounds (#209): VOUCHR_FETCH_DEADLINE_MS (30000), VOUCHR_MAX_INFLIGHT (200),
               VOUCHR_MAX_INFLIGHT_PER_PROVIDER (40), VOUCHR_HEADERS_TIMEOUT_MS (15000),
               VOUCHR_REQUEST_TIMEOUT_MS (30000), VOUCHR_KEEPALIVE_TIMEOUT_MS (10000),
