@@ -19,7 +19,7 @@ import { Consent } from '../../src/core/consent';
 
 /** The minimal shape a deprovision webhook needs to give us. */
 export interface DeprovisionEvent {
-  /** Enterprise Grid org id. Optional: omit to span by the (org-wide-unique) Slack userId alone. */
+  /** Enterprise Grid org id. Pass when known; omit only for an intentionally global deprovision. */
   enterpriseId?: string | null;
   /** The Slack userId being deactivated. */
   userId: string;
@@ -50,7 +50,7 @@ async function deps() {
  */
 export async function onDeprovision(
   event: DeprovisionEvent,
-): Promise<{ teamId: string; providers: string[] }[]> {
+): Promise<{ teamId: string; providers: string[]; ok: boolean }[]> {
   const { db, vault, audit, consent, registry } = await deps();
   try {
     const summary = await offboardUserEverywhere(
@@ -62,9 +62,12 @@ export async function onDeprovision(
       registry,
       'scim-deprovision',
     );
-    // Log counts only: provider ids and team ids are not secret; tokens never appear here.
+    // Log counts only: provider ids and team ids are not secret; tokens never appear here. A
+    // per-team failure remains explicit so an operator/webhook can retry instead of recording a
+    // blanket success while one workspace still has a credential.
     const removed = summary.reduce((n, t) => n + t.providers.length, 0);
-    console.log(`[vouchr] deprovisioned ${event.userId}: ${removed} connection(s) across ${summary.length} team(s)`);
+    const incomplete = summary.filter((team) => !team.ok).length;
+    console.log(`[vouchr] offboarding processed for ${event.userId}: ${removed} connection(s), ${incomplete} incomplete team(s)`);
     return summary;
   } finally {
     await db.close();
@@ -81,5 +84,6 @@ export async function onDeprovision(
 //     const { enterpriseId, userId } = JSON.parse(body) as DeprovisionEvent;
 //     if (!userId) { res.writeHead(400).end('userId required'); return; }
 //     const summary = await onDeprovision({ enterpriseId, userId });
-//     res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(summary));
+//     const complete = summary.every((team) => team.ok);
+//     res.writeHead(complete ? 200 : 503, { 'content-type': 'application/json' }).end(JSON.stringify(summary));
 //   }).listen(Number(process.env.PORT ?? 3001));

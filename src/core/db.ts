@@ -1,5 +1,6 @@
 import { Pool, types, type PoolClient } from 'pg';
 import { isPostgresUrl, optionalPositiveEnv } from './options';
+import { POSTGRES_NOW_MS_SQL } from './interaction';
 
 /**
  * Minimal async data handle over the store. Vouchr is PostgreSQL-only (#204): multi-replica
@@ -22,6 +23,10 @@ export interface Db {
    * both consuming a rotating refresh token. Optional only so minimal test stubs keep compiling.
    */
   withRefreshLock?<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T>;
+  /** Acquire several advisory locks in canonical order inside one transaction. Credential-mode,
+   *  tool-governance, and pending-interaction mutations use this when one logical write touches
+   *  several provider keys; canonical ordering prevents cross-replica deadlocks. */
+  withRefreshLocks?<T>(keys: readonly string[], fn: (txDb: Db) => Promise<T>): Promise<T>;
   /**
    * Run `fn`'s statements atomically (BEGIN … COMMIT, ROLLBACK on throw), with `fn`'s Db bound to
    * the transaction. Used where one logical mutation spans two tables (e.g. a connection write +
@@ -54,6 +59,10 @@ class PgDb implements Db {
   async exec(sql: string) { await this.pool.query(sql); }
 
   async withRefreshLock<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T> {
+    return this.withRefreshLocks([key], fn);
+  }
+
+  async withRefreshLocks<T>(keys: readonly string[], fn: (txDb: Db) => Promise<T>): Promise<T> {
     if (!this.refreshPool) {
       this.refreshPool = new Pool({
         connectionString: this.connectionString,
@@ -74,12 +83,12 @@ class PgDb implements Db {
       // ponytail: hashtext is 32-bit, so two distinct keys can collide and over-serialize. That only
       // adds latency, never incorrectness. Upgrade to a 64-bit key (two-arg pg_advisory_xact_lock)
       // only if a real collision hot-spot shows up.
-      // Acquire the lock BEFORE arming statement_timeout: a loser blocks on this SELECT until the
-      // winner COMMITs, which can exceed 8s for a slow /token round-trip. If the 8s capped this wait
-      // the loser would abort and throw instead of reusing the winner's rotated token. statement_timeout
-      // is set only after the lock, to bound the in-lock DB statements (re-read / updateTokens) — not the
-      // /token fetch, which is JS and bounded by the refresh pool size, not by statement_timeout.
-      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]); // released at COMMIT
+      // Acquire locks BEFORE arming statement_timeout: a loser blocks until the winner COMMITs,
+      // which can exceed 8s for a slow /token round-trip. Canonical order prevents two multi-key
+      // governance writers from deadlocking while retaining the single-key refresh behavior.
+      for (const key of [...new Set(keys)].sort()) {
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]);
+      }
       await client.query("SET LOCAL statement_timeout = '8s'");
       const out = await fn(new PgClientDb(client));
       await client.query('COMMIT');
@@ -130,6 +139,15 @@ class PgClientDb implements Db {
   async exec(sql: string) { await this.client.query(sql); }
   /** Already inside an open transaction (BEGIN'd by the owner): run inline, atomic with the outer tx. */
   async transaction<T>(fn: (txDb: Db) => Promise<T>): Promise<T> { return fn(this); }
+  async withRefreshLock<T>(key: string, fn: (txDb: Db) => Promise<T>): Promise<T> {
+    return this.withRefreshLocks([key], fn);
+  }
+  async withRefreshLocks<T>(keys: readonly string[], fn: (txDb: Db) => Promise<T>): Promise<T> {
+    for (const key of [...new Set(keys)].sort()) {
+      await this.client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]);
+    }
+    return fn(this);
+  }
   async close() { /* lifecycle owned by withRefreshLock (BEGIN/COMMIT/release); nothing to do here */ }
 }
 
@@ -137,30 +155,36 @@ class PgClientDb implements Db {
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
  * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so this PostgreSQL
  * PostgreSQL baseline started at 7 — never reset it to 1, or a v6 database would be wrongly refused
- * as "newer" by {@link guardSchemaVersion}. Version 8 removes the retired private-preview table.
- * `migrate()` accepts v6/v7 and applies both idempotent cleanups (remove union borrowing and preview
- * configuration) before stamping 8. The `meta` marker fails a downgrade closed (old code vs a newer
- * DB) rather than letting rolling versions interpret state differently.
+ * as "newer" by {@link guardSchemaVersion}. Version 8 removed private previews; version 9 adds
+ * persistent, generation-bound single-use interaction state and exact-action approval deduplication;
+ * version 10 adds durable user/channel-provisioning requests, cross-team offboard tombstones,
+ * scoped break-glass provisioning tombstones, channel-interaction mutation tombstones, and one
+ * PostgreSQL-clock credential-generation boundary for delayed destructive requests.
+ * `migrate()` accepts v6-v10 and applies every idempotent cleanup before stamping 10.
+ * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
+ * controls differently.
  */
-export const SCHEMA_VERSION = 8;
-const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, SCHEMA_VERSION]);
+export const SCHEMA_VERSION = 10;
+const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
  * Migration entry guard — runs BEFORE any DDL. `migrate()` implements exactly two lineages: create a
- * fresh baseline, and carry a v6/v7 database to v8. So the ONLY inputs it can correctly converge are:
+ * fresh baseline, and carry a v6-v9 database to v10. So the ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
  *  - a v6 database → the union cleanup plus preview removal;
  *  - a v7 database → preview removal;
- *  - a v8 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v8 over an unknown shape (a v1–v5 marker,
- * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v8 downgrade —
+ *  - a v8 database → persistent interaction state + approval dedup;
+ *  - a v9 database → durable user/channel-provisioning requests + cross-team lifecycle tombstones;
+ *  - a v10 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v10 over an unknown shape (a v1–v5 marker,
+ * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v10 downgrade —
  * which would let old code corrupt encrypted rows). Vouchr is greenfield: the fix for a rejected
  * database is to recreate it fresh, not to add historical migrations.
  */
-async function guardSchemaVersion(db: Db): Promise<void> {
+async function guardSchemaVersion(db: Db): Promise<number | null> {
   // Probe the marker WITHOUT creating `meta` first, so a genuinely empty schema is distinguishable
   // from a markerless legacy one. `to_regclass` returns NULL (never errors) for a missing table — a
   // SELECT on the missing table would raise 42P01 and, since this runs inside migrate's transaction,
@@ -185,7 +209,7 @@ async function guardSchemaVersion(db: Db): Promise<void> {
       );
     }
     await db.exec(META_DDL); // fresh → ensure the marker table exists for the version stamp
-    return; // migrate() creates the baseline and stamps SCHEMA_VERSION
+    return null; // migrate() creates the baseline and stamps SCHEMA_VERSION
   }
   const row = marker;
   const found = Number(row.value);
@@ -200,9 +224,10 @@ async function guardSchemaVersion(db: Db): Promise<void> {
   if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 6, 7, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
+        `version 6, 7, 8, 9, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
     );
   }
+  return found;
 }
 
 /** Record that the database is now at this build's schema version (after migrations ran). */
@@ -236,6 +261,7 @@ function schema(): string {
       expires_at ${int},
       external_account TEXT,
       dry_run ${int} NOT NULL DEFAULT 0,
+      generation_at ${int} NOT NULL DEFAULT ${POSTGRES_NOW_MS_SQL},
       created_at ${int} NOT NULL,
       updated_at ${int} NOT NULL,
       last_used_at ${int},
@@ -253,6 +279,65 @@ function schema(): string {
       created_at ${int} NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS user_provisioning_request (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      expires_at ${int} NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_user_provisioning_owner_provider
+      ON user_provisioning_request (team_id, user_id, provider);
+    CREATE INDEX IF NOT EXISTS idx_user_provisioning_expiry
+      ON user_provisioning_request (expires_at);
+
+    CREATE TABLE IF NOT EXISTS channel_provisioning_request (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      expires_at ${int} NOT NULL
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_channel_provisioning_actor_target
+      ON channel_provisioning_request (team_id, channel, user_id, provider);
+    CREATE INDEX IF NOT EXISTS idx_channel_provisioning_expiry
+      ON channel_provisioning_request (expires_at);
+
+    CREATE TABLE IF NOT EXISTS channel_interaction_tombstone (
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      PRIMARY KEY (team_id, channel, provider),
+      CHECK (provider ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$')
+    );
+
+    CREATE TABLE IF NOT EXISTS user_offboard_scope_tombstone (
+      scope_kind TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      PRIMARY KEY (scope_kind, scope_id, user_id),
+      CHECK (scope_kind IN ('enterprise', 'unscoped', 'global')),
+      CHECK (
+        (scope_kind='enterprise' AND scope_id<>'') OR
+        (scope_kind IN ('unscoped', 'global') AND scope_id='')
+      )
+    );
+
+    CREATE TABLE IF NOT EXISTS provisioning_revocation_tombstone (
+      provider TEXT NOT NULL,
+      scope_kind TEXT NOT NULL,
+      scope_key TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      PRIMARY KEY (provider, scope_key),
+      CHECK (provider ~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$'),
+      CHECK (scope_kind IN ('global', 'team', 'user', 'team-user', 'channel', 'team-channel')),
+      CHECK (scope_key ~ '^[A-Za-z0-9_-]{43}$')
+    );
     CREATE TABLE IF NOT EXISTS channel_config (
       team_id TEXT NOT NULL,
       channel TEXT NOT NULL,
@@ -275,19 +360,39 @@ function schema(): string {
       thread TEXT NOT NULL,
       user_id TEXT NOT NULL,
       provider TEXT NOT NULL,
+      credential_id TEXT NOT NULL,
       created_at ${int} NOT NULL,
       expires_at ${int} NOT NULL,
       PRIMARY KEY (team_id, channel, thread, user_id, provider)
     );
 
+    CREATE TABLE IF NOT EXISTS session_request (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      thread TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      credential_id TEXT NOT NULL,
+      created_at ${int} NOT NULL,
+      expires_at ${int} NOT NULL,
+      delivery_token TEXT,
+      delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
+      delivered_at ${int},
+      UNIQUE (team_id, channel, thread, user_id, provider)
+    );
+
     CREATE TABLE IF NOT EXISTS approval_request (
       id TEXT PRIMARY KEY,
+      action_key TEXT NOT NULL,
       team_id TEXT NOT NULL,
       user_id TEXT NOT NULL,
       owner_kind TEXT NOT NULL,
       owner_id TEXT NOT NULL,
+      credential_id TEXT NOT NULL,
       provider TEXT NOT NULL,
       method TEXT NOT NULL,
+      origin TEXT NOT NULL,
       host TEXT NOT NULL,
       path TEXT NOT NULL,
       query_hash TEXT NOT NULL DEFAULT '',
@@ -296,7 +401,10 @@ function schema(): string {
       status TEXT NOT NULL,
       approved_by TEXT,
       created_at ${int} NOT NULL,
-      expires_at ${int} NOT NULL
+      expires_at ${int} NOT NULL,
+      delivery_token TEXT,
+      delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
+      delivered_at ${int}
     );
 
     CREATE TABLE IF NOT EXISTS notification_state (
@@ -447,14 +555,57 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
   try {
     await db.transaction(async (tx) => {
       await tx.get('SELECT pg_advisory_xact_lock(hashtext(current_schema()))'); // released at COMMIT
-      await guardSchemaVersion(tx); // fail closed on a newer-schema DB, before any DDL
+      const previousVersion = await guardSchemaVersion(tx); // fail closed before any DDL
       await tx.exec(schema()); // idempotent baseline (CREATE TABLE IF NOT EXISTS)
-      // One-way carries from v6/v7: union credential-borrowing and Vouchr-owned private previews are
-      // gone. Every statement is idempotent — a no-op on a fresh DB and on a re-run. Atomic with the
-      // DDL above (one advisory-locked tx), so migration is all-or-nothing.
+      // One-way carries from v6-v9: union borrowing and private previews are gone, v9 makes pending
+      // interaction state durable and binds every authority row to one exact connection id, and v10
+      // adds durable user/channel-provisioning requests, cross-team offboard tombstones, and
+      // scoped break-glass provisioning tombstones.
+      // Older grants/requests have no credential generation to bind, so clear them fail-closed; a
+      // user must make a fresh decision after upgrade. Every statement is idempotent and atomic with
+      // the DDL/version stamp under the migration lock.
       await tx.exec(`DROP TABLE IF EXISTS union_optin`);
       await tx.run(`UPDATE channel_config SET mode='per-user' WHERE mode='union'`);
       await tx.exec(`DROP TABLE IF EXISTS channel_preview`);
+      // A delayed provider-addressed disconnect must prove the row existed at its trusted request
+      // receipt. Existing rows are conservatively stamped at the drained migration boundary, so no
+      // pre-cutover request can target them; every later reconnect gets PostgreSQL time at INSERT.
+      await tx.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS generation_at BIGINT NOT NULL DEFAULT ${POSTGRES_NOW_MS_SQL}`);
+      // No pre-v10 consent can prove that an enterprise/global offboard did not happen while its
+      // target workspace was artifact-free: the scope-tombstone relation did not exist yet. Spend
+      // every such state fail-closed at the drained cutover. A v10 idempotent rerun preserves
+      // v10-minted states. v8 and older tombstones additionally used per-pod Date.now(), so clear
+      // those; a v9 team tombstone already uses PostgreSQL time and remains useful.
+      if (previousVersion !== null && previousVersion < SCHEMA_VERSION) {
+        await tx.exec(`DELETE FROM consent_request`);
+      }
+      if (previousVersion !== null && previousVersion < 9) {
+        await tx.exec(`DELETE FROM offboard_tombstone`);
+      }
+      await tx.exec(`ALTER TABLE session_grant ADD COLUMN IF NOT EXISTS credential_id TEXT`);
+      await tx.exec(`ALTER TABLE session_request ADD COLUMN IF NOT EXISTS credential_id TEXT`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS credential_id TEXT`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS origin TEXT`);
+      await tx.exec(`DELETE FROM session_grant WHERE credential_id IS NULL`);
+      await tx.exec(`DELETE FROM session_request WHERE credential_id IS NULL`);
+      await tx.exec(`DELETE FROM approval_request WHERE credential_id IS NULL`);
+      // A pre-origin v9 development row cannot be made exact retroactively. Drain it just like an
+      // unbound pre-v9 generation; the user makes a fresh decision against the full action key.
+      await tx.exec(`DELETE FROM approval_request WHERE origin IS NULL`);
+      await tx.exec(`ALTER TABLE session_grant ALTER COLUMN credential_id SET NOT NULL`);
+      await tx.exec(`ALTER TABLE session_request ALTER COLUMN credential_id SET NOT NULL`);
+      await tx.exec(`ALTER TABLE approval_request ALTER COLUMN credential_id SET NOT NULL`);
+      await tx.exec(`ALTER TABLE approval_request ALTER COLUMN origin SET NOT NULL`);
+      // PostgreSQL cannot safely btree-index the bounded-but-multi-KiB raw path, so v9 uses one
+      // HMAC-SHA-256 action key while retaining every full field for exact comparison. No v8 row survives:
+      // it lacks credential_id and cannot be bound safely.
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS action_key TEXT`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);
+      await tx.exec(`ALTER TABLE approval_request ALTER COLUMN action_key SET NOT NULL`);
+      await tx.exec(`DROP INDEX IF EXISTS uq_approval_request_action`);
+      await tx.exec(`CREATE UNIQUE INDEX uq_approval_request_action ON approval_request (action_key)`);
       await stampSchemaVersion(tx);
     });
     return { version: SCHEMA_VERSION };

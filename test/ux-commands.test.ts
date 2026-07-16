@@ -1,11 +1,15 @@
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openTestDb } from './support/pg';
+import { openTestDb, testDbUrl } from './support/pg';
 import { createVouchr } from '../src/adapters/bolt';
-import type { Db } from '../src/core/db';
+import { openDb, type Db } from '../src/core/db';
 import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
+import { Vault } from '../src/core/vault';
+import { Audit } from '../src/core/audit';
+import { Consent } from '../src/core/consent';
+import { offboardUser } from '../src/core/offboard';
 
 // createVouchr builds the vault keyring from the env at construction (like the other command tests).
 process.env.VOUCHR_MASTER_KEY ??= randomBytes(32).toString('base64');
@@ -332,6 +336,93 @@ test('disconnect removes a real connection and confirms it', async (t) => {
   assert.equal(await vouchr.vault.get(userOwner(ID), 'mcp'), null);
 });
 
+test('#194 a delayed slash-command disconnect preserves a fresh post-offboard connection', async (t) => {
+  const databaseUrl = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl }),
+    openDb({ databaseUrl }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const provider = defineProvider({
+    ...mcp,
+    revokeUrl: 'https://api.test/revoke',
+  });
+  const events: unknown[] = [];
+  const vouchr = await createVouchr({
+    providers: [provider], baseUrl: 'https://app.test', db: dbA,
+    onEvent: (event) => events.push(event),
+  });
+  let handler: any;
+  vouchr.registerCommands({
+    command: (_name: string, registered: any) => { handler = registered; },
+    view: () => undefined,
+    action: () => undefined,
+  });
+  const owner = userOwner(ID);
+  await vouchr.vault.upsert(owner, 'mcp', {
+    ...cred,
+    accessToken: 'OLD_SLACK_TOKEN',
+  });
+
+  const originalIssuedAt = vouchr.vault.userProvisioningIssuedAt.bind(vouchr.vault);
+  let entered!: () => void;
+  let resume!: () => void;
+  const atIssuance = new Promise<void>((resolve) => { entered = resolve; });
+  const resumed = new Promise<void>((resolve) => { resume = resolve; });
+  let pause = true;
+  vouchr.vault.userProvisioningIssuedAt = async () => {
+    if (pause) {
+      pause = false;
+      entered();
+      await resumed;
+    }
+    return originalIssuedAt();
+  };
+  const responses: string[] = [];
+  const handling = handler({
+    command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text: 'disconnect mcp' },
+    ack: async () => undefined,
+    respond: async (response: unknown) => { responses.push(String(response)); },
+    client: {},
+  });
+  await atIssuance;
+
+  const vaultB = new Vault(dbB, Buffer.from(process.env.VOUCHR_MASTER_KEY!, 'base64'));
+  await offboardUser(vaultB, new Audit(dbB), new Consent(dbB), ID);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(await vaultB.upsert(owner, 'mcp', {
+    ...cred,
+    accessToken: 'FRESH_SLACK_TOKEN',
+  }), true);
+  const freshId = await vaultB.liveId(owner, 'mcp');
+  assert.ok(freshId);
+  const revokesBefore = (await dbB.get<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM audit WHERE action='revoke' AND provider='mcp'`,
+  ))!.n;
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  try {
+    resume();
+    await handling;
+    assert.equal(responses.length, 1);
+    assert.match(responses[0], /Access changed.*resolve current access and retry/i);
+    assert.equal(await vaultB.liveId(owner, 'mcp'), freshId);
+    assert.equal((await vaultB.get(owner, 'mcp'))?.accessToken, 'FRESH_SLACK_TOKEN');
+    assert.equal(upstreamCalls, 0);
+    assert.equal((await dbB.get<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM audit WHERE action='revoke' AND provider='mcp'`,
+    ))!.n, revokesBefore);
+    assert.deepEqual(events, []);
+  } finally {
+    globalThis.fetch = realFetch;
+    resume();
+  }
+});
+
 test('disconnect delete failure returns safe visible recovery and leaves the connection', async (t) => {
   const { run, vouchr } = await harness(t);
   await vouchr.vault.upsert(userOwner(ID), 'mcp', cred);
@@ -366,8 +457,8 @@ test('disconnect removes a status-visible retired provider and reports upstream 
   assert.match(status, /retired/);
   const msg = await run('disconnect retired');
   assert.match(msg, /Disconnected \*retired\* locally/);
-  assert.match(msg, /upstream token revoke could not be confirmed/i);
-  assert.match(msg, /Revoke or rotate .* directly/);
+  assert.match(msg, /complete revocation could not be confirmed/i);
+  assert.match(msg, /revoke or rotate .* directly/i);
   assert.equal(await vouchr.vault.has(userOwner(ID), 'retired'), false);
   assert.equal(((await db.get(`SELECT COUNT(*) AS n FROM audit WHERE action='revoke' AND provider='retired'`)) as any).n, 1);
   assert.deepEqual(events, [{ type: 'revoked', provider: 'retired', ok: false }]);
@@ -389,7 +480,7 @@ test('disconnect reports an unconfirmed upstream revoke truthfully', async (t) =
     const msg = await run('disconnect rev');
     assert.match(msg, /Disconnected \*rev\*/);
     assert.match(msg, /could not be confirmed/);
-    assert.match(msg, /Revoke or rotate .* directly/);
+    assert.match(msg, /revoke or rotate .* directly/i);
     assert.equal(await vouchr.vault.get(userOwner(ID), 'rev'), null); // local delete still happened
   } finally {
     globalThis.fetch = realFetch;
@@ -410,8 +501,8 @@ test('disconnect preserves upstream-revoke guidance when the audit write also fa
   try {
     const msg = await run('disconnect rev');
     assert.match(msg, /Disconnected \*rev\* locally/);
-    assert.match(msg, /upstream token revoke could not be confirmed/i);
-    assert.match(msg, /Revoke or rotate .* directly/);
+    assert.match(msg, /complete revocation could not be confirmed/i);
+    assert.match(msg, /revoke or rotate .* directly/i);
     assert.doesNotMatch(msg, /ghp_/);
     assert.equal(await vouchr.vault.has(userOwner(ID), 'rev'), false);
     assert.deepEqual(events, [{ type: 'revoked', provider: 'rev', ok: false }]);

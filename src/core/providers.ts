@@ -247,8 +247,17 @@ export function hasAmbiguousPathEncoding(path: string): boolean {
  */
 export function canonicalMethod(m: string): string | null {
   if (typeof m !== 'string') return null;
+  // Boundary ASCII spaces are intentionally canonicalizable. Reject every other raw character
+  // before trim/case-folding so controls and Unicode lookalikes cannot be transformed into a
+  // different method than the caller supplied (e.g. `POST\n` or `POſT`).
+  if (/[^ A-Za-z]/.test(m)) return null;
   const t = m.trim().toUpperCase();
-  return /^[A-Z]+$/.test(t) ? t : null;
+  if (!/^[A-Z]+$/.test(t)) return null;
+  // WHATWG Fetch forbids these methods even though they are syntactically valid HTTP tokens.
+  // Reject them here so provider config and request-time validation cannot defer failure until the
+  // native fetch edge after approval/audit/credential state has already changed.
+  if (t === 'CONNECT' || t === 'TRACE' || t === 'TRACK') return null;
+  return t;
 }
 
 /**

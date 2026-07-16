@@ -8,6 +8,7 @@ import { userOwner } from './owner';
 import { exchangeCode, normalizeGrantedScopes, type TokenResponse } from './tokens';
 import { DRY_RUN_ACCOUNT, DRY_RUN_CODE, DryRunVaultError, dryRunTokenResponse } from './dryRun';
 import { safeEmit } from './safe-emit';
+import type { Db } from './db';
 
 export interface CallbackDeps {
   registry: ProviderRegistry;
@@ -137,12 +138,19 @@ export async function handleOAuthCallback(
       row.pkceVerifier,
     ]) ?? provider.scopesDefault.join(' ');
     const token = { accessToken: tok.accessToken, refreshToken: tok.refreshToken, scopes, expiresAt: tok.expiresAt, externalAccount: account };
-    if (deps.dryRun) {
+    const owner = userOwner(row.identity);
+    const recordConnect = (tx: Db) =>
+      deps.audit.record('connect', row.identity, provider.id, { account }, undefined, tx);
+    const provisioned = deps.dryRun
+      ? await deps.vault.upsertDryRunUser(owner, provider.id, token, row.createdAt, recordConnect)
+      : await deps.vault.upsertUser(owner, provider.id, token, row.createdAt, recordConnect);
+    if (deps.dryRun && provisioned === 'conflict') {
       // ATOMIC no-clobber: one conditional statement that only overwrites an existing SYNTHETIC row,
       // so a REAL credential a sibling process wrote — even between boot and now — survives untouched.
       // No get()-then-upsert, so there is no TOCTOU window. false → a real row blocked it: refuse.
-      if (!(await deps.vault.upsertDryRun(userOwner(row.identity), provider.id, token))) throw new DryRunVaultError();
-    } else if (!(await deps.vault.upsert(userOwner(row.identity), provider.id, token, { mintedAt: row.createdAt }))) {
+      throw new DryRunVaultError();
+    }
+    if (provisioned === 'offboarded') {
       // GHSA-25m2: offboarding won the race between consume() and this write — it wrote the
       // tombstone and deleted every credential while we were in token exchange. The atomic gate
       // refused to resurrect the credential (nothing landed). Audit as denied; write nothing.
@@ -150,14 +158,30 @@ export async function handleOAuthCallback(
       emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 403);
       return { ok: false, status: 403, error: 'This account is no longer active. Reconnect is unavailable.' };
     }
-    await deps.audit.record('connect', row.identity, provider.id, { account });
+    if (provisioned !== 'stored') {
+      // A confirmed break-glass revoke linearized while this already-consumed OAuth state was in
+      // token exchange. This is not account deactivation and unchanged retries of the old state are
+      // not useful: refuse the write and direct the user to start one genuinely new setup.
+      await deps.audit.record('denied', row.identity, provider.id, { reason: 'revoked' });
+      emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 409);
+      return {
+        ok: false,
+        status: 409,
+        error: 'Connection setup changed while authorization was completing. Start a new connection request.',
+      };
+    }
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_granted', 200);
     return { ok: true, provider: provider.id, account, scopes, identity: row.identity };
   } catch {
     // Post-consent connection FAILURE (token exchange / account probe / vault write threw) — not a
     // user denial, but the closest action on the lossy stream. status 500 here is synthetic (the host
     // distinguishes the real user-denial above by its 400). See VouchrAuditEvent.status doc.
-    await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
+    // The credential + connect audit already rolled back together when either write failed. A
+    // second audit-store failure must not escape this public boundary or turn a fixed 500 into an
+    // unhandled rejection; there is no committed success to conceal here.
+    try {
+      await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
+    } catch { /* audit store unavailable; return the fixed failure below */ }
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 500);
     return { ok: false, status: 500, error: 'Connection failed. Please try again.' };
   }

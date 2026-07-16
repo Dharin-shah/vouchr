@@ -91,6 +91,62 @@ requires stopping v8 and restoring the pre-migration database backup before star
 Share/Dismiss buttons cannot publish data after cutover; v8 acknowledges them with fixed expiry
 guidance.
 
+### Required v8 (or prerelease v9) → v10 drained cutover
+
+Schema v9 introduced persistent thread-session controls, exact credential-generation bindings, and
+the bounded exact-action key for approval deduplication. Schema v10 retains those rules and adds
+`user_provisioning_request` and `channel_provisioning_request`, the durable single-use boundaries
+for Slack user and shared-channel key setup;
+`channel_interaction_tombstone`, the PostgreSQL-clock boundary that prevents a setup received before
+an effective channel credential/mode/tool mutation from persisting or committing afterward;
+`user_offboard_scope_tombstone`, which fences enterprise/global offboarding before artifact
+discovery; and `provisioning_revocation_tombstone`, whose fixed hashed scope selectors fence older
+user and shared-channel writes during confirmed break-glass revocation. Treat this as a maintenance
+cutover, not a mixed-version rolling upgrade:
+
+1. Back up PostgreSQL and verify that the backup can be restored.
+2. Quiesce Slack and broker traffic **including identity-assertion minting**, drain in-flight
+   fetches/interactions, and stop **every** v8 or prerelease-v9 replica.
+3. Wait at least **6 minutes 30 seconds after the last old assertion was minted** (the 5-minute
+   maximum lifetime plus the conservative 90-second cluster-skew horizon documented below). Do not
+   restore the minter during this interval. This closes the stateless authority that a prerelease-v9
+   artifact-free enterprise offboard could not record in a scope tombstone.
+4. Run the v10 `vouchr migrate` command with the schema-owner role. From v8, it creates
+   `session_request`, adds exact credential-generation bindings and the bounded approval action key,
+   and deletes every pre-v9 approval/session grant fail-closed because those rows cannot identify
+   which connection generation was authorized. It also clears pre-v9 consent requests and offboard
+   tombstones because those rows used per-pod application clocks. From a prerelease v9 database, it
+   preserves already-bound session/approval rows but deletes all pre-v10 consent: those states cannot
+   prove that no artifact-free enterprise offboard happened before the scope table existed. Both
+   paths add the bounded user/channel-provisioning, channel-interaction, cross-workspace offboard,
+   and scoped break-glass tombstone tables and their indexes. The migration also adds
+   `connection.generation_at` using PostgreSQL time; existing rows receive the drained-cutover
+   boundary, and later reconnects replace it atomically with their own generation time. This is what
+   lets a delayed provider-addressed command/assertion prove it cannot target a newer row.
+5. Start only v10 replicas, confirm readiness, and restore traffic and assertion minting. Users
+   coming from v8 make fresh
+   decisions; setup buttons rendered by v8 or prerelease v9 are rejected with fixed
+   ask-the-agent-again guidance because they do not carry a v10 provisioning-request id.
+
+This is a source-breaking security cutover for low-level headless integrations. `SessionGrants` and
+`Approvals` are no longer package exports; a complete safe broker-to-Slack interaction facade remains
+a later #194 slice. `ChannelConfig` and `ChannelTools` remain public read stores, but raw `setMode`,
+`setEnabled`, and `applyEnabled` writes are removed. Migrate governance writes to packaged Bolt/App
+Home or `POST /v1/admin/mode` and `POST /v1/admin/tools`; those paths keep authorization, lifecycle
+locks, dependent-state purge, and audit atomic. Do not write the interaction/config tables directly:
+v10 deliberately makes old authority unusable after the connection row changes.
+`ApprovalRequiredError` no longer exposes the raw `path`: its constructor now takes the bounded
+`actionFingerprint` and opaque `approvalId` before `queryParamCount` and `newRequest`. Update any
+catch-site field access and direct construction together; never reconstruct an approval decision
+from those display/routing fields.
+
+Do not leave a v8 or prerelease-v9 process live during or after migration. Neither re-checks the
+marker after startup; v8 cannot supply the required approval action key, while v9 can still accept
+an unfenced static/reference write. Runtime startup requires the exact schema version, so mixed
+v8/v9/v10 service is unsupported. Rollback requires stopping v10, restoring the matching
+pre-migration backup, and only then starting the v8 or prerelease-v9 binary that created it; running
+either older binary against schema v10 is refused and unsafe.
+
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
   and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
@@ -105,8 +161,8 @@ guidance.
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
   if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
-  Job / initContainer) to completion before new runtime replicas start. For v7 → v8, use the drained
-  maintenance sequence above instead.
+  Job / initContainer) to completion before new runtime replicas start. For v7 → v8 and
+  v8/prerelease-v9 → v10, use the applicable drained maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 
@@ -180,8 +236,8 @@ Instead of storing a raw secret, point a credential at a secret-manager **refere
 the reference and calls a resolver just-in-time at the HTTP boundary. Resolvers are keyed by source
 id (`Resolvers = Record<string, (ref, signal?) => Promise<string>>`). A production resolver must pass
 the supplied `AbortSignal` into its SDK/network call so timeout and disconnect stop the underlying
-work, not only Vouchr's wait. The repository AWS example does not yet do this; see
-[#209](https://github.com/Dharin-shah/vouchr/issues/209).
+work, not only Vouchr's wait. The repository AWS example passes the signal to the AWS SDK `send`
+call and includes a regression for that propagation.
 
 ```ts
 import { awsSecretsManager } from './examples/aws-secrets-manager/resolver';
@@ -540,8 +596,8 @@ permission to *use the credential at that endpoint/method*, not transaction-leve
 arbitrary request body: Vouchr does not inspect or fingerprint payloads. A provider that needs a human
 to confirm the specific action (an amount, a recipient) must either keep generic writes off, or the
 host must implement that confirmation with a tool-specific step — see the `approval` knob below for
-per-endpoint human-in-the-loop approval, which binds a grant to the exact method + host + path +
-query, single-use.
+per-endpoint human-in-the-loop approval, which binds a grant to the exact method + origin (scheme,
+hostname, and effective port) + path + query, single-use.
 
 To expose a provider on `POST /v1/mcp` (#65), declare the `mcp` knob too — it is a separate opt-in
 on top of the write gating above, and locks the reachable endpoint + response media types
@@ -666,7 +722,7 @@ enablement; neither can override a denial by the other.
 The headless broker can **revoke** credentials, not just inject them — the two checklist items
 "deactivated users lose access" and "TTL sweep scheduled" are satisfied without the Bolt control plane.
 
-- `POST /v1/disconnect` — body `{ handle: { provider }, identityToken }`. The acting user revokes their
+- `POST /v1/disconnect` — body `{ handle: { provider, credentialId? }, identityToken }`. The acting user revokes their
   OWN connection for one provider (identity from the signed token; a forged body can't disconnect
   someone else). Local delete first, best-effort upstream revoke. A retired provider remains removable
   when that exact user-owned row exists; an unknown, unstored provider returns a static `404` before
@@ -674,23 +730,50 @@ The headless broker can **revoke** credentials, not just inject them — the two
   in `revoked`, while `ok` is false if upstream revocation or authoritative auditing was unconfirmed.
   In particular, a revocable external-reference row has no vaulted token to send to the provider: it
   is deleted locally and returned in `revoked`, but `ok` is false and the reference must be rotated in
-  its source manager.
+  its source manager. For an immediate, exact disconnect, call `/v1/resolve` with
+  `includeCredentialId: true` and pass the returned opaque id. Provider-only legacy calls remain
+  accepted only when the conservative assertion/PostgreSQL clock comparison proves the row already
+  existed; an ambiguous recent connection returns typed `409 resolve_again` instead of risking a
+  delayed request deleting its replacement.
 - `POST /v1/admin/offboard` — body `{ identityToken, targetUserId }`. Removes ALL of the target's
-  connections + pending consent + thread grants (wire it to your directory/deprovision hook). Admin
-  authority comes from the **signed `isAdmin` claim** — the broker can't verify workspace admin itself,
+  user-owned connections plus pending consent, thread grants, requester-bound approvals, and Slack
+  credential-setup requests (wire it to your directory/deprovision hook). Shared channel credentials
+  remain for other current users, but the target's old `/v1/fetch` and `/v1/mcp` assertions are
+  rejected before secret access and again at provider send. Admin authority comes from the **signed
+  `isAdmin` claim** — the broker can't verify workspace admin itself,
   so your minter sets it after its own check; fail closed. A signed `enterpriseId` routes the
-  cross-workspace (Grid/SCIM) case to `offboardUserEverywhere`.
-- **TTL sweep** — `broker-server` runs the sweep at startup and every `VOUCHR_SWEEP_INTERVAL_MS`
+  cross-workspace (Grid/SCIM) case to `offboardUserEverywhere`, which writes an enterprise scope
+  tombstone before discovering artifacts and therefore also fences workspaces with no existing row.
+  For that Grid path, the minter must also set signed `offboardTargetUserId` to the exact
+  `targetUserId`; an admin assertion cannot nominate a different global user through the body. The
+  route deliberately remains HTTP 200 after committed local progress, so callers must inspect its
+  body. On a single-team request, failed/skipped upstream revocation or a failed authoritative audit
+  returns `{ ok: false, revoked }` while retaining every locally removed provider in `revoked`. On
+  Grid, any such debt or a team-local cleanup failure yields `{ ok: false, incompleteTeams: N,
+  revoked }`; successful teams are not discarded. Both responses are incomplete, not success, and
+  deprovision hooks must retry or reconcile until `ok` is true. Once a
+  request passes the final provider-send fence and is dispatched, later offboarding cannot recall it.
+- **TTL sweep** — `broker-server` runs its broker-owned sweep at startup and every
+  `VOUCHR_SWEEP_INTERVAL_MS`
   (default hourly; `0` to defer to your own scheduler). It deletes connections past the TTL policy
-  (`VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS`, default 7d / 30d) plus stale consent and expired
-  thread grants. The sweep is idempotent, so overlapping runs across replicas are safe. **Note:** the
+  (`VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS`, default 7d / 30d) plus stale consent, approval,
+  thread-grant, and provisioning state. Direct `createBroker()` deployments schedule the returned
+  server's `sweepExpired()` method; it owns every private interaction store without exporting their
+  mutators.
+  The numeric result remains the expired-credential count for compatibility even though all lifecycle
+  families are swept. The operation is idempotent, so overlapping runs across replicas are safe.
+  **Note:** the
   default TTL now matches the Bolt path — a pure-headless deployment that previously kept credentials
   forever will start expiring them; set both TTL vars to `0` to preserve unbounded lifetime.
 
-For in-process control, `offboardUser`, `sweepExpired`, and `disconnectProvider` are exported from the
-package root. `disconnectProvider` returns `{ recognized, removed, ok, audited }`; delete failures still
-reject, while an audit failure preserves the already-committed local/upstream outcome as
-`audited: false`.
+For in-process control, `offboardUser`, the lower-level core `sweepExpired`, and `disconnectProvider`
+are exported from the package root. A direct broker must use its own `server.sweepExpired()` method so
+approval/session cleanup cannot be omitted. `disconnectProvider` returns
+`{ recognized, removed, ok, audited }`; delete failures still reject, while an audit failure preserves
+the already-committed local/upstream outcome as `audited: false`. For source compatibility,
+`offboardUser` still returns only the locally removed provider ids; that array is not a claim that
+upstream revocation or audit succeeded. Integrations that need the detailed contract should use
+`POST /v1/admin/offboard` and inspect its `ok` field.
 
 ### Replay (multi-replica)
 
@@ -928,7 +1011,7 @@ static-policy enforcement, rather than assuming a Slack control write reaches ev
 | Public URL is HTTPS. Egress also requires https, loopback exempt | operator (Vouchr enforces https egress) |
 | Least-privilege IAM for any resolver (read-only on the specific secrets) | operator (example policy provided) |
 | Slack scopes / events / interactivity applied from the manifest | operator (manifest provided) |
-| TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; Bolt: schedule it. Headless: `broker-server` runs it automatically (#54) |
+| TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; Bolt: schedule `vouchr.sweepExpired()`. Headless: `broker-server` runs it automatically; direct brokers schedule `server.sweepExpired()` (#54) |
 | Offboarding wired so deactivated users lose access | Vouchr provides; Bolt: `registerOffboarding`. Headless: `POST /v1/admin/offboard` from your deprovision hook (#54) |
 | KMS envelope configured for production Vault token columns; multi-workspace installation-token gap #241 closed before launch | Vouchr/operator; currently blocked for multi-workspace |
 | Backups of the credential store (and a restore drill) | operator |

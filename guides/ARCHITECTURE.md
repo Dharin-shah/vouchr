@@ -93,13 +93,24 @@ Tables (`schema()` in `db.ts`):
 
 | Table | Purpose | Key |
 | --- | --- | --- |
-| `connection` | Credentials (vaulted or external-reference) | UNIQUE `(team_id, owner_kind, owner_id, provider)` |
+| `meta` | Exact schema-version downgrade/startup guard | PK `key` |
+| `connection` | Credentials (vaulted or external-reference), with PostgreSQL `generation_at` for delayed provider-addressed disconnect fencing | UNIQUE `(team_id, owner_kind, owner_id, provider)` |
 | `consent_request` | In-flight OAuth `state` + PKCE verifier | PK `state` |
+| `user_provisioning_request` | Opaque, single-use Slack user-key setup intent | PK `id`; UNIQUE `(team_id, user_id, provider)` |
+| `channel_provisioning_request` | Opaque, single-use Slack channel-key setup intent | PK `id`; UNIQUE `(team_id, channel, user_id, provider)` |
+| `channel_interaction_tombstone` | Latest channel/provider credential or effective-governance mutation; fences older setup receipts | PK `(team_id, channel, provider)` |
+| `provisioning_revocation_tombstone` | Provider-scoped break-glass fence; scope identifiers are one-way selectors | PK `(provider, scope_key)` |
+| `user_offboard_scope_tombstone` | Enterprise/unscoped/global user-authority fence | PK `(scope_kind, scope_id, user_id)` |
 | `channel_config` | Per-channel auth mode (`shared` / `per-user` / `session`) | PK `(team_id, channel, provider)` |
 | `channel_tool` | Per-channel tool allowlist (which providers an agent may use) | PK `(team_id, channel, provider)` |
 | `session_grant` | Opt-in thread-scoped authorization (who may use a provider in which thread) | PK `(team_id, channel, thread, user_id, provider)` |
+| `session_request` | Opaque pending thread-session control | PK `id`; UNIQUE exact thread context |
+| `approval_request` | Opaque pending/granted exact-action approval | PK `id`; UNIQUE bounded `action_key` |
+| `notification_state` | Credential-health DM debounce | PK `(team_id, owner_kind, owner_id, provider, type)` |
+| `offboard_tombstone` | Team/user authority fence | PK `(team_id, user_id)` |
 | `audit` | Append-only action log | PK `id` |
 | `installation` | Encrypted Slack install (bot/user tokens) for multi-workspace | PK rowKey `(enterprise, team)` |
+| `broker_jti` | Cross-replica single-use identity assertion replay guard | PK `jti` |
 
 Every vault read/write is scoped by the **owner key `(team_id, owner_kind, owner_id,
 provider)`**, and the UNIQUE constraint enforces one credential per principal+provider. `owner_kind` is `user` or `channel`; `team_id` is always the
@@ -149,15 +160,26 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
 
 1. **Consent** (`src/core/consent.ts`). `begin()` mints a single-use `state` (32 random
    bytes) + PKCE verifier, persists the consent row, and builds the provider authorize
-   URL.
+   URL. Headless/user flows use `beginFenced()` so an assertion or Slack demand that predates
+   offboarding cannot mint fresh callback authority after the fence.
 2. **Callback** (`src/core/oauthCallback.ts`). `consume()` atomically deletes the state
    (`DELETE ... RETURNING`, single-use, 10-min TTL), the code is exchanged for tokens,
    an optional `accountProbe` fetches a human-readable label, and the token is vaulted.
 3. **Vault** (`src/core/vault.ts`). `upsert` stores a vaulted credential (resets
-   `created_at`); `reference` stores an external-ref credential; both are owner-keyed.
+   `created_at`); `reference` stores an external-ref credential; both are owner-keyed. Every
+   user-owned OAuth, static-key, dry-run, and reference write converges on one credential-lock →
+   applicable break-glass locks → offboard locks → latest-tombstone fence, with its config/connect
+   audit in the same transaction. Shared-channel setup and the exported low-level channel Vault
+   writers use the corresponding scoped break-glass fence. Built-in Slack channel setup first opens
+   an authority-free loading view, then stores an opaque actor/channel/provider request; the final
+   credential transaction consumes that request with `DELETE ... RETURNING`, so duplicate submit,
+   write, mode/satellite cleanup, and config audit are one atomic outcome.
 4. **Inject** (`src/core/injector.ts`). `handle.fetch()` enforces egress allowlist +
-   HTTPS, reads/resolves the secret, attaches it (`redirect: 'manual'`), touches the idle
-   timer, and audits as the acting human.
+   HTTPS and revalidates the retained acting-user receipt plus current governance, session, and
+   credential generation before stateful gates. It reads/resolves the secret only after those gates,
+   revalidates again at the provider-send boundary, attaches it (`redirect: 'manual'`), touches the
+   idle timer, and audits as the acting human. A request already handed to the provider cannot be
+   recalled by a later offboard event.
 5. **Refresh.** On a 401 (or near-expiry) for a vaulted OAuth credential, a single-flight
    refresh (`inflight` map dedups concurrent refreshes of a rotating token) updates the
    tokens via `updateTokens`, which leaves `created_at` intact, so refresh cannot defer
@@ -165,15 +187,30 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
 6. **TTL / sweep** (`src/core/sweep.ts`, `vault.ts`). `get()` returns `null` for an
    expired connection (lazy expiry); a periodic `sweepExpired()` deletes idle/aged rows
    (default idle 7d / max-age 30d) and clears stale consent. Filtering happens in SQL.
-7. **Offboard / revoke** (`src/core/offboard.ts`, `src/core/tokens.ts`). On Slack
-   deactivation (or `/vouchr disconnect`, or a SCIM hook), the local credential is deleted
-   first (the security-meaningful action), pending consent and thread session grants are
-   purged, and an upstream revoke is attempted best-effort only for a real row when the provider
+7. **Disconnect / offboard / break-glass revoke** (`src/core/offboard.ts`, `src/core/tokens.ts`).
+   `/vouchr disconnect` is a provider-scoped local delete plus satellite cleanup and best-effort
+   upstream revoke. It writes an exact provider/owner provisioning marker (but no offboard
+   tombstone), so already-issued setup/OAuth authority cannot undo the deletion while a fresh later
+   reconnect remains allowed.
+   Slack deactivation and SCIM offboarding first commit a monotonic team or enterprise/global scope
+   tombstone before cleanup/artifact discovery, including an otherwise-empty workspace. The local
+   credential is deleted first (the security-meaningful cleanup); pending consent, setup requests,
+   requester-bound approvals, and
+   thread session grants are purged best-effort, and an upstream revoke is attempted best-effort
+   only for a real row when the provider
    supports it and the claim supplies a usable vaulted token. A real revocable external reference
    or unreadable token is still removed locally but leaves upstream revocation unconfirmed;
    non-revocable and trusted dry-run rows are intentional skips. The Grid/SCIM
-   `offboardUserEverywhere` sweep applies the same cleanup across every team. Channel/shared
-   credentials are intentionally left for an admin to review.
+   `offboardUserEverywhere` sweep applies the same cleanup across every team. The offboard
+   tombstones—not bounded-state purge success—are the load-bearing barrier against later user
+   provisioning and retained use. Approval decisions and consumption compare trusted actor/request
+   creation times with those tombstones. Channel/shared credentials are intentionally left for an
+   admin to review and remain usable by other current actors; the departed actor's older handles and
+   assertions are refused before secret access and provider send.
+   Separately, confirmed `vouchr revoke --yes` commits one exact provider+scope marker before
+   enumerating pending or live state. Matching older user and channel writers either finish before
+   that marker and are found by the post-fence scan, or refuse afterward. Scope ids are stored only
+   as fixed hashes, and a genuinely new setup after the marker remains possible.
 
 **Per-channel auth mode.** `channel_config.mode` is the single source of truth for which credential
 model `connect()` uses for a provider in a channel: `per-user` (the default), `shared` (route to the
@@ -181,7 +218,12 @@ channel credential), or `session`. `connect()` resolves the mode and routes acco
 model is configured in Slack (`/vouchr mode <provider> <mode>`), not hardcoded in the agent. In
 PostgreSQL, shared-credential setup and mode changes take the same owner/provider advisory lock and
 commit the credential row, mode, satellite cleanup, and audit together. A mode change to `per-user`
-or `session` therefore cannot race setup into leaving a dormant shared credential. In
+or `session` therefore cannot race setup into leaving a dormant shared credential. In addition,
+every effective credential/mode/tool mutation advances a PostgreSQL-clock channel
+interaction tombstone in that transaction. A setup handler compares it with the original verified
+Slack receipt before hydrating or consuming the form, closing the window while `views.open` or
+admin checks are pending. Same-value governance retries do not advance the marker. Envelope/KMS
+wrapping is prepared before any credential, revocation, or actor-offboard lock is acquired. In
 `session` mode `connect()` adds an authorization gate before the credential is resolved: the
 provider is usable only inside the Slack thread the user approved it in (a grant keyed
 `(team_id, channel, thread, user_id, provider)`), with a TTL ceiling. Grants live in `session_grant`,

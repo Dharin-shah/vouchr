@@ -6,7 +6,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
-import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { SessionGrants } from '../src/core/session';
 import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
@@ -79,7 +79,7 @@ test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  await channelConfig.setMode('T1', 'C1', 'acme', 'session');
+  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   const port = await listen(server);
@@ -104,9 +104,11 @@ test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', asy
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   const sessions = new SessionGrants(db);
-  await channelConfig.setMode('T1', 'C1', 'acme', 'session');
+  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  await sessions.grant(U1, 'C1', '111.222', 'acme', 60_000); // approve exactly this thread
+  const credentialId = await vault.liveId(userOwner(U1), 'acme');
+  assert.ok(credentialId);
+  await sessions.grant(U1, 'C1', '111.222', 'acme', 60_000, credentialId); // approve exactly this thread
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   const port = await listen(server);
   const up = mockUpstream();

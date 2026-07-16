@@ -37,7 +37,9 @@ configured before saving the reference. The resolver itself is not invoked until
 
 The resolver uses the **ambient IAM role** (ECS/Fargate task role, EC2 instance
 profile, or EKS IRSA). There are **no static credentials in code**. Region and
-credentials are resolved by the AWS SDK's default provider chain.
+credentials are resolved by the AWS SDK's default provider chain. The resolver forwards Vouchr's
+optional `AbortSignal` to the SDK request so a caller disconnect or deadline cancels underlying AWS
+work as well as Vouchr's wait.
 
 ## Least-privilege IAM policy
 

@@ -1,10 +1,14 @@
 import { isOAuthScopeToken } from './providers';
 import type { Vault } from './vault';
+import type { UserProvisioningIssuance, UserProvisioningResult } from './vault';
 import type { Audit } from './audit';
 import type { SlackIdentity } from './identity';
-import { userOwner } from './owner';
 import type { ChannelConfig, ChannelMode } from './channelConfig';
-import { configureChannelCredential } from './channelCredential';
+import {
+  configureChannelCredential,
+  type ChannelProvisioningIssuance,
+} from './channelCredential';
+import { configureUserCredential } from './provisioning';
 
 export const SECRET_REFERENCE_SOURCES = ['aws-sm', 'gcp-sm', 'azure-kv', 'vault'] as const;
 export type SecretReferenceSource = (typeof SECRET_REFERENCE_SOURCES)[number];
@@ -168,15 +172,12 @@ export async function referenceUserCredential(input: {
   identity: SlackIdentity;
   providerId: string;
   reference: SecretReference;
-}): Promise<void> {
-  await input.vault.reference(
-    userOwner(input.identity),
-    input.providerId,
-    input.reference,
-    (tx) => input.audit.record('config', input.identity, input.providerId, {
-      owner: 'user', kind: 'ref', source: input.reference.source,
-    }, undefined, tx),
-  );
+  issuance: UserProvisioningIssuance;
+}): Promise<UserProvisioningResult> {
+  return configureUserCredential({
+    ...input,
+    credential: { kind: 'ref', reference: input.reference },
+  });
 }
 
 /**
@@ -191,19 +192,21 @@ export async function referenceChannelCredential(input: {
   channel: string;
   providerId: string;
   reference: SecretReference;
+  issuance: ChannelProvisioningIssuance;
   authorize: () => Promise<void>;
   assertEligible: () => Promise<void>;
   modeConflict: (mode: Exclude<ChannelMode, 'shared'>) => never;
-}): Promise<void> {
+}): Promise<boolean> {
   await input.authorize();
   await input.assertEligible();
-  await configureChannelCredential({
+  return configureChannelCredential({
     vault: input.vault,
     audit: input.audit,
     channelConfig: input.channelConfig,
     identity: input.identity,
     channel: input.channel,
     providerId: input.providerId,
+    issuance: input.issuance,
     credential: { kind: 'ref', reference: input.reference },
     modeConflict: input.modeConflict,
   });

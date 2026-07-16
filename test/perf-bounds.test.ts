@@ -554,7 +554,7 @@ test('createBroker: inbound server timeouts are set from the configured values (
   assert.equal(server.headersTimeout, 12_000);
   assert.equal(server.requestTimeout, 21_000);
   assert.equal(server.keepAliveTimeout, 7_000);
-  assert.equal((server as http.Server & { connectionsCheckingInterval: number }).connectionsCheckingInterval, 1_000);
+  assert.equal((server as unknown as http.Server & { connectionsCheckingInterval: number }).connectionsCheckingInterval, 1_000);
   assert.equal(server.timeout, 5 * 60_000, 'general socket inactivity is finite and preserves MCP duration');
 });
 

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  ApprovalPathTooLongError,
   ApprovalRequiredError,
   ConsentRequiredError,
   EgressBlockedError,
+  InteractionStateChangedError,
   NoConnectionError,
   PolicyDeniedError,
   RateLimitedError,
@@ -23,9 +25,11 @@ import {
   safeUserMessage,
 } from '../src/index';
 import {
+  ApprovalPathTooLongError as HeadlessApprovalPathTooLongError,
   ApprovalRequiredError as HeadlessApprovalRequiredError,
   ConsentRequiredError as HeadlessConsentRequiredError,
   EgressBlockedError as HeadlessEgressBlockedError,
+  InteractionStateChangedError as HeadlessInteractionStateChangedError,
   NoConnectionError as HeadlessNoConnectionError,
   PolicyDeniedError as HeadlessPolicyDeniedError,
   RateLimitedError as HeadlessRateLimitedError,
@@ -48,9 +52,11 @@ import { OverloadedError } from '../src/core/inflight';
 
 test('typed error classes and mapper are the same exports on root and Bolt-free headless entrypoints', () => {
   const pairs = [
+    [ApprovalPathTooLongError, HeadlessApprovalPathTooLongError, 'ApprovalPathTooLongError'],
     [ApprovalRequiredError, HeadlessApprovalRequiredError, 'ApprovalRequiredError'],
     [ConsentRequiredError, HeadlessConsentRequiredError, 'ConsentRequiredError'],
     [EgressBlockedError, HeadlessEgressBlockedError, 'EgressBlockedError'],
+    [InteractionStateChangedError, HeadlessInteractionStateChangedError, 'InteractionStateChangedError'],
     [NoConnectionError, HeadlessNoConnectionError, 'NoConnectionError'],
     [PolicyDeniedError, HeadlessPolicyDeniedError, 'PolicyDeniedError'],
     [RateLimitedError, HeadlessRateLimitedError, 'RateLimitedError'],
@@ -80,8 +86,10 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
     'self',
     'POST',
     'api.github.com',
-    '/repos/a/b',
-    'approval-1',
+    `hmac-sha256:${'a'.repeat(64)}`,
+    '00000000-0000-4000-8000-000000000001',
+    0,
+    true,
   );
   const cases = [
     [new ConsentRequiredError('github'), 'consent_required', 'connect', false, undefined,
@@ -90,6 +98,12 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
       'Thread-scoped session approval is required. Approve the private prompt, then retry.'],
     [approval, 'approval_required', 'request_approval', false, undefined,
       'Human approval is required. Request approval, then retry.'],
+    [new ApprovalPathTooLongError(), 'approval_path_too_large', 'fix_configuration', false, undefined,
+      'The approval action path is too large. Narrow the endpoint and retry.'],
+    [new InteractionStateChangedError('connection', 'credential'), 'interaction_state_changed', 'resolve_again', false, undefined,
+      'The connection changed while Vouchr was handling this request. Resolve it again and retry.'],
+    [new InteractionStateChangedError('approval', 'authorization'), 'interaction_state_changed', 'resolve_again', false, undefined,
+      'Access changed while Vouchr was handling this request. Resolve current access and retry.'],
     [new PolicyDeniedError(), 'policy_denied', 'contact_admin', false, undefined,
       'Provider policy denies this request. Contact an eligible admin.'],
     [new ToolDisabledError(), 'tool_disabled', 'contact_admin', false, undefined,
@@ -138,7 +152,10 @@ test('mapSafeError does not trust arbitrary messages merely because they use an 
   const errors = [
     new ConsentRequiredError(secret),
     new SessionApprovalRequiredError(secret),
-    new ApprovalRequiredError(secret, 'self', secret, secret, secret, 'approval-1'),
+    new ApprovalRequiredError(
+      secret, 'self', secret, secret, secret,
+      '00000000-0000-4000-8000-000000000001', 0, true,
+    ),
     new EgressBlockedError(secret),
     new NoConnectionError(secret, 'user'),
     new ResolverConfigurationError(),
@@ -179,7 +196,9 @@ test('runtime-invalid trusted-class discriminants collapse to fixed internal met
   };
   const invalidRecovery = new UserFacingError('deliberate safe copy', sentinel as any);
   const invalidTokenKind = new TokenEndpointError(sentinel, sentinel as any);
-  for (const error of [invalidRecovery, invalidTokenKind]) {
+  const invalidInteraction = new InteractionStateChangedError('connection', 'credential');
+  (invalidInteraction as any).reason = sentinel;
+  for (const error of [invalidRecovery, invalidTokenKind, invalidInteraction]) {
     const mapped = mapSafeError(error);
     assert.deepEqual(mapped, expected);
     assert.ok(!JSON.stringify(mapped).includes(sentinel));
@@ -219,6 +238,7 @@ test('published code and recovery registries are closed, duplicate-free contract
   assert.deepEqual(VOUCHR_RECOVERY_ACTIONS, [
     'connect',
     'request_approval',
+    'resolve_again',
     'retry_later',
     'fix_configuration',
     'contact_admin',

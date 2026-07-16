@@ -5,8 +5,8 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig } from '../src/core/channelConfig';
-import { ChannelTools } from '../src/core/tools';
+import { ChannelConfig, writeChannelMode, type ChannelMode } from '../src/core/channelConfig';
+import { applyChannelToolsEnabled, ChannelTools } from '../src/core/tools';
 import { sweepExpired } from '../src/core/sweep';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { github, defineProvider } from '../src/core/providers';
@@ -43,36 +43,38 @@ test('postgres backend: channel setup and mode changes serialize in both race di
   // Mode wins the lock: it deletes the old shared row and pauses before writing per-user. A setup
   // on the other pool must wait, then observe per-user and refuse instead of resurrecting a row.
   const modeFirst = 'mode-first';
-  const configA = new ChannelConfig(dbA);
+  let beforeModeWrite: ((provider: string, mode: ChannelMode) => Promise<void>) | undefined;
+  const configA = new ChannelConfig(dbA, async (provider, mode) => beforeModeWrite?.(provider, mode));
   const configB = new ChannelConfig(dbB);
   await configureChannelCredential({
     vault: vaultA, audit: auditA, channelConfig: configA, identity, channel, providerId: modeFirst,
+    issuance: await vaultA.userProvisioningIssuedAt(),
     credential: { kind: 'secret', token: tok('old-shared') }, modeConflict: conflict,
   });
   let modeEntered!: () => void;
   let releaseMode!: () => void;
   const atModeWrite = new Promise<void>((resolve) => { modeEntered = resolve; });
   const modeGate = new Promise<void>((resolve) => { releaseMode = resolve; });
-  const setModeA = configA.setMode.bind(configA);
-  configA.setMode = async (...args) => {
-    if (args[2] === modeFirst && args[3] === 'per-user') { modeEntered(); await modeGate; }
-    return setModeA(...args);
+  beforeModeWrite = async (provider, mode) => {
+    if (provider === modeFirst && mode === 'per-user') { modeEntered(); await modeGate; }
   };
+  const modeChangeIssuance = await vaultA.userProvisioningIssuedAt();
   const modeChange = setChannelCredentialMode({
     vault: vaultA, audit: auditA, channelConfig: configA, identity, channel,
-    providerId: modeFirst, mode: 'per-user',
+    providerId: modeFirst, mode: 'per-user', issuance: modeChangeIssuance,
   });
   await atModeWrite;
   let setupSettled = false;
   const lateSetup = configureChannelCredential({
     vault: vaultB, audit: auditB, channelConfig: configB, identity, channel, providerId: modeFirst,
+    issuance: await vaultB.userProvisioningIssuedAt(),
     credential: { kind: 'secret', token: tok('late-shared') }, modeConflict: conflict,
   }).finally(() => { setupSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(setupSettled, false, 'setup did not wait for the in-flight mode transaction');
   releaseMode();
   await modeChange;
-  await assert.rejects(lateSetup, /mode conflict: per-user/);
+  assert.equal(await lateSetup, false, 'the winning mode change invalidates the older setup receipt');
   assert.equal(await configB.getMode(identity.teamId, channel, modeFirst), 'per-user');
   assert.equal(await vaultB.get(channelOwner(identity.teamId, channel), modeFirst), null);
 
@@ -83,19 +85,20 @@ test('postgres backend: channel setup and mode changes serialize in both race di
   let releaseSetup!: () => void;
   const atSetupModeWrite = new Promise<void>((resolve) => { setupEntered = resolve; });
   const setupGate = new Promise<void>((resolve) => { releaseSetup = resolve; });
-  configA.setMode = async (...args) => {
-    if (args[2] === setupFirst && args[3] === 'shared') { setupEntered(); await setupGate; }
-    return setModeA(...args);
+  beforeModeWrite = async (provider, mode) => {
+    if (provider === setupFirst && mode === 'shared') { setupEntered(); await setupGate; }
   };
+  const lateModeIssuance = await vaultB.userProvisioningIssuedAt();
   const setup = configureChannelCredential({
     vault: vaultA, audit: auditA, channelConfig: configA, identity, channel, providerId: setupFirst,
+    issuance: await vaultA.userProvisioningIssuedAt(),
     credential: { kind: 'secret', token: tok('new-shared') }, modeConflict: conflict,
   });
   await atSetupModeWrite;
   let modeSettled = false;
   const lateMode = setChannelCredentialMode({
     vault: vaultB, audit: auditB, channelConfig: configB, identity, channel,
-    providerId: setupFirst, mode: 'per-user',
+    providerId: setupFirst, mode: 'per-user', issuance: lateModeIssuance,
   }).finally(() => { modeSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(modeSettled, false, 'mode change did not wait for the in-flight setup transaction');
@@ -157,7 +160,7 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
 
   // Channel config mode persists.
   const cfg = new ChannelConfig(db);
-  await cfg.setMode('T1', 'C_FIN', 'mcp', 'per-user');
+  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'per-user');
   assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), 'per-user');
 
   // #107 stats rollup on the REAL engine. Postgres returns COUNT/BIGINT as strings and lowercases
@@ -317,17 +320,17 @@ test('postgres backend: rekey converges direct rows onto the primary key (BYTEA 
   assert.equal(inst.bot?.token, 'xoxb-pg-secret');
 });
 
-// #111: ChannelTools.applyEnabled's atomic materialize-or-upsert statements (UNION ALL + CASTs +
+// #111: the channel-tool atomic materialize-or-upsert statements (UNION ALL + CASTs +
 // in-statement NOT EXISTS + ON CONFLICT) on the real engine — a PG-only syntax or type-inference
 // mistake in that SQL surfaces here, not in the SQLite-backed unit tests.
 test('postgres backend: applyEnabled materializes atomically, then upserts on the configured channel', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const db = await openTestDb(t);
   const tools = new ChannelTools(db);
-  await tools.applyEnabled('T_PG', 'C1', [['mcp', false]], ['mcp', 'other']);
+  await applyChannelToolsEnabled(tools, 'T_PG', 'C1', [['mcp', false]], ['mcp', 'other']);
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), false); // the targeted provider
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // materialized, not silently disabled
-  await tools.applyEnabled('T_PG', 'C1', [['mcp', true]], ['mcp', 'other']);
+  await applyChannelToolsEnabled(tools, 'T_PG', 'C1', [['mcp', true]], ['mcp', 'other']);
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), true); // configured path: plain upsert
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // untouched
 });
@@ -349,8 +352,8 @@ test('postgres backend: opposite provider orders cannot deadlock first or bulk t
   for (let i = 0; i < 12; i++) {
     const channel = `C_FIRST_${i}`;
     await Promise.all([
-      toolsA.applyEnabled('T_ORDER', channel, [[forward[0], false]], forward),
-      toolsB.applyEnabled('T_ORDER', channel, [[reverse[0], false]], reverse),
+      applyChannelToolsEnabled(toolsA, 'T_ORDER', channel, [[forward[0], false]], forward),
+      applyChannelToolsEnabled(toolsB, 'T_ORDER', channel, [[reverse[0], false]], reverse),
     ]);
     assert.equal(await toolsA.isEnabled('T_ORDER', channel, forward[0]), false);
     assert.equal(await toolsA.isEnabled('T_ORDER', channel, reverse[0]), false);
@@ -359,10 +362,10 @@ test('postgres backend: opposite provider orders cannot deadlock first or bulk t
 
   // The configured-channel upsert must use the same canonical row-lock order for bulk modal writes.
   const bulkChannel = 'C_BULK';
-  await toolsA.applyEnabled('T_ORDER', bulkChannel, [[forward[0], true]], forward);
+  await applyChannelToolsEnabled(toolsA, 'T_ORDER', bulkChannel, [[forward[0], true]], forward);
   await Promise.all([
-    toolsA.applyEnabled('T_ORDER', bulkChannel, forward.map((provider) => [provider, false] as const), forward),
-    toolsB.applyEnabled('T_ORDER', bulkChannel, reverse.map((provider) => [provider, true] as const), reverse),
+    applyChannelToolsEnabled(toolsA, 'T_ORDER', bulkChannel, forward.map((provider) => [provider, false] as const), forward),
+    applyChannelToolsEnabled(toolsB, 'T_ORDER', bulkChannel, reverse.map((provider) => [provider, true] as const), reverse),
   ]);
   const verdict = await toolsA.enabledSnapshot('T_ORDER', bulkChannel);
   const finalBits = new Set(forward.map(verdict));

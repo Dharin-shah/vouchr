@@ -4,17 +4,23 @@ import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import http from 'node:http';
 import { createVouchr, createBroker, ConsentRequiredError, PolicyDeniedError } from '../src';
-import { defineProvider, ProviderRegistry } from '../src/core/providers';
+import { defineProvider, ProviderRegistry, type Provider } from '../src/core/providers';
 import { Vault, type StoredToken } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
 import { Consent } from '../src/core/consent';
+import { Approvals, type ApprovalKey } from '../src/core/approval';
+import {
+  ChannelProvisioningRequests,
+  UserProvisioningRequests,
+} from '../src/core/provisioning';
 import { SessionGrants } from '../src/core/session';
 import { revokeConnection, selectRevocations } from '../src/core/offboard';
 import { EgressBlockedError } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
 import { identityConfig, signIdentity } from './support/identity';
 import type { SlackIdentity } from '../src/core/identity';
+import type { Db } from '../src/core/db';
 
 process.env.VOUCHR_MASTER_KEY = randomBytes(32).toString('base64');
 
@@ -42,6 +48,115 @@ const acme = () => defineProvider({
   clientId: 'dry',
   clientSecret: 'run',
 });
+
+const LIFECYCLE_TABLES = [
+  'connection',
+  'audit',
+  'consent_request',
+  'approval_request',
+  'session_request',
+  'session_grant',
+  'user_provisioning_request',
+  'channel_provisioning_request',
+] as const;
+
+const lifecycleIdentity = (userId: string): SlackIdentity => ({
+  enterpriseId: null,
+  teamId: 'T1',
+  userId,
+});
+
+async function lifecycleCounts(db: Db): Promise<Record<string, number>> {
+  const counts: Record<string, number> = {};
+  for (const table of LIFECYCLE_TABLES) {
+    const row = await db.get<{ count: number }>(`SELECT COUNT(*) AS count FROM ${table}`);
+    counts[table] = Number(row?.count ?? 0);
+  }
+  return counts;
+}
+
+/** Seed every lifecycle family as expired. Two connection rows matter: one legitimate dry-run row
+ * and one contaminating REAL row. A failing safety rail must preserve both, not partially sweep the
+ * synthetic row before noticing the real one. */
+async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provider): Promise<void> {
+  await new Consent(db, true).begin(
+    lifecycleIdentity('U_SWEEP_CONSENT'),
+    provider,
+    'https://broker.test/oauth/callback',
+    null,
+  );
+
+  const approvalKey: ApprovalKey = {
+    teamId: 'T1',
+    userId: 'U_SWEEP_APPROVAL',
+    ownerKind: 'user',
+    ownerId: 'U_SWEEP_APPROVAL',
+    credentialId: randomUUID(),
+    provider: provider.id,
+    method: 'POST',
+    origin: 'https://api.acme.example',
+    host: 'api.acme.example',
+    path: '/write',
+    queryHash: '',
+    channel: null,
+    thread: null,
+  };
+  await new Approvals(db).request(approvalKey);
+
+  const sessions = new SessionGrants(db);
+  await sessions.request(
+    lifecycleIdentity('U_SWEEP_SESSION_REQUEST'),
+    'C_SWEEP',
+    'TH_REQUEST',
+    provider.id,
+    randomUUID(),
+  );
+  await sessions.grant(
+    lifecycleIdentity('U_SWEEP_SESSION_GRANT'),
+    'C_SWEEP',
+    'TH_GRANT',
+    provider.id,
+    60_000,
+    randomUUID(),
+  );
+
+  assert.ok(await new UserProvisioningRequests(db, vault).issue(
+    lifecycleIdentity('U_SWEEP_USER_SETUP'),
+    provider.id,
+  ));
+  assert.ok(await new ChannelProvisioningRequests(db, vault).issue(
+    lifecycleIdentity('U_SWEEP_CHANNEL_SETUP'),
+    'C_SWEEP_SETUP',
+    provider.id,
+    await vault.userProvisioningIssuedAt(),
+  ));
+
+  await seedDry(vault, lifecycleIdentity('U_SWEEP_DRY_CONNECTION'), provider.id);
+  await vault.upsert(userOwner(lifecycleIdentity('U_SWEEP_REAL_CONNECTION')), provider.id, {
+    ...FRESH,
+    accessToken: 'real-expired-test-token',
+    externalAccount: 'production',
+  });
+
+  await db.run(`UPDATE connection SET created_at=0, last_used_at=0`);
+  await db.run(`UPDATE consent_request SET created_at=0`);
+  await db.run(`UPDATE approval_request SET expires_at=0`);
+  await db.run(`UPDATE session_request SET expires_at=0`);
+  await db.run(`UPDATE session_grant SET expires_at=0`);
+  await db.run(`UPDATE user_provisioning_request SET expires_at=0`);
+  await db.run(`UPDATE channel_provisioning_request SET expires_at=0`);
+}
+
+const contaminatedLifecycleCounts = {
+  connection: 2,
+  audit: 0,
+  consent_request: 1,
+  approval_request: 1,
+  session_request: 1,
+  session_grant: 1,
+  user_provisioning_request: 1,
+  channel_provisioning_request: 1,
+};
 
 /** Fail-loud network ban: ANY outbound fetch during a dry-run test is a bug. Restore in finally (TEST-3). */
 function banNetwork(): () => void {
@@ -376,6 +491,62 @@ test('dry-run: a real row written AFTER boot is refused per-request, never injec
   }
 });
 
+test('dry-run broker sweep refuses pre-construction real contamination without touching lifecycle state', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, MASTER, { idleMs: 60_000 });
+  const provider = acme();
+  await seedContaminatedLifecycle(db, vault, provider);
+  assert.deepEqual(await lifecycleCounts(db), contaminatedLifecycleCounts);
+
+  const server = createBroker({
+    providers: [provider],
+    vault,
+    audit: new Audit(db),
+    db,
+    identitySecret: identityConfig('dry-run-lifecycle-before'),
+    dryRun: true,
+  });
+  await assert.rejects(
+    server.sweepExpired(),
+    /refusing dryRun against a vault with real credentials/,
+  );
+  assert.deepEqual(
+    await lifecycleCounts(db),
+    contaminatedLifecycleCounts,
+    'construction-time refusal must not delete credentials, audit, or interactions',
+  );
+  server.close();
+});
+
+test('dry-run broker sweep transaction rejects post-construction contamination atomically', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, MASTER, { idleMs: 60_000 });
+  const provider = acme();
+  const server = createBroker({
+    providers: [provider],
+    vault,
+    audit: new Audit(db),
+    db,
+    identitySecret: identityConfig('dry-run-lifecycle-after'),
+    dryRun: true,
+  });
+
+  assert.equal(await server.sweepExpired(), 0, 'the construction-time clean-vault check has passed');
+  await seedContaminatedLifecycle(db, vault, provider);
+  assert.deepEqual(await lifecycleCounts(db), contaminatedLifecycleCounts);
+
+  await assert.rejects(
+    server.sweepExpired(),
+    /refusing dryRun against a vault with real credentials/,
+  );
+  assert.deepEqual(
+    await lifecycleCounts(db),
+    contaminatedLifecycleCounts,
+    'transactional revalidation must roll back every lifecycle family and audit companion',
+  );
+  server.close();
+});
+
 test('dry-run: provider response constraints never false-deny the synthetic echo', async (t) => {
   const restore = banNetwork();
   try {
@@ -506,10 +677,12 @@ test('P1-B: a concurrent real write is never clobbered by a synthetic consent (a
     // SHARED db handle (a sibling "production process") through a barrier, many times.
     const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
     const sibling = new Vault(vouchr.db, MASTER); // same db handle = same store, like another process
-    const { ctx } = await boltContext(vouchr);
 
     for (let i = 0; i < 12; i++) {
       await vouchr.vault.delete(userOwner(ID), 'acme'); // reset to empty
+      // Each attempt is a new Slack delivery received after the reset's lifecycle marker. Reusing
+      // one old context would correctly exercise the stale-interaction fence instead of this race.
+      const { ctx } = await boltContext(vouchr);
       await assert.rejects(() => ctx.connect('acme'), ConsentRequiredError); // records a fresh consent state
       // Barrier: both ops constructed, then released together — arrival order into the FIFO decides
       // the interleaving; the invariant must hold for BOTH orderings.
