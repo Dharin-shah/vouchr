@@ -455,6 +455,7 @@ POST /v1/admin/reference
 | `VOUCHR_PG_POOL_MAX` | no | pool size (validated positive integer; `pg`'s default of 10 when unset). The pool sets `application_name=vouchr`. |
 | `VOUCHR_PROVIDERS` / `VOUCHR_PROVIDERS_FILE` | yes | provider config (inline JSON / file path); see below. |
 | `VOUCHR_PROVIDER_<ID>_CLIENT_ID` / `_CLIENT_SECRET` | per OAuth provider | client creds, kept out of the JSON. |
+| `VOUCHR_POLICY` / `VOUCHR_POLICY_FILE` | no | static provider-by-channel policy (inline JSON / file path); choose at most one source. See [Static channel policy](#static-channel-policy-declarative). |
 | `VOUCHR_KMS_KEY_ID` | prod | enables the KMS envelope (KEK). Needs `@aws-sdk/client-kms` in the image. |
 | `VOUCHR_BROKER_TOKEN` | no | static bearer for the coarse perimeter gate on `/v1/*`. |
 | `VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS` | no | credential idle / max-age TTL (#54). Default 7d / 30d (matches the Bolt path); `0` disables that dimension. |
@@ -469,6 +470,8 @@ POST /v1/admin/reference
 
 Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
 prints one line: port, backend, provider ids, `allowWrites`, and `dryRun=true` when dry-run is on).
+A configured `defaultDeny: true` policy with zero rules also emits a warning that every provider is
+denied; this is valid configuration, not a startup failure.
 
 ### Provider config (declarative)
 
@@ -575,6 +578,60 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
   }
 ]
 ```
+
+### Static channel policy (declarative)
+
+The packaged broker accepts the existing provider-by-channel `Policy` through one optional,
+config-as-code source:
+
+- `VOUCHR_POLICY` contains inline JSON; or
+- `VOUCHR_POLICY_FILE` names a file containing the same JSON (for example a read-only Kubernetes
+  ConfigMap mount).
+
+Set **at most one**. If both variables are present, startup fails instead of merging them. If neither
+is present, no static policy gate is installed and existing deployments retain their behavior.
+
+```json
+{
+  "defaultDeny": true,
+  "rules": {
+    "github": {
+      "defaultAllow": true,
+      "denyChannels": ["C0EXTERNAL"]
+    },
+    "prod-admin-api": {
+      "defaultAllow": false,
+      "allowChannels": ["C0OPSROOM"]
+    }
+  }
+}
+```
+
+The schema is deliberately small and strict. The top-level object accepts only `defaultDeny`
+(optional boolean, default `false`) and `rules` (optional object). Every rule requires a boolean
+`defaultAllow` and accepts only `allowChannels` and `denyChannels` as arrays of channel strings.
+Unknown fields, wrong types, or a rule key that is not an exact configured provider id fail startup;
+a misspelling cannot silently leave the real provider unscoped.
+
+Policy evaluation uses the channel from the verified identity assertion, never a request-body
+channel. Its semantics map directly to `new Policy(rules, { defaultDeny })`:
+
+- A provider with no rule is allowed when `defaultDeny` is false and denied when it is true.
+- A rule with `defaultAllow: true` allows every channel except its `denyChannels`.
+- A rule with `defaultAllow: false` allows only its `allowChannels`.
+- `denyChannels` wins over an allow for the same channel.
+
+`{"defaultDeny":true}` and `{"defaultDeny":true,"rules":{}}` are both valid, intentional deny-all
+configurations. Every otherwise-authorized provider-use request receives `403` until a rule allows
+its signed channel. The broker emits a startup warning for this zero-rule form so an operator can
+distinguish an intentional lockdown from a mistaken rollout.
+
+Static `Policy` does not replace `ChannelTools`. Policy is operator-owned deployment configuration;
+`ChannelTools` is the PostgreSQL-backed, runtime-mutable allowlist changed through Slack or
+`POST /v1/admin/tools` (with the backward-compatible “no rows means enabled” default). The broker
+applies their intersection: the static policy **and** the mutable channel setting must both allow a
+provider. Use policy for reviewed deployment boundaries and `ChannelTools` for day-to-day admin
+enablement; neither can override a denial by the other.
 
 ### Provisioning (how credentials get in)
 
@@ -765,6 +822,9 @@ recommend:
 - **A KMS envelope** (`VOUCHR_KMS_KEY_ID`) — per-secret KMS-wrapped data keys for Vault connection
   tokens, not just storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA
   ServiceAccount. Multi-workspace installation tokens remain direct-master encrypted until #241.
+- **Static channel policy** (`VOUCHR_POLICY_FILE`) for sensitive providers — keep the reviewed JSON
+  beside the deployment manifest and use `defaultDeny: true` when every provider must be explicitly
+  scoped. Runtime `ChannelTools` remains a second, independently enforced admin control.
 
 The runtime will boot without KMS, but the adopted production vision requires it. Enabling KMS in the
 reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding `@aws-sdk/client-kms` to the

@@ -200,8 +200,9 @@ setting `inject` only on the control-plane provider would create unsafe plane dr
 provider to its exact HTTPS hosts, paths, methods, response shapes, and provider-side scopes.
 `/v1/mcp` uses HTTP `POST`, so the broker also needs its explicit write opt-in; this is transport
 permission, not semantic permission to run every MCP tool. The static policy above fails closed when
-the channel allowlist is empty and is enforced by the Bolt path; #236 tracks loading the same policy
-into the packaged broker.
+the channel allowlist is empty. Materialize the same provider/channel rules in the packaged broker's
+`VOUCHR_POLICY` or `VOUCHR_POLICY_FILE`; the broker validates rule keys against its configured
+providers and evaluates only the signed channel claim.
 
 ### Multi-workspace and Enterprise Grid
 
@@ -262,6 +263,7 @@ VOUCHR_CHANNEL_MODES=1
 VOUCHR_ALLOW_WRITES=1
 VOUCHR_SWEEP_INTERVAL_MS=0
 VOUCHR_PROVIDERS_FILE=/run/config/providers.json
+VOUCHR_POLICY_FILE=/run/config/policy.json
 VOUCHR_BROKER_TOKEN=<required unless mTLS/mesh or authorize authenticates callers>
 ```
 
@@ -290,15 +292,36 @@ control service:
 ]
 ```
 
+The matching `policy.json` keeps the operator boundary identical on the private data plane (replace
+the channel id with the real Slack channel from this deployment):
+
+```json
+{
+  "defaultDeny": true,
+  "rules": {
+    "internal-mcp": {
+      "defaultAllow": false,
+      "allowChannels": ["C0OPSROOM"]
+    }
+  }
+}
+```
+
+Use exactly one policy source: inline `VOUCHR_POLICY` or file-backed `VOUCHR_POLICY_FILE`. Both set
+is a startup error, not a merge. Unknown fields, wrong types, and rule ids absent from the configured
+providers also fail startup. A `defaultDeny: true` policy with empty or missing rules is valid and
+denies every provider; the broker warns at startup for that zero-rule lockdown.
+
 `VOUCHR_ALLOW_WRITES=1` is present because MCP Streamable HTTP uses `POST`; the provider's own
 method/path/MCP declarations still have to allow the request. It is not a general authorization to
 run every MCP tool. `VOUCHR_SWEEP_INTERVAL_MS=0` makes the control plane the cleanup owner in this
 example.
 
 For OAuth providers, the broker also needs client configuration because refresh can happen at egress.
-Deploy provider definitions as one versioned artifact for both planes and test that their IDs and
-credential semantics match. Today the Bolt path is code-configured while the packaged broker reads
-`VOUCHR_PROVIDERS` or `VOUCHR_PROVIDERS_FILE`; deployment automation must prevent drift.
+Deploy provider definitions and static policy as versioned artifacts for both planes and test that
+their IDs, credential semantics, and channel rules match. The Bolt path is code-configured while the
+packaged broker reads `VOUCHR_PROVIDERS` / `VOUCHR_PROVIDERS_FILE` and `VOUCHR_POLICY` /
+`VOUCHR_POLICY_FILE`; deployment automation must prevent drift.
 
 When using KMS envelope encryption, the packaged broker wires `VOUCHR_KMS_KEY_ID`, but
 `createVouchr()` needs the matching `envelope` option explicitly. Both planes must use the same KMS
@@ -308,12 +331,10 @@ The AWS KMS SDK dependency is not bundled in the published package/image, so KMS
 custom package/image layer containing it. Multi-workspace installation tokens remain outside the
 envelope until [#241](https://github.com/Dharin-shah/vouchr/issues/241) closes.
 
-> [!CAUTION]
-> The packaged broker shares and enforces PostgreSQL-backed `ChannelTools` state with Bolt;
-> `VOUCHR_CHANNEL_MODES=1` additionally permits channel-owned credential modes. It still does not
-> load static `Policy` ([#236](https://github.com/Dharin-shah/vouchr/issues/236)), so Slack
-> Enable/Disable is now an enforced runtime boundary but not a default-deny “only these channels”
-> operator policy.
+> [!NOTE]
+> The packaged broker enforces both the static operator `Policy` above and PostgreSQL-backed
+> `ChannelTools` state shared with Bolt; neither gate can override a denial by the other.
+> `VOUCHR_CHANNEL_MODES=1` is separate and only permits channel-owned credential modes.
 
 Both `/v1/admin/reference` and `/v1/user/reference` enforce the reference-only boundary before any
 credential, mode, or audit write: the broker validates a bounded supported reference form, derives its
@@ -533,9 +554,8 @@ There are two honest designs:
 1. **Vouchr-enforced channel boundary.** Physically split read and write into different endpoints and
    provider IDs. The read credential/endpoint must be incapable of mutation. Apply default-deny
    static `Policy` to the write provider, keep the mutable channel enablement as a second admin
-   control, and use a least-privilege write credential. The packaged broker now enforces mutable
-   channel enablement; the default-deny outer gate remains blocked until it can load static policy
-   through [#236](https://github.com/Dharin-shah/vouchr/issues/236).
+   control, and use a least-privilege write credential. The packaged broker enforces both boundaries;
+   the request proceeds only when static policy and mutable channel enablement allow it.
 2. **Host/MCP-server boundary.** Keep one MCP endpoint and let the trusted host/server classify tool
    names, authorize them, perform transaction-specific confirmation, and supply idempotency or
    reconciliation for consequential writes. Vouchr still protects the credential, owner, channel,
@@ -790,8 +810,8 @@ Run this proof against at least two broker replicas and one shared PostgreSQL da
    it.
 5. Disable the provider in App Home and prove the **separate packaged broker** refuses it before
    credential resolution or upstream I/O.
-6. Apply default-deny static policy and prove an unlisted channel is refused. This currently exposes
-   #236 on the packaged broker.
+6. Apply default-deny static policy through `VOUCHR_POLICY_FILE` and prove an unlisted channel is
+   refused by the packaged broker.
 7. Prove Slack Connect, DM, archived, unverifiable, and forged-channel requests fail closed.
 8. Replay one assertion against two replicas and prove exactly one succeeds.
 9. Exercise provider timeout after dispatch; prove no automatic write retry occurs.

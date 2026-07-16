@@ -7,6 +7,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Declarative packaged channel policy** (#236). The standalone broker now accepts static
+  provider-by-channel policy through exactly one of `VOUCHR_POLICY` (inline JSON) or
+  `VOUCHR_POLICY_FILE` (the same JSON from a file). Configuration is validated fail-closed at boot:
+  unknown fields, invalid rule shapes, conflicting sources, and provider IDs absent from the
+  configured provider registry are rejected. `defaultDeny: true` with empty or missing rules is
+  deliberately valid and denies every provider. Static operator policy composes with the
+  PostgreSQL-backed, admin-mutable `ChannelTools` allowlist; both gates must allow a provider before
+  use.
 - **Packaged channel-tool governance** (#240). `buildBrokerServer()` now wires the shared
   PostgreSQL-backed `ChannelTools` store, so Bolt/App Home and headless admin changes have one
   persisted meaning across `GET /v1/admin/config`, the channel-scoped manifest, `/v1/fetch`, and
@@ -15,7 +23,7 @@ All notable changes to this project are documented here. This project adheres to
   change without its audit row, and changing one provider cannot silently disable untouched
   providers, including under concurrent first writes. Service tools remain host-authenticated, but
   their Enable/Disable bit is now consistently writable and visible in admin config and manifests
-  for the trusted host to enforce. Static packaged policy configuration remains tracked by #236.
+  for the trusted host to enforce.
 - **Bounded network, memory, and concurrency at the HTTP boundary** (#209). The broker now applies
   finite admission, request, response, and time limits so slow, malformed, cancelled, or oversized
   HTTP traffic cannot grow work without a configured bound. `/v1/fetch` upstream calls carry a finite, configurable deadline

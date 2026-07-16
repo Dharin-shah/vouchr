@@ -85,6 +85,16 @@ spec:
             # image (see Dockerfile) together. Vouchr does not enforce this — the host decides.
             # - { name: VOUCHR_KMS_KEY_ID, value: "<kms-key-arn>" }
             # - { name: VOUCHR_PROVIDERS_FILE, value: "/etc/vouchr/providers.json" }
+            # Static provider-by-channel policy is optional. Use exactly ONE of VOUCHR_POLICY
+            # (inline JSON) or VOUCHR_POLICY_FILE; setting both fails startup instead of merging.
+            # Provider rule ids must exist in the configured provider file. defaultDeny: true with
+            # zero rules is a valid deny-all lockdown and emits a startup warning.
+            # - { name: VOUCHR_POLICY_FILE, value: "/etc/vouchr/policy.json" }
+          # Pair VOUCHR_POLICY_FILE with a read-only ConfigMap mount (and define the commented
+          # pod-level volume below). Keep provider and policy artifacts versioned together.
+          # volumeMounts:
+          #   - { name: vouchr-policy, mountPath: /etc/vouchr/policy.json, subPath: policy.json,
+          #       readOnly: true }
           # Readiness hits /readyz (schema + shared replay-store checks) so a pod drains from the
           # Service when Postgres or replay protection is unusable. Liveness hits /healthz (a bare
           # process-serving check, no DB) — a DB blip must NOT restart the whole fleet.
@@ -103,6 +113,9 @@ spec:
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
             limits: { memory: "256Mi" }
+      # volumes:
+      #   - name: vouchr-policy
+      #     configMap: { name: vouchr-policy }
 ---
 apiVersion: v1
 kind: Service

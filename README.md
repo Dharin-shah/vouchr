@@ -340,10 +340,13 @@ packaged broker requires `VOUCHR_DEPLOYMENT_ID`; every trusted minter and broker
 issuer, audience, and bounded active/overlap key set so assertions cannot cross deployments.
 
 The packaged broker loads the same PostgreSQL-backed channel tool allowlist Bolt writes and enforces
-it on channel-scoped manifests, brokered fetches, and MCP calls. It still does not load declarative
-static channel policy; [#236](https://github.com/Dharin-shah/vouchr/issues/236) remains the release
-blocker for default-deny packaged hybrid “only these channels” enforcement. The hybrid guide keeps
-that remaining limitation explicit.
+it on channel-scoped manifests, brokered fetches, and MCP calls. Operators can also load a static,
+config-as-code channel policy from exactly one of `VOUCHR_POLICY` or `VOUCHR_POLICY_FILE`; its
+provider rules are validated against the configured provider registry at boot and evaluate only the
+signed channel claim. Static `Policy` and mutable `ChannelTools` are independent gates: a provider
+is usable only when both allow it. See the
+[deployment guide](./guides/DEPLOYMENT.md#static-channel-policy-declarative) for the strict JSON
+shape and default-deny examples.
 
 ## Production Notes
 

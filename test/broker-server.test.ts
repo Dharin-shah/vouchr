@@ -336,6 +336,110 @@ test('buildBrokerServer: boots on PostgreSQL and serves /healthz + /health + /re
   }
 });
 
+test('#236 packaged policy trusts the signed channel and denies before credential resolution', async (t) => {
+  const env = await baseEnv(t, {
+    VOUCHR_POLICY: JSON.stringify({
+      defaultDeny: true,
+      rules: {
+        internal: { defaultAllow: false, allowChannels: ['C_ALLOWED'] },
+      },
+    }),
+  });
+  let resolverCalls = 0;
+  const resolvedSecret = 'resolved-test-value';
+  const built = await buildBrokerServer(env, {
+    resolvers: {
+      'aws-sm': async () => {
+        resolverCalls++;
+        return resolvedSecret;
+      },
+    },
+  });
+  await new Promise<void>((resolve) => built.server.listen(0, resolve));
+  const port = (built.server.address() as any).port;
+  const vault = new Vault(built.db, Buffer.from(KEY_B64, 'base64'));
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vault.reference(owner, 'internal', {
+    source: 'aws-sm',
+    secretRef: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:policy-test',
+  });
+
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  let upstreamAuthorization: string | null = null;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    upstreamCalls++;
+    upstreamAuthorization = new Headers(init?.headers).get('authorization');
+    return new Response('{"ok":true}', {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as any;
+  const identityToken = (channel: string) => mintIdentity({
+    teamId: 'T1', userId: 'U1', channel,
+  }, idConfig());
+
+  try {
+    const denied = await requestJson(port, 'POST', '/v1/fetch', {
+      handle: { provider: 'internal', owner: 'user' },
+      identityToken: identityToken('C_DENIED'),
+      method: 'GET',
+      path: '/data',
+      // Request JSON is forgeable. This must not override the verified C_DENIED claim above.
+      channel: 'C_ALLOWED',
+    });
+    assert.equal(denied.status, 403);
+    assert.deepEqual(denied.json, { error: 'policy denies this provider in this channel' });
+    assert.equal(resolverCalls, 0, 'policy must run before an external reference is resolved');
+    assert.equal(upstreamCalls, 0, 'policy must run before provider I/O');
+
+    const allowed = await requestJson(port, 'POST', '/v1/fetch', {
+      handle: { provider: 'internal', owner: 'user' },
+      identityToken: identityToken('C_ALLOWED'),
+      method: 'GET',
+      path: '/data',
+      // The inverse forgery also has no authority: the signed C_ALLOWED claim controls the result.
+      channel: 'C_DENIED',
+    });
+    assert.equal(allowed.status, 200, allowed.raw);
+    assert.equal(resolverCalls, 1);
+    assert.equal(upstreamCalls, 1);
+    assert.equal(upstreamAuthorization, `Bearer ${resolvedSecret}`);
+    assert.equal(allowed.raw.includes(resolvedSecret), false);
+
+    // SEC-1: resolving a reference is ephemeral. The credential may reach the allowlisted upstream,
+    // but it must never be copied into either authoritative persistence surface.
+    const persisted = {
+      connection: await built.db.all(`SELECT * FROM connection WHERE team_id=? AND provider=?`, ['T1', 'internal']),
+      audit: await built.db.all(`SELECT * FROM audit WHERE team_id=? AND provider=?`, ['T1', 'internal']),
+    };
+    assert.equal(JSON.stringify(persisted).includes(resolvedSecret), false);
+  } finally {
+    globalThis.fetch = realFetch;
+    built.server.close();
+    await built.db.close();
+  }
+});
+
+test('#236 packaged default-deny policy with zero rules emits a deny-all boot warning', async (t) => {
+  const env = await baseEnv(t, {
+    VOUCHR_POLICY: JSON.stringify({ defaultDeny: true }),
+  });
+  const warnings: string[] = [];
+  const realWarn = console.warn;
+  let built: Awaited<ReturnType<typeof buildBrokerServer>> | undefined;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+  try {
+    built = await buildBrokerServer(env);
+    assert.deepEqual(warnings, [
+      '[vouchr] static policy has defaultDeny=true and zero rules; all providers are denied',
+    ]);
+  } finally {
+    console.warn = realWarn;
+    await built?.db.close();
+  }
+});
+
 test('#240 packaged broker shares and enforces channel governance across every data-plane door', async (t) => {
   const providerConfig = [
     { id: 'fetcher', credential: 'key', egressAllow: ['api.fetcher.example'] },
