@@ -212,6 +212,17 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    that marker and are found by the post-fence scan, or refuse afterward. Scope ids are stored only
    as fixed hashes, and a genuinely new setup after the marker remains possible.
 
+**Prompt delivery and idempotency.** Session and approval prompts are persisted, opaque, single-use
+controls: repeated agent turns reuse one durable request row, and a short cross-replica delivery
+lease suppresses immediate duplicate prompts. A click is bound to the exact signed thread and
+rechecks current access at the mutation; duplicate or stale clicks get fixed recovery copy instead
+of silence. The pending request and its audit row commit together **before** Slack delivery. A
+Slack delivery API rejection has an unknown acceptance outcome, so Vouchr retains the delivery
+lease and keeps a possibly-visible button decidable while preventing an immediate duplicate; only a
+known pre-delivery render/no-recipient failure removes the request. Definite versus ambiguous Slack
+failures are classified separately, so the user is never told nothing was sent while a delivered
+button may still be visible.
+
 **Per-channel auth mode.** `channel_config.mode` is the single source of truth for which credential
 model `connect()` uses for a provider in a channel: `per-user` (the default), `shared` (route to the
 channel credential), or `session`. `connect()` resolves the mode and routes accordingly, so the
