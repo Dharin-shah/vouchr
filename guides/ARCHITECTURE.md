@@ -85,6 +85,20 @@ all decided in one place; an adapter only supplies verified inputs (e.g.
 `conversations.info` output is passed to `channelIneligibleReason`, which fails closed on
 `null`).
 
+### Wiring without `install()`
+
+`vouchr.install(app, receiver)` is a convenience that registers every Bolt-facing piece.
+Hosts that need finer control (custom routers, their own sweep scheduler) can wire each
+piece individually — the pieces are independent and this is exactly what `install()` does:
+
+```ts
+app.use(vouchr.middleware);
+vouchr.mountRoutes(receiver.router);   // /vouchr/oauth/callback
+vouchr.registerCommands(app);          // /vouchr slash command
+vouchr.registerOffboarding(app);       // revoke connections when Slack deactivates a user
+setInterval(() => vouchr.sweepExpired(), 3_600_000);
+```
+
 ## Storage schema
 
 One store, PostgreSQL only (stateless / multi-instance), behind a minimal async `Db`

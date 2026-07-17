@@ -790,6 +790,14 @@ the already-committed local/upstream outcome as `audited: false`. For source com
 upstream revocation or audit succeeded. Integrations that need the detailed contract should use
 `POST /v1/admin/offboard` and inspect its `ok` field.
 
+### Credential health notifications (`onCredentialHealth`)
+
+When a refresh token dies for real (a definitive provider rejection, not a transient failure) or a
+connection nears its TTL ceiling, the owner gets at most one private Slack DM per day; the daily
+claim is taken atomically in PostgreSQL, so replicas never double-notify. Hosts that want to route
+these events themselves (pager, email, dashboard) can pass `onCredentialHealth` to `createVouchr` —
+the event carries the owner, provider, and reason, never token material.
+
 ### Replay (multi-replica)
 
 A signed `jti` must be single-use across the fleet. Shared replay protection is automatic: every
