@@ -188,13 +188,25 @@ All notable changes to this project are documented here. This project adheres to
   creation moves to a separately invoked, advisory-locked `vouchr migrate` command run with a
   schema-owner role; runtime replicas connect with a DML-only role and never create tables (`openDb`
   verifies the schema version and fails closed if un-migrated). The schema version stays monotonic
-  (`SCHEMA_VERSION = 7`, past the pre-#204 max of 6); `migrate` carries a legacy v6 database to head,
-  dropping `union_optin` and converting stored `union` modes to `per-user`. TLS is native
+  (`SCHEMA_VERSION = 8`, past the pre-#204 max of 6); `migrate` carries legacy v6/v7 databases to
+  head, dropping `union_optin`/`channel_preview` and converting stored `union` modes to `per-user`. TLS is native
   (`sslmode=` in the URL); the pool sets `application_name`, a validated `VOUCHR_PG_POOL_MAX`, and a
   connection lifetime. Tests and CI run against a real PostgreSQL container (`npm run pg:up`).
   `better-sqlite3` is dropped as a dependency.
 
 ### Removed
+
+- **Private previews and retained provider responses** (#194, breaking). Vouchr no longer owns
+  provider-output rendering: `ConnectContext.preview()` / `setChannelVisibility()`, the process-memory
+  `PendingPreviews` store, live Slack Share/Dismiss behavior and Block Kit builders, `/vouchr preview`, the
+  settings toggle, preview exports, and `ToolManifestEntry.visibility` are removed. Bolt and headless
+  manifests now carry only credential/tool policy; trusted hosts choose output redaction, audience,
+  data-loss prevention, and rendering. `vouchr migrate` advances the schema to v8 and drops the retired
+  `channel_preview` table. Drain old replicas before migrating: v7 runtimes deliberately refuse the v8
+  schema. For one release, non-exported tombstone listeners acknowledge old Share/Dismiss buttons and
+  replace them with fixed expiry guidance; they retain and share no provider response. Historical
+  `preview` audit rows remain readable, but no new preview rows are written. The exact maintenance
+  sequence and rollback constraint are documented in `guides/DEPLOYMENT.md`.
 
 - **`vouchr-seed` command** (#246, breaking). The direct-database seeder bypassed provider
   validation and audit, and channel seeds did not configure the required shared mode. Raw static

@@ -149,30 +149,18 @@ deletion, upstream-revocation uncertainty, and an audit-store failure without in
 Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees a bounded first
 set of connected accounts with Disconnect buttons and the channel's tool manifest; paged
 `/vouchr status [page]` reaches every connection when the complete status exceeds Slack's message
-limit. Admins additionally get a per-provider mode select, Enabled checkbox, and Private-previews
-checkbox that route to the same mutations as the commands above (authorization is re-checked
+limit. Admins additionally get a per-provider mode select and Enabled checkbox that route to the
+same mutations as the commands above (authorization is re-checked
 server-side on submit). The ordinary text-subcommand responses are unchanged. The Block Kit builder
 (`configModal`) and its callback id (`CONFIG_CALLBACK`) are exported for headless hosts.
 
-### Private previews
+### Provider responses and rendering
 
-> [!WARNING]
-> This is a transitional alpha surface scheduled for removal under
-> [#194](https://github.com/Dharin-shah/vouchr/issues/194). Hosts own provider-output rendering in
-> the supported product direction; do not build new integrations that depend on Vouchr retaining
-> private provider responses or process-local preview state.
-
-Orthogonal to the credential mode, each channel can set a provider's **preview visibility**
-(`/vouchr preview <provider> <public|private>`, or the checkbox in the config modal). In a
-`private` channel, output the agent posts through `context.vouchr.preview(provider, { title,
-lines })` goes **ephemerally to the requester only**, with a Share button — provider data never
-reaches the rest of the thread unless the human who saw it explicitly shares it (a single-use,
-recipient-bound claim; the public post is attributed to them and audited as `preview`). `public`
-(the default) posts normally. Agents discover the bit via `toolManifest()` in Bolt or
-`POST /v1/manifest` on the headless broker — one core builder feeds both, so the two transports
-can't drift; a host rendering with its own client is expected to honor it, and the `previewBlocks` /
-`previewPostBlocks` builders are exported so that surface matches Vouchr's. Pending previews are
-held in memory with a 10-minute TTL — a restart or timeout just means "preview expired, ask again".
+Vouchr returns provider responses to the trusted host and does not render or retain them. The host
+decides what reaches the model or Slack and owns output redaction, data-loss prevention, audience,
+and presentation. Accordingly, channel manifests contain credential/tool policy only; there is no
+Vouchr preview API, preview-visibility setting, or process-local provider-response store. See
+[`SECURITY.md`](./SECURITY.md) for this boundary and [`vision.md`](./vision.md) for the product scope.
 
 Vouchr brokers credentials for tools that act **as a human**. Service-to-service tools
 (`identity: 'service'`) act as the agent itself: the host wires its own auth and Vouchr refuses

@@ -68,6 +68,7 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
   assert.equal(await tableExists('connection'), true, 'migrate must create the baseline tables');
   assert.equal(await tableExists('audit'), true);
   assert.equal(await tableExists('broker_jti'), true);
+  assert.equal(await tableExists('channel_preview'), false, 'fresh schemas must not recreate the removed preview store');
 
   // A second migrate on the same schema must be a no-op (idempotent), not error, same version.
   const second = await migrate({ databaseUrl: url });
@@ -96,6 +97,20 @@ test('openDb() succeeds after migrate()', async (t) => {
   t.after(() => db.close());
   // A trivial query proves the handle is live against the migrated schema.
   assert.equal((await db.all('SELECT COUNT(*)::int AS n FROM connection'))[0].n, 0);
+});
+
+test('v8 runtime refuses a v7 schema until the drained migration runs', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+  await raw.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version', '7')`);
+
+  await assert.rejects(
+    () => openDb({ databaseUrl: url }),
+    /schema version 7.*needs 8.*vouchr migrate/i,
+    'v8 must not start against v7 while old replicas are being drained',
+  );
 });
 
 test('CLI top-level failures never serialize database-provided error text (SEC-1)', async (t) => {
@@ -184,8 +199,8 @@ test('readiness: assertSchemaCurrent throws on an un-migrated schema and resolve
 
 // ── #196/#204 review findings ─────────────────────────────────────────────────
 
-// Finding 1: the lineage stays monotonic (baseline 7, not a reset to 1), and migrate() carries a
-// pre-#204 v6 database to head — dropping union_optin and converting stored `union` modes.
+// Finding 1: the lineage stays monotonic, and migrate() carries a pre-#204 v6 database to head —
+// dropping union_optin and converting stored `union` modes.
 test('migrate() carries a legacy v6 database to head: accepts it, drops union_optin, converts union→per-user', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url, tableExists } = await emptySchema(t);
@@ -204,6 +219,24 @@ test('migrate() carries a legacy v6 database to head: accepts it, drops union_op
   assert.equal(await tableExists('union_optin'), false, 'union_optin must be dropped');
   const row = await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1' AND channel='C1' AND provider='github'`);
   assert.equal(row?.mode, 'per-user', 'a stored union mode must convert to per-user');
+});
+
+test('migrate() carries v7 to head and deletes the retired preview configuration table', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url, tableExists } = await emptySchema(t);
+  const raw = rawDb(t, url);
+  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  await raw.exec(`CREATE TABLE channel_preview (
+    team_id TEXT NOT NULL, channel TEXT NOT NULL, provider TEXT NOT NULL, visibility TEXT NOT NULL,
+    PRIMARY KEY(team_id, channel, provider)
+  )`);
+  await raw.run(`INSERT INTO channel_preview VALUES ('T1','C1','mcp','private')`);
+  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','7')`);
+
+  const { version } = await migrate({ databaseUrl: url });
+  assert.equal(version, SCHEMA_VERSION);
+  assert.equal(await tableExists('channel_preview'), false);
+  assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, String(SCHEMA_VERSION));
 });
 
 // Finding 2: only explicit databaseUrl / VOUCHR_DATABASE_URL is honored — no generic DATABASE_URL
@@ -287,17 +320,19 @@ test('privilege split: a DML-only role runs the runtime but is denied CREATE', a
   await assert.rejects(() => db.exec('CREATE TABLE evil (x int)'), /permission denied|insufficient/i); // no DDL
 });
 
-// Finding 5: a REAL failed v6→7 migration must roll back EVERY mutation — the drop, the mode
+// Finding 5: a REAL failed migration must roll back EVERY mutation — the drops, the mode
 // conversion, and the version stamp all run inside migrate()'s one transaction. Here union_optin is
 // a real TABLE (so the DROP succeeds) and a CHECK on meta.value forces the FINAL stamp to fail, so
 // the failure lands AFTER the drop + conversion — the strongest rollback proof.
-test('a failed v6→7 migration rolls back the drop, conversion, and stamp together', async (t) => {
+test('a failed v6 migration rolls back both drops, conversion, and stamp together', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url, tableExists } = await emptySchema(t);
   const raw = rawDb(t, url);
   await raw.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT, PRIMARY KEY(team_id,channel,provider))`);
   await raw.exec(`CREATE TABLE union_optin (team_id TEXT, channel_id TEXT, user_id TEXT, provider TEXT)`); // a REAL table — DROP will succeed
-  // CHECK pins value to '6', so migrate()'s final stamp of '7' violates it — the deterministic failure.
+  await raw.exec(`CREATE TABLE channel_preview (team_id TEXT, channel TEXT, provider TEXT, visibility TEXT)`);
+  await raw.run(`INSERT INTO channel_preview VALUES ('T1','C1','github','private')`);
+  // CHECK pins value to '6', so migrate()'s final stamp violates it — the deterministic failure.
   await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (value = '6'))`);
   await raw.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T1','C1','github','union')`);
   await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','6')`);
@@ -310,6 +345,8 @@ test('a failed v6→7 migration rolls back the drop, conversion, and stamp toget
   assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, '6');
   assert.equal((await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1'`))?.mode, 'union', 'the union→per-user conversion rolled back');
   assert.equal(await tableExists('union_optin'), true, 'the dropped union_optin table was restored by rollback');
+  assert.equal(await tableExists('channel_preview'), true, 'the dropped channel_preview table was restored by rollback');
+  assert.equal((await raw.get<{ visibility: string }>(`SELECT visibility FROM channel_preview`))?.visibility, 'private');
   assert.equal(await tableExists('session_grant'), false, 'no baseline table migrate would create was committed');
 });
 

@@ -135,27 +135,28 @@ class PgClientDb implements Db {
 
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
- * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so this PostgreSQL
- * baseline is 7 — never a reset to 1, or a v6 Postgres database (from a `main` checkout) would be
- * (wrongly) refused as "newer" by {@link guardSchemaVersion} and could never be migrated. `migrate()`
- * applies the one-way cleanup that carries a v6 DB to 7 (drop `union_optin`, convert `union` modes —
- * both idempotent on a fresh DB). Vouchr is greenfield, so that is the only migration step; add
- * another only when a shipped release's schema must change. The `meta` marker fails a downgrade
- * closed (old code vs a newer DB) rather than corrupting encrypted rows.
+ * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so the PostgreSQL
+ * baseline started at 7 — never reset it to 1, or a v6 database would be wrongly refused
+ * as "newer" by {@link guardSchemaVersion}. Version 8 removes the retired private-preview table.
+ * `migrate()` accepts v6/v7 and applies both idempotent cleanups (remove union borrowing and preview
+ * configuration) before stamping 8. The `meta` marker fails a downgrade closed (old code vs a newer
+ * DB) rather than letting rolling versions interpret state differently.
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
+const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
  * Migration entry guard — runs BEFORE any DDL. `migrate()` implements exactly two lineages: create a
- * fresh baseline, and carry a v6 database to v7. So the ONLY inputs it can correctly converge are:
+ * fresh baseline, and carry a v6/v7 database to v8. So the ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
- *  - a v6 database → the v6→7 cleanup;
- *  - a v7 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v7 over an unknown shape (a v1–v5 marker,
- * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v7 downgrade —
+ *  - a v6 database → the union cleanup plus preview removal;
+ *  - a v7 database → preview removal;
+ *  - a v8 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v8 over an unknown shape (a v1–v5 marker,
+ * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v8 downgrade —
  * which would let old code corrupt encrypted rows). Vouchr is greenfield: the fix for a rejected
  * database is to recreate it fresh, not to add historical migrations.
  */
@@ -196,10 +197,10 @@ async function guardSchemaVersion(db: Db): Promise<void> {
         'Upgrade the vouchr package.',
     );
   }
-  if (found !== 6 && found !== SCHEMA_VERSION) {
+  if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 6 or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
+        `version 6, 7, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
     );
   }
 }
@@ -257,14 +258,6 @@ function schema(): string {
       channel TEXT NOT NULL,
       provider TEXT NOT NULL,
       mode TEXT NOT NULL,
-      PRIMARY KEY (team_id, channel, provider)
-    );
-
-    CREATE TABLE IF NOT EXISTS channel_preview (
-      team_id TEXT NOT NULL,
-      channel TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      visibility TEXT NOT NULL,
       PRIMARY KEY (team_id, channel, provider)
     );
 
@@ -456,11 +449,12 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       await tx.get('SELECT pg_advisory_xact_lock(hashtext(current_schema()))'); // released at COMMIT
       await guardSchemaVersion(tx); // fail closed on a newer-schema DB, before any DDL
       await tx.exec(schema()); // idempotent baseline (CREATE TABLE IF NOT EXISTS)
-      // One-way carry from the pre-#204 v6 lineage (#196): union credential-borrowing is gone. Both
-      // statements are idempotent — no-ops on a fresh DB (no union_optin table, no union modes) and
-      // on a re-run. Atomic with the DDL above (one advisory-locked tx), so migrate is all-or-nothing.
+      // One-way carries from v6/v7: union credential-borrowing and Vouchr-owned private previews are
+      // gone. Every statement is idempotent — a no-op on a fresh DB and on a re-run. Atomic with the
+      // DDL above (one advisory-locked tx), so migration is all-or-nothing.
       await tx.exec(`DROP TABLE IF EXISTS union_optin`);
       await tx.run(`UPDATE channel_config SET mode='per-user' WHERE mode='union'`);
+      await tx.exec(`DROP TABLE IF EXISTS channel_preview`);
       await stampSchemaVersion(tx);
     });
     return { version: SCHEMA_VERSION };

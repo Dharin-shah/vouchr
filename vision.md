@@ -214,9 +214,9 @@ parallel when it does not create conflicting foundations.
 - [#204](https://github.com/Dharin-shah/vouchr/issues/204) is complete: PostgreSQL is the only
   runtime database and migration/runtime roles are separated.
 - [#194](https://github.com/Dharin-shah/vouchr/issues/194): the commands/rendering/disconnect slice
-  landed in [PR #244](https://github.com/Dharin-shah/vouchr/pull/244); remove private previews and
-  complete pending-interaction state, OAuth/API recovery, typed errors, and the trusted
-  broker-to-Slack recovery bridge.
+  landed in [PR #244](https://github.com/Dharin-shah/vouchr/pull/244), and Vouchr-owned private
+  previews are removed; complete pending-interaction state, OAuth/API recovery, typed errors, and
+  the trusted broker-to-Slack recovery bridge.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility
 project would require a new explicit product decision backed by a concrete deployed lineage; it is

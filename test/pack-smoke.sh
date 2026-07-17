@@ -35,6 +35,11 @@ echo "==> require() every published entrypoint (CJS exports map)"
       if (typeof surface[name] !== 'function') throw new Error('missing packed export: ' + name);
     }
     if ('OverloadedError' in surface) throw new Error('internal overload error leaked into public API');
+    for (const name of ['PendingPreviews', 'PREVIEW_VISIBILITIES', 'isPreviewVisibility',
+      'previewBlocks', 'previewPostBlocks', 'normalizePreviewContent',
+      'PREVIEW_SHARE_ACTION', 'PREVIEW_DISMISS_ACTION']) {
+      if (name in surface) throw new Error('removed private-preview export leaked into package: ' + name);
+    }
   }
   const identity = headless.loadIdentityConfig({
     VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
@@ -57,7 +62,7 @@ done
 
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
-import { createVouchr } from '@vouchr/core';
+import { createVouchr, type ConnectContext } from '@vouchr/core';
 import {
   createBroker, loadIdentityConfig, mintIdentity, verifyIdentity, SecretReferenceError,
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type IdentityConfig,
@@ -74,8 +79,14 @@ type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : fals
 type HasSkewKnob = 'skewMs' extends keyof IdentityConfig ? true : false;
 const noReplayOverride: false = null as unknown as HasReplayOverride;
 const noSkewKnob: false = null as unknown as HasSkewKnob;
+type HasPreview = 'preview' extends keyof ConnectContext ? true : false;
+type HasPreviewConfig = 'setChannelVisibility' extends keyof ConnectContext ? true : false;
+const noPreview: false = null as unknown as HasPreview;
+const noPreviewConfig: false = null as unknown as HasPreviewConfig;
 void noReplayOverride;
 void noSkewKnob;
+void noPreview;
+void noPreviewConfig;
 const overload: BrokerError = { error: 'overloaded', scope: 'provider', retryAfterMs: 1000 };
 void overload;
 const referenceCode: SecretReferenceErrorCode = new SecretReferenceError('invalid_reference').code;
