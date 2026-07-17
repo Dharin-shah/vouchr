@@ -265,18 +265,21 @@ browser OAuth. The `state` binds the *initiating* Slack identity, so the colleag
 account is stored under the initiator's Slack user — and the agent then uses it on the
 initiator's turns.
 
-- **Reduced; honestly not eliminated.** The browser session completing OAuth has no Slack
-  authentication, so Vouchr cannot prove the person clicking is the person who asked — the
-  structural limit of every start-in-chat, finish-in-browser flow (cf. RFC 8628 §5.4).
+- **Not prevented; impact and detection reduced.** This is a real credential-confusion attack by
+  a malicious workspace user — the same actor the "Malicious user" section models as an attacker,
+  so it is **not** inside the trusted boundary. The disclosure controls below reduce its impact and
+  make it detectable; they do not stop a determined insider. The browser session completing OAuth
+  has no Slack authentication, so Vouchr cannot prove the person clicking is the person who asked —
+  the structural limit of every start-in-chat, finish-in-browser flow (cf. RFC 8628 §5.4).
   Bounds: the link is delivered only as a private ephemeral/DM, the state is single-use with a
-  10-minute TTL, and one active generation exists per workspace/user/provider. Detection: the
-  success page names the bound Slack user and workspace (`connectedHtml`), so whoever completes
-  a forwarded link sees immediately whose agent it empowers; the provider's own consent screen
-  names the app; and the initiator receives the success DM naming the connected provider
-  account. Deliberate insider misuse remains inside the workspace-trust boundary (see
-  "Malicious user"). Full elimination would require binding the browser session to the Slack
-  identity (Sign in with Slack / OIDC) before starting the provider OAuth — a friction
-  trade-off deliberately not taken at this stage.
+  10-minute TTL, and one active generation exists per workspace/user/provider. Detection: every
+  supported callback surface (Bolt route and headless broker) names the bound Slack user, workspace,
+  and the concrete provider account (`connectedHtml`), so whoever completes a forwarded link sees
+  whose agent it empowers and can recognize that they linked *their* account to someone else; the
+  provider's own consent screen names the app; and the initiator receives the success DM naming the
+  connected provider account. Prevention (not yet shipped) requires binding the browser session to
+  the Slack identity (Sign in with Slack / OIDC) before starting the provider OAuth — tracked
+  privately; opt-in and ON-by-default for GA, not required for a supervised single-workspace pilot.
 
 ### Deactivated user
 

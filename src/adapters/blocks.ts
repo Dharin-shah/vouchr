@@ -972,33 +972,3 @@ export function homeView(o: {
   return { type: 'home', blocks };
 }
 
-/** HTML-escape untrusted values before inlining: provider/account/scope can be provider-controlled
- * (account + granted scope come from the OAuth token response / account probe), so a malicious or
- * compromised provider must not be able to inject markup into this page served on the Vouchr host. */
-const escapeHtml = (s: string): string =>
-  s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c] as string);
-
-/** Confirmation HTML shown in the browser tab after a successful connect. Naming the bound Slack
- * identity is load-bearing: consent binds the *initiating* Slack user, so whoever completes a
- * forwarded link must see exactly whose agent turns the new connection will serve (THREAT-MODEL,
- * "Forwarded consent link"). */
-export function connectedHtml(
-  provider: string,
-  account: string | null,
-  scopes?: string,
-  slack?: { userId: string; teamId: string },
-): string {
-  const who = account ? ` as ${escapeHtml(account)}` : '';
-  const granted = scopes
-    ? `<p style="color:#555">The agent can now, acting as you: <code>${escapeHtml(scopes)}</code></p>`
-    : '';
-  const bound = slack
-    ? `<p style="color:#555">This connection is linked to Slack user <code>${escapeHtml(slack.userId)}</code> in workspace <code>${escapeHtml(slack.teamId)}</code> — the agent acts for that Slack user. Not you? Contact your Slack admin.</p>`
-    : '';
-  return `<!doctype html><html><body style="font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center">
-    <h2>✅ ${escapeHtml(provider)} connected${who}</h2>
-    ${granted}
-    ${bound}
-    <p>You can close this tab and return to Slack.</p>
-  </body></html>`;
-}

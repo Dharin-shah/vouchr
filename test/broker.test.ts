@@ -1971,6 +1971,10 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
     assert.equal(cb.status, 200);
     assert.match(cb.contentType ?? '', /text\/html/);
     assert.match(cb.raw, /connected/);
+    // The supported headless callback surface must ALSO name the bound Slack identity, so a
+    // forwarded /v1/connect URL cannot silently bind the completer's account to the initiator.
+    assert.match(cb.raw, /U1/); // bound Slack user
+    assert.match(cb.raw, /not you/i); // the forwarded-link warning
     // The token is now vaulted; a subsequent fetch injects it and resolve reports connected.
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(f.status, 200);

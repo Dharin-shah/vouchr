@@ -76,8 +76,9 @@ export {
   UserFacingError,
   safeUserMessage,
 } from '../core/errors';
+import { connectedHtml } from '../core/landing';
 import {
-  connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
+  connectBlocks, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
   privateStatusModal,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,

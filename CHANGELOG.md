@@ -253,6 +253,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **OAuth success page discloses the bound Slack identity** (#194). Every supported callback
+  surface (Bolt route and headless broker) now names the bound Slack user, workspace, and the
+  concrete provider account on the connect success page, via one shared `connectedHtml` renderer
+  whose identity argument is mandatory (so no surface can omit it). This is a security-detection
+  control for the **forwarded consent link** limitation: consent binds the *initiating* Slack
+  identity, so an insider who forwards their private Connect link has a colleague's provider account
+  bound under the initiator. The disclosure lets the completer recognize they linked their own
+  account to someone else; it does not *prevent* the attack — browser-side Slack identity binding
+  (Sign in with Slack / OIDC) is the prevention, tracked privately and slated ON-by-default for GA.
+  `guides/THREAT-MODEL.md` documents the limitation and residual risk honestly.
 - **Breaking wire expansion — typed broker recovery metadata** (#194). Typed `/v1/fetch` and
   `/v1/mcp` failures now add stable `code`, `retryable`, and `recovery` fields (plus the existing
   millisecond `retryAfterMs` where applicable) while retaining established `error` prose and HTTP
