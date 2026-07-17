@@ -5,9 +5,33 @@ import type { Owner } from './owner';
 import { isValidProviderId, type Provider } from './providers';
 import { sha256base64url } from './crypto';
 import { DRY_RUN_CODE } from './dryRun';
-import { POSTGRES_NOW_MS_SQL } from './interaction';
+import {
+  isInteractionId,
+  newInteractionId,
+  POSTGRES_NOW_MS_SQL,
+  PROMPT_DELIVERY_LEASE_MS,
+  type PromptDeliveryClaim,
+} from './interaction';
 
 export const STATE_TTL_MS = 10 * 60 * 1000;
+/** Expired state has no authority, but its owner-bound row remains briefly so the callback can give
+ * precise private recovery instead of becoming indistinguishable from hostile random input. */
+export const STATE_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
+export const MAX_CONSENT_SWEEP_BATCH = 1_000;
+/** One bounded retention statement. The created_at subquery rides
+ * idx_consent_request_created_at; the state array lets PostgreSQL use the primary key when that is
+ * cheaper than scanning a small or mostly-expired table. */
+export const CONSENT_SWEEP_BATCH_SQL =
+  `DELETE FROM consent_request WHERE state = ANY(ARRAY(` +
+  `SELECT state FROM consent_request ` +
+  `WHERE created_at < ? ` +
+  `ORDER BY created_at LIMIT ? FOR UPDATE SKIP LOCKED))`;
+
+/** OAuth state is exactly one 32-byte base64url value. Reject malformed/oversized callback input
+ * before a database lookup; the random value remains the authority, not this shape check. */
+export function isConsentState(value: unknown): value is string {
+  return typeof value === 'string' && /^[A-Za-z0-9_-]{43}$/.test(value);
+}
 
 /**
  * The ONE offboarding-tombstone rule (GHSA-25m2): does a tombstone disqualify a consent minted at
@@ -430,7 +454,7 @@ export async function markUserOffboardedEverywhere(
   await withOffboardLocks(db, keys, (tx) => writeScopeOffboardMarkers(tx, user.userId, scopes));
 }
 
-export interface ConsentRow {
+interface ConsentRow {
   state: string;
   identity: SlackIdentity;
   provider: string;
@@ -438,6 +462,36 @@ export interface ConsentRow {
   pkceVerifier: string;
   /** When the consent state was minted — the callback write-gate compares it to the tombstone. */
   createdAt: number;
+}
+
+export interface ConsentRequest {
+  authorizeUrl: string;
+  state: string;
+}
+
+type ConsentCallbackClaim =
+  | { status: 'active'; row: ConsentRow }
+  | { status: 'expired' | 'superseded'; row: ConsentRow }
+  | { status: 'invalidated'; reason: 'offboarded' | 'revoked'; row: ConsentRow }
+  | { status: 'unavailable' };
+
+function consentRow(row: any): ConsentRow {
+  return {
+    state: row.state,
+    identity: {
+      enterpriseId: row.enterprise_id,
+      teamId: row.team_id,
+      userId: row.user_id,
+    },
+    provider: row.provider,
+    channel: row.channel,
+    pkceVerifier: row.pkce_verifier,
+    createdAt: row.created_at,
+  };
+}
+
+function sameNullable(a: string | null, b: string | null): boolean {
+  return a === b;
 }
 
 /** Manages the single-use OAuth `state` + PKCE for a consent round-trip. */
@@ -456,7 +510,7 @@ export class Consent {
     provider: Provider,
     redirectUri: string,
     channel: string | null,
-  ): Promise<{ authorizeUrl: string; state: string }> {
+  ): Promise<ConsentRequest> {
     const clock = await this.db.get<{ issued_at: number }>(
       `SELECT ${POSTGRES_NOW_MS_SQL} AS issued_at`,
     );
@@ -481,7 +535,7 @@ export class Consent {
     redirectUri: string,
     channel: string | null,
     issuedAt: number,
-  ): Promise<{ authorizeUrl: string; state: string } | null> {
+  ): Promise<ConsentRequest | null> {
     if (!Number.isSafeInteger(issuedAt)) throw new Error('invalid consent issuance');
     return withUserProvisioningLock(this.db, i, provider.id, async (tx) => {
       const owner: Owner = {
@@ -495,7 +549,16 @@ export class Consent {
       if (tombstoneBlocks(offboardedAt, issuedAt) || tombstoneBlocks(revokedAt, issuedAt)) {
         return null;
       }
-      return this.beginAt(tx, i, provider, redirectUri, channel, issuedAt);
+      return this.beginAt(
+        tx,
+        i,
+        provider,
+        redirectUri,
+        channel,
+        issuedAt,
+        offboardedAt,
+        revokedAt,
+      );
     });
   }
 
@@ -505,21 +568,72 @@ export class Consent {
     provider: Provider,
     redirectUri: string,
     channel: string | null,
-    issuedAt?: number,
-  ): Promise<{ authorizeUrl: string; state: string }> {
+    issuedAt: number,
+    offboardedAt: number | null,
+    revokedAt: number | null,
+  ): Promise<ConsentRequest | null> {
+    const existing = await db.get<any>(
+      `SELECT *, ${POSTGRES_NOW_MS_SQL} AS observed_at
+       FROM consent_request
+       WHERE team_id=? AND user_id=? AND provider=? AND superseded_at IS NULL
+       FOR UPDATE`,
+      [i.teamId, i.userId, provider.id],
+    );
+    if (existing) {
+      const sameContext = sameNullable(existing.enterprise_id, i.enterpriseId)
+        && sameNullable(existing.channel, channel);
+      const live = existing.consumed_at == null
+        && existing.observed_at - existing.created_at <= STATE_TTL_MS;
+      const lifecycleCurrent = !tombstoneBlocks(offboardedAt, existing.created_at)
+        && !tombstoneBlocks(revokedAt, existing.created_at);
+      if (sameContext && live && lifecycleCurrent) {
+        return this.requestFor(
+          provider,
+          redirectUri,
+          existing.state,
+          existing.pkce_verifier,
+        );
+      }
+      // A delayed older request may reuse an already-visible prompt in the same context, but it may
+      // not replace a newer generation or move that prompt to another channel.
+      if (existing.created_at > issuedAt || existing.observed_at - issuedAt > STATE_TTL_MS) {
+        return null;
+      }
+      await db.run(
+        `UPDATE consent_request
+         SET superseded_at=${POSTGRES_NOW_MS_SQL}
+         WHERE state=? AND superseded_at IS NULL`,
+        [existing.state],
+      );
+    } else {
+      const clock = await db.get<{ observed_at: number }>(
+        `SELECT ${POSTGRES_NOW_MS_SQL} AS observed_at`,
+      );
+      if (!Number.isSafeInteger(clock?.observed_at)) {
+        throw new Error('could not establish consent generation');
+      }
+      if (clock!.observed_at - issuedAt > STATE_TTL_MS) return null;
+    }
+
     const state = randomBytes(32).toString('base64url');
     const pkceVerifier = randomBytes(48).toString('base64url');
 
     await db.run(
       `INSERT INTO consent_request
          (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
-       VALUES (?,?,?,?,?,?,?,${issuedAt === undefined ? POSTGRES_NOW_MS_SQL : '?'})`,
-      [
-        state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier,
-        ...(issuedAt === undefined ? [] : [issuedAt]),
-      ],
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt],
     );
 
+    return this.requestFor(provider, redirectUri, state, pkceVerifier);
+  }
+
+  private requestFor(
+    provider: Provider,
+    redirectUri: string,
+    state: string,
+    pkceVerifier: string,
+  ): ConsentRequest {
     // #116 dry-run: the authorize URL is the ONLY thing replaced — an instantly-succeeding local
     // redirect into the real callback. The code is synthetic; the single-use `state` above is what
     // the callback verifies, exactly as in production.
@@ -575,12 +689,27 @@ export class Consent {
     await this.db.run(`DELETE FROM consent_request WHERE team_id=? AND user_id=? AND provider=?`, [teamId, userId, provider]);
   }
 
-  /** Delete consent requests older than the state TTL (abandoned "Connect" clicks). */
+  /** Delete consent rows after the longer authority-free recovery window. Every statement is
+   * bounded, limiting statement work. Ordinary runtime calls autocommit each batch; a caller that
+   * deliberately supplies a transaction-bound Db retains its outer transaction semantics. */
   async sweepStale(): Promise<number> {
-    return (await this.db.run(
-      `DELETE FROM consent_request WHERE created_at < ${POSTGRES_NOW_MS_SQL} - ?`,
-      [STATE_TTL_MS],
-    )).changes;
+    // Sample PostgreSQL time once. A volatile clock_timestamp() inside the row predicate becomes a
+    // per-row filter instead of an index condition and can make an empty sweep scan the whole table.
+    const rawCutoff = await this.db.get<{ cutoff: unknown }>(
+      `SELECT ${POSTGRES_NOW_MS_SQL} - ? AS cutoff`,
+      [STATE_RECOVERY_RETENTION_MS],
+    );
+    const cutoff = Number(rawCutoff?.cutoff);
+    if (!Number.isSafeInteger(cutoff)) throw new Error('consent retention cutoff is unavailable');
+    let total = 0;
+    for (;;) {
+      const { changes } = await this.db.run(CONSENT_SWEEP_BATCH_SQL, [
+        cutoff,
+        MAX_CONSENT_SWEEP_BATCH,
+      ]);
+      total += changes;
+      if (changes < MAX_CONSENT_SWEEP_BATCH) return total;
+    }
   }
 
   /** Newest pending state for (user, provider) — the dry-run completeConsent lookup (#116). Scoped
@@ -588,33 +717,33 @@ export class Consent {
   async latestStateFor(userId: string, provider: string, teamId?: string): Promise<string | null> {
     const row = (await this.db.get(
       `SELECT state FROM consent_request WHERE user_id=? AND provider=?${teamId ? ' AND team_id=?' : ''}
+         AND superseded_at IS NULL AND consumed_at IS NULL
+         AND created_at >= ${POSTGRES_NOW_MS_SQL} - ?
        ORDER BY created_at DESC LIMIT 1`,
-      teamId ? [userId, provider, teamId] : [userId, provider],
+      teamId ? [userId, provider, teamId, STATE_TTL_MS] : [userId, provider, STATE_TTL_MS],
     )) as any;
     return row?.state ?? null;
   }
 
-  /** Look up and consume (single-use) a consent request. Returns null if absent/expired — or if
-   *  the user was offboarded at/after the state was minted (the tombstone gate, GHSA-25m2). */
-  async consume(state: string): Promise<ConsentRow | null> {
-    // Atomic single-use: DELETE ... RETURNING so two concurrent callbacks can't both pass the
-    // check (a get-then-delete has a TOCTOU window on multi-instance Postgres). Both engines support it.
-    const row = (await this.db.get(
-      `DELETE FROM consent_request WHERE state=? RETURNING *, ${POSTGRES_NOW_MS_SQL} AS consumed_at`,
+  /** Atomically spend one callback state while retaining its bounded row long enough to classify an
+   * expired or superseded authentic link. Replays and unknown values are intentionally identical. */
+  async consume(state: string): Promise<ConsentCallbackClaim> {
+    if (!isConsentState(state)) return { status: 'unavailable' };
+    const raw = await this.db.get<any>(
+      `UPDATE consent_request
+       SET consumed_at=${POSTGRES_NOW_MS_SQL}
+       WHERE state=? AND consumed_at IS NULL
+       RETURNING *, ${POSTGRES_NOW_MS_SQL} AS observed_at`,
       [state],
-    )) as any;
-    if (!row) return null;
-    if (row.consumed_at - row.created_at > STATE_TTL_MS) return null;
-    // Offboarding tombstone (GHSA-25m2): a consent minted at or before the user's offboarding can
-    // never complete, even when the offboarding row-purge transiently failed. Checked AFTER the
-    // single-use delete, so the state is spent either way. This is the FIRST gate; the callback's
-    // credential write is gated a SECOND time, atomically, against a tombstone written AFTER this
-    // consume but BEFORE the write (see Vault.upsert's `gate`). See {@link tombstoneBlocks}.
-    const identity: SlackIdentity = {
-      enterpriseId: row.enterprise_id,
-      teamId: row.team_id,
-      userId: row.user_id,
-    };
+    );
+    if (!raw) return { status: 'unavailable' };
+    const row = consentRow(raw);
+    if (raw.superseded_at != null) return { status: 'superseded', row };
+    if (raw.observed_at - raw.created_at > STATE_TTL_MS) return { status: 'expired', row };
+
+    // This is the FIRST lifecycle gate. finalizeProvisioning() runs again inside the credential
+    // transaction so an offboard/revoke/newer prompt that wins during token exchange still blocks.
+    const identity = row.identity;
     const owner: Owner = {
       teamId: identity.teamId,
       kind: 'user',
@@ -625,17 +754,101 @@ export class Consent {
       latestUserOffboardTombstone(this.db, identity),
       latestProvisioningRevocationTombstone(this.db, owner, row.provider),
     ]);
-    if (
-      tombstoneBlocks(offboardedAt, row.created_at) ||
-      tombstoneBlocks(revokedAt, row.created_at)
-    ) return null;
-    return {
-      state: row.state,
-      identity,
-      provider: row.provider,
-      channel: row.channel,
-      pkceVerifier: row.pkce_verifier,
-      createdAt: row.created_at,
+    if (tombstoneBlocks(offboardedAt, row.createdAt)) {
+      return { status: 'invalidated', reason: 'offboarded', row };
+    }
+    if (tombstoneBlocks(revokedAt, row.createdAt)) {
+      return { status: 'invalidated', reason: 'revoked', row };
+    }
+    return { status: 'active', row };
+  }
+
+  /** Resolve the callback's issuance inside Vault's credential transaction. Deleting only the exact
+   * still-active generation makes token exchange lose safely to a newer prompt. `requireAbsent`
+   * independently prevents a delayed callback from overwriting a credential another path created. */
+  async finalizeProvisioning(
+    row: ConsentRow,
+    db: Db,
+  ): Promise<{ issuedAt: number; requireAbsent: true } | null> {
+    const current = await db.get<{ created_at: number }>(
+      `DELETE FROM consent_request
+       WHERE state=? AND team_id=? AND user_id=? AND provider=?
+         AND superseded_at IS NULL AND consumed_at IS NOT NULL
+       RETURNING created_at`,
+      [row.state, row.identity.teamId, row.identity.userId, row.provider],
+    );
+    if (current) return { issuedAt: current.created_at, requireAbsent: true };
+
+    // Offboard/revoke cleanup may have deleted the row while token exchange was in flight. Preserve
+    // that more precise lifecycle result by letting Vault evaluate the original issuance against the
+    // tombstone under the same locks. With no matching tombstone, absence means a newer generation
+    // or unrelated cleanup won and the old callback stays stale.
+    const owner: Owner = {
+      teamId: row.identity.teamId,
+      kind: 'user',
+      id: row.identity.userId,
+      enterpriseId: row.identity.enterpriseId,
     };
+    const offboardedAt = await latestUserOffboardTombstone(db, row.identity);
+    const revokedAt = await latestProvisioningRevocationTombstone(db, owner, row.provider);
+    return tombstoneBlocks(offboardedAt, row.createdAt) || tombstoneBlocks(revokedAt, row.createdAt)
+      ? { issuedAt: row.createdAt, requireAbsent: true }
+      : null;
+  }
+
+  /** Cross-replica lease for the private Slack Connect prompt. */
+  async claimDelivery(state: string): Promise<PromptDeliveryClaim> {
+    if (!isConsentState(state)) return { status: 'stale' };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const token = newInteractionId();
+      const claimed = await this.db.get<{ state: string }>(
+        `UPDATE consent_request
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
+         WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
+           AND created_at >= ${POSTGRES_NOW_MS_SQL}-? AND delivered_at IS NULL
+           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+         RETURNING state`,
+        [token, PROMPT_DELIVERY_LEASE_MS, state, STATE_TTL_MS],
+      );
+      if (claimed) return { status: 'claimed', token };
+      const current = await this.db.get<{
+        delivered_at: number | null;
+        delivery_lease_expires_at: number;
+        now_ms: number;
+      }>(
+        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
+         FROM consent_request
+         WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
+           AND created_at >= ${POSTGRES_NOW_MS_SQL}-?`,
+        [state, STATE_TTL_MS],
+      );
+      if (!current) return { status: 'stale' };
+      if (current.delivered_at != null) return { status: 'delivered' };
+      if (current.delivery_lease_expires_at > current.now_ms) return { status: 'in-flight' };
+    }
+    return { status: 'in-flight' };
+  }
+
+  async confirmDelivery(state: string, token: string): Promise<boolean> {
+    if (!isConsentState(state) || !isInteractionId(token)) return false;
+    return (await this.db.run(
+      `UPDATE consent_request
+       SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
+       WHERE state=? AND delivery_token=? AND superseded_at IS NULL AND consumed_at IS NULL
+         AND delivered_at IS NULL AND created_at >= ${POSTGRES_NOW_MS_SQL}-?`,
+      [state, token, STATE_TTL_MS],
+    )).changes === 1;
+  }
+
+  /** Release only this delivery claim. A Slack rejection never deletes OAuth authority: another
+   * adapter may already have presented the same URL, and the TTL bounds abandoned state. */
+  async abandonDelivery(state: string, token: string): Promise<boolean> {
+    if (!isConsentState(state) || !isInteractionId(token)) return false;
+    return (await this.db.run(
+      `UPDATE consent_request SET delivery_token=NULL, delivery_lease_expires_at=0
+       WHERE state=? AND delivery_token=? AND superseded_at IS NULL
+         AND consumed_at IS NULL AND delivered_at IS NULL`,
+      [state, token],
+    )).changes === 1;
   }
 }

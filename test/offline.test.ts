@@ -110,11 +110,13 @@ test('consent: state is single-use and expires', async (t) => {
   assert.match(authorizeUrl, /response_type=code/);
   assert.match(authorizeUrl, /state=/);
 
-  const row = await consent.consume(state);
-  assert.equal(row?.identity.userId, 'U1');
-  assert.equal(row?.provider, 'github');
+  const claim = await consent.consume(state);
+  assert.equal(claim.status, 'active');
+  if (claim.status !== 'active') assert.fail('fresh consent was not claimable');
+  assert.equal(claim.row.identity.userId, 'U1');
+  assert.equal(claim.row.provider, 'github');
   // Single-use: second consume returns null.
-  assert.equal(await consent.consume(state), null);
+  assert.equal((await consent.consume(state)).status, 'unavailable');
 });
 
 test('providers: ANY OAuth2 provider works via generic defineProvider', async (t) => {
@@ -580,7 +582,7 @@ test('sweepExpired also clears abandoned consent requests', async (t) => {
   const { state } = await consent.begin(ID, github({ clientId: 'a', clientSecret: 'b' }), 'https://x/cb', null);
   await db.run('UPDATE consent_request SET created_at=? WHERE state=?', [1, state]); // ancient
   await sweepExpired(vault, audit, consent);
-  assert.equal(await consent.consume(state), null); // gone
+  assert.equal((await consent.consume(state)).status, 'unavailable'); // gone
 });
 
 test('offboardUser removes connections + pending consent, idempotently, leaving others', async (t) => {
@@ -596,7 +598,7 @@ test('offboardUser removes connections + pending consent, idempotently, leaving 
 
   assert.deepEqual((await offboardUser(vault, audit, consent, ID)).sort(), ['github', 'google']);
   assert.equal((await vault.listForUser(ID)).length, 0);
-  assert.equal(await consent.consume(state), null); // pending consent purged (no resurrection)
+  assert.equal((await consent.consume(state)).status, 'unavailable'); // pending consent purged
   assert.equal((await vault.listForUser({ ...ID, userId: 'U2' })).length, 1); // other user untouched
   assert.deepEqual(await offboardUser(vault, audit, consent, ID), []); // idempotent
 });

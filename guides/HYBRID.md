@@ -480,6 +480,13 @@ The broker has no Slack client. Shared PostgreSQL lets both planes see the same 
 `403` or `409` does not automatically post a prompt. The trusted Bolt/tool-router layer must own the
 user-facing transition.
 
+Provider OAuth callbacks mounted on the Bolt control plane are already closed-loop: one active
+owner/provider generation is finalized transactionally, fixed browser outcomes return without
+waiting for Slack, and attributable failures make at most one immediate, best-effort private
+recovery-DM attempt. A process failure can drop that message. The bridge still required by #194 is
+for typed outcomes returned by the separate broker process (connect, session, and write approval),
+not for Bolt's own callback route.
+
 For **every brokered mode**, preflight with the in-process Bolt context before dispatching the remote
 worker. In shared mode this rechecks current mode, policy/tool state, credential presence, channel
 class, and optional membership; in per-user/session mode it also renders the recovery prompt:
@@ -708,7 +715,7 @@ process where possible.
 
 Typed broker egress failures include stable `code`, `retryable`, and `recovery` fields from the same
 core mapper exported by `@vouchr/core` and `@vouchr/core/headless`. Branch on those fields, never the
-legacy `error` prose. The trusted bridge still derives owner/channel/thread facts from verified Slack
+human-readable `error` prose. The trusted bridge still derives owner/channel/thread facts from verified Slack
 state; recovery metadata is routing guidance, not authority.
 
 | Signal | Meaning | Safe response |

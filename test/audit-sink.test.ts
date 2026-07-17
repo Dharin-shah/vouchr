@@ -136,7 +136,7 @@ test('audit-sink: consent_denied fires on a REAL user denial (?error=access_deni
   assert.equal(events[0].userId, 'U1'); // attributed to the resolved identity
   assert.ok(events[0].jti, 'jti missing');
   // State was consumed by the denial: it can't be replayed for a later exchange.
-  assert.equal(await consent.consume(state), null);
+  assert.equal((await consent.consume(state)).status, 'unavailable');
 });
 
 test('audit-sink: consent_denied fires when the token exchange fails', async (t) => {

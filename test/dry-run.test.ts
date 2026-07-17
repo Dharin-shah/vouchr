@@ -852,7 +852,7 @@ test('dry-run broker: callback refuses a foreign code and never clobbers a real 
     const c2 = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: tok('shh') });
     const u2 = new URL(c2.json.authorizeUrl);
     const r2 = await get(port, u2.pathname + u2.search); // code=dry-run, valid single-use state
-    assert.equal(r2.status, 500);
+    assert.equal(r2.status, 409); // precise setup_changed outcome: the live credential won
     const cred = await vault.get(userOwner(ID), 'acme');
     assert.equal(cred?.accessToken, 'real-token'); // not clobbered
     assert.equal(cred?.externalAccount, 'octocat');

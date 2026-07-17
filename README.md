@@ -67,9 +67,25 @@ app.event('app_mention', async ({ context, say }) => {
 
 If the user hasn't connected yet, `connect()` posts a private prompt and throws
 `ConsentRequiredError` — catch it and stop the turn. The user clicks once, finishes OAuth in the
-browser, and asks again:
+browser, and asks again. Repeated demand across replicas shares one active workspace/user/provider
+generation and one Slack delivery lease: a delivered prompt is reused, a definite Slack rejection
+only releases that exact lease, and an ambiguous transport failure retains it briefly. No adapter
+may delete a still-live OAuth URL merely because its own presentation failed.
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
+
+OAuth callback failures use fixed browser copy. When the consumed state identifies a user, Bolt also
+attempts at most one immediate, best-effort private next-step DM for denial, incomplete authorization,
+expiry, supersession, setup changes, and provider/token failure. Raw provider errors are never
+rendered. The browser response does not wait for Slack; a process failure can drop the DM, and
+replaying the callback cannot trigger another attempt. A successful later connection sends the normal
+private confirmation.
+
+For low-level core integrations, `Consent.begin()` and `beginFenced()` return the minimal
+`ConsentRequest` `{ authorizeUrl, state }`; `Consent.consume()` returns the classified claim directly.
+This is a greenfield breaking contract: there is no legacy nullable-row wrapper, and the internal
+callback row (including PKCE material) is not a root-package export. Prefer the packaged Bolt or
+broker callback path unless implementing another trusted adapter.
 
 Session approvals ([thread-scoped](./assets/slack-session-thread.svg)) are persisted, opaque,
 single-use controls: repeated turns reuse one durable request, with a live delivery lease suppressing

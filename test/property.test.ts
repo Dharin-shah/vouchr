@@ -6,7 +6,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
 import { Policy, type PolicyRule } from '../src/core/policy';
-import { Consent } from '../src/core/consent';
+import { Consent, STATE_TTL_MS } from '../src/core/consent';
 import { defineProvider, github, google, gitlab, notion, type Provider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
@@ -251,9 +251,8 @@ test('property: policy check() never throws and honors its invariants', async ()
 });
 
 // =====================================================================================
-// 4. OAuth state single-use, begin() then consume() once; second/unknown/expired return null.
+// 4. OAuth state single-use, begin() then consume() once; second/unknown are unavailable.
 // =====================================================================================
-const STATE_TTL_MS = 10 * 60 * 1000; // mirrors consent.ts (not exported)
 const consentProvider = defineProvider({
   id: 'cp',
   authorizeUrl: 'https://idp.example/authorize',
@@ -266,7 +265,7 @@ const consentProvider = defineProvider({
   clientSecret: 'csec',
 });
 
-test('property: consume() is single-use; unknown states return null', async (t) => {
+test('property: consume() is single-use; unknown states are unavailable', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
   const N = scale(200);
@@ -276,35 +275,40 @@ test('property: consume() is single-use; unknown states return null', async (t) 
     const { state } = await consent.begin(ident, consentProvider, 'https://app/cb', channel);
 
     const first = await consent.consume(state);
-    assert.ok(first, 'first consume should return the row');
-    assert.equal(first!.state, state);
-    assert.equal(first!.identity.teamId, ident.teamId);
-    assert.equal(first!.identity.userId, ident.userId);
-    assert.equal(first!.provider, consentProvider.id);
-    assert.equal(first!.channel, channel);
+    assert.equal(first.status, 'active', 'first consume should claim the row');
+    if (first.status !== 'active') assert.fail('fresh consent was not claimable');
+    assert.equal(first.row.state, state);
+    assert.equal(first.row.identity.teamId, ident.teamId);
+    assert.equal(first.row.identity.userId, ident.userId);
+    assert.equal(first.row.provider, consentProvider.id);
+    assert.equal(first.row.channel, channel);
 
-    // single-use: a second consume of the same state returns null
-    assert.equal(await consent.consume(state), null, 'second consume must be null');
+    // single-use: a second consume of the same state is unavailable
+    assert.equal((await consent.consume(state)).status, 'unavailable', 'second consume must be unavailable');
 
-    // an unknown / never-issued state returns null
-    assert.equal(await consent.consume(`never-${randStr(20)}`), null, 'unknown state must be null');
+    // an unknown / never-issued state is unavailable
+    assert.equal(
+      (await consent.consume(`never-${randStr(20)}`)).status,
+      'unavailable',
+      'unknown state must be unavailable',
+    );
   }
 });
 
-test('property: rows older than the TTL are treated as expired (null)', async (t) => {
+test('property: rows older than the TTL are classified as expired', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
   const N = scale(100);
   for (let i = 0; i < N; i++) {
-    const state = `stale-${randStr(24)}`;
+    const state = randomBytes(32).toString('base64url');
     // Insert a row directly with a created_at older than the TTL (can't control the clock otherwise).
     const age = STATE_TTL_MS + 1000 + rint(60_000);
     await db.run(
       `INSERT INTO consent_request (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
        VALUES (?,?,?,?,?,?,?,?)`,
-      [state, null, 'T1', 'U1', 'cp', null, 'verifier', Date.now() - age],
+      [state, null, 'T1', `U${i}`, 'cp', null, 'verifier', Date.now() - age],
     );
-    assert.equal(await consent.consume(state), null, 'expired state must consume to null');
+    assert.equal((await consent.consume(state)).status, 'expired', 'expired state must be classified');
   }
 });
 
