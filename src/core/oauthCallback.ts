@@ -49,6 +49,10 @@ function emitConsent(
   safeEmit(deps.auditSink, e);
 }
 
+/** RFC 6749 §4.1.2.1 authorization-endpoint errors that are genuinely retryable-as-is. Every other
+ * value — the permanent config/request codes and anything unrecognized — is non-transient. */
+const TRANSIENT_OAUTH_ERRORS = new Set(['server_error', 'temporarily_unavailable']);
+
 export type OAuthCallbackOutcome =
   | 'connected'
   | 'denied'
@@ -223,12 +227,21 @@ export async function handleOAuthCallback(
     try {
       await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
     } catch { /* audit store unavailable; return the fixed failure below */ }
-    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 502);
+    // Closed classification (RFC 6749 §4.1.2.1): only server_error and temporarily_unavailable are
+    // transient. invalid_request/unauthorized_client/unsupported_response_type/invalid_scope — and
+    // any unrecognized value — are permanent configuration/request faults; telling the user to retry
+    // unchanged config is false. Default to fix_configuration so an unknown value never claims
+    // transient. The raw value is still never reflected or persisted (SEC-4).
+    const transient = TRANSIENT_OAUTH_ERRORS.has(error);
+    const status = transient ? 502 : 500;
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', status);
     return attributedFailure(
       'exchange_failed',
-      502,
-      'The provider could not complete authorization. Wait a moment, then ask the agent for a new connection prompt.',
-      'retry_later',
+      status,
+      transient
+        ? 'The provider is temporarily unavailable. Wait a moment, then ask the agent for a new connection prompt.'
+        : 'The provider rejected this authorization. Ask an administrator to check the Vouchr OAuth configuration.',
+      transient ? 'retry_later' : 'fix_configuration',
       context,
     );
   }

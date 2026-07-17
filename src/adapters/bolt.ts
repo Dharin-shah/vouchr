@@ -1,4 +1,4 @@
-import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
+import { ErrorCode as SlackErrorCode, WebClient, type WebClientOptions } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
@@ -179,11 +179,16 @@ const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
  * lookups so a broken shared store cannot turn callback traffic into unbounded retained work. */
 export const MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS = 32;
 
-function slackNotificationClient(token: string): WebClient {
-  return new WebClient(token, SLACK_NOTIFICATION_CLIENT_OPTIONS);
+/** A bounded client for lease-guarded prompt posts and best-effort DMs. Preserves the operator's
+ * transport (`base`: custom slackApiUrl, agent/proxy, tls, headers) so a deployment using a
+ * non-default Slack endpoint is not bypassed; Vouchr's finite timeout, zero retries, and rate-limit
+ * rejection are applied ON TOP and always win (spread last), so a slow post can never outlive its
+ * delivery lease. */
+function slackNotificationClient(token: string, base?: WebClientOptions): WebClient {
+  return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS });
 }
 
-function boundedNotificationResolution<T>(work: Promise<T>, onTimeout?: () => void): Promise<T | null> {
+function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value: T | null): void => {
@@ -192,10 +197,7 @@ function boundedNotificationResolution<T>(work: Promise<T>, onTimeout?: () => vo
       clearTimeout(timer);
       resolve(value);
     };
-    const timer = setTimeout(() => {
-      onTimeout?.();
-      finish(null);
-    }, SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(null), SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS);
     timer.unref();
     void work.then((value) => finish(value), () => finish(null));
   });
@@ -332,6 +334,12 @@ export interface VouchrOptions {
   policy?: Policy;
   /** Bot token used only for post-callback success and recovery DMs. */
   botToken?: string;
+  /** Transport options for the bounded clients Vouchr builds to post prompts and best-effort DMs
+   *  (custom `slackApiUrl`, `agent`/proxy, `tls`, `headers`). Vouchr always enforces finite timeout,
+   *  zero retries, and rate-limit rejection on top — those cannot be overridden. Set this to match
+   *  your Bolt `App`'s `clientOptions` when it uses a non-default transport, or those prompts/DMs
+   *  would bypass it. */
+  slackClientOptions?: WebClientOptions;
   /**
    * Multi-workspace token source. When set, post-OAuth success and recovery DMs are sent with the
    * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
@@ -487,6 +495,8 @@ export interface ConnectContextDeps {
   /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
    *  VouchrOptions.dryRun). Default false: unchanged behavior. */
   dryRun?: boolean;
+  /** Transport options for bounded prompt/DM clients (see VouchrOptions.slackClientOptions). */
+  slackClientOptions?: WebClientOptions;
 }
 
 // Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
@@ -549,6 +559,7 @@ export class ConnectContext {
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
   private dryRun: boolean;
+  private slackClientOptions?: WebClientOptions;
   private provisioningReceivedAt: bigint;
   private channelProvisioningIssuance?: ChannelProvisioningIssuance;
 
@@ -578,6 +589,7 @@ export class ConnectContext {
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
     this.dryRun = deps.dryRun ?? false;
+    this.slackClientOptions = deps.slackClientOptions;
     this.provisioningReceivedAt =
       (deps as InternalConnectContextDeps)[INTERNAL_PROVISIONING_RECEIVED_AT]
       ?? process.hrtime.bigint();
@@ -661,6 +673,12 @@ export class ConnectContext {
               'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
             );
           }
+          // Resolve the admin recipients BEFORE claiming the delivery lease: member enumeration is an
+          // unbounded Slack read, and running it *inside* the lease could let the lease expire (and
+          // another replica take over) before this worker posts, producing a duplicate. 'self' and
+          // off-channel approvals need no enumeration. The posts themselves run on the bounded
+          // promptClient, so the lease window then covers only bounded work.
+          const approvers = e.approver === 'admin' && this.channel ? await this.eligibleApprovers() : [];
           const delivery = await this.approvals?.claimDelivery(e.approvalId);
           if (!delivery || delivery.status === 'stale') {
             throw new UserFacingError(
@@ -676,7 +694,7 @@ export class ConnectContext {
           }
           if (delivery.status === 'claimed') {
             try {
-              await this.postApprovalPrompt(e, prompt);
+              await this.postApprovalPrompt(e, prompt, approvers);
             } catch (deliveryError) {
               const noSurface = isNoApprovalDecisionSurface(deliveryError);
               if (noSurface) {
@@ -811,14 +829,17 @@ export class ConnectContext {
   private promptClient(): WebClient {
     const token = (this.client as { token?: unknown }).token;
     return typeof token === 'string' && token.length > 0
-      ? slackNotificationClient(token)
+      ? slackNotificationClient(token, this.slackClientOptions)
       : this.client;
   }
 
-  /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
+  /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. `approvers` is
+   * resolved by the caller BEFORE the delivery lease is claimed (member enumeration is unbounded and
+   * must not run inside the lease); it is empty for 'self'/off-channel approvals that need none. */
   private async postApprovalPrompt(
     e: ApprovalRequiredError,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
+    approvers: string[],
   ): Promise<void> {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
@@ -840,7 +861,6 @@ export class ConnectContext {
       }).catch(() => undefined);
       throw new NoApprovalDecisionSurfaceError('admin approval requires a channel decision surface');
     }
-    const approvers = await this.eligibleApprovers();
     let delivered = false;
     let sawAmbiguousFailure = false;
     let ambiguousFailure: unknown;
@@ -1103,14 +1123,9 @@ export class ConnectContext {
     const delivery = await this.consent.claimDelivery(pendingConsent.state);
     if (delivery.status !== 'claimed') {
       // 'delivered' reuses the live prompt instead of re-posting — but an in-channel prompt is an
-      // ephemeral, which vanishes on reload/device switch. Say so instead of claiming a fresh post.
-      if (delivery.status === 'delivered') {
-        throw new ConsentRequiredError(
-          providerId,
-          `Consent required for "${providerId}". A Connect prompt was already posted; if it is no `
-          + 'longer visible, ask again after the current request expires (up to 10 minutes).',
-        );
-      }
+      // ephemeral, which vanishes on reload/device switch. The typed 'reused' state drives fixed
+      // copy (here and in the safe mapper) instead of claiming a fresh post.
+      if (delivery.status === 'delivered') throw new ConsentRequiredError(providerId, 'reused');
       if (delivery.status === 'in-flight') {
         throw new UserFacingError(
           'A private connection prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
@@ -1573,7 +1588,7 @@ export async function createVouchr(opts: VouchrOptions) {
     (source) => Object.hasOwn(resolvers, source) && typeof resolvers[source] === 'function',
   );
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
-  const confirmClient = botToken ? slackNotificationClient(botToken) : null;
+  const confirmClient = botToken ? slackNotificationClient(botToken, opts.slackClientOptions) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
   // Shared per-(owner, provider) rate-limit buckets (provider.rateLimit); per-process by default.
   const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
@@ -1865,37 +1880,36 @@ export async function createVouchr(opts: VouchrOptions) {
     const key = JSON.stringify([identity.enterpriseId, identity.teamId]);
     let entry = notificationClientLookups.get(key);
     if (!entry) {
-      if (notificationClientLookups.size >= MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS) return null;
+      if (notificationClientLookups.size >= MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS) {
+        // Bounded, non-fatal: skip this best-effort DM rather than start unbounded work behind a
+        // hung installation store. Logged so a persistently full cap (a wedged store) is diagnosable
+        // instead of silent. A custom store has no cancellation contract, so the slot must count
+        // *unresolved* work — releasing it on a mere timeout would let a new lookup start every
+        // window and defeat the cap. A store that never settles holds its slot until restart; that
+        // bounded degradation is the deliberate trade for never exceeding the concurrency cap.
+        console.error('[vouchr] notification-client lookup cap reached; skipping this best-effort DM');
+        return null;
+      }
       const raw = Promise.resolve().then(async () => {
         const inst = await opts.installationStore!.fetchInstallation({
           teamId: identity.teamId,
           enterpriseId: identity.enterpriseId ?? undefined,
           isEnterpriseInstall: false,
         });
-        return inst.bot?.token ? slackNotificationClient(inst.bot.token) : null;
+        return inst.bot?.token ? slackNotificationClient(inst.bot.token, opts.slackClientOptions) : null;
       }).catch(() => null);
-      let exactEntry: NotificationClientLookup;
-      const evict = (): void => {
-        if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key);
-      };
-      // Evict on the resolution timeout too, not only on settlement: a store promise that NEVER
-      // settles must not occupy its cap slot forever — 32 wedged workspaces would otherwise
-      // silently disable every success/recovery/health DM until restart. Post-timeout callbacks
-      // for the same workspace may start a fresh (human-rate, equally bounded) lookup.
-      exactEntry = {
-        raw,
-        bounded: boundedNotificationResolution(raw, () => {
-          evict();
-          console.error('[vouchr] slack installation lookup timed out; notification slot released');
-        }),
-      };
+      const exactEntry: NotificationClientLookup = { raw, bounded: boundedNotificationResolution(raw) };
       entry = exactEntry;
       notificationClientLookups.set(key, entry);
-      void raw.then(evict, evict);
+      // Release the slot ONLY when the underlying store operation actually settles, so the cap
+      // bounds unresolved concurrency, not just map size.
+      void raw.then(
+        () => { if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key); },
+        () => { if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key); },
+      );
     }
-    // A custom installation store has no cancellation contract. Bound each caller, but keep the raw
-    // lookup and its single timeout wrapper deduplicated while it is pending inside the timeout
-    // window. This prevents repeated callbacks from piling up promise reactions on one hung lookup.
+    // A custom installation store has no cancellation contract. Bound each caller (so a callback
+    // never waits on a hung store), but keep the raw lookup deduplicated until it actually settles.
     return entry.bounded;
   }
 
@@ -1980,6 +1994,7 @@ export async function createVouchr(opts: VouchrOptions) {
         auditSink,
         health,
         dryRun,
+        slackClientOptions: opts.slackClientOptions,
       });
     }
     await args.next();
@@ -2061,6 +2076,7 @@ export async function createVouchr(opts: VouchrOptions) {
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, approvals, auditSink, health, dryRun,
+      slackClientOptions: opts.slackClientOptions,
     };
     if (provisioningReceivedAt != null) {
       deps[INTERNAL_PROVISIONING_RECEIVED_AT] = provisioningReceivedAt;

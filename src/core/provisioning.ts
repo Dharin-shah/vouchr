@@ -86,7 +86,7 @@ export class UserProvisioningRequests {
          RETURNING created_at`,
         [id, identity.teamId, identity.userId, provider],
       );
-      return row ? { issuedAt: row.created_at, requireNewest: true } : null;
+      return row ? row.created_at : null;
     };
   }
 

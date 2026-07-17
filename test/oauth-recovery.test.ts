@@ -16,7 +16,7 @@ import {
 } from '../src/core/consent';
 import { userOwner } from '../src/core/owner';
 import { openDb, type Db } from '../src/core/db';
-import { ConsentRequiredError, UserFacingError } from '../src/core/errors';
+import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
 import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
@@ -252,11 +252,26 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
 
   // Only `access_denied` is a user decision. Any other redirect error value — including a hostile
   // one — is a provider-side failure and must not be audited or messaged as a denial (nor echoed).
+  // Closed classification: only server_error / temporarily_unavailable are transient (502 +
+  // retry_later). Config/request codes and any unknown value are permanent (500 + fix_configuration)
+  // — never "retry unchanged". The raw value is never reflected or persisted for either.
+  const transientState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const transient = await handleOAuthCallback(deps, undefined, transientState.state, 'temporarily_unavailable');
+  assert.equal(!transient.ok && transient.outcome, 'exchange_failed');
+  assert.equal(!transient.ok && transient.status, 502);
+  assert.equal(!transient.ok && 'recovery' in transient && transient.recovery, 'retry_later');
+
+  const permanentState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const permanent = await handleOAuthCallback(deps, undefined, permanentState.state, 'invalid_scope');
+  assert.equal(!permanent.ok && permanent.outcome, 'exchange_failed');
+  assert.equal(!permanent.ok && permanent.status, 500);
+  assert.equal(!permanent.ok && 'recovery' in permanent && permanent.recovery, 'fix_configuration');
+
   const providerFailedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
   const providerFailed = await handleOAuthCallback(deps, undefined, providerFailedState.state, foreign);
   assert.equal(!providerFailed.ok && providerFailed.outcome, 'exchange_failed');
-  assert.equal(!providerFailed.ok && providerFailed.status, 502);
-  assert.equal(!providerFailed.ok && 'recovery' in providerFailed && providerFailed.recovery, 'retry_later');
+  assert.equal(!providerFailed.ok && providerFailed.status, 500, 'an unknown error value defaults to permanent');
+  assert.equal(!providerFailed.ok && 'recovery' in providerFailed && providerFailed.recovery, 'fix_configuration');
   assert.ok(!JSON.stringify(providerFailed).includes(foreign));
   const providerFailedAudit = await db.get<{ meta: string }>(
     `SELECT meta FROM audit WHERE action='denied' ORDER BY at DESC LIMIT 1`,
@@ -577,14 +592,16 @@ test('a provider-side callback error is not messaged as a user denial and is nev
     let callback: any;
     vouchr.mountRoutes({ get: (_path: string, handler: any) => { callback = handler; } });
     const response = fakeResponse();
+    // An unknown, secret-bearing error value classifies as permanent (500 + fix_configuration), not
+    // a denial and not transient — and its raw text must never reach the browser or Slack.
     await callback({ query: { state: pending.state, error: foreign } }, response);
     await new Promise<void>((resolve) => setImmediate(resolve));
-    assert.equal(response.statusCode, 502);
-    assert.match(String(response.body), /provider could not complete authorization/i);
+    assert.equal(response.statusCode, 500);
+    assert.match(String(response.body), /OAuth configuration/i);
     assert.equal(apiCalls.length, 1);
     const dm = JSON.stringify(apiCalls[0].args.blocks);
-    assert.match(dm, /temporarily unavailable/i);
-    assert.doesNotMatch(dm, /not authorized|allowed/i);
+    assert.match(dm, /configuration/i);
+    assert.doesNotMatch(dm, /not authorized|allowed|temporarily unavailable/i);
     assert.ok(!JSON.stringify([response.body, apiCalls]).includes(foreign));
   } finally {
     prototype.apiCall = realApiCall;
@@ -681,23 +698,25 @@ test('Bolt bounds and deduplicates a non-settling multi-workspace notification l
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(
     lookups,
-    2,
-    'a timed-out lookup releases its slot: a never-settling store must not wedge notifications until restart',
+    1,
+    'a timed-out CALLER gives up, but the unresolved store lookup keeps its slot — the cap bounds unresolved concurrency, not map size',
   );
 
-  const shared = await consent.begin(
+  settleLookups[0]!({});
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const afterSettlement = await consent.begin(
     ID,
     secondProvider,
     'https://vouchr.test/vouchr/oauth/callback',
     null,
   );
   await callback(
-    { query: { state: shared.state, error: 'access_denied' } },
+    { query: { state: afterSettlement.state, error: 'access_denied' } },
     fakeResponse(),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(lookups, 2, 'the fresh pending lookup is still shared inside its own timeout window');
-  for (const settle of settleLookups) settle({});
+  assert.equal(lookups, 2, 'a settled raw lookup releases the workspace for a later lookup');
+  for (const settle of settleLookups.slice(1)) settle({});
 });
 
 test('Bolt caps hung notification lookups across distinct workspaces', async (t) => {
@@ -842,15 +861,26 @@ test('a delivered but possibly-vanished ephemeral prompt is not claimed as fresh
   assert.equal(posts.length, 1, 'the live prompt is reused, not reposted');
 });
 
-test('a Bolt client carrying a token posts leased prompts through a bounded twin', async (t) => {
+test('a leased prompt post is bounded AND preserves the operator Slack transport', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   const db = await openTestDb(t);
-  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db });
-  const posted: Array<{ retries: unknown; rejectRateLimited: unknown }> = [];
+  // A deployment with a non-default Slack endpoint must not be bypassed by the bounded prompt client.
+  const vouchr = await createVouchr({
+    providers: [provider],
+    baseUrl: 'https://vouchr.test',
+    db,
+    slackClientOptions: { slackApiUrl: 'https://slack-proxy.internal/api/' },
+  });
+  const posted: Array<{ retries: unknown; rejectRateLimited: unknown; timeout: unknown; apiUrl: unknown }> = [];
   const prototype = WebClient.prototype as any;
   const realApiCall = prototype.apiCall;
   prototype.apiCall = async function (this: any) {
-    posted.push({ retries: this.retryConfig?.retries, rejectRateLimited: this.rejectRateLimitedCalls });
+    posted.push({
+      retries: this.retryConfig?.retries,
+      rejectRateLimited: this.rejectRateLimitedCalls,
+      timeout: this.requestConfig?.timeout ?? this.timeout,
+      apiUrl: this.slackApiUrl,
+    });
     return { ok: true };
   };
   try {
@@ -859,7 +889,67 @@ test('a Bolt client carrying a token posts leased prompts through a bounded twin
     assert.equal(posted.length, 1);
     assert.equal(posted[0].retries, 0, 'a leased prompt post must not queue SDK retries past its lease');
     assert.equal(posted[0].rejectRateLimited, true, 'a 429 must fail the leased post, not park it in the SDK queue');
+    assert.equal(posted[0].apiUrl, 'https://slack-proxy.internal/api/', 'the operator transport must survive the bound');
   } finally {
     prototype.apiCall = realApiCall;
   }
+});
+
+test('every user-owned issuance shape is generation-fenced: an older key/reference write loses with no audit', async (t) => {
+  const { a, b } = await openReplicaPair(t);
+  const vaultA = new Vault(a, KEY);
+  const vaultB = new Vault(b, KEY);
+  const owner = userOwner(ID);
+  const audits = await b.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='connect'`);
+
+  // Replica A captures an issuance, then replica B commits a NEWER credential (a rotation) before A
+  // writes. A's numeric (direct key/reference) write must lose to the newer generation — the fence
+  // is unconditional, not resolver-object-only — and it must NOT emit a connect audit row.
+  const staleIssuedAt = await vaultA.userProvisioningIssuedAt();
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  assert.equal(
+    await vaultB.upsertUser(owner, provider.id, {
+      accessToken: 'newer', refreshToken: null, scopes: 'read', expiresAt: null, externalAccount: null,
+    }, await vaultB.userProvisioningIssuedAt()),
+    'stored',
+  );
+  let audited = false;
+  const staleWrite = await vaultA.referenceUser(
+    owner, provider.id,
+    { source: 'aws-sm', secretRef: 'arn:aws:secretsmanager:us-east-1:1:secret:x', scopes: 'read' },
+    staleIssuedAt,
+    async () => { audited = true; },
+  );
+  assert.equal(staleWrite, 'stale', 'a numeric issuance older than the live credential must be fenced');
+  assert.equal(audited, false, 'a fenced write must not run its audit companion');
+  assert.equal((await vaultA.get(owner, provider.id))?.accessToken, 'newer', 'the newer credential survives');
+  assert.equal(
+    (await b.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='connect'`))?.n,
+    audits?.n,
+    'no extra connect audit from the fenced write',
+  );
+});
+
+test("an offboarded user's surviving expired link is account-inactive, not \"ask again\"", async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  // Offboarding tolerates a failed consent-row purge, so the row can outlive STATE_TTL_MS with no
+  // re-onboarding. Expiry must NOT mask the lifecycle invalidation the user must act on.
+  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  await consent.markOffboarded(ID);
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await db.run(`UPDATE consent_request SET created_at=? WHERE state=?`, [Date.now() - STATE_TTL_MS - 1_000, pending.state]);
+  const claim = await consent.consume(pending.state);
+  assert.equal(claim.status, 'invalidated', 'a blocking tombstone wins over expiry');
+  assert.equal(claim.status === 'invalidated' && claim.reason, 'offboarded');
+});
+
+test('mapSafeError emits fixed copy for a reused (possibly-hidden) Connect prompt', () => {
+  const posted = mapSafeError(new ConsentRequiredError('acme'));
+  const reused = mapSafeError(new ConsentRequiredError('acme', 'reused'));
+  assert.equal(posted.recovery, 'connect');
+  assert.equal(reused.recovery, 'connect');
+  assert.match(posted.message, /Complete the private Connect prompt/);
+  assert.match(reused.message, /no longer visible/); // never claims the ephemeral is on screen
+  assert.doesNotMatch(reused.message, /Complete the private Connect prompt, then retry/);
 });

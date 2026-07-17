@@ -734,15 +734,6 @@ export class Consent {
     );
     if (!raw) return { status: 'unavailable' };
     const row = consentRow(raw);
-    // Supersession/expiry classify BEFORE the tombstones, deliberately: a tombstone only blocks
-    // generations minted at-or-before it, so re-onboarding after an offboard is a supported flow —
-    // a stale link superseded by that newer generation must say "use the newest prompt", not
-    // falsely claim the account is inactive. The tombstone gate below still refuses every
-    // pre-tombstone authority, and finalizeProvisioning() re-checks inside the credential
-    // transaction so an offboard/revoke that wins during token exchange still blocks.
-    if (raw.superseded_at != null) return { status: 'superseded', row };
-    if (raw.observed_at - raw.created_at > STATE_TTL_MS) return { status: 'expired', row };
-
     const identity = row.identity;
     const owner: Owner = {
       teamId: identity.teamId,
@@ -754,24 +745,40 @@ export class Consent {
       latestUserOffboardTombstone(this.db, identity),
       latestProvisioningRevocationTombstone(this.db, owner, row.provider),
     ]);
-    if (tombstoneBlocks(offboardedAt, row.createdAt)) {
-      return { status: 'invalidated', reason: 'offboarded', row };
+    const offBlocks = tombstoneBlocks(offboardedAt, row.createdAt);
+    const revBlocks = tombstoneBlocks(revokedAt, row.createdAt);
+    if (offBlocks || revBlocks) {
+      // A blocking tombstone wins over supersession/expiry UNLESS a supersession happened strictly
+      // after every blocking tombstone — that is a legitimately re-onboarded generation minted
+      // post-offboard/revoke, so "use the newest prompt" is correct. Expiry, or a supersession at or
+      // before the block, cannot mask a lifecycle invalidation the user must actually act on
+      // (offboarding tolerates a failed consent-row purge, so the row can outlive the tombstone).
+      const blockingTime = Math.max(
+        offBlocks ? (offboardedAt as number) : Number.NEGATIVE_INFINITY,
+        revBlocks ? (revokedAt as number) : Number.NEGATIVE_INFINITY,
+      );
+      if (!(raw.superseded_at != null && raw.superseded_at > blockingTime)) {
+        return offBlocks
+          ? { status: 'invalidated', reason: 'offboarded', row }
+          : { status: 'invalidated', reason: 'revoked', row };
+      }
     }
-    if (tombstoneBlocks(revokedAt, row.createdAt)) {
-      return { status: 'invalidated', reason: 'revoked', row };
-    }
+    // finalizeProvisioning() re-checks the tombstones inside the credential transaction, so an
+    // offboard/revoke that wins during token exchange still blocks the write.
+    if (raw.superseded_at != null) return { status: 'superseded', row };
+    if (raw.observed_at - raw.created_at > STATE_TTL_MS) return { status: 'expired', row };
     return { status: 'active', row };
   }
 
-  /** Resolve the callback's issuance inside Vault's credential transaction. Deleting only the exact
-   * still-active generation makes token exchange lose safely to a newer prompt. `requireNewest`
-   * independently prevents a delayed callback from overwriting a credential written after this
-   * generation was minted — while still letting a generation minted over an older live credential
-   * replace it, so deliberate re-auth (provider-side-dead token, scope change) cannot dead-end. */
+  /** Resolve the callback's issuance (the consent's mint time) inside Vault's credential
+   * transaction. Deleting only the exact still-active generation makes token exchange lose safely
+   * to a newer prompt; Vault's unconditional newest-generation fence then prevents this issuance
+   * from overwriting a credential written after it, while still letting a generation minted over an
+   * older live credential replace it, so deliberate re-auth cannot dead-end. */
   async finalizeProvisioning(
     row: ConsentRow,
     db: Db,
-  ): Promise<{ issuedAt: number; requireNewest: true } | null> {
+  ): Promise<number | null> {
     const current = await db.get<{ created_at: number }>(
       `DELETE FROM consent_request
        WHERE state=? AND team_id=? AND user_id=? AND provider=?
@@ -779,7 +786,7 @@ export class Consent {
        RETURNING created_at`,
       [row.state, row.identity.teamId, row.identity.userId, row.provider],
     );
-    if (current) return { issuedAt: current.created_at, requireNewest: true };
+    if (current) return current.created_at;
 
     // Offboard/revoke cleanup may have deleted the row while token exchange was in flight. Preserve
     // that more precise lifecycle result by letting Vault evaluate the original issuance against the
@@ -794,7 +801,7 @@ export class Consent {
     const offboardedAt = await latestUserOffboardTombstone(db, row.identity);
     const revokedAt = await latestProvisioningRevocationTombstone(db, owner, row.provider);
     return tombstoneBlocks(offboardedAt, row.createdAt) || tombstoneBlocks(revokedAt, row.createdAt)
-      ? { issuedAt: row.createdAt, requireNewest: true }
+      ? row.createdAt
       : null;
   }
 

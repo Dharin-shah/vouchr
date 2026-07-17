@@ -31,16 +31,9 @@ export interface StoredToken {
 }
 
 /** A user-provisioning intent is either a trusted server timestamp or an atomic resolver that
- * consumes a persisted opaque request inside the credential transaction. */
-export interface UserProvisioningGate {
-  issuedAt: number;
-  /** Write only when no live credential with `generation_at >= issuedAt` exists (a tie fails
-   * closed). A delayed prompt/callback can never overwrite a credential written after it was
-   * issued, while an intent minted after the live credential — deliberate re-auth over a
-   * provider-dead or scope-upgraded token — replaces it. */
-  requireNewest: true;
-}
-export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | UserProvisioningGate | null>);
+ * consumes a persisted opaque request inside the credential transaction and yields its issuance
+ * time (or null to abort). Every user write is fenced by generation ordering regardless of shape. */
+export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | null>);
 export type UserProvisioningResult = 'stored' | 'stale' | 'offboarded' | 'revoked' | 'conflict';
 
 const PREPARE_VAULT_CREDENTIAL_WRITE = Symbol('prepare-vault-credential-write');
@@ -612,9 +605,8 @@ export class Vault {
     };
     return this.withCredentialLock(owner, provider, async (_locked, tx) =>
       withUserProvisioningLock(tx, identity, provider, async (fencedTx) => {
-        const resolved = typeof issuance === 'number' ? issuance : await issuance(fencedTx);
-        if (resolved == null) return 'stale';
-        const issuedAt = typeof resolved === 'number' ? resolved : resolved.issuedAt;
+        const issuedAt = typeof issuance === 'number' ? issuance : await issuance(fencedTx);
+        if (issuedAt == null) return 'stale';
         if (!Number.isSafeInteger(issuedAt)) throw new Error('invalid user provisioning issuance');
         const offboardedAt = await latestUserOffboardTombstone(fencedTx, identity);
         const revokedAt = await latestProvisioningRevocationTombstone(
@@ -624,23 +616,28 @@ export class Vault {
         );
         if (tombstoneBlocks(offboardedAt, issuedAt)) return 'offboarded';
         if (tombstoneBlocks(revokedAt, issuedAt)) return 'revoked';
-        if (typeof resolved !== 'number' && resolved.requireNewest) {
-          const existing = await fencedTx.get<{
-            created_at: number;
-            last_used_at: number | null;
-            generation_at: number;
-          }>(
-            `SELECT created_at, last_used_at, generation_at FROM connection
-             WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
-            [owner.teamId, owner.id, provider],
-          );
-          if (
-            existing
-            && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)
-            && existing.generation_at >= issuedAt
-          ) {
-            return 'stale';
-          }
+        // Newest-generation fence for EVERY user write, whatever the issuance shape. A credential
+        // written STRICTLY AFTER this request was issued is newer and must never be overwritten: a
+        // stalled OAuth/key/reference request (whose issuance is strictly earlier than a rotation
+        // that committed while it was in flight) loses. Equality is not "stale" — a same-instant
+        // legitimate replacement (re-key, re-reference) is a concurrent write, not a delayed one, so
+        // it proceeds. A request issued at or after the live credential (deliberate re-auth over a
+        // provider-dead or scope-upgraded token) still replaces it.
+        const existing = await fencedTx.get<{
+          created_at: number;
+          last_used_at: number | null;
+          generation_at: number;
+        }>(
+          `SELECT created_at, last_used_at, generation_at FROM connection
+           WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
+          [owner.teamId, owner.id, provider],
+        );
+        if (
+          existing
+          && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)
+          && existing.generation_at > issuedAt
+        ) {
+          return 'stale';
         }
         await write(fencedTx);
         return 'stored';
