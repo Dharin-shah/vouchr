@@ -46,6 +46,7 @@ export type { Db, DbOptions } from './core/db';
 export { Vault } from './core/vault';
 export { Audit } from './core/audit';
 export { Consent } from './core/consent';
+export type { ConsentRequest } from './core/consent';
 export { github, google, gitlab, notion, databricks, defineProvider, ProviderRegistry } from './core/providers';
 export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy } from './core/providers';
 export { Policy } from './core/policy';

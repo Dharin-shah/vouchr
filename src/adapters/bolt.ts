@@ -28,7 +28,7 @@ import {
   type ChannelProvisioningIssuance,
 } from '../core/channelCredential';
 import { ChannelTools, configureChannelTools, type ToolManifestEntry } from '../core/tools';
-import { handleOAuthCallback } from '../core/oauthCallback';
+import { handleOAuthCallback, type CallbackResult } from '../core/oauthCallback';
 import {
   offboardUser,
   disconnectProvider,
@@ -84,7 +84,7 @@ import {
   approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
-  escapeMrkdwn, blocksFallbackText, connectedDmText,
+  escapeMrkdwn, blocksFallbackText, connectedDmText, oauthRecoveryBlocks,
   type Connection, type ConfigAdminRow,
 } from './blocks';
 
@@ -169,6 +169,35 @@ function optionalBlockFallback(blocks: unknown[]): { text: string } | Record<str
   }
 }
 
+const SLACK_NOTIFICATION_CLIENT_OPTIONS = Object.freeze({
+  retryConfig: { retries: 0 },
+  timeout: 3_000,
+  rejectRateLimitedCalls: true,
+});
+const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
+/** A custom installation store has no cancellation contract. Cap distinct unresolved workspace
+ * lookups so a broken shared store cannot turn callback traffic into unbounded retained work. */
+export const MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS = 32;
+
+function slackNotificationClient(token: string): WebClient {
+  return new WebClient(token, SLACK_NOTIFICATION_CLIENT_OPTIONS);
+}
+
+function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: T | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS);
+    timer.unref();
+    void work.then((value) => finish(value), () => finish(null));
+  });
+}
+
 /** No actionable Slack recipient exists, so delivery is known not to have happened. Network/API
  * rejection is deliberately NOT this type: Slack may have accepted before the caller saw failure. */
 class NoApprovalDecisionSurfaceError extends Error {}
@@ -211,7 +240,7 @@ function isNoApprovalDecisionSurface(error: unknown): boolean {
 
 function slackPromptDeliveryRecovery(
   outcome: SlackPromptDeliveryFailure,
-  surface: 'approval' | 'session',
+  surface: 'approval' | 'connection' | 'session',
 ): UserFacingError {
   if (outcome === 'platform-rejected') {
     return new UserFacingError(
@@ -232,11 +261,8 @@ function slackPromptDeliveryRecovery(
 }
 
 async function abandonKnownUndeliveredPrompt(
-  store: { abandonDelivery: (id: string, token: string, remove: boolean) => Promise<boolean> },
-  id: string,
-  token: string,
-  remove: boolean,
-  surface: 'approval' | 'session',
+  abandon: () => Promise<boolean>,
+  surface: 'approval' | 'connection' | 'session',
   cause: 'slack-rejected' | 'no-decision-surface' = 'slack-rejected',
 ): Promise<void> {
   const description = cause === 'slack-rejected'
@@ -244,7 +270,7 @@ async function abandonKnownUndeliveredPrompt(
     : `Vouchr found no ${surface} decision surface`;
   let released: boolean;
   try {
-    released = await store.abandonDelivery(id, token, remove);
+    released = await abandon();
   } catch {
     throw new UserFacingError(
       `${description}, but could not reset its request state. Ask the agent to retry shortly.`,
@@ -301,13 +327,13 @@ export interface VouchrOptions {
    *  injected, the caller owns its lifecycle — `install().stop()` will NOT close it. */
   db?: Db;
   policy?: Policy;
-  /** Bot token used only to post the "connected" confirmation back to Slack. */
+  /** Bot token used only for post-callback success and recovery DMs. */
   botToken?: string;
   /**
-   * Multi-workspace token source. When set, the post-OAuth confirmation DM is sent with the
+   * Multi-workspace token source. When set, post-OAuth success and recovery DMs are sent with the
    * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
-   * so an app installed to many workspaces / org-wide works. When omitted, behaves exactly as
-   * before, a single `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
+   * so an app installed to many workspaces / org-wide works. When omitted, Vouchr uses the single
+   * `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
    */
   installationStore?: InstallationStore;
   /** Connection lifetime. Defaults to idle 7d / max-age 30d. Pass `{}` to disable expiry. */
@@ -653,10 +679,11 @@ export class ConnectContext {
               if (noSurface) {
                 if (this.approvals) {
                   await abandonKnownUndeliveredPrompt(
-                    this.approvals,
-                    e.approvalId,
-                    delivery.token,
-                    e.newRequest,
+                    () => this.approvals!.abandonDelivery(
+                      e.approvalId,
+                      delivery.token,
+                      e.newRequest,
+                    ),
                     'approval',
                     'no-decision-surface',
                   );
@@ -669,10 +696,11 @@ export class ConnectContext {
               const outcome = classifySlackPromptDeliveryFailure(deliveryError);
               if (outcome !== 'ambiguous' && this.approvals) {
                 await abandonKnownUndeliveredPrompt(
-                  this.approvals,
-                  e.approvalId,
-                  delivery.token,
-                  e.newRequest,
+                  () => this.approvals!.abandonDelivery(
+                    e.approvalId,
+                    delivery.token,
+                    e.newRequest,
+                  ),
                   'approval',
                 );
               }
@@ -973,10 +1001,11 @@ export class ConnectContext {
               const outcome = classifySlackPromptDeliveryFailure(deliveryError);
               if (outcome !== 'ambiguous') {
                 await abandonKnownUndeliveredPrompt(
-                  this.sessions,
-                  pending.id,
-                  delivery.token,
-                  pending.created,
+                  () => this.sessions!.abandonDelivery(
+                    pending.id,
+                    delivery.token,
+                    pending.created,
+                  ),
                   'session',
                 );
               }
@@ -1051,8 +1080,41 @@ export class ConnectContext {
         'resolve_again',
       );
     }
-    const { authorizeUrl } = pendingConsent;
-    await this.postConnectPrompt(providerId, authorizeUrl);
+    // Render before claiming delivery. A local registry/render failure is a known no-send and must
+    // not park this reusable consent generation behind an ambiguous Slack lease.
+    const prompt = this.connectPrompt(providerId, pendingConsent.authorizeUrl);
+    const delivery = await this.consent.claimDelivery(pendingConsent.state);
+    if (delivery.status !== 'claimed') {
+      if (delivery.status === 'delivered') throw new ConsentRequiredError(providerId);
+      if (delivery.status === 'in-flight') {
+        throw new UserFacingError(
+          'A private connection prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
+          'retry_later',
+        );
+      }
+      throw new UserFacingError(
+        'The connection request changed before its prompt could be delivered. Ask the agent again.',
+        'resolve_again',
+      );
+    }
+    try {
+      await this.postConnectPrompt(prompt);
+    } catch (deliveryError) {
+      const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+      if (outcome !== 'ambiguous') {
+        await abandonKnownUndeliveredPrompt(
+          () => this.consent.abandonDelivery(pendingConsent.state, delivery.token),
+          'connection',
+        );
+      }
+      throw slackPromptDeliveryRecovery(outcome, 'connection');
+    }
+    if (!(await this.consent.confirmDelivery(pendingConsent.state, delivery.token))) {
+      throw new UserFacingError(
+        'Vouchr posted a private connection prompt but could not confirm its current state. Use it if it appears; otherwise ask the agent again.',
+        'resolve_again',
+      );
+    }
     this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId);
   }
@@ -1335,13 +1397,23 @@ export class ConnectContext {
     }
   }
 
-  private async postConnectPrompt(providerId: string, url: string): Promise<void> {
+  private connectPrompt(providerId: string, url: string): {
+    blocks: unknown[];
+    fallback: { text: string } | Record<string, never>;
+  } {
     const provider = this.registry.get(providerId);
     const blocks = connectBlocks(providerId, url, {
       list: provider.scopesDefault,
       describe: provider.scopeDescriptions,
     });
-    const fallback = optionalBlockFallback(blocks);
+    return { blocks, fallback: optionalBlockFallback(blocks) };
+  }
+
+  private async postConnectPrompt(prompt: {
+    blocks: unknown[];
+    fallback: { text: string } | Record<string, never>;
+  }): Promise<void> {
+    const { blocks, fallback } = prompt;
     if (this.channel) {
       await this.client.chat.postEphemeral({
         channel: this.channel,
@@ -1374,7 +1446,7 @@ export class ConnectContext {
  * anywhere. A refresh-dead DM contains no reconnect control: it may live past offboarding, so a
  * later click cannot safely mint fresh consent. The user asks the agent again, which produces a
  * current, offboard-fenced prompt. Exported for tests; createVouchr wires it with the same client
- * resolution the post-OAuth confirmation DM uses.
+ * resolution the post-OAuth success and recovery DMs use.
  */
 export function healthNotifier(deps: {
   registry: ProviderRegistry;
@@ -1475,7 +1547,7 @@ export async function createVouchr(opts: VouchrOptions) {
     (source) => Object.hasOwn(resolvers, source) && typeof resolvers[source] === 'function',
   );
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
-  const confirmClient = botToken ? new WebClient(botToken) : null;
+  const confirmClient = botToken ? slackNotificationClient(botToken) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
   // Shared per-(owner, provider) rate-limit buckets (provider.rateLimit); per-process by default.
   const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
@@ -1752,27 +1824,77 @@ export async function createVouchr(opts: VouchrOptions) {
   };
 
   /**
-   * The WebClient used to post the post-OAuth confirmation DM. With an installationStore,
+   * The WebClient used to post post-OAuth success and recovery DMs. With an installationStore,
    * resolve the connecting user's own workspace bot token via fetchInstallation; without one,
    * fall back to the single env/opts token (unchanged behavior). The DM is best-effort, so a
    * missing install just means no nudge. Never throw, and never log the token.
    */
+  type NotificationClientLookup = {
+    raw: Promise<WebClient | null>;
+    bounded: Promise<WebClient | null>;
+  };
+  const notificationClientLookups = new Map<string, NotificationClientLookup>();
   async function confirmClientFor(identity: SlackIdentity): Promise<WebClient | null> {
     if (!opts.installationStore) return confirmClient;
-    try {
-      const inst = await opts.installationStore.fetchInstallation({
-        teamId: identity.teamId,
-        enterpriseId: identity.enterpriseId ?? undefined,
-        isEnterpriseInstall: false,
+    const key = JSON.stringify([identity.enterpriseId, identity.teamId]);
+    let entry = notificationClientLookups.get(key);
+    if (!entry) {
+      if (notificationClientLookups.size >= MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS) return null;
+      const raw = Promise.resolve().then(async () => {
+        const inst = await opts.installationStore!.fetchInstallation({
+          teamId: identity.teamId,
+          enterpriseId: identity.enterpriseId ?? undefined,
+          isEnterpriseInstall: false,
+        });
+        return inst.bot?.token ? slackNotificationClient(inst.bot.token) : null;
+      }).catch(() => null);
+      entry = { raw, bounded: boundedNotificationResolution(raw) };
+      notificationClientLookups.set(key, entry);
+      const exactEntry = entry;
+      void raw.then(() => {
+        if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key);
       });
-      return inst.bot?.token ? new WebClient(inst.bot.token) : null;
-    } catch {
-      return null;
     }
+    // A custom installation store has no cancellation contract. Bound each caller, but keep the raw
+    // lookup and its single timeout wrapper deduplicated until it actually settles. This prevents
+    // repeated callbacks from piling up either store work or promise reactions on one hung lookup.
+    return entry.bounded;
+  }
+
+  /** Attributable callback failures get one fixed private Slack next step. Unknown/replayed states
+   * carry no identity and deliberately stay browser-only. Delivery is informational and best-effort:
+   * it never changes the already-decided callback result. */
+  async function notifyOAuthRecovery(
+    result: Extract<CallbackResult, { ok: false; context: unknown }>,
+  ): Promise<void> {
+    const client = await confirmClientFor(result.context.identity);
+    if (!client) return;
+    const blocks = oauthRecoveryBlocks(
+      result.context.provider,
+      result.outcome,
+      result.recovery,
+    );
+    await client.chat.postMessage({
+      channel: result.context.identity.userId,
+      blocks: blocks as any,
+      text: blocksFallbackText(blocks),
+    }).catch(() => undefined);
+  }
+
+  async function notifyOAuthConnected(
+    result: Extract<CallbackResult, { ok: true }>,
+  ): Promise<void> {
+    const client = await confirmClientFor(result.identity);
+    if (!client) return;
+    await client.chat.postMessage({
+      channel: result.identity.userId,
+      // SEC-5: connectedDmText escapes the provider-reported account label.
+      text: connectedDmText(result.provider, result.account),
+    }).catch(() => undefined);
   }
 
   // #117 credential-health wiring. Default: DM the owner (healthNotifier), via the same per-workspace
-  // client resolution as the post-OAuth confirmation DM, debounced by the persistent notification_state
+  // client resolution as post-OAuth success and recovery DMs, debounced by the persistent notification_state
   // table. An operator-supplied onCredentialHealth REPLACES the default DMs (like `isAdmin`). Either
   // way the hook is fire-and-forget: a throwing/failing notifier never affects what fired it.
   const notifyState = new NotificationState(db);
@@ -1862,28 +1984,27 @@ export async function createVouchr(opts: VouchrOptions) {
         // query value. Keep text/plain + nosniff as defense in depth; the success path below opts
         // into text/html explicitly for the rendered landing page.
         if (!result.ok) {
-          return res
+          const response = res
             .status(result.status)
             .set({ 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' })
             .send(result.error);
+          // Slack is a best-effort side effect, never part of the browser callback's latency or
+          // truthfulness. State was already consumed, so a replay cannot trigger a second DM attempt.
+          if ('context' in result) void notifyOAuthRecovery(result).catch(() => undefined);
+          return response;
         }
         emit({ type: 'connected', provider: result.provider });
-
-        // Best-effort nudge back into Slack, from the connecting user's own workspace.
-        const client = await confirmClientFor(result.identity);
-        if (client) {
-          await client.chat
-            .postMessage({
-              channel: result.identity.userId,
-              // SEC-5: connectedDmText escapes the provider-reported account label.
-              text: connectedDmText(result.provider, result.account),
-            })
-            .catch(() => undefined);
-        }
-        res.set('content-type', 'text/html').send(connectedHtml(result.provider, result.account, result.scopes));
+        const response = res
+          .set('content-type', 'text/html')
+          .send(connectedHtml(result.provider, result.account, result.scopes));
+        void notifyOAuthConnected(result).catch(() => undefined);
+        return response;
       } catch {
         // Express doesn't catch async rejections; an unhandled one here hangs the browser.
-        res.status(500).send('Connection failed. Please try again.');
+        res
+          .status(500)
+          .set({ 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' })
+          .send('Connection failed. Please try again.');
       }
     });
   }

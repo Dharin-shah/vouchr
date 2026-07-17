@@ -1609,11 +1609,11 @@ test('break-glass revoke during token exchange invalidates the old OAuth write b
       'CODE',
       state,
     );
-    assert.deepEqual(result, {
-      ok: false,
-      status: 409,
-      error: 'Connection setup changed while authorization was completing. Start a new connection request.',
-    });
+    assert.equal(result.ok, false);
+    assert.equal(!result.ok && result.outcome, 'setup_changed');
+    assert.equal(!result.ok && result.status, 409);
+    assert.equal(!result.ok && result.recovery, 'connect');
+    assert.equal(!result.ok && result.retryable, false);
     assert.equal(await countConnections(dbA), 0);
     assert.equal(
       (await dbA.get<{ n: number }>(

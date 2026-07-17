@@ -40,6 +40,7 @@ export type { Keyring, MasterKeys, EnvelopeProvider } from './core/crypto';
 export { Audit } from './core/audit';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';
+export type { ConsentRequest } from './core/consent';
 // Shared typed operational failures + the single safe recovery mapper. These imports are all core,
 // so the headless graph stays independent of Bolt/Slack packages.
 export {

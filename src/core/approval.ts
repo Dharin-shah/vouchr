@@ -357,9 +357,8 @@ function toRow(r: any): ApprovalRow {
  * Human-in-the-loop approval requests/grants for sensitive writes (#113). Lifecycle: the injector
  * `request()`s a pending row and throws ApprovalRequiredError; a human decision `approve()`s it into
  * a TTL-bound grant (or `deny()`s it); the retried fetch `consume()`s the grant — SINGLE-USE, via
- * the same atomic `DELETE ... RETURNING` pattern as the OAuth consent state, so two concurrent
- * retries can never both spend one approval. Expired rows (unanswered prompts and unspent grants)
- * are reclaimed by `sweepExpired()`.
+ * atomic `DELETE ... RETURNING`, so two concurrent retries can never both spend one approval.
+ * Expired rows (unanswered prompts and unspent grants) are reclaimed by `sweepExpired()`.
  */
 export class Approvals {
   constructor(private db: Db) {}

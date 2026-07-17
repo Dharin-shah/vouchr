@@ -120,7 +120,7 @@ test('current runtime refuses a v8 schema until the drained migration runs', asy
   );
 });
 
-test('v10 invalidates prerelease-v9 consent and preserves v10 lifecycle rows', async (t) => {
+test('current migration invalidates prerelease-v9 consent and preserves current lifecycle rows', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url, tableExists } = await emptySchema(t);
   const raw = rawDb(t, url);
@@ -128,7 +128,9 @@ test('v10 invalidates prerelease-v9 consent and preserves v10 lifecycle rows', a
   // marker. This catches migrations that work on a synthetic marker-only DB but not a real v9.
   await migrate({ databaseUrl: url });
   await raw.run(
-    `INSERT INTO consent_request VALUES
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES
        ('pre-v10-state',NULL,'T1','U1','acme','C1','verifier',1)`,
   );
   await raw.run(
@@ -143,7 +145,7 @@ test('v10 invalidates prerelease-v9 consent and preserves v10 lifecycle rows', a
 
   await assert.rejects(
     () => openDb({ databaseUrl: url }),
-    /schema version 9.*needs 10.*vouchr migrate/i,
+    new RegExp(`schema version 9.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
   );
   assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
   assert.equal(await tableExists('user_provisioning_request'), true);
@@ -193,8 +195,10 @@ test('v10 invalidates prerelease-v9 consent and preserves v10 lifecycle rows', a
     ['A'.repeat(43)],
   );
   await raw.run(
-    `INSERT INTO consent_request VALUES
-       ('v10-state',NULL,'T1','U1','acme','C1','verifier',1)`,
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES
+       ('current-state',NULL,'T1','U1','acme','C1','verifier',1)`,
   );
   await assert.rejects(
     raw.run(`INSERT INTO user_offboard_scope_tombstone VALUES ('enterprise','','U2',1)`),
@@ -226,9 +230,113 @@ test('v10 invalidates prerelease-v9 consent and preserves v10 lifecycle rows', a
     1,
   );
   assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request WHERE state='v10-state'`))?.n,
+    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request WHERE state='current-state'`))?.n,
     1,
-    'an idempotent v10 migration must preserve v10-minted consent',
+    'an idempotent current migration must preserve current-version consent',
+  );
+});
+
+test('v10 to v11 drains old consent authority and installs the single-generation lifecycle schema', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+
+  // Start from the complete current schema, then faithfully remove the v11-only consent lifecycle
+  // surface and restore the v10 marker. This exercises the production carry without maintaining a
+  // second hand-written copy of every unrelated v10 table.
+  await migrate({ databaseUrl: url });
+  await raw.exec(`DROP INDEX uq_consent_request_active`);
+  await raw.exec(`DROP INDEX idx_consent_request_created_at`);
+  await raw.exec(`ALTER TABLE consent_request
+    DROP COLUMN consumed_at,
+    DROP COLUMN superseded_at,
+    DROP COLUMN delivery_token,
+    DROP COLUMN delivery_lease_expires_at,
+    DROP COLUMN delivered_at`);
+  await raw.run(
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',1)`,
+    ['A'.repeat(43)],
+  );
+  await raw.run(`UPDATE meta SET value='10' WHERE key='schema_version'`);
+
+  await assert.rejects(
+    () => openDb({ databaseUrl: url }),
+    new RegExp(`schema version 10.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
+  );
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  assert.equal(
+    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))?.n,
+    0,
+    'v10 consent cannot prove the v11 single-generation and delivery lifecycle invariants',
+  );
+  assert.equal(
+    (await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value,
+    String(SCHEMA_VERSION),
+  );
+
+  const columns = await raw.all<{ column_name: string; is_nullable: string; column_default: string | null }>(
+    `SELECT column_name,is_nullable,column_default
+       FROM information_schema.columns
+      WHERE table_schema=current_schema()
+        AND table_name='consent_request'
+        AND column_name IN
+          ('consumed_at','superseded_at','delivery_token','delivery_lease_expires_at','delivered_at')
+      ORDER BY column_name`,
+  );
+  assert.deepEqual(columns.map((column) => column.column_name), [
+    'consumed_at',
+    'delivered_at',
+    'delivery_lease_expires_at',
+    'delivery_token',
+    'superseded_at',
+  ]);
+  const deliveryLease = columns.find((column) => column.column_name === 'delivery_lease_expires_at');
+  assert.equal(deliveryLease?.is_nullable, 'NO');
+  assert.match(deliveryLease?.column_default ?? '', /0/);
+  const activeIndex = await raw.get<{ indexdef: string }>(
+    `SELECT indexdef FROM pg_indexes
+      WHERE schemaname=current_schema() AND indexname='uq_consent_request_active'`,
+  );
+  assert.match(
+    activeIndex?.indexdef ?? '',
+    /UNIQUE.*\(team_id, user_id, provider\).*WHERE \(superseded_at IS NULL\)/i,
+  );
+  const retentionIndex = await raw.get<{ indexdef: string }>(
+    `SELECT indexdef FROM pg_indexes
+      WHERE schemaname=current_schema() AND indexname='idx_consent_request_created_at'`,
+  );
+  assert.match(retentionIndex?.indexdef ?? '', /\(created_at\)/i);
+
+  const currentState = 'B'.repeat(43);
+  const deliveryToken = 'C'.repeat(43);
+  await raw.run(
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at,
+        delivery_token,delivery_lease_expires_at,delivered_at)
+     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',2,$2,3,4)`,
+    [currentState, deliveryToken],
+  );
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  assert.deepEqual(
+    await raw.get<{
+      state: string;
+      delivery_token: string;
+      delivery_lease_expires_at: number;
+      delivered_at: number;
+    }>(
+      `SELECT state,delivery_token,delivery_lease_expires_at,delivered_at
+         FROM consent_request WHERE state=$1`,
+      [currentState],
+    ),
+    {
+      state: currentState,
+      delivery_token: deliveryToken,
+      delivery_lease_expires_at: 3,
+      delivered_at: 4,
+    },
+    'an idempotent v11 migration preserves v11-minted consent lifecycle state',
   );
 });
 
@@ -436,7 +544,9 @@ test('migrate() carries v8 to head: clears unbound interaction authority and is 
   );
   await raw.run(`INSERT INTO session_grant VALUES ('T1','C1','TH1','U1','acme',1,9999999999999)`);
   await raw.run(
-    `INSERT INTO consent_request VALUES ('future-state',NULL,'T1','U1','acme','C1','verifier',9999999999999)`,
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES ('future-state',NULL,'T1','U1','acme','C1','verifier',9999999999999)`,
   );
   await raw.run(`INSERT INTO offboard_tombstone VALUES ('T1','U1',9999999999999)`);
 
@@ -466,7 +576,9 @@ test('migrate() carries v8 to head: clears unbound interaction authority and is 
   });
   await runtime.close();
   await raw.run(
-    `INSERT INTO consent_request VALUES ('v9-state',NULL,'T1','U1','acme','C1','verifier',1)`,
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES ('current-state',NULL,'T1','U1','acme','C1','verifier',1)`,
   );
   await raw.run(`INSERT INTO offboard_tombstone VALUES ('T1','U1',1)`);
   assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
