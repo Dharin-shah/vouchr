@@ -14,6 +14,7 @@ import {
   STATE_RECOVERY_RETENTION_MS,
   STATE_TTL_MS,
 } from '../src/core/consent';
+import { userOwner } from '../src/core/owner';
 import { openDb, type Db } from '../src/core/db';
 import { ConsentRequiredError, UserFacingError } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
@@ -240,15 +241,27 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   const foreign = 'ghp_RAW_PROVIDER_ERROR_MUST_NOT_ESCAPE';
 
   const deniedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
-  const denied = await handleOAuthCallback(deps, undefined, deniedState.state, foreign);
+  const denied = await handleOAuthCallback(deps, undefined, deniedState.state, 'access_denied');
   assert.equal(!denied.ok && denied.outcome, 'denied');
-  assert.ok(!JSON.stringify(denied).includes(foreign));
   assert.equal(!denied.ok && 'context' in denied && denied.context.identity.userId, ID.userId);
   assert.equal(
-    (await handleOAuthCallback(deps, undefined, deniedState.state, foreign)).outcome,
+    (await handleOAuthCallback(deps, undefined, deniedState.state, 'access_denied')).outcome,
     'state_unavailable',
     'a Slack/provider retry cannot duplicate the attributed denial',
   );
+
+  // Only `access_denied` is a user decision. Any other redirect error value — including a hostile
+  // one — is a provider-side failure and must not be audited or messaged as a denial (nor echoed).
+  const providerFailedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const providerFailed = await handleOAuthCallback(deps, undefined, providerFailedState.state, foreign);
+  assert.equal(!providerFailed.ok && providerFailed.outcome, 'exchange_failed');
+  assert.equal(!providerFailed.ok && providerFailed.status, 502);
+  assert.equal(!providerFailed.ok && 'recovery' in providerFailed && providerFailed.recovery, 'retry_later');
+  assert.ok(!JSON.stringify(providerFailed).includes(foreign));
+  const providerFailedAudit = await db.get<{ meta: string }>(
+    `SELECT meta FROM audit WHERE action='denied' ORDER BY at DESC LIMIT 1`,
+  );
+  assert.deepEqual(JSON.parse(providerFailedAudit?.meta ?? '{}'), { reason: 'exchange_failed' });
 
   const incompleteState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
   const incomplete = await handleOAuthCallback(deps, undefined, incompleteState.state);
@@ -496,7 +509,6 @@ test('Bolt sends one private recovery DM for an attributable callback and none f
     apiCalls.push({ method, args });
     return { ok: true, channel: args.channel, ts: '1.0' };
   };
-  const foreign = 'ghp_RAW_CALLBACK_ERROR_MUST_NOT_REACH_SLACK';
   try {
     const vouchr = await createVouchr({
       providers: [provider],
@@ -519,7 +531,7 @@ test('Bolt sends one private recovery DM for an attributable callback and none f
     let callback: any;
     vouchr.mountRoutes({ get: (_path: string, handler: any) => { callback = handler; } });
     const response = fakeResponse();
-    await callback({ query: { state, error: foreign } }, response);
+    await callback({ query: { state, error: 'access_denied' } }, response);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(response.statusCode, 400);
     assert.equal(response.body, 'OAuth authorization was denied. Please try again.');
@@ -527,13 +539,53 @@ test('Bolt sends one private recovery DM for an attributable callback and none f
     assert.equal(apiCalls[0].method, 'chat.postMessage');
     assert.equal(apiCalls[0].args.channel, ID.userId);
     assert.match(JSON.stringify(apiCalls[0].args.blocks), /not authorized|re-run the request/i);
-    assert.ok(!JSON.stringify(apiCalls).includes(foreign));
 
     const replay = fakeResponse();
-    await callback({ query: { state, error: foreign } }, replay);
+    await callback({ query: { state, error: 'access_denied' } }, replay);
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(replay.statusCode, 400);
     assert.equal(apiCalls.length, 1, 'a replay must not duplicate the private recovery DM');
+  } finally {
+    prototype.apiCall = realApiCall;
+  }
+});
+
+test('a provider-side callback error is not messaged as a user denial and is never echoed', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  const db = await openTestDb(t);
+  const apiCalls: Array<{ method: string; args: any }> = [];
+  const prototype = WebClient.prototype as any;
+  const realApiCall = prototype.apiCall;
+  prototype.apiCall = async (method: string, args: any) => {
+    apiCalls.push({ method, args });
+    return { ok: true };
+  };
+  const foreign = 'server_error_RAW_PROVIDER_ERROR_MUST_NOT_ESCAPE';
+  try {
+    const vouchr = await createVouchr({
+      providers: [provider],
+      baseUrl: 'https://vouchr.test',
+      db,
+      botToken: 'xoxb-test',
+    });
+    const pending = await new Consent(db).begin(
+      ID,
+      provider,
+      'https://vouchr.test/vouchr/oauth/callback',
+      null,
+    );
+    let callback: any;
+    vouchr.mountRoutes({ get: (_path: string, handler: any) => { callback = handler; } });
+    const response = fakeResponse();
+    await callback({ query: { state: pending.state, error: foreign } }, response);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(response.statusCode, 502);
+    assert.match(String(response.body), /provider could not complete authorization/i);
+    assert.equal(apiCalls.length, 1);
+    const dm = JSON.stringify(apiCalls[0].args.blocks);
+    assert.match(dm, /temporarily unavailable/i);
+    assert.doesNotMatch(dm, /not authorized|allowed/i);
+    assert.ok(!JSON.stringify([response.body, apiCalls]).includes(foreign));
   } finally {
     prototype.apiCall = realApiCall;
   }
@@ -627,23 +679,25 @@ test('Bolt bounds and deduplicates a non-settling multi-workspace notification l
     fakeResponse(),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(lookups, 1, 'a timed-out caller must not start another still-running store lookup');
+  assert.equal(
+    lookups,
+    2,
+    'a timed-out lookup releases its slot: a never-settling store must not wedge notifications until restart',
+  );
 
-  settleLookups[0]!({});
-  await new Promise<void>((resolve) => setImmediate(resolve));
-  const afterSettlement = await consent.begin(
+  const shared = await consent.begin(
     ID,
     secondProvider,
     'https://vouchr.test/vouchr/oauth/callback',
     null,
   );
   await callback(
-    { query: { state: afterSettlement.state, error: 'access_denied' } },
+    { query: { state: shared.state, error: 'access_denied' } },
     fakeResponse(),
   );
   await new Promise<void>((resolve) => setImmediate(resolve));
-  assert.equal(lookups, 2, 'a settled raw lookup releases the workspace for a later lookup');
-  settleLookups[1]!({});
+  assert.equal(lookups, 2, 'the fresh pending lookup is still shared inside its own timeout window');
+  for (const settle of settleLookups) settle({});
 });
 
 test('Bolt caps hung notification lookups across distinct workspaces', async (t) => {
@@ -713,4 +767,99 @@ test('Bolt caps hung notification lookups across distinct workspaces', async (t)
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(lookups, MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS + 1, 'a settled slot admits later work');
   for (const settle of settleLookups.slice(1)) settle({});
+});
+
+test('re-authorization over a live credential replaces it; a delayed stale callback still loses', async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const audit = new Audit(db);
+  const vault = new Vault(db, KEY);
+  const registry = new ProviderRegistry([provider]);
+  const deps = { registry, vault, audit, consent, redirectUri: 'https://vouchr.test/callback' };
+  const owner = userOwner(ID);
+  let providerToken = 'token-1';
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: providerToken }), {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  })) as typeof fetch;
+  try {
+    const first = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+    assert.equal((await handleOAuthCallback(deps, 'code-1', first.state)).ok, true);
+
+    // A consent generation minted BEFORE the newest credential write can never overwrite it.
+    const stale = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+    providerToken = 'token-from-stale-callback';
+    await new Promise((resolve) => setTimeout(resolve, 2)); // strictly newer PostgreSQL-ms generation
+    const direct = {
+      accessToken: 'token-direct', refreshToken: null, scopes: 'read', expiresAt: null, externalAccount: null,
+    };
+    assert.equal(
+      await vault.upsertUser(owner, provider.id, direct, await vault.userProvisioningIssuedAt()),
+      'stored',
+    );
+    const staleResult = await handleOAuthCallback(deps, 'code-2', stale.state);
+    assert.equal(!staleResult.ok && staleResult.outcome, 'state_stale');
+    assert.equal((await vault.get(owner, provider.id))?.accessToken, 'token-direct');
+
+    // Re-auth while connected (provider-side-dead token, scope change) must not dead-end: a
+    // generation minted AFTER the live credential replaces it instead of looping on state_stale.
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    const reauth = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+    providerToken = 'token-2';
+    const result = await handleOAuthCallback(deps, 'code-3', reauth.state);
+    assert.equal(result.ok, true);
+    assert.equal((await vault.get(owner, provider.id))?.accessToken, 'token-2');
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('a delivered but possibly-vanished ephemeral prompt is not claimed as freshly posted', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db });
+  const posts: any[] = [];
+  const client = {
+    chat: {
+      postEphemeral: async (args: unknown) => { posts.push(args); },
+      postMessage: async (args: unknown) => { posts.push(args); },
+    },
+  };
+  const context = await contextFor(vouchr, client);
+  await assert.rejects(
+    () => context.connect('acme'),
+    (error: unknown) => error instanceof ConsentRequiredError && /was posted/.test(error.message),
+  );
+  assert.equal(posts.length, 1);
+  await assert.rejects(
+    () => context.connect('acme'),
+    (error: unknown) => error instanceof ConsentRequiredError
+      && /already posted/.test(error.message)
+      && /no longer visible/.test(error.message),
+    'an ephemeral vanishes on reload; the reuse fence must not claim a fresh post',
+  );
+  assert.equal(posts.length, 1, 'the live prompt is reused, not reposted');
+});
+
+test('a Bolt client carrying a token posts leased prompts through a bounded twin', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db });
+  const posted: Array<{ retries: unknown; rejectRateLimited: unknown }> = [];
+  const prototype = WebClient.prototype as any;
+  const realApiCall = prototype.apiCall;
+  prototype.apiCall = async function (this: any) {
+    posted.push({ retries: this.retryConfig?.retries, rejectRateLimited: this.rejectRateLimitedCalls });
+    return { ok: true };
+  };
+  try {
+    const context = await contextFor(vouchr, { token: 'xoxb-context', chat: {} });
+    await assert.rejects(() => context.connect('acme'), ConsentRequiredError);
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].retries, 0, 'a leased prompt post must not queue SDK retries past its lease');
+    assert.equal(posted[0].rejectRateLimited, true, 'a 429 must fail the leased post, not park it in the SDK queue');
+  } finally {
+    prototype.apiCall = realApiCall;
+  }
 });

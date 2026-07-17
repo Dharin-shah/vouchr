@@ -13,7 +13,7 @@ All notable changes to this project are documented here. This project adheres to
   posting duplicates; a known Slack rejection releases only its lease and never deletes a URL that
   another adapter may already have presented. Callback state is spent once but retained until sweep
   long enough to distinguish authentic expiry and supersession from unknown/replayed input. The
-  final state claim, offboard/revoke fences, live-credential absence check, encrypted credential
+  final state claim, offboard/revoke fences, newest-generation check, encrypted credential
   write, and connect audit share the credential transaction, so an older callback cannot overwrite
   a newer prompt or connection. Denial, incomplete authorization, expiry, supersession, setup
   changes, and token/provider failures return a closed fixed-copy outcome; provider-controlled error
@@ -616,6 +616,29 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Re-authorization over a live credential no longer dead-ends** (#194). The credential-write
+  fence compares the consent generation against the stored credential's `generation_at` instead of
+  refusing on bare existence: a generation minted after the live credential replaces it (broker
+  re-auth, scope change, provider-side-dead token), while a delayed older callback still loses and
+  a same-millisecond tie still fails closed. Previously every OAuth callback over a live,
+  non-expired credential returned a false `state_stale` ("use the newest prompt") forever and
+  silently discarded the freshly granted provider token. Renames the unreleased
+  `UserProvisioningGate.requireAbsent` to `requireNewest`.
+- **Provider-side OAuth redirect errors are no longer classified as user denials** (#194). Only
+  `error=access_denied` audits and messages as a denial; any other redirect error value
+  (`server_error`, `temporarily_unavailable`, or unrecognized) returns the fixed retry-later
+  provider-failure outcome (`exchange_failed`, 502) instead of falsely telling the user they
+  refused authorization. The error value itself is still never persisted or reflected.
+- **Leased Slack prompt posts are bounded to their delivery lease** (#194). Connect, approval, and
+  session prompt posts go through a no-retry, short-timeout client when the Bolt client carries a
+  token, so a rate-limited or hanging post can no longer outlive its 30-second lease and
+  double-deliver after another replica takes over. When a still-live delivered prompt is reused,
+  the thrown `ConsentRequiredError` now says the ephemeral may no longer be visible instead of
+  claiming a fresh post; `ConsentRequiredError` accepts an optional message (additive).
+- **Notification client slots self-heal** (#194). A never-settling `installationStore` lookup is
+  evicted when its resolution times out (with a `[vouchr]` log line) instead of permanently
+  occupying one of the capped slots — previously 32 wedged workspaces silently disabled all
+  success/recovery/health DMs until restart.
 - **External-reference configuration now enforces its reference-only boundary** (#53). The Bolt
   key-reference flow and both headless routes (`/v1/admin/reference`, `/v1/user/reference`) share one
   core validator: only bounded supported AWS Secrets Manager, GCP Secret Manager, Azure Key Vault,

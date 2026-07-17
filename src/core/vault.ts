@@ -34,9 +34,11 @@ export interface StoredToken {
  * consumes a persisted opaque request inside the credential transaction. */
 export interface UserProvisioningGate {
   issuedAt: number;
-  /** Slack key-setup prompts are issued only for an absent live credential. Reassert that predicate
-   * under the final credential lock so a delayed modal cannot overwrite a sibling write. */
-  requireAbsent: true;
+  /** Write only when no live credential with `generation_at >= issuedAt` exists (a tie fails
+   * closed). A delayed prompt/callback can never overwrite a credential written after it was
+   * issued, while an intent minted after the live credential — deliberate re-auth over a
+   * provider-dead or scope-upgraded token — replaces it. */
+  requireNewest: true;
 }
 export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | UserProvisioningGate | null>);
 export type UserProvisioningResult = 'stored' | 'stale' | 'offboarded' | 'revoked' | 'conflict';
@@ -622,16 +624,21 @@ export class Vault {
         );
         if (tombstoneBlocks(offboardedAt, issuedAt)) return 'offboarded';
         if (tombstoneBlocks(revokedAt, issuedAt)) return 'revoked';
-        if (typeof resolved !== 'number' && resolved.requireAbsent) {
+        if (typeof resolved !== 'number' && resolved.requireNewest) {
           const existing = await fencedTx.get<{
             created_at: number;
             last_used_at: number | null;
+            generation_at: number;
           }>(
-            `SELECT created_at, last_used_at FROM connection
+            `SELECT created_at, last_used_at, generation_at FROM connection
              WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
             [owner.teamId, owner.id, provider],
           );
-          if (existing && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)) {
+          if (
+            existing
+            && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)
+            && existing.generation_at >= issuedAt
+          ) {
             return 'stale';
           }
         }

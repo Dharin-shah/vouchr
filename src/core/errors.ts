@@ -79,12 +79,14 @@ export { UpstreamTimeoutError } from './httpBounds';
 
 const USER_FACING_ERRORS = new WeakSet<object>();
 
-/** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
+/** Thrown by `connect()` after a Connect prompt is posted: stop this turn. Hosts branch on the
+ * class/`code`, never the message; `message` only lets a caller state precisely what was (or was
+ * previously) posted, e.g. when a still-live prompt is reused instead of re-posted. */
 export class ConsentRequiredError extends Error {
   readonly code = 'consent_required' as const;
 
-  constructor(public provider: string) {
-    super(`Consent required for "${provider}". A Connect prompt was posted to the user.`);
+  constructor(public provider: string, message?: string) {
+    super(message ?? `Consent required for "${provider}". A Connect prompt was posted to the user.`);
     this.name = 'ConsentRequiredError';
   }
 }

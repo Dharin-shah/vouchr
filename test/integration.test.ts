@@ -209,10 +209,12 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
     const res = fakeRes();
     await callback({ query: { state, error: evil } }, res);
 
-    assert.equal(res.statusCode, 400);
+    // A non-access_denied error value is a provider-side failure (502), not a user denial — and
+    // regardless of classification it must be served inert and never reflected.
+    assert.equal(res.statusCode, 502);
     assert.match(String(res.headers['content-type']), /text\/plain/); // never text/html
     assert.equal(res.headers['x-content-type-options'], 'nosniff'); // and no content sniffing back to html
-    assert.equal(res.body, 'OAuth authorization was denied. Please try again.');
+    assert.equal(res.body, 'The provider could not complete authorization. Wait a moment, then ask the agent for a new connection prompt.');
     assert.ok(!res.body.includes(evil), 'provider-controlled error text must never reach output');
   } finally {
     await mock.close();

@@ -183,7 +183,7 @@ function slackNotificationClient(token: string): WebClient {
   return new WebClient(token, SLACK_NOTIFICATION_CLIENT_OPTIONS);
 }
 
-function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
+function boundedNotificationResolution<T>(work: Promise<T>, onTimeout?: () => void): Promise<T | null> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value: T | null): void => {
@@ -192,7 +192,10 @@ function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
       clearTimeout(timer);
       resolve(value);
     };
-    const timer = setTimeout(() => finish(null), SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      onTimeout?.();
+      finish(null);
+    }, SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS);
     timer.unref();
     void work.then((value) => finish(value), () => finish(null));
   });
@@ -799,25 +802,39 @@ export class ConnectContext {
     };
   }
 
+  /** Client for lease-guarded prompt posts. A leased post must terminate well inside its
+   * PROMPT_DELIVERY_LEASE_MS: the default WebClient has no request timeout and silently queues
+   * rate-limited retries for up to ~30 minutes, so a slow post outlives its lease and a takeover
+   * replica double-delivers the prompt (the caller then also mis-reports its own landed post).
+   * Real Bolt clients carry their resolved token — post through a bounded twin (no retries, short
+   * timeout, 429 rejected). A test double without a token string is already immediate; use as-is. */
+  private promptClient(): WebClient {
+    const token = (this.client as { token?: unknown }).token;
+    return typeof token === 'string' && token.length > 0
+      ? slackNotificationClient(token)
+      : this.client;
+  }
+
   /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
   private async postApprovalPrompt(
     e: ApprovalRequiredError,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
   ): Promise<void> {
+    const client = this.promptClient();
     const { blocks, fallback } = prompt;
     const threadArg = this.thread ? { thread_ts: this.thread } : {};
     if (e.approver === 'self') {
       if (this.channel) {
-        await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
+        await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
       } else {
-        await this.client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
+        await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
       }
       return;
     }
     // 'admin': the channel is the approval surface. Off-channel (a DM) there are no channel admins
     // to prompt — tell the requester why nothing can proceed instead of failing silently (STR-5).
     if (!this.channel) {
-      await this.client.chat.postMessage({
+      await client.chat.postMessage({
         channel: this.identity.userId,
         text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval — run it in a channel so an admin can approve it.`,
       }).catch(() => undefined);
@@ -830,7 +847,7 @@ export class ConnectContext {
     let definiteFailure: Exclude<SlackPromptDeliveryFailure, 'ambiguous'> | undefined;
     for (const admin of approvers) {
       try {
-        await this.client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, ...fallback });
+        await client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, ...fallback });
         delivered = true;
       } catch (error) {
         // Try every eligible admin before declaring failure. If any send has an ambiguous transport
@@ -847,7 +864,7 @@ export class ConnectContext {
     if (!approvers.length) {
       // No eligible admin visible from here (fail-closed member/admin reads): the requester should
       // know the request is parked, not silently dropped.
-      await this.client.chat.postEphemeral({
+      await client.chat.postEphemeral({
         channel: this.channel, user: this.identity.userId, ...threadArg,
         text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval, but no eligible admin was found in this channel.`,
       }).catch(() => undefined);
@@ -1085,7 +1102,15 @@ export class ConnectContext {
     const prompt = this.connectPrompt(providerId, pendingConsent.authorizeUrl);
     const delivery = await this.consent.claimDelivery(pendingConsent.state);
     if (delivery.status !== 'claimed') {
-      if (delivery.status === 'delivered') throw new ConsentRequiredError(providerId);
+      // 'delivered' reuses the live prompt instead of re-posting — but an in-channel prompt is an
+      // ephemeral, which vanishes on reload/device switch. Say so instead of claiming a fresh post.
+      if (delivery.status === 'delivered') {
+        throw new ConsentRequiredError(
+          providerId,
+          `Consent required for "${providerId}". A Connect prompt was already posted; if it is no `
+          + 'longer visible, ask again after the current request expires (up to 10 minutes).',
+        );
+      }
       if (delivery.status === 'in-flight') {
         throw new UserFacingError(
           'A private connection prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
@@ -1362,7 +1387,7 @@ export class ConnectContext {
    *  Caller guarantees we're in a channel + thread. */
   private async postSessionApprovalPrompt(providerId: string, requestId: string, thread: string): Promise<void> {
     const blocks = sessionApprovalBlocks(providerId, requestId);
-    await this.client.chat.postEphemeral({
+    await this.promptClient().chat.postEphemeral({
       channel: this.channel!,
       user: this.identity.userId,
       thread_ts: thread,
@@ -1413,16 +1438,17 @@ export class ConnectContext {
     blocks: unknown[];
     fallback: { text: string } | Record<string, never>;
   }): Promise<void> {
+    const client = this.promptClient();
     const { blocks, fallback } = prompt;
     if (this.channel) {
-      await this.client.chat.postEphemeral({
+      await client.chat.postEphemeral({
         channel: this.channel,
         user: this.identity.userId,
         blocks: blocks as any,
         ...fallback,
       });
     } else {
-      await this.client.chat.postMessage({
+      await client.chat.postMessage({
         channel: this.identity.userId,
         blocks: blocks as any,
         ...fallback,
@@ -1848,16 +1874,28 @@ export async function createVouchr(opts: VouchrOptions) {
         });
         return inst.bot?.token ? slackNotificationClient(inst.bot.token) : null;
       }).catch(() => null);
-      entry = { raw, bounded: boundedNotificationResolution(raw) };
-      notificationClientLookups.set(key, entry);
-      const exactEntry = entry;
-      void raw.then(() => {
+      let exactEntry: NotificationClientLookup;
+      const evict = (): void => {
         if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key);
-      });
+      };
+      // Evict on the resolution timeout too, not only on settlement: a store promise that NEVER
+      // settles must not occupy its cap slot forever — 32 wedged workspaces would otherwise
+      // silently disable every success/recovery/health DM until restart. Post-timeout callbacks
+      // for the same workspace may start a fresh (human-rate, equally bounded) lookup.
+      exactEntry = {
+        raw,
+        bounded: boundedNotificationResolution(raw, () => {
+          evict();
+          console.error('[vouchr] slack installation lookup timed out; notification slot released');
+        }),
+      };
+      entry = exactEntry;
+      notificationClientLookups.set(key, entry);
+      void raw.then(evict, evict);
     }
     // A custom installation store has no cancellation contract. Bound each caller, but keep the raw
-    // lookup and its single timeout wrapper deduplicated until it actually settles. This prevents
-    // repeated callbacks from piling up either store work or promise reactions on one hung lookup.
+    // lookup and its single timeout wrapper deduplicated while it is pending inside the timeout
+    // window. This prevents repeated callbacks from piling up promise reactions on one hung lookup.
     return entry.bounded;
   }
 

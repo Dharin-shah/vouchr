@@ -490,10 +490,6 @@ function consentRow(row: any): ConsentRow {
   };
 }
 
-function sameNullable(a: string | null, b: string | null): boolean {
-  return a === b;
-}
-
 /** Manages the single-use OAuth `state` + PKCE for a consent round-trip. */
 export class Consent {
   /** `dryRun` (#116): begin() then returns a LOCAL authorize URL — the redirect target itself with
@@ -580,8 +576,8 @@ export class Consent {
       [i.teamId, i.userId, provider.id],
     );
     if (existing) {
-      const sameContext = sameNullable(existing.enterprise_id, i.enterpriseId)
-        && sameNullable(existing.channel, channel);
+      const sameContext = existing.enterprise_id === i.enterpriseId
+        && existing.channel === channel;
       const live = existing.consumed_at == null
         && existing.observed_at - existing.created_at <= STATE_TTL_MS;
       const lifecycleCurrent = !tombstoneBlocks(offboardedAt, existing.created_at)
@@ -738,11 +734,15 @@ export class Consent {
     );
     if (!raw) return { status: 'unavailable' };
     const row = consentRow(raw);
+    // Supersession/expiry classify BEFORE the tombstones, deliberately: a tombstone only blocks
+    // generations minted at-or-before it, so re-onboarding after an offboard is a supported flow —
+    // a stale link superseded by that newer generation must say "use the newest prompt", not
+    // falsely claim the account is inactive. The tombstone gate below still refuses every
+    // pre-tombstone authority, and finalizeProvisioning() re-checks inside the credential
+    // transaction so an offboard/revoke that wins during token exchange still blocks.
     if (raw.superseded_at != null) return { status: 'superseded', row };
     if (raw.observed_at - raw.created_at > STATE_TTL_MS) return { status: 'expired', row };
 
-    // This is the FIRST lifecycle gate. finalizeProvisioning() runs again inside the credential
-    // transaction so an offboard/revoke/newer prompt that wins during token exchange still blocks.
     const identity = row.identity;
     const owner: Owner = {
       teamId: identity.teamId,
@@ -764,12 +764,14 @@ export class Consent {
   }
 
   /** Resolve the callback's issuance inside Vault's credential transaction. Deleting only the exact
-   * still-active generation makes token exchange lose safely to a newer prompt. `requireAbsent`
-   * independently prevents a delayed callback from overwriting a credential another path created. */
+   * still-active generation makes token exchange lose safely to a newer prompt. `requireNewest`
+   * independently prevents a delayed callback from overwriting a credential written after this
+   * generation was minted — while still letting a generation minted over an older live credential
+   * replace it, so deliberate re-auth (provider-side-dead token, scope change) cannot dead-end. */
   async finalizeProvisioning(
     row: ConsentRow,
     db: Db,
-  ): Promise<{ issuedAt: number; requireAbsent: true } | null> {
+  ): Promise<{ issuedAt: number; requireNewest: true } | null> {
     const current = await db.get<{ created_at: number }>(
       `DELETE FROM consent_request
        WHERE state=? AND team_id=? AND user_id=? AND provider=?
@@ -777,7 +779,7 @@ export class Consent {
        RETURNING created_at`,
       [row.state, row.identity.teamId, row.identity.userId, row.provider],
     );
-    if (current) return { issuedAt: current.created_at, requireAbsent: true };
+    if (current) return { issuedAt: current.created_at, requireNewest: true };
 
     // Offboard/revoke cleanup may have deleted the row while token exchange was in flight. Preserve
     // that more precise lifecycle result by letting Vault evaluate the original issuance against the
@@ -792,7 +794,7 @@ export class Consent {
     const offboardedAt = await latestUserOffboardTombstone(db, row.identity);
     const revokedAt = await latestProvisioningRevocationTombstone(db, owner, row.provider);
     return tombstoneBlocks(offboardedAt, row.createdAt) || tombstoneBlocks(revokedAt, row.createdAt)
-      ? { issuedAt: row.createdAt, requireAbsent: true }
+      ? { issuedAt: row.createdAt, requireNewest: true }
       : null;
   }
 

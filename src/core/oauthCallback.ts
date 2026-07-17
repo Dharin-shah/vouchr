@@ -49,18 +49,15 @@ function emitConsent(
   safeEmit(deps.auditSink, e);
 }
 
-export const OAUTH_CALLBACK_OUTCOMES = Object.freeze([
-  'connected',
-  'denied',
-  'incomplete',
-  'state_unavailable',
-  'state_expired',
-  'state_stale',
-  'exchange_failed',
-  'setup_changed',
-] as const);
-
-export type OAuthCallbackOutcome = (typeof OAUTH_CALLBACK_OUTCOMES)[number];
+export type OAuthCallbackOutcome =
+  | 'connected'
+  | 'denied'
+  | 'incomplete'
+  | 'state_unavailable'
+  | 'state_expired'
+  | 'state_stale'
+  | 'exchange_failed'
+  | 'setup_changed';
 export type AttributedOAuthCallbackOutcome = Exclude<
   OAuthCallbackOutcome,
   'connected' | 'state_unavailable'
@@ -196,9 +193,13 @@ export async function handleOAuthCallback(
   }
 
   const provider = deps.registry.get(row.provider);
-  // Provider-side denial is definitive and happens before token exchange. Keep it outside the
-  // exchange catch so audit trouble cannot rewrite a real denial as `exchange_failed`.
-  if (error !== undefined) {
+  // A user denial is exactly `error=access_denied` (RFC 6749 §4.1.2.1). Every other redirect error
+  // (`server_error`, `temporarily_unavailable`, `invalid_scope`, or anything unrecognized) is a
+  // provider-side failure the user never decided — classifying it as a denial would DM a false
+  // "you haven't allowed this" claim. Both branches treat the provider-controlled query value as a
+  // branch signal only: never reflected into the browser, Slack, logs, or audit output (SEC-4).
+  // Denial stays outside the exchange catch so audit trouble cannot rewrite it as `exchange_failed`.
+  if (error === 'access_denied') {
     const recorded = await recordDenied(deps, row.identity, provider.id, 'consent_denied');
     emitConsent(
       deps,
@@ -208,8 +209,6 @@ export async function handleOAuthCallback(
       'consent_denied',
       recorded ? 400 : 500,
     );
-    // The provider-controlled query value is only a branch signal. Never reflect it into the
-    // browser, Slack, logs, or audit output.
     return attributedFailure(
       'denied',
       recorded ? 400 : 500,
@@ -217,6 +216,19 @@ export async function handleOAuthCallback(
         ? 'OAuth authorization was denied. Please try again.'
         : 'OAuth authorization was denied, but Vouchr could not record the outcome. Contact an administrator.',
       recorded ? 'connect' : 'contact_admin',
+      context,
+    );
+  }
+  if (error !== undefined) {
+    try {
+      await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
+    } catch { /* audit store unavailable; return the fixed failure below */ }
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 502);
+    return attributedFailure(
+      'exchange_failed',
+      502,
+      'The provider could not complete authorization. Wait a moment, then ask the agent for a new connection prompt.',
+      'retry_later',
       context,
     );
   }

@@ -634,7 +634,7 @@ test('OAuth callback normalizes a custom accountProbe before persistence and aud
         }),
         finalizeProvisioning: async (row: { createdAt: number }) => ({
           issuedAt: row.createdAt,
-          requireAbsent: true,
+          requireNewest: true,
         }),
       } as any,
       vault: {
@@ -695,7 +695,7 @@ test('OAuth callback drops an account label containing credential material (SEC-
         }),
         finalizeProvisioning: async (row: { createdAt: number }) => ({
           issuedAt: row.createdAt,
-          requireAbsent: true,
+          requireNewest: true,
         }),
       } as any,
       vault: {
