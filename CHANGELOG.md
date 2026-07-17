@@ -616,6 +616,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **The reference Kubernetes deployment can start, and is Restricted-policy clean** (#216). The
+  broker image now runs as a numeric non-root user (`USER 1000:1000`), so the kubelet verifies
+  `runAsNonRoot` from the image config — previously `USER node` (a name) with `runAsNonRoot: true`
+  failed every pod with `CreateContainerConfigError` before start. The manifest no longer pins a UID
+  (a Restricted platform assigns an arbitrary one from its namespace range), and the schema-owner
+  migrate Job now carries the same container-level Restricted controls as the runtime
+  (`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, read-only root filesystem, bounded
+  resources). The docker smoke additionally boots the image under an arbitrary UID with a read-only
+  root filesystem, and a static test validates both pod templates.
 - **External-reference configuration now enforces its reference-only boundary** (#53). The Bolt
   key-reference flow and both headless routes (`/v1/admin/reference`, `/v1/user/reference`) share one
   core validator: only bounded supported AWS Secrets Manager, GCP Secret Manager, Azure Key Vault,

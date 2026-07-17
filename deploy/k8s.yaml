@@ -27,10 +27,11 @@ spec:
       labels: { app: vouchr-broker }
     spec:
       restartPolicy: Never
+      # The image runs as a numeric non-root user (Dockerfile `USER 1000:1000`), so the kubelet
+      # verifies non-root without a pinned UID. A Restricted platform that assigns a namespace UID
+      # range overrides runAsUser here with its own; do not hardcode one (#216 arbitrary-numeric-user).
       securityContext:
         runAsNonRoot: true
-        runAsUser: 1000 # the `node` user in the official Node.js images
-        runAsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: migrate
@@ -40,6 +41,16 @@ spec:
           # a DIFFERENT Secret from the runtime's DML-only credential below.
           envFrom:
             - secretRef: { name: vouchr-migrate }
+          # Container-level Restricted Pod Security controls — required alongside the pod-level
+          # settings for the `restricted` policy to admit this Job (kubernetes.io Pod Security
+          # Standards). Matches the runtime container below.
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { memory: "128Mi" }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -57,12 +68,11 @@ spec:
       # For KMS via IRSA / workload identity, bind a ServiceAccount here; the AWS SDK default
       # credential chain then works with zero code. Create the SA out-of-band with your IAM role.
       # serviceAccountName: vouchr-broker
+      # The image runs as a numeric non-root user (Dockerfile `USER 1000:1000`), so the kubelet can
+      # verify runAsNonRoot from the image config alone — no manifest UID is pinned, letting a
+      # Restricted platform assign an arbitrary UID from its namespace range (#216).
       securityContext:
         runAsNonRoot: true
-        # The image's `USER node` is non-numeric, so the kubelet cannot prove non-root at admission:
-        # without an explicit UID every pod fails with CreateContainerConfigError before starting.
-        runAsUser: 1000 # the `node` user in the official Node.js images
-        runAsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: broker
