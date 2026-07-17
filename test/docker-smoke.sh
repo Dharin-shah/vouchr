@@ -49,6 +49,7 @@ DB_URL="postgres://vouchr:vouchr@${PG_NAME}:5432/vouchr"
 # The runtime no longer creates tables (it connects with a DML-only role and fails closed on an
 # unmigrated DB), so migrate the schema first using the SAME image. `vouchr migrate` is idempotent
 # and advisory-locked. Fail the smoke if it errors — a broken migrate path must not reach a deploy.
+echo "==> image runtime identity (must be numeric non-root): $(docker run --rm "$IMAGE" id 2>&1)"
 echo "==> migrate the schema (vouchr migrate) against Postgres"
 docker run --rm --network "$NET" \
   -e VOUCHR_DATABASE_URL="$DB_URL" \
