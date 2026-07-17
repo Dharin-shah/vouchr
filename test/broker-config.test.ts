@@ -5,7 +5,8 @@ import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ChannelConfig } from '../src/core/channelConfig';
+import { Consent } from '../src/core/consent';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { channelOwner } from '../src/core/owner';
 import { defineProvider, type Provider } from '../src/core/providers';
@@ -241,9 +242,32 @@ test('GET /v1/admin/config keeps real-route reads fixed as providers grow and sk
     }
   };
 
-  assert.deepEqual(await read(2), { get: 0, all: 2 });
-  assert.deepEqual(await read(51), { get: 0, all: 2 });
-  assert.deepEqual(await read(0), { get: 0, all: 0 });
+  assert.deepEqual(await read(2), { get: 2, all: 2 });
+  assert.deepEqual(await read(51), { get: 2, all: 2 });
+  assert.deepEqual(await read(0), { get: 2, all: 0 });
+});
+
+test('GET /v1/admin/config rejects an assertion issued before the acting admin was offboarded', async (t) => {
+  const base = await openTestDb(t);
+  const counted = countingDb(base);
+  const { server, port } = await makeConfigBroker(t, { db: counted.db });
+  const actor = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
+  const stale = admin();
+  await new Consent(base).markOffboarded(actor);
+  counted.reset();
+  try {
+    const response = await getConfig(port, stale);
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.json, {
+      error: 'authorization changed; resolve and retry',
+      code: 'interaction_state_changed',
+      retryable: false,
+      recovery: 'resolve_again',
+    });
+    assert.equal(counted.counts.all, 0, 'stale authority is refused before channel config snapshots');
+  } finally {
+    server.close();
+  }
 });
 
 // (b) an admin token can toggle a provider in the channel's tool allowlist.
@@ -325,6 +349,36 @@ test('config routes fail closed: a non-admin token gets 403 on mode/tools/config
 
     // A refused write changed nothing.
     assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('admin mode and tools reject assertions issued before the acting admin was offboarded', async (t) => {
+  const { server, port, db, channelConfig, channelTools } = await makeConfigBroker(t);
+  const actor = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
+  const staleMode = admin();
+  const staleTools = admin();
+  await new Consent(db).markOffboarded(actor);
+  try {
+    const mode = await post(port, '/v1/admin/mode', {
+      provider: 'acme', mode: 'session', identityToken: staleMode,
+    });
+    const tools = await post(port, '/v1/admin/tools', {
+      provider: 'acme', enabled: false, identityToken: staleTools,
+    });
+    for (const response of [mode, tools]) {
+      assert.equal(response.status, 409);
+      assert.equal(response.json.code, 'interaction_state_changed');
+      assert.equal(response.json.recovery, 'resolve_again');
+      assert.equal(response.json.retryable, false);
+    }
+    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+    assert.equal(await channelTools.isEnabled('T1', 'C1', 'acme'), true);
+    assert.equal(
+      (await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='config'`))?.n,
+      0,
+    );
   } finally {
     server.close();
   }
@@ -501,7 +555,7 @@ test('admin config routes reject an invalid/expired identity token (401)', async
 test('manifest: POST returns channel policy without a provider-output visibility field', async (t) => {
   const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
-    await channelConfig.setMode('T1', 'C1', 'acme', 'session');
+    await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
     const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.tools.find((t: any) => t.provider === 'acme'), {
@@ -521,7 +575,7 @@ test('manifest: POST requires a valid signed identity and reads only the claims 
     const bad = await post(port, '/v1/manifest', { identityToken: 'garbage' });
     assert.equal(bad.status, 401);
     // A mode on ANOTHER channel must not leak into this channel's manifest.
-    await channelConfig.setMode('T1', 'C_OTHER', 'acme', 'shared');
+    await writeChannelMode(channelConfig, 'T1', 'C_OTHER', 'acme', 'shared');
     const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) }); // channel C1
     assert.equal(r.json.tools.find((t: any) => t.provider === 'acme').mode, null);
   } finally {

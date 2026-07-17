@@ -36,6 +36,9 @@ export interface IdentityClaims {
    * request body can never assert it.
    */
   isAdmin?: boolean;
+  /** Enterprise/global lifecycle mutations bind their subject into the signed assertion. An admin
+   * body may repeat this value for routing, but cannot nominate a foreign user after minting. */
+  offboardTargetUserId?: string;
   /**
    * Enterprise/org id (#54). When present on an admin offboard, the removal spans EVERY workspace the
    * target touches (Enterprise Grid / SCIM deprovision) via offboardUserEverywhere. Signed.
@@ -393,7 +396,15 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
  *  single-workspace, user-owned request when omitted. */
 export type MintIdentityInput = Pick<
   IdentityClaims,
-  'teamId' | 'userId' | 'channel' | 'threadTs' | 'isAdmin' | 'enterpriseId' | 'ownerKind' | 'channelEligible'
+  | 'teamId'
+  | 'userId'
+  | 'channel'
+  | 'threadTs'
+  | 'isAdmin'
+  | 'offboardTargetUserId'
+  | 'enterpriseId'
+  | 'ownerKind'
+  | 'channelEligible'
 >;
 
 /**
@@ -422,6 +433,9 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
     channel: input.channel,
     ...(input.threadTs !== undefined ? { threadTs: input.threadTs } : {}),
     ...(input.isAdmin !== undefined ? { isAdmin: input.isAdmin } : {}),
+    ...(input.offboardTargetUserId !== undefined
+      ? { offboardTargetUserId: input.offboardTargetUserId }
+      : {}),
     ...(input.enterpriseId !== undefined ? { enterpriseId: input.enterpriseId } : {}),
     ...(input.ownerKind !== undefined ? { ownerKind: input.ownerKind } : {}),
     ...(input.channelEligible !== undefined ? { channelEligible: input.channelEligible } : {}),
@@ -481,6 +495,7 @@ function isClaims(v: unknown): v is IdentityClaims {
     // Admin/lifecycle claims (#54): reject a wrong-typed value rather than coercing — a malformed
     // signed isAdmin fails closed (it can't slip through as true).
     (c.isAdmin === undefined || typeof c.isAdmin === 'boolean') &&
+    (c.offboardTargetUserId === undefined || typeof c.offboardTargetUserId === 'string') &&
     (c.enterpriseId === undefined || typeof c.enterpriseId === 'string') &&
     // Channel-fact claims (#51): reject a wrong-typed value rather than coercing it — a malformed
     // signed claim fails closed (an unknown ownerKind can't slip through as 'channel').

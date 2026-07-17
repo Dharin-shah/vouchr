@@ -192,11 +192,12 @@ test('connectBlocks: a direct caller cannot construct an oversized Slack section
 
 test('credential and session renderers escape mrkdwn but preserve literal interaction data', () => {
   const provider = '<!channel> & <https://evil.example|click>';
+  const requestId = '123e4567-e89b-42d3-a456-426614174000';
   const escaped = '&lt;!channel&gt; &amp; &lt;https://evil.example|click&gt;';
   const configure = configureModal(provider, 'C1') as any;
   const userKey = userKeyModal(provider) as any;
-  const keySetup = keySetupBlocks(provider) as any[];
-  const session = sessionApprovalBlocks(provider, 'TH1') as any[];
+  const keySetup = keySetupBlocks(provider, requestId) as any[];
+  const session = sessionApprovalBlocks(provider, requestId) as any[];
 
   for (const [name, rendered] of [
     ['configureModal', configure],
@@ -215,10 +216,12 @@ test('credential and session renderers escape mrkdwn but preserve literal intera
   assert.equal(JSON.parse(userKey.private_metadata).provider, provider);
   const keyButton = keySetup.find((block) => block.type === 'actions').elements[0];
   assert.equal(keyButton.text.text, `Set up ${provider}`);
-  assert.equal(keyButton.value, provider);
+  assert.equal(keyButton.value, requestId);
+  assert.ok(!keyButton.value.includes(provider));
   const sessionButton = session.find((block) => block.type === 'actions').elements[0];
   assert.equal(sessionButton.text.text, `Allow ${provider} here`);
-  assert.deepEqual(JSON.parse(sessionButton.value), { provider, thread: 'TH1' });
+  assert.equal(sessionButton.value, requestId);
+  assert.ok(!sessionButton.value.includes(provider));
 });
 
 test('credential modals advertise only reference sources available in their process', () => {
@@ -240,6 +243,14 @@ test('credential modals advertise only reference sources available in their proc
   assert.match(multiRef.hint.text, /Azure Key Vault/);
   assert.match(multiRef.hint.text, /HashiCorp Vault/);
   assert.equal(multiRef.element.placeholder.text, 'Paste a supported reference');
+});
+
+test('request-backed channel credential modal carries only its opaque request id', () => {
+  const requestId = '123e4567-e89b-42d3-a456-426614174000';
+  const modal = configureModal('acme', 'C1', [], requestId) as any;
+  assert.deepEqual(JSON.parse(modal.private_metadata), { requestId });
+  assert.ok(!modal.private_metadata.includes('acme'));
+  assert.ok(!modal.private_metadata.includes('C1'));
 });
 
 test('auditBlocks escapes a caller-supplied heading when the empty state renders it as mrkdwn', () => {
@@ -405,6 +416,22 @@ test('configModal bounds connection buttons and points every omitted row to page
   assert.ok(modal.blocks.length <= 100);
 });
 
+test('config and Home connection rows carry the supplied opaque credential generation', () => {
+  const credentialId = '123e4567-e89b-42d3-a456-426614174000';
+  const connection = { provider: 'github', channel: null, credentialId };
+  const modal = configModal({ channel: 'C1', connections: [connection], tools: [] }) as any;
+  const home = homeView({ connections: [connection], providers: ['github'] }) as any;
+
+  for (const view of [modal, home]) {
+    const button = view.blocks.find(
+      (block: any) => block.accessory?.action_id === DISCONNECT_ACTION,
+    ).accessory;
+    assert.equal(button.value, credentialId);
+    assert.ok(!button.value.includes('github'));
+    assert.match(button.confirm.text.text, /github/);
+  }
+});
+
 test('disconnectConfirmBlocks: destructive button carries provider in value', () => {
   const b = disconnectConfirmBlocks('github') as any[];
   const actions = b.find((x) => x.type === 'actions');
@@ -441,6 +468,9 @@ test('homeView: returns a home view listing connections and available providers'
   const avail = v.blocks.find((x: any) => x.type === 'section' && /Available providers/.test(x.text?.text ?? ''));
   assert.ok(avail);
   assert.doesNotMatch(avail.text.text, /github/);
+  // Unstamped exported views retain their historical provider-valued action for host listeners.
+  const disconnect = v.blocks.find((x: any) => x.accessory?.action_id === DISCONNECT_ACTION);
+  assert.equal(disconnect.accessory.value, 'github');
 });
 
 test('homeView: empty connections still renders a valid home view', () => {

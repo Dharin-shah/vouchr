@@ -53,6 +53,7 @@ function fakeVault(over: Record<string, unknown> = {}) {
   };
   const vault: any = {
     crossProcessRefresh: false,
+    liveId: async () => '00000000-0000-4000-8000-000000000001',
     get: async () => credential,
     touch: async () => undefined,
     updateTokens: async () => undefined,
@@ -622,9 +623,16 @@ test('OAuth callback normalizes a custom accountProbe before persistence and aud
         }),
       } as any,
       vault: {
-        upsert: async (_owner: unknown, _provider: string, token: unknown) => {
+        upsertUser: async (
+          _owner: unknown,
+          _provider: string,
+          token: unknown,
+          _gate: unknown,
+          afterWrite?: (tx: unknown) => Promise<void>,
+        ) => {
           stored = token;
-          return true;
+          await afterWrite?.({});
+          return 'stored';
         },
       } as any,
       audit: {
@@ -669,9 +677,16 @@ test('OAuth callback drops an account label containing credential material (SEC-
         }),
       } as any,
       vault: {
-        upsert: async (_owner: unknown, _provider: string, token: unknown) => {
+        upsertUser: async (
+          _owner: unknown,
+          _provider: string,
+          token: unknown,
+          _gate: unknown,
+          afterWrite?: (tx: unknown) => Promise<void>,
+        ) => {
           stored = token;
-          return true;
+          await afterWrite?.({});
+          return 'stored';
         },
       } as any,
       audit: {

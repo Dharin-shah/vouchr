@@ -1,12 +1,26 @@
-import type { Vault } from './vault';
+import { credentialLockKey, type Vault } from './vault';
 import type { Audit } from './audit';
-import type { Consent } from './consent';
+import {
+  markProvisioningRevoked,
+  markUserOffboardedEverywhere,
+  type Consent,
+} from './consent';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
-import type { ProviderRegistry } from './providers';
+import { isValidProviderId, type ProviderRegistry } from './providers';
 import { revokeToken } from './tokens';
-import { userOwner, type Owner } from './owner';
+import { channelOwner, userOwner, type Owner } from './owner';
 import { SessionGrants } from './session';
+import { ChannelProvisioningRequests, UserProvisioningRequests } from './provisioning';
+import { Approvals } from './approval';
+import { InteractionStateChangedError, isInteractionId } from './interaction';
+
+type DisconnectOutcome = {
+  recognized: boolean;
+  removed: boolean;
+  ok: boolean;
+  audited: boolean;
+};
 
 /**
  * The ONE local-delete/claim → decode → upstream-revoke sequence for a user-owned credential, shared by
@@ -22,13 +36,19 @@ async function removeUserConnection(
   registry: ProviderRegistry | undefined,
   identity: SlackIdentity,
   provider: string,
-): Promise<{ removed: boolean; ok: boolean; attempted: boolean }> {
+  prepared?: {
+    expectedId: string;
+    fenced: boolean;
+    identity: SlackIdentity;
+    issuedAt: number;
+  },
+): Promise<{ removed: boolean; ok: boolean; attempted: boolean; fenced: boolean }> {
   const owner = userOwner(identity);
   const current = registry?.has(provider) ? registry.get(provider) : null;
   const registered = current != null;
   // The atomic delete returns token material only to its winner. Stale/unregistered rows are never
   // decrypted; their trusted dry_run bit is enough to distinguish synthetic state from real debt.
-  const claimed = await vault.deleteForRevoke(owner, provider, registered);
+  const claimed = await vault.deleteForRevoke(owner, provider, registered, prepared);
   const removed = claimed.removed;
   // `ok` = "no upstream revocation debt was left behind"; `attempted` = a real revoke call was made.
   // A revocation that was DUE (revocable provider, row existed) but couldn't run because the token
@@ -56,7 +76,7 @@ async function removeUserConnection(
       ok = false;
     }
   }
-  return { removed, ok, attempted };
+  return { removed, ok, attempted, fenced: claimed.fenced };
 }
 
 /**
@@ -64,13 +84,19 @@ async function removeUserConnection(
  * FIRST, then best-effort upstream token revocation. A revoke failure is non-fatal — local access is
  * already gone. Audited as 'revoke' (never the token). Transport-agnostic, so the Bolt `/vouchr
  * disconnect` command and the headless broker's `/v1/disconnect` route share ONE implementation.
- * A provider is recognized when it is registered now OR is the id of an exact stored connection
- * owned by the acting user. The latter keeps removed-from-config providers locally removable without
- * letting arbitrary external values reach a mutation or audit row (SEC-4).
+ * A provider is recognized before mutation when it is registered now OR is the id of an exact
+ * stored connection owned by the acting user. The latter keeps removed-from-config providers
+ * locally removable without letting arbitrary external values reach a lifecycle marker or audit
+ * row (SEC-4).
  *
- * `ok` means no upstream revocation debt remains; `audited` reports whether the audit obligation is
- * complete (a committed delete was recorded, or no row existed so no revoke audit was due). Audit
- * failure never discards an already-committed delete/revoke outcome.
+ * This public compatibility form represents a current-state, in-process call and captures its
+ * server-trusted PostgreSQL issuance itself. Transport adapters with an earlier trusted receipt use
+ * the internal-path `disconnectProviderAtReceipt` form so delayed requests retain their true age.
+ *
+ * `ok` means the full disconnect is complete: no upstream revocation debt remains and the durable
+ * provisioning fence was established. `audited` reports whether the audit obligation is complete
+ * (a committed delete was recorded, or no row existed so no revoke audit was due). Audit failure
+ * never discards an already-committed delete/revoke outcome.
  */
 export async function disconnectProvider(
   vault: Vault,
@@ -78,20 +104,92 @@ export async function disconnectProvider(
   registry: ProviderRegistry | undefined,
   identity: SlackIdentity,
   provider: string,
-): Promise<{ recognized: boolean; removed: boolean; ok: boolean; audited: boolean }> {
-  const registered = registry?.has(provider) ?? false;
-  const outcome = await removeUserConnection(vault, registry, identity, provider);
-  // For an unregistered value, the atomic delete claim IS the secondary allowlist check. No matching
-  // owned row means no satellite purge, audit, reflection, or other committed mutation (SEC-4).
-  if (!registered && !outcome.removed) {
+): Promise<DisconnectOutcome> {
+  return disconnectProviderAtReceipt(
+    vault,
+    audit,
+    registry,
+    identity,
+    provider,
+    await vault.userProvisioningIssuedAt(),
+  );
+}
+
+/** Receipt-bound form for trusted adapters. `issuedAt` is the server-trusted Slack receipt or
+ * verified headless assertion issuance in PostgreSQL's clock domain. Core checks it while holding
+ * the actor's offboard fence and snapshots the exact credential generation before writing the
+ * setup-revocation marker. The later delete is conditional on that generation, so an
+ * offboard/reconnect between authorization and deletion cannot redirect the request onto the
+ * replacement credential. This transport primitive is deliberately not exported from the package
+ * root: arbitrary callers must not supply a future timestamp. */
+export async function disconnectProviderAtReceipt(
+  vault: Vault,
+  audit: Audit,
+  registry: ProviderRegistry | undefined,
+  identity: SlackIdentity,
+  provider: string,
+  issuedAt: number,
+  expectedId?: string,
+): Promise<DisconnectOutcome> {
+  const outcome = await disconnectProviderAtGeneration(
+    vault,
+    audit,
+    registry,
+    identity,
+    provider,
+    issuedAt,
+    expectedId,
+  );
+  if (!outcome) throw new InteractionStateChangedError('connection', 'credential');
+  return outcome;
+}
+
+/** Internal exact-generation form shared by provider-addressed public calls and Vouchr-owned Slack
+ * controls. `null` is a stale generation verdict: it is reached before a provisioning marker,
+ * credential delete, upstream revoke, or audit write. */
+async function disconnectProviderAtGeneration(
+  vault: Vault,
+  audit: Audit,
+  registry: ProviderRegistry | undefined,
+  identity: SlackIdentity,
+  provider: string,
+  issuedAt: number,
+  expectedId?: string,
+): Promise<DisconnectOutcome | null> {
+  if (!isValidProviderId(provider)) {
     return { recognized: false, removed: false, ok: false, audited: false };
   }
-  const ok = outcome.ok;
+  const registered = registry?.has(provider) ?? false;
+  // Establish recognition before deleteForRevoke persists its lifecycle fence. A registered id is
+  // declaratively trusted; a retired id must match this actor's exact stored row. If that row then
+  // disappears concurrently, retaining the marker is valid—it fenced a provider that was known at
+  // this request's authorization point. Arbitrary valid-looking input reaches no write (SEC-4).
+  if (!registered && !(await vault.has(userOwner(identity), provider))) {
+    return { recognized: false, removed: false, ok: false, audited: false };
+  }
+  const prepared = await vault.prepareUserDisconnect(identity, provider, issuedAt, expectedId);
+  if (prepared.status === 'offboarded') {
+    throw new InteractionStateChangedError('connection', 'authorization');
+  }
+  if (prepared.status === 'stale') return null;
+  const outcome = prepared.expectedId
+      ? await removeUserConnection(vault, registry, identity, provider, {
+          expectedId: prepared.expectedId,
+          fenced: prepared.fenced,
+          identity,
+          issuedAt,
+        })
+    : { removed: false, ok: true, attempted: false, fenced: prepared.fenced };
+  if (!outcome.removed && prepared.expectedId && await vault.has(userOwner(identity), provider)) {
+    throw new InteractionStateChangedError('connection', 'credential');
+  }
+  const ok = outcome.ok && outcome.fenced;
   // A no-op is not a revoke event. Keep duplicate/idempotent calls quiet: there is no committed
   // mutation to audit, and adapters use `removed` to suppress the matching metrics event (#226).
   if (!outcome.removed) return { recognized: true, removed: false, ok, audited: true };
   // meta.ok keeps its shape; upstream:'skipped' (same key as revokeConnection, STR-4) marks that no
-  // real revoke call was made — so ok:false + skipped is legible as "token unreadable, revoke due".
+  // real revoke call was made. An ok:false outcome can mean upstream debt, a failed provisioning
+  // fence, or both; the public copy gives recovery for both without exposing internal failure text.
   let audited = true;
   try {
     await audit.record('revoke', identity, provider, { ok, ...(outcome.attempted ? {} : { upstream: 'skipped' }) }); // never the token
@@ -101,17 +199,52 @@ export async function disconnectProvider(
   return { recognized: true, removed: outcome.removed, ok, audited };
 }
 
+/** Disconnect the exact opaque connection generation rendered in a Vouchr-owned Slack surface.
+ * The UUID reveals no provider or identity. Core first resolves it against the verified actor, then
+ * repeats actor ownership + exact generation under the destructive mutation's locks. */
+export async function disconnectConnectionGeneration(
+  vault: Vault,
+  audit: Audit,
+  registry: ProviderRegistry | undefined,
+  identity: SlackIdentity,
+  credentialId: unknown,
+  issuedAt: number,
+): Promise<
+  | { status: 'stale' }
+  | {
+      status: 'current';
+      provider: string;
+      outcome: DisconnectOutcome;
+    }
+> {
+  if (!isInteractionId(credentialId)) return { status: 'stale' };
+  const provider = await vault.providerForUserGeneration(identity, credentialId);
+  if (!provider) return { status: 'stale' };
+  const outcome = await disconnectProviderAtGeneration(
+    vault,
+    audit,
+    registry,
+    identity,
+    provider,
+    issuedAt,
+    credentialId,
+  );
+  if (!outcome?.recognized) return { status: 'stale' };
+  return { status: 'current', provider, outcome };
+}
+
 /**
  * Remove ALL of a user's own connections: the offboarding cleanup. Triggered
  * automatically when Slack deactivates the account (see the Bolt adapter's
  * registerOffboarding), and callable from a SCIM deprovision hook or an admin.
  *
- * Also purges any in-flight consent AND any thread session grants for the user, so neither a
- * pending "Connect" click nor a lingering thread grant can resurrect access after offboarding.
+ * Also purges in-flight consent, setup/session state, and requester-bound approvals for the user.
+ * The tombstone remains the load-bearing barrier: retained credential use and approval
+ * decision/consumption compare their trusted receipt times even if bounded-state cleanup fails.
  *
- * Only the user's own connections are removed. Channel/shared connections belong
- * to the channel, not the person, so they are intentionally left in place and
- * reviewed separately by an admin. Idempotent. Returns the providers removed.
+ * Only the user's own connections are removed. Channel/shared connections belong to the channel,
+ * not the person, so they are intentionally left in place for current actors and reviewed
+ * separately by an admin. Idempotent. Returns the providers removed.
  */
 export async function offboardUser(
   vault: Vault,
@@ -125,7 +258,50 @@ export async function offboardUser(
   // Optional: when supplied, also clear the user's thread session grants. Centralized here so
   // every offboarding path (per-team and the Grid/SCIM sweep) gets the same cleanup.
   sessions?: SessionGrants,
+  // Optional: clear opaque private-modal provisioning requests. The tombstone remains the
+  // load-bearing fence; this is bounded-state cleanup and makes stale controls converge promptly.
+  provisioning?: UserProvisioningRequests,
+  // Optional: clear channel-setup requests issued to this actor. Channel credentials themselves
+  // belong to the channel and remain; only the deactivated user's outstanding modal authority goes.
+  channelProvisioning?: ChannelProvisioningRequests,
+  // Optional bounded-state cleanup. The tombstone is still load-bearing: approval decision and
+  // consumption compare their own trusted creation times, so a failed cleanup cannot revive one.
+  approvals?: Approvals,
 ): Promise<string[]> {
+  return (await offboardUserDetailed(
+    vault,
+    audit,
+    consent,
+    identity,
+    registry,
+    reason,
+    sessions,
+    provisioning,
+    channelProvisioning,
+    approvals,
+  )).providers;
+}
+
+/** Complete, no-secret offboarding outcome for trusted transport adapters. Intentionally not
+ * re-exported from the package root: the long-standing public {@link offboardUser} contract remains
+ * `Promise<string[]>`, while transports also need to report upstream/audit debt truthfully. */
+export interface OffboardUserOutcome {
+  providers: string[];
+  ok: boolean;
+}
+
+export async function offboardUserDetailed(
+  vault: Vault,
+  audit: Audit,
+  consent: Consent,
+  identity: SlackIdentity,
+  registry?: ProviderRegistry,
+  reason = 'offboarded',
+  sessions?: SessionGrants,
+  provisioning?: UserProvisioningRequests,
+  channelProvisioning?: ChannelProvisioningRequests,
+  approvals?: Approvals,
+): Promise<OffboardUserOutcome> {
   // The durable fail-closed gate FIRST (GHSA-25m2): once the tombstone is written, no consent
   // minted at or before this instant can ever complete (Consent.consume checks it), so a pending
   // "Connect" cannot resurrect a credential even if the row purge below transiently fails.
@@ -138,22 +314,36 @@ export async function offboardUser(
   // the stale rows are reclaimed by the TTL sweep (consent.sweepStale).
   try { await consent.deleteForUser(identity); } catch { /* fenced by the tombstone; TTL-swept */ }
   try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
+  try { await provisioning?.revokeForUser(identity); } catch { /* provisioning requests are TTL-bound */ }
+  try { await channelProvisioning?.revokeForUser(identity); } catch { /* provisioning requests are TTL-bound */ }
+  try { await approvals?.revokeForUser(identity); } catch { /* approvals are TTL-bound + tombstone-fenced */ }
   const providers = (await vault.listForUser(identity)).map((c) => c.provider); // user-owned only, enumerated without decrypting
   const removed: string[] = [];
   let deleteFailures = 0;
+  let complete = true;
   for (const provider of providers) {
     // Per-row isolation (GHSA-25m2): one row's decrypt/delete/audit failure must never strand the
     // remaining credentials — every row gets its own delete attempt, and the return value only
     // claims what was actually removed.
-    let outcome: { removed: boolean; ok: boolean; attempted: boolean };
+    let outcome: Awaited<ReturnType<typeof removeUserConnection>>;
     try {
       outcome = await removeUserConnection(vault, registry, identity, provider);
     } catch {
       deleteFailures++; // this row's DELETE failed (transient DB error): keep going, surface below
       continue;
     }
-    if (!outcome.removed) continue; // a concurrent winner owns the revoke + audit for this row
+    if (!outcome.removed) {
+      // This invocation observed the row but lost the delete claim. A concurrent winner owns its
+      // revoke/audit outcome, which this transaction cannot prove complete. Registry-backed
+      // transports therefore fail closed for this response; a later reconciliation after the row
+      // is gone can establish a clean no-op independently.
+      if (registry) complete = false;
+      continue;
+    }
     removed.push(provider);
+    // Registry-backed callers requested upstream cleanup. A failed call, unreadable externally
+    // referenced token, or retired provider leaves known debt even though local deletion won.
+    if (registry && !outcome.ok) complete = false;
     const meta: Record<string, unknown> = { reason };
     if (registry) {
       meta.ok = outcome.ok; // never the token, just whether upstream revocation debt remains
@@ -163,6 +353,7 @@ export async function offboardUser(
       await audit.record('revoke', identity, provider, meta);
     } catch {
       // audit is best-effort per row here: the delete already happened and later rows must run
+      complete = false;
     }
   }
   // Every delete above was attempted regardless — but a failure that left state behind must not
@@ -178,7 +369,7 @@ export async function offboardUser(
   if (deleteFailures > 0) {
     throw new Error(`offboarding incomplete: ${deleteFailures} credential deletion(s) failed; retry offboarding`); // no ids/secrets
   }
-  return removed;
+  return { providers: removed, ok: complete };
 }
 
 /** Break-glass bulk revocation filter. `provider` is REQUIRED (revoking across every provider is too
@@ -235,9 +426,12 @@ export async function selectRevocations(db: Db, f: RevokeFilter): Promise<Revoke
   }));
 }
 
-/** Scoped predicate for pending consent / session grants — `provider` plus whichever of team/user/
- *  channel the filter narrows to. Both `consent_request` and `session_grant` carry these columns. */
+/** Scoped predicate for pending consent / session requests / session grants — `provider` plus
+ *  whichever of team/user/channel the filter narrows to. All three tables carry these columns. */
 function pendingWhere(f: RevokeFilter): { where: string; params: unknown[] } {
+  // --channel selects a channel-owned credential. A consent/session row is USER authority whose
+  // channel column is only request origin, never ownership; do not widen a channel kill into users.
+  if (f.channel) return { where: 'FALSE', params: [] };
   const where = ['provider=?'];
   const params: unknown[] = [f.provider];
   if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
@@ -246,30 +440,150 @@ function pendingWhere(f: RevokeFilter): { where: string; params: unknown[] } {
   return { where: where.join(' AND '), params };
 }
 
-/**
- * Pending OAuth consents + thread session grants a {@link RevokeFilter} matches — counted, NOT deleted
- * (for the dry-run). These exist INDEPENDENTLY of a live connection row: a Connect-button click that
- * never completed, or a thread grant that outlived its connection, both match the provider but not
- * `selectRevocations`, so break-glass must report + clear them separately or they resurrect access.
- */
-export async function countPendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
-  const { where, params } = pendingWhere(f);
-  const c = (await db.get(`SELECT COUNT(*) AS n FROM consent_request WHERE ${where}`, params)) as { n: number } | undefined;
-  const s = (await db.get(`SELECT COUNT(*) AS n FROM session_grant WHERE ${where}`, params)) as { n: number } | undefined;
-  return { consents: c?.n ?? 0, grants: s?.n ?? 0 };
+/** User key-setup requests have team/user scope but no channel: a channel-only break-glass run must
+ * not widen into unrelated personal setup authority. */
+function provisioningWhere(f: RevokeFilter): { where: string; params: unknown[] } {
+  if (f.channel) return { where: 'FALSE', params: [] };
+  const where = ['provider=?'];
+  const params: unknown[] = [f.provider];
+  if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
+  if (f.userId) { where.push('user_id=?'); params.push(f.userId); }
+  return { where: where.join(' AND '), params };
+}
+
+/** Channel setup authority belongs to its channel target, not to the admin actor who opened it.
+ * Therefore a user-scoped break-glass run excludes these rows; channel/team/global scopes include
+ * the exact channel requests they can turn into. */
+function channelProvisioningWhere(f: RevokeFilter): { where: string; params: unknown[] } {
+  if (f.userId) return { where: 'FALSE', params: [] };
+  const where = ['provider=?'];
+  const params: unknown[] = [f.provider];
+  if (f.teamId) { where.push('team_id=?'); params.push(f.teamId); }
+  if (f.channel) { where.push('channel=?'); params.push(f.channel); }
+  return { where: where.join(' AND '), params };
+}
+
+export interface PendingProviderAuthority {
+  consents: number;
+  requests: number;
+  grants: number;
+  provisioning: number;
+  channelProvisioning: number;
 }
 
 /**
- * Delete every pending consent + thread session grant matching the scope, so a pending "Connect" or a
- * lingering thread grant can't complete after the break-glass run and resurrect the revoked provider.
- * Runs regardless of whether any live connection matched (that's the whole point). Returns the
- * consent/grant counts.
+ * Pending OAuth consents + thread/session/key-setup authority a {@link RevokeFilter} matches —
+ * counted, NOT deleted (for the dry-run). These exist INDEPENDENTLY of a live connection row, so
+ * break-glass must report + clear them separately or they can recreate access.
  */
-export async function purgePendingForProvider(db: Db, f: RevokeFilter): Promise<{ consents: number; grants: number }> {
+export async function countPendingForProvider(
+  db: Db,
+  f: RevokeFilter,
+): Promise<PendingProviderAuthority> {
   const { where, params } = pendingWhere(f);
-  const consents = (await db.run(`DELETE FROM consent_request WHERE ${where}`, params)).changes;
-  const grants = (await db.run(`DELETE FROM session_grant WHERE ${where}`, params)).changes;
-  return { consents, grants };
+  const provisioning = provisioningWhere(f);
+  const channelProvisioning = channelProvisioningWhere(f);
+  const c = (await db.get(`SELECT COUNT(*) AS n FROM consent_request WHERE ${where}`, params)) as { n: number } | undefined;
+  const r = (await db.get(`SELECT COUNT(*) AS n FROM session_request WHERE ${where}`, params)) as { n: number } | undefined;
+  const s = (await db.get(`SELECT COUNT(*) AS n FROM session_grant WHERE ${where}`, params)) as { n: number } | undefined;
+  const p = (await db.get(
+    `SELECT COUNT(*) AS n FROM user_provisioning_request WHERE ${provisioning.where}`,
+    provisioning.params,
+  )) as { n: number } | undefined;
+  const cp = (await db.get(
+    `SELECT COUNT(*) AS n FROM channel_provisioning_request WHERE ${channelProvisioning.where}`,
+    channelProvisioning.params,
+  )) as { n: number } | undefined;
+  return {
+    consents: c?.n ?? 0,
+    requests: r?.n ?? 0,
+    grants: s?.n ?? 0,
+    provisioning: p?.n ?? 0,
+    channelProvisioning: cp?.n ?? 0,
+  };
+}
+
+/** A retired provider remains a valid break-glass target when its exact id already exists in any
+ * canonical durable store. This keeps local deletion available when provider config is broken,
+ * without persisting an arbitrary CLI value as a revocation fence (SEC-4). */
+async function providerKnownToStore(db: Db, provider: string): Promise<boolean> {
+  const row = await db.get(
+    `SELECT 1 AS known FROM (
+       SELECT provider FROM connection WHERE provider=?
+       UNION ALL SELECT provider FROM consent_request WHERE provider=?
+       UNION ALL SELECT provider FROM user_provisioning_request WHERE provider=?
+       UNION ALL SELECT provider FROM channel_provisioning_request WHERE provider=?
+       UNION ALL SELECT provider FROM session_request WHERE provider=?
+       UNION ALL SELECT provider FROM session_grant WHERE provider=?
+       UNION ALL SELECT provider FROM approval_request WHERE provider=?
+       UNION ALL SELECT provider FROM channel_config WHERE provider=?
+       UNION ALL SELECT provider FROM channel_tool WHERE provider=?
+       UNION ALL SELECT provider FROM provisioning_revocation_tombstone WHERE provider=?
+     ) AS known_provider LIMIT 1`,
+    Array(10).fill(provider),
+  );
+  return row != null;
+}
+
+/**
+ * Delete every matching pending OAuth/session/key-setup authority. Key-setup rows are first
+ * snapshotted, then their canonical credential locks are acquired in one transaction. If a writer
+ * already consumed a ticket but has not committed, PostgreSQL still exposes the old row to the
+ * snapshot; this purge waits for that writer before returning. The caller must reselect connections
+ * after this settles, because that writer may have committed a credential while the purge waited.
+ */
+export async function purgePendingForProvider(
+  db: Db,
+  f: RevokeFilter,
+  options: { providerRegistered?: boolean } = {},
+): Promise<PendingProviderAuthority> {
+  if (!isValidProviderId(f.provider)) throw new Error('invalid provider revocation scope');
+  if (!options.providerRegistered && !(await providerKnownToStore(db, f.provider))) {
+    throw new Error('provider revocation scope is not recognized');
+  }
+  // Load-bearing fence FIRST, in its own short transaction. Every matching writer either committed
+  // before this marker (and is visible to the caller's post-fence connection scan) or sees the newer
+  // marker and refuses. Never retain this scope lock while taking credential locks below.
+  await markProvisioningRevoked(db, f);
+  const { where, params } = pendingWhere(f);
+  const provisioning = provisioningWhere(f);
+  const channelProvisioning = channelProvisioningWhere(f);
+  const userScopes = (await db.all(
+    `SELECT team_id, user_id FROM user_provisioning_request WHERE ${provisioning.where}`,
+    provisioning.params,
+  )) as { team_id: string; user_id: string }[];
+  const channelScopes = (await db.all(
+    `SELECT team_id, channel FROM channel_provisioning_request WHERE ${channelProvisioning.where}`,
+    channelProvisioning.params,
+  )) as { team_id: string; channel: string }[];
+  const purge = async (tx: Db): Promise<PendingProviderAuthority> => {
+    const consents = (await tx.run(`DELETE FROM consent_request WHERE ${where}`, params)).changes;
+    const requests = (await tx.run(`DELETE FROM session_request WHERE ${where}`, params)).changes;
+    const grants = (await tx.run(`DELETE FROM session_grant WHERE ${where}`, params)).changes;
+    const removedProvisioning = (await tx.run(
+      `DELETE FROM user_provisioning_request WHERE ${provisioning.where}`,
+      provisioning.params,
+    )).changes;
+    const removedChannelProvisioning = (await tx.run(
+      `DELETE FROM channel_provisioning_request WHERE ${channelProvisioning.where}`,
+      channelProvisioning.params,
+    )).changes;
+    return {
+      consents,
+      requests,
+      grants,
+      provisioning: removedProvisioning,
+      channelProvisioning: removedChannelProvisioning,
+    };
+  };
+  const keys = [...new Set([
+    ...userScopes.map(({ team_id: teamId, user_id: userId }) =>
+      credentialLockKey({ teamId, kind: 'user', id: userId }, f.provider)),
+    ...channelScopes.map(({ team_id: teamId, channel }) =>
+      credentialLockKey(channelOwner(teamId, channel), f.provider)),
+  ])];
+  if (keys.length && db.withRefreshLocks) return db.withRefreshLocks(keys, purge);
+  return db.transaction ? db.transaction(purge) : purge(db);
 }
 
 /**
@@ -294,7 +608,13 @@ export async function revokeConnection(
   const registered = current != null;
   // Atomically claim the row before decoding: a concurrent revoke loser receives no token and cannot
   // double-call the provider. A decrypt/delete failure stays per-row best-effort for the bulk loop.
-  let claimed = { removed: false, accessToken: null as string | null, dryRun: false, readFailed: false };
+  let claimed = {
+    removed: false,
+    accessToken: null as string | null,
+    dryRun: false,
+    readFailed: false,
+    fenced: true,
+  };
   try { claimed = await vault.deleteForRevoke(owner, provider, registered); } catch { /* removed stays false */ }
   const removed = claimed.removed;
   if (!removed) return { ...row, removed: false, upstreamAttempted: false, upstreamOk: true };
@@ -328,13 +648,11 @@ export async function revokeConnection(
 /**
  * Enterprise Grid / SCIM offboarding: remove a user across EVERY workspace, not just one.
  *
- * The Vault API is team-scoped (the full owner key is team_id + kind + id), so "everywhere" can
- * only mean "every team this user touches". We discover those teams honestly at the DB level:
- * the distinct team_ids where the user has an own connection, an in-flight consent, OR a thread
- * session grant, then replay {@link offboardUser} once per team. That keeps the upstream-revoke +
- * audit + consent-purge + session-purge logic in exactly one place and each per-team call still
- * uses the FULL owner key
- * (team_id + 'user' + userId), so the cross-team sweep can never reach beyond this user's own rows.
+ * The Vault API is team-scoped (the full owner key is team_id + kind + id). A cross-team tombstone
+ * first fences even an artifact-free workspace, then we discover every team with an own connection,
+ * in-flight consent, pending session request, thread grant, approval, or setup request and replay
+ * {@link offboardUser} once per team. That keeps upstream revoke + audit + bounded-state cleanup in
+ * one place, and each delete still uses the FULL owner key (team_id + 'user' + userId).
  *
  * In Enterprise Grid the Slack userId is unique org-wide, so `userId` alone is a complete span key.
  * `enterpriseId`, when passed, narrows connection/consent discovery to that org's rows PLUS rows
@@ -356,27 +674,56 @@ export async function offboardUserEverywhere(
 ): Promise<{ teamId: string; providers: string[]; ok: boolean }[]> {
   const ent = user.enterpriseId != null;
   const sessions = new SessionGrants(db);
+  const provisioning = new UserProvisioningRequests(db, vault);
+  const channelProvisioning = new ChannelProvisioningRequests(db, vault);
+  const approvals = new Approvals(db);
+  // Establish the cross-team fence BEFORE taking the artifact snapshot. A provisioning mutation
+  // holds the matching scope lock through commit: it either commits first and appears below, or
+  // this tombstone commits first and every old issuance on an artifact-free team is refused.
+  // Never retain the scope lock while deleting team credentials (credential -> scope is the one
+  // mutation lock order); markUserOffboardedEverywhere commits its own short transaction here.
+  await markUserOffboardedEverywhere(db, user);
   // The ONLY query that spans teams. UNION so a team with only a pending "Connect" or only a lingering
-  // thread session grant (no live connection) is still found and purged. session_grant has no
-  // enterprise_id column, so it is always matched by user_id alone (userId is org-unique).
+  // thread session artifact (no live connection) is still found and purged. Session tables have no
+  // enterprise_id column, so they are always matched by user_id alone (userId is org-unique).
   const rows = (await db.all(
     `SELECT team_id FROM connection WHERE owner_kind='user' AND owner_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
      SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
-     SELECT team_id FROM session_grant WHERE user_id=?`,
+     SELECT team_id FROM session_request WHERE user_id=?
+     UNION
+     SELECT team_id FROM session_grant WHERE user_id=?
+     UNION
+     SELECT team_id FROM user_provisioning_request WHERE user_id=?
+     UNION
+     SELECT team_id FROM channel_provisioning_request WHERE user_id=?
+     UNION
+     SELECT team_id FROM approval_request WHERE user_id=?`,
     ent
-      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId]
-      : [user.userId, user.userId, user.userId],
+      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId, user.userId, user.userId, user.userId, user.userId]
+      : [user.userId, user.userId, user.userId, user.userId, user.userId, user.userId, user.userId],
   )) as { team_id: string }[];
 
   const summary: { teamId: string; providers: string[]; ok: boolean }[] = [];
   for (const { team_id: teamId } of rows) {
-    // Full owner key per team, never a partial key. offboardUser does the local delete first, then
-    // best-effort upstream revoke + audit, and purges this team's pending consent + session grants.
+    // Full owner key per team, never a partial key. The detailed helper does the local delete first,
+    // then best-effort upstream revoke + audit, and purges this team's pending consent + grants.
     const identity: SlackIdentity = { enterpriseId: user.enterpriseId ?? null, teamId, userId: user.userId };
     try {
-      summary.push({ teamId, providers: await offboardUser(vault, audit, consent, identity, registry, reason, sessions), ok: true });
+      const outcome = await offboardUserDetailed(
+        vault,
+        audit,
+        consent,
+        identity,
+        registry,
+        reason,
+        sessions,
+        provisioning,
+        channelProvisioning,
+        approvals,
+      );
+      summary.push({ teamId, providers: outcome.providers, ok: outcome.ok });
     } catch {
       // Non-fatal per team so later teams still run — but the failure must be SURFACED, not buried
       // (GHSA-25m2 r3): mark this team ok:false so the caller can report the enterprise offboard as

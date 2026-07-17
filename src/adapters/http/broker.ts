@@ -8,8 +8,8 @@ import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import { configureChannelTools, type ChannelTools } from '../../core/tools';
-import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, canonicalMethod, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, approvalNeeded, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
 import { MAX_TIMER_MS } from '../../core/options';
@@ -17,7 +17,7 @@ import { awaitWithSignal, disposableDeadline } from '../../core/httpBounds';
 import { mapSafeError, SessionApprovalRequiredError, UpstreamTimeoutError } from '../../core/errors';
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
-import { userOwner, type Owner } from '../../core/owner';
+import { channelOwner, userOwner, type Owner } from '../../core/owner';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
 import { setChannelCredentialMode } from '../../core/channelCredential';
 import {
@@ -30,19 +30,47 @@ import {
   ToolDisabledError,
 } from '../../core/authz';
 import type { SlackIdentity } from '../../core/identity';
-import { Consent } from '../../core/consent';
+import {
+  Consent,
+  markUserOffboardedByActor,
+  markUserOffboardedEverywhereByActor,
+  userInteractionIsCurrent,
+} from '../../core/consent';
 import { SessionGrants } from '../../core/session';
-import { Approvals, ApprovalRequiredError } from '../../core/approval';
-import { disconnectProvider, offboardUser, offboardUserEverywhere } from '../../core/offboard';
+import { InteractionStateChangedError, isInteractionId } from '../../core/interaction';
+import { ChannelProvisioningRequests, UserProvisioningRequests } from '../../core/provisioning';
+import {
+  Approvals,
+  ApprovalPathTooLongError,
+  ApprovalRequiredError,
+  credentialUseStateFenced,
+  credentialUseStillCurrentFenced,
+  type ApprovalKey,
+} from '../../core/approval';
+import {
+  disconnectProvider,
+  disconnectProviderAtReceipt,
+  offboardUserDetailed,
+  offboardUserEverywhere,
+} from '../../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
 import { handleOAuthCallback } from '../../core/oauthCallback';
+import { sweepLifecycle } from '../../core/sweep';
 import {
   normalizeSecretReference,
   referenceChannelCredential,
   referenceUserCredential,
   SecretReferenceError,
 } from '../../core/reference';
-import { verifyIdentity, IdentityError, normalizeIdentityConfig, assertIdentityPurposeDistinct, type IdentityClaims, type IdentityConfig } from './identity';
+import {
+  verifyIdentity,
+  IdentityError,
+  IDENTITY_SKEW_MS,
+  normalizeIdentityConfig,
+  assertIdentityPurposeDistinct,
+  type IdentityClaims,
+  type IdentityConfig,
+} from './identity';
 import { DbReplayStore } from './replayStore';
 import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditResponse, BrokerChannelManifestResponse } from '../../broker-types';
 
@@ -61,6 +89,15 @@ import type { BrokerAdminOkResponse, BrokerAdminConfigResponse, BrokerAuditRespo
 export interface ConnectionHandleRef {
   provider: string;
   owner: 'user' | 'channel';
+}
+
+/**
+ * The direct broker server owns its complete lifecycle sweep. Interaction stores deliberately stay
+ * private: callers can reclaim their expired rows without gaining raw approval/session/provisioning
+ * mutation authority or accidentally sweeping a store wired to a different broker instance.
+ */
+export interface BrokerServer extends http.Server {
+  readonly sweepExpired: () => Promise<number>;
 }
 
 export interface BrokerFetchRequest {
@@ -388,7 +425,10 @@ export function withEgressDefaults(p: Provider, defaultDenyNonGet?: boolean): Pr
 }
 
 function requestMethod(method: unknown): string {
-  return typeof method === 'string' ? method.toUpperCase() : '';
+  if (typeof method !== 'string') throw new HttpError(400, { error: 'invalid method' });
+  const canonical = canonicalMethod(method);
+  if (!canonical) throw new HttpError(400, { error: 'invalid method' });
+  return canonical;
 }
 
 function requestBody(body: unknown): string | undefined {
@@ -518,6 +558,7 @@ function pickHeaders(headers: Record<string, string> | undefined, allow: string[
  *    Slack-facing service routes the human there, then retries. The id is the pending-approval
  *    handle, not a secret and not authority (eligibility is re-checked at the click).
  *  - NoConnectionError → 409 (no stored credential for this owner+provider)
+ *  - InteractionStateChangedError → 409 on reconnect, otherwise 403; retry after re-resolving
  *  - ResponseBlockedError → 413 over-cap / 502 disallowed type (provider.egressResponse withheld
  *    the response); the static message never carries the offending header value or body
  *  - ResolverConfigurationError / ResolverFailedError → 502 with distinct configuration/runtime
@@ -544,10 +585,21 @@ function typedHttpError(status: number, error: string, typed: unknown): HttpErro
 function mapUpstreamError(e: unknown): never {
   const fields = safeErrorFields(e);
   if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked', ...fields });
+  if (e instanceof ApprovalPathTooLongError) {
+    throw new HttpError(413, { error: 'approval action path too large', ...fields });
+  }
   if (e instanceof ApprovalRequiredError) {
     throw new HttpError(403, { error: 'approval_required', approvalId: e.approvalId, ...fields });
   }
   if (e instanceof NoConnectionError) throw new HttpError(409, { error: 'not connected', ...fields });
+  if (e instanceof InteractionStateChangedError) {
+    throw new HttpError(e.reason === 'credential' ? 409 : 403, {
+      error: e.reason === 'credential'
+        ? 'connection changed; resolve and retry'
+        : 'authorization changed; resolve and retry',
+      ...fields,
+    });
+  }
   if (e instanceof ResolverConfigurationError || e instanceof ResolverFailedError) {
     throw new HttpError(502, { error: 'credential resolution failed', ...fields });
   }
@@ -625,7 +677,7 @@ function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdenti
   return { owner: userOwner(acting), acting };
 }
 
-export function createBroker(rawOpts: BrokerOptions): http.Server {
+export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   // #212 / PostgreSQL-only production: never accept a caller-supplied replay implementation. A
   // JavaScript caller may still carry the removed property after a type upgrade; reject it instead
   // of silently ignoring a process-local store and reporting false readiness.
@@ -705,6 +757,8 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   const consent = new Consent(opts.db, dryRun); // #116: dry-run mints local instantly-succeeding authorize URLs
   const sessions = new SessionGrants(opts.db);
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
+  const provisioning = new UserProvisioningRequests(opts.db, opts.vault);
+  const channelProvisioning = new ChannelProvisioningRequests(opts.db, opts.vault);
   const callbackPath = opts.callbackPath === undefined ? '/oauth/callback' : opts.callbackPath;
   // The same core helper owns origin/path validation for both adapters. A configured callback path
   // must be the exact pathname this server matches, never a relative/URL/query/fragment variant.
@@ -769,6 +823,46 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     return claims;
   }
 
+  /** Map one verified deployment-bound assertion into PostgreSQL's clock domain. Preserving its
+   * observed age makes process/DB clock offset irrelevant; query latency and the accepted identity
+   * skew both move the result earlier, so uncertainty fails closed. */
+  async function userInteractionIssuedAt(claims: IdentityClaims): Promise<number> {
+    if (!Number.isSafeInteger(claims.iat)) {
+      throw new HttpError(401, { error: 'invalid identity token' });
+    }
+    const pgNow = await opts.vault.userProvisioningIssuedAt();
+    const observedAt = Date.now();
+    const tokenAge = Math.max(0, observedAt - claims.iat!);
+    const issuedAt = pgNow - tokenAge - IDENTITY_SKEW_MS;
+    if (!Number.isSafeInteger(issuedAt)) {
+      throw new HttpError(401, { error: 'invalid identity token' });
+    }
+    return issuedAt;
+  }
+
+  /** Reject a verified but pre-offboard actor before any authenticated read/use work. Signature and
+   * replay verification stay in `verify()` exactly once; this helper only maps that trusted claim's
+   * issuance into PostgreSQL time and compares the durable actor tombstone. Mutation routes retain
+   * their stronger lock-held checks at the write itself. */
+  async function requireCurrentActor(
+    claims: IdentityClaims,
+  ): Promise<{ identity: SlackIdentity; issuedAt: number }> {
+    const identity: SlackIdentity = {
+      enterpriseId: claims.enterpriseId ?? null,
+      teamId: claims.teamId,
+      userId: claims.userId,
+    };
+    const issuedAt = await userInteractionIssuedAt(claims);
+    if (!(await userInteractionIsCurrent(opts.db, identity, issuedAt))) {
+      throw typedHttpError(
+        409,
+        'authorization changed; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
+    return { identity, issuedAt };
+  }
+
   /**
    * Operator authorization, mirroring the Bolt credential-use path (bolt.ts:173-185): Policy then the
    * channel tool allowlist. The channel/team come ONLY from verified claims. A deny is audited (no
@@ -812,7 +906,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   async function resolveOwner(
     ref: ConnectionHandleRef,
     claims: IdentityClaims,
-  ): Promise<{ owner: Owner; acting: SlackIdentity }> {
+  ): Promise<{ owner: Owner; acting: SlackIdentity; credentialId: string }> {
     const ownerKind = claims.ownerKind ?? 'user';
     // The body handle's owner must MATCH the signed ownerKind — a forged body owner:'channel' on a plain
     // user token is refused, never silently downgraded. This claims-integrity check is broker-specific
@@ -825,13 +919,24 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       // gate now lives in ONE core function (resolveCredentialOwner) the Bolt path calls too, so the two
       // transports can no longer drift (that drift is how this check went missing on the broker). Only
       // meaningful when channelConfig is opted in; otherwise mode stays null and the gate is inert.
+      const owner = userOwner(acting);
+      const credentialId = await opts.vault.liveId(owner, ref.provider);
+      if (!credentialId) {
+        throw typedHttpError(
+          409,
+          'not connected',
+          new NoConnectionError(`No connection for provider "${ref.provider}"`, owner.kind),
+        );
+      }
       let mode: ChannelMode | null = null;
       let hasSessionGrant = false;
       const thread = claims.threadTs ?? null;
       if (opts.channelConfig) {
         mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
         if (mode === 'session' && thread) {
-          hasSessionGrant = await sessions.isGranted(acting, claims.channel, thread, ref.provider);
+          hasSessionGrant = (await sessions.grantedCredentialId(
+            acting, claims.channel, thread, ref.provider,
+          )) === credentialId;
         }
       }
       const r = resolveCredentialOwner({ path: 'user', mode, principal: acting, channel: claims.channel, thread, hasSessionGrant });
@@ -844,8 +949,14 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       }
       // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
       // resolved owner here — the injector 409s later if the credential is missing.
-      if (r.status !== 'resolved') throw new HttpError(409, { error: 'not connected' });
-      return { owner: r.owner, acting: r.acting };
+      if (r.status !== 'resolved') {
+        throw typedHttpError(
+          409,
+          'not connected',
+          new NoConnectionError(`No connection for provider "${ref.provider}"`, 'user'),
+        );
+      }
+      return { owner: r.owner, acting: r.acting, credentialId };
     }
 
     // ── channel-owned (opt-in, fail-closed) ──
@@ -866,7 +977,15 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
     // The channel path only ever yields resolved or refused; anything else fails closed (defensive).
     if (r.status !== 'resolved') throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
-    return { owner: r.owner, acting: r.acting };
+    const credentialId = await opts.vault.liveId(r.owner, ref.provider);
+    if (!credentialId) {
+      throw typedHttpError(
+        409,
+        'not connected',
+        new NoConnectionError(`No connection for provider "${ref.provider}"`, r.owner.kind),
+      );
+    }
+    return { owner: r.owner, acting: r.acting, credentialId };
   }
 
   // The ONE shared gate pipeline for the credential-use routes (/v1/fetch and /v1/mcp — STR-3):
@@ -884,6 +1003,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     // Identity is verified BEFORE any provider-existence probe, so an unauthenticated caller past the
     // perimeter can't enumerate registered providers via distinct 404/403 responses (#enumeration).
     const claims = await verify(body.identityToken);
+    const { issuedAt: actorIssuedAt } = await requireCurrentActor(claims);
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
     // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
@@ -892,7 +1012,52 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
     await authorize(ref.provider, claims);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.allowWrites);
-    const { owner, acting } = await resolveOwner(ref, claims);
+    const { owner, acting, credentialId } = await resolveOwner(ref, claims);
+    // A verified token makes the channel facts trustworthy, not immutable. Governance, session
+    // authority, and the selected connection generation can all change after resolveOwner's reads.
+    // Re-resolve the complete use binding under the same canonical lifecycle locks both before any
+    // approval/credential work and at the actual provider-send boundary (ConnectionHandle calls this
+    // callback at both points). Channel eligibility remains claim-based because the broker has no
+    // Slack client; fail closed for a channel owner unless the signed verdict/config permits it.
+    const useStillValid = async (): Promise<boolean> => {
+      if (owner.kind === 'channel') {
+        const eligible = (opts.requireChannelEligibility ?? true)
+          ? claims.channelEligible === true
+          : true;
+        if (!eligible) return false;
+      }
+      return opts.vault.withCredentialLocks(
+        [
+          { owner: channelOwner(acting.teamId, claims.channel), provider: ref.provider },
+          { owner: userOwner(acting), provider: ref.provider },
+          { owner, provider: ref.provider },
+        ],
+        async (locked, tx) => {
+          const state = await credentialUseStateFenced({
+            binding: {
+              teamId: acting.teamId,
+              userId: acting.userId,
+              ownerKind: owner.kind,
+              ownerId: owner.id,
+              credentialId,
+              provider: ref.provider,
+              channel: claims.channel,
+              thread: claims.threadTs ?? null,
+            },
+            db: tx,
+            registry,
+            policy: opts.policy,
+            vault: locked,
+            enterpriseId: acting.enterpriseId,
+            actorIssuedAt,
+            channelTools: opts.channelTools ?? null,
+            channelConfig: opts.channelConfig ?? null,
+          });
+          if (state !== 'current') throw new InteractionStateChangedError('connection', state);
+          return true;
+        },
+      );
+    };
     // The 7th arg is the createBroker-scoped SHARED inflight map, so concurrent requests for the same
     // owner+provider collapse to one token refresh (rotating-refresh providers brick on a double
     // refresh). The 8th wires the metrics sink so the broker path stops being a black box; the 9th
@@ -907,7 +1072,24 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     const handle = new ConnectionHandle(
       provider, owner, acting, opts.vault, opts.audit, opts.resolvers ?? {}, inflight, opts.onEvent,
       opts.auditSink, claims.channel ?? null, rateLimits, opts.onCredentialHealth, approvals,
-      claims.threadTs ?? null, dryRun, routeDeadlineMs, transportResponseMaxBytes,
+      claims.threadTs ?? null, dryRun, routeDeadlineMs, transportResponseMaxBytes, credentialId,
+      async (key: ApprovalKey, tx: Db, locked: Pick<Vault, 'liveId'>) => {
+        if (!registry.has(key.provider) || !isBrokeredProvider(registry.get(key.provider))) return false;
+        const currentApproval = registry.get(key.provider).approval;
+        if (!currentApproval || !approvalNeeded(currentApproval, key.method, key.path)) return false;
+        return credentialUseStillCurrentFenced({
+          binding: key,
+          db: tx,
+          registry,
+          policy: opts.policy,
+          vault: locked,
+          enterpriseId: claims.enterpriseId,
+          actorIssuedAt,
+          channelTools: opts.channelTools ?? null,
+          channelConfig: opts.channelConfig ?? null,
+        });
+      },
+      useStillValid,
     );
     return { handle, provider, acting };
   }
@@ -1120,13 +1302,21 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
   }
 
-  async function handleResolve(body: { handle: ConnectionHandleRef; identityToken: string }): Promise<Record<string, unknown>> {
+  async function handleResolve(body: {
+    handle: ConnectionHandleRef;
+    identityToken: string;
+    includeCredentialId?: unknown;
+  }): Promise<Record<string, unknown>> {
     const ref = body.handle;
     if (!ref || ref.owner !== 'user' || typeof ref.provider !== 'string') {
       throw new HttpError(400, { error: 'invalid handle' });
     }
+    if (body.includeCredentialId !== undefined && typeof body.includeCredentialId !== 'boolean') {
+      throw new HttpError(400, { error: 'invalid includeCredentialId flag' });
+    }
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
+    await requireCurrentActor(claims);
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools are not brokered by Vouchr — don't even report their consent state
     // (else /v1/resolve would call a service tool "connected"/"needs_consent"). Refuse like /v1/fetch.
@@ -1134,9 +1324,15 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
     const { owner } = ownerFromClaims(claims);
-    const connected = (await opts.vault.get(owner, ref.provider)) != null;
-    // NO secret: only existence + a coarse consent state. The token is never read into the response.
-    return { connected, consentState: connected ? 'connected' : 'needs_consent' };
+    const credentialId = await opts.vault.liveId(owner, ref.provider);
+    const connected = credentialId !== null;
+    // NO secret: only existence, a coarse consent state, and—when explicitly requested—the opaque
+    // generation needed to make an immediate disconnect exact under cross-service clock skew.
+    return {
+      connected,
+      consentState: connected ? 'connected' : 'needs_consent',
+      ...(body.includeCredentialId === true && credentialId ? { credentialId } : {}),
+    };
   }
 
   /**
@@ -1144,12 +1340,41 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * headless analogue of `/vouchr disconnect <provider>`). Identity from the signed token; a forged
    * body can't disconnect someone else. Best-effort upstream revoke; local delete always wins. No secret.
    */
-  async function handleDisconnect(body: { handle?: { provider?: unknown }; identityToken: string }): Promise<Record<string, unknown>> {
+  async function handleDisconnect(body: {
+    handle?: { provider?: unknown; credentialId?: unknown };
+    identityToken: string;
+  }): Promise<Record<string, unknown>> {
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
+    const expectedId = body.handle?.credentialId;
+    if (expectedId !== undefined && !isInteractionId(expectedId)) {
+      throw new HttpError(400, { error: 'invalid handle' });
+    }
     const claims = await verify(body.identityToken);
-    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    const outcome = await disconnectProvider(opts.vault, opts.audit, registry, identity, providerId);
+    const { identity, issuedAt } = await requireCurrentActor(claims);
+    let outcome: Awaited<ReturnType<typeof disconnectProvider>>;
+    try {
+      outcome = await disconnectProviderAtReceipt(
+        opts.vault,
+        opts.audit,
+        registry,
+        identity,
+        providerId,
+        issuedAt,
+        expectedId,
+      );
+    } catch (error) {
+      if (error instanceof InteractionStateChangedError) {
+        throw typedHttpError(
+          409,
+          error.reason === 'credential'
+            ? 'connection changed; resolve and retry'
+            : 'authorization changed; resolve and retry',
+          error,
+        );
+      }
+      throw error;
+    }
     if (!outcome.recognized) throw new HttpError(404, { error: 'unknown provider' });
     // Preserve the established wire shape. A committed local delete stays in `revoked`; `ok` is
     // false when either upstream revocation or authoritative auditing could not be confirmed.
@@ -1161,12 +1386,14 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * thread grants (the headless analogue of the Bolt `registerOffboarding` hook). Admin authority
    * comes from the SIGNED `isAdmin` claim (the broker can't verify workspace admin itself); fail
    * closed. A signed `enterpriseId` routes the cross-workspace (Grid/SCIM) case to
-   * offboardUserEverywhere. `targetUserId` is the subject, never the actor.
+   * offboardUserEverywhere. On that cross-workspace path the target is repeated in the signed
+   * `offboardTargetUserId` claim: admin status alone must not let an E1 actor nominate a foreign
+   * global Slack user id in the body. `targetUserId` is the subject, never the actor.
    */
   async function handleOffboard(body: { identityToken: string; targetUserId?: unknown }): Promise<Record<string, unknown>> {
     const claims = await verify(body.identityToken);
+    const { identity: actor, issuedAt: issuance } = await requireCurrentActor(claims);
     if (claims.isAdmin !== true) {
-      const actor: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
       await opts.audit.record('denied', actor, 'offboard', { reason: 'not-admin' });
       throw new HttpError(403, { error: 'admin authority required' });
     }
@@ -1174,6 +1401,22 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (typeof targetUserId !== 'string' || !targetUserId) throw new HttpError(400, { error: 'targetUserId is required' });
     // Enterprise/Grid: span every workspace the target touches; else this one workspace.
     if (claims.enterpriseId) {
+      if (claims.offboardTargetUserId !== targetUserId) {
+        throw new HttpError(403, { error: 'signed offboard target required' });
+      }
+      const authorized = await markUserOffboardedEverywhereByActor(
+        opts.db,
+        actor,
+        issuance,
+        { enterpriseId: claims.enterpriseId, userId: targetUserId },
+      );
+      if (!authorized) {
+        throw typedHttpError(
+          409,
+          'admin assertion no longer current; resolve and retry',
+          new InteractionStateChangedError('connection', 'authorization'),
+        );
+      }
       const summary = await offboardUserEverywhere(opts.db, opts.vault, opts.audit, consent, { enterpriseId: claims.enterpriseId, userId: targetUserId }, registry);
       // Truthful completeness (GHSA-25m2 r3): ok:true ONLY when every touched workspace fully
       // offboarded. A credential left in one workspace must never read as a successful sweep.
@@ -1181,8 +1424,27 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       return { ok: incompleteTeams === 0, revoked: summary.flatMap((s) => s.providers), ...(incompleteTeams ? { incompleteTeams } : {}) };
     }
     const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
-    const providers = await offboardUser(opts.vault, opts.audit, consent, target, registry, 'offboarded', sessions);
-    return { ok: true, revoked: providers };
+    const authorized = await markUserOffboardedByActor(opts.db, actor, issuance, target);
+    if (!authorized) {
+      throw typedHttpError(
+        409,
+        'admin assertion no longer current; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
+    const outcome = await offboardUserDetailed(
+      opts.vault,
+      opts.audit,
+      consent,
+      target,
+      registry,
+      'offboarded',
+      sessions,
+      provisioning,
+      channelProvisioning,
+      approvals,
+    );
+    return { ok: outcome.ok, revoked: outcome.providers };
   }
 
   /**
@@ -1199,11 +1461,12 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     secretRef?: unknown;
     scopes?: unknown;
   }): Promise<Record<string, unknown>> {
-    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
+    const { identity: acting, issuedAt } = await requireCurrentActor(claims);
+    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
@@ -1211,10 +1474,9 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     // A legacy caller may still send `source`, but it has no authority and must match exactly.
     const reference = normalizeSecretReference(body, opts.resolvers, provider.scopesDefault);
 
-    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    await referenceChannelCredential({
+    const stored = await referenceChannelCredential({
       vault: opts.vault, audit: opts.audit, channelConfig: opts.channelConfig,
-      identity: acting, channel: claims.channel, providerId, reference,
+      identity: acting, channel: claims.channel, providerId, reference, issuance: issuedAt,
       authorize: async () => {
         // Admin authority: SIGNED claim only (the broker can't verify Slack admin).
         if (claims.isAdmin === true) return;
@@ -1236,22 +1498,36 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
         });
       },
     });
+    if (!stored) {
+      throw typedHttpError(
+        409,
+        'channel credential setup no longer valid; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
     return { ok: true };
   }
 
   /** Verify identity before registry membership so an unauthenticated caller cannot enumerate
    * providers. Tool governance accepts every registered provider; credential-mode writes add the
    * brokerable check below because service tools never have a Vouchr-owned credential. */
-  async function verifyRegisteredProvider(providerId: string, token: string): Promise<IdentityClaims> {
+  async function verifyRegisteredProvider(
+    providerId: string,
+    token: string,
+  ): Promise<{ claims: IdentityClaims; identity: SlackIdentity; issuedAt: number }> {
     const claims = await verify(token);
+    const current = await requireCurrentActor(claims);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
-    return claims;
+    return { claims, ...current };
   }
 
-  async function verifyBrokerableProvider(providerId: string, token: string): Promise<IdentityClaims> {
-    const claims = await verifyRegisteredProvider(providerId, token);
+  async function verifyBrokerableProvider(
+    providerId: string,
+    token: string,
+  ): Promise<{ claims: IdentityClaims; identity: SlackIdentity; issuedAt: number }> {
+    const current = await verifyRegisteredProvider(providerId, token);
     if (!isBrokeredProvider(registry.get(providerId))) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
-    return claims;
+    return current;
   }
 
   /** Admin gate, identical to the reference/offboard routes: authority is the SIGNED `isAdmin` claim
@@ -1269,17 +1545,19 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * `POST /v1/admin/mode` — set the channel's credential MODE for a provider (the headless analogue of
    * `/vouchr mode`). Body `{ provider, mode }`; the channel/team come ONLY from the signed claims (never
    * the body), admin authority from the SIGNED `isAdmin` claim. Config, NOT secret ingest — calls the
-   * SAME core `ChannelConfig.setMode` the Bolt path uses. Requires channelConfig opt-in; fail closed.
    */
   async function handleAdminMode(body: { provider?: unknown; mode?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
-    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
     const mode = body.mode;
     if (!isChannelMode(mode)) {
       throw new HttpError(400, { error: 'mode must be one of shared|per-user|session' });
     }
-    const claims = await verifyBrokerableProvider(providerId, body.identityToken);
+    const { claims, issuedAt: issuance } = await verifyBrokerableProvider(
+      providerId,
+      body.identityToken,
+    );
+    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     const acting = await requireAdmin(claims, providerId);
     // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
     // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
@@ -1291,7 +1569,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     }
     // The shared core lifecycle mutation serializes this mode flip with Bolt/headless credential
     // setup across replicas. A user-owned mode and a live shared credential cannot both commit.
-    await setChannelCredentialMode({
+    const configured = await setChannelCredentialMode({
       vault: opts.vault,
       audit: opts.audit,
       channelConfig: opts.channelConfig,
@@ -1299,7 +1577,15 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       channel: claims.channel,
       providerId,
       mode,
+      issuance,
     });
+    if (!configured) {
+      throw typedHttpError(
+        409,
+        'admin assertion no longer current; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
     return { ok: true };
   }
 
@@ -1311,23 +1597,23 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * too so one channel setting has one meaning. Requires channelTools opt-in; fail closed.
    */
   async function handleAdminTools(body: { provider?: unknown; enabled?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
-    if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
     if (typeof body.enabled !== 'boolean') throw new HttpError(400, { error: 'enabled must be a boolean' });
-    const claims = await verifyRegisteredProvider(providerId, body.identityToken);
-    const acting: SlackIdentity = {
-      enterpriseId: claims.enterpriseId ?? null,
-      teamId: claims.teamId,
-      userId: claims.userId,
-    };
-    await configureChannelTools({
+    const { claims, identity: acting, issuedAt: issuance } = await verifyRegisteredProvider(
+      providerId,
+      body.identityToken,
+    );
+    if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
+    const configured = await configureChannelTools({
       channelTools: opts.channelTools,
+      vault: opts.vault,
       audit: opts.audit,
       identity: acting,
       channel: claims.channel,
       changes: [[providerId, body.enabled]],
       allProviders: providerIds,
+      issuance,
       authorize: async () => {
         await requireAdmin(claims, providerId);
         return true;
@@ -1337,6 +1623,13 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
       // the separate credential-owner gate and is not silently broadened into a new API requirement.
       assertEligible: async () => undefined,
     });
+    if (configured === 'stale') {
+      throw typedHttpError(
+        409,
+        'admin assertion no longer current; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
     return { ok: true };
   }
 
@@ -1351,6 +1644,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    */
   async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
+    await requireCurrentActor(claims);
     await requireAdmin(claims, 'config');
     if (providerIds.length === 0) return { providers: [] };
     // Two channel-scoped batch reads (mode + tool allowlist) instead of getMode/isEnabled per provider,
@@ -1379,20 +1673,29 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    * callback below. Refuses service tools (no human cred) and key providers (no OAuth handshake).
    */
   async function handleConnect(body: { handle?: { provider?: unknown }; identityToken: string }): Promise<Record<string, unknown>> {
-    if (!redirectUri) throw new HttpError(404, { error: 'oauth connect is not configured' });
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
+    const { identity, issuedAt } = await requireCurrentActor(claims);
+    if (!redirectUri) throw new HttpError(404, { error: 'oauth connect is not configured' });
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     if (provider.credential === 'key') throw new HttpError(400, { error: 'provider has no OAuth flow; supply a key instead' });
     // Carry the signed enterpriseId so the resulting connection is discoverable by an enterprise
     // offboard (Grid/SCIM) — else a headless-OAuth connection would be pinned to enterpriseId:null.
-    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    // Consent.begin persists the single-use state + PKCE verifier and returns the provider authorize URL.
-    return await consent.begin(identity, provider, redirectUri, claims.channel);
+    // Persist the signed assertion's issuance, not request-receipt time: an assertion minted before
+    // offboarding cannot manufacture a fresh post-tombstone OAuth state by being presented later.
+    const pending = await consent.beginFenced(identity, provider, redirectUri, claims.channel, issuedAt);
+    if (!pending) {
+      throw typedHttpError(
+        403,
+        'credential setup no longer valid; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
+    return pending;
   }
 
   /**
@@ -1423,7 +1726,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    */
   async function handleStatus(body: { identityToken: string }): Promise<Record<string, unknown>> {
     const claims = await verify(body.identityToken);
-    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    const { identity } = await requireCurrentActor(claims);
     // ONE query, ZERO decryption: listLiveForUser returns the user's LIVE connected providers (no
     // secret, no KMS unwrap; TTL-expired rows dropped exactly as vault.get would). Intersect with the
     // brokered list in memory instead of N sequential vault.get calls, each of which would decrypt
@@ -1445,7 +1748,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    */
   async function handleAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
     const claims = await verify(body.identityToken);
-    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    const { identity } = await requireCurrentActor(claims);
     const events = await opts.audit.listByOwnerUser(identity, 20);
     return { events };
   }
@@ -1458,6 +1761,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    */
   async function handleAdminAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
     const claims = await verify(body.identityToken);
+    await requireCurrentActor(claims);
     await requireAdmin(claims, 'audit'); // non-admin → 403 + audited denial, before any read
     if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
     const events = await opts.audit.listByChannel(claims.teamId, claims.channel, 20);
@@ -1487,7 +1791,7 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
    */
   async function handleChannelManifest(body: { identityToken: string }): Promise<BrokerChannelManifestResponse> {
     const claims = await verify(body.identityToken);
-    const principal: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
+    const { identity: principal } = await requireCurrentActor(claims);
     const tools = await buildToolManifest({
       providerIds, registry,
       policy: opts.policy, channelTools: opts.channelTools, channelConfig: opts.channelConfig,
@@ -1514,16 +1818,26 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
+    const { identity, issuedAt } = await requireCurrentActor(claims);
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     const reference = normalizeSecretReference(body, opts.resolvers, provider.scopesDefault);
+    // This mutation may outlive an offboard request, so its fence is the verified assertion's
+    // conservative issuance bound — never request-receipt time. A legacy assertion has no trusted
+    // iat and was refused above.
     // Carry the signed enterpriseId so an enterprise offboard (Grid/SCIM) can discover this reference.
-    const identity: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // Owner is the VERIFIED acting user, never the body — a forged body can't reference into another's slot.
-    await referenceUserCredential({
-      vault: opts.vault, audit: opts.audit, identity, providerId, reference,
+    const result = await referenceUserCredential({
+      vault: opts.vault, audit: opts.audit, identity, providerId, reference, issuance: issuedAt,
     });
+    if (result !== 'stored') {
+      throw typedHttpError(
+        403,
+        'credential setup no longer valid; resolve and retry',
+        new InteractionStateChangedError('connection', 'authorization'),
+      );
+    }
     return { ok: true };
   }
 
@@ -1800,5 +2114,25 @@ export function createBroker(rawOpts: BrokerOptions): http.Server {
   server.keepAliveTimeout = keepAliveTimeoutMs;
   server.timeout = Math.max(fetchDeadlineMs, maxStreamMs);
   server.maxHeadersCount = 100;
-  return server;
+  // Public safe lifecycle facade for direct createBroker() deployments. The closure owns the exact
+  // private interaction stores used by this broker (including its normalized dry-run audit), so a
+  // host can reclaim every bounded row without importing their authority-bearing mutators. As with
+  // the historical core sweep, the numeric result counts expired credentials; the interaction
+  // cleanup is still performed even when that count is zero.
+  const sweepExpired = async (): Promise<number> => {
+    // The HTTP routes wait on the same construction-time dry-run vault check. The public lifecycle
+    // door must not bypass it: otherwise a host could delete real expired credentials and mislabel
+    // their audit rows as dry-run while every request correctly refuses the contaminated vault.
+    if (dryRunReady) await dryRunReady;
+    if (dryRunRefusal) throw dryRunRefusal;
+    return sweepLifecycle({
+      db: opts.db,
+      vault: opts.vault,
+      audit: opts.audit,
+      sink: opts.onEvent,
+      health: opts.onCredentialHealth,
+      dryRun,
+    });
+  };
+  return Object.assign(server, { sweepExpired });
 }

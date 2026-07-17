@@ -6,10 +6,12 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
-import { ChannelTools } from '../src/core/tools';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { Consent } from '../src/core/consent';
 import type { Db } from '../src/core/db';
 import { defineProvider, type Provider } from '../src/core/providers';
-import { userOwner } from '../src/core/owner';
+import { channelOwner, userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
@@ -356,6 +358,51 @@ test('#65 mcp: identity comes from the signed token, never the body (cross-tenan
   }
 });
 
+test('#194 mcp: a channel-owner assertion minted before actor offboard cannot use the retained shared credential', async (t) => {
+  const owner = channelOwner('T1', 'C1');
+  const { server, vault, db, port } = await makeMcpBroker(t, async (brokerDb) => {
+    const channelConfig = new ChannelConfig(brokerDb);
+    await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'shared');
+    await new Vault(brokerDb, KEY).upsert(owner, 'acme', {
+      accessToken: SECRET_TOKEN,
+      refreshToken: null,
+      scopes: '',
+      expiresAt: null,
+      externalAccount: null,
+    });
+    return { channelConfig };
+  });
+  const staleAssertion = signIdentity(claims({
+    ownerKind: 'channel',
+    channelEligible: true,
+  }), SECRET);
+  await new Consent(db).markOffboarded({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const response = await postRaw(port, '/v1/mcp', envelope({
+      handle: { provider: 'acme', owner: 'channel' },
+      identityToken: staleAssertion,
+    }));
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(recoveryFields(response.raw), {
+      code: 'interaction_state_changed',
+      retryable: false,
+      recovery: 'resolve_again',
+    });
+    assert.equal(up.seen.length, 0, 'a stale actor assertion never reaches the provider');
+    assert.equal(await vault.has(owner, 'acme'), true, 'actor offboarding retains channel-owned credentials');
+    assert.equal(
+      (await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='inject'`))?.n,
+      0,
+      'a refused use emits no successful injection audit',
+    );
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('#194 fetch/MCP: policy denial has stable admin recovery metadata before credential use', async (t) => {
   const policy = new Policy({ acme: { defaultAllow: true, denyChannels: ['C1'] } });
   const { server, port } = await makeMcpBroker(t, { policy });
@@ -383,7 +430,7 @@ test('#194 fetch/MCP: channel tool-disabled denial has stable admin recovery met
   const { server, port } = await makeMcpBroker(t, async (db) => {
     const channelTools = new ChannelTools(db);
     // Any row configures the channel as an allowlist; acme is deliberately absent/disabled.
-    await channelTools.setEnabled('T1', 'C1', 'other', true);
+    await setChannelToolEnabled(channelTools, 'T1', 'C1', 'other', true);
     return { channelTools };
   });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
@@ -735,6 +782,9 @@ test('#194 typed recovery: vault/KMS failures stay secret-free and aligned acros
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
   const sentinel = 'kms_ghp_internal_sentinel';
   const failingVault = new Proxy(vault, {
     get(target, property) {

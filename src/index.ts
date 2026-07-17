@@ -16,7 +16,13 @@ export {
 export type { VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
 // Headless HTTP broker (non-Bolt agent runtimes): signed identity + fail-closed read-only egress.
 export { createBroker } from './adapters/http/broker';
-export type { BrokerOptions, BrokerFetchRequest, BrokerMcpRequest, ConnectionHandleRef } from './adapters/http/broker';
+export type {
+  BrokerOptions,
+  BrokerServer,
+  BrokerFetchRequest,
+  BrokerMcpRequest,
+  ConnectionHandleRef,
+} from './adapters/http/broker';
 export {
   signIdentity, mintIdentity, verifyIdentity, ReplayGuard, IdentityError, MAX_LIFETIME_MS,
   // #212 deployment-bound identity: config builder + helpers for minting/verifying bound assertions.
@@ -26,14 +32,15 @@ export type { IdentityClaims, MintIdentityInput, IdentityConfig, IdentityKey } f
 export { DbReplayStore } from './adapters/http/replayStore';
 export { kmsEnvelope, awsKmsClient } from './adapters/kms';
 export type { KmsClientLike } from './adapters/kms';
-export { SessionGrants } from './core/session';
-// #113 human-in-the-loop approval for sensitive writes: the typed control-flow error (catch it and
-// stop the turn, exactly like ConsentRequiredError — the prompt was already posted) plus the grant
-// store, exported like SessionGrants so a headless host can drive its own approve/deny surface.
-export { ApprovalRequiredError, Approvals } from './core/approval';
+export { InteractionStateChangedError } from './core/interaction';
+// #113 human-in-the-loop approval for sensitive writes. Typed control-flow errors remain public;
+// persisted interaction stores are intentionally internal so
+// package consumers cannot bypass the packaged Bolt/broker mutation+lock+audit facades.
+export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
 // (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
-// `./headless`. SessionGrants/sweepExpired/TtlPolicy are already exported below.
+// `./headless`. A direct createBroker() result owns safe interaction cleanup through its
+// sweepExpired() method; the lower-level core sweepExpired/TtlPolicy remain exported below.
 export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
 export { Vault } from './core/vault';

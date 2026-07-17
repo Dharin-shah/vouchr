@@ -48,6 +48,9 @@ export interface BrokerFetchResponse {
 export interface BrokerResolveResponse {
   connected: boolean;
   consentState: BrokerConsentState;
+  /** Opaque, authority-free current row generation, returned only when the request explicitly sets
+   * `includeCredentialId: true`. Pass it back to `/v1/disconnect` to bind that mutation exactly. */
+  credentialId?: string;
 }
 
 /** `POST /v1/status` — the acting user's connection state across ALL brokered providers. */

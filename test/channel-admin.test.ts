@@ -5,10 +5,11 @@ import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig, isChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, isChannelMode, writeChannelMode } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
+import { CONFIGURE_CALLBACK } from '../src/adapters/blocks';
 
 // The channel-creator config gate is OPT-IN (`allowChannelCreatorConfig`, default off). When off the
 // gate is exactly workspace-admin-only; when on, a channel's CREATOR may also run the config
@@ -120,15 +121,29 @@ async function commandHarness(t: TestContext, opts: {
   lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
   const out: string[] = [];
   let opened: any = null;
+  const updates: any[] = [];
   const client = {
     users: { info: async () => ({ user: { is_admin: false } }) }, // never a workspace admin
     conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: opts.creator } }) },
-    views: { open: async (a: any) => { opened = a; } },
+    views: {
+      open: async (a: any) => {
+        opened = a;
+        return { view: { id: 'V_LOADING' } };
+      },
+      update: async (a: any) => { updates.push(a); },
+    },
+    chat: { postMessage: async () => ({}) },
   };
   const base = { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig' };
   const run = (text: string) =>
     handler({ command: { ...base, text }, ack: async () => {}, respond: async (m: string) => out.push(m), client });
-  return { lan, run, out, opened: () => opened };
+  return {
+    lan,
+    run,
+    out,
+    opened: () => opened,
+    hydrated: () => updates.find((entry) => entry?.view?.callback_id === CONFIGURE_CALLBACK)?.view ?? null,
+  };
 }
 
 // Flag on: channel creator can enable/disable tools and open the configure modal.
@@ -143,7 +158,8 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
   assert.match(h.out[1], /Disabled/);
 
   await h.run('configure mcp');
-  assert.equal(h.opened()?.trigger_id, 'trig'); // modal opened → passed the pre-modal gate
+  assert.equal(h.opened()?.trigger_id, 'trig'); // loading modal consumed the trigger immediately
+  assert.equal(h.hydrated()?.callback_id, CONFIGURE_CALLBACK);
 });
 
 // Flag off (default): the creator is denied on the same command paths — workspace-admin-only.
@@ -152,7 +168,8 @@ test('flag off (default): channel creator is denied on enable/configure', async 
   await h.run('enable mcp');
   assert.match(h.out[0], /Only a workspace admin can/);
   await h.run('configure mcp');
-  assert.equal(h.opened(), null); // modal never opened
+  assert.ok(h.opened());
+  assert.equal(h.hydrated(), null);
 });
 
 // A non-creator non-admin is denied on the command paths even with the flag on.
@@ -162,7 +179,8 @@ test('flag on: non-creator non-admin is denied on enable/configure', async (t) =
   assert.match(h.out[0], /admin or the channel creator/);
   await h.run('configure mcp');
   assert.match(h.out[1], /admin or the channel creator/);
-  assert.equal(h.opened(), null);
+  assert.ok(h.opened());
+  assert.equal(h.hydrated(), null);
   assert.ok((await h.lan.db.all('SELECT action FROM audit') as any[]).every((r) => r.action === 'denied'));
 });
 
@@ -192,9 +210,12 @@ test('union mode is rejected at the config boundary, writing nothing (SEC-4)', a
   assert.equal(cfgRow, undefined); // never persisted
   assert.equal((await h.lan.db.all('SELECT 1 FROM audit') as any[]).length, 0); // never audited
 
-  // True sink: ChannelConfig.setMode itself throws on the bogus runtime value and writes nothing.
+  // Internal row sink still rejects a bogus runtime value before writing anything.
   const db = await openTestDb(t);
   const cfg = new ChannelConfig(db);
-  await assert.rejects(() => cfg.setMode('T1', 'C_FIN', 'mcp', 'union' as any), /invalid channel mode/);
+  await assert.rejects(
+    () => writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'union' as any),
+    /invalid channel mode/,
+  );
   assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), null);
 });

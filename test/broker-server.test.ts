@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { loadProviders } from '../bin/providerConfig';
 import { beginBrokerDrain, buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
@@ -580,8 +581,11 @@ test('#240 packaged broker shares and enforces channel governance across every d
     // same shared core mutation while the packaged broker keeps serving from its own pool.
     const controlDb = await openDb({ databaseUrl: env.VOUCHR_DATABASE_URL });
     try {
+      const controlVault = new Vault(controlDb, randomBytes(32));
+      const issuance = await controlVault.userProvisioningIssuedAt();
       await configureChannelTools({
         channelTools: new ChannelTools(controlDb),
+        vault: controlVault,
         audit: new Audit(controlDb),
         identity: { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' },
         channel: 'C1',
@@ -589,6 +593,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
         allProviders: providerConfig.map((provider) => provider.id),
         authorize: async () => true,
         assertEligible: async () => undefined,
+        issuance,
       });
     } finally {
       await controlDb.close();

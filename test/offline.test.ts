@@ -59,6 +59,49 @@ test('vault: tokens are stored encrypted and round-trip by Slack identity', asyn
   assert.equal(await vault.get(O1, 'github'), null);
 });
 
+test('vault exact-generation APIs reject supplied invalid ids before read or mutation', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  await vault.upsert(O1, 'github', {
+    accessToken: 'generation-a', refreshToken: 'refresh-a', scopes: 'repo',
+    expiresAt: null, externalAccount: null,
+  });
+  const generation = await vault.liveId(O1, 'github');
+  assert.ok(generation);
+  await db.run(`UPDATE connection SET last_used_at=0 WHERE id=?`, [generation]);
+  const before = await db.get<any>(
+    `SELECT access_token_enc, refresh_token_enc, scopes, expires_at, updated_at, last_used_at
+     FROM connection WHERE id=?`,
+    [generation],
+  );
+
+  const realGet = db.get.bind(db);
+  let credentialReads = 0;
+  (db as any).get = (sql: string, params?: unknown[]) => {
+    if (/SELECT \* FROM connection/.test(sql)) credentialReads++;
+    return realGet(sql, params);
+  };
+  for (const expectedId of [null, '', ' ', 'not-a-uuid', 'x'.repeat(10_000)]) {
+    assert.equal(await vault.get(O1, 'github', undefined, expectedId as any), null);
+    assert.equal(await vault.updateTokens(O1, 'github', {
+      accessToken: 'must-not-land', refreshToken: 'must-not-land', scopes: 'changed', expiresAt: 1,
+    }, expectedId as any), false);
+    await vault.touch(O1, 'github', expectedId as any);
+  }
+  assert.equal(credentialReads, 0, 'invalid exact ids never reach the credential read');
+  const after = await realGet<any>(
+    `SELECT access_token_enc, refresh_token_enc, scopes, expires_at, updated_at, last_used_at
+     FROM connection WHERE id=?`,
+    [generation],
+  );
+  assert.deepEqual(after, before, 'invalid exact ids cannot update tokens or idle-use metadata');
+
+  // `undefined` remains the intentional legacy/unbound call shape; a supplied invalid value never
+  // falls into that path merely because it is falsy.
+  assert.equal((await vault.get(O1, 'github'))?.accessToken, 'generation-a');
+  assert.equal((await vault.get(O1, 'github', undefined, generation))?.accessToken, 'generation-a');
+});
+
 test('consent: state is single-use and expires', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);

@@ -1,5 +1,5 @@
 import { test, type TestContext } from 'node:test';
-import { openTestDb } from './support/pg';
+import { openTestDb, testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
@@ -10,6 +10,8 @@ import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext, ConsentRequiredError } from '../src/adapters/bolt';
 import { userOwner } from '../src/core/owner';
+import { openDb } from '../src/core/db';
+import { offboardUser } from '../src/core/offboard';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_MAYA' };
@@ -127,13 +129,20 @@ test('referenceUserSecret: invalid input or missing resolver writes no connectio
 test('connect: key provider, no cred → ephemeral key-setup prompt + ConsentRequiredError', async (t) => {
   let ephemeral: any = null;
   const client = { chat: { postEphemeral: async (a: any) => { ephemeral = a; return {}; } } };
-  const { c } = await ctx(t, 'C1', client);
+  const { c, db } = await ctx(t, 'C1', client);
   await assert.rejects(() => c.connect('customdb'), ConsentRequiredError);
   assert.equal(ephemeral.user, 'U_MAYA'); // posted to the asking user, ephemeral
   // It's the key-setup button (has an action_id), not an OAuth url button.
   const json = JSON.stringify(ephemeral.blocks);
   assert.ok(json.includes('vouchr_setup_key'));
   assert.ok(!json.includes('authorizeUrl') && !json.includes('"url"'));
+  const button = ephemeral.blocks.find((block: any) => block.type === 'actions').elements[0];
+  assert.match(button.value, /^[0-9a-f-]{36}$/i);
+  assert.notEqual(button.value, 'customdb', 'the control must carry only the opaque request id');
+  assert.deepEqual(
+    await db.get(`SELECT team_id, user_id, provider FROM user_provisioning_request WHERE id=?`, [button.value]),
+    { team_id: 'T1', user_id: 'U_MAYA', provider: 'customdb' },
+  );
   assert.match(ephemeral.text, /stored encrypted/i);
   assert.match(ephemeral.text, /never shown to the agent/i);
 });
@@ -144,4 +153,103 @@ test('connect: key provider with cred → handle, no prompt', async (t) => {
   await c.setUserSecret('customdb', SECRET);
   const handle = await c.connect('customdb'); // must not call any client method
   assert.ok(handle);
+});
+
+function delayedModeRead() {
+  let entered!: () => void;
+  let release!: () => void;
+  const waiting = new Promise<void>((resolve) => { entered = resolve; });
+  const resume = new Promise<void>((resolve) => { release = resolve; });
+  return {
+    waiting,
+    release,
+    store: {
+      getMode: async () => {
+        entered();
+        await resume;
+        return null;
+      },
+    } as unknown as ChannelConfig,
+  };
+}
+
+test('two replicas: delayed key connect cannot mint a prompt or request after offboarding', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const delayed = delayedModeRead();
+  const posts: unknown[] = [];
+  const context = new ConnectContext({
+    identity: ID,
+    channel: 'C1',
+    client: { chat: { postEphemeral: async (post: unknown) => { posts.push(post); return {}; } } } as any,
+    registry: new ProviderRegistry([keyProvider]),
+    vault: new Vault(dbA, KEY),
+    audit: new Audit(dbA),
+    consent: new Consent(dbA),
+    policy: new Policy(),
+    redirectUri: 'http://x',
+    channelConfig: delayed.store,
+  });
+
+  const connecting = context.connect('customdb');
+  await delayed.waiting;
+  await offboardUser(new Vault(dbB, KEY), new Audit(dbB), new Consent(dbB), ID);
+  delayed.release();
+
+  await assert.rejects(connecting, /changed while Vouchr was preparing/i);
+  assert.deepEqual(posts, []);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM user_provisioning_request`))?.n, 0);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))?.n, 0);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM connection`))?.n, 0);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit`))?.n, 0);
+});
+
+test('two replicas: delayed OAuth connect cannot mint a prompt or state after offboarding', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const oauthProvider = defineProvider({
+    id: 'oauth',
+    authorizeUrl: 'https://oauth.test/authorize',
+    tokenUrl: 'https://oauth.test/token',
+    clientId: 'client',
+    clientSecret: 'secret',
+    scopesDefault: ['read'],
+    egressAllow: ['api.test'],
+    refresh: 'none',
+    pkce: true,
+  });
+  const delayed = delayedModeRead();
+  const posts: unknown[] = [];
+  const context = new ConnectContext({
+    identity: ID,
+    channel: 'C1',
+    client: { chat: { postEphemeral: async (post: unknown) => { posts.push(post); return {}; } } } as any,
+    registry: new ProviderRegistry([oauthProvider]),
+    vault: new Vault(dbA, KEY),
+    audit: new Audit(dbA),
+    consent: new Consent(dbA),
+    policy: new Policy(),
+    redirectUri: 'https://vouchr.test/callback',
+    channelConfig: delayed.store,
+  });
+
+  const connecting = context.connect('oauth');
+  await delayed.waiting;
+  await offboardUser(new Vault(dbB, KEY), new Audit(dbB), new Consent(dbB), ID);
+  delayed.release();
+
+  await assert.rejects(connecting, /changed while Vouchr was preparing/i);
+  assert.deepEqual(posts, []);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM user_provisioning_request`))?.n, 0);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))?.n, 0);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM connection`))?.n, 0);
+  assert.equal((await dbA.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit`))?.n, 0);
 });

@@ -25,6 +25,17 @@ test('#212 config mode: a deployment-bound token round-trips with iss/aud/iat/ki
   assert.equal(claims.kid, identityKid(ACTIVE));
 });
 
+test('#194 identity minter round-trips the signed enterprise offboard target', () => {
+  const now = 1_000_000;
+  const claims = verifyIdentity(mintIdentity({
+    ...who,
+    enterpriseId: 'E1',
+    isAdmin: true,
+    offboardTargetUserId: 'U_TARGET',
+  }, cfg(), 60_000, now), cfg(), { now });
+  assert.equal(claims.offboardTargetUserId, 'U_TARGET');
+});
+
 test('#212 normalizeIdentityConfig: rejects malformed, ambiguous, weak, and non-canonical config', () => {
   assert.throws(() => normalizeIdentityConfig(null as any), /plain object/);
   assert.throws(() => normalizeIdentityConfig({ ...cfg(), extra: true } as any), /unknown field/);

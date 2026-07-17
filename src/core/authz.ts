@@ -4,6 +4,7 @@ import { ChannelConfig, type ChannelMode } from './channelConfig';
 import type { Policy } from './policy';
 import { ChannelTools, type ToolManifestEntry } from './tools';
 import type { ProviderRegistry } from './providers';
+import type { Db } from './db';
 
 /**
  * The two SECURITY-CRITICAL decisions — credential-owner resolution and provider authorization —
@@ -122,12 +123,13 @@ export async function authorizeProvider(
   principal: SlackIdentity,
   channel: string | null,
   provider: string,
+  db?: Db,
 ): Promise<AuthzDenial | null> {
   const policyAllows = !policy || policy.check(provider, channel);
   // Resolve the tool-allowlist bit only when policy would allow AND there's a channel + store to
   // restrict against — so a policy-deny still never runs the allowlist query (unchanged short-circuit).
   const toolAllowed = policyAllows && channel && channelTools
-    ? await channelTools.isEnabled(principal.teamId, channel, provider)
+    ? await channelTools.isEnabled(principal.teamId, channel, provider, db)
     : true;
   return authorizeVerdict(policyAllows, toolAllowed);
 }

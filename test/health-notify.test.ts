@@ -74,12 +74,6 @@ function fakeClient(dms: any[], fail?: () => boolean) {
   } as unknown as WebClient;
 }
 
-/** The first button URL in a Block Kit blocks array (the Connect button). */
-function buttonUrl(blocks: any[]): string | undefined {
-  const actions = blocks.find((b) => b.type === 'actions');
-  return actions?.elements?.[0]?.url;
-}
-
 test('classification: credential, configuration, and transient token failures stay distinct through the safe mapper', async () => {
   const provider = acme();
   let next: () => Response | Promise<Response>;
@@ -238,7 +232,7 @@ test('refresh_dead: a throwing hook never masks the original refresh error', asy
   }
 });
 
-test('default notifier: one DM with a reconnect ACTION button (no expirable URL); debounced across repeats and restarts; reconnect resets', async (t) => {
+test('default notifier: one action-free DM; debounced across repeats and restarts; reconnect resets', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -253,13 +247,9 @@ test('default notifier: one DM with a reconnect ACTION button (no expirable URL)
   assert.equal(dms.length, 1);
   assert.equal(dms[0].channel, 'U1'); // DM the owner
   assert.match(dms[0].text, /stopped working/);
-  // The button is an ACTION, not a baked-in authorize URL: a consent state lives 10 minutes and
-  // the DM may be read hours later, so the state is minted on CLICK (see the handler test below).
-  const btn = (dms[0].blocks as any[]).find((b) => b.type === 'actions')?.elements?.[0];
-  assert.equal(btn?.action_id, RECONNECT_ACTION);
-  assert.equal(btn?.value, 'acme');
-  assert.equal(btn?.url, undefined);
-  // Nothing expirable was minted at send time: no consent row exists until the click.
+  // A health DM can outlive offboarding, so it carries no action that could mint fresh authority.
+  assert.equal((dms[0].blocks as any[]).some((b) => b.type === 'actions'), false);
+  assert.match(JSON.stringify(dms[0].blocks), /Ask the agent to reconnect/);
   assert.equal(Number(((await db.get(`SELECT COUNT(*) AS n FROM consent_request`)) as any).n), 0);
 
   await notify(e); // same event within 24h → debounced
@@ -284,8 +274,8 @@ test('default notifier: one DM with a reconnect ACTION button (no expirable URL)
   }
 });
 
-test('reconnect button click mints a FRESH single-use state — works no matter how old the DM is; forged values do nothing', async (t) => {
-  // Drive the registered RECONNECT_ACTION handler through the real createVouchr wiring.
+test('legacy reconnect button is stale guidance only and never mints consent', async (t) => {
+  // Drive the compatibility RECONNECT_ACTION handler through the real createVouchr wiring.
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://broker.example', db: await openTestDb(t) });
   const actions: Record<string, (args: any) => Promise<void>> = {};
@@ -296,29 +286,30 @@ test('reconnect button click mints a FRESH single-use state — works no matter 
   const handler = actions[RECONNECT_ACTION];
   assert.ok(handler, 'RECONNECT_ACTION handler must be registered');
 
-  // The DM itself carries NO consent state (verified in the test above), so there is nothing that
-  // can expire between send and click — clicking at +6h mints a state that is fresh BY CONSTRUCTION.
   const replies: any[] = [];
   let acked = 0;
   const body = { team: { id: 'T1' }, user: { id: 'U1' }, actions: [{ value: 'acme' }] };
+  await vouchr.offboard(ID); // the already-delivered legacy button predates this fence
   await handler({ ack: async () => { acked++; }, body, respond: async (m: any) => { replies.push(m); } });
   assert.equal(acked, 1);
   assert.equal(replies.length, 1);
   assert.equal(replies[0].replace_original, true);
-  const url = buttonUrl(replies[0].blocks);
-  assert.ok(url?.startsWith('https://acme.example/auth?'), `expected an authorize URL, got ${url}`);
-  // The minted state is LIVE and single-use, bound to the ACTING user from the verified payload.
-  const consent = new Consent(vouchr.db);
-  const state = new URL(url!).searchParams.get('state')!;
-  const consumed = await consent.consume(state);
-  assert.equal(consumed?.identity.userId, 'U1');
-  assert.equal(consumed?.channel, null); // DM context: no channel on the consent row
-  assert.equal(await consent.consume(state), null); // single-use
+  assert.equal(replies[0].text, 'This reconnect button is no longer valid. Ask the agent to reconnect.');
+  assert.equal(Number(((await vouchr.db.get(`SELECT COUNT(*) AS n FROM consent_request`)) as any).n), 0);
 
-  // SEC-3/SEC-4: the button value is forgeable — an unregistered provider is refused before any
-  // consent write, and nothing is sent back.
+  // The forgeable legacy value is never inspected or persisted; it receives the same fixed receipt.
   await handler({ ack: async () => {}, body: { ...body, actions: [{ value: 'ghost' }] }, respond: async (m: any) => { replies.push(m); } });
-  assert.equal(replies.length, 1);
+  assert.equal(replies.length, 2);
+  assert.deepEqual(replies[1], replies[0]);
+
+  const fallback: string[] = [];
+  await handler({
+    ack: async () => {},
+    body,
+    respond: async () => { throw new Error('response expired'); },
+    client: { chat: { postMessage: async ({ text }: any) => { fallback.push(text); } } },
+  });
+  assert.deepEqual(fallback, ['This reconnect button is no longer valid. Ask the agent to reconnect.']);
   assert.equal(Number(((await vouchr.db.get(`SELECT COUNT(*) AS n FROM consent_request`)) as any).n), 0);
 });
 

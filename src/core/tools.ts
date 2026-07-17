@@ -2,6 +2,15 @@ import type { Db } from './db';
 import type { Audit } from './audit';
 import type { ChannelMode } from './channelConfig';
 import type { SlackIdentity } from './identity';
+import { withUserInteractionFence } from './consent';
+import { purgeChannelInteractionState } from './interaction';
+import { channelOwner } from './owner';
+import type { Vault } from './vault';
+
+// Like ChannelConfig, the exported class is a read store. Raw writes are symbol-keyed so package
+// consumers cannot bypass the supported governance facade's authorization, locks, purge, and audit.
+const SET_CHANNEL_TOOL_ENABLED = Symbol('set-channel-tool-enabled');
+const APPLY_CHANNEL_TOOLS_ENABLED = Symbol('apply-channel-tools-enabled');
 
 /** One row of a channel's tool manifest: a provider, its channel credential mode, and whether
  *  it's usable in this channel. This is the shape an agent / MCP gateway reads before planning. */
@@ -37,7 +46,7 @@ export class ChannelTools {
   constructor(private db: Db) {}
 
   /** Enable or disable `provider` in this channel. Upsert keyed on (team, channel, provider). */
-  async setEnabled(teamId: string, channel: string, provider: string, enabled: boolean): Promise<void> {
+  async [SET_CHANNEL_TOOL_ENABLED](teamId: string, channel: string, provider: string, enabled: boolean): Promise<void> {
     await this.db.run(
       `INSERT INTO channel_tool (team_id, channel, provider, enabled) VALUES (?,?,?,?)
        ON CONFLICT(team_id, channel, provider) DO UPDATE SET enabled=excluded.enabled`,
@@ -74,7 +83,7 @@ export class ChannelTools {
    * change without its audit row. Any concurrent interleaving converges, while any failure rolls the
    * complete logical mutation back.
    */
-  async applyEnabled(
+  async [APPLY_CHANNEL_TOOLS_ENABLED](
     teamId: string,
     channel: string,
     changes: readonly (readonly [string, boolean])[],
@@ -151,23 +160,46 @@ export class ChannelTools {
    *  backward-compat "all providers enabled" default. Callers about to write the FIRST row (which flips
    *  the channel into allowlist mode, silently disabling every still-row-less provider) use this to
    *  materialize the full desired allowlist instead of a single row. */
-  async isConfigured(teamId: string, channel: string): Promise<boolean> {
-    const row = (await this.db.get(
+  async isConfigured(teamId: string, channel: string, db: Db = this.db): Promise<boolean> {
+    const row = (await db.get(
       `SELECT 1 AS x FROM channel_tool WHERE team_id=? AND channel=? LIMIT 1`,
       [teamId, channel],
     )) as { x: number } | undefined;
     return !!row;
   }
 
-  async isEnabled(teamId: string, channel: string, provider: string): Promise<boolean> {
-    const configured = await this.isConfigured(teamId, channel);
+  async isEnabled(teamId: string, channel: string, provider: string, db: Db = this.db): Promise<boolean> {
+    const configured = await this.isConfigured(teamId, channel, db);
     if (!configured) return true; // no rows for this channel → all providers enabled (backward compat)
-    const row = (await this.db.get(
+    const row = (await db.get(
       `SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?`,
       [teamId, channel, provider],
     )) as { enabled: number } | undefined;
     return row ? !!row.enabled : false; // configured channel = allowlist; unlisted provider → disabled
   }
+}
+
+/** @internal Raw single-row fixture helper. Supported product writes use configureChannelTools. */
+export async function setChannelToolEnabled(
+  tools: ChannelTools,
+  teamId: string,
+  channel: string,
+  provider: string,
+  enabled: boolean,
+): Promise<void> {
+  return tools[SET_CHANNEL_TOOL_ENABLED](teamId, channel, provider, enabled);
+}
+
+/** @internal Atomic first-write primitive for configureChannelTools and store-level tests. */
+export async function applyChannelToolsEnabled(
+  tools: ChannelTools,
+  teamId: string,
+  channel: string,
+  changes: readonly (readonly [string, boolean])[],
+  allProviders: readonly string[],
+  afterWrite?: (tx: Db) => Promise<void>,
+): Promise<void> {
+  return tools[APPLY_CHANNEL_TOOLS_ENABLED](teamId, channel, changes, allProviders, afterWrite);
 }
 
 /**
@@ -178,6 +210,7 @@ export class ChannelTools {
  */
 export async function configureChannelTools(input: {
   channelTools: ChannelTools;
+  vault: Vault;
   audit: Audit;
   identity: SlackIdentity;
   channel: string;
@@ -185,23 +218,61 @@ export async function configureChannelTools(input: {
   allProviders: readonly string[];
   authorize: () => Promise<boolean>;
   assertEligible: () => Promise<void>;
-}): Promise<boolean> {
-  if (!(await input.authorize())) return false;
+  issuance: number;
+}): Promise<'configured' | 'denied' | 'stale'> {
+  if (!(await input.authorize())) return 'denied';
   await input.assertEligible();
-  await input.channelTools.applyEnabled(
-    input.identity.teamId,
-    input.channel,
-    input.changes,
-    input.allProviders,
-    async (tx) => {
-      for (const [providerId, enabled] of input.changes) {
-        await input.audit.record('config', input.identity, providerId, {
-          owner: 'channel',
-          channel: input.channel,
-          tool: enabled ? 'enabled' : 'disabled',
-        }, undefined, tx);
-      }
+  const owner = channelOwner(input.identity.teamId, input.channel);
+  const result = await input.vault.withCredentialLocks(
+    input.changes.map(([provider]) => ({ owner, provider })),
+    async (_locked, tx) => {
+      return withUserInteractionFence(tx, input.identity, input.issuance, async (fencedTx) => {
+        // Compare effective authorization before materializing/upserting. An unconfigured channel is
+        // already all-enabled, so its first explicit `enabled=true` write is not an authority change
+        // and must not revoke live grants. The credential locks serialize same-provider writers; the
+        // snapshot, write, selective purge, and audit all remain in this one transaction.
+        const txTools = new ChannelTools(fencedTx);
+        const desired = new Map(input.changes);
+        const effectiveBefore = new Map<string, boolean>();
+        for (const providerId of desired.keys()) {
+          effectiveBefore.set(
+            providerId,
+            await txTools.isEnabled(
+              input.identity.teamId,
+              input.channel,
+              providerId,
+              fencedTx,
+            ),
+          );
+        }
+        await applyChannelToolsEnabled(
+          txTools,
+          input.identity.teamId,
+          input.channel,
+          input.changes,
+          input.allProviders,
+          async (writeTx) => {
+            // applyEnabled commits the final last-write-wins map, never the intermediate duplicate
+            // tuples. Purge and audit that same state exactly once per provider.
+            for (const [providerId, enabled] of desired) {
+              if (effectiveBefore.get(providerId) !== enabled) {
+                await purgeChannelInteractionState(
+                  writeTx,
+                  input.identity.teamId,
+                  input.channel,
+                  providerId,
+                );
+              }
+              await input.audit.record('config', input.identity, providerId, {
+                owner: 'channel',
+                channel: input.channel,
+                tool: enabled ? 'enabled' : 'disabled',
+              }, undefined, writeTx);
+            }
+          }
+        );
+      });
     },
   );
-  return true;
+  return result.status === 'current' ? 'configured' : 'stale';
 }

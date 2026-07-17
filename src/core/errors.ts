@@ -1,4 +1,4 @@
-import { ApprovalRequiredError } from './approval';
+import { ApprovalPathTooLongError, ApprovalRequiredError } from './approval';
 import { PolicyDeniedError, ToolDisabledError } from './authz';
 import { OverloadedError } from './inflight';
 import { UpstreamTimeoutError } from './httpBounds';
@@ -10,6 +10,11 @@ import {
   ResponseBlockedError,
 } from './injector';
 import { RateLimitedError } from './rateLimit';
+import {
+  InteractionStateChangedError,
+  isInteractionKind,
+  isInteractionStateReason,
+} from './interaction';
 import {
   SECRET_REFERENCE_ERROR_CODES,
   SecretReferenceError,
@@ -27,6 +32,8 @@ export const VOUCHR_ERROR_CODES = Object.freeze([
   'consent_required',
   'session_approval_required',
   'approval_required',
+  'approval_path_too_large',
+  'interaction_state_changed',
   'policy_denied',
   'tool_disabled',
   'not_connected',
@@ -50,6 +57,7 @@ export type VouchrErrorCode = (typeof VOUCHR_ERROR_CODES)[number];
 export const VOUCHR_RECOVERY_ACTIONS = Object.freeze([
   'connect',
   'request_approval',
+  'resolve_again',
   'retry_later',
   'fix_configuration',
   'contact_admin',
@@ -176,6 +184,27 @@ export function mapSafeError(error: unknown): VouchrSafeError {
         message: 'Human approval is required. Request approval, then retry.',
         retryable: false,
         recovery: 'request_approval',
+      };
+    }
+    if (error instanceof ApprovalPathTooLongError) {
+      return {
+        code: 'approval_path_too_large',
+        message: 'The approval action path is too large. Narrow the endpoint and retry.',
+        retryable: false,
+        recovery: 'fix_configuration',
+      };
+    }
+    if (error instanceof InteractionStateChangedError) {
+      if (!isInteractionKind(error.interaction) || !isInteractionStateReason(error.reason)) {
+        return INTERNAL_ERROR;
+      }
+      return {
+        code: 'interaction_state_changed',
+        message: error.reason === 'credential'
+          ? 'The connection changed while Vouchr was handling this request. Resolve it again and retry.'
+          : 'Access changed while Vouchr was handling this request. Resolve current access and retry.',
+        retryable: false,
+        recovery: 'resolve_again',
       };
     }
     if (error instanceof PolicyDeniedError) {
