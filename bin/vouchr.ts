@@ -20,7 +20,15 @@ import { openDb, migrate, type Db } from '../src/core/db';
 import { loadKeyring, type Keyring } from '../src/core/crypto';
 import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
-import { github, google, gitlab, notion, ProviderRegistry, type Provider } from '../src/core/providers';
+import {
+  github,
+  google,
+  gitlab,
+  isValidProviderId,
+  notion,
+  ProviderRegistry,
+  type Provider,
+} from '../src/core/providers';
 import { Vault } from '../src/core/vault';
 import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -116,6 +124,10 @@ type RevokePlan = { db?: string; filter: RevokeFilter; dryRun: boolean };
 function planRevoke(v: StrictValues): RevokePlan | { error: string } {
   const provider = v.provider as string | undefined;
   if (!provider) return { error: '--provider <id> is required (refusing to revoke across every provider)' };
+  if (!isValidProviderId(provider)) return { error: '--provider must be a valid provider id' };
+  if (v.user !== undefined && v.channel !== undefined) {
+    return { error: '--user and --channel are mutually exclusive owner scopes' };
+  }
   const intent = destructiveIntent(v);
   if (typeof intent === 'object') return intent;
   return {
@@ -208,7 +220,7 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * master key (needed only for the best-effort UPSTREAM revoke + token decrypt) are loaded defensively,
  * so a malformed provider config or an unavailable master key disables upstream revoke but never blocks
  * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
- * the upstream revoke, never to stdout. Pending consent + thread grants for the scope are cleared too.
+ * the upstream revoke, never to stdout. Pending consent/session/key-setup authority is cleared too.
  */
 async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   const { filter, dryRun } = plan;
@@ -223,10 +235,29 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   );
   if (dryRun) {
     const pending = await countPendingForProvider(db, filter);
-    if (pending.consents || pending.grants) {
-      console.log(`Would also clear ${pending.consents} pending consent + ${pending.grants} session grant(s).`);
+    if (
+      pending.consents ||
+      pending.requests ||
+      pending.grants ||
+      pending.provisioning ||
+      pending.channelProvisioning
+    ) {
+      console.log(
+        `Would also clear ${pending.consents} pending consent + ${pending.requests} session request(s) + ` +
+        `${pending.grants} session grant(s) + ${pending.provisioning} user setup request(s) + ` +
+        `${pending.channelProvisioning} channel setup request(s).`,
+      );
     }
-    if (rows.length || pending.consents || pending.grants) console.log('\nNo changes made. Re-run with --yes to revoke.');
+    if (
+      rows.length ||
+      pending.consents ||
+      pending.requests ||
+      pending.grants ||
+      pending.provisioning ||
+      pending.channelProvisioning
+    ) {
+      console.log('\nNo changes made. Re-run with --yes to revoke.');
+    }
     return 0;
   }
 
@@ -239,6 +270,14 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   } catch {
     console.error('revoke: provider config unavailable; upstream revoke disabled — local deletion will proceed');
   }
+  // Establish the scoped provisioning fence and clear pending authority BEFORE deleting live rows.
+  // A matching old writer either committed before this marker and appears in the scan below, or it
+  // observes the marker and refuses. Registry membership validates a provider with no stored rows;
+  // a retired provider is recognized from its exact durable state inside the core helper.
+  const purged = await purgePendingForProvider(db, filter, {
+    providerRegistered: registry?.has(filter.provider) ?? false,
+  });
+
   let key: Buffer | Keyring;
   try {
     key = loadKeyring(); // full ring, so post-rotation rows (keyed scheme) still decrypt for upstream revoke
@@ -251,36 +290,45 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
 
-  let localFailures = 0;
+  let localRemoved = 0;
   let upstreamAttempted = 0;
   let upstreamFailures = 0;
   let upstreamSkipped = 0;
-  for (const row of rows) {
-    // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on one row
-    // never strands the rest of a break-glass sweep.
-    try {
-      const r = await revokeConnection(vault, audit, consent, sessions, registry, row, filter.provider);
-      if (!r.removed) localFailures++;
-      if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
-      else upstreamSkipped++;
-    } catch {
-      localFailures++;
-      // A provider/KMS extension may include credential material in a thrown value. Keep the
-      // break-glass sweep moving, but never serialize that value (SEC-1).
-      console.error('revoke: one connection failed; continuing');
+  const revokeRows = async (batch: typeof rows) => {
+    for (const row of batch) {
+      // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on
+      // one row never strands the rest of a break-glass sweep.
+      try {
+        const r = await revokeConnection(vault, audit, consent, sessions, registry, row, filter.provider);
+        if (r.removed) {
+          localRemoved++;
+          if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
+          else upstreamSkipped++;
+        }
+      } catch {
+        // A provider/KMS extension may include credential material in a thrown value. Keep the
+        // break-glass sweep moving, but never serialize that value (SEC-1).
+        console.error('revoke: one connection failed; continuing');
+      }
     }
-  }
-  // Clear pending consent + thread grants for the SCOPE regardless of whether any connection matched —
-  // an in-flight "Connect" or a lingering grant with no live connection would otherwise resurrect access.
-  const purged = await purgePendingForProvider(db, filter);
-  const revoked = rows.length - localFailures;
-  console.log(`\nRevoked ${revoked}/${rows.length} locally.`);
+  };
+  // Re-select after the fence: a pre-fence writer that owned its scope lock was allowed to finish,
+  // and is now a normal visible row that this same command must remove.
+  await revokeRows(await selectRevocations(db, filter));
+  const settledRows = await selectRevocations(db, filter);
+  if (settledRows.length) await revokeRows(settledRows);
+  const remaining = await selectRevocations(db, filter);
+  console.log(`\nRevoked ${localRemoved} locally; ${remaining.length} matching connection(s) remain.`);
   // Report upstream honestly: attempted vs skipped (no revoke endpoint / no decryptable token) are NOT
   // the same as success. A skip is not a failure, but it is not a revoke either.
   console.log(`Upstream revoke: ${upstreamAttempted} attempted (${upstreamFailures} failed), ${upstreamSkipped} skipped (no revoke endpoint or no decryptable token).`);
-  console.log(`Cleared ${purged.consents} pending consent + ${purged.grants} session grant(s).`);
-  // Non-zero only when a LOCAL deletion failed (access still present); upstream failures don't fail.
-  return localFailures ? 1 : 0;
+  console.log(
+    `Cleared ${purged.consents} pending consent + ${purged.requests} session request(s) + ` +
+    `${purged.grants} session grant(s) + ${purged.provisioning} user setup request(s) + ` +
+    `${purged.channelProvisioning} channel setup request(s).`,
+  );
+  // Non-zero only when local access remains; upstream failures do not fail the local kill.
+  return remaining.length ? 1 : 0;
 }
 
 /**
@@ -469,6 +517,7 @@ Commands:
                 --team <id>      narrow to one team
                 --user <id>      narrow to one user's own credentials
                 --channel <id>   narrow to one channel's shared credentials
+                                  (--user and --channel are mutually exclusive)
                 --yes            actually revoke (default is a dry-run)
                 exits non-zero if any LOCAL deletion failed
   doctor      Diagnostics (PASS/FAIL): master key(s), DB reachability, row counts.

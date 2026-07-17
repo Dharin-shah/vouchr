@@ -410,6 +410,9 @@ test('broker: provider-level size/content-type breaches deny on the wire (413/50
     const big = await call('acme');
     assert.equal(big.status, 413);
     assert.equal(big.json.error, 'response blocked'); // the injector's static message, not the broker's own #26 gate
+    assert.equal(big.json.code, 'response_blocked');
+    assert.equal(big.json.retryable, false);
+    assert.equal(big.json.recovery, 'fix_configuration');
     assert.ok(!JSON.stringify(big.json).includes('MUST_NEVER_LEAK'), 'over-cap body leaked onto the wire');
     assert.ok(!JSON.stringify(big.json).includes(SECRET_TOKEN));
 
@@ -417,6 +420,9 @@ test('broker: provider-level size/content-type breaches deny on the wire (413/50
     const wrong = await call('acmect');
     assert.equal(wrong.status, 502);
     assert.equal(wrong.json.error, 'response blocked');
+    assert.equal(wrong.json.code, 'response_blocked');
+    assert.equal(wrong.json.retryable, false);
+    assert.equal(wrong.json.recovery, 'fix_configuration');
     assert.ok(!JSON.stringify(wrong.json).includes('login'), 'disallowed body leaked onto the wire');
 
     const rows = await db.all(`SELECT provider, meta FROM audit WHERE action='denied' ORDER BY at`);

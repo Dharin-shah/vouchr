@@ -5,6 +5,7 @@ import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
+import { Consent } from '../src/core/consent';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { defineProvider } from '../src/core/providers';
@@ -29,6 +30,12 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
 }
 const userToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims(over), SECRET);
 const adminToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, ...over }), SECRET);
+const STALE_ACTOR_ERROR = {
+  error: 'authorization changed; resolve and retry',
+  code: 'interaction_state_changed',
+  retryable: false,
+  recovery: 'resolve_again',
+};
 
 async function harness(t: TestContext) {
   const db = await openTestDb(t);
@@ -39,7 +46,7 @@ async function harness(t: TestContext) {
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',
   });
   await new Promise<void>((r) => server.listen(0, r));
-  return { audit, server, port: (server.address() as any).port };
+  return { audit, db, server, port: (server.address() as any).port };
 }
 
 function request(port: number, method: string, urlPath: string, body?: unknown): Promise<{ status: number; json: any }> {
@@ -90,6 +97,26 @@ test('POST /v1/audit: empty events when the caller has no rows; no meta key anyw
   } finally { server.close(); }
 });
 
+test('POST /v1/audit rejects an assertion issued before the acting user was offboarded', async (t) => {
+  const { audit, db, server, port } = await harness(t);
+  try {
+    await audit.record('inject', uid('U1'), 'gh-visible-only-to-current-u1', { host: 'api.x' });
+    const stale = userToken();
+    await new Consent(db).markOffboarded(uid('U1'));
+    const before = await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM audit');
+
+    const response = await request(port, 'POST', '/v1/audit', { identityToken: stale });
+
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.json, STALE_ACTOR_ERROR);
+    assert.equal(
+      (await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM audit'))?.n,
+      before?.n,
+      'a stale audit read has no audit-table side effect',
+    );
+  } finally { server.close(); }
+});
+
 test('POST /v1/admin/audit: signed admin sees only THIS channel\'s rows', async (t) => {
   const { audit, server, port } = await harness(t);
   try {
@@ -110,5 +137,27 @@ test('POST /v1/admin/audit: a non-admin token is refused (authority is the signe
     // A forged body isAdmin must be ignored — only the signed claim counts.
     const res = await request(port, 'POST', '/v1/admin/audit', { identityToken: userToken(), isAdmin: true } as any);
     assert.equal(res.status, 403);
+  } finally { server.close(); }
+});
+
+test('POST /v1/admin/audit rejects stale admin and non-admin assertions before reads or denial audit', async (t) => {
+  const { audit, db, server, port } = await harness(t);
+  try {
+    await audit.record('inject', uid('U2'), 'gh-visible-only-to-current-admin', { channel: 'C1' });
+    const staleAdmin = adminToken();
+    const staleNonAdmin = userToken();
+    await new Consent(db).markOffboarded(uid('U1'));
+    const before = await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM audit');
+
+    for (const identityToken of [staleAdmin, staleNonAdmin]) {
+      const response = await request(port, 'POST', '/v1/admin/audit', { identityToken });
+      assert.equal(response.status, 409);
+      assert.deepEqual(response.json, STALE_ACTOR_ERROR);
+    }
+    assert.equal(
+      (await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM audit'))?.n,
+      before?.n,
+      'stale admin reads are refused before requireAdmin can append a denial row',
+    );
   } finally { server.close(); }
 });

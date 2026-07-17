@@ -52,11 +52,35 @@ vouchr inventory --team T123 --provider github
 
 ### `channels`
 Per-channel policy at a glance from `channel_config` + `channel_tool`: team, channel,
-provider, mode (`shared` | `per-user`), enabled (`yes` | `no` | `-`).
+provider, mode (`shared` | `per-user` | `session`), enabled (`yes` | `no` | `-`).
 
 ```bash
 vouchr channels --team T123
 ```
+
+### `revoke`
+
+Break-glass incident response for one provider. Dry-run is the default: it reads matching connection
+and pending-authority counts, writes no revocation marker, and deletes nothing. An exact bare `--yes`
+first commits a durable provider+scope fence, then clears matching pending authority (including
+opaque user and channel credential-setup requests), deletes local
+credentials, and attempts supported upstream revocation best-effort. A matching setup that began
+before the fence either finishes first and is found by the post-fence scan or is refused; a genuinely
+new setup begun afterward remains possible.
+
+```bash
+vouchr revoke --provider github                         # dry-run, all owners
+vouchr revoke --provider github --team T123 --yes       # users + channels in one team
+vouchr revoke --provider github --user U123 --yes       # this user's own rows across teams
+vouchr revoke --provider github --channel C123 --yes    # this shared channel owner across teams
+```
+
+`--team` composes with either owner scope. `--user` and `--channel` are mutually exclusive: the
+consent row's channel is request origin, not shared-credential ownership. Durable markers store only
+a fixed hash of the selected scope. A provider must be currently registered or already present under
+that exact validated id in Vouchr's durable state; an unrecognized typo cannot create a marker. The
+command exits non-zero if the fence cannot be established or matching local access remains. Upstream
+attempted, failed, and skipped counts are reported separately; a skip is never called success.
 
 ### `doctor`
 Diagnostics printed as `PASS`/`FAIL` (plus `INFO` lines). Exits non-zero if any check

@@ -21,12 +21,31 @@ export class ResponseBodyTooLargeError extends Error {
   }
 }
 
+/** A provider request exceeded Vouchr's own bounded deadline. Caller-owned cancellation and
+ * caller-owned timeout signals remain their original abort reasons instead of using this type. */
+export class UpstreamTimeoutError extends Error {
+  readonly code = 'upstream_timeout' as const;
+
+  constructor() {
+    super('Upstream request timed out.');
+    this.name = 'UpstreamTimeoutError';
+  }
+}
+
 export interface DisposableDeadline {
   signal: AbortSignal;
   /** True only when this helper's timer fired, not when the caller cancelled. */
   timedOut: () => boolean;
   /** Release the timer and caller-signal listener. Idempotent; does not abort completed work. */
   dispose: () => void;
+}
+
+// Identity, not the public DOMException name, distinguishes a Vouchr-owned deadline from a
+// caller-supplied AbortSignal.timeout(). Nested internal layers can preserve that provenance.
+const vouchrDeadlineReasons = new WeakSet<object>();
+
+export function isVouchrDeadlineReason(reason: unknown): boolean {
+  return typeof reason === 'object' && reason !== null && vouchrDeadlineReasons.has(reason);
 }
 
 /**
@@ -63,7 +82,9 @@ export function disposableDeadline(timeoutMs: number, caller?: AbortSignal): Dis
     timer = setTimeout(() => {
       if (!release()) return;
       didTimeout = true;
-      controller.abort(new DOMException('HTTP deadline exceeded', 'TimeoutError'));
+      const reason = new DOMException('HTTP deadline exceeded', 'TimeoutError');
+      vouchrDeadlineReasons.add(reason);
+      controller.abort(reason);
     }, timeoutMs);
   }
 
@@ -154,7 +175,11 @@ export async function readResponseJsonCapped(response: Response, maxBytes = OAUT
  * retain its deadline until its caller actually consumes the provider body without leaking the timer
  * for fast responses.
  */
-export function responseWithCleanup(response: Response, cleanup: () => void): Response {
+export function responseWithCleanup(
+  response: Response,
+  cleanup: () => void,
+  mapBodyError: (error: unknown) => unknown = (error) => error,
+): Response {
   let cleaned = false;
   const finish = () => {
     if (cleaned) return;
@@ -187,7 +212,7 @@ export function responseWithCleanup(response: Response, cleanup: () => void): Re
       } catch (error) {
         release();
         finish();
-        controller.error(error);
+        controller.error(mapBodyError(error));
       }
     },
     async cancel(reason) {

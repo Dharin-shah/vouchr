@@ -1,5 +1,11 @@
 import type { Db } from './db';
 
+// Write capability kept module-private. `ChannelConfig` is exported to headless hosts as the
+// broker's read store, but a naked row upsert would bypass lifecycle locks, dependent-state purge,
+// authorization, and audit. Internal core mutations use `writeChannelMode`; package entry points do
+// not export that helper, so supported writes go through the Bolt/headless governance facades.
+const WRITE_CHANNEL_MODE = Symbol('write-channel-mode');
+
 /**
  * Per-channel auth mode for a provider. The single source of truth for which credential model
  * `connect()` uses in this channel:
@@ -47,7 +53,12 @@ export function channelIneligibleReason(info: ChannelInfo | null | undefined): s
 
 /** Store for `(team_id, channel, provider) → mode`. Non-secret; just the policy bit. */
 export class ChannelConfig {
-  constructor(private db: Db) {}
+  constructor(
+    private db: Db,
+    /** Test/diagnostic hook inside the caller's lifecycle transaction. It can observe or fail a
+     * write but cannot authorize one. */
+    private beforeWrite?: (provider: string, mode: ChannelMode) => Promise<void>,
+  ) {}
 
   async getMode(teamId: string, channel: string, provider: string, db: Db = this.db): Promise<ChannelMode | null> {
     const row = (await db.get(
@@ -68,7 +79,7 @@ export class ChannelConfig {
     return (provider) => m.get(provider) ?? null;
   }
 
-  async setMode(
+  async [WRITE_CHANNEL_MODE](
     teamId: string,
     channel: string,
     provider: string,
@@ -78,10 +89,24 @@ export class ChannelConfig {
     // Defense-in-depth at the true sink: TypeScript's `ChannelMode` is compile-time only, so a value
     // arriving from an untrusted surface (modal/broker/slash) could still be a bogus string at runtime.
     if (!isChannelMode(mode)) throw new Error(`invalid channel mode: ${mode}`);
+    await this.beforeWrite?.(provider, mode);
     await db.run(
       `INSERT INTO channel_config (team_id, channel, provider, mode) VALUES (?,?,?,?)
        ON CONFLICT(team_id, channel, provider) DO UPDATE SET mode=excluded.mode`,
       [teamId, channel, provider, mode],
     );
   }
+}
+
+/** @internal Raw row write for already-authorized, lifecycle-locked core mutations and fixtures.
+ * This is deliberately not re-exported from the package entry points. */
+export async function writeChannelMode(
+  config: ChannelConfig,
+  teamId: string,
+  channel: string,
+  provider: string,
+  mode: ChannelMode,
+  db?: Db,
+): Promise<void> {
+  return config[WRITE_CHANNEL_MODE](teamId, channel, provider, mode, db);
 }

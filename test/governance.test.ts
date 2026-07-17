@@ -9,6 +9,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
+import { CONFIGURE_CALLBACK } from '../src/adapters/blocks';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -117,12 +118,20 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
 
   const out: string[] = [];
   let opened: any = null;
+  let hydrated: any = null;
   const client = {
     users: { info: async () => ({ user: { is_admin: false } }) },
     // enable/configure now assert channel eligibility at the mutation (like mode always did),
     // so the fake must serve conversations.info for an ordinary eligible channel.
     conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }) },
-    views: { open: async (a: any) => { opened = a; } },
+    views: {
+      open: async (a: any) => {
+        opened = a;
+        return { view: { id: 'V_LOADING' } };
+      },
+      update: async ({ view }: any) => { hydrated = view; },
+    },
+    chat: { postMessage: async () => ({}) },
   };
   const base = { team_id: 'T1', user_id: 'U_ADMIN', channel_id: 'C_FIN', trigger_id: 'trig' };
 
@@ -143,4 +152,6 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
     client,
   });
   assert.equal(opened?.trigger_id, 'trig');
+  assert.equal(opened?.view?.callback_id, undefined);
+  assert.equal(hydrated?.callback_id, CONFIGURE_CALLBACK);
 });

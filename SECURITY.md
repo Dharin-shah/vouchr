@@ -61,6 +61,30 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   Rotate referenced credentials in their source manager. Providers without revocation support and
   trusted dry-run rows are intentional skips. A network/provider failure likewise cannot keep local
   access alive, but upstream revocation is not guaranteed.
+- **Local offboarding is a durable user-authority fence.** User OAuth, static-key, and reference
+  writes are ordered against a PostgreSQL tombstone. Slack setup controls and deployment-bound
+  headless assertions minted before that fence cannot recreate local access afterward. Retained
+  Bolt handles and broker assertions are checked before secret access and again immediately before
+  provider send, including when the credential belongs to a shared channel and therefore remains
+  available to other current users. Pending and granted approvals requested by the departed user are
+  removed best-effort; their creation time is also checked against the tombstone at decision and
+  consumption, and an approver's stale control receipt is refused. Callers must obtain a fresh setup
+  or use receipt after legitimate re-onboarding. Enterprise/global offboarding records its scope
+  before discovering rows, so the fence also applies to an artifact-free Grid workspace. Once a
+  request passes the final provider-send fence and is dispatched, later offboarding cannot recall it.
+- **Disconnect and shared-channel changes fence older setup authority.** Ordinary credential
+  deletion commits an exact provider/owner provisioning marker before removal; a failed bounded-row
+  cleanup therefore cannot let an already-exposed key form or OAuth callback recreate access after
+  Disconnect reports completion. For shared credentials, every effective credential, mode, or tool
+  mutation advances a channel/provider tombstone atomically with dependent-state cleanup. Setup
+  received before that marker cannot hydrate or commit afterward, including when Slack modal or
+  admin checks delayed request persistence. Same-value governance retries leave current forms valid.
+- **Confirmed break-glass revoke is a scoped provisioning fence.** `vouchr revoke --yes` commits a
+  provider+scope marker before it enumerates pending or live state. Older matching user and shared
+  channel writes cannot land after the command reports no local access; outstanding opaque channel
+  setup requests are counted and purged with their channel/team/global scope. A fresh setup begun
+  after the marker remains possible. `--user` and `--channel` are distinct owner scopes, dry-run
+  writes no marker, and raw scope ids are represented durably only by fixed server-derived hashes.
 - **Audit metadata is caller-supplied.** Vouchr's own code keeps secrets out of `audit.meta`
   (and tests enforce it), but a custom provider/`accountProbe` or caller could put sensitive data
   in metadata. Don't.

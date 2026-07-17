@@ -9,10 +9,12 @@
 /**
  * Thrown when the (owner, provider) token bucket is empty. Carries structured, NO-SECRET fields so
  * each surface renders its own message: the Bolt adapter posts an ephemeral "Slow down …", the HTTP
- * broker maps it to 429 with a `Retry-After` header. The message text is Vouchr-authored and
- * secret-free, so `safeUserMessage` (bolt.ts) may echo it to the user verbatim.
+ * broker maps it to 429 with a `Retry-After` header. The core safe mapper derives fixed copy from
+ * the structured retry hint; constructor message text is not itself a rendering trust boundary.
  */
 export class RateLimitedError extends Error {
+  readonly code = 'rate_limited' as const;
+
   constructor(
     /** Provider id, from the registry-validated provider (never raw caller input). */
     public provider: string,

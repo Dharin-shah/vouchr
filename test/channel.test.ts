@@ -9,6 +9,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext } from '../src/adapters/bolt';
+import { mapSafeError } from '../src/core/errors';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -28,11 +29,15 @@ async function ctx(
   convo: any = {},
   policy = new Policy(),
   resolvers: any = { 'aws-sm': async () => SECRET },
+  failModeWrite = false,
 ) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const channelConfig = new ChannelConfig(db);
+  const channelConfig = new ChannelConfig(
+    db,
+    failModeWrite ? async () => { throw new Error('mode unavailable'); } : undefined,
+  );
   const client = {
     users: { info: async () => ({ user: { is_admin: isAdmin } }) },
     conversations: {
@@ -42,12 +47,12 @@ async function ctx(
       },
     },
   } as any;
-  const c = new ConnectContext({
+  const freshContext = () => new ConnectContext({
     identity: ID, channel, client, registry: new ProviderRegistry([provider]), vault, audit,
     consent: new Consent(db), policy, redirectUri: 'http://x', channelConfig,
     resolvers,
   });
-  return { c, db, vault, audit, channelConfig };
+  return { c: freshContext(), freshContext, db, vault, audit, channelConfig };
 }
 
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
@@ -63,7 +68,7 @@ test('T6 setChannelSecret: admin-gated, audited, atomic overwrite', async (t) =>
   const ok = await ctx(t, true);
   await ok.c.setChannelSecret('mcp', SECRET);
   assert.equal((await ok.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
-  await ok.c.setChannelSecret('mcp', 'second-value'); // overwrite
+  await ok.freshContext().setChannelSecret('mcp', 'second-value'); // a distinct Slack interaction overwrites
   assert.equal((await ok.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, 'second-value');
   assert.equal(await connCount(ok.db), 1); // exactly one connection row → atomic, not duplicated
   assert.deepEqual((await auditRows(ok.db)).map((r) => r.action), ['config', 'config']);
@@ -87,8 +92,9 @@ test('T7 setChannelSecret: secret never leaks to audit/return/error', async (t) 
 });
 
 test('setChannelSecret rolls back connection, mode, and audit on a mode-write failure', async (t) => {
-  const { c, db, vault, channelConfig } = await ctx(t, true);
-  channelConfig.setMode = async () => { throw new Error('mode unavailable'); };
+  const { c, db, vault } = await ctx(
+    t, true, 'C_FIN', {}, new Policy(), { 'aws-sm': async () => SECRET }, true,
+  );
 
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /mode unavailable/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
@@ -118,11 +124,11 @@ test('setChannelMode preserves the shared credential and mode when its audit fai
 
 // invariant 7: a per-user-locked channel refuses static keys and references.
 test('per-user lock refuses shared creds (invariant 7)', async (t) => {
-  const { c } = await ctx(t, true);
+  const { c, freshContext } = await ctx(t, true);
   await c.setChannelMode('mcp', 'per-user');
-  await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /per-user/);
+  await assert.rejects(() => freshContext().setChannelSecret('mcp', SECRET), /per-user/);
   await assert.rejects(
-    () => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }),
+    () => freshContext().referenceChannelSecret('mcp', { secretRef: AWS_REF }),
     /per-user/,
   );
 });
@@ -144,8 +150,9 @@ test('referenceChannelSecret stores the ARN pointer, not a secret', async (t) =>
 });
 
 test('referenceChannelSecret rolls back connection, mode, and audit on a mode-write failure', async (t) => {
-  const { c, db, vault, channelConfig } = await ctx(t, true);
-  channelConfig.setMode = async () => { throw new Error('mode unavailable'); };
+  const { c, db, vault } = await ctx(
+    t, true, 'C_FIN', {}, new Policy(), { 'aws-sm': async () => SECRET }, true,
+  );
 
   await assert.rejects(() => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }), /mode unavailable/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
@@ -204,7 +211,10 @@ test('connectChannel: refused + audited when policy denies the provider in this 
   const deny = new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } });
   const ok = await ctx(t, true, 'C_FIN', {}, deny);
   await ok.c.setChannelSecret('mcp', SECRET); // config is admin-gated, not policy-gated
-  await assert.rejects(async () => ok.c.connectChannel('mcp'), /Policy denies/);
+  await assert.rejects(
+    async () => ok.c.connectChannel('mcp'),
+    (error: unknown) => mapSafeError(error).code === 'policy_denied',
+  );
   assert.ok((await auditRows(ok.db)).some((r) => r.action === 'denied'));
 });
 

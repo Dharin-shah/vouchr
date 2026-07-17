@@ -7,12 +7,18 @@
  * imports ONLY from `./core/*`, `./adapters/http/*`, `./adapters/kms`, and `../bin/broker-server`
  * (itself Bolt-free — see broker-server.ts). It must NEVER import `./adapters/bolt`, so its resolved
  * module graph never reaches `@slack/*`. A build-time check (test/headless-boltfree.test.ts) enforces
- * this. The root `./index.ts` stays unchanged for back-compat.
+ * this. The root `./index.ts` remains the Slack-inclusive entry point.
  */
 
 // ── the broker + its request/option types ──
 export { createBroker } from './adapters/http/broker';
-export type { BrokerOptions, BrokerFetchRequest, BrokerMcpRequest, ConnectionHandleRef } from './adapters/http/broker';
+export type {
+  BrokerOptions,
+  BrokerServer,
+  BrokerFetchRequest,
+  BrokerMcpRequest,
+  ConnectionHandleRef,
+} from './adapters/http/broker';
 
 // ── the ready-to-run headless server (env → wired broker), same core the standalone binary uses ──
 export { buildBrokerServer } from '../bin/broker-server';
@@ -20,8 +26,10 @@ export type { BuiltBroker } from '../bin/broker-server';
 
 // ── low-level building blocks for the FLEXIBLE direct-construction path: BrokerOptions requires a
 // vault/audit/db, so a typed consumer must be able to build them with ONLY `./headless` imports
-// (openDb → new Vault → new Audit → createBroker). Consent/SessionGrants/sweepExpired/TtlPolicy are
-// the lifecycle bits a headless deploy wires for the TTL sweep. All core — no @slack in the graph. ──
+// (openDb → new Vault → new Audit → createBroker). Direct brokers schedule the returned server's
+// safe sweepExpired() facade, which also owns private interaction cleanup. Consent/core
+// sweepExpired/TtlPolicy remain available for lower-level lifecycle integrations. All core — no
+// @slack in the graph. ──
 export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
 export { Vault } from './core/vault';
@@ -32,11 +40,22 @@ export type { Keyring, MasterKeys, EnvelopeProvider } from './core/crypto';
 export { Audit } from './core/audit';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';
-export { SessionGrants } from './core/session';
-// #113 human-in-the-loop approval: the broker maps ApprovalRequiredError to 403 approval_required;
-// the store is exported (like SessionGrants) so a headless host can drive its own approve/deny
-// surface and wire the sweep. All core — no @slack in the graph.
-export { ApprovalRequiredError, Approvals } from './core/approval';
+// Shared typed operational failures + the single safe recovery mapper. These imports are all core,
+// so the headless graph stays independent of Bolt/Slack packages.
+export {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UpstreamTimeoutError,
+  UserFacingError,
+  VOUCHR_ERROR_CODES,
+  VOUCHR_RECOVERY_ACTIONS,
+  mapSafeError,
+  safeUserMessage,
+} from './core/errors';
+export type { VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
+// The broker maps this typed control-flow error to 403. Interaction stores are not exported: until
+// the later hybrid bridge lands, only packaged Bolt/broker paths own safe interaction mutations.
+export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval';
 export { sweepExpired } from './core/sweep';
 
 // ── signed identity minting/verification (the headless auth contract) ──
@@ -80,11 +99,19 @@ export type { ChannelMode } from './core/channelConfig';
 // BrokerOptions. All core/adapters-http — no @slack in the graph. ──
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
+export { PolicyDeniedError, ToolDisabledError } from './core/authz';
 export { ChannelTools } from './core/tools';
+export { InteractionStateChangedError } from './core/interaction';
 export type { ToolManifestEntry } from './core/tools';
 export type { Resolvers, EventSink, VouchrEvent } from './core/injector';
-export { ResolverFailedError } from './core/injector';
-export { SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
+export {
+  EgressBlockedError,
+  NoConnectionError,
+  ResolverConfigurationError,
+  ResolverFailedError,
+  ResponseBlockedError,
+} from './core/injector';
+export { SECRET_REFERENCE_ERROR_CODES, SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
 export type {
   SecretReference,
   SecretReferenceErrorCode,
@@ -100,7 +127,8 @@ export type { RateLimitStore } from './core/rateLimit';
 // headless notifier should use (reconnect/delete clear it). All core — no @slack in the graph.
 export { NotificationState, HEALTH_NOTIFY_DEBOUNCE_MS } from './core/health';
 export type { CredentialHealthEvent, CredentialHealthHook } from './core/health';
-export { TokenEndpointError } from './core/tokens';
+export { TOKEN_ENDPOINT_FAILURE_KINDS, TokenEndpointError } from './core/tokens';
+export type { TokenEndpointFailureKind } from './core/tokens';
 
 // ── exported wire RESPONSE types (mirror the broker's HTTP responses) ──
 export type {

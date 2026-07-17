@@ -17,8 +17,11 @@ export function awsSecretsManager(): Resolvers {
   const client = new SecretsManagerClient({});
 
   return {
-    'aws-sm': async (arn: string): Promise<string> => {
-      const out = await client.send(new GetSecretValueCommand({ SecretId: arn }));
+    'aws-sm': async (arn: string, signal?: AbortSignal): Promise<string> => {
+      const out = await client.send(
+        new GetSecretValueCommand({ SecretId: arn }),
+        { abortSignal: signal },
+      );
 
       if (out.SecretString != null) return out.SecretString;
 

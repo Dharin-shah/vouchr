@@ -69,7 +69,7 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
     ...opts,
   });
   await new Promise<void>((r) => server.listen(0, r));
-  return { server, db, port: (server.address() as any).port };
+  return { server, vault, db, port: (server.address() as any).port };
 }
 
 function request(
@@ -223,8 +223,9 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
   } },
   { name: 'disconnect', run: async (t) => {
       // U1 has the seeded acme credential, so `revoked` is non-empty → its element type is frozen.
-      const { server, port } = await makeBroker(t);
-      try { return await request(port, 'POST', '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: userToken() }); } finally { server.close(); }
+      const { server, vault, port } = await makeBroker(t);
+      const credentialId = await vault.liveId(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+      try { return await request(port, 'POST', '/v1/disconnect', { handle: { provider: 'acme', credentialId }, identityToken: userToken() }); } finally { server.close(); }
   } },
   { name: 'admin.offboard.ok', run: async (t) => {
       // Admin offboards U1 (who has acme) → revoked:[string].

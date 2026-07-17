@@ -5,6 +5,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import http from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { loadProviders } from '../bin/providerConfig';
 import { beginBrokerDrain, buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
@@ -389,7 +390,12 @@ test('#236 packaged policy trusts the signed channel and denies before credentia
       channel: 'C_ALLOWED',
     });
     assert.equal(denied.status, 403);
-    assert.deepEqual(denied.json, { error: 'policy denies this provider in this channel' });
+    assert.deepEqual(denied.json, {
+      error: 'policy denies this provider in this channel',
+      code: 'policy_denied',
+      retryable: false,
+      recovery: 'contact_admin',
+    });
     assert.equal(resolverCalls, 0, 'policy must run before an external reference is resolved');
     assert.equal(upstreamCalls, 0, 'policy must run before provider I/O');
 
@@ -495,7 +501,12 @@ test('#240 packaged broker shares and enforces channel governance across every d
       provider: 'fetcher', enabled: false, identityToken: adminToken(),
     });
     assert.equal(auditRejected.status, 500);
-    assert.deepEqual(auditRejected.json, { error: 'internal error' });
+    assert.deepEqual(auditRejected.json, {
+      error: 'internal error',
+      code: 'internal_error',
+      retryable: false,
+      recovery: 'contact_admin',
+    });
     const rolledBackTools = await built.db.get<{ n: number }>(
       `SELECT count(*)::int AS n FROM channel_tool WHERE team_id=? AND channel=?`,
       ['T1', 'C1'],
@@ -570,8 +581,11 @@ test('#240 packaged broker shares and enforces channel governance across every d
     // same shared core mutation while the packaged broker keeps serving from its own pool.
     const controlDb = await openDb({ databaseUrl: env.VOUCHR_DATABASE_URL });
     try {
+      const controlVault = new Vault(controlDb, randomBytes(32));
+      const issuance = await controlVault.userProvisioningIssuedAt();
       await configureChannelTools({
         channelTools: new ChannelTools(controlDb),
+        vault: controlVault,
         audit: new Audit(controlDb),
         identity: { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' },
         channel: 'C1',
@@ -579,6 +593,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
         allProviders: providerConfig.map((provider) => provider.id),
         authorize: async () => true,
         assertEligible: async () => undefined,
+        issuance,
       });
     } finally {
       await controlDb.close();

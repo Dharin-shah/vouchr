@@ -126,7 +126,8 @@ compatibility layers or hardening beyond what is needed to remove them safely.
 
 1. A person asks a Slack agent to use a provider.
 2. The agent asks Vouchr for a handle, never a token.
-3. If no credential or session grant exists, Vouchr posts one private, deduplicated prompt.
+3. If no credential or session grant exists, Vouchr records one durable request and posts a private,
+   best-effort deduplicated prompt.
 4. The person connects through OAuth or approves the thread-scoped session.
 5. Vouchr stores the credential encrypted and the person retries the request.
 6. Vouchr validates policy and egress, injects the credential, and returns only the provider
@@ -158,8 +159,17 @@ Vouchr is secure by construction where it can be, and explicit about residual ri
 - No credential, OAuth code/state, identity assertion, sensitive request body, or resolved secret
   appears in Slack, browser error pages, logs, metrics, audit metadata, tool schemas, or committed
   fixtures. Tests may use clearly synthetic, non-secret request bodies.
-- OAuth state and approvals are bounded, single-use, owner-bound, and consumed atomically.
-- Offboarding fences in-flight callbacks so earlier consent cannot recreate access afterward.
+- OAuth state, credential-setup requests, and approvals are bounded, single-use, owner-bound, and
+  consumed atomically; Slack modal metadata never supplies channel/provider authority.
+- Offboarding fences every user authority path: OAuth callbacks, static keys, external references,
+  retained credential handles, and requester-bound approvals. An earlier Slack receipt or headless
+  identity assertion cannot recreate or keep exercising access; retained use is rechecked before
+  secret access and provider send. Shared channel credentials remain available to other current
+  actors. Enterprise/global scope tombstones apply before artifact discovery, including empty
+  workspaces.
+- Confirmed break-glass revocation fences every matching older user or shared-channel provisioning
+  write at its exact provider/owner scope before cleanup is reported complete; new setup remains an
+  explicit post-incident action.
 - Egress validates HTTPS, origin, path, method, redirects, and provider rules before reading the
   credential.
 - Broker assertions are short-lived, replay-protected across replicas, and bound to one deployment.
@@ -215,8 +225,9 @@ parallel when it does not create conflicting foundations.
   runtime database and migration/runtime roles are separated.
 - [#194](https://github.com/Dharin-shah/vouchr/issues/194): the commands/rendering/disconnect slice
   landed in [PR #244](https://github.com/Dharin-shah/vouchr/pull/244), and Vouchr-owned private
-  previews are removed; complete pending-interaction state, OAuth/API recovery, typed errors, and
-  the trusted broker-to-Slack recovery bridge.
+  previews are removed. Persistent single-use interaction state, OAuth/API recovery, offboarding
+  fences, and typed errors are complete. The remaining focused slice is the trusted broker-to-Slack
+  recovery bridge.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility
 project would require a new explicit product decision backed by a concrete deployed lineage; it is
@@ -227,16 +238,16 @@ it does not gate independent storage or broker-security changes.
 ### 3. Finish the retained security and performance boundary
 
 After the PostgreSQL-only foundation, these issues may proceed independently where their files and
-state machines do not conflict. #192, #208, #211, and #212 are complete. #209 must finish the
-measured resource envelope for the deployment proof; #241 must close the documented KMS boundary
-before a multi-workspace production claim.
+state machines do not conflict. #192, #208, #209, #211, and #212 are complete. #241 must close the
+documented KMS boundary before a multi-workspace production claim.
 
 - [#192](https://github.com/Dharin-shah/vouchr/issues/192) is complete: credential lifecycle
   mutations are atomic and idempotent across replicas and retries.
 - [#208](https://github.com/Dharin-shah/vouchr/issues/208) is complete: audit indexes are measured and
   retention pruning is bounded.
-- [#209](https://github.com/Dharin-shah/vouchr/issues/209): bound network, memory, database, and
-  concurrency work and remove N+1 behavior.
+- [#209](https://github.com/Dharin-shah/vouchr/issues/209) is complete: network, memory, database,
+  and concurrency work are bounded, cooperative resolver cancellation reaches the underlying SDK,
+  and N+1 provider reads are removed.
 - [#211](https://github.com/Dharin-shah/vouchr/issues/211) is complete: one strict provider, OAuth,
   and egress validation boundary is enforced.
 - [#212](https://github.com/Dharin-shah/vouchr/issues/212) is complete: short-lived broker identity is

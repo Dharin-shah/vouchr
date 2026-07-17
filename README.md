@@ -71,8 +71,18 @@ browser, and asks again:
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
-Session approvals ([thread-scoped](./assets/slack-session-thread.svg)) and private credential
-modals ([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. The app's **App Home
+Session approvals ([thread-scoped](./assets/slack-session-thread.svg)) are persisted, opaque,
+single-use controls: repeated turns reuse one durable request, with a live delivery lease suppressing
+immediate duplicate prompts; a click is bound to the exact signed thread and rechecks current access
+at the mutation, and duplicate/stale clicks get fixed recovery instead of silence. The pending request
+and audit commit together before Slack delivery; a delivery
+API rejection has an unknown acceptance outcome, so Vouchr retains the short delivery lease and
+keeps a possibly-visible button decidable while preventing an immediate duplicate. Only a known
+pre-delivery render/no-recipient failure removes the request. Private credential modals
+([non-OAuth keys](./assets/slack-secret-modal.svg)) are built in too. Channel setup consumes the
+Slack trigger into a fixed loading view before admin/channel lookups, then hydrates it with an
+opaque, actor-bound, single-use request; channel and provider are never trusted from modal metadata,
+and duplicate submits cannot rotate the credential or duplicate its config audit. The app's **App Home
 tab is a config console**: everyone manages their own connections there, and admins (plus channel
 creators when `allowChannelCreatorConfig` is on) pick a channel and set per-provider modes, tool
 availability, and shared credentials — the same server-side gates and audit rows as the `/vouchr`
@@ -145,6 +155,20 @@ to it instead of silently doing nothing. A provider removed from the current reg
 disconnectable while its user-owned credential exists. The exported `disconnectProvider` reports
 `{ recognized, removed, ok, audited }`, so callers can distinguish unknown input, committed local
 deletion, upstream-revocation uncertainty, and an audit-store failure without inspecting raw errors.
+Its five-argument public form captures trusted PostgreSQL time itself; built-in transports retain
+their earlier verified receipt through an internal receipt-bound primitive.
+Vouchr-owned Home/config Disconnect buttons carry an opaque credential-generation id. Redelivering
+an old button after reconnect is stale and cannot delete, revoke, or audit the replacement row.
+Provider-addressed `/vouchr disconnect` and legacy `/v1/disconnect` requests that omit a row id use
+the connection's PostgreSQL `generation_at` boundary. A delayed command/assertion can act only on a
+row that already existed at its trusted receipt; it cannot retarget a later reconnect.
+Headless callers can avoid cross-service clock ambiguity by asking `/v1/resolve` for the optional
+opaque `credentialId` and returning it with `/v1/disconnect`; exact actor/provider/generation checks
+repeat under the mutation locks, and the default resolve wire shape stays unchanged.
+Channel setup first opens an authority-free loading view, then binds one opaque, single-use request
+in PostgreSQL. A credential, mode, or tool change committed after the verified Slack receipt fences
+that older setup before a secret-entry form can overwrite newer state; same-value governance retries
+preserve the form. External KMS wrapping completes before lifecycle locks are acquired.
 
 Running `/vouchr` with **no subcommand** opens an interactive modal: everyone sees a bounded first
 set of connected accounts with Disconnect buttons and the channel's tool manifest; paged
@@ -205,26 +229,42 @@ audit row. Absent = unchanged behavior (bar the unconditional cookie strip).
 `approval: { methods?, paths?, approver: 'self' | 'admin', ttlMs? }` adds **human-in-the-loop
 approval** for sensitive writes at the same boundary. Between "never allowed" (egress) and "always
 allowed" there is "allowed when a human clicks yes": a matching request (default: any non-GET/HEAD
-method; `paths` narrows like `egressPaths`) with no live grant posts Approve/Deny buttons on the
+method; `paths` narrows like `egressPaths`) with no live grant persists one deduplicated request and
+posts Approve/Deny buttons on the
 in-process Bolt path—to the acting user for `'self'`, to eligible admins for `'admin'` (the same
-eligibility gate as the channel config commands)—showing the provider, method, host+path, and the
-COUNT of query parameters (names and values are both caller-controlled and can carry secrets/PII,
-so neither is displayed; the exact query string is bound byte-for-byte), never the request body. It
+eligibility gate as the channel config commands)—showing the provider, method, host, a salted action
+fingerprint, and the COUNT of query parameters. Raw paths, parameter names/values, and bodies are
+caller-controlled and may carry secrets or PII, so none is displayed; the fingerprint binds the
+exact owner/origin/method/path/query without making a low-entropy path guessable. The origin binds
+scheme, hostname, and effective port even though the prompt keeps displaying hostname only. It
 then throws the exported `ApprovalRequiredError` (catch and stop the turn,
 exactly like `ConsentRequiredError`); on Approve the retried call finds the grant, spends it, and
 executes. A grant is **single-use**, expires after `ttlMs` (default 5 minutes), and matches only
-the exact (method, host, path, query) it was minted for — the query byte-exact as a digest, so
+the exact (method, origin, path, query) it was minted for — the query byte-exact as a digest, so
 raw values are never persisted and any reordering re-prompts; not a prefix, not the payload
-bytes — **and** the exact
-credential owner: a per-user→shared mode change re-prompts rather than
+bytes — **and** the exact credential row generation: a per-user→shared mode change or reconnect
+invalidates the old handle and re-prompts rather than
 running against a credential the human didn't approve, and disconnecting/reconnecting the credential
-purges the grant (see the [threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every
-egress gate (an additional gate, never a bypass) and **before** the secret is read; every step —
-requested, approved, denied, consumed, expired — is audited with the approver as the actor. The
+purges the grant. Effective mode or tool-governance changes also purge pending requests and grants, so a
+disable→enable or mode flip-back cannot resurrect an old decision. Clicks recheck the current
+provider rule, owner, credential, mode, policy, tool bit, signed conversation, and approver before
+the decision commits. Raw paths are never copied into Slack, public errors, or audit. Approval paths
+are capped at 16 KiB before rate budget, persistence, audit, credential reads, or Slack delivery; an
+oversized path gets fixed recovery guidance and leaves no pending request (see the
+[threat model](./guides/THREAT-MODEL.md)). Approval runs **after** every
+egress gate (an additional gate, never a bypass) and **before** the secret is read. Request audits
+are attributed to the requester, approve/deny/consume records carry the deciding approver when one
+exists, and expiry is attributed to `system`; each
+request/decision/consume mutation and its audit companion is one PostgreSQL transaction. The
 headless broker enforces the same gate and returns `403 { "error": "approval_required",
-"approvalId" }`, but it does not post Slack buttons. The trusted Slack-facing host must bridge that
-denial to a private decision UI, re-check the approver, and retry with a fresh identity assertion;
-the complete built-in bridge remains [#194](https://github.com/Dharin-shah/vouchr/issues/194). Enable
+"approvalId": "…", "code": "approval_required", "retryable": false,
+"recovery": "request_approval" }`, but it does not post Slack buttons. The opaque id is not
+authority, and the package intentionally does not expose the low-level decision stores. The trusted
+Slack-facing host will need a private decision bridge that re-checks the approver and retries with a
+fresh identity assertion, but that safe facade is not public yet. Until the complete built-in bridge
+lands, the headless surface is enforcement-only: do not enable an `approval` rule on a headless-only
+request path because the resulting write cannot be approved through supported APIs. The bridge is a focused slice of
+[#194](https://github.com/Dharin-shah/vouchr/issues/194). Enable
 the gate on a built-in via typed config (`github({ approval: { approver: 'admin' } })`) or on any
 `defineProvider`. Absent = unchanged behavior.
 
@@ -255,6 +295,67 @@ More examples: [Google user credentials](./examples/google-user) ·
 [HashiCorp Vault](./examples/hashicorp-vault) ·
 [Postgres + KMS](./examples/postgres-kms) ·
 [headless broker client](./examples/broker-client)
+
+## Typed Errors and Recovery
+
+Both supported package entrypoints export the same Bolt-free error contract:
+
+```ts
+import {
+  mapSafeError,
+  type VouchrSafeError,
+} from '@vouchr/core'; // also available from @vouchr/core/headless
+
+try {
+  await handle.fetch(url);
+} catch (error) {
+  const safe: VouchrSafeError = mapSafeError(error);
+  // Branch on safe.code / safe.recovery, never safe.message.
+}
+```
+
+`mapSafeError()` returns `{ code, message, retryable, recovery, retryAfterMs? }`.
+`retryAfterMs` is always milliseconds. `recovery` is one of `connect`, `request_approval`,
+`resolve_again`, `retry_later`, `fix_configuration`, or `contact_admin`; the exported
+`VOUCHR_ERROR_CODES` / `VOUCHR_RECOVERY_ACTIONS` are the runtime registries. Token failures also
+publish the closed `TOKEN_ENDPOINT_FAILURE_KINDS` registry (`credential`, `configuration`, or
+`transient`). The fixed `message` is
+safe to render privately, but remains presentation text, not control flow. Foreign errors—including
+custom provider, resolver, KMS, and database messages—map to fixed `internal_error` copy without
+revealing their message or class name. `UserFacingError` is the deliberate exception: constructing
+it explicitly opts Vouchr-authored fixed text into rendering; never wrap a caught third-party error
+with it. JavaScript callers cannot extend the recovery vocabulary through `UserFacingError`: an
+invalid runtime recovery value fails closed to `internal_error`.
+
+| Exported error | Stable code | Recovery | Meaning |
+| --- | --- | --- | --- |
+| `ConsentRequiredError` | `consent_required` | `connect` | A private connection prompt was posted; stop the turn. |
+| `SessionApprovalRequiredError` | `session_approval_required` | `request_approval` | A thread-scoped session prompt was posted; stop the turn. |
+| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. |
+| `ApprovalPathTooLongError` | `approval_path_too_large` | `fix_configuration` | The approval endpoint exceeds the bounded exact-action path; narrow it before retrying. |
+| `InteractionStateChangedError` | `interaction_state_changed` | `resolve_again` | The credential generation or current authorization changed; discard the stale handle and resolve current access before retrying. |
+| `PolicyDeniedError` | `policy_denied` | `contact_admin` | Provider/channel policy denied the request; retrying cannot change governance. |
+| `ToolDisabledError` | `tool_disabled` | `contact_admin` | The channel allowlist disabled the provider; an eligible admin must change it. |
+| `NoConnectionError` | `not_connected` | `connect` for user credentials; `fix_configuration` for shared channel credentials | No usable credential exists for the resolved owner. |
+| `EgressBlockedError` | `egress_blocked` | `fix_configuration` | Host/path/method/validator policy refused the request before credential use. |
+| `ResponseBlockedError` | `response_blocked` | `fix_configuration` | Provider response policy withheld the response. |
+| `ResolverConfigurationError` | `resolver_configuration_error` | `fix_configuration` | Resolver wiring, a stored reference, or a fulfilled resolver value is missing/malformed; unchanged retries cannot repair it. |
+| `ResolverFailedError` | `resolver_failed` | `retry_later` | A configured resolver threw or timed out before provider egress, so a later retry can be safe. |
+| `UpstreamTimeoutError` | `upstream_timeout` | `retry_later`, but `retryable: false` | Provider outcome may be unknown; never authorize an automatic replay. |
+| `RateLimitedError` | `rate_limited` | `retry_later` | Back pressure includes a millisecond retry hint. |
+| `SecretReferenceError` | `invalid_reference`, `source_mismatch`, `invalid_scopes`, or `resolver_unavailable` | `fix_configuration` | Reference input/configuration failed before persistence. Existing codes are unchanged. |
+| `TokenEndpointError` | `token_endpoint_failed` | `connect` for `credential`; `fix_configuration` for `configuration`; `retry_later` for `transient` | Distinguishes `invalid_grant`, OAuth client/configuration rejection, and RFC transient codes plus 408/429/5xx/network/timeout failures. The legacy `definitive` boolean remains true only for `credential`. |
+| `UserFacingError` | `user_facing` | chosen at construction (default `fix_configuration`) | Explicit opt-in for fixed Vouchr-authored refusal/validation copy. |
+
+`safeUserMessage(error)` remains the text-only convenience wrapper and delegates to the same core
+mapper. `retryable: true` means the condition can clear later; it never authorizes automatic replay
+of an uncertain or non-idempotent write. The HTTP broker additionally uses the same codes and
+recovery fields for typed `/v1/fetch` and `/v1/mcp` failures, including unknown-outcome timeouts,
+default response-type denials, MCP policy denials, and fixed internal failures; see the
+[headless error table](./guides/HEADLESS.md#bounded-failure-and-retry-contract).
+Authenticated broker reads and mutations also return the exact typed `409
+interaction_state_changed` / `resolve_again` contract when the verified actor assertion predates
+offboarding; the spent assertion then replays as `401`.
 
 ## Test Your Integration
 
@@ -319,14 +420,40 @@ const identity = loadIdentityConfig(process.env); // strong key + issuer + deplo
 const identityToken = mintIdentity({ teamId, userId, channel }, identity); // fresh per broker call
 ```
 
+Direct `createBroker()` deployments schedule `broker.sweepExpired()` on the returned `BrokerServer`.
+That safe facade reclaims expired credentials plus the broker's private consent, approval, session,
+and provisioning state without exporting raw interaction mutators; its numeric result remains the
+expired credential count. The packaged `vouchr-broker` schedules the same method automatically.
+
 Read-only by default (writes are a double opt-in), with an enforced reference-only headless secret
 boundary. Both reference routes accept only bounded, structurally valid AWS Secrets Manager, GCP
 Secret Manager, Azure Key Vault, or HashiCorp Vault reference forms, derive the resolver source
 server-side, and require that resolver to be configured before any credential, channel mode, or
 audit row is written. Raw secret values are rejected; the configured resolver is invoked only when
-the credential is used. Validation failures carry a stable `code`; a just-in-time resolver failure
-returns `resolver_failed` without exposing resolver text or the stored reference. Programmatic
-channel-governance routes sit behind a signed admin claim. Bolt and the packaged broker order
+the credential is used. Validation failures carry a stable `code`. A configured resolver throw or
+deadline returns `code: "resolver_failed"`, `retryable: true`, and `recovery: "retry_later"` without
+exposing resolver text or the stored reference. Missing/malformed resolver configuration, or a
+fulfilled `undefined`, non-string, or empty value, instead returns non-retryable
+`resolver_configuration_error` with `fix_configuration`; unchanged retries cannot repair that
+contract violation. Invalid fulfilled values are never coerced or sent upstream. A resolver
+deadline is not `upstream_timeout` because provider egress has not begun. Bolt user-key prompts and
+headless user provisioning are offboard-fenced across
+replicas: Slack controls carry one short-lived opaque request minted with the prompt, while headless
+OAuth/reference writes preserve the verified identity token's age in PostgreSQL's clock domain.
+Retained Bolt handles and broker assertions preserve that same acting-user receipt: Vouchr rechecks
+it before secret access and at the provider-send boundary. A shared channel credential remains
+available to other current users, but a departed user cannot keep using it through an old handle or
+assertion. Offboarding also removes approvals requested by that user; decision and consumption
+remain tombstone-fenced if bounded-state cleanup fails. After offboarding, discard old prompts,
+handles, and tokens and resolve current identity before attempting setup or use again. Once a
+request passes the final provider-send fence and is dispatched, later offboarding cannot recall it. Confirmed
+`vouchr revoke --yes` similarly records one exact hashed provider+owner scope before cleanup, fencing
+older matching user and shared-channel writes while allowing a new post-incident setup. Outstanding
+channel setup forms are counted and cleared in their channel/team/global break-glass scope. The exported
+channel-owner `Vault.upsert`, `upsertDryRun`, and `reference` paths participate in that fence too.
+Ordinary Disconnect/delete establishes the same exact owner/provider boundary before local removal,
+so a cleanup fallback cannot let an older key form or OAuth callback silently recreate access.
+Programmatic channel-governance routes sit behind a signed admin claim. Bolt and the packaged broker order
 shared setup and mode changes through `Vault.withCredentialLock()`; custom low-level control planes
 should use the same owner/provider transaction boundary rather than calling the stores separately.
 Providers that ship as MCP servers over Streamable HTTP get a dedicated stateless proxy,
@@ -355,14 +482,15 @@ shape and default-deny examples.
   already prompted the user—catch them and stop the turn; don't log them as failures. A headless
   broker 403 does not automatically render that Slack UI. For in-process `ApprovalRequiredError`, the
   human clicks Approve and asks again; the grant is single-use and covers only the exact
-  method+host+path+query that was prompted (the request body is not inspected).
+  method+origin+path+query bound by the displayed action fingerprint (the raw path/query and request
+  body are not displayed).
 - **Credential health notifications.** When a refresh token dies for real (`invalid_grant` or a
   bare 400/401 from the token endpoint — never a transient blip or an operator-side error like
   `invalid_client`) or a connection is within 72h of its idle/max-age TTL ceiling (dimensions
   longer than 72h only — shorter ones would always be "expiring"), Vouchr DMs the credential owner
-  (the configuring admin for a channel-owned credential): a reconnect button for a dead refresh
-  (it mints a fresh consent link on click, so it can't expire unread), a heads-up for an upcoming
-  expiry. At most one DM per (owner, provider, type) per 24h: the window is claimed atomically in
+  (the configuring admin for a channel-owned credential): ask-the-agent-again guidance for a dead
+  refresh (no long-lived control can mint fresh authority after offboarding), or a heads-up for an
+  upcoming expiry. At most one DM per (owner, provider, type) per 24h: the window is claimed atomically in
   the `notification_state` table before sending (no duplicates across replicas; a process that
   crashes between claim and send loses that window's DM — the next window retries), and
   reconnecting resets it. To route these yourself instead, set

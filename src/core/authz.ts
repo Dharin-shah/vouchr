@@ -4,6 +4,7 @@ import { ChannelConfig, type ChannelMode } from './channelConfig';
 import type { Policy } from './policy';
 import { ChannelTools, type ToolManifestEntry } from './tools';
 import type { ProviderRegistry } from './providers';
+import type { Db } from './db';
 
 /**
  * The two SECURITY-CRITICAL decisions — credential-owner resolution and provider authorization —
@@ -22,6 +23,26 @@ import type { ProviderRegistry } from './providers';
 /** Why a provider is not authorized in a channel, or null if it is. The CHECK is shared; each adapter
  *  maps the reason to its own surface (audit meta, whether to emit policy_denied, error string/status). */
 export type AuthzDenial = 'policy' | 'tool-disabled';
+
+/** Static/provider policy refused this channel. The caller cannot repair governance by retrying. */
+export class PolicyDeniedError extends Error {
+  readonly code = 'policy_denied' as const;
+
+  constructor() {
+    super('Provider policy denies this request.');
+    this.name = 'PolicyDeniedError';
+  }
+}
+
+/** The channel's explicit tool allowlist disabled this provider. Retrying cannot change the bit. */
+export class ToolDisabledError extends Error {
+  readonly code = 'tool_disabled' as const;
+
+  constructor() {
+    super('Provider is disabled in this channel.');
+    this.name = 'ToolDisabledError';
+  }
+}
 
 /**
  * The authorization VERDICT from the two already-resolved bits (pure, no I/O): Policy first, then the
@@ -102,12 +123,13 @@ export async function authorizeProvider(
   principal: SlackIdentity,
   channel: string | null,
   provider: string,
+  db?: Db,
 ): Promise<AuthzDenial | null> {
   const policyAllows = !policy || policy.check(provider, channel);
   // Resolve the tool-allowlist bit only when policy would allow AND there's a channel + store to
   // restrict against — so a policy-deny still never runs the allowlist query (unchanged short-circuit).
   const toolAllowed = policyAllows && channel && channelTools
-    ? await channelTools.isEnabled(principal.teamId, channel, provider)
+    ? await channelTools.isEnabled(principal.teamId, channel, provider, db)
     : true;
   return authorizeVerdict(policyAllows, toolAllowed);
 }

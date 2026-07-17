@@ -1,4 +1,4 @@
-import { WebClient } from '@slack/web-api';
+import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
@@ -9,33 +9,73 @@ import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
-import { userOwner, channelOwner } from '../core/owner';
+import { userOwner, channelOwner, type Owner } from '../core/owner';
 import {
   authorizeProvider,
+  PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
   buildToolManifestSnapshot,
+  ToolDisabledError,
 } from '../core/authz';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, approvalNeeded, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
-import { configureChannelCredential, setChannelCredentialMode } from '../core/channelCredential';
+import {
+  configureChannelCredential,
+  setChannelCredentialMode,
+  type ChannelProvisioningIssuance,
+} from '../core/channelCredential';
 import { ChannelTools, configureChannelTools, type ToolManifestEntry } from '../core/tools';
 import { handleOAuthCallback } from '../core/oauthCallback';
-import { offboardUser, disconnectProvider } from '../core/offboard';
+import {
+  offboardUser,
+  disconnectProvider,
+  disconnectProviderAtReceipt,
+  disconnectConnectionGeneration,
+} from '../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
-import { sweepExpired } from '../core/sweep';
-import { SessionGrants } from '../core/session';
-import { Approvals, ApprovalRequiredError, DEFAULT_APPROVAL_TTL_MS } from '../core/approval';
+import { sweepLifecycle } from '../core/sweep';
+import { SessionGrants, type SessionGrantResult } from '../core/session';
+import { InteractionStateChangedError, isInteractionId } from '../core/interaction';
+import {
+  ChannelProvisioningRequests,
+  configureUserCredential,
+  issueUserProvisioningRequest,
+  UserProvisioningRequests,
+} from '../core/provisioning';
+import {
+  Approvals,
+  ApprovalRequiredError,
+  DEFAULT_APPROVAL_TTL_MS,
+  approvalDecisionLockOwners,
+  approvalOwnerStillCurrent,
+  credentialUseStateFenced,
+  credentialUseStillCurrentFenced,
+  type ApprovalDecisionResult,
+  type ApprovalKey,
+} from '../core/approval';
 import { NotificationState, type CredentialHealthEvent, type CredentialHealthHook } from '../core/health';
 import {
   normalizeSecretReference,
   referenceChannelCredential,
   referenceUserCredential,
   SECRET_REFERENCE_SOURCES,
-  SecretReferenceError,
+  type SecretReference,
 } from '../core/reference';
+import {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UserFacingError,
+  safeUserMessage,
+} from '../core/errors';
+export {
+  ConsentRequiredError,
+  SessionApprovalRequiredError,
+  UserFacingError,
+  safeUserMessage,
+} from '../core/errors';
 import {
   connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
@@ -117,64 +157,6 @@ async function adminEligible(
     : (await isSlackAdmin(client, userId) || (allowCreator && await isChannelAdmin(client, channel, userId)));
 }
 
-/** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
-export class ConsentRequiredError extends Error {
-  constructor(public provider: string) {
-    super(`Consent required for "${provider}". A Connect prompt was posted to the user.`);
-    this.name = 'ConsentRequiredError';
-  }
-}
-
-/** Thrown by `connect()` when a thread-scoped session is required and not yet approved: an in-thread
- *  "Allow … here" button was posted. Stop this turn; the user approves and re-invokes. */
-export class SessionApprovalRequiredError extends Error {
-  constructor(public provider: string) {
-    super(`Session approval required for "${provider}": an approval button was posted in the thread.`);
-    this.name = 'SessionApprovalRequiredError';
-  }
-}
-
-/**
- * Marker for a deliberate, Vouchr-authored, secret-free denial/validation message that IS safe to
- * echo to the Slack user (an admin gate, a channel-eligibility or mode-lock refusal, a bad-input
- * message). These read identically to a foreign `new Error(...)` — which could carry a provider /
- * KMS / DB secret — so the throw site opts a message into the whitelist by using THIS class; a bare
- * Error stays masked to its class name. See safeUserMessage.
- */
-export class UserFacingError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'UserFacingError';
-  }
-}
-
-/**
- * The only text safe to echo to a Slack user from a caught error. Mirrors the headless broker's
- * top-level catch (broker.ts), which returns the error CLASS NAME only: an extension point (a custom
- * `provider.inject`, KMS `wrapDataKey`, a DB driver) can throw AFTER touching a secret, so a raw
- * `e.message` could carry a token. We therefore show `e.message` ONLY for Vouchr's OWN error classes
- * — those are the messages Vouchr deliberately authored to be user-facing and secret-free. Any other
- * (unexpected) error is reduced to its class name; the type still triages in the logs.
- */
-export function safeUserMessage(e: unknown): string {
-  if (
-    e instanceof ConsentRequiredError ||
-    e instanceof SessionApprovalRequiredError ||
-    e instanceof ApprovalRequiredError ||
-    e instanceof EgressBlockedError ||
-    e instanceof ResponseBlockedError ||
-    e instanceof NoConnectionError ||
-    e instanceof ResolverFailedError ||
-    e instanceof RateLimitedError ||
-    e instanceof SecretReferenceError ||
-    e instanceof UserFacingError
-  ) {
-    return e.message;
-  }
-  const name = (e as Error)?.constructor?.name ?? 'Error';
-  return `Something went wrong (${name}). Ask an admin to check the Vouchr logs.`;
-}
-
 /** Slack may synthesize accessible top-level text from blocks when complete visible copy exceeds its
  *  40k fallback ceiling. Valid maximum-scope OAuth prompts can reach that case while every individual
  *  section and the 50-block message remain valid; omit `text` rather than failing after consent state
@@ -185,6 +167,106 @@ function optionalBlockFallback(blocks: unknown[]): { text: string } | Record<str
   } catch {
     return {};
   }
+}
+
+/** No actionable Slack recipient exists, so delivery is known not to have happened. Network/API
+ * rejection is deliberately NOT this type: Slack may have accepted before the caller saw failure. */
+class NoApprovalDecisionSurfaceError extends Error {}
+
+type SlackPromptDeliveryFailure = 'platform-rejected' | 'rate-limited' | 'ambiguous';
+
+/** Preserve one classified outcome after an admin fan-out without retaining/rendering any foreign
+ * Slack error content. A single ambiguous send dominates definite rejections because Slack may have
+ * accepted that request before the transport failed locally. */
+class SlackPromptDeliveryError extends Error {
+  constructor(readonly outcome: Exclude<SlackPromptDeliveryFailure, 'ambiguous'>) {
+    super('Slack prompt delivery was rejected');
+  }
+}
+
+/** Slack Web API errors are structural interfaces, not reliable instanceof classes. Only the two
+ * SDK codes that prove Slack did not accept the post release its delivery lease. HTTP, request,
+ * generic, and even hostile accessor failures remain ambiguous (fail safe: the button may exist). */
+function classifySlackPromptDeliveryFailure(error: unknown): SlackPromptDeliveryFailure {
+  try {
+    if (error instanceof SlackPromptDeliveryError) return error.outcome;
+    const code = error && (typeof error === 'object' || typeof error === 'function')
+      ? (error as { code?: unknown }).code
+      : undefined;
+    if (code === SlackErrorCode.PlatformError) return 'platform-rejected';
+    if (code === SlackErrorCode.RateLimitedError) return 'rate-limited';
+  } catch {
+    return 'ambiguous';
+  }
+  return 'ambiguous';
+}
+
+function isNoApprovalDecisionSurface(error: unknown): boolean {
+  try {
+    return error instanceof NoApprovalDecisionSurfaceError;
+  } catch {
+    return false;
+  }
+}
+
+function slackPromptDeliveryRecovery(
+  outcome: SlackPromptDeliveryFailure,
+  surface: 'approval' | 'session',
+): UserFacingError {
+  if (outcome === 'platform-rejected') {
+    return new UserFacingError(
+      `Slack rejected the ${surface} prompt before delivery. Ask an admin to check Vouchr’s Slack access, then ask the agent again.`,
+      'fix_configuration',
+    );
+  }
+  if (outcome === 'rate-limited') {
+    return new UserFacingError(
+      `Slack rate-limited the ${surface} prompt before delivery. Wait, then ask the agent again.`,
+      'retry_later',
+    );
+  }
+  return new UserFacingError(
+    `Vouchr could not confirm ${surface}-prompt delivery. If a prompt appears, use it; otherwise ask the agent to retry shortly.`,
+    'retry_later',
+  );
+}
+
+async function abandonKnownUndeliveredPrompt(
+  store: { abandonDelivery: (id: string, token: string, remove: boolean) => Promise<boolean> },
+  id: string,
+  token: string,
+  remove: boolean,
+  surface: 'approval' | 'session',
+  cause: 'slack-rejected' | 'no-decision-surface' = 'slack-rejected',
+): Promise<void> {
+  const description = cause === 'slack-rejected'
+    ? `Slack rejected the ${surface} prompt`
+    : `Vouchr found no ${surface} decision surface`;
+  let released: boolean;
+  try {
+    released = await store.abandonDelivery(id, token, remove);
+  } catch {
+    throw new UserFacingError(
+      `${description}, but could not reset its request state. Ask the agent to retry shortly.`,
+      'retry_later',
+    );
+  }
+  if (!released) {
+    throw new UserFacingError(
+      `The ${surface} request changed before its undelivered state could be cleared. Ask the agent again.`,
+      'resolve_again',
+    );
+  }
+}
+
+/** Channel/thread carried by a Slack-signed block_action. These are context facts only, never
+ * authority on their own: core compares them with the persisted request before mutation. */
+function interactionLocation(body: any): { channel: string; thread: string | null } | null {
+  const channel = body?.channel?.id ?? body?.container?.channel_id;
+  const thread = body?.container?.thread_ts ?? body?.message?.thread_ts ?? null;
+  if (typeof channel !== 'string' || channel.length < 1 || channel.length > 255) return null;
+  if (thread !== null && (typeof thread !== 'string' || thread.length < 1 || thread.length > 255)) return null;
+  return { channel, thread };
 }
 
 /**
@@ -299,7 +381,7 @@ export interface VouchrOptions {
    * a connection within 72h of its TTL ceiling (`expiring_soon`, per sweep pass), or a swept
    * connection (`expired`). Events carry the owning principal + provider, never token material.
    * When omitted, the DEFAULT wiring DMs the credential owner (the configuring admin for a
-   * channel-owned credential), with a reconnect button on `refresh_dead`, debounced to one DM per
+   * channel-owned credential), with ask-the-agent-again guidance on `refresh_dead`, debounced to one DM per
    * (owner, provider, type) per 24h via the persistent `notification_state` table. Setting this
    * REPLACES the default DMs (same override contract as `isAdmin`) — debounce with the exported
    * `NotificationState` if your notifier needs it. Note the hook is wired while createVouchr is
@@ -378,6 +460,39 @@ export interface ConnectContextDeps {
   dryRun?: boolean;
 }
 
+// Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
+// caller nor any forgeable Slack field can choose a newer provisioning issuance. Normal direct
+// construction falls back to the constructor's own monotonic instant.
+const INTERNAL_PROVISIONING_RECEIVED_AT = Symbol('vouchr.provisioning-received-at');
+const INTERNAL_CHANNEL_PROVISIONING_ISSUANCE = Symbol('vouchr.channel-provisioning-issuance');
+type InternalConnectContextDeps = ConnectContextDeps & {
+  [INTERNAL_PROVISIONING_RECEIVED_AT]?: bigint;
+  [INTERNAL_CHANNEL_PROVISIONING_ISSUANCE]?: ChannelProvisioningIssuance;
+};
+
+/** Map a verified handler's monotonic receipt instant into PostgreSQL's clock domain. Query latency
+ * is included in the subtraction and fractional milliseconds round up, so uncertainty can only
+ * make the issuance older (fail closed), never newer than the received interaction. */
+async function provisioningIssuedAtFromReceipt(vault: Vault, receivedAt: bigint): Promise<number> {
+  const pgNow = await vault.userProvisioningIssuedAt();
+  const elapsedNs = process.hrtime.bigint() - receivedAt;
+  if (elapsedNs < 0n) throw new Error('invalid provisioning receipt clock');
+  const elapsedMs = Number((elapsedNs + 999_999n) / 1_000_000n);
+  const issuedAt = pgNow - elapsedMs;
+  if (!Number.isSafeInteger(issuedAt)) throw new Error('could not issue provisioning fence');
+  return issuedAt;
+}
+
+class ChannelProvisioningStaleError extends UserFacingError {
+  constructor() {
+    super(
+      'Channel credential setup changed while Vouchr was preparing it. Reopen setup and review the current state.',
+      'resolve_again',
+    );
+    this.name = 'ChannelProvisioningStaleError';
+  }
+}
+
 /** Per-request handle attached to Bolt's `context.vouchr`. */
 export class ConnectContext {
   private identity: SlackIdentity;
@@ -405,6 +520,8 @@ export class ConnectContext {
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
   private dryRun: boolean;
+  private provisioningReceivedAt: bigint;
+  private channelProvisioningIssuance?: ChannelProvisioningIssuance;
 
   constructor(deps: ConnectContextDeps) {
     this.identity = deps.identity;
@@ -432,6 +549,18 @@ export class ConnectContext {
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
     this.dryRun = deps.dryRun ?? false;
+    this.provisioningReceivedAt =
+      (deps as InternalConnectContextDeps)[INTERNAL_PROVISIONING_RECEIVED_AT]
+      ?? process.hrtime.bigint();
+    this.channelProvisioningIssuance =
+      (deps as InternalConnectContextDeps)[INTERNAL_CHANNEL_PROVISIONING_ISSUANCE];
+  }
+
+  /** Map this verified request's monotonic receipt instant into PostgreSQL's clock domain. Query
+   * latency is included in the elapsed subtraction and fractional milliseconds round up, so clock
+   * uncertainty can only make the issuance older (fail closed), never newer than the request. */
+  private async provisioningIssuedAt(): Promise<number> {
+    return provisioningIssuedAtFromReceipt(this.vault, this.provisioningReceivedAt);
   }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -470,9 +599,10 @@ export class ConnectContext {
    * fetch throws ApprovalRequiredError, post the Approve/Deny prompt — ephemerally to the acting
    * user for approver 'self', ephemerally to each eligible admin for 'admin' — then rethrow, so
    * the typed error still reaches the caller (catch-and-stop-turn, exactly like
-   * ConsentRequiredError). Best-effort: a Slack hiccup never replaces the typed error. The blocks
-   * show provider/method/host+path and NEVER the request body (SEC-1); the buttons carry only the
-   * pending-approval id (SEC-3 — authority is re-decided server-side at the click).
+   * ConsentRequiredError). If no actionable decision surface is delivered, remove only the id this
+   * fetch minted and throw fixed retry guidance instead of falsely claiming a prompt was posted.
+   * The blocks show provider/method/host plus a salted action fingerprint; raw path/query/body never
+   * reach Slack (SEC-1). Buttons carry only the pending id (SEC-3 — authority is re-decided at click).
    */
   private notifyApprovalRequired(handle: ConnectionHandle): ConnectionHandle {
     const fetch = handle.fetch.bind(handle);
@@ -480,26 +610,179 @@ export class ConnectContext {
       try {
         return await fetch(input, init);
       } catch (e) {
-        if (e instanceof ApprovalRequiredError) await this.postApprovalPrompt(e).catch(() => undefined);
+        if (e instanceof ApprovalRequiredError) {
+          let prompt: { blocks: any; fallback: { text: string } | Record<string, never> };
+          try {
+            const blocks = approvalBlocks({
+              provider: e.provider,
+              method: e.method,
+              host: e.host,
+              actionFingerprint: e.actionFingerprint,
+              queryParamCount: e.queryParamCount,
+              requester: this.identity.userId,
+              id: e.approvalId,
+              approver: e.approver,
+            }) as any;
+            prompt = { blocks, fallback: optionalBlockFallback(blocks) };
+          } catch {
+            // Rendering happens before a delivery claim or Slack call, so this is a KNOWN no-post
+            // failure. Remove the impossible request rather than parking it behind an unknown lease.
+            await this.approvals?.discardPending(e.approvalId).catch(() => undefined);
+            throw new UserFacingError(
+              'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
+            );
+          }
+          const delivery = await this.approvals?.claimDelivery(e.approvalId);
+          if (!delivery || delivery.status === 'stale') {
+            throw new UserFacingError(
+              'The approval request changed before delivery. Ask the agent to retry the action.',
+              'resolve_again',
+            );
+          }
+          if (delivery.status === 'in-flight') {
+            throw new UserFacingError(
+              'An approval prompt is still being delivered. Ask the agent to retry shortly.',
+              'retry_later',
+            );
+          }
+          if (delivery.status === 'claimed') {
+            try {
+              await this.postApprovalPrompt(e, prompt);
+            } catch (deliveryError) {
+              const noSurface = isNoApprovalDecisionSurface(deliveryError);
+              if (noSurface) {
+                if (this.approvals) {
+                  await abandonKnownUndeliveredPrompt(
+                    this.approvals,
+                    e.approvalId,
+                    delivery.token,
+                    e.newRequest,
+                    'approval',
+                    'no-decision-surface',
+                  );
+                }
+                throw new UserFacingError(
+                  'Vouchr could not find an approval decision surface. Ask the agent to retry in an eligible channel.',
+                  'fix_configuration',
+                );
+              }
+              const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+              if (outcome !== 'ambiguous' && this.approvals) {
+                await abandonKnownUndeliveredPrompt(
+                  this.approvals,
+                  e.approvalId,
+                  delivery.token,
+                  e.newRequest,
+                  'approval',
+                );
+              }
+              throw slackPromptDeliveryRecovery(outcome, 'approval');
+            }
+            if (!(await this.approvals?.confirmDelivery(e.approvalId, delivery.token))) {
+              throw new UserFacingError(
+                'The approval prompt was delivered, but its request changed before confirmation. Ask the agent to retry.',
+                'resolve_again',
+              );
+            }
+          }
+        }
         throw e;
       }
     };
     return handle;
   }
 
+  /** Recheck channel-governance facts while Approvals holds both the channel and credential locks. */
+  private async approvalRequestStillCurrent(
+    actorIssuedAt: number,
+    key: ApprovalKey,
+    tx: Db,
+    locked: Pick<Vault, 'liveId'>,
+  ): Promise<boolean> {
+    if (!this.registry.has(key.provider) || !isBrokeredProvider(this.registry.get(key.provider))) return false;
+    const approval = this.registry.get(key.provider).approval;
+    if (!approval || !approvalNeeded(approval, key.method, key.path)) return false;
+    return credentialUseStillCurrentFenced({
+      binding: key,
+      db: tx,
+      registry: this.registry,
+      policy: this.policy,
+      vault: locked,
+      enterpriseId: this.identity.enterpriseId,
+      actorIssuedAt,
+      channelTools: this.channelTools ?? null,
+      channelConfig: this.channelConfig ?? null,
+    });
+  }
+
+  /** Build the use-time validator for every Bolt handle. Handles are public and may be retained, so
+   * every use rechecks the actor's offboard receipt, current owner/mode/policy/tool/session state,
+   * and exact credential generation. Shared credentials also recheck live Slack channel safety and
+   * the acting user's membership before entering the database-locked validation. */
+  private useValidator(
+    owner: Owner,
+    provider: string,
+    credentialId: string,
+    channel: string | null,
+    thread: string | null,
+    actorIssuedAt: number,
+  ): () => Promise<boolean> {
+    return async () => {
+      if (owner.kind === 'channel') {
+        if (!channel) return false;
+        try {
+          await assertChannelEligible(this.client, channel);
+        } catch {
+          return false;
+        }
+        if (!(await isChannelMember(this.client, channel, this.identity.userId))) return false;
+      }
+      return this.vault.withCredentialLocks(
+        [
+          ...(channel ? [{ owner: channelOwner(this.identity.teamId, channel), provider }] : []),
+          { owner: userOwner(this.identity), provider },
+          { owner, provider },
+        ],
+        async (locked, tx) => {
+          const state = await credentialUseStateFenced({
+            binding: {
+              teamId: this.identity.teamId,
+              userId: this.identity.userId,
+              ownerKind: owner.kind,
+              ownerId: owner.id,
+              credentialId,
+              provider,
+              channel,
+              thread,
+            },
+            db: tx,
+            registry: this.registry,
+            policy: this.policy,
+            vault: locked,
+            enterpriseId: this.identity.enterpriseId,
+            actorIssuedAt,
+            channelTools: this.channelTools ?? null,
+            channelConfig: this.channelConfig ?? null,
+          });
+          if (state !== 'current') throw new InteractionStateChangedError('connection', state);
+          return true;
+        },
+      );
+    };
+  }
+
   /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
-  private async postApprovalPrompt(e: ApprovalRequiredError): Promise<void> {
-    const blocks = approvalBlocks({
-      provider: e.provider, method: e.method, host: e.host, path: e.path, queryParamCount: e.queryParamCount,
-      requester: this.identity.userId, id: e.approvalId, approver: e.approver,
-    }) as any;
-    const text = blocksFallbackText(blocks);
+  private async postApprovalPrompt(
+    e: ApprovalRequiredError,
+    prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
+  ): Promise<void> {
+    const { blocks, fallback } = prompt;
     const threadArg = this.thread ? { thread_ts: this.thread } : {};
     if (e.approver === 'self') {
       if (this.channel) {
-        await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, text });
+        await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
       } else {
-        await this.client.chat.postMessage({ channel: this.identity.userId, blocks, text });
+        await this.client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
       }
       return;
     }
@@ -509,12 +792,29 @@ export class ConnectContext {
       await this.client.chat.postMessage({
         channel: this.identity.userId,
         text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval — run it in a channel so an admin can approve it.`,
-      });
-      return;
+      }).catch(() => undefined);
+      throw new NoApprovalDecisionSurfaceError('admin approval requires a channel decision surface');
     }
     const approvers = await this.eligibleApprovers();
+    let delivered = false;
+    let sawAmbiguousFailure = false;
+    let ambiguousFailure: unknown;
+    let definiteFailure: Exclude<SlackPromptDeliveryFailure, 'ambiguous'> | undefined;
     for (const admin of approvers) {
-      await this.client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, text }).catch(() => undefined);
+      try {
+        await this.client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, ...fallback });
+        delivered = true;
+      } catch (error) {
+        // Try every eligible admin before declaring failure. If any send has an ambiguous transport
+        // outcome, the aggregate must remain ambiguous even when every sibling was definitely
+        // rejected: at least one actionable prompt may still have reached Slack.
+        const outcome = classifySlackPromptDeliveryFailure(error);
+        if (outcome === 'ambiguous') {
+          sawAmbiguousFailure = true;
+          ambiguousFailure ??= error;
+        }
+        else if (outcome === 'rate-limited' || definiteFailure === undefined) definiteFailure = outcome;
+      }
     }
     if (!approvers.length) {
       // No eligible admin visible from here (fail-closed member/admin reads): the requester should
@@ -523,6 +823,17 @@ export class ConnectContext {
         channel: this.channel, user: this.identity.userId, ...threadArg,
         text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval, but no eligible admin was found in this channel.`,
       }).catch(() => undefined);
+    }
+    // A requester-only explanation is not an approval surface. Reject when zero eligible admins or
+    // every approver delivery failed so notifyApprovalRequired removes only this minted id; a later
+    // turn can create and deliver a fresh prompt instead of being parked behind dedup for 10m.
+    if (!delivered) {
+      if (!approvers.length) throw new NoApprovalDecisionSurfaceError('no eligible approval recipient');
+      if (sawAmbiguousFailure) {
+        throw ambiguousFailure ?? new Error('approval prompt delivery outcome is unknown');
+      }
+      if (definiteFailure !== undefined) throw new SlackPromptDeliveryError(definiteFailure);
+      throw new Error('approval prompt delivery outcome is unknown');
     }
   }
 
@@ -571,17 +882,21 @@ export class ConnectContext {
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
-      throw new Error(`Policy denies "${providerId}" in this channel.`);
+      throw new PolicyDeniedError();
     }
     if (denial === 'tool-disabled') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
-      throw new Error(`"${providerId}" is not enabled in this channel.`);
+      throw new ToolDisabledError();
     }
   }
 
   async connect(providerId: string): Promise<ConnectionHandle> {
     // Refuse service-to-service tools BEFORE any consent flow — no Connect prompt, no vault lookup.
     const provider = this.brokerable(providerId);
+    // Capture the intent in PostgreSQL's clock domain before ANY asynchronous read. Policy, mode,
+    // credential, or session reads may pause behind offboarding; they must not let an older connect
+    // mint a newer key request or OAuth state after the tombstone has committed.
+    const connectIssuedAt = await this.provisioningIssuedAt();
 
     // The channel's configured auth mode for this provider decides the credential model:
     //   'shared'  → the channel's shared credential (delegate to connectChannel)
@@ -597,14 +912,22 @@ export class ConnectContext {
     // a tool-disabled deny — preserved deliberately).
     await this.requireProviderAuthorized(providerId);
 
+    // Resolve existence without decrypting. A first-time session user connects before approving a
+    // thread; reconnect then purges old grants as a Vault satellite, so no approval can silently
+    // carry across credential generations.
+    const owner = userOwner(this.identity);
+    const credentialId = await this.vault.liveId(owner, providerId);
+
     // Thread-scoped session: when the channel sets this provider to 'session', the user's token is usable
     // only inside the Slack thread they approved it in. The fail-closed rule lives in resolveCredentialOwner
     // (shared with the broker so the two can't drift); this branch maps the signal to Slack's surface — an
     // in-thread approval button, or the off-thread refusal. Checked before the stored-connection shortcut,
     // so being connected once still needs per-thread approval.
-    if (mode === 'session') {
-      const hasSessionGrant = !!(this.channel && this.thread && this.sessions &&
-        (await this.sessions.isGranted(this.identity, this.channel, this.thread, providerId)));
+    if (mode === 'session' && credentialId) {
+      const grantedCredentialId = this.channel && this.thread && this.sessions
+        ? await this.sessions.grantedCredentialId(this.identity, this.channel, this.thread, providerId)
+        : null;
+      const hasSessionGrant = grantedCredentialId === credentialId;
       const r = resolveCredentialOwner({
         path: 'user', mode, principal: this.identity, channel: this.channel, thread: this.thread, hasSessionGrant,
       });
@@ -613,38 +936,122 @@ export class ConnectContext {
           await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'no-thread' });
           throw new Error(`"${providerId}" needs a thread-scoped session; ask me inside a thread.`);
         }
-        await this.postSessionApprovalPrompt(providerId, this.thread!);
-        await this.audit.record('session', this.identity, providerId, { channel: this.channel, thread: this.thread, event: 'prompt' });
-        throw new SessionApprovalRequiredError(providerId);
+        if (!this.sessions || !this.channel) {
+          throw new Error('Session approval state is not available. Ask an admin to check Vouchr.');
+        }
+        const pending = await this.sessions.requestAudited({
+          identity: this.identity,
+          channel: this.channel,
+          thread: this.thread!,
+          provider: providerId,
+          credentialId,
+          actorIssuedAt: connectIssuedAt,
+          audit: this.audit,
+          vault: this.vault,
+          validate: async (tx) => {
+            const currentMode = await new ChannelConfig(tx).getMode(
+              this.identity.teamId,
+              this.channel!,
+              providerId,
+              tx,
+            );
+            return currentMode === 'session' && (await authorizeProvider(
+              this.policy,
+              new ChannelTools(tx),
+              this.identity,
+              this.channel,
+              providerId,
+            )) === null;
+          },
+        });
+        if (pending.status === 'requested') {
+          const delivery = await this.sessions.claimDelivery(pending.id);
+          if (delivery.status === 'claimed') {
+            try {
+              await this.postSessionApprovalPrompt(providerId, pending.id, this.thread!);
+            } catch (deliveryError) {
+              const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+              if (outcome !== 'ambiguous') {
+                await abandonKnownUndeliveredPrompt(
+                  this.sessions,
+                  pending.id,
+                  delivery.token,
+                  pending.created,
+                  'session',
+                );
+              }
+              throw slackPromptDeliveryRecovery(outcome, 'session');
+            }
+            if (!(await this.sessions.confirmDelivery(pending.id, delivery.token))) {
+              throw new UserFacingError(
+                'The session prompt was delivered, but its request changed before confirmation. Ask the agent again.',
+                'resolve_again',
+              );
+            }
+          } else if (delivery.status === 'in-flight') {
+            throw new UserFacingError(
+              'A session approval prompt is still being delivered. Ask the agent to retry shortly.',
+              'retry_later',
+            );
+          } else if (delivery.status === 'stale') {
+            throw new UserFacingError(
+              'The session request changed before delivery. Ask the agent again.',
+              'resolve_again',
+            );
+          }
+          throw new SessionApprovalRequiredError(providerId);
+        }
+        // The click committed while this connect() was waiting for the lifecycle locks. Continue
+        // with the newly-live exact grant; do not mint, audit, or deliver a redundant request.
       }
       // resolved → fall through to the stored-credential / consent tail below (as before).
     }
 
-    if (await this.vault.get(userOwner(this.identity), providerId)) {
+    if (credentialId && await this.vault.get(owner, providerId, undefined, credentialId)) {
       return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
-        provider, userOwner(this.identity), this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
+        provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
         this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
         this.rateLimits,
         this.health,
         this.approvals,
         this.thread,
         this.dryRun,
+        undefined,
+        undefined,
+        credentialId,
+        this.approvalRequestStillCurrent.bind(this, connectIssuedAt),
+        this.useValidator(
+          owner,
+          providerId,
+          credentialId,
+          this.channel,
+          this.thread,
+          connectIssuedAt,
+        ),
       )));
     }
 
     // Key providers have no OAuth: post a self-service "set up your key" prompt instead.
     if (provider.credential === 'key') {
-      await this.postKeySetupPrompt(providerId);
+      await this.postKeySetupPrompt(providerId, connectIssuedAt);
       this.emit({ type: 'connect_prompted', provider: providerId });
       throw new ConsentRequiredError(providerId);
     }
 
-    const { authorizeUrl } = await this.consent.begin(
+    const pendingConsent = await this.consent.beginFenced(
       this.identity,
       provider,
       this.redirectUri,
       this.channel,
+      connectIssuedAt,
     );
+    if (!pendingConsent) {
+      throw new UserFacingError(
+        'Connection setup changed while Vouchr was preparing it. Ask the agent again.',
+        'resolve_again',
+      );
+    }
+    const { authorizeUrl } = pendingConsent;
     await this.postConnectPrompt(providerId, authorizeUrl);
     this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId);
@@ -657,16 +1064,23 @@ export class ConnectContext {
    */
   async setUserSecret(providerId: string, secret: string): Promise<void> {
     this.brokerable(providerId);
-    await this.vault.upsert(userOwner(this.identity), providerId, {
-      accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-    }, undefined, (tx) => this.audit.record(
-      'config',
-      this.identity,
+    const issuance = await this.provisioningIssuedAt();
+    const result = await configureUserCredential({
+      vault: this.vault,
+      audit: this.audit,
+      identity: this.identity,
       providerId,
-      { owner: 'user', kind: 'secret' },
-      undefined,
-      tx,
-    ));
+      credential: {
+        kind: 'secret',
+        token: {
+          accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+        },
+      },
+      issuance,
+    });
+    if (result !== 'stored') {
+      throw new UserFacingError('This credential setup is no longer valid. Reopen it and try again.', 'resolve_again');
+    }
   }
 
   /** Point the acting user's OWN credential at an external secret manager (self-service). */
@@ -676,9 +1090,13 @@ export class ConnectContext {
   ): Promise<void> {
     const provider = this.brokerable(providerId);
     const reference = normalizeSecretReference(r, this.resolvers, provider.scopesDefault);
-    await referenceUserCredential({
-      vault: this.vault, audit: this.audit, identity: this.identity, providerId, reference,
+    const issuance = await this.provisioningIssuedAt();
+    const result = await referenceUserCredential({
+      vault: this.vault, audit: this.audit, identity: this.identity, providerId, reference, issuance,
     });
+    if (result !== 'stored') {
+      throw new UserFacingError('This credential setup is no longer valid. Reopen it and try again.', 'resolve_again');
+    }
   }
 
   /** Whether the user already has a stored connection (no prompt side-effect). A service-to-service
@@ -733,15 +1151,17 @@ export class ConnectContext {
   async setChannelSecret(providerId: string, secret: string): Promise<void> {
     this.brokerable(providerId); // validate provider exists + refuse service tools
     const { cfg, channel } = this.channelTarget();
+    const issuance = this.channelProvisioningIssuance ?? await this.provisioningIssuedAt();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    await configureChannelCredential({
+    const stored = await configureChannelCredential({
       vault: this.vault,
       audit: this.audit,
       channelConfig: cfg,
       identity: this.identity,
       channel,
       providerId,
+      issuance,
       credential: {
         kind: 'secret',
         token: { accessToken: secret, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null },
@@ -750,6 +1170,7 @@ export class ConnectContext {
         throw new UserFacingError(`Channel is set to ${escapeMrkdwn(mode)} for "${escapeMrkdwn(providerId)}"; static keys are not allowed.`);
       },
     });
+    if (!stored) throw new ChannelProvisioningStaleError();
   }
 
   /**
@@ -763,10 +1184,11 @@ export class ConnectContext {
   ): Promise<void> {
     const provider = this.brokerable(providerId);
     const { cfg, channel } = this.channelTarget();
+    const issuance = this.channelProvisioningIssuance ?? await this.provisioningIssuedAt();
     const reference = normalizeSecretReference(r, this.resolvers, provider.scopesDefault);
-    await referenceChannelCredential({
+    const stored = await referenceChannelCredential({
       vault: this.vault, audit: this.audit, channelConfig: cfg, identity: this.identity,
-      channel, providerId, reference,
+      channel, providerId, reference, issuance,
       authorize: () => this.requireAdmin(providerId),
       assertEligible: () => this.assertChannelEligible(),
       modeConflict: (mode) => {
@@ -775,6 +1197,7 @@ export class ConnectContext {
         );
       },
     });
+    if (!stored) throw new ChannelProvisioningStaleError();
   }
 
   /**
@@ -785,9 +1208,10 @@ export class ConnectContext {
   async setChannelMode(providerId: string, mode: ChannelMode): Promise<void> {
     this.brokerable(providerId);
     const { cfg, channel } = this.channelTarget();
+    const issuance = await this.provisioningIssuedAt();
     await this.requireAdmin(providerId);
     await this.assertChannelEligible();
-    await setChannelCredentialMode({
+    const configured = await setChannelCredentialMode({
       vault: this.vault,
       audit: this.audit,
       channelConfig: cfg,
@@ -795,7 +1219,9 @@ export class ConnectContext {
       channel,
       providerId,
       mode,
+      issuance,
     });
+    if (!configured) throw new InteractionStateChangedError('connection', 'authorization');
   }
 
   /**
@@ -805,6 +1231,7 @@ export class ConnectContext {
    */
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
     const provider = this.brokerable(providerId);
+    const connectIssuedAt = await this.provisioningIssuedAt();
     const { cfg, owner, channel } = this.channelTarget();
     // Same authorization gate as connect() (the shared core CHECK): a deny applies to shared channel
     // creds too. Audit meta carries owner:'channel' here; like connect(), no policy_denied on tool-disabled.
@@ -812,17 +1239,18 @@ export class ConnectContext {
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
       this.emit({ type: 'policy_denied', provider: providerId });
-      throw new Error(`Policy denies "${providerId}" in this channel.`);
+      throw new PolicyDeniedError();
     }
     if (denial === 'tool-disabled') {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'tool-disabled' });
-      throw new Error(`"${providerId}" is not enabled in this channel.`);
+      throw new ToolDisabledError();
     }
     const m = await cfg.getMode(owner.teamId, channel, providerId);
     if (m != null && m !== 'shared') {
       throw new Error(`Channel "${channel}" uses ${m} credentials for "${providerId}"; use connect() instead.`);
     }
-    if (!(await this.vault.get(owner, providerId))) {
+    const credentialId = await this.vault.liveId(owner, providerId);
+    if (!credentialId || !(await this.vault.get(owner, providerId, undefined, credentialId))) {
       throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
     }
     // Governance (opt-in): a shared cred is only usable by an actual channel member. Fail-closed.
@@ -844,6 +1272,9 @@ export class ConnectContext {
     return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
       provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
       null, this.rateLimits, this.health, this.approvals, this.thread, this.dryRun,
+      undefined, undefined, credentialId,
+      this.approvalRequestStillCurrent.bind(this, connectIssuedAt),
+      this.useValidator(r.owner, providerId, credentialId, owner.id, this.thread, connectIssuedAt),
     )));
   }
 
@@ -867,8 +1298,8 @@ export class ConnectContext {
 
   /** Ephemeral in-thread prompt to approve a thread-scoped session. Only the acting user sees it.
    *  Caller guarantees we're in a channel + thread. */
-  private async postSessionApprovalPrompt(providerId: string, thread: string): Promise<void> {
-    const blocks = sessionApprovalBlocks(providerId, thread);
+  private async postSessionApprovalPrompt(providerId: string, requestId: string, thread: string): Promise<void> {
+    const blocks = sessionApprovalBlocks(providerId, requestId);
     await this.client.chat.postEphemeral({
       channel: this.channel!,
       user: this.identity.userId,
@@ -879,8 +1310,23 @@ export class ConnectContext {
   }
 
   /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
-  private async postKeySetupPrompt(providerId: string): Promise<void> {
-    const blocks = keySetupBlocks(providerId);
+  private async postKeySetupPrompt(providerId: string, issuedAt: number): Promise<void> {
+    // Mint when the prompt is produced, not when it is clicked. The PostgreSQL timestamp is the
+    // authority's true start, so a prompt already delivered before offboarding can never mint a
+    // post-offboard credential merely because its button was clicked later.
+    const requestId = await issueUserProvisioningRequest(
+      this.vault,
+      this.identity,
+      providerId,
+      issuedAt,
+    );
+    if (!requestId) {
+      throw new UserFacingError(
+        'Credential setup changed while Vouchr was preparing it. Ask the agent again.',
+        'resolve_again',
+      );
+    }
+    const blocks = keySetupBlocks(providerId, requestId);
     const text = blocksFallbackText(blocks);
     if (this.channel) {
       await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, blocks: blocks as any, text });
@@ -925,11 +1371,10 @@ export class ConnectContext {
  * the alternative, where two pods can double-DM. The provider is registry-validated before
  * anything is rendered or
  * persisted (SEC-4), and every interpolated value is escaped at render (SEC-5). No token material
- * anywhere. The refresh_dead reconnect button is an ACTION (RECONNECT_ACTION), not a baked-in
- * authorize URL: a consent state lives 10 minutes and this DM may be read hours later, so the
- * state is minted fresh on click (see the handler in registerCommands) — otherwise the 24h
- * debounce would leave a dead link with no recovery path. Exported for tests; createVouchr wires
- * it with the same client resolution the post-OAuth confirmation DM uses.
+ * anywhere. A refresh-dead DM contains no reconnect control: it may live past offboarding, so a
+ * later click cannot safely mint fresh consent. The user asks the agent again, which produces a
+ * current, offboard-fenced prompt. Exported for tests; createVouchr wires it with the same client
+ * resolution the post-OAuth confirmation DM uses.
  */
 export function healthNotifier(deps: {
   registry: ProviderRegistry;
@@ -940,7 +1385,6 @@ export function healthNotifier(deps: {
   return async (e) => {
     if (e.type === 'expired') return; // deleted: nothing actionable to reconnect yet
     if (!deps.registry.has(e.provider)) return; // stale row for an unregistered provider (SEC-4 gate)
-    const provider = deps.registry.get(e.provider);
     const recipient = e.owner.kind === 'user'
       ? e.owner.id
       : await deps.audit.lastChannelConfigActor(e.owner.teamId, e.owner.id, e.provider);
@@ -954,22 +1398,12 @@ export function healthNotifier(deps: {
     let blocks: unknown[] | undefined;
     if (e.type === 'refresh_dead') {
       if (e.owner.kind === 'user') {
-        text = `Your ${p} connection stopped working and needs to be reconnected.`;
+        text = `Your ${p} connection stopped working. Ask the agent to reconnect it.`;
         const intro = { type: 'section', text: { type: 'mrkdwn', text: `:warning: Your *${p}* connection stopped working and needs to be reconnected.` } };
-        // Key providers have no OAuth authorize URL: reuse the key-setup prompt instead. (Today only
-        // OAuth creds can refresh at all, so this branch is defensive symmetry, not a live path.)
-        blocks = provider.credential === 'key'
-          ? [intro, ...keySetupBlocks(e.provider)]
-          : [intro, {
-              type: 'actions',
-              elements: [{
-                type: 'button',
-                text: { type: 'plain_text', text: `Connect ${e.provider}`, emoji: true },
-                action_id: RECONNECT_ACTION,
-                value: e.provider, // forgeable — the click handler re-validates against the registry
-                style: 'primary',
-              }],
-            }];
+        blocks = [intro, {
+          type: 'section',
+          text: { type: 'mrkdwn', text: 'Ask the agent to reconnect; it will create a current private prompt.' },
+        }];
       } else {
         text = `The shared ${p} connection${where} stopped working and needs to be reconfigured. Use \`/vouchr configure ${p}\` there.`;
       }
@@ -1030,6 +1464,8 @@ export async function createVouchr(opts: VouchrOptions) {
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
   const approvals = new Approvals(db); // #113 per-action approval requests/grants (provider.approval)
+  const provisioning = new UserProvisioningRequests(db, vault);
+  const channelProvisioning = new ChannelProvisioningRequests(db, vault);
   // The 'session' channel mode drives whether a thread grant is required; this is just the TTL ceiling.
   const sessionTtlMs = opts.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
   const providerIds = opts.providers.map((p) => p.id); // for toolManifest(); mirrors the registry
@@ -1062,9 +1498,14 @@ export async function createVouchr(opts: VouchrOptions) {
    *  never lists as a "connected account" (defensive — storage is blocked); an unknown/stale row
    *  still shows so nothing stored is ever hidden. */
   const listBrokeredConnections = async (identity: SlackIdentity): Promise<Connection[]> =>
-    (await vault.listForUser(identity))
+    (await vault.listForUser(identity, true))
       .filter((c) => { try { return isBrokeredProvider(registry.get(c.provider)); } catch { return true; } })
-      .map((c) => ({ provider: c.provider, channel: null, account: c.externalAccount }))
+      .map((c) => ({
+        provider: c.provider,
+        channel: null,
+        account: c.externalAccount,
+        credentialId: c.credentialId,
+      }))
       .sort((a, b) => a.provider < b.provider ? -1 : a.provider > b.provider ? 1 : 0);
 
   /** Best-effort DM to the acting user — the App Home has no ephemeral/inline-error surface, so
@@ -1105,15 +1546,22 @@ export async function createVouchr(opts: VouchrOptions) {
    * records anything.
    */
   const setChannelToolEnabled = async (
-    client: WebClient, identity: SlackIdentity, channel: string, provider: string, on: boolean,
+    client: WebClient,
+    identity: SlackIdentity,
+    channel: string,
+    provider: string,
+    on: boolean,
+    provisioningReceivedAt: bigint,
   ): Promise<'ok' | 'denied'> => {
     const configured = await configureChannelTools({
       channelTools,
+      vault,
       audit,
       identity,
       channel,
       changes: [[provider, on]],
       allProviders: providerIds,
+      issuance: await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
       authorize: async () => {
         if (await commandAdmin(client, identity, channel)) return true;
         await audit.record('denied', identity, provider, { reason: 'not-admin', owner: 'channel', channel });
@@ -1125,30 +1573,180 @@ export async function createVouchr(opts: VouchrOptions) {
       // UserFacingError with no audit row, exactly mirroring setChannelMode.
       assertEligible: () => assertChannelEligible(client, channel),
     });
-    return configured ? 'ok' : 'denied';
+    if (configured === 'stale') {
+      throw new InteractionStateChangedError('connection', 'authorization');
+    }
+    return configured === 'configured' ? 'ok' : 'denied';
   };
 
-  /** STR-3: the admin gate + denial audit in front of the channel-credential modal, shared by
-   *  `/vouchr configure` and the App Home Configure button. Same caller contract as
-   *  setChannelToolEnabled: provider registry-validated, channel verified, BEFORE any audit write.
-   *  Also refuses ineligible channel classes up front (same rule the submit re-asserts at the
-   *  write), so a forged click can't even open the modal for an archived/ext-shared channel. */
+  const CHANNEL_CREDENTIAL_UNAVAILABLE =
+    'This tool uses service-managed credentials and cannot be configured here.';
+
+  /** Consume Slack's short-lived trigger before any network/database gate, reserve opaque setup
+   * authority immediately after Slack confirms the loading view, then hydrate it only after the
+   * channel, admin, eligibility, and lifecycle fences pass. Reserving before the slow Slack gates
+   * lets any concurrent credential mutation invalidate this request instead of being overwritten
+   * by an older handler. Slash and App Home share this exact sequence (STR-3). */
   const openConfigureModal = async (
-    client: WebClient, identity: SlackIdentity, channel: string, provider: string, triggerId: string,
-  ): Promise<'ok' | 'denied'> => {
-    if (!(await commandAdmin(client, identity, channel))) {
-      await audit.record('denied', identity, provider, { reason: 'not-admin', owner: 'channel', channel });
-      return 'denied';
+    client: WebClient,
+    identity: SlackIdentity,
+    candidateChannel: string | null,
+    provider: string,
+    triggerId: string,
+    provisioningReceivedAt: bigint,
+    verifyChannel?: () => Promise<string | null>,
+  ): Promise<'ok' | 'denied' | 'unavailable' | 'unconfirmed' | 'unsupported'> => {
+    // A forged App Home action and the slash command share this eligibility boundary. Reject
+    // service-only tools before consuming the trigger, reading Slack/DB state, or minting setup
+    // authority: Vouchr must never ask an admin to enter a credential it cannot use.
+    if (!registry.has(provider) || !isBrokeredProvider(registry.get(provider))) {
+      return 'unsupported';
     }
-    await assertChannelEligible(client, channel); // throws UserFacingError, mirrors setChannelMode
+    let opened: any;
     try {
-      await client.views.open({
+      opened = await client.views.open({
         trigger_id: triggerId,
-        view: configureModal(provider, channel, referenceSources) as any,
+        view: privateStatusModal(
+          'Preparing setup',
+          'Vouchr is checking this channel credential setup. If no result appears, close this window and try again.',
+        ) as any,
       });
     } catch {
-      // Expired trigger_id / transient Slack error: tell the actor instead of dying silently.
-      await dmActor(client, identity, `Couldn't open the ${escapeMrkdwn(provider)} credential modal (the button may have expired). Try again.`);
+      // Slack may have accepted the modal before the response failed. Do no authorization reads or
+      // ticket writes, and never claim that the window definitely did not open.
+      await dmActor(
+        client,
+        identity,
+        'Vouchr could not confirm whether channel credential setup opened. If a setup window appeared, follow it or close it; otherwise try again.',
+      );
+      return 'unconfirmed';
+    }
+    const viewId = opened?.view?.id;
+    if (typeof viewId !== 'string' || !viewId) {
+      await dmActor(
+        client,
+        identity,
+        'Vouchr could not confirm whether channel credential setup opened. If a setup window appeared, follow it or close it; otherwise try again.',
+      );
+      return 'unconfirmed';
+    }
+
+    if (!candidateChannel) {
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Setup unavailable',
+        'This channel selection is no longer current. Close this window, select the channel again, and retry.',
+      );
+      return 'unavailable';
+    }
+
+    let requestId: string | null;
+    try {
+      const issuedAt = await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt);
+      requestId = await channelProvisioning.issue(identity, candidateChannel, provider, issuedAt);
+    } catch {
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Setup not confirmed',
+        'Vouchr could not confirm this setup request. Close this window and review the current channel state before trying again.',
+      );
+      return 'unconfirmed';
+    }
+    if (!requestId) {
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Review current status',
+        'This channel credential setup is no longer active. Review the current channel state before requesting setup again.',
+      );
+      return 'unavailable';
+    }
+    const channel = verifyChannel ? await verifyChannel() : candidateChannel;
+    if (!channel || channel !== candidateChannel) {
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Setup unavailable',
+        'This channel selection is no longer current. Close this window, select the channel again, and retry.',
+      );
+      return 'unavailable';
+    }
+    const authorized = await commandAdmin(client, identity, channel);
+    if (!authorized) {
+      await audit.record('denied', identity, provider, {
+        reason: 'not-admin',
+        owner: 'channel',
+        channel,
+      });
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Setup unavailable',
+        adminOnly(allowChannelCreatorConfig, 'configure channel credentials'),
+      );
+      return 'denied';
+    }
+    try {
+      await assertChannelEligible(client, channel);
+    } catch (error) {
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Setup unavailable',
+        safeUserMessage(error),
+      );
+      return 'unavailable';
+    }
+
+    // A sibling credential/mode mutation may have committed while Slack authorization was in
+    // flight. Re-read before rendering a secret-entry surface so the user is not invited to submit
+    // a request that the mutation already invalidated. The final transaction still consumes and
+    // rechecks the row, covering a mutation after this UX-only read.
+    try {
+      const pending = await channelProvisioning.resolveForModal(requestId, identity);
+      if (!pending || pending.channel !== channel || pending.provider !== provider) {
+        await deliverModalOutcome(
+          client,
+          identity,
+          { id: viewId },
+          'Review current status',
+          'This channel credential setup is no longer active. Review the current channel state before requesting setup again.',
+        );
+        return 'unavailable';
+      }
+    } catch {
+      await deliverModalOutcome(
+        client,
+        identity,
+        { id: viewId },
+        'Setup not confirmed',
+        'Vouchr could not confirm this setup request. Close this window and review the current channel state before trying again.',
+      );
+      return 'unconfirmed';
+    }
+
+    try {
+      await client.views.update({
+        view_id: viewId,
+        view: configureModal(provider, channel, referenceSources, requestId) as any,
+      });
+    } catch {
+      // Acceptance of views.update is unknown. Leave the TTL-bound request alone and do not issue a
+      // second update that could overwrite the form Slack actually accepted.
+      await dmActor(
+        client,
+        identity,
+        'Vouchr could not confirm whether channel credential setup finished opening. If the credential form appeared, use it or close it; otherwise try again.',
+      );
+      return 'unconfirmed';
     }
     return 'ok';
   };
@@ -1291,14 +1889,27 @@ export async function createVouchr(opts: VouchrOptions) {
   }
 
   /** Build a per-request ConnectContext bound to a specific channel (for the modal submit). */
-  function contextFor(identity: SlackIdentity, channel: string | null, client: WebClient): ConnectContext {
-    return new ConnectContext({
+  function contextFor(
+    identity: SlackIdentity,
+    channel: string | null,
+    client: WebClient,
+    provisioningReceivedAt?: bigint,
+    channelIssuance?: ChannelProvisioningIssuance,
+  ): ConnectContext {
+    const deps: InternalConnectContextDeps = {
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, approvals, auditSink, health, dryRun,
-    });
+    };
+    if (provisioningReceivedAt != null) {
+      deps[INTERNAL_PROVISIONING_RECEIVED_AT] = provisioningReceivedAt;
+    }
+    if (channelIssuance != null) {
+      deps[INTERNAL_CHANNEL_PROVISIONING_ISSUANCE] = channelIssuance;
+    }
+    return new ConnectContext(deps);
   }
 
   /** The manifest plus its raw allowlist snapshot for admin renderers. Keeping the raw predicate lets
@@ -1373,6 +1984,7 @@ export async function createVouchr(opts: VouchrOptions) {
     };
 
     app.command('/vouchr', async ({ command, ack, respond, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       await ack();
       const identity = resolveIdentity({ body: command });
       if (!identity) return respond('Could not resolve your Slack identity.');
@@ -1442,7 +2054,14 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         const on = sub === 'enable';
         try {
-          if ((await setChannelToolEnabled(client, identity, command.channel_id, arg, on)) === 'denied') {
+          if ((await setChannelToolEnabled(
+            client,
+            identity,
+            command.channel_id,
+            arg,
+            on,
+            provisioningReceivedAt,
+          )) === 'denied') {
             return respond(adminOnly(allowChannelCreatorConfig, 'change channel tools'));
           }
         } catch (e) {
@@ -1460,7 +2079,12 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');
         try {
-          await contextFor(identity, command.channel_id, client).setChannelMode(arg, arg2);
+          await contextFor(
+            identity,
+            command.channel_id,
+            client,
+            provisioningReceivedAt,
+          ).setChannelMode(arg, arg2);
         } catch (e) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
         }
@@ -1476,9 +2100,18 @@ export async function createVouchr(opts: VouchrOptions) {
         // audit + modal open is openConfigureModal, shared with the App Home Configure button (STR-3).
         if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         try {
-          if ((await openConfigureModal(client, identity, command.channel_id, arg, command.trigger_id)) === 'denied') {
+          const result = await openConfigureModal(
+            client,
+            identity,
+            command.channel_id,
+            arg,
+            command.trigger_id,
+            provisioningReceivedAt,
+          );
+          if (result === 'denied') {
             return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
           }
+          if (result === 'unsupported') return respond(CHANNEL_CREDENTIAL_UNAVAILABLE);
         } catch (e) {
           return respond(safeUserMessage(e)); // ineligible channel class → the core reason, nothing else
         }
@@ -1491,14 +2124,27 @@ export async function createVouchr(opts: VouchrOptions) {
         // this user's exact stored stale row; arbitrary input reaches no mutation/audit/event (SEC-4).
         let outcome: Awaited<ReturnType<typeof disconnectProvider>>;
         try {
-          outcome = await disconnectProvider(vault, audit, registry, identity, arg);
-        } catch {
+          outcome = await disconnectProviderAtReceipt(
+            vault,
+            audit,
+            registry,
+            identity,
+            arg,
+            await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
+          );
+        } catch (error) {
+          if (error instanceof InteractionStateChangedError) {
+            return respond(safeUserMessage(error));
+          }
           // A thrown failure means the local delete itself is uncertain. Never echo DB/KMS/provider
           // text; give one state-agnostic way to discover the committed outcome (#194 UX-1/5).
           return respond('Could not confirm whether the account was disconnected. Run `/vouchr status` to check; if it is still listed, try again.');
         }
         if (!outcome.recognized) return respond(UNKNOWN_DISCONNECT_PROVIDER_TEXT);
         const p = escapeMrkdwn(arg); // recognized current/stored id; still escape at render (SEC-5)
+        if (!outcome.removed && !outcome.ok) {
+          return respond(`Could not confirm that older *${p}* setup requests were invalidated. Retry \`/vouchr disconnect ${p}\` before reconnecting.`);
+        }
         if (!outcome.removed) return respond(`You have no connected *${p}* account, so there was nothing to disconnect.`);
         emit({ type: 'revoked', provider: arg, ok: outcome.ok });
         if (!outcome.audited && outcome.ok) {
@@ -1506,7 +2152,7 @@ export async function createVouchr(opts: VouchrOptions) {
         }
         return respond(outcome.ok
           ? `Disconnected *${p}*. The agent can no longer act as you on ${p}.`
-          : `Disconnected *${p}* locally, but the upstream token revoke could not be confirmed. Revoke or rotate Vouchr’s access in ${p} directly.`);
+          : `Disconnected *${p}* locally, but complete revocation could not be confirmed. Retry \`/vouchr disconnect ${p}\` to invalidate older setup requests, and revoke or rotate Vouchr’s access in ${p} directly if needed.`);
       }
 
       // Self-service transparency: where your credential was used. `audit channel` (admin-gated) shows
@@ -1597,10 +2243,10 @@ export async function createVouchr(opts: VouchrOptions) {
     // The typed value is never echoed, posted, logged, or put in audit meta (invariant 8 / T7).
     const handleSecretSubmit = async ({ ack, body, view, client }: any, kind: 'channel' | 'user') => {
       const identity = resolveIdentity({ body });
-      let channel = '';
-      let provider = '';
+      let provider: unknown;
+      let requestId: unknown;
       try {
-        ({ channel = '', provider } = JSON.parse(view.private_metadata));
+        ({ provider, requestId } = JSON.parse(view.private_metadata));
       } catch {
         return ack({ response_action: 'errors', errors: { raw: 'Malformed request. Please reopen the modal.' } });
       }
@@ -1615,19 +2261,24 @@ export async function createVouchr(opts: VouchrOptions) {
       if ((ref && raw) || (!ref && !raw)) {
         return ack({ response_action: 'errors', errors: { raw: 'Provide exactly one: a reference or a key.' } });
       }
-      if (kind === 'channel' && (typeof channel !== 'string' || !channel)) {
-        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: 'No channel was selected. Reopen the modal.' } });
-      }
-      if (typeof provider !== 'string' || !registry.has(provider) || !isBrokeredProvider(registry.get(provider))) {
+      let normalizedReference: SecretReference | undefined;
+      if (kind === 'user' && (
+        typeof provider !== 'string' ||
+        !registry.has(provider) ||
+        !isBrokeredProvider(registry.get(provider))
+      )) {
         return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: 'Credential setup is unavailable. Reopen the modal.' } });
       }
-      if (ref) {
+      if (kind === 'user' && ref) {
         try {
-          const definition = registry.get(provider);
-          normalizeSecretReference({ secretRef: ref }, resolvers, definition.scopesDefault);
+          const definition = registry.get(provider as string);
+          normalizedReference = normalizeSecretReference({ secretRef: ref }, resolvers, definition.scopesDefault);
         } catch (e) {
           return ack({ response_action: 'errors', errors: { ref: safeUserMessage(e) } });
         }
+      }
+      if (!isInteractionId(requestId)) {
+        return ack({ response_action: 'errors', errors: { [ref ? 'ref' : 'raw']: 'Credential setup expired. Reopen the modal.' } });
       }
       await ack({
         response_action: 'update',
@@ -1637,29 +2288,142 @@ export async function createVouchr(opts: VouchrOptions) {
         ),
       });
 
-      const ctx = contextFor(identity, kind === 'channel' ? channel : null, client);
+      let channel = '';
+      if (kind === 'channel') {
+        let pending: { channel: string; provider: string } | null;
+        try {
+          pending = await channelProvisioning.resolveForModal(requestId, identity);
+        } catch {
+          await deliverModalOutcome(
+            client,
+            identity,
+            view,
+            'Save not confirmed',
+            'Vouchr could not confirm whether the channel credential was saved. Review the current channel state before requesting setup again.',
+          );
+          return;
+        }
+        if (!pending) {
+          await deliverModalOutcome(
+            client,
+            identity,
+            view,
+            'Review current status',
+            'This channel credential setup request is no longer active. Review the current channel state before requesting setup again.',
+          );
+          return;
+        }
+        ({ channel, provider } = pending);
+        if (!registry.has(pending.provider) || !isBrokeredProvider(registry.get(pending.provider))) {
+          await deliverModalOutcome(
+            client,
+            identity,
+            view,
+            'Review current status',
+            'This provider is no longer available for channel credential setup. Review the current channel state before requesting setup again.',
+          );
+          return;
+        }
+        if (ref) {
+          try {
+            const definition = registry.get(pending.provider);
+            normalizeSecretReference({ secretRef: ref }, resolvers, definition.scopesDefault);
+          } catch (error) {
+            await deliverModalOutcome(
+              client,
+              identity,
+              view,
+              'Credential not saved',
+              safeUserMessage(error),
+            );
+            return;
+          }
+        }
+      }
+
+      const authoritativeProvider = provider as string;
       try {
         if (kind === 'channel') {
-          if (ref) await ctx.referenceChannelSecret(provider, { secretRef: ref });
-          else await ctx.setChannelSecret(provider, raw);
+          const channelContext = contextFor(
+            identity,
+            channel,
+            client,
+            undefined,
+            channelProvisioning.issuance(requestId, identity, channel, authoritativeProvider),
+          );
+          if (ref) {
+            await channelContext.referenceChannelSecret(authoritativeProvider, { secretRef: ref });
+          } else {
+            await channelContext.setChannelSecret(authoritativeProvider, raw);
+          }
         } else {
-          if (ref) await ctx.referenceUserSecret(provider, { secretRef: ref });
-          else await ctx.setUserSecret(provider, raw);
+          const result = await configureUserCredential({
+            vault,
+            audit,
+            identity,
+            providerId: authoritativeProvider,
+            credential: normalizedReference
+              ? { kind: 'ref', reference: normalizedReference }
+              : {
+                  kind: 'secret',
+                  token: {
+                    accessToken: raw,
+                    refreshToken: null,
+                    scopes: '',
+                    expiresAt: null,
+                    externalAccount: null,
+                  },
+                },
+            issuance: provisioning.issuance(requestId, identity, authoritativeProvider),
+          });
+          if (result !== 'stored') {
+            // A consumed request can be a Slack retry after the first submit already committed.
+            // Never overwrite that success receipt with a definitive failure: the exact current
+            // state may have changed again, so direct the user to review it before retrying.
+            await deliverModalOutcome(
+              client,
+              identity,
+              view,
+              'Review current status',
+              `This setup request is no longer active. Your *${escapeMrkdwn(authoritativeProvider)}* credential may already be saved. Ask the agent to check current connection status before requesting setup again.`,
+            );
+            return;
+          }
         }
-      } catch (e) {
-        const p = escapeMrkdwn(provider);
+      } catch (error) {
+        const p = escapeMrkdwn(authoritativeProvider);
         const target = kind === 'channel' ? `the *${p}* channel credential` : `your *${p}* credential`;
+        if (error instanceof ChannelProvisioningStaleError) {
+          await deliverModalOutcome(
+            client,
+            identity,
+            view,
+            'Review current status',
+            'This channel credential setup request is no longer active. Review the current channel state before requesting setup again.',
+          );
+          return;
+        }
+        if (error instanceof UserFacingError) {
+          await deliverModalOutcome(
+            client,
+            identity,
+            view,
+            'Credential not saved',
+            safeUserMessage(error),
+          );
+          return;
+        }
         await deliverModalOutcome(
           client,
           identity,
           view,
           'Save not confirmed',
-          `Could not save ${target}. ${safeUserMessage(e)} Reopen credential setup and try again.`,
+          `Vouchr could not confirm whether ${target} was saved. Ask the agent to check current connection status before requesting setup again.`,
         );
         return;
       }
       // Private confirmation DM (no secret), just the fact it was set.
-      const p = escapeMrkdwn(provider);
+      const p = escapeMrkdwn(authoritativeProvider);
       const text = kind === 'channel'
         ? `Saved the *${p}* credential for <#${escapeMrkdwn(channel)}>.`
         : `Your *${p}* credential is set. Ask me again and I'll use it.`;
@@ -1726,6 +2490,7 @@ export async function createVouchr(opts: VouchrOptions) {
     // mutates or reverts a concurrent admin's change because every value is diffed against OPEN-TIME
     // metadata, not a later store read.
     app.view(CONFIG_CALLBACK, async ({ ack, body, view, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       const identity = resolveIdentity({ body });
       if (!identity) {
         return ack({
@@ -1782,7 +2547,7 @@ export async function createVouchr(opts: VouchrOptions) {
         return;
       }
 
-      const ctx = contextFor(identity, channel, client);
+      const ctx = contextFor(identity, channel, client, provisioningReceivedAt);
       let confirmed = 0;
       let unconfirmed = 0;
 
@@ -1801,19 +2566,22 @@ export async function createVouchr(opts: VouchrOptions) {
       const enabledChanged = [...submittedEnabled].filter(([p]) => registry.has(p) && submittedEnabled.get(p) !== (openEnabled.get(p) ?? true));
       if (enabledChanged.length) {
         try {
-          await configureChannelTools({
+          const configured = await configureChannelTools({
             channelTools,
+            vault,
             audit,
             identity,
             channel,
             changes: enabledChanged,
             allProviders: providerIds,
+            issuance: await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
             // The modal's common gate above already proved current admin authority once for every
             // submitted setting; the shared helper still owns the mutation/audit sequence.
             authorize: async () => true,
             assertEligible: () => assertChannelEligible(client, channel),
           });
-          confirmed += enabledChanged.length;
+          if (configured === 'configured') confirmed += enabledChanged.length;
+          else unconfirmed += enabledChanged.length;
         } catch {
           unconfirmed += enabledChanged.length;
         }
@@ -1977,6 +2745,7 @@ export async function createVouchr(opts: VouchrOptions) {
     // order matches the slash command: registry + modes list BEFORE the mutation (SEC-4) — an invalid
     // forged mode must not even reach setChannelMode (whose shared-cred cleanup precedes its sink check).
     app.action(HOME_MODE_ACTION, async ({ ack, body, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       await ack();
       if (body.view?.callback_id !== HOME_CALLBACK) return;
       const identity = resolveIdentity({ body });
@@ -1988,7 +2757,12 @@ export async function createVouchr(opts: VouchrOptions) {
       const channel = await verifiedHomeChannel(client, body);
       if (!channel) return staleChannelFeedback(client, identity);
       try {
-        await contextFor(identity, channel, client).setChannelMode(provider, mode);
+        await contextFor(
+          identity,
+          channel,
+          client,
+          provisioningReceivedAt,
+        ).setChannelMode(provider, mode);
       } catch (e) {
         // The home view has no inline-error surface; the re-publish below shows the real (unchanged)
         // state, and the reason goes to the actor as a DM. Denials were already audited inside.
@@ -2000,6 +2774,7 @@ export async function createVouchr(opts: VouchrOptions) {
     // Enable/Disable → the SAME helper as `/vouchr enable|disable` (STR-3; a denial is audited
     // inside), then re-publish. The button value carries the TARGET state, never trusted for authz.
     app.action(HOME_TOOL_ACTION, async ({ ack, body, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       await ack();
       if (body.view?.callback_id !== HOME_CALLBACK) return;
       const identity = resolveIdentity({ body });
@@ -2009,7 +2784,14 @@ export async function createVouchr(opts: VouchrOptions) {
       const channel = await verifiedHomeChannel(client, body);
       if (!channel) return staleChannelFeedback(client, identity);
       try {
-        if ((await setChannelToolEnabled(client, identity, channel, m[2], m[1] === 'enable')) === 'denied') {
+        if ((await setChannelToolEnabled(
+          client,
+          identity,
+          channel,
+          m[2],
+          m[1] === 'enable',
+          provisioningReceivedAt,
+        )) === 'denied') {
           await dmActor(client, identity, adminOnly(allowChannelCreatorConfig, 'change channel tools'));
         }
       } catch (e) {
@@ -2023,51 +2805,86 @@ export async function createVouchr(opts: VouchrOptions) {
     // Configure → the SAME gate + modal as `/vouchr configure` (STR-3). The modal's submit is the
     // existing CONFIGURE_CALLBACK flow, so the credential write path is untouched.
     app.action(HOME_CONFIGURE_ACTION, async ({ ack, body, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       await ack();
       if (body.view?.callback_id !== HOME_CALLBACK) return;
       const identity = resolveIdentity({ body });
       if (!identity) return;
       const provider = body.actions?.[0]?.value;
       if (typeof provider !== 'string' || !registry.has(provider) || !body.trigger_id) return;
-      const channel = await verifiedHomeChannel(client, body);
-      if (!channel) return staleChannelFeedback(client, identity);
+      const candidateChannel = homeSelectedChannel(body.view);
       try {
-        if ((await openConfigureModal(client, identity, channel, provider, body.trigger_id)) === 'denied') {
+        const result = await openConfigureModal(
+          client,
+          identity,
+          candidateChannel,
+          provider,
+          body.trigger_id,
+          provisioningReceivedAt,
+          () => verifiedHomeChannel(client, body),
+        );
+        if (result === 'denied') {
           await dmActor(client, identity, adminOnly(allowChannelCreatorConfig, 'configure channel credentials')); // denial audited inside
         }
+        if (result === 'unsupported') await dmActor(client, identity, CHANNEL_CREDENTIAL_UNAVAILABLE);
       } catch (e) {
         await dmActor(client, identity, safeUserMessage(e)); // ineligible channel class → the core reason
       }
     });
 
-    // Disconnect the acting user's own connection from a Disconnect button IN VOUCHR'S OWN surfaces —
-    // the config modal (refresh via views.update) or the App Home (#111, refresh via views.publish).
-    // Scoped to OUR callback_ids: the DISCONNECT_ACTION id is also EXPORTED for hosts who embed
-    // disconnectConfirmBlocks in their OWN surfaces and register their own listener — Bolt runs every
-    // matching listener, so acting on a foreign view/message here would double-fire disconnectProvider
-    // (duplicate audit/revoke) and clobber the host's view. When it isn't ours we ack and defer.
+    // Disconnect the acting user's own EXACT rendered connection generation from Vouchr-owned
+    // config/Home views. The button carries only its opaque UUID; core resolves provider + ownership
+    // server-side and repeats the generation check under the mutation locks. The exported
+    // DISCONNECT_ACTION / disconnectConfirmBlocks provider-valued contract remains host-owned: Bolt
+    // runs every matching listener, so acting on a foreign view/message here would double-fire a host
+    // disconnect and clobber its view. When the callback stamp isn't ours we ack and defer.
     app.action(DISCONNECT_ACTION, async ({ ack, body, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       await ack();
       const surface = body.view?.callback_id === CONFIG_CALLBACK ? 'modal'
         : body.view?.callback_id === HOME_CALLBACK ? 'home' : null;
       if (!surface) return; // not our view → the host owns this action
       const identity = resolveIdentity({ body });
-      const provider = body.actions?.[0]?.value;
-      if (!identity || typeof provider !== 'string') return;
-      // Core accepts a current registry id or this user's exact stored stale row, and rejects every
-      // forged/unknown value before mutation/audit. That keeps retired credentials removable from
-      // status/config surfaces without trusting the button payload (SEC-3/SEC-4).
+      const credentialId = body.actions?.[0]?.value;
+      // Exported/custom configModal users retain the historical provider-valued action contract and
+      // own its handler. Only an opaque Vouchr generation proves this listener owns the action; ack
+      // and defer every other value so parallel Bolt listeners neither double-disconnect nor emit a
+      // spurious stale receipt for a host control.
+      if (!identity || !isInteractionId(credentialId)) return;
+      let provider: string | undefined;
       let outcome: Awaited<ReturnType<typeof disconnectProvider>> | undefined;
       try {
-        outcome = await disconnectProvider(vault, audit, registry, identity, provider);
-      } catch {
-        await dmActor(client, identity, 'Could not confirm whether the account was disconnected. Run `/vouchr status` to check; if it is still listed, try again.');
+        const resolved = await disconnectConnectionGeneration(
+          vault,
+          audit,
+          registry,
+          identity,
+          credentialId,
+          await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
+        );
+        if (resolved.status === 'stale') {
+          await dmActor(
+            client,
+            identity,
+            'That Disconnect button is no longer current. Review your current connections before trying again.',
+          );
+        } else {
+          ({ provider, outcome } = resolved);
+        }
+      } catch (error) {
+        await dmActor(
+          client,
+          identity,
+          error instanceof InteractionStateChangedError
+            ? safeUserMessage(error)
+            : 'Could not confirm whether the account was disconnected. Run `/vouchr status` to check; if it is still listed, try again.',
+        );
       }
-      if (outcome?.recognized) {
+      if (outcome && provider) {
         const p = escapeMrkdwn(provider);
         if (outcome.removed) emit({ type: 'revoked', provider, ok: outcome.ok });
         if (outcome.removed && !outcome.ok) {
-          await dmActor(client, identity, `Disconnected *${p}* locally, but the upstream token revoke could not be confirmed. Revoke or rotate Vouchr’s access in ${p} directly.`);
+          await dmActor(client, identity, `Disconnected *${p}* locally, but complete revocation could not be confirmed. Retry \`/vouchr disconnect ${p}\` to invalidate older setup requests, and revoke or rotate Vouchr’s access in ${p} directly if needed.`);
         } else if (outcome.removed && !outcome.audited) {
           await dmActor(client, identity, `Disconnected *${p}* locally, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
         } else if (outcome.removed) {
@@ -2075,80 +2892,163 @@ export async function createVouchr(opts: VouchrOptions) {
           // committed. Always send one explicit receipt so a failed refresh never leaves the click
           // looking ignored (#194 UX-1/5).
           await dmActor(client, identity, `Disconnected *${p}*. The agent can no longer act as you on ${p}.`);
+        } else if (!outcome.ok) {
+          await dmActor(client, identity, `Could not confirm that older *${p}* setup requests were invalidated. Retry \`/vouchr disconnect ${p}\` before reconnecting.`);
         } else {
           // A duplicate click is still a valid interaction. It owns no mutation/event/audit, but it
           // must receive one idempotent receipt even if the subsequent view refresh also fails.
           await dmActor(client, identity, `No *${p}* account was connected, so there was nothing to disconnect.`);
         }
-      } else if (outcome) {
-        // This is either a forged value or the losing half of a concurrent click on a retired row.
-        // Do not reflect the unvalidated value; one fixed receipt keeps the valid race non-silent.
-        await dmActor(client, identity, 'That connection no longer exists. Run `/vouchr status` to see your current connections.');
       }
       const channel = homeSelectedChannel(body.view);
       if (surface === 'home') return publishHome(identity, client, channel);
       await client.views.update({ view_id: body.view.id, view: await buildConfigModal(identity, channel, client) }).catch(() => undefined);
     });
 
-    // Per-user key setup: ephemeral button → private modal (self-service, not admin-gated).
+    // Per-user key setup: an already-issued opaque prompt id → private modal (self-service, not
+    // admin-gated). The click does not mint or extend authority; provider is reloaded from the exact
+    // Slack-actor-bound row, and the same id is consumed only with the final credential write.
     app.action(SETUP_KEY_ACTION, async ({ ack, body, client }: any) => {
       await ack();
       const identity = resolveIdentity({ body });
-      const provider = body.actions?.[0]?.value;
-      const recover = () => identity
-        ? dmActor(client, identity, 'This credential setup button is no longer valid. Ask the agent to request setup again.')
+      const requestId = body.actions?.[0]?.value;
+      const staleText = 'This credential setup button is no longer valid. Ask the agent to request setup again.';
+      const unconfirmedText = 'Vouchr could not confirm whether credential setup is available. Close this window and use the setup button again; if it keeps failing, ask the agent to request setup again.';
+      const staleRecover = () => identity
+        ? dmActor(client, identity, staleText)
         : Promise.resolve();
-      if (typeof provider !== 'string' || !body.trigger_id || !registry.has(provider)) return recover();
-      if (!isBrokeredProvider(registry.get(provider))) return recover();
+      if (!identity || !body.trigger_id || !isInteractionId(requestId)) return staleRecover();
+      // Slack trigger_ids expire in roughly three seconds. Consume it before any database read with
+      // a fixed, authority-free loading view; provider/request bindings are resolved server-side
+      // afterward, then the same private view is hydrated. The loading view has no callback or
+      // metadata, so a forged click gains no submit surface while validation is pending.
+      let opened: any;
       try {
-        await client.views.open({
+        opened = await client.views.open({
           trigger_id: body.trigger_id,
-          view: userKeyModal(provider, referenceSources),
+          view: privateStatusModal(
+            'Credential setup',
+            'Checking current access… If this does not finish, close this window and ask the agent to request setup again.',
+          ),
         });
       } catch {
-        await recover();
+        return identity
+          ? dmActor(
+              client,
+              identity,
+              'Vouchr could not confirm whether credential setup opened. If a setup window appeared, follow it or close it; otherwise use the button again or ask the agent to request setup again.',
+            )
+          : undefined;
       }
-    });
-
-    // #117 refresh_dead DM's Connect button: mint a FRESH single-use consent state on click and
-    // swap the DM for the normal connect prompt. Late-minting is the point — a state lives 10
-    // minutes (STATE_TTL_MS) and the DM may sit unread for hours, and the 24h DM debounce means a
-    // dead baked-in link would have no recovery path. The button value is forgeable (SEC-3/SEC-4):
-    // validate it against the registry before anything, and mint for the ACTING user from the
-    // Slack-verified payload — exactly what that user could do themselves via connect().
-    app.action(RECONNECT_ACTION, async ({ ack, body, respond }: any) => {
-      await ack();
-      const identity = resolveIdentity({ body });
-      const providerId = body.actions?.[0]?.value;
-      if (!identity || typeof providerId !== 'string' || !registry.has(providerId)) return;
-      const provider = registry.get(providerId);
-      // No OAuth to mint for service/key tools (the DM never offers this button for them; forged-safe).
-      if (provider.identity === 'service' || provider.credential === 'key') return;
-      const { authorizeUrl } = await consent.begin(identity, provider, redirectUri, null);
-      emit({ type: 'connect_prompted', provider: providerId });
-      if (respond) {
-        const blocks = connectBlocks(providerId, authorizeUrl, { list: provider.scopesDefault, describe: provider.scopeDescriptions });
-        await respond({
-          replace_original: true,
-          ...optionalBlockFallback(blocks),
-          blocks: blocks as any,
+      const loadingView = opened?.view;
+      try {
+        const provider = await provisioning.resolveForModal(requestId, identity);
+        if (!provider || !registry.has(provider)) {
+          return deliverModalOutcome(client, identity, loadingView, 'Setup unavailable', staleText);
+        }
+        const definition = registry.get(provider);
+        if (!isBrokeredProvider(definition) || definition.credential !== 'key') {
+          return deliverModalOutcome(client, identity, loadingView, 'Setup unavailable', staleText);
+        }
+        if (typeof loadingView?.id !== 'string') {
+          return dmActor(client, identity, 'Vouchr could not finish opening credential setup. Use the setup button again.');
+        }
+        await client.views.update({
+          view_id: loadingView.id,
+          view: userKeyModal(provider, referenceSources, requestId),
         });
+      } catch {
+        await deliverModalOutcome(client, identity, loadingView, 'Setup not confirmed', unconfirmedText);
       }
     });
 
-    // Thread-scoped session approval: the user clicks "Allow … here" → grant for THIS thread only.
-    // provider + thread come from the (verified) button value; channel/user/team from the payload.
-    app.action(APPROVE_SESSION_ACTION, async ({ ack, body, respond }: any) => {
+    // Compatibility for already-delivered #117 reconnect buttons. A health DM can outlive
+    // offboarding, so its click must never mint fresh consent. Acknowledge it and replace/DM fixed
+    // recovery; a current agent turn owns creation of the next offboard-fenced prompt.
+    app.action(RECONNECT_ACTION, async ({ ack, body, respond, client }: any) => {
       await ack();
       const identity = resolveIdentity({ body });
-      if (!identity) return;
-      let provider = '', thread = '';
-      try { ({ provider, thread } = JSON.parse(body.actions?.[0]?.value ?? '{}')); } catch { return; }
-      const channel: string | undefined = body.channel?.id ?? body.container?.channel_id;
-      if (!provider || !thread || !channel || !registry.has(provider)) return;
-      await sessions.grant(identity, channel, thread, provider, sessionTtlMs);
-      await audit.record('session', identity, provider, { channel, thread, event: 'grant' });
-      if (respond) await respond({ replace_original: true, text: `✅ Approved *${escapeMrkdwn(provider)}* for this thread. Ask me again.` });
+      const text = 'This reconnect button is no longer valid. Ask the agent to reconnect.';
+      if (respond) {
+        try {
+          await respond({ replace_original: true, text });
+          return;
+        } catch { /* fall through to the private DM receipt */ }
+      }
+      if (identity) await dmActor(client, identity, text);
+    });
+
+    // Thread-scoped session approval. The control contains one opaque request id; provider and every
+    // binding come from PostgreSQL, while identity/channel/thread come from the Slack-signed click.
+    // The provider lock is shared with mode and tool writers, so revalidation + consume + grant +
+    // audit linearize before or after a concurrent governance change across replicas.
+    app.action(APPROVE_SESSION_ACTION, async ({ ack, body, respond, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
+      await ack();
+      const identity = resolveIdentity({ body });
+      const location = interactionLocation(body);
+      const id = body.actions?.[0]?.value;
+      const reply = async (text: string, replaceOriginal = true) => {
+        if (respond) {
+          try {
+            await respond({ replace_original: replaceOriginal, response_type: 'ephemeral', text });
+            return;
+          } catch { /* fall back to a private DM */ }
+        }
+        if (identity) await dmActor(client, identity, text);
+      };
+      const stale = 'This session request expired or was already completed. Ask the agent again in this thread.';
+      if (!identity || !location?.thread || typeof id !== 'string') return reply(stale);
+
+      const pending = await sessions.getRequest(id, identity, location.channel, location.thread);
+      if (!pending) return reply(stale);
+      let result: SessionGrantResult;
+      try {
+        const actorIssuedAt = await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt);
+        result = await vault.withCredentialLocks(
+          [
+            { owner: channelOwner(identity.teamId, location.channel), provider: pending.provider },
+            { owner: userOwner(identity), provider: pending.provider },
+          ],
+          async (locked, tx) => new SessionGrants(tx).grantRequested({
+            id,
+            identity,
+            channel: location.channel,
+            thread: location.thread!,
+            ttlMs: sessionTtlMs,
+            actorIssuedAt,
+            audit,
+            validate: async (row, decisionTx) => {
+              if (!registry.has(row.provider) || !isBrokeredProvider(registry.get(row.provider))) return false;
+              if ((await locked.liveId(userOwner(identity), row.provider)) !== row.credentialId) return false;
+              const currentMode = await new ChannelConfig(decisionTx).getMode(
+                row.teamId,
+                row.channel,
+                row.provider,
+                decisionTx,
+              );
+              if (currentMode !== 'session') return false;
+              return (await authorizeProvider(
+                policy,
+                new ChannelTools(decisionTx),
+                identity,
+                row.channel,
+                row.provider,
+              )) === null;
+            },
+          }),
+        );
+      } catch {
+        return reply('Vouchr could not confirm the session. Try this button again.', false);
+      }
+      if (result.status === 'stale') return reply(stale);
+      if (result.status === 'actor-stale') {
+        return reply('Your authority changed while Vouchr was checking this session. Ask the agent again in this thread.', false);
+      }
+      if (result.status === 'invalidated') {
+        return reply('This session request is no longer valid because provider or channel access changed. Ask the agent again in this thread.');
+      }
+      return reply(`Approved *${escapeMrkdwn(result.provider)}* for this thread. Ask the agent again.`);
     });
 
     // #113 Approve/Deny for a pending sensitive-write approval. The button value is ONLY the
@@ -2160,35 +3060,50 @@ export async function createVouchr(opts: VouchrOptions) {
     // ineligible click is rejected AND audited 'denied'. Approve mints the single-use TTL grant;
     // Deny records the denial (approver in the actor column) and notifies the requester.
     const handleApprovalDecision = async ({ ack, body, respond, client }: any, decision: 'approve' | 'deny') => {
+      const provisioningReceivedAt = process.hrtime.bigint();
       await ack();
       const identity = resolveIdentity({ body });
+      const location = interactionLocation(body);
       const id = body.actions?.[0]?.value;
-      if (!identity || typeof id !== 'string' || !id) return;
+      const reply = async (text: string, replaceOriginal = true) => {
+        if (respond) {
+          try {
+            await respond({ replace_original: replaceOriginal, response_type: 'ephemeral', text });
+            return;
+          } catch { /* fall back to a private DM */ }
+        }
+        if (identity) await dmActor(client, identity, text);
+      };
+      const stale = 'This approval expired or was already decided. Ask the agent again.';
+      if (!identity || typeof id !== 'string') return reply(stale);
       const pending = await approvals.get(id);
-      // Team binding: a forged id from another workspace must never be decidable here.
-      if (!pending || pending.teamId !== identity.teamId) {
-        if (respond) await respond({ replace_original: true, text: 'This approval expired or was already decided. Ask the agent again.' });
-        return;
+      // Team + conversation binding: a control copied from another workspace/channel/thread cannot
+      // decide the real row. Off-channel requests are delivered in the requester's DM and have no
+      // stored channel/thread binding.
+      if (
+        !pending ||
+        pending.teamId !== identity.teamId ||
+        (pending.channel !== null && (
+          !location ||
+          location.channel !== pending.channel ||
+          location.thread !== pending.thread
+        ))
+      ) {
+        return reply(stale);
       }
-      if (!registry.has(pending.provider)) return; // stale row for an unregistered provider (SEC-4)
-      const approval = registry.get(pending.provider).approval;
-      const eligible = approval?.approver === 'admin'
-        ? await commandAdmin(client, identity, pending.channel ?? '')
-        : identity.userId === pending.userId; // 'self': exactly the requester, nobody else
-      if (!eligible) {
-        await audit.record('denied', identity, pending.provider,
-          { reason: 'not-approver', ...(pending.channel ? { channel: pending.channel } : {}) });
-        if (respond) await respond({ replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval.' });
-        return;
+      if (
+        !registry.has(pending.provider) ||
+        !isBrokeredProvider(registry.get(pending.provider)) ||
+        !registry.get(pending.provider).approval ||
+        !approvalNeeded(registry.get(pending.provider).approval!, pending.method, pending.path)
+      ) {
+        await approvals.discardPending(id).catch(() => undefined);
+        return reply('This approval is no longer valid because provider access changed. Ask the agent again.');
       }
-      const requester: SlackIdentity = { enterpriseId: identity.enterpriseId, teamId: pending.teamId, userId: pending.userId };
-      // Same meta shape as the injector's approval rows (STR-4): method + host + pathname, never a
-      // body or query value. Row values were egress-validated before they were ever stored (SEC-4).
-      const meta = { host: pending.host, method: pending.method, path: pending.path, ...(pending.channel ? { channel: pending.channel } : {}) };
+      const approval = registry.get(pending.provider).approval!;
       const p = escapeMrkdwn(pending.provider); // SEC-5, even for a registry-validated id
-      // Raw query values are never stored (GHSA-pg84: only their digest is) — the receipt marks
-      // that parameters are bound with '?…'; the prompt the decision was made on showed them fully.
-      const what = `\`${escapeMrkdwn(pending.method)} ${escapeMrkdwn(pending.host)}${escapeMrkdwn(pending.path)}${pending.queryHash ? '?…' : ''}\``;
+      // Raw query values are never stored or shown (GHSA-pg84: only their digest is); the receipt
+      // marks that parameters are cryptographically bound with '?…'.
       // Requester notification: ephemeral in the request's channel, or a DM when there was none.
       const tellRequester = async (text: string) => {
         if (pending.channel) {
@@ -2197,22 +3112,122 @@ export async function createVouchr(opts: VouchrOptions) {
           await client.chat.postMessage({ channel: pending.userId, text }).catch(() => undefined);
         }
       };
+      const ttlMs = approval.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
+      let decided: ApprovalDecisionResult;
+      try {
+        // Slack facts cannot be queried through PostgreSQL. Resolve them before taking lifecycle
+        // locks, fail closed on any read error, then carry only the verdict into the row-locked
+        // validation. A channel-owned approval is invalid if the channel class is no longer safe or
+        // the original requester is no longer a member.
+        let sharedOwnerFactsValid = true;
+        if (pending.ownerKind === 'channel') {
+          if (!pending.channel) sharedOwnerFactsValid = false;
+          else {
+            try {
+              await assertChannelEligible(client, pending.channel);
+            } catch {
+              sharedOwnerFactsValid = false;
+            }
+            if (
+              sharedOwnerFactsValid &&
+              !(await isChannelMember(client, pending.channel, pending.userId))
+            ) sharedOwnerFactsValid = false;
+          }
+        }
+        const approverRule = approval.approver;
+        const approverEligible = approverRule === 'admin'
+          ? !!pending.channel && await commandAdmin(client, identity, pending.channel)
+          : identity.userId === pending.userId;
+        // Snapshot mode only to choose every possibly-relevant lock. The authoritative mode/owner/
+        // policy/tool decision is reloaded after those canonical locks are held below.
+        const mode = pending.channel
+          ? await channelConfig.getMode(pending.teamId, pending.channel, pending.provider)
+          : null;
+        const owners = approvalDecisionLockOwners(pending, mode);
+        const issuance = await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt);
+        decided = await vault.withCredentialLocks(
+          owners.map((owner) => ({ owner, provider: pending.provider })),
+          async (locked, tx) => {
+            const outcome = await new Approvals(tx).decideAudited({
+              id,
+              decision,
+              approvedBy: identity.userId,
+              actor: identity,
+              issuance,
+              ttlMs,
+              audit,
+              enterpriseId: identity.enterpriseId,
+              validate: async (row, decisionTx) => {
+                // Exact signed conversation binding is checked again while the pending row is
+                // locked. It is immutable, but keeping it beside every other mutation-time fact
+                // prevents a future row-shape change from weakening the boundary.
+                if (
+                  row.teamId !== identity.teamId ||
+                  row.channel !== pending.channel ||
+                  row.thread !== pending.thread ||
+                  (row.channel !== null && (
+                    !location || location.channel !== row.channel || location.thread !== row.thread
+                  ))
+                ) return 'ineligible';
+                if (!registry.has(row.provider) || !isBrokeredProvider(registry.get(row.provider))) {
+                  return 'invalidated';
+                }
+                const currentApproval = registry.get(row.provider).approval;
+                if (!currentApproval || !approvalNeeded(currentApproval, row.method, row.path)) {
+                  return 'invalidated';
+                }
+                if (currentApproval.approver !== approverRule) return 'invalidated';
+                if (row.ownerKind === 'channel' && !sharedOwnerFactsValid) return 'invalidated';
+                if (!(await approvalOwnerStillCurrent({
+                  row,
+                  db: decisionTx,
+                  registry,
+                  policy,
+                  vault: locked,
+                  enterpriseId: identity.enterpriseId,
+                  actorIssuedAt: row.createdAt,
+                }))) return 'invalidated';
+                return approverEligible ? 'valid' : 'ineligible';
+              },
+            });
+            if (outcome.status === 'ineligible') {
+              await audit.record(
+                'denied',
+                identity,
+                pending.provider,
+                { reason: 'not-approver', ...(pending.channel ? { channel: pending.channel } : {}) },
+                undefined,
+                tx,
+              );
+            }
+            return outcome;
+          },
+        );
+      } catch {
+        const verb = decision === 'approve' ? 'approval' : 'denial';
+        return reply(`Vouchr could not confirm this ${verb}. Try this button again.`, false);
+      }
+      if (decided.status === 'stale') return reply(stale);
+      if (decided.status === 'invalidated') {
+        return reply('This approval is no longer valid because provider or channel access changed. Ask the agent again.');
+      }
+      if (decided.status === 'actor-stale') {
+        return reply('Your authority changed while Vouchr was checking this approval. Reopen the current request before deciding it.', false);
+      }
+      if (decided.status === 'ineligible') {
+        return reply('You are not eligible to decide this approval.', false);
+      }
       if (decision === 'approve') {
-        const ttlMs = approval?.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
-        if (!(await approvals.approve(id, identity.userId, ttlMs))) return; // concurrently decided: exactly one wins
-        await audit.record('approved', requester, pending.provider, meta, identity.userId);
         emit({ type: 'approval_approved', provider: pending.provider, host: pending.host });
-        if (respond) await respond({ replace_original: true, text: `✅ Approved ${what} on *${p}*. The approval is single-use and expires in ${Math.round(ttlMs / 1000)}s — have the agent retry now.` });
+        await reply(`✅ Approved the *${p}* action. The approval is single-use and expires in ${Math.round(ttlMs / 1000)}s — have the agent retry now.`);
         if (identity.userId !== pending.userId) {
-          await tellRequester(`✅ <@${escapeMrkdwn(identity.userId)}> approved your *${p}* request (${what}) — ask the agent to retry.`);
+          await tellRequester(`✅ <@${escapeMrkdwn(identity.userId)}> approved your *${p}* action — ask the agent to retry.`);
         }
       } else {
-        if (!(await approvals.deny(id))) return; // concurrently decided: exactly one wins
-        await audit.record('denied', requester, pending.provider, { ...meta, reason: 'approval-denied' }, identity.userId);
         emit({ type: 'approval_denied', provider: pending.provider, host: pending.host });
-        if (respond) await respond({ replace_original: true, text: `🚫 Denied ${what} on *${p}*. Nothing was sent.` });
+        await reply(`🚫 Denied the *${p}* action. Nothing was sent.`);
         if (identity.userId !== pending.userId) {
-          await tellRequester(`🚫 <@${escapeMrkdwn(identity.userId)}> denied your *${p}* request (${what}). Nothing was sent.`);
+          await tellRequester(`🚫 <@${escapeMrkdwn(identity.userId)}> denied your *${p}* action. Nothing was sent.`);
         }
       }
     };
@@ -2233,7 +3248,18 @@ export async function createVouchr(opts: VouchrOptions) {
   /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).
    *  offboardUser clears the session grants (passed through), so the Grid/SCIM path gets it too. */
   function offboard(identity: SlackIdentity): Promise<string[]> {
-    return offboardUser(vault, audit, consent, identity, registry, 'offboarded', sessions);
+    return offboardUser(
+      vault,
+      audit,
+      consent,
+      identity,
+      registry,
+      'offboarded',
+      sessions,
+      provisioning,
+      channelProvisioning,
+      approvals,
+    );
   }
 
   /**
@@ -2262,12 +3288,10 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
-  /** Delete every connection past its TTL + clear stale consent + expired thread sessions +
-   *  expired approval prompts/grants (#113, audited inside core sweepExpired). Run on a timer. */
+  /** Delete every connection past its TTL plus every stale interaction family through the one core
+   *  lifecycle coordinator. Expired approvals are audited there (#113). Run on a timer. */
   async function sweep(): Promise<number> {
-    const n = await sweepExpired(vault, audit, consent, sink, health, approvals);
-    await sessions.sweepExpired();
-    return n;
+    return sweepLifecycle({ db, vault, audit, sink, health, dryRun });
   }
 
   /**

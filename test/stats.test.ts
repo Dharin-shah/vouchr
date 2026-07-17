@@ -3,7 +3,7 @@ import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Audit } from '../src/core/audit';
-import { ChannelTools } from '../src/core/tools';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
 import { ConnectionHandle } from '../src/core/injector';
@@ -96,7 +96,7 @@ async function harness(t: TestContext, opts: { isAdmin?: boolean } = {}) {
 test('/vouchr stats (admin): shows used providers with counts and flags an enabled-but-idle tool', async (t) => {
   const { lan, audit, run } = await harness(t, { isAdmin: true });
   const tools = new ChannelTools(lan.db);
-  for (const p of ['github', 'gitlab', 'idle']) await tools.setEnabled('T1', 'C_FIN', p, true);
+  for (const p of ['github', 'gitlab', 'idle']) await setChannelToolEnabled(tools, 'T1', 'C_FIN', p, true);
   // github used by 2 people, gitlab by 1; 'idle' is enabled but never used.
   await audit.record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U1' }, 'github', { channel: 'C_FIN' });
   await audit.record('inject', { enterpriseId: null, teamId: 'T1', userId: 'U2' }, 'github', { channel: 'C_FIN' });

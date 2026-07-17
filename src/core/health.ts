@@ -9,7 +9,7 @@ import type { Owner } from './owner';
  *
  *  - 'refresh_dead':   a token refresh failed DEFINITIVELY (invalid_grant / 400/401 from the token
  *                      endpoint — see TokenEndpointError in tokens.ts). Only reconnecting fixes it.
- *                      Never fired on transient failures (network blip, 5xx, timeout).
+ *                      Never fired on configuration or transient failures (network blip, 5xx, timeout).
  *  - 'expiring_soon':  the connection is within the sweep's warn window of its TTL ceiling
  *                      (idle/max-age — see Vault.listExpiringSoon). `expiresAt` = that ceiling.
  *  - 'expired':        the sweep just deleted the connection (past its TTL).

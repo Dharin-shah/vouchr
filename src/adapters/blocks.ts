@@ -205,8 +205,8 @@ export const CONFIGURE_CALLBACK = 'vouchr_configure';
 export const USER_KEY_CALLBACK = 'vouchr_user_key';
 export const SETUP_KEY_ACTION = 'vouchr_setup_key';
 export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
-/** #117 refresh_dead DM: mints a FRESH consent state on click (a baked-in authorize URL would be
- *  dead after the 10-min state TTL, and the 24h DM debounce would leave no recovery path). */
+/** Legacy #117 action id. New health DMs render no long-lived reconnect control; the registered
+ * handler only acknowledges already-delivered buttons with fixed stale guidance. */
 export const RECONNECT_ACTION = 'vouchr_reconnect';
 
 const REFERENCE_COPY: Record<SecretReferenceSource, { label: string; placeholder: string }> = {
@@ -297,11 +297,14 @@ export function configureModal(
   provider: string,
   channel: string,
   referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
+  requestId?: string,
 ): unknown {
   const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: CONFIGURE_CALLBACK,
-    meta: { channel, provider },
+    // Built-in Slack flows carry only the opaque request id. Preserve the legacy metadata shape
+    // when hosts call this exported renderer directly without the request-backed dispatcher.
+    meta: requestId === undefined ? { channel, provider } : { requestId },
     title: 'Channel credential',
     referenceSources,
     intro:
@@ -314,11 +317,12 @@ export function configureModal(
 export function userKeyModal(
   provider: string,
   referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
+  requestId?: string,
 ): unknown {
   const p = escapeMrkdwn(provider);
   return secretModal({
     callbackId: USER_KEY_CALLBACK,
-    meta: { provider },
+    meta: { provider, ...(requestId === undefined ? {} : { requestId }) },
     title: 'Your credential',
     referenceSources,
     intro:
@@ -327,8 +331,8 @@ export function userKeyModal(
   });
 }
 
-/** Ephemeral JIT prompt: a button that opens the per-user key modal (for key providers). */
-export function keySetupBlocks(provider: string): unknown[] {
+/** Ephemeral JIT prompt: its button carries only the opaque, actor/provider-bound request id. */
+export function keySetupBlocks(provider: string, requestId: string): unknown[] {
   const p = escapeMrkdwn(provider);
   return [
     {
@@ -348,7 +352,7 @@ export function keySetupBlocks(provider: string): unknown[] {
           type: 'button',
           text: { type: 'plain_text', text: `Set up ${provider}`, emoji: true },
           action_id: SETUP_KEY_ACTION,
-          value: provider,
+          value: requestId,
           style: 'primary',
         },
       ],
@@ -356,9 +360,9 @@ export function keySetupBlocks(provider: string): unknown[] {
   ];
 }
 
-/** Ephemeral in-thread prompt: a button granting the agent use of `provider` for THIS thread only.
- *  `thread` is carried in the button value so the action handler grants the exact thread. */
-export function sessionApprovalBlocks(provider: string, thread: string): unknown[] {
+/** Ephemeral in-thread prompt. The button carries only an opaque pending-request id; provider,
+ *  identity, channel, and thread are reloaded and revalidated at the mutation. */
+export function sessionApprovalBlocks(provider: string, requestId: string): unknown[] {
   const p = escapeMrkdwn(provider);
   return [
     {
@@ -378,7 +382,7 @@ export function sessionApprovalBlocks(provider: string, thread: string): unknown
           type: 'button',
           text: { type: 'plain_text', text: `Allow ${provider} here`, emoji: true },
           action_id: APPROVE_SESSION_ACTION,
-          value: JSON.stringify({ provider, thread }),
+          value: requestId,
           style: 'primary',
         },
       ],
@@ -391,7 +395,8 @@ export const APPROVAL_DENY_ACTION = 'vouchr_approval_deny';
 
 /**
  * Approve/Deny prompt for ONE sensitive write (#113), the per-action sibling of
- * sessionApprovalBlocks. Shows provider, method, host+path and — for a query-bearing request —
+ * sessionApprovalBlocks. Shows provider, method, host, a bounded salted action fingerprint and — for a
+ * query-bearing request —
  * only the COUNT of query parameters (GHSA-pg84). Parameter names and values are BOTH
  * caller-controlled and can carry tokens, signed-URL material, or PII, so neither is ever
  * rendered (SEC-1); the copy tells the human the exact query is bound byte-for-byte. The request
@@ -405,7 +410,7 @@ export function approvalBlocks(o: {
   provider: string;
   method: string;
   host: string;
-  path: string;
+  actionFingerprint: string;
   /** How many query parameters the request carries (0 = none). Names/values are never shown. */
   queryParamCount: number;
   requester: string;
@@ -415,19 +420,33 @@ export function approvalBlocks(o: {
   const p = escapeMrkdwn(o.provider);
   const n = o.queryParamCount;
   const query = n ? `?… (${n} parameter${n === 1 ? '' : 's'})` : '';
-  const action = `\`${escapeMrkdwn(o.method)} ${escapeMrkdwn(o.host)}${escapeMrkdwn(o.path)}\`${query ? ` ${query}` : ''}`;
+  // Raw paths are never rendered: they are caller-controlled and can embed tokens, signed webhook
+  // material, or PII. The fixed-size fingerprint is the same value recorded in audit, while the
+  // short-lived internal row retains the raw bytes solely for exact grant matching.
+  const action = `${o.method} ${o.host}\nAction fingerprint: ${o.actionFingerprint}`;
   const bound = n
     ? ' The exact query string is bound byte-for-byte (its parameters are not displayed); any change re-prompts.'
     : '';
   const intro = o.approver === 'admin'
-    ? `The agent wants to run ${action} on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`
-    : `The agent wants to run ${action} as you on ${p}.`;
+    ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`
+    : `The agent wants to run an action as you on ${p}.`;
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `:lock: *Approve this ${p} action?*\n${intro}\nApproval covers exactly this method, endpoint, and query string — once — and expires if unused.${bound} The request body is not inspected.`,
+        text: `:lock: *Approve this ${p} action?*\n${intro}`,
+      },
+    },
+    {
+      type: 'section',
+      text: { type: 'plain_text', text: action, emoji: false },
+    },
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `${query ? `${query}. ` : ''}The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires if unused.${bound} The raw path and request body are not displayed or inspected.`,
       },
     },
     {
@@ -457,8 +476,16 @@ export const CONFIG_CALLBACK = 'vouchr_config';
 
 /** The four per-channel auth modes, in the order the config modal lists them. */
 /** One connection row for the status / home views. `channel` null = a personal (DM) credential.
- *  `account` is the provider-reported external account (escaped at render — provider-influenced). */
-export type Connection = { provider: string; channel: string | null; mode?: string; account?: string | null };
+ *  `account` is the provider-reported external account (escaped at render — provider-influenced).
+ *  Vouchr-owned interactive views add the opaque `credentialId`; keeping it optional preserves the
+ *  existing exported renderer input shape, while the built-in action handler refuses that fallback. */
+export type Connection = {
+  provider: string;
+  channel: string | null;
+  mode?: string;
+  account?: string | null;
+  credentialId?: string;
+};
 
 /** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list. */
 export type ToolRow = { provider: string; enabled: boolean; mode?: string | null };
@@ -604,7 +631,10 @@ function connectionRow(c: Connection): unknown {
       type: 'button',
       text: { type: 'plain_text', text: 'Disconnect', emoji: true },
       action_id: DISCONNECT_ACTION,
-      value: c.provider,
+      // Internal Home/config builders supply the opaque row generation, binding a delayed click to
+      // exactly what was rendered. Callers omitting it keep the historical serialized provider value
+      // for compatibility, but Vouchr's built-in listener requires a server-resolved generation.
+      value: c.credentialId ?? c.provider,
       style: 'danger',
       // Destructive + one-click, so gate it behind a native confirm dialog (parity with the
       // ephemeral `/vouchr disconnect` confirm flow) — an accidental click shouldn't revoke.
@@ -662,7 +692,7 @@ export function consentDeniedBlocks(provider: string, reason?: string): unknown[
   const p = escapeMrkdwn(provider);
   // Keep the optional parameter for source compatibility, but never render arbitrary caller text:
   // it may be a raw provider/OAuth error containing credential material. Stable copy is the only
-  // safe contract until the typed safe-message mapper in the remaining #194 API slice owns it.
+  // safe contract; typed operational failures are normalized separately by mapSafeError.
   void reason;
   const why = `You haven't allowed ${p} for this request.`;
   return [
@@ -710,8 +740,9 @@ export function statusBlocks(
   ];
 }
 
-/** Ephemeral confirm-prompt: a destructive button to disconnect `provider`.
- *  `provider` rides in the button value so the action handler removes the exact credential. */
+/** Exported ephemeral confirm-prompt for host-owned surfaces. Its historical provider-valued button
+ * remains unchanged; hosts own its listener and lifecycle semantics. Vouchr-owned Home/config rows
+ * instead carry an opaque exact credential generation through {@link connectionRow}. */
 export function disconnectConfirmBlocks(provider: string): unknown[] {
   const p = escapeMrkdwn(provider);
   return [

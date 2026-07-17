@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { createVouchr } from '../src/adapters/bolt';
 import { Policy } from '../src/core/policy';
-import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { CONFIG_CALLBACK, DISCONNECT_ACTION } from '../src/adapters/blocks';
 import { userOwner } from '../src/core/owner';
@@ -86,6 +86,13 @@ const modeRow = async (db: any) =>
 const auditActions = async (db: any) => ((await db.all('SELECT action FROM audit')) as any[]).map((r) => r.action);
 const checked = (v = 'enabled') => ({ enabled: { selected_options: [{ value: v }] } });
 const unchecked = () => ({ enabled: { selected_options: [] } });
+const disconnectValue = (view: any): string => {
+  const button = view.blocks
+    .map((block: any) => block.accessory)
+    .find((accessory: any) => accessory?.action_id === DISCONNECT_ACTION);
+  assert.equal(typeof button?.value, 'string');
+  return button.value;
+};
 
 test('no-arg /vouchr opens the modal; non-admin sees NO admin controls (no submit)', async (t) => {
   const h = await harness(t, { slackAdmin: false });
@@ -186,6 +193,39 @@ test('config modal acknowledges before its Slack admin lookup', async (t) => {
   );
   assert.equal(acknowledged, true);
   assert.equal(await modeRow(h.lan.db), null);
+});
+
+test('an admin offboarded during modal verification cannot change mode or tools', async (t) => {
+  let enteredAdminLookup!: () => void;
+  const adminLookupStarted = new Promise<void>((resolve) => { enteredAdminLookup = resolve; });
+  let releaseAdminLookup!: () => void;
+  const adminLookupGate = new Promise<void>((resolve) => { releaseAdminLookup = resolve; });
+  let pause = true;
+  const h = await harness(t, {
+    usersInfo: async () => {
+      if (pause) {
+        pause = false;
+        enteredAdminLookup();
+        await adminLookupGate;
+      }
+      return { user: { is_admin: true } };
+    },
+  });
+
+  const submitting = h.submit({
+    'mode:mcp': { mode: { selected_option: { value: 'per-user' } } },
+    'tool:mcp': unchecked(),
+  }, async () => {});
+  await adminLookupStarted;
+  await h.lan.offboard(ID);
+  releaseAdminLookup();
+  await submitting;
+
+  assert.equal(await modeRow(h.lan.db), null);
+  assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false);
+  assert.deepEqual(await auditActions(h.lan.db), []);
+  assert.match(h.dms[0], /2 settings could not be confirmed/);
+  assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
 test('admin mode change via the modal == /vouchr mode: same channel_config + audit', async (t) => {
@@ -305,11 +345,11 @@ test('disabling one provider materializes the full allowlist; the others stay en
 test('untouched mode select does not revert a concurrent change or delete the shared credential', async (t) => {
   const h = await harness(t, { slackAdmin: true });
   const cfg = new ChannelConfig(h.lan.db);
-  await cfg.setMode('T1', 'C_FIN', 'mcp', 'per-user');
+  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'per-user');
   const view = await h.openModal(); // opens with mode 'per-user' as the select's initial
   const pm = view.private_metadata;
   // Between open and save, another admin flips to shared and connects a shared credential.
-  await cfg.setMode('T1', 'C_FIN', 'mcp', 'shared');
+  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'shared');
   await h.lan.vault.upsert({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp', { accessToken: 'SHARED', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // A saves the modal without touching the mode select (it re-submits its open value 'per-user').
   await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } }, async () => {}, pm);
@@ -340,7 +380,8 @@ test('the Disconnect button carries a confirm dialog (no accidental one-click re
 test('disconnect button removes the user connection and refreshes the modal view', async (t) => {
   const h = await harness(t, { slackAdmin: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) });
+  const view = await h.openModal();
+  await h.disconnect(async () => {}, { ...view, id: 'V1' }, disconnectValue(view));
   assert.equal(await h.lan.vault.get(userOwner(ID), 'mcp'), null);
   assert.equal(h.updated()?.view_id, 'V1');
 });
@@ -348,18 +389,26 @@ test('disconnect button removes the user connection and refreshes the modal view
 test('disconnect button sends one committed receipt even when the modal refresh fails', async (t) => {
   const h = await harness(t, { slackAdmin: false, updateThrows: true });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) });
+  const view = await h.openModal();
+  await h.disconnect(async () => {}, { ...view, id: 'V1' }, disconnectValue(view));
   assert.equal(await h.lan.vault.get(userOwner(ID), 'mcp'), null);
   assert.deepEqual(h.dms, ['Disconnected *mcp*. The agent can no longer act as you on mcp.']);
   assert.equal(h.updated(), null);
 });
 
-test('duplicate disconnect click sends one idempotent receipt when the modal refresh fails', async (t) => {
+test('duplicate disconnect click reports its rendered generation as stale when refresh fails', async (t) => {
   const h = await harness(t, { slackAdmin: false, updateThrows: true });
-  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) });
-  assert.deepEqual(h.dms, ['No *mcp* account was connected, so there was nothing to disconnect.']);
+  await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const view = await h.openModal();
+  const value = disconnectValue(view);
+  await h.disconnect(async () => {}, { ...view, id: 'V1' }, value);
+  h.dms.length = 0;
+  await h.disconnect(async () => {}, { ...view, id: 'V1' }, value);
+  assert.deepEqual(h.dms, [
+    'That Disconnect button is no longer current. Review your current connections before trying again.',
+  ]);
   assert.equal(h.updated(), null);
-  assert.deepEqual(await auditActions(h.lan.db), []);
+  assert.deepEqual(await auditActions(h.lan.db), ['revoke']);
 });
 
 test('disconnect button removes a retired provider that is still visible in the user connection list', async (t) => {
@@ -368,7 +417,7 @@ test('disconnect button removes a retired provider that is still visible in the 
   const view = await h.openModal();
   assert.match(JSON.stringify(view.blocks), /retired/);
 
-  await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) }, 'retired');
+  await h.disconnect(async () => {}, { ...view, id: 'V1' }, disconnectValue(view));
 
   assert.equal(await h.lan.vault.has(userOwner(ID), 'retired'), false);
   assert.equal(h.updated()?.view_id, 'V1');
@@ -378,17 +427,21 @@ test('disconnect button removes a retired provider that is still visible in the 
 test('concurrent retired Disconnect clicks each get one safe receipt when refresh fails', async (t) => {
   const h = await harness(t, { slackAdmin: false, providers: [], updateThrows: true });
   await h.lan.vault.upsert(userOwner(ID), 'retired', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const view = { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) };
+  const opened = await h.openModal();
+  const value = disconnectValue(opened);
+  const view = { ...opened, id: 'V1' };
 
   await Promise.all([
-    h.disconnect(async () => {}, view, 'retired'),
-    h.disconnect(async () => {}, view, 'retired'),
+    h.disconnect(async () => {}, view, value),
+    h.disconnect(async () => {}, view, value),
   ]);
 
   assert.equal(await h.lan.vault.has(userOwner(ID), 'retired'), false);
   assert.equal(h.dms.length, 2);
-  assert.ok(h.dms.some((text) => /upstream token revoke could not be confirmed/.test(text)));
-  assert.ok(h.dms.includes('That connection no longer exists. Run `/vouchr status` to see your current connections.'));
+  assert.ok(h.dms.some((text) => /complete revocation could not be confirmed/.test(text)));
+  assert.ok(h.dms.includes(
+    'That Disconnect button is no longer current. Review your current connections before trying again.',
+  ));
   assert.deepEqual(await auditActions(h.lan.db), ['revoke']);
 });
 
@@ -403,12 +456,26 @@ test('disconnect action ignores a non-Vouchr view (no double-fire, no clobber)',
   assert.equal(h.updated(), null); // did not clobber the host's view
 });
 
-// Finding 5: an unknown/forged provider value must not be revoked or written to the audit column.
-test('disconnect action rejects an unknown provider (no audit pollution)', async (t) => {
+test('provider-valued exported config-modal actions remain host-owned', async (t) => {
   const h = await harness(t, { slackAdmin: false });
-  const untrusted = 'not-a-provider';
+  await h.disconnect(
+    async () => {},
+    { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) },
+    'mcp',
+  );
+  assert.deepEqual(h.dms, []);
+  assert.deepEqual(await auditActions(h.lan.db), []);
+  assert.equal(h.updated(), null);
+});
+
+// Finding 5: an unknown/forged opaque generation must not be revoked or written to the audit column.
+test('disconnect action rejects an unknown generation (no audit pollution)', async (t) => {
+  const h = await harness(t, { slackAdmin: false });
+  const untrusted = '123e4567-e89b-42d3-a456-426614174000';
   await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) }, untrusted);
   assert.deepEqual(await auditActions(h.lan.db), []); // nothing audited for the bogus provider
-  assert.deepEqual(h.dms, ['That connection no longer exists. Run `/vouchr status` to see your current connections.']);
+  assert.deepEqual(h.dms, [
+    'That Disconnect button is no longer current. Review your current connections before trying again.',
+  ]);
   assert.ok(!h.dms[0].includes(untrusted));
 });

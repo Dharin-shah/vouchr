@@ -5,7 +5,7 @@ import http from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { defineProvider } from '../src/core/providers';
 import { userOwner, channelOwner, type Owner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
@@ -60,7 +60,7 @@ async function makeBroker(t: TestContext, channelConfigSet: boolean) {
   let channelConfig: ChannelConfig | undefined;
   if (channelConfigSet) {
     channelConfig = new ChannelConfig(db);
-    await channelConfig.setMode('T1', 'C1', 'acme', 'shared'); // the channel owns one shared credential
+    await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'shared'); // the channel owns one shared credential
   }
 
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });

@@ -23,12 +23,34 @@ Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/headless';
 ```
 
-`@vouchr/core/headless` re-exports exactly the headless surface — `createBroker`, `buildBrokerServer`
-(env → wired server), identity minting/verification, providers, the owner model, and the low-level
-building blocks (`openDb`, `Vault`, `Audit`, `Consent`, `SessionGrants`, `sweepExpired`, `Policy`,
-`ChannelTools`) — plus the typed wire response types (`BrokerFetchResponse`, `BrokerStatusResponse`,
-`BrokerAdminConfigResponse`, …). The root `@vouchr/core` entry still exports everything, including the
-Bolt adapter.
+`@vouchr/core/headless` re-exports exactly the headless surface — `createBroker`, its `BrokerServer`
+type, `buildBrokerServer` (env → wired server), identity minting/verification, providers, the owner
+model, and the low-level building blocks (`openDb`, `Vault`, `Audit`, `Consent`, `sweepExpired`,
+`Policy`, `ChannelTools`) — plus the typed wire response types (`BrokerFetchResponse`,
+`BrokerStatusResponse`, `BrokerAdminConfigResponse`, …), typed operational errors, and the Bolt-free
+`mapSafeError` recovery mapper. The root `@vouchr/core` entry exports the same error contract plus the
+Bolt adapter; neither entry exports the internal session/approval mutation stores.
+
+A directly constructed broker owns those private stores. Schedule the safe method on the returned
+server, not a separately constructed interaction store:
+
+```ts
+const broker = createBroker({ providers, vault, audit, db, identitySecret });
+const sweepTimer = setInterval(
+  () => void broker.sweepExpired().catch(() => console.error('[vouchr] lifecycle sweep failed')),
+  3_600_000,
+);
+sweepTimer.unref();
+```
+
+`broker.sweepExpired()` reclaims expired credentials and stale consent, approval, session, and
+provisioning state through one idempotent lifecycle facade. It does not expose interaction mutators.
+Configured `onEvent` and `onCredentialHealth` hooks receive the sweep's `expired` events only after
+the cleanup commits.
+The lower-level core `sweepExpired(vault, audit, consent, …)` export remains for non-broker lifecycle
+integrations, but it does not own a broker's private interaction stores and is not a substitute for
+this method. For compatibility, the returned number counts expired credential deletions only; all
+interaction families are still swept on every call.
 
 Headless is primarily the credential **use path**, not a replacement for Slack consent. Users still
 connect or approve access through the Slack app first (or through the headless OAuth flow when it is
@@ -65,12 +87,56 @@ only `{ "ok": false }`). Failures a worker should handle explicitly include:
 
 | HTTP | Body | Caller action |
 | --- | --- | --- |
-| `400` | `{ "error": "…", "code": "invalid_reference" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
-| `413` | `{ "error": "request body too large" }`, `{ "error": "response too large; narrow your query or endpoint" }`, or `{ "error": "response blocked" }` | Do not retry unchanged. Reduce the request or choose a narrower provider endpoint. |
-| `429` | `{ "error": "rate limited", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry if the operation itself is safe to retry. |
-| `502` | `{ "error": "credential resolution failed", "code": "resolver_failed" }` | Do not ask the user to reconnect. Check the configured resolver, workload identity/IAM, and secret-manager availability. |
-| `503` | `{ "error": "overloaded", "scope": "global", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
-| `504` | `{ "error": "upstream timed out" }` | Treat the outcome as unknown. Retry only a known-idempotent operation; never automatically replay an uncertain write. |
+| `400` | `{ "error": "…", "code": "invalid_reference", "retryable": false, "recovery": "fix_configuration" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
+| `403` | `{ "error": "egress blocked", "code": "egress_blocked", "retryable": false, "recovery": "fix_configuration" }` | Correct the provider/egress configuration; unchanged retries remain denied. |
+| `403` | `{ "error": "approval_required", "approvalId": "…", "code": "approval_required", "retryable": false, "recovery": "request_approval" }` | Stop the turn. The broker currently enforces this gate but exposes no supported headless decision bridge; do not treat the opaque id as authority. |
+| `403` / `409` | `{ "error": "authorization changed; resolve and retry", "code": "interaction_state_changed", "retryable": false, "recovery": "resolve_again" }` (`409` uses connection-changed prose) | Discard the stale handle, re-resolve current credential/mode/tool/session authority, mint a fresh identity token, and retry only if the operation is still allowed. |
+| `403` | `{ "error": "policy denies this provider in this channel", "code": "policy_denied", "retryable": false, "recovery": "contact_admin" }` | Static/channel policy denied use. Retrying cannot change governance; contact an eligible admin. |
+| `403` | `{ "error": "provider is not enabled in this channel", "code": "tool_disabled", "retryable": false, "recovery": "contact_admin" }` | The channel tool allowlist disabled the provider; contact an eligible admin. |
+| `409` | `{ "error": "not connected", "code": "not_connected", "retryable": false, "recovery": "connect" }` | Start personal connection recovery. For a shared-owner request, `recovery` is `fix_configuration` so an eligible admin configures the channel credential instead. |
+| `413` | `{ "error": "approval action path too large", "code": "approval_path_too_large", "retryable": false, "recovery": "fix_configuration" }` | Narrow the provider endpoint; an unchanged request cannot create a bounded exact-action approval. |
+| `413` / `502` | `{ "error": "response blocked", "code": "response_blocked", "retryable": false, "recovery": "fix_configuration" }` | Provider response policy withheld the body. The broker's default content-type denial retains `error: "disallowed content-type"` but uses the same machine fields. Generic byte caps retain their established prose-only shape. |
+| `429` | `{ "error": "rate limited", "code": "rate_limited", "retryable": true, "recovery": "retry_later", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry only if the operation itself is safe to replay. |
+| `502` | `{ "error": "credential resolution failed", "code": "resolver_configuration_error", "retryable": false, "recovery": "fix_configuration" }` | Resolver wiring, the stored reference, or a fulfilled resolver value is missing/malformed. Correct configuration; unchanged retries cannot repair it. |
+| `502` | `{ "error": "credential resolution failed", "code": "resolver_failed", "retryable": true, "recovery": "retry_later" }` | A configured resolver threw or timed out before provider egress. Retry later when replaying the requested operation is otherwise safe. |
+| `502` | `{ "error": "upstream fetch failed", "code": "token_endpoint_failed", "retryable": false, "recovery": "connect" }` | The stored grant is dead (`kind: credential`). Configuration failures use `fix_configuration`; RFC transient codes and 408/429/5xx/network/timeout failures use `retry_later` with `retryable: true`. In-process callers can inspect `TokenEndpointError.kind`. |
+| `502` | `{ "error": "upstream fetch failed", "code": "internal_error", "retryable": false, "recovery": "contact_admin" }` | Unknown extension/upstream throws are deliberately not guessed retryable; inspect private operator logs. |
+| `503` | `{ "error": "overloaded", "code": "overloaded", "scope": "global", "retryable": true, "recovery": "retry_later", "retryAfterMs": 1000 }` (scope may instead be `provider`) | Honour `Retry-After`. The scope is a fixed operator signal, never a provider id or request value. |
+| `500` | `{ "error": "internal error", "code": "internal_error", "retryable": false, "recovery": "contact_admin" }` | Pre-handle database/KMS/internal failures use fixed metadata and never expose the foreign error. |
+| `504` | `{ "error": "upstream timed out", "code": "upstream_timeout", "retryable": false, "recovery": "retry_later" }` | Treat the outcome as unknown. Retry only a known-idempotent operation; never automatically replay an uncertain write. |
+
+Typed `/v1/fetch` and `/v1/mcp` failures use the same `code`, `retryable`, `recovery`, and
+`retryAfterMs` policy. Authenticated reads and mutations also use the exact typed `409
+interaction_state_changed` / `resolve_again` response when the verified actor assertion predates
+offboarding; replaying that consumed assertion returns `401`. Other validation/authentication
+failures retain established prose where no exported typed outcome exists, so `BrokerError` fields
+remain optional.
+`retryAfterMs` is explicitly milliseconds; the HTTP `Retry-After` header remains whole seconds.
+
+In-process hosts can use the identical contract without parsing HTTP prose:
+
+```ts
+import {
+  mapSafeError,
+  VOUCHR_ERROR_CODES,
+  VOUCHR_RECOVERY_ACTIONS,
+  type VouchrSafeError,
+} from '@vouchr/core/headless';
+
+const safe: VouchrSafeError = mapSafeError(caught);
+```
+
+Every exported typed error (`ConsentRequiredError`, `SessionApprovalRequiredError`,
+`ApprovalRequiredError`, `ApprovalPathTooLongError`, `InteractionStateChangedError`,
+`PolicyDeniedError`, `ToolDisabledError`, `NoConnectionError`,
+`EgressBlockedError`, `ResponseBlockedError`,
+`ResolverConfigurationError`, `ResolverFailedError`, `RateLimitedError`, `SecretReferenceError`,
+`TokenEndpointError`, `UpstreamTimeoutError`, and the explicit `UserFacingError` marker) is available
+from both package entrypoints. Unknown errors never
+expose their message or class name. `UserFacingError` is an explicit opt-in for fixed,
+Vouchr-authored copy—never wrap a caught resolver/provider/KMS/database error in it. See the root
+README's [typed error table](../README.md#typed-errors-and-recovery) for thrown control-flow vs
+operational meanings.
 
 Identity assertions are single-use. **Mint a fresh `identityToken` for every retry**, including a
 retry after `429`, `503`, or `504`; never infer from the error scope whether the earlier assertion
@@ -80,20 +146,40 @@ be available at that instant.
 
 ### Disconnecting a credential
 
-`POST /v1/disconnect` accepts `{ "handle": { "provider": "github" }, "identityToken": "…" }`.
-Identity comes from the verified assertion, so the caller can remove only its own user credential.
-The response keeps committed local deletion separate from upstream/audit confirmation:
+`POST /v1/disconnect` accepts `{ "handle": { "provider": "github", "credentialId": "…" },
+"identityToken": "…" }`. Identity comes from the verified assertion, so the caller can remove only
+its own user credential. Obtain the opaque id by calling `/v1/resolve` with
+`"includeCredentialId": true`; the ordinary resolve response remains unchanged when that opt-in is
+absent. The id is a lookup handle, not authority: disconnect repeats actor, provider, and exact-row
+validation under the lifecycle locks. The response keeps committed local deletion separate from
+upstream/audit confirmation:
 
 | Response | Meaning |
 | --- | --- |
 | `200 { "ok": true, "revoked": ["github"] }` | The local row was removed and every applicable upstream/audit obligation was confirmed. |
 | `200 { "ok": false, "revoked": ["github"] }` | The local row was removed, but upstream revocation or authoritative auditing is unconfirmed. A revocable external reference is one such case because no vaulted token is available to send to the provider; rotate it at its source. |
 | `200 { "ok": true, "revoked": [] }` | The registered provider already had no user credential; this is an idempotent no-op. |
+| `409 { "error": "connection changed; resolve and retry", "code": "interaction_state_changed", "retryable": false, "recovery": "resolve_again" }` | The actor assertion or exact credential generation is stale. Resolve current state; the request cannot delete a credential connected after its issuance. |
 | `404 { "error": "unknown provider" }` | The id is neither registered nor an exact stored row owned by the caller; nothing was mutated or audited. |
 
 `revoked` therefore means “removed from Vouchr”, not “every possible provider-side credential was
 invalidated”. Error text never includes the submitted provider value, a credential reference, or a
-raw dependency error.
+raw dependency error. The identity assertion is consumed on the first authenticated attempt, so its
+replay returns `401` even after a `409`.
+For backward compatibility, a provider-only handle is still accepted when PostgreSQL can prove the
+row predates the assertion's conservative issuance boundary. A recently connected row can be
+clock-ambiguous across the minter and broker, so that legacy form returns the same `409`; resolve the
+current opaque id and retry instead of waiting or blindly replaying.
+
+### Admin offboarding
+
+`POST /v1/admin/offboard` accepts `{ "identityToken": "…", "targetUserId": "…" }`; admin
+authority comes only from the signed assertion. A single-team response keeps every committed local
+deletion in `revoked`, but returns `ok: false` if supported upstream revocation or its authoritative
+audit row could not be confirmed. An Enterprise/Grid assertion must also bind the exact target in
+signed `offboardTargetUserId`; any incomplete workspace adds to `incompleteTeams`. Both paths may
+return HTTP 200 with `ok: false` because successful local deletion is retained—directory hooks must
+inspect the body and reconcile until `ok` is true.
 
 ## Capability matrix: Bolt vs headless
 
@@ -142,24 +228,46 @@ matching action — enforced in the shared injector, so this door inherits it id
 AFTER every egress gate (never a bypass) and BEFORE the credential is read. The broker **cannot
 render Approve/Deny buttons**, so the split is deliberate:
 
-- A matching `/v1/fetch` (or `/v1/mcp`) with no live grant records a pending approval, audits
-  `approval_requested`, and returns:
+- A matching `/v1/fetch` (or `/v1/mcp`) with no live grant records and audits one pending approval
+  atomically, and returns. Concurrent/repeated identical actions reuse the same opaque id and do not
+  duplicate the request audit:
 
   ```json
-  { "error": "approval_required", "approvalId": "…" }   // HTTP 403
+  {
+    "error": "approval_required",
+    "approvalId": "…",
+    "code": "approval_required",
+    "retryable": false,
+    "recovery": "request_approval"
+  }
   ```
 
 - The Bolt adapter renders Approve/Deny automatically only when its own in-process handle starts the
-  write. A headless 403 does not trigger that UI. The Slack-facing host must implement the bridge,
-  re-check approver eligibility, and retry with a fresh identity token; the complete supported bridge
-  remains [#194](https://github.com/Dharin-shah/vouchr/issues/194). A host can use the exported
-  `Approvals` store, but the current package does not export the Bolt approval blocks/action IDs as a
-  ready-made headless surface.
+  write. A headless 403 does not trigger that UI. The package does not yet expose a safe headless
+  decision/session facade: the required Slack eligibility checks, lifecycle locks, current-state
+  validation, mutation, and audit must stay one canonical operation. Do not mutate interaction
+  tables or import internal stores. The supported broker-to-Slack bridge remains a later focused
+  slice of [#194](https://github.com/Dharin-shah/vouchr/issues/194).
 
-The grant matches ONLY the exact (method, host, path) it was minted for, expires after `ttlMs`
+Therefore approval on a headless-only request path is currently **enforcement-only**: it will deny
+the matching write, but there is no supported API that can complete the human decision. Leave the
+provider's `approval` knob disabled for such a path until the #194 bridge lands, or route that action
+through the packaged in-process Bolt surface that owns its private prompt and handlers.
+
+The grant matches ONLY the exact (method, origin, path, byte-exact query digest) it was minted for.
+Origin includes scheme, hostname, and effective port; the human/audit surface still shows hostname only. It
+expires after `ttlMs`
 (default 5 minutes), and is consumed atomically on first use — a second identical call returns a
 fresh 403 with a new `approvalId`. The `approvalId` is a lookup handle, not authority and not a
-secret. Expired prompts/grants are reclaimed by the standard TTL sweep (audited, actor `system`).
+secret. On the packaged Bolt path, decisions and spends commit with their audit companions, current
+owner/credential/mode/policy/tool/conversation state is revalidated, and mode/tool changes purge old
+pending controls and grants so flip-back cannot revive them. Expired prompts/grants are reclaimed by
+the standard TTL sweep (audited, actor `system`). These lifecycle guarantees do not imply a supported
+custom headless decision UI before the bridge above lands.
+
+Bolt prompts and approval audits expose only method, host, parameter count, and a salted action
+fingerprint. Raw paths/queries may contain secrets or PII and stay out of Slack, public errors, and
+audit. A path over 16 KiB fails before rate budget, interaction state, credential reads, or egress.
 
 ## MCP servers (Streamable HTTP): `POST /v1/mcp`
 
@@ -249,9 +357,9 @@ channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool al
 authority comes only from the verified identity token, never the request body — and are scoped to
 the signed channel.
 
-Direct `createBroker()` callers opt into the mutable gate by supplying `channelTools`. The packaged
-`buildBrokerServer()` constructs `ChannelTools` from its existing PostgreSQL handle unconditionally,
-so Bolt and the admin API write through the same first-write-safe `applyEnabled` mutation, while
+Direct `createBroker()` callers opt into the mutable gate by supplying the read-only `channelTools` store.
+The packaged `buildBrokerServer()` constructs it from its existing PostgreSQL handle unconditionally,
+so the broker admin routes and Bolt write through one audited, lifecycle-locked core mutation, while
 admin config, the channel manifest, `/v1/fetch`, and `/v1/mcp` read and enforce that same state. No
 allowlist cache or additional environment switch is involved. Service tools are included in admin
 config and the channel manifest and may be enabled or disabled there; because Vouchr never executes
@@ -265,15 +373,49 @@ against the configured provider registry at boot and evaluation uses only the si
 Static policy and mutable `ChannelTools` intersect, so an admin enable cannot override an operator
 deny and a policy allow cannot override a disabled channel tool.
 
+`ChannelConfig` and `ChannelTools` are public read stores. Their former raw `setMode`, `setEnabled`,
+and `applyEnabled` methods are removed in v10 because they could bypass interaction invalidation and
+audit. Use `POST /v1/admin/mode` and `POST /v1/admin/tools` (or packaged Bolt/App Home) for writes.
+
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).
-Both routes validate a bounded supported reference form, derive its source server-side, and require an
-own configured resolver function before any credential, mode, or audit write. A compatibility
+Both routes validate a bounded supported reference form, derive its source server-side, and require a
+configured resolver function before any credential, mode, or audit write. A compatibility
 `source` field may be supplied only when it exactly matches that derived source; optional scopes
 must be a bounded unique subset of the provider's declared scopes. Saving does not invoke the
 resolver or prove IAM, network, or secret availability; resolution remains just in time at
-credential use. Validation errors include a stable `code` for recovery UI; JIT failures return
-`resolver_failed` without exposing the resolver's error text or stored reference.
+credential use. Validation errors include a stable `code` for recovery UI. Missing/malformed
+resolver configuration or a fulfilled undefined, non-string, or empty value returns non-retryable
+`resolver_configuration_error`; a configured resolver's throw or deadline returns retryable
+`resolver_failed`. Neither exposes resolver error text or the stored reference. Resolvers must
+fulfill with a non-empty string, and invalid output fails closed before provider egress; explicit
+caller cancellation still propagates.
+
+User provisioning, authenticated reads and mutations, and retained credential use are bound to the
+verified assertion that initiated them. The broker maps the deployment-bound token's observed age
+into PostgreSQL's clock domain and compares that conservative issuance with the durable offboard
+fence. Presenting a token minted before offboarding therefore cannot mint a fresh OAuth state or
+referenced credential afterward; callers must resolve current access and mint a new verified
+identity after legitimate re-onboarding. Before provider/config/registry/audit discovery, the
+current-actor check covers `/v1/resolve`, `/v1/status`, `/v1/audit`, `/v1/admin/audit`, `GET
+/v1/admin/config`, the channel manifest, and the connect, reference, mode, tools, offboard, and
+disconnect mutations. `/v1/fetch` and `/v1/mcp` make the same early check, then the retained handle
+checks again before secret access and at provider send; every credential/governance mutation retains
+its final under-lock fence. A newly presented pre-offboard assertion receives exact `409
+interaction_state_changed` with `recovery: "resolve_again"`, and its replay receives `401`. It cannot
+use a surviving shared channel credential; that credential remains available to another current
+actor with fresh authority. Pending or granted approvals requested by the offboarded user are
+removed, while tombstone checks at decision and consumption keep them unusable if cleanup fails.
+Once a request passes the final provider-send fence and is dispatched, later offboarding cannot
+recall it. Under
+the documented ±30-second minter, broker, and PostgreSQL clock bounds, wait the conservative
+90-second cluster-skew horizon before minting the replacement assertion. `/v1/admin/reference`
+applies the same age-preserving fence to the acting admin while it atomically writes the channel
+reference, shared mode, and config audit; an assertion minted before that admin's offboarding cannot
+gain fresh channel-setup authority by being replayed later. Enterprise/global offboarding writes its
+scope
+before artifact discovery, so this also holds for a Grid workspace with no existing Vouchr row.
+Legacy assertions without a verified `iat` fail closed at the production broker boundary.
 
 ## Operations
 
@@ -297,9 +439,9 @@ credential use. Validation errors include a stable `code` for recovery UI; JIT f
   `onCredentialHealth` (a `BrokerOptions` field, e.g. `buildBrokerServer(env, { onCredentialHealth })`)
   to hear `refresh_dead` — a DEFINITIVELY dead refresh token (`invalid_grant`, or a bare 400/401
   from the token endpoint; never a transient network blip, nor an operator-side error such as
-  `invalid_client` — see `TokenEndpointError`). The same hook passed to `sweepExpired` also fires
-  `expiring_soon` (within 72h of the idle/max-age TTL ceiling, for dimensions longer than the 72h
-  window; re-fired on every sweep pass) and
+  `invalid_client` — see `TokenEndpointError`). The broker-owned `sweepExpired()` method uses that
+  same hook for `expiring_soon` (within 72h of the idle/max-age TTL ceiling, for dimensions longer
+  than the 72h window; re-fired on every sweep pass) and
   `expired` (the sweep deleted the connection). Events carry the owning principal + provider, never
   token material. Debounce your notifier with the exported `NotificationState`: `claim()` the 24h
   window atomically (exactly one winner per (owner, provider, type), across replicas sharing a

@@ -11,10 +11,17 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
+import {
+  ChannelProvisioningRequests,
+  issueUserProvisioningRequest,
+  UserProvisioningRequests,
+} from '../src/core/provisioning';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider } from '../src/core/offboard';
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
+import { ChannelConfig } from '../src/core/channelConfig';
+import { configureChannelCredential } from '../src/core/channelCredential';
 
 const KEY = randomBytes(32);
 
@@ -121,23 +128,57 @@ test('local delete is guaranteed even with a wrong key and no registry (break-gl
   assert.equal(await wrongKeyVault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable'), null);
 });
 
-test('pending consent + grants with NO connection are counted and purged for the scope', async (t) => {
-  // P2: a pending "Connect" (or lingering thread grant) for the provider but no live connection must
-  // still be cleared, or it resurrects access after the break-glass run.
+test('pending consent, sessions, and key setup with NO connection are counted and purged for the scope', async (t) => {
+  // P2: pending authority without a live connection must still be cleared, or it can recreate
+  // access after the break-glass run.
   const { db } = await seed(t);
   const id: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U_ORPHAN' }; // no connection row
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
   await consent.begin(id, revocable, 'https://broker.example/cb', 'C9');
-  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000);
+  const orphanGeneration = '00000000-0000-4000-8000-000000000001';
+  await sessions.request(id, 'C9', 'THREAD', 'revocable', orphanGeneration);
+  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000, orphanGeneration);
+  const vault = new Vault(db, KEY);
+  assert.ok(await new UserProvisioningRequests(db, vault).issue(id, 'revocable'));
+  assert.ok(await new ChannelProvisioningRequests(db, vault).issue(
+    id,
+    'C9',
+    'revocable',
+    await vault.userProvisioningIssuedAt(),
+  ));
   // A different provider's pending state must survive the scoped purge.
   await consent.begin(id, { ...revocable, id: 'other' } as any, 'https://broker.example/cb', 'C9');
 
-  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), { consents: 1, grants: 1 });
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), {
+    consents: 1,
+    requests: 1,
+    grants: 1,
+    provisioning: 1,
+    channelProvisioning: 1,
+  });
   const purged = await purgePendingForProvider(db, { provider: 'revocable' });
-  assert.deepEqual(purged, { consents: 1, grants: 1 });
-  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), { consents: 0, grants: 0 });
-  assert.deepEqual(await countPendingForProvider(db, { provider: 'other' }), { consents: 1, grants: 0 }); // untouched
+  assert.deepEqual(purged, {
+    consents: 1,
+    requests: 1,
+    grants: 1,
+    provisioning: 1,
+    channelProvisioning: 1,
+  });
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), {
+    consents: 0,
+    requests: 0,
+    grants: 0,
+    provisioning: 0,
+    channelProvisioning: 0,
+  });
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'other' }), {
+    consents: 1,
+    requests: 0,
+    grants: 0,
+    provisioning: 0,
+    channelProvisioning: 0,
+  }); // untouched
 });
 
 test('pending purge respects the team/user scope', async (t) => {
@@ -145,23 +186,471 @@ test('pending purge respects the team/user scope', async (t) => {
   const consent = new Consent(db);
   await consent.begin({ enterpriseId: null, teamId: 'T1', userId: 'U1' }, revocable, 'https://x/cb', null);
   await consent.begin({ enterpriseId: null, teamId: 'T2', userId: 'U2' }, revocable, 'https://x/cb', null);
+  const provisioning = new UserProvisioningRequests(db, new Vault(db, KEY));
+  assert.ok(await provisioning.issue({ enterpriseId: null, teamId: 'T1', userId: 'U_SETUP_1' }, 'revocable'));
+  assert.ok(await provisioning.issue({ enterpriseId: null, teamId: 'T2', userId: 'U_SETUP_2' }, 'revocable'));
   const purged = await purgePendingForProvider(db, { provider: 'revocable', teamId: 'T1' });
   assert.equal(purged.consents, 1); // only T1
-  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable', teamId: 'T2' }), { consents: 1, grants: 0 });
+  assert.equal(purged.provisioning, 1); // only T1
+  assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable', teamId: 'T2' }), {
+    consents: 1,
+    requests: 0,
+    grants: 0,
+    provisioning: 1,
+    channelProvisioning: 0,
+  });
+});
+
+test('--channel treats a consent channel as origin, not shared-credential ownership', async (t) => {
+  const { db } = await seed(t);
+  const identity = { enterpriseId: null, teamId: 'T1', userId: 'U_ORIGIN' };
+  await new Consent(db).begin(identity, revocable, 'https://x/cb', 'C1');
+  const vault = new Vault(db, KEY);
+  const channelRequests = new ChannelProvisioningRequests(db, vault);
+  assert.ok(await channelRequests.issue(
+    identity,
+    'C1',
+    'revocable',
+    await vault.userProvisioningIssuedAt(),
+  ));
+
+  assert.deepEqual(await countPendingForProvider(db, {
+    provider: 'revocable', channel: 'C1',
+  }), {
+    consents: 0,
+    requests: 0,
+    grants: 0,
+    provisioning: 0,
+    channelProvisioning: 1,
+  });
+  assert.deepEqual(await purgePendingForProvider(db, {
+    provider: 'revocable', channel: 'C1',
+  }), {
+    consents: 0,
+    requests: 0,
+    grants: 0,
+    provisioning: 0,
+    channelProvisioning: 1,
+  });
+  assert.equal(
+    (await db.get<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM consent_request WHERE user_id=? AND provider=?`,
+      [identity.userId, 'revocable'],
+    ))?.n,
+    1,
+    'a channel-owner revoke must not consume a user consent merely because it originated there',
+  );
+});
+
+test('--user does not treat the admin actor as owner of a channel setup request', async (t) => {
+  const { db } = await seed(t);
+  const identity = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
+  const vault = new Vault(db, KEY);
+  const requests = new ChannelProvisioningRequests(db, vault);
+  assert.ok(await requests.issue(
+    identity,
+    'C_SHARED',
+    'revocable',
+    await vault.userProvisioningIssuedAt(),
+  ));
+
+  assert.deepEqual(
+    await purgePendingForProvider(db, { provider: 'revocable', userId: identity.userId }),
+    {
+      consents: 0,
+      requests: 0,
+      grants: 0,
+      provisioning: 0,
+      channelProvisioning: 0,
+    },
+  );
+  assert.equal(
+    (await db.get<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM channel_provisioning_request WHERE user_id=?`,
+      [identity.userId],
+    ))?.n,
+    1,
+  );
+});
+
+test('a retired provider represented only by a channel setup request remains revocable', async (t) => {
+  const { db } = await seed(t);
+  const identity = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
+  const vault = new Vault(db, KEY);
+  assert.ok(await new ChannelProvisioningRequests(db, vault).issue(
+    identity,
+    'C_RETIRED',
+    'retired-channel',
+    await vault.userProvisioningIssuedAt(),
+  ));
+  const purged = await purgePendingForProvider(db, {
+    provider: 'retired-channel',
+    channel: 'C_RETIRED',
+  });
+  assert.equal(purged.channelProvisioning, 1);
+});
+
+test('scoped revoke fences an invisible pre-insert user setup without blocking a sibling or fresh setup', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const vaultA = new Vault(dbA, KEY);
+  const blocked = { enterpriseId: null, teamId: 'T1', userId: 'U_BLOCKED' };
+  const sibling = { enterpriseId: null, teamId: 'T1', userId: 'U_SIBLING' };
+  const siblingIssuedAt = await vaultA.userProvisioningIssuedAt();
+  const realLock = vaultA.withCredentialLock.bind(vaultA);
+  let entered!: () => void;
+  let release!: () => void;
+  const beforeLock = new Promise<void>((resolve) => { entered = resolve; });
+  const resume = new Promise<void>((resolve) => { release = resolve; });
+  vaultA.withCredentialLock = (async (...args: Parameters<Vault['withCredentialLock']>) => {
+    entered();
+    await resume;
+    return realLock(...args);
+  }) as Vault['withCredentialLock'];
+
+  const oldSetup = issueUserProvisioningRequest(vaultA, blocked, 'revocable');
+  await beforeLock;
+  await purgePendingForProvider(
+    dbB,
+    { provider: 'revocable', userId: blocked.userId },
+    { providerRegistered: true },
+  );
+  release();
+  assert.equal(await oldSetup, null);
+
+  assert.ok(
+    await issueUserProvisioningRequest(vaultA, sibling, 'revocable', siblingIssuedAt),
+    'a user-scoped marker must not invalidate a sibling user in the same team',
+  );
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.ok(
+    await issueUserProvisioningRequest(vaultA, blocked, 'revocable'),
+    'a genuinely new setup after the marker remains possible',
+  );
+  const marker = await dbA.get<Record<string, unknown>>(
+    `SELECT provider, scope_kind, scope_key, created_at
+       FROM provisioning_revocation_tombstone`,
+  );
+  assert.equal(marker?.scope_kind, 'user');
+  assert.doesNotMatch(JSON.stringify(marker), /U_BLOCKED|U_SIBLING/);
+});
+
+test('a marker-only retired provider remains recognized so a later revoke refreshes its fence', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const identity = { enterpriseId: null, teamId: 'T1', userId: 'U_RETIRED' };
+  const filter = { provider: 'retired-provider', userId: identity.userId };
+  await purgePendingForProvider(dbB, filter, { providerRegistered: true });
+  await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const vault = new Vault(dbA, KEY);
+  const issuedAt = await vault.userProvisioningIssuedAt();
+  const realLock = vault.withCredentialLock.bind(vault);
+  let entered!: () => void;
+  let release!: () => void;
+  const beforeLock = new Promise<void>((resolve) => { entered = resolve; });
+  const resume = new Promise<void>((resolve) => { release = resolve; });
+  vault.withCredentialLock = (async (...args: Parameters<Vault['withCredentialLock']>) => {
+    entered();
+    await resume;
+    return realLock(...args);
+  }) as Vault['withCredentialLock'];
+  const delayed = issueUserProvisioningRequest(
+    vault,
+    identity,
+    filter.provider,
+    issuedAt,
+  );
+  await beforeLock;
+  // No registry entry or live/pending row remains. The validated first marker is the only durable
+  // recognition, and must authorize refreshing this exact fence rather than rejecting the run.
+  await purgePendingForProvider(dbB, filter);
+  release();
+  assert.equal(await delayed, null);
+  assert.equal(
+    (await dbA.get<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM user_provisioning_request WHERE provider=?`,
+      [filter.provider],
+    ))?.n,
+    0,
+  );
+});
+
+test('a failed break-glass fence leaves pending authority intact and never reports a purge', async (t) => {
+  const db = await openTestDb(t);
+  const identity: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
+  await new Consent(db).begin(identity, revocable, 'https://broker.example/callback', 'C1');
+  const failingDb = {
+    get: db.get.bind(db),
+    all: db.all.bind(db),
+    run: db.run.bind(db),
+    withRefreshLock: async () => {
+      throw new Error('provisioning fence unavailable');
+    },
+  } as any;
+
+  await assert.rejects(
+    purgePendingForProvider(
+      failingDb,
+      { provider: 'revocable', teamId: identity.teamId, userId: identity.userId },
+      { providerRegistered: true },
+    ),
+    /provisioning fence unavailable/,
+  );
+  assert.equal((await db.get<any>('SELECT COUNT(*)::int AS n FROM consent_request')).n, 1);
+  assert.equal((await db.get<any>('SELECT COUNT(*)::int AS n FROM provisioning_revocation_tombstone')).n, 0);
+});
+
+test('channel-scoped revoke fences a delayed shared write without blocking a sibling channel', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const identity = { enterpriseId: null, teamId: 'T1', userId: 'ADMIN' };
+  const vaultA = new Vault(dbA, KEY);
+  const issuedAt = await vaultA.userProvisioningIssuedAt();
+  const realLock = vaultA.withCredentialLock.bind(vaultA);
+  let entered!: () => void;
+  let release!: () => void;
+  const beforeLock = new Promise<void>((resolve) => { entered = resolve; });
+  const resume = new Promise<void>((resolve) => { release = resolve; });
+  vaultA.withCredentialLock = (async (...args: Parameters<Vault['withCredentialLock']>) => {
+    entered();
+    await resume;
+    return realLock(...args);
+  }) as Vault['withCredentialLock'];
+  const modeConflict = (mode: 'per-user' | 'session'): never => {
+    throw new Error(`unexpected mode ${mode}`);
+  };
+  const delayed = configureChannelCredential({
+    vault: vaultA,
+    audit: new Audit(dbA),
+    channelConfig: new ChannelConfig(dbA),
+    identity,
+    channel: 'C_BLOCKED',
+    providerId: 'revocable',
+    issuance: issuedAt,
+    credential: { kind: 'secret', token: tok('DELAYED_CHANNEL_TOKEN') },
+    modeConflict,
+  });
+  await beforeLock;
+  await purgePendingForProvider(
+    dbB,
+    { provider: 'revocable', channel: 'C_BLOCKED' },
+    { providerRegistered: true },
+  );
+  release();
+  assert.equal(await delayed, false);
+  assert.equal(await vaultA.has(channelOwner('T1', 'C_BLOCKED'), 'revocable'), false);
+
+  assert.equal(await configureChannelCredential({
+    vault: vaultA,
+    audit: new Audit(dbA),
+    channelConfig: new ChannelConfig(dbA),
+    identity,
+    channel: 'C_SIBLING',
+    providerId: 'revocable',
+    issuance: issuedAt,
+    credential: { kind: 'secret', token: tok('SIBLING_CHANNEL_TOKEN') },
+    modeConflict,
+  }), true);
+  assert.equal(await vaultA.has(channelOwner('T1', 'C_SIBLING'), 'revocable'), true);
+});
+
+for (const kind of ['vault', 'dry-run', 'reference'] as const) {
+  test(`exported Vault ${kind} channel write cannot cross a confirmed scoped revoke`, async (t) => {
+    const url = await testDbUrl(t);
+    const [dbA, dbB] = await Promise.all([
+      openDb({ databaseUrl: url }),
+      openDb({ databaseUrl: url }),
+    ]);
+    t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+    const channel = `C_LOW_${kind.replace('-', '_')}`;
+    const owner = channelOwner('T1', channel);
+    const vault = new Vault(dbA, KEY);
+    const realLock = vault.withCredentialLock.bind(vault);
+    let entered!: () => void;
+    let release!: () => void;
+    const beforeLock = new Promise<void>((resolve) => { entered = resolve; });
+    const resume = new Promise<void>((resolve) => { release = resolve; });
+    vault.withCredentialLock = (async (...args: Parameters<Vault['withCredentialLock']>) => {
+      entered();
+      await resume;
+      return realLock(...args);
+    }) as Vault['withCredentialLock'];
+
+    const writing = kind === 'vault'
+      ? vault.upsert(owner, 'revocable', tok('LOW_LEVEL_TOKEN'))
+      : kind === 'dry-run'
+        ? vault.upsertDryRun(owner, 'revocable', tok('LOW_LEVEL_DRY_TOKEN'))
+        : vault.reference(owner, 'revocable', {
+            source: 'aws-sm',
+            secretRef: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:vouchr/low-level',
+          });
+    await beforeLock;
+    await purgePendingForProvider(
+      dbB,
+      { provider: 'revocable', channel },
+      { providerRegistered: true },
+    );
+    release();
+    if (kind === 'reference') {
+      await assert.rejects(writing, /channel credential provisioning was refused/);
+    } else {
+      assert.equal(await writing, false);
+    }
+    assert.equal(await vault.has(owner, 'revocable'), false);
+  });
+}
+
+test('pending key purge waits for a consumed in-flight ticket so the CLI rescan catches its credential', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const identity: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U_RACE' };
+  const owner = userOwner(identity);
+  const vaultA = new Vault(dbA, KEY);
+  const requests = new UserProvisioningRequests(dbA, vaultA);
+  const requestId = await requests.issue(identity, 'revocable');
+  assert.ok(requestId);
+
+  let writeEntered!: () => void;
+  let releaseWrite!: () => void;
+  const entered = new Promise<void>((resolve) => { writeEntered = resolve; });
+  const release = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  const writing = vaultA.upsertUser(
+    owner,
+    'revocable',
+    tok('RACE_TOKEN'),
+    requests.issuance(requestId, identity, 'revocable'),
+    async () => {
+      writeEntered();
+      await release;
+    },
+  );
+  await entered;
+
+  let purgeSettled = false;
+  const purging = purgePendingForProvider(dbB, {
+    provider: 'revocable', teamId: identity.teamId, userId: identity.userId,
+  }).then((result) => { purgeSettled = true; return result; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(purgeSettled, false, 'purge must wait on the writer\'s canonical credential lock');
+  releaseWrite();
+  assert.equal(await writing, 'stored');
+  const purged = await purging;
+  assert.equal(purged.provisioning, 0, 'the winning writer consumed the ticket in its transaction');
+
+  const settled = await selectRevocations(dbB, {
+    provider: 'revocable', teamId: identity.teamId, userId: identity.userId,
+  });
+  assert.equal(settled.length, 1, 'the required post-purge rescan sees the settled credential');
+  const vaultB = new Vault(dbB, KEY);
+  await revokeConnection(
+    vaultB,
+    new Audit(dbB),
+    new Consent(dbB),
+    new SessionGrants(dbB),
+    undefined,
+    settled[0],
+    'revocable',
+  );
+  assert.equal(await vaultB.has(owner, 'revocable'), false);
+});
+
+test('pending channel-key purge waits for a consumed ticket so the CLI rescan catches its credential', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl: url }),
+    openDb({ databaseUrl: url }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const identity: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
+  const channel = 'C_RACE';
+  const owner = channelOwner(identity.teamId, channel);
+  const vaultA = new Vault(dbA, KEY);
+  const requests = new ChannelProvisioningRequests(dbA, vaultA);
+  const requestId = await requests.issue(
+    identity,
+    channel,
+    'revocable',
+    await vaultA.userProvisioningIssuedAt(),
+  );
+  assert.ok(requestId);
+
+  let writeEntered!: () => void;
+  let releaseWrite!: () => void;
+  const entered = new Promise<void>((resolve) => { writeEntered = resolve; });
+  const release = new Promise<void>((resolve) => { releaseWrite = resolve; });
+  const audit = new Audit(dbA);
+  const originalRecord = audit.record.bind(audit);
+  (audit as any).record = async (...args: any[]) => {
+    writeEntered();
+    await release;
+    return (originalRecord as any)(...args);
+  };
+  const writing = configureChannelCredential({
+    vault: vaultA,
+    audit,
+    channelConfig: new ChannelConfig(dbA),
+    identity,
+    channel,
+    providerId: 'revocable',
+    issuance: requests.issuance(requestId, identity, channel, 'revocable'),
+    credential: { kind: 'secret', token: tok('CHANNEL_RACE_TOKEN') },
+    modeConflict: (mode) => { throw new Error(`unexpected mode ${mode}`); },
+  });
+  await entered;
+
+  let purgeSettled = false;
+  const purging = purgePendingForProvider(dbB, {
+    provider: 'revocable', teamId: identity.teamId, channel,
+  }).then((result) => { purgeSettled = true; return result; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(purgeSettled, false, 'purge must wait on the channel credential lock');
+  releaseWrite();
+  assert.equal(await writing, true);
+  const purged = await purging;
+  assert.equal(
+    purged.channelProvisioning,
+    0,
+    'the winning writer consumed the channel ticket in its transaction',
+  );
+
+  const settled = await selectRevocations(dbB, {
+    provider: 'revocable', teamId: identity.teamId, channel,
+  });
+  assert.equal(settled.length, 1, 'the required post-purge rescan sees the settled channel credential');
+  assert.equal(await new Vault(dbB, KEY).has(owner, 'revocable'), true);
 });
 
 test('revoking a user connection clears that user+provider session grants and pending consent', async (t) => {
   const { db, vault, audit, consent, sessions, registry } = await seed(t);
   const id: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
-  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000);
+  const credentialId = await vault.liveId(userOwner(id), 'revocable');
+  assert.ok(credentialId);
+  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000, credentialId);
   await consent.begin(id, revocable, 'https://broker.example/cb', 'C9');
-  assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable'), true);
+  assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable', credentialId), true);
   assert.equal((await db.get('SELECT COUNT(*) AS n FROM consent_request') as any).n, 1);
 
   const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
   await revokeConnection(vault, audit, consent, sessions, registry, row, 'revocable');
 
-  assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable'), false); // grant cleared
+  assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable', credentialId), false); // grant cleared
   assert.equal((await db.get('SELECT COUNT(*) AS n FROM consent_request') as any).n, 0); // consent cleared
 });
 
@@ -261,6 +750,84 @@ test('CLI revoke rejects an EMPTY scope (--team=) instead of treating it as "all
     await db2.close();
     assert.equal(n.n, 2, `${scope} must delete nothing`); // both teams survive
   }
+});
+
+test('CLI revoke validates provider and mutually exclusive owner scopes before fencing', async (t) => {
+  const dbPath = await testDbUrl(t);
+  const keyB64 = randomBytes(32).toString('base64');
+  const env = {
+    ...process.env,
+    VOUCHR_DATABASE_URL: dbPath,
+    VOUCHR_MASTER_KEY: keyB64,
+    VOUCHR_PROVIDERS: '[]',
+  };
+  for (const entry of [
+    { args: ['--provider', 'bad/id', '--yes'], error: /valid provider id/ },
+    {
+      args: ['--provider', 'revocable', '--user', 'U1', '--channel', 'C1', '--yes'],
+      error: /mutually exclusive/,
+    },
+  ]) {
+    const res = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', ...entry.args], {
+      env,
+      encoding: 'utf8',
+    });
+    assert.equal(res.status, 2);
+    assert.match(res.stderr, entry.error);
+  }
+  const db = await openDb({ databaseUrl: dbPath });
+  assert.equal((await db.get<any>('SELECT COUNT(*)::int AS n FROM provisioning_revocation_tombstone')).n, 0);
+  await db.close();
+});
+
+test('CLI actual revoke refuses a valid unknown provider without persisting its id', async (t) => {
+  const dbPath = await testDbUrl(t);
+  const keyB64 = randomBytes(32).toString('base64');
+  const res = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', 'retired-typo', '--yes'],
+    {
+      env: {
+        ...process.env,
+        VOUCHR_DATABASE_URL: dbPath,
+        VOUCHR_MASTER_KEY: keyB64,
+        VOUCHR_PROVIDERS: '[]',
+      },
+      encoding: 'utf8',
+    },
+  );
+  assert.equal(res.status, 1);
+  assert.match(res.stderr, /command failed/);
+  const db = await openDb({ databaseUrl: dbPath });
+  assert.equal((await db.get<any>('SELECT COUNT(*)::int AS n FROM provisioning_revocation_tombstone')).n, 0);
+  await db.close();
+});
+
+test('CLI dry-run writes no provisioning fence', async (t) => {
+  const dbPath = await testDbUrl(t);
+  const keyB64 = randomBytes(32).toString('base64');
+  const db = await openDb({ databaseUrl: dbPath });
+  const vault = new Vault(db, Buffer.from(keyB64, 'base64'));
+  await vault.upsert(
+    userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }),
+    'revocable',
+    tok('DRY_RUN_PROOF_TOKEN'),
+  );
+  await db.close();
+
+  const res = spawnSync(
+    process.execPath,
+    ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', 'revocable', '--dry-run'],
+    {
+      env: { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: keyB64 },
+      encoding: 'utf8',
+    },
+  );
+  assert.equal(res.status, 0);
+  const after = await openDb({ databaseUrl: dbPath });
+  assert.equal((await after.get<any>('SELECT COUNT(*)::int AS n FROM connection')).n, 1);
+  assert.equal((await after.get<any>('SELECT COUNT(*)::int AS n FROM provisioning_revocation_tombstone')).n, 0);
+  await after.close();
 });
 
 test('CLI revoke does not echo a token-shaped positional or unknown-flag secret (SEC-1)', async (t) => {

@@ -370,9 +370,9 @@ void main().catch(() => { process.exitCode = 1; });
 The repository's [`examples/aws-secrets-manager`](../examples/aws-secrets-manager) contains a
 reference resolver. It is an example, not part of the published npm package; the wrapper must install
 `@aws-sdk/client-secrets-manager` and own the small adapter. A production resolver must accept the
-provided `AbortSignal` and pass it into the AWS SDK request so a deadline or disconnect cancels the
-underlying call, not only Vouchr's wait. The repository example does not yet do this; see the
-resolver-cancellation acceptance on [#209](https://github.com/Dharin-shah/vouchr/issues/209).
+provided `AbortSignal` and pass it into the SDK/network request so a deadline or disconnect cancels
+the underlying call, not only Vouchr's wait. The repository example demonstrates this by passing
+the signal to the AWS SDK `send` call.
 Production wrappers must also preserve graceful draining and must schedule periodic cleanup unless
 the control plane owns it. The standalone binary already owns both lifecycles, so preserve its
 shutdown ordering when replacing its entrypoint.
@@ -384,7 +384,8 @@ Use a schema-owner role only for `vouchr migrate`; both runtimes use DML-only cr
 
 The trusted Slack service or a narrow internal gateway mints a fresh, single-use assertion for each
 broker request. Never let a model, untrusted MCP client, or generic worker supply `teamId`, `userId`,
-`channel`, `threadTs`, `isAdmin`, `ownerKind`, or `channelEligible`.
+`channel`, `threadTs`, `isAdmin`, `enterpriseId`, `offboardTargetUserId`, `ownerKind`, or
+`channelEligible`.
 
 ```ts
 import {
@@ -468,7 +469,10 @@ the already-authenticated action. Never expose a generic “mint arbitrary claim
 
 `isAdmin: true` is only for custom callers of `/v1/admin/*`. Set it after the same fail-closed Slack
 admin predicate used by the UI; never copy a boolean from request input. The built-in Slack control
-path does not need this claim.
+path does not need this claim. For Enterprise Grid `/v1/admin/offboard`, also sign
+`offboardTargetUserId` from the authenticated SCIM/directory subject and require the body
+`targetUserId` to repeat that exact value. Never derive this claim from the generic request body;
+admin status alone does not authorize choosing an arbitrary global user.
 
 ## 5. Bridge the Slack experience to the worker
 
@@ -572,8 +576,9 @@ It is workspace/user-scoped; it cannot currently express per-channel custom RBAC
 
 The Bolt predicate also governs channel audit/stats and `approver: 'admin'` recipients. Automatic
 `user_change` offboarding is separate and does not ask for an interactive admin. On the headless
-surface, one signed `isAdmin` boolean currently covers configuration, channel audit, and offboarding;
-scoped headless roles are not supported.
+surface, one signed `isAdmin` boolean gates configuration, channel audit, and the offboard route;
+Enterprise Grid offboarding additionally requires the signed `offboardTargetUserId` to equal the
+body target. Scoped headless roles are not supported.
 
 Owning the Vouchr service or PostgreSQL grants infrastructure control, not Slack UI authority. An
 operator must still satisfy the Slack/admin predicate to use the built-in control surface.
@@ -701,17 +706,25 @@ process where possible.
 
 ## Failure and retry contract
 
+Typed broker egress failures include stable `code`, `retryable`, and `recovery` fields from the same
+core mapper exported by `@vouchr/core` and `@vouchr/core/headless`. Branch on those fields, never the
+legacy `error` prose. The trusted bridge still derives owner/channel/thread facts from verified Slack
+state; recovery metadata is routing guidance, not authority.
+
 | Signal | Meaning | Safe response |
 | --- | --- | --- |
-| `409 not connected` | No usable owner credential | For user ownership, run Bolt preflight/connect. For shared ownership, an eligible admin must configure the channel credential. Do not loop broker retries |
-| `403` session required | No live thread grant | Run Bolt preflight in that verified thread; current automatic cross-plane bridge is tracked by #194 |
-| `403 approval_required` | A write needs a human grant | Do not retry; the broker does not render Slack buttons. Host-owned bridge work remains under #194 |
-| policy/tool denial | Provider is not authorized here | Stop and tell the user to contact an eligible admin; never silently widen scope |
-| `429` or overload `503` | Bounded back-pressure | Honor `Retry-After`; mint a fresh assertion; retry only when the operation is safe |
-| `504` | Provider outcome may be unknown | Retry only a known-idempotent operation; never auto-replay an uncertain write |
+| `409`, code `not_connected` | No usable owner credential | Follow `recovery`: `connect` for user ownership; `fix_configuration` for shared ownership so an eligible admin configures the channel credential. Do not loop broker retries |
+| `403`, code `session_approval_required` | No live thread grant | Follow `request_approval` in that verified thread; current automatic cross-plane bridge is tracked by #194 |
+| `403`, code `approval_required` | A write needs a human grant | Stop. The headless route is enforcement-only until #194 ships a safe decision bridge; the opaque `approvalId` is not authority. Do not enable approval-gated writes on headless-only actions |
+| `policy_denied` or `tool_disabled` | Provider is not authorized here | Follow non-retryable `contact_admin`; never silently widen scope or loop retries |
+| `429` code `rate_limited` or `503` code `overloaded` | Bounded back-pressure | Only `retry_later` outcomes are retryable; honor `Retry-After`, mint a fresh assertion, and retry only when the operation is safe |
+| `504`, code `upstream_timeout`, `retryable: false` | Provider outcome may be unknown | `retry_later` describes the operator/user action, not replay permission. Retry only a known-idempotent operation; never auto-replay an uncertain write |
 | identity `401` | Bad/expired/replayed assertion or config drift | Mint once more from verified facts; repeated failure is an issuer/audience/key/clock incident |
 | `/readyz` `503` | Schema, database, or replay store unavailable | Remove the replica from traffic; `/healthz` may remain 200 by design |
-| resolver/KMS failure | Credential cannot be decrypted/resolved | Fail closed with no plaintext fallback; alert from hooks/request failures. `/readyz` may remain green |
+| code `resolver_configuration_error` | Resolver wiring/reference is missing or malformed, or the resolver fulfilled with an invalid value | Follow `fix_configuration`; fail closed with no plaintext fallback and do not loop unchanged retries. `/readyz` may remain green |
+| code `resolver_failed` | A configured resolver threw or timed out before provider egress | Follow retryable `retry_later`; never expose resolver output or failure text. `/readyz` may remain green |
+| code `token_endpoint_failed` | Refresh grant, OAuth client configuration, or token dependency failed | Follow the returned recovery: `connect` for a dead grant, `fix_configuration` for client/config rejection, or retryable `retry_later` for RFC transient codes and 408/429/5xx/network/timeout |
+| code `internal_error` | Unclassified extension/provider failure | Follow `contact_admin`; fixed wire copy reveals neither foreign message nor class name |
 
 Identity assertions are single-use. Every retry needs a new assertion even when the previous request
 was rejected before provider egress. Never use a retry response to infer that the earlier assertion
@@ -819,10 +832,10 @@ Run this proof against at least two broker replicas and one shared PostgreSQL da
 11. Prove both reference routes reject raw, malformed, mismatched-source, invalid-scope, and
     unconfigured-resolver input without creating a credential, channel mode, or audit row. Then deny
     resolver/KMS IAM and prove there is no plaintext fallback and no secret in output/audit. Cancel
-    one resolver call and prove the underlying SDK work ends; this currently exposes #209 in the
-    repository example.
-12. Drive a remote `approval_required` through the private Slack decision, denial, expiry,
-    double-click, fresh-assertion retry, and single-use grant paths required by #194.
+    one resolver call and prove the underlying SDK work ends.
+12. Prove a remote `approval_required` stops the turn, exposes no decision authority, and performs
+    no credential read or upstream I/O. Defer decision, denial, expiry, double-click, and single-use
+    bridge coverage until #194 lands the supported headless interaction bridge.
 13. Drain one broker under load, restore PostgreSQL from backup, prove #239's containment state
     prevents post-backup deletes/offboarding/replay windows from resurrecting access, and complete
     one request in every supported credential mode before returning traffic.
@@ -845,7 +858,9 @@ vision and the open blocker set above.
 - **ARN saves but egress fails:** verify the resolver is wired on the broker, region/IAM/KMS rights,
   and the secret value is the exact credential shape the provider expects.
 - **Broker returns session/approval denial with no Slack prompt:** shared storage alone does not
-  bridge UI; run Bolt preflight for sessions. The generic write-approval bridge remains #194.
+  bridge UI; run Bolt preflight for sessions. Generic write approval is enforcement-only on the
+  headless route: do not enable approval-gated headless-only actions or mutate interaction tables;
+  wait for #194's supported bridge.
 - **Identity fails only on some replicas:** compare deployment ID, issuer, active/previous key set,
   clock sync, and rollout phase across minters and every broker.
 - **OAuth succeeds but worker cannot use the connection:** compare provider IDs/config, database,

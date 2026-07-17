@@ -38,7 +38,7 @@ const HELP: Record<string, string> = {
   vouchr_egress_denied_total: 'Egress attempts rejected by an allowlist/policy gate.',
   vouchr_egress_error_total: 'Upstream failures (network throw or refresh throw) on an allowed target.',
   vouchr_rate_limited_total: 'Requests refused by the per-(owner, provider) rate limit before any secret was read.',
-  vouchr_resolver_failed_total: 'External secret-manager resolver failures.',
+  vouchr_resolver_failed_total: 'Configured external resolver throws or Vouchr-owned deadlines.',
   vouchr_connect_prompted_total: 'Connect prompts shown to a user.',
   vouchr_connected_total: 'Successful provider connections.',
   vouchr_policy_denied_total: 'Requests denied by policy.',

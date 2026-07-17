@@ -1,18 +1,34 @@
-import { hasAmbiguousPathEncoding, isLoopbackHost, type Provider } from './providers';
+import { canonicalMethod, hasAmbiguousPathEncoding, isLoopbackHost, type Provider } from './providers';
 import type { Vault, StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
+import type { Db } from './db';
 import type { Audit, AuditSink, VouchrAuditEvent } from './audit';
 import { refreshToken, TokenEndpointError } from './tokens';
 import { DryRunVaultError, dryRunEcho } from './dryRun';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
 import { safeEmit } from './safe-emit';
 import type { CredentialHealthHook } from './health';
-import { ApprovalRequiredError, queryDigest, type Approvals } from './approval';
+import {
+  approvalActionFingerprint,
+  ApprovalPathTooLongError,
+  ApprovalRequiredError,
+  queryDigest,
+  type ApprovalKey,
+  type Approvals,
+  MAX_APPROVAL_PATH_BYTES,
+} from './approval';
 import { randomUUID } from 'node:crypto';
-import { awaitWithSignal, disposableDeadline, responseWithCleanup } from './httpBounds';
+import {
+  awaitWithSignal,
+  disposableDeadline,
+  isVouchrDeadlineReason,
+  responseWithCleanup,
+  UpstreamTimeoutError,
+} from './httpBounds';
 import { MAX_TIMER_MS } from './options';
 import { assertStoredSecretReference } from './reference';
+import { InteractionStateChangedError } from './interaction';
 
 /** Resolves an external secret-manager reference to a secret, just-in-time. Operator-provided.
  * Existing one-argument resolvers remain compatible; implementations should use the optional signal
@@ -58,6 +74,8 @@ export type VouchrEvent =
   | { type: 'approval_requested'; provider: string; host: string }
   | { type: 'approval_approved'; provider: string; host: string }
   | { type: 'approval_denied'; provider: string; host: string }
+  // A configured resolver threw or hit Vouchr's deadline before provider egress. Configuration and
+  // resolver-contract failures deliberately do not emit this retryable-outage signal.
   | { type: 'resolver_failed'; provider: string; source: string }
   | { type: 'connect_prompted'; provider: string }
   | { type: 'connected'; provider: string }
@@ -90,6 +108,8 @@ export type EventSink = (e: VouchrEvent) => void;
  * this is purely additive typing so the broker can switch its regex to an `instanceof` check.
  */
 export class EgressBlockedError extends Error {
+  readonly code = 'egress_blocked' as const;
+
   constructor(message: string) {
     super(message);
     this.name = 'EgressBlockedError';
@@ -98,15 +118,35 @@ export class EgressBlockedError extends Error {
 
 /** No stored credential for this owner+provider. The broker maps this to 409. Message TEXT preserved. */
 export class NoConnectionError extends Error {
-  constructor(message: string) {
+  readonly code = 'not_connected' as const;
+
+  constructor(
+    message: string,
+    /** Credential ownership determines whether recovery is personal connect or channel config. */
+    public readonly owner?: Owner['kind'],
+  ) {
     super(message);
     this.name = 'NoConnectionError';
   }
 }
 
-/** External secret resolution failed. Fixed text prevents a custom resolver from reflecting
- * credential material, references, or provider SDK errors through direct handles or adapters. */
+/** External secret resolution is misconfigured (missing resolver/reference, malformed stored
+ * reference, or invalid fulfilled output). Retrying cannot repair it; an operator must fix the
+ * deployment, stored row, or resolver implementation. */
+export class ResolverConfigurationError extends Error {
+  readonly code = 'resolver_configuration_error' as const;
+
+  constructor() {
+    super('External credential resolver is not configured correctly.');
+    this.name = 'ResolverConfigurationError';
+  }
+}
+
+/** A configured resolver failed at runtime before any provider request was made. Fixed text prevents
+ * a custom resolver from reflecting credential material, references, or SDK errors through callers. */
 export class ResolverFailedError extends Error {
+  readonly code = 'resolver_failed' as const;
+
   constructor() {
     super('External credential resolution failed.');
     this.name = 'ResolverFailedError';
@@ -117,10 +157,12 @@ export class ResolverFailedError extends Error {
  * The provider's RESPONSE violated a structural constraint (provider.egressResponse) — disallowed
  * content-type or an over-cap body — and was withheld from the caller. Unlike EgressBlockedError
  * this is thrown AFTER the request went out; the body is never returned, not even partially. The
- * message is Vouchr-authored and secret-free (safe for safeUserMessage); the broker maps this to
- * 413 (size) / 502 (content_type).
+ * core safe mapper derives fixed copy from the typed reason rather than trusting constructor text;
+ * the broker maps this to 413 (size) / 502 (content_type).
  */
 export class ResponseBlockedError extends Error {
+  readonly code = 'response_blocked' as const;
+
   constructor(
     message: string,
     public reason: 'content_type' | 'size',
@@ -197,10 +239,10 @@ interface RefreshFlight {
  * every waiter is gone; one cancelled caller must not break a still-live peer request. */
 const refreshFlights = new WeakMap<Promise<string | null>, RefreshFlight>();
 
-/** HTTP methods safe to auto-replay after a 401-triggered token refresh: side-effect-free or
- *  idempotent per RFC 9110. A non-idempotent write (POST/PATCH, or any unknown method) is NEVER
- *  auto-replayed — a provider may have applied it before returning 401 (#209). */
-const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'TRACE', 'PUT', 'DELETE']);
+/** Fetch-supported HTTP methods safe to auto-replay after a 401-triggered token refresh:
+ * side-effect-free or idempotent per RFC 9110. A non-idempotent write (POST/PATCH, or any unknown
+ * method) is NEVER auto-replayed — a provider may have applied it before returning 401 (#209). */
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']);
 function isIdempotentMethod(method: string): boolean {
   return IDEMPOTENT_METHODS.has(method);
 }
@@ -251,6 +293,21 @@ export class ConnectionHandle {
     // Optional transport ceiling (the HTTP /v1/fetch envelope cap). Enforced at the injector's FIRST
     // body read so a larger provider egressResponse.maxBytes cannot buffer past the transport bound.
     private transportResponseMaxBytes?: number,
+    // Exact connection generation selected when this handle was created (or lazily on first use for
+    // legacy/direct callers). Every read, refresh write, and touch is scoped to this id: reconnecting
+    // replaces the row id and can never make an old handle observe or mutate the replacement.
+    private credentialId?: string,
+    // Revalidates channel governance under the same channel/credential locks used to create a
+    // pending approval. Without it, a writer could purge then pause while stale demand reinserts.
+    private approvalRequestValid?: (
+      key: ApprovalKey,
+      tx: Db,
+      locked: Pick<Vault, 'liveId'>,
+    ) => Promise<boolean>,
+    // Bolt handles may outlive the channel governance state that created them. Recheck exact
+    // credential/mode/owner/policy/tool/session state before any authority is spent and again at
+    // each provider send. Headless requests construct a fresh handle after resolving those facts.
+    private useStillValid?: () => Promise<boolean>,
   ) {
     if (!Number.isSafeInteger(fetchDeadlineMs) || fetchDeadlineMs <= 0 || fetchDeadlineMs > MAX_TIMER_MS) {
       throw new Error(`ConnectionHandle: fetchDeadlineMs must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
@@ -265,6 +322,35 @@ export class ConnectionHandle {
    *  the rate-limit buckets key on the same fact. */
   private ownerKey(): string {
     return `${this.owner.teamId}:${this.owner.kind}:${this.owner.id}:${this.provider.id}`;
+  }
+
+  /** Refresh single-flight identity includes the exact row generation. A rotation for generation A
+   * can never be shared with a handle bound to replacement B. Called only after bindCredential(). */
+  private refreshKey(): string {
+    return `${this.ownerKey()}:${this.credentialId ?? 'unbound'}`;
+  }
+
+  /** Pin an unbound direct/headless handle to the current live connection without decrypting it. */
+  private async bindCredential(): Promise<string> {
+    const id = await this.vault.liveId(this.owner, this.provider.id);
+    if (!id) {
+      throw new NoConnectionError(`No connection for provider "${this.provider.id}"`, this.owner.kind);
+    }
+    if (this.credentialId !== undefined && id !== this.credentialId) {
+      throw new InteractionStateChangedError('connection', 'credential');
+    }
+    this.credentialId = id;
+    return id;
+  }
+
+  /** Preserve the distinction between a truly absent exact row and a reconnect that replaced the
+   * generation after an earlier validation. Never adopt the replacement credential. */
+  private async exactCredentialMissingError(vault: Pick<Vault, 'liveId'> = this.vault): Promise<Error> {
+    const live = await vault.liveId(this.owner, this.provider.id);
+    if (this.credentialId !== undefined && live && live !== this.credentialId) {
+      return new InteractionStateChangedError('connection', 'credential');
+    }
+    return new NoConnectionError(`No connection for provider "${this.provider.id}"`, this.owner.kind);
   }
 
   /** The channel an injection is attributed to in the audit log: the explicit origin channel when known,
@@ -409,7 +495,7 @@ export class ConnectionHandle {
     } catch (e) {
       // Caller cancellation/deadline is not a provider outage. It already has a stable transport
       // outcome; do not write a false refresh_failed audit/event for it.
-      if (signal?.aborted) throw e;
+      if (signal?.aborted || e instanceof NoConnectionError) throw e;
       await this.egressError(new URL(this.provider.tokenUrl).hostname, 'refresh_failed');
       throw e;
     }
@@ -434,12 +520,33 @@ export class ConnectionHandle {
   }
 
   async account(): Promise<string | null> {
-    return (await this.vault.get(this.owner, this.provider.id))?.externalAccount ?? null;
+    if (this.useStillValid && !(await this.useStillValid())) {
+      throw new InteractionStateChangedError('connection', 'authorization');
+    }
+    const id = this.credentialId ?? await this.vault.liveId(this.owner, this.provider.id);
+    if (!id) return null;
+    this.credentialId = id;
+    const account = await this.vault.getAccount(this.owner, this.provider.id, id);
+    if (!account) {
+      const live = await this.vault.liveId(this.owner, this.provider.id);
+      if (live && live !== id) throw new InteractionStateChangedError('connection', 'credential');
+      return null;
+    }
+    // A writer may have committed between the first validation and metadata read. The second check
+    // gives the read a valid linearization point without ever decrypting the credential.
+    if (this.useStillValid && !(await this.useStillValid())) {
+      throw new InteractionStateChangedError('connection', 'authorization');
+    }
+    return account.externalAccount;
   }
 
   async fetch(input: string, init: RequestInit = {}): Promise<Response> {
+    // Validate the raw caller value before any mutable gate (rate budget, approval/audit rows,
+    // credential metadata/read, or Slack prompt). The same canonical spelling drives every policy
+    // decision and is explicitly forwarded at the network edge below.
+    const method = canonicalMethod(init.method ?? 'GET');
+    if (!method) throw new TypeError('Invalid HTTP method.');
     const url = new URL(input);
-    const method = (init.method ?? 'GET').toUpperCase();
     if (url.username || url.password) {
       await this.denyEgress(url.hostname, 'host', `Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
     }
@@ -475,8 +582,22 @@ export class ConnectionHandle {
     if (this.provider.egressMethods && !this.provider.egressMethods.some((m) => m.toUpperCase() === method)) {
       await this.denyEgress(url.hostname, 'method', `Egress blocked: method "${method}" is not allowed for provider "${this.provider.id}"`);
     }
-    if (this.provider.egressValidate && !this.provider.egressValidate(url, init)) {
+    if (this.provider.egressValidate && !this.provider.egressValidate(url, { ...init, method })) {
       await this.denyEgress(url.hostname, 'validator', `Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
+    }
+
+    const approval = this.provider.approval;
+    const requiresApproval = !!approval && approvalNeeded(approval, method, url.pathname);
+    // Bound caller-controlled persistence/hash work before any mutable gate (rate budget, lifecycle
+    // locks, approval rows/audit, or credential reads). The error is fixed and contains no path.
+    if (requiresApproval && Buffer.byteLength(url.pathname, 'utf8') > MAX_APPROVAL_PATH_BYTES) {
+      throw new ApprovalPathTooLongError();
+    }
+
+    // A retained channel handle may outlive its mode/tool/session/credential authority. Revalidate
+    // before any stateful gate so stale use cannot spend another caller's rate budget or approval.
+    if (this.useStillValid && !(await this.useStillValid())) {
+      throw new InteractionStateChangedError('connection', 'authorization');
     }
 
     // Per-(owner, provider) throttle (provider.rateLimit) — checked AFTER the egress gates (a denied
@@ -495,6 +616,10 @@ export class ConnectionHandle {
       }
     }
 
+    // Bind authority to the exact live row before approval/session state is consulted. This is a
+    // metadata-only read; the credential remains encrypted until every gate below has passed.
+    const credentialId = await this.bindCredential();
+
     // #113 human-in-the-loop approval (provider.approval): an ADDITIONAL gate, never a bypass —
     // checked strictly AFTER every egress gate and the throttle above (an egress-denied or
     // rate-limited target never mints a prompt) and BEFORE the vault read below, so an unapproved
@@ -506,8 +631,8 @@ export class ConnectionHandle {
     // against a credential the human didn't approve: consume() runs BEFORE the vault read, so a
     // born-orphan grant just falls through to NoConnectionError below with zero injection, and any
     // (re)connect purges stale grants via the vault upsert before the new credential is usable.
-    const ap = this.provider.approval;
-    if (ap && approvalNeeded(ap, method, url.pathname)) {
+    const ap = approval;
+    if (ap && requiresApproval) {
       if (!this.approvals) {
         // Fail closed (STR-5): a provider that declares `approval` on a deployment that never wired
         // the store must hard-fail, not silently skip the gate. A wiring bug, and it says so.
@@ -525,37 +650,54 @@ export class ConnectionHandle {
       // construction. Audit still attributes to `acting` + the approver (below).
       const key = {
         teamId: this.acting.teamId, userId: this.acting.userId,
-        ownerKind: this.owner.kind, ownerId: this.owner.id, provider: this.provider.id,
+        ownerKind: this.owner.kind, ownerId: this.owner.id, credentialId, provider: this.provider.id,
         // queryHash (GHSA-pg84): the grant binds the exact query string sent upstream, as a
         // digest — a retry with ANY textual change to the query re-prompts instead of spending
         // the human's approval.
-        method, host: url.hostname, path: url.pathname, queryHash: queryDigest(url.search),
+        method, origin: url.origin, host: url.hostname, path: url.pathname,
+        queryHash: queryDigest(url.search),
         channel: this.auditChannel(), thread: this.thread,
       };
-      const grant = await this.approvals.consume(key);
-      const apCh = this.auditChannel();
-      const apChannelMeta = apCh ? { channel: apCh } : {};
-      // Meta carries method + hostname + pathname only — never the body or any query value (SEC-1).
-      const apMeta = { host: url.hostname, method, path: url.pathname, ...apChannelMeta };
+      const grant = await this.approvals.consumeAudited(
+        key,
+        this.audit,
+        this.acting,
+        this.vault,
+        this.approvalRequestValid,
+      );
       if (!grant) {
-        const approvalId = await this.approvals.request(key);
-        this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
-        await this.audit.record('approval_requested', this.acting, this.provider.id, apMeta);
+        const pending = await this.approvals.requestAudited(
+          key,
+          this.audit,
+          this.acting,
+          this.vault,
+          this.approvalRequestValid,
+        );
+        if (pending.created) {
+          this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
+        }
         // Only the parameter COUNT rides the error for the prompt display (GHSA-pg84): names are
         // as caller-controlled as values and must not reach Slack or logs (SEC-1). The exact
         // query is bound via the digest in the key above.
-        throw new ApprovalRequiredError(this.provider.id, ap.approver, method, url.hostname, url.pathname, approvalId,
-          [...url.searchParams.keys()].length);
+        throw new ApprovalRequiredError(
+          this.provider.id,
+          ap.approver,
+          method,
+          url.hostname,
+          approvalActionFingerprint(key),
+          pending.id,
+          [...url.searchParams.keys()].length,
+          pending.created,
+        );
       }
-      // The grant is spent exactly once, right here — so the trail records the consumption even if
-      // the upstream call later fails. The approver's identity rides the actor column (STR-4).
-      await this.audit.record('approval_consumed', this.acting, this.provider.id, apMeta, grant.approvedBy ?? undefined);
+      // The grant was spent exactly once together with its audit row above. If audit insertion
+      // failed the transaction rolled back and execution stopped before any credential read.
     }
 
     // Count real KMS/envelope DEK unwraps incurred reading this credential (0 on the legacy path).
     let kms = 0;
-    const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; });
-    if (!cred) throw new NoConnectionError(`No connection for provider "${this.provider.id}"`);
+    const cred = await this.vault.get(this.owner, this.provider.id, () => { kms++; }, credentialId);
+    if (!cred) throw await this.exactCredentialMissingError();
     if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms });
     // #116 dry-run per-request rail: the startup vault check only sees rows that exist at boot —
     // a REAL row written afterward (a seeder, a sibling production process on the same database)
@@ -573,8 +715,26 @@ export class ConnectionHandle {
     let responseHandedOff = false;
     try {
       deadline.signal.throwIfAborted();
-      let token = vaulted ? await this.vaultToken(cred, deadline.signal) : await this.resolveRef(cred, deadline.signal);
+      let token: string;
+      if (vaulted) {
+        try {
+          token = await this.vaultToken(cred, deadline.signal);
+        } catch (error) {
+          if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+            throw new UpstreamTimeoutError();
+          }
+          throw error;
+        }
+      } else {
+        token = await this.resolveRef(cred, deadline.signal, deadline.timedOut);
+      }
       const send = async (t: string) => {
+      // Recheck at the actual egress boundary too. The early check above prevents an invalid
+      // retained handle from consuming a generic approval; this late check prevents governance or
+      // session expiry during credential/approval work from reaching the provider.
+      if (this.useStillValid && !(await this.useStillValid())) {
+        throw new InteractionStateChangedError('connection', 'authorization');
+      }
       // #116 dry-run: the outbound-fetch edge, stubbed at the exact point the network call would
       // happen — every gate above (egress, rate limit, vault read) has already run. Returned BEFORE
       // the production inject so the provider's inject hook runs EXACTLY ONCE (inside dryRunEcho,
@@ -589,9 +749,12 @@ export class ConnectionHandle {
         // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
         // The composed signal covers headers + the still-streaming body, proactive/401 refresh, and
         // client cancellation. It is disposed when the returned body finishes/cancels (below).
-        return await fetch(input, { ...init, headers, redirect: 'manual', signal: deadline.signal });
+        return await fetch(input, { ...init, method, headers, redirect: 'manual', signal: deadline.signal });
       } catch (e) {
-        if (deadline.signal.aborted) throw e; // cancellation/timeout is not a provider-outage event
+        if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+          throw new UpstreamTimeoutError();
+        }
+        if (deadline.signal.aborted) throw e; // caller cancellation/timeout keeps its original reason
         // Network-level throw (DNS/connection refused): fire the no-secret failure signal, then re-throw
         // so the broker still maps it to 502 — the signal is emitted, not swallowed.
         await this.egressError(url.hostname, 'fetch_failed');
@@ -611,6 +774,9 @@ export class ConnectionHandle {
         // unread body until GC. Best-effort: cancelling must never mask the refresh error. (Not a
         // finally: when the refresh yields nothing the 401 itself is returned, body intact.)
         res.body?.cancel().catch(() => undefined);
+        if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+          throw new UpstreamTimeoutError();
+        }
         throw e;
       }
       // #209: the refresh runs so the NEXT request carries a live token, but the failed request is
@@ -628,7 +794,7 @@ export class ConnectionHandle {
     // Mark the connection used (resets its idle TTL) and audit AS THE ACTING HUMAN, never the secret.
     // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
     // failed fetch (the caller might retry a non-idempotent request).
-    await this.vault.touch(this.owner, this.provider.id).catch(() => undefined);
+    await this.vault.touch(this.owner, this.provider.id, credentialId).catch(() => undefined);
     // Attribute the injection to the channel it happened in (origin channel, or the owning channel for a
     // channel-owned cred). Powers per-channel usage analytics across ALL modes, not just shared.
     const ch = this.auditChannel();
@@ -649,8 +815,22 @@ export class ConnectionHandle {
     // strip: enforced HERE, after the outbound call is booked (the call DID happen — its inject
     // audit/event stay truthful) and before the Response is handed back, so both doors (Bolt
     // handle + HTTP broker) inherit them. A breach throws; the caller never sees a partial body.
-      const guarded = await this.guardResponse(res, url.hostname);
-      const response = responseWithCleanup(guarded, deadline.dispose);
+      let guarded: Response;
+      try {
+        guarded = await this.guardResponse(res, url.hostname);
+      } catch (error) {
+        if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
+          throw new UpstreamTimeoutError();
+        }
+        throw error;
+      }
+      const response = responseWithCleanup(
+        guarded,
+        deadline.dispose,
+        (error) => deadline.timedOut() || isVouchrDeadlineReason(error)
+          ? new UpstreamTimeoutError()
+          : error,
+      );
       responseHandedOff = true;
       return response;
     } finally {
@@ -659,27 +839,46 @@ export class ConnectionHandle {
   }
 
   /** Resolve an external-ref secret JIT. Never persisted, never cached, never logged. */
-  private async resolveRef(cred: StoredCredential, signal: AbortSignal): Promise<string> {
+  private async resolveRef(
+    cred: StoredCredential,
+    signal: AbortSignal,
+    deadlineTimedOut: () => boolean,
+  ): Promise<string> {
     const resolver = this.resolvers[cred.source];
     if (!resolver) {
-      throw new ResolverFailedError();
+      throw new ResolverConfigurationError();
     }
     if (!cred.secretRef) {
-      throw new ResolverFailedError();
+      throw new ResolverConfigurationError();
     }
+    // Public configuration validates before write, but legacy rows may predate that boundary.
+    // Keep malformed/configuration state distinct from a configured resolver's runtime outage.
     try {
-      // Public configuration now validates before write, but legacy rows may predate that boundary.
-      // Recheck before resolver I/O and normalize any malformed stored row to the same fixed
-      // resolver failure contract as a runtime secret-manager error.
       assertStoredSecretReference(cred.source, cred.secretRef);
+    } catch {
+      throw new ResolverConfigurationError();
+    }
+    let secret: unknown;
+    try {
       // Pass cancellation to cooperative resolvers, but also race it here: an older/custom resolver
       // may ignore the optional signal and must not pin admission slots beyond the request deadline.
-      return await awaitWithSignal(resolver(cred.secretRef, signal), signal);
+      secret = await awaitWithSignal(resolver(cred.secretRef, signal), signal);
     } catch (e) {
-      if (signal.aborted) throw e;
+      // Caller-owned cancellation, including AbortSignal.timeout(), keeps its original reason.
+      // Only this handle's own deadline is a resolver outage before provider egress.
+      if (signal.aborted && !deadlineTimedOut() && !isVouchrDeadlineReason(signal.reason)) {
+        throw e;
+      }
       this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
       throw new ResolverFailedError();
     }
+    // TypeScript resolvers promise strings, but JavaScript/custom implementations can fulfill any
+    // value. Refuse undefined, non-strings, and empty strings before injection; never stringify or
+    // reflect the value because it may itself contain credential material.
+    if (typeof secret !== 'string' || secret.length === 0) {
+      throw new ResolverConfigurationError();
+    }
+    return secret;
   }
 
   private async vaultToken(cred: StoredCredential, signal?: AbortSignal): Promise<string> {
@@ -697,7 +896,7 @@ export class ConnectionHandle {
   // Each caller can still cancel its own wait; the underlying refresh is aborted only after ALL live
   // waiters cancel, so one disconnected request cannot break a peer sharing the rotation.
   private async refreshAndStore(signal?: AbortSignal): Promise<string | null> {
-    const key = this.ownerKey();
+    const key = this.refreshKey();
     let p = this.inflight.get(key);
     if (!p) {
       const controller = new AbortController();
@@ -755,8 +954,13 @@ export class ConnectionHandle {
     const emitKms = () => { if (kms) this.emit({ type: 'kms_decrypt', provider: this.provider.id, count: kms }); };
     // The refresh token we're about to consume. On Postgres a peer pod may rotate it while we wait
     // for the lock; we detect that by re-reading under the lock and comparing against this value.
-    const before = await this.vault.get(this.owner, this.provider.id, onDecrypt);
-    if (!before?.refreshToken) { emitKms(); return null; }
+    const credentialId = await this.bindCredential();
+    const before = await this.vault.get(this.owner, this.provider.id, onDecrypt, credentialId);
+    if (!before) {
+      emitKms();
+      throw await this.exactCredentialMissingError();
+    }
+    if (!before.refreshToken) { emitKms(); return null; }
     // #116 dry-run: the refresh edge is a REAL /token network call — never make it. All refresh
     // triggers funnel through here (near-expiry in vaultToken, retry-on-401), so this one gate
     // covers e.g. a seeded dry-run row carrying a refreshToken + near expiresAt. The synthetic
@@ -773,10 +977,11 @@ export class ConnectionHandle {
     let refreshMs = 0; // #27 timing, captured in-lock but emitted post-commit with the 'refreshed' event
     const token = await this.vault.withRefreshLock(this.owner, this.provider.id, async (vault) => {
       // Re-read UNDER the lock: another tx may already have rotated since the read above.
-      const stored = await vault.get(this.owner, this.provider.id, onDecrypt);
+      const stored = await vault.get(this.owner, this.provider.id, onDecrypt, credentialId);
       emitKms(); // both reads done — report total unwraps once for this refresh
       const waitMs = Date.now() - t0;
-      if (!stored?.refreshToken) return null;
+      if (!stored) throw await this.exactCredentialMissingError(vault);
+      if (!stored.refreshToken) return null;
       // Loser path: the stored refresh token moved, so a concurrent winner already refreshed. Reuse
       // its access token — refreshing again would consume a token the winner invalidated (rotating
       // providers brick on a double refresh).
@@ -788,12 +993,15 @@ export class ConnectionHandle {
       const r0 = Date.now();
       const refreshed = await refreshToken(this.provider, stored.refreshToken, signal);
       // updateTokens, not upsert: refresh must not reset created_at (max-age TTL).
-      await vault.updateTokens(this.owner, this.provider.id, {
+      const storedUpdate = await vault.updateTokens(this.owner, this.provider.id, {
         accessToken: refreshed.accessToken,
         refreshToken: refreshed.refreshToken ?? stored.refreshToken,
         scopes: refreshed.scopes ?? stored.scopes,
         expiresAt: refreshed.expiresAt,
-      });
+      }, credentialId);
+      if (!storedUpdate) {
+        throw await this.exactCredentialMissingError(vault);
+      }
       rotated = true;
       refreshMs = Date.now() - r0;
       return refreshed.accessToken;
@@ -804,7 +1012,8 @@ export class ConnectionHandle {
       // released the advisory lock, mirroring the post-commit audit placement below: a hook must
       // never run inside the lock. The instanceof gate also means a rollback for any OTHER reason
       // (a DB write failure after a successful /token call, a lock timeout) never claims the token
-      // is dead, and transient failures (network throw, 5xx, timeout) never fire. safeEmit swallows
+      // is dead, and configuration/transient failures (invalid_client, network, 5xx, timeout) never
+      // fire. safeEmit swallows
       // a throwing hook; the original error always re-throws unchanged.
       if (e instanceof TokenEndpointError && e.definitive) {
         safeEmit(this.health, { type: 'refresh_dead', owner: this.owner, provider: this.provider.id });

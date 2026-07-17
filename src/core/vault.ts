@@ -3,7 +3,22 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
-import { STATE_TTL_MS } from './consent';
+import { purgeSessionsForOwner } from './session';
+import {
+  InteractionStateChangedError,
+  isInteractionId,
+  POSTGRES_NOW_MS_SQL,
+  purgeChannelInteractionState,
+} from './interaction';
+import {
+  latestProvisioningRevocationTombstone,
+  latestUserOffboardTombstone,
+  markProvisioningRevoked,
+  tombstoneBlocks,
+  withProvisioningRevocationLock,
+  withUserInteractionFence,
+  withUserProvisioningLock,
+} from './consent';
 import { seal, open, toBuffer, toKeyring, type EnvelopeProvider, type MasterKeys } from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
@@ -13,6 +28,37 @@ export interface StoredToken {
   scopes: string;
   expiresAt: number | null;
   externalAccount: string | null;
+}
+
+/** A user-provisioning intent is either a trusted server timestamp or an atomic resolver that
+ * consumes a persisted opaque request inside the credential transaction. */
+export interface UserProvisioningGate {
+  issuedAt: number;
+  /** Slack key-setup prompts are issued only for an absent live credential. Reassert that predicate
+   * under the final credential lock so a delayed modal cannot overwrite a sibling write. */
+  requireAbsent: true;
+}
+export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | UserProvisioningGate | null>);
+export type UserProvisioningResult = 'stored' | 'stale' | 'offboarded' | 'revoked' | 'conflict';
+
+const PREPARE_VAULT_CREDENTIAL_WRITE = Symbol('prepare-vault-credential-write');
+const BIND_VAULT_EXPIRY_TRANSACTION = Symbol('bind-vault-expiry-transaction');
+export type PreparedVaultCredentialWrite = (
+  tx: Db,
+  owner: Owner,
+  provider: string,
+) => Promise<void>;
+
+interface VaultExpiryTransaction {
+  listExpired(): Promise<{ owner: Owner; provider: string }[]>;
+  deleteExpired(owner: Owner, provider: string): Promise<boolean>;
+  listExpiringSoon(withinMs: number): Promise<{ owner: Owner; provider: string; expiresAt: number }[]>;
+}
+
+/** Canonical PostgreSQL advisory-lock key for one credential lifecycle. Kept beside Vault so every
+ * mutation, including break-glass pending-authority purge, orders on the exact same key. */
+export function credentialLockKey(owner: Owner, provider: string): string {
+  return `${owner.teamId}:${owner.kind}:${owner.id}:${provider}`;
 }
 
 /**
@@ -49,6 +95,11 @@ export interface TtlPolicy {
 
 /** Encrypted credential store, keyed by the owning principal (user OR channel). */
 export class Vault {
+  /** Set only on the transaction-bound facade created by withCredentialLocks. Deletion through
+   * that facade already rolls satellite cleanup back with its outer mutation, so it must not try
+   * to establish a provisioning marker while holding the credential lock. */
+  private credentialLockHeld = false;
+
   constructor(
     private db: Db,
     // A bare Buffer is the single id-less master key (today's deploys); a Keyring (#115) adds
@@ -72,8 +123,14 @@ export class Vault {
    * `onDecrypt` (optional) fires once per real KMS/envelope DEK unwrap, so a caller can meter
    * decrypt volume without the vault holding an event sink. No-op on the legacy direct path.
    */
-  async get(owner: Owner, provider: string, onDecrypt?: () => void): Promise<StoredCredential | null> {
-    const row = await this.fetchRow(owner, provider);
+  async get(
+    owner: Owner,
+    provider: string,
+    onDecrypt?: () => void,
+    expectedId?: string,
+  ): Promise<StoredCredential | null> {
+    if (expectedId !== undefined && !isInteractionId(expectedId)) return null;
+    const row = await this.fetchRow(owner, provider, expectedId);
     if (!row) return null;
     if (this.isExpired(row.created_at, row.last_used_at ?? row.created_at)) return null;
     return this.decode(row, onDecrypt);
@@ -104,10 +161,55 @@ export class Vault {
     return row != null;
   }
 
-  private async fetchRow(owner: Owner, provider: string): Promise<any> {
-    return this.db.get(
-      `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
+  /** Metadata-only live existence check for control-flow gates that must run before any credential
+   *  decrypt (for example session approval). Uses the same TTL predicate as get(). */
+  async hasLive(owner: Owner, provider: string): Promise<boolean> {
+    return (await this.liveId(owner, provider)) !== null;
+  }
+
+  /** Metadata-only current credential generation. Reconnect/reconfiguration writes a fresh row id;
+   * approvals, sessions, and handles bind to it so authority for generation A can never read B. */
+  async liveId(owner: Owner, provider: string): Promise<string | null> {
+    const row = await this.db.get<{ id: string; created_at: number; last_used_at: number | null }>(
+      `SELECT id, created_at, last_used_at FROM connection
+       WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
       [owner.teamId, owner.kind, owner.id, provider],
+    );
+    return row && !this.isExpired(row.created_at, row.last_used_at ?? row.created_at) ? row.id : null;
+  }
+
+  /** TTL-aware, metadata-only account label for one exact connection generation. Account display
+   * must not decrypt token material (or invoke KMS) merely to render non-secret identity metadata. */
+  async getAccount(
+    owner: Owner,
+    provider: string,
+    expectedId?: string,
+  ): Promise<{ externalAccount: string | null } | null> {
+    if (expectedId !== undefined && !isInteractionId(expectedId)) return null;
+    const exact = expectedId !== undefined;
+    const row = await this.db.get<{
+      external_account: string | null;
+      created_at: number;
+      last_used_at: number | null;
+    }>(
+      `SELECT external_account, created_at, last_used_at FROM connection
+       WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?${exact ? ' AND id=?' : ''}`,
+      exact
+        ? [owner.teamId, owner.kind, owner.id, provider, expectedId]
+        : [owner.teamId, owner.kind, owner.id, provider],
+    );
+    if (!row || this.isExpired(row.created_at, row.last_used_at ?? row.created_at)) return null;
+    return { externalAccount: row.external_account };
+  }
+
+  private async fetchRow(owner: Owner, provider: string, expectedId?: string): Promise<any> {
+    if (expectedId !== undefined && !isInteractionId(expectedId)) return undefined;
+    const exact = expectedId !== undefined;
+    return this.db.get(
+      `SELECT * FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?${exact ? ' AND id=?' : ''}`,
+      exact
+        ? [owner.teamId, owner.kind, owner.id, provider, expectedId]
+        : [owner.teamId, owner.kind, owner.id, provider],
     );
   }
 
@@ -138,6 +240,10 @@ export class Vault {
    * so it must not outlive a delete (disconnect / offboard / bulk-revoke / TTL-expiry all route
    * through delete()) nor be spent after a reconnect/reconfiguration (upsert/reference). updateTokens
    * again does NOT purge — a silent refresh keeps the same connection, so a live grant stays valid.
+   *
+   * User- and channel-provisioning requests are credential satellites too. A successful write or
+   * delete spends every sibling setup prompt for that owner/provider, so an older modal cannot
+   * overwrite a newer credential or recreate one after disconnect.
    */
   private async clearSatellites(db: Db, owner: Owner, provider: string): Promise<void> {
     await db.run(
@@ -145,6 +251,15 @@ export class Vault {
       [owner.teamId, owner.kind, owner.id, provider],
     );
     await purgeApprovalsForOwner(db, owner, provider);
+    await purgeSessionsForOwner(db, owner, provider);
+    if (owner.kind === 'user') {
+      await db.run(
+        `DELETE FROM user_provisioning_request WHERE team_id=? AND user_id=? AND provider=?`,
+        [owner.teamId, owner.id, provider],
+      );
+    } else {
+      await purgeChannelInteractionState(db, owner.teamId, owner.id, provider);
+    }
   }
 
   /** Connection write/delete + its satellite purge are ONE logical mutation: run them in one
@@ -172,6 +287,7 @@ export class Vault {
   private async claimDelete(
     owner: Owner,
     provider: string,
+    expectedId?: string,
   ): Promise<{
     id: string;
     access_token_enc: unknown;
@@ -179,11 +295,20 @@ export class Vault {
     secret_ref: string | null;
     dry_run: unknown;
   } | null> {
+    if (expectedId !== undefined && !isInteractionId(expectedId)) {
+      throw new Error('invalid expected credential generation');
+    }
     const returning = 'RETURNING id, access_token_enc, refresh_token_enc, secret_ref, dry_run';
     const sql = `DELETE FROM connection
-      WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?
+      WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?${expectedId !== undefined ? ' AND id=?' : ''}
       ${returning}`;
-    const params = [owner.teamId, owner.kind, owner.id, provider];
+    const params = [
+      owner.teamId,
+      owner.kind,
+      owner.id,
+      provider,
+      ...(expectedId !== undefined ? [expectedId] : []),
+    ];
     let claimed: {
       id: string;
       access_token_enc: unknown;
@@ -192,7 +317,7 @@ export class Vault {
       dry_run: unknown;
     } | null | undefined;
     try {
-      return await this.mutation(async (tx) => {
+      return await this.withCredentialLock(owner, provider, async (_locked, tx) => {
         claimed = (await tx.get(sql, params)) ?? null;
         if (claimed) await this.clearSatellites(tx, owner, provider);
         return claimed;
@@ -204,22 +329,197 @@ export class Vault {
       // Current reconnects write a fresh row-generation id; the ciphertext/reference fingerprint
       // also protects rolling overlap with an older writer that preserved id. Bind the fallback to
       // the exact row whose transaction rolled back, never a newer reconnect or refresh.
-      const retry = claimed
-        ? (await this.db.get(
+      const original = claimed;
+      const retry = original
+        ? await this.withCredentialLock(owner, provider, async (_locked, tx) => (
+          await tx.get(
             `DELETE FROM connection
              WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND id=?
                AND access_token_enc IS NOT DISTINCT FROM ?
                AND refresh_token_enc IS NOT DISTINCT FROM ?
                AND secret_ref IS NOT DISTINCT FROM ?
              ${returning}`,
-            [...params, claimed.id, claimed.access_token_enc, claimed.refresh_token_enc, claimed.secret_ref],
-          )) ?? null
+            [...params, original.id, original.access_token_enc, original.refresh_token_enc, original.secret_ref],
+          )
+        ) ?? null)
         : null;
       // Without a real transaction, the first DELETE was already committed before cleanup failed.
       if (retry) return retry;
       if (!this.db.transaction) return claimed;
       throw new Error('credential deletion could not be confirmed after cleanup failure; retry');
     }
+  }
+
+  /** Establish a durable exact-owner provisioning fence before an ordinary delete. The marker's
+   * short transaction releases its scope lock before claimDelete takes the credential lock: an old
+   * writer either commits first and is then deleted, or observes this marker and refuses. If the
+   * marker fails, still attempt the local delete but surface the outcome as unconfirmed afterward;
+   * a credential must never be reported cleanly removed while an exposed setup request can recreate
+   * it. Transaction-bound locked facades skip this step because their outer mutation makes delete +
+   * satellite purge atomic and already serializes the same credential lifecycle. */
+  private async claimDeleteFenced(
+    owner: Owner,
+    provider: string,
+    expectedId?: string,
+  ): Promise<{
+    row: Awaited<ReturnType<Vault['claimDelete']>>;
+    fenced: boolean;
+    fenceError: unknown;
+  }> {
+    let fenced = this.credentialLockHeld;
+    let fenceError: unknown;
+    if (!this.credentialLockHeld) {
+      try {
+        await markProvisioningRevoked(
+          this.db,
+          owner.kind === 'user'
+            ? { provider, teamId: owner.teamId, userId: owner.id }
+            : { provider, teamId: owner.teamId, channel: owner.id },
+        );
+        fenced = true;
+      } catch (error) {
+        fenceError = error;
+      }
+    }
+    // Preserve a marker failure as outcome data until the caller has finished every operation that
+    // depends on the deleted row. In particular, deleteForRevoke must still decode the one claimed
+    // token and make its best-effort upstream revoke before the lifecycle failure is surfaced.
+    return {
+      row: await this.claimDelete(owner, provider, expectedId),
+      fenced,
+      fenceError,
+    };
+  }
+
+  /** Exact-generation delete used only after {@link prepareUserDisconnect}. The caller holds the
+   * credential and actor-offboard locks. A savepoint keeps satellite cleanup atomic while retaining
+   * the historical credential-only fallback without releasing either fence. */
+  private async claimPreparedDisconnect(
+    tx: Db,
+    owner: Owner,
+    provider: string,
+    expectedId: string,
+  ): Promise<Awaited<ReturnType<Vault['claimDelete']>>> {
+    if (!isInteractionId(expectedId)) throw new Error('invalid expected credential generation');
+    const returning = 'RETURNING id, access_token_enc, refresh_token_enc, secret_ref, dry_run';
+    const params = [owner.teamId, owner.kind, owner.id, provider, expectedId];
+    const sql = `DELETE FROM connection
+      WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND id=?
+      ${returning}`;
+    const savepoint = 'vouchr_disconnect_credential_delete';
+    await tx.exec(`SAVEPOINT ${savepoint}`);
+    let claimed: Awaited<ReturnType<Vault['claimDelete']>> | undefined;
+    try {
+      claimed = (await tx.get(sql, params)) ?? null;
+      if (claimed) await this.clearSatellites(tx, owner, provider);
+      await tx.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      return claimed;
+    } catch (error) {
+      try {
+        await tx.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        await tx.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      } catch {
+        throw error;
+      }
+      if (claimed === undefined) throw error;
+      if (!claimed) return null;
+      const retry = await tx.get<NonNullable<Awaited<ReturnType<Vault['claimDelete']>>>>(
+        `DELETE FROM connection
+          WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND id=?
+            AND access_token_enc IS NOT DISTINCT FROM ?
+            AND refresh_token_enc IS NOT DISTINCT FROM ?
+            AND secret_ref IS NOT DISTINCT FROM ?
+          ${returning}`,
+        [
+          ...params,
+          claimed.access_token_enc,
+          claimed.refresh_token_enc,
+          claimed.secret_ref,
+        ],
+      );
+      if (retry) return retry;
+      throw new Error('credential deletion could not be confirmed after cleanup failure; retry');
+    }
+  }
+
+  /**
+   * Bind one user-initiated Disconnect to its trusted receipt and the exact stored credential
+   * generation visible at that authorization point. Lock order is the suffix of every user writer:
+   * provisioning-revocation scopes, then actor offboarding scopes. A reconnect writer holding the
+   * credential lock therefore waits here at the revocation lock; this helper never takes that
+   * credential lock, so the order cannot invert.
+   *
+   * The exact setup marker and generation snapshot share that short transaction. PostgreSQL-only
+   * savepoint recovery preserves the historical disconnect guarantee: if the marker write itself
+   * fails, the caller may still conditionally delete the snapshotted generation, but must report
+   * `fenced:false`. Failure before the actor verdict or savepoint recovery propagates fail-closed.
+   */
+  async prepareUserDisconnect(
+    identity: SlackIdentity,
+    provider: string,
+    issuedAt: number,
+    expectedId?: string,
+  ): Promise<
+    | { status: 'current'; expectedId: string | null; fenced: boolean }
+    | { status: 'offboarded' }
+    | { status: 'stale' }
+  > {
+    if (!Number.isSafeInteger(issuedAt)) throw new Error('invalid disconnect issuance');
+    if (expectedId !== undefined && !isInteractionId(expectedId)) return { status: 'stale' };
+    const owner: Owner = {
+      teamId: identity.teamId,
+      kind: 'user',
+      id: identity.userId,
+      enterpriseId: identity.enterpriseId,
+    };
+    return withProvisioningRevocationLock(this.db, owner, provider, async (revocationTx) => {
+      const current = await withUserInteractionFence(
+        revocationTx,
+        identity,
+        issuedAt,
+        async (actorTx) => {
+          const row = await actorTx.get<{ id: string; generation_at: number }>(
+            `SELECT id, generation_at FROM connection
+              WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
+            [identity.teamId, identity.userId, provider],
+          );
+          // A Vouchr-owned Disconnect button carries only the opaque generation rendered with it.
+          // Resolve provider/ownership before entering this helper, then repeat the exact-generation
+          // check here under the credential + actor fences. A redelivered generation A action after
+          // reconnect B must leave no provisioning marker or other durable side effect.
+          if (expectedId !== undefined && row?.id !== expectedId) {
+            return { status: 'stale' } as const;
+          }
+          // Provider-addressed slash/headless requests carry no opaque row id. This PostgreSQL-clock
+          // boundary proves the current row already existed when the trusted request/assertion was
+          // issued; a delayed request can never retarget a later reconnect.
+          if (expectedId === undefined && row && row.generation_at > issuedAt) {
+            return { status: 'stale' } as const;
+          }
+          const savepoint = 'vouchr_disconnect_provisioning_fence';
+          await actorTx.exec(`SAVEPOINT ${savepoint}`);
+          let fenced = true;
+          try {
+            await markProvisioningRevoked(actorTx, {
+              provider,
+              teamId: identity.teamId,
+              userId: identity.userId,
+            });
+            await actorTx.exec(`RELEASE SAVEPOINT ${savepoint}`);
+          } catch (error) {
+            try {
+              await actorTx.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+              await actorTx.exec(`RELEASE SAVEPOINT ${savepoint}`);
+            } catch {
+              throw error;
+            }
+            fenced = false;
+          }
+          return { status: 'current', expectedId: row?.id ?? null, fenced } as const;
+        },
+      );
+      return current.status === 'current' ? current.value : { status: 'offboarded' };
+    });
   }
 
   /**
@@ -231,19 +531,301 @@ export class Vault {
     owner: Owner,
     provider: string,
     decrypt: boolean,
-  ): Promise<{ removed: boolean; accessToken: string | null; dryRun: boolean; readFailed: boolean }> {
-    const row = await this.claimDelete(owner, provider);
-    if (!row) return { removed: false, accessToken: null, dryRun: false, readFailed: false };
+    prepared?: {
+      expectedId: string;
+      fenced: boolean;
+      identity: SlackIdentity;
+      issuedAt: number;
+    },
+  ): Promise<{
+    removed: boolean;
+    accessToken: string | null;
+    dryRun: boolean;
+    readFailed: boolean;
+    fenced: boolean;
+  }> {
+    let row: Awaited<ReturnType<Vault['claimDelete']>>;
+    let fenced: boolean;
+    if (prepared) {
+      const current = await this.withCredentialLock(owner, provider, async (_locked, tx) =>
+        withUserInteractionFence(tx, prepared.identity, prepared.issuedAt, (actorTx) =>
+          this.claimPreparedDisconnect(actorTx, owner, provider, prepared.expectedId)));
+      if (current.status === 'offboarded') {
+        throw new InteractionStateChangedError('connection', 'authorization');
+      }
+      row = current.value;
+      fenced = prepared.fenced;
+    } else {
+      ({ row, fenced } = await this.claimDeleteFenced(owner, provider));
+    }
+    if (!row) {
+      return {
+        removed: false,
+        accessToken: null,
+        dryRun: false,
+        readFailed: false,
+        fenced,
+      };
+    }
     const dryRun = row.dry_run === 1;
-    if (!decrypt || dryRun) return { removed: true, accessToken: null, dryRun, readFailed: false };
+    if (!decrypt || dryRun) {
+      return { removed: true, accessToken: null, dryRun, readFailed: false, fenced };
+    }
     try {
       const accessToken = row.access_token_enc
         ? await open(toBuffer(row.access_token_enc), this.key, this.envelope)
         : null;
-      return { removed: true, accessToken, dryRun, readFailed: false };
+      return { removed: true, accessToken, dryRun, readFailed: false, fenced };
     } catch {
-      return { removed: true, accessToken: null, dryRun, readFailed: true };
+      return { removed: true, accessToken: null, dryRun, readFailed: true, fenced };
     }
+  }
+
+  /** PostgreSQL-clock timestamp for a direct trusted user-provisioning call. Capture this before
+   * any work that may race offboarding, then pass it to {@link upsertUser} or
+   * {@link referenceUser}. Persisted Slack requests and verified headless assertions carry their
+   * own earlier issuance time instead. */
+  async userProvisioningIssuedAt(): Promise<number> {
+    const row = await this.db.get<{ issued_at: number }>(`SELECT ${POSTGRES_NOW_MS_SQL} AS issued_at`);
+    if (!Number.isSafeInteger(row?.issued_at)) throw new Error('could not issue user provisioning fence');
+    return row!.issued_at;
+  }
+
+  /** One load-bearing fence for every user-owned credential creation/replacement. Lock order stays
+   * credential lifecycle -> user offboard fence: either this transaction commits first and a later
+   * offboard sees/deletes the row, or the tombstone commits first and this write refuses. A request
+   * resolver runs under the same transaction so opaque-request consumption, credential mutation,
+   * satellite purge, and audit companions are one outcome. */
+  private async withUserProvisioningFence(
+    owner: Owner,
+    provider: string,
+    issuance: UserProvisioningIssuance,
+    write: (tx: Db) => Promise<void>,
+  ): Promise<Exclude<UserProvisioningResult, 'conflict'>> {
+    if (owner.kind !== 'user') throw new Error('user provisioning requires a user owner');
+    const identity: SlackIdentity = {
+      enterpriseId: owner.enterpriseId ?? null,
+      teamId: owner.teamId,
+      userId: owner.id,
+    };
+    return this.withCredentialLock(owner, provider, async (_locked, tx) =>
+      withUserProvisioningLock(tx, identity, provider, async (fencedTx) => {
+        const resolved = typeof issuance === 'number' ? issuance : await issuance(fencedTx);
+        if (resolved == null) return 'stale';
+        const issuedAt = typeof resolved === 'number' ? resolved : resolved.issuedAt;
+        if (!Number.isSafeInteger(issuedAt)) throw new Error('invalid user provisioning issuance');
+        const offboardedAt = await latestUserOffboardTombstone(fencedTx, identity);
+        const revokedAt = await latestProvisioningRevocationTombstone(
+          fencedTx,
+          owner,
+          provider,
+        );
+        if (tombstoneBlocks(offboardedAt, issuedAt)) return 'offboarded';
+        if (tombstoneBlocks(revokedAt, issuedAt)) return 'revoked';
+        if (typeof resolved !== 'number' && resolved.requireAbsent) {
+          const existing = await fencedTx.get<{
+            created_at: number;
+            last_used_at: number | null;
+          }>(
+            `SELECT created_at, last_used_at FROM connection
+             WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
+            [owner.teamId, owner.id, provider],
+          );
+          if (existing && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)) {
+            return 'stale';
+          }
+        }
+        await write(fencedTx);
+        return 'stored';
+      }));
+  }
+
+  /** The matching break-glass fence for exported low-level channel-owner writes. Capture issuance
+   * before KMS or caller-adjacent async work, then hold every applicable revoke-scope lock through
+   * the credential mutation so a confirmed CLI sweep cannot return before an older write settles. */
+  private async withChannelProvisioningFence<T>(
+    owner: Owner,
+    provider: string,
+    issuedAt: number,
+    write: (tx: Db) => Promise<T>,
+  ): Promise<{ status: 'written'; value: T } | { status: 'revoked' }> {
+    if (owner.kind !== 'channel') throw new Error('channel provisioning requires a channel owner');
+    if (!Number.isSafeInteger(issuedAt)) throw new Error('invalid channel provisioning issuance');
+    return this.withCredentialLock(owner, provider, async (_locked, tx) =>
+      withProvisioningRevocationLock(tx, owner, provider, async (fencedTx) => {
+        const revokedAt = await latestProvisioningRevocationTombstone(
+          fencedTx,
+          owner,
+          provider,
+        );
+        if (tombstoneBlocks(revokedAt, issuedAt)) return { status: 'revoked' };
+        return { status: 'written', value: await write(fencedTx) };
+      }));
+  }
+
+  private async sealedToken(t: StoredToken): Promise<{
+    accessEnc: Buffer;
+    refreshEnc: Buffer | null;
+    now: number;
+  }> {
+    return {
+      accessEnc: await seal(t.accessToken, this.key, this.envelope),
+      refreshEnc: t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null,
+      now: Date.now(),
+    };
+  }
+
+  /** Prepare envelope/KMS material before a caller acquires lifecycle locks, then expose only one
+   * transaction-bound write. The symbol keeps this primitive off the public package API; channel
+   * setup uses it so a slow external KMS cannot pin an actor's offboarding fence. */
+  async [PREPARE_VAULT_CREDENTIAL_WRITE](
+    t: StoredToken,
+  ): Promise<PreparedVaultCredentialWrite> {
+    const prepared = await this.sealedToken(t);
+    let used = false;
+    return async (tx, owner, provider) => {
+      if (used) throw new Error('prepared credential write already used');
+      used = true;
+      await this.writeVaultCredential(tx, owner, provider, t, prepared);
+    };
+  }
+
+  private async writeVaultCredential(
+    tx: Db,
+    owner: Owner,
+    provider: string,
+    t: StoredToken,
+    prepared: Awaited<ReturnType<Vault['sealedToken']>>,
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<void> {
+    await tx.run(
+      `INSERT INTO connection
+         (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+          access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
+          external_account, dry_run, created_at, updated_at, last_used_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?)
+       ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
+         id=excluded.id, source='vault', enterprise_id=excluded.enterprise_id,
+         generation_at=excluded.generation_at,
+         access_token_enc=excluded.access_token_enc,
+         refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
+         scopes=excluded.scopes, expires_at=excluded.expires_at,
+         external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
+         created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
+      [
+        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
+        prepared.accessEnc, prepared.refreshEnc,
+        t.scopes, t.expiresAt, t.externalAccount, prepared.now, prepared.now, prepared.now,
+      ],
+    );
+    await this.clearSatellites(tx, owner, provider);
+    await afterWrite?.(tx);
+  }
+
+  private async writeDryRunCredential(
+    tx: Db,
+    owner: Owner,
+    provider: string,
+    t: StoredToken,
+    prepared: Awaited<ReturnType<Vault['sealedToken']>>,
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<boolean> {
+    const { changes } = await tx.run(
+      `INSERT INTO connection
+         (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+          access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
+          external_account, dry_run, created_at, updated_at, last_used_at)
+       VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 1, ?, ?, ?)
+       ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
+         id=excluded.id, source='vault', enterprise_id=excluded.enterprise_id,
+         generation_at=excluded.generation_at,
+         access_token_enc=excluded.access_token_enc,
+         refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
+         scopes=excluded.scopes, expires_at=excluded.expires_at,
+         external_account=excluded.external_account, updated_at=excluded.updated_at,
+         created_at=excluded.created_at, last_used_at=excluded.last_used_at
+       WHERE connection.dry_run=1`,
+      [
+        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
+        prepared.accessEnc, prepared.refreshEnc,
+        t.scopes, t.expiresAt, t.externalAccount, prepared.now, prepared.now, prepared.now,
+      ],
+    );
+    if (changes === 0) return false;
+    await this.clearSatellites(tx, owner, provider);
+    await afterWrite?.(tx);
+    return true;
+  }
+
+  private async writeReferenceCredential(
+    tx: Db,
+    owner: Owner,
+    provider: string,
+    r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<void> {
+    const now = Date.now();
+    await tx.run(
+      `INSERT INTO connection
+         (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
+          access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
+          external_account, dry_run, created_at, updated_at, last_used_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, 0, ?, ?, ?)
+       ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
+         id=excluded.id, source=excluded.source, enterprise_id=excluded.enterprise_id,
+         generation_at=excluded.generation_at,
+         access_token_enc=NULL, refresh_token_enc=NULL,
+         secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
+         external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
+         created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
+      [
+        randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider, r.source,
+        r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
+      ],
+    );
+    await this.clearSatellites(tx, owner, provider);
+    await afterWrite?.(tx);
+  }
+
+  /** Store one real user credential behind the unified offboard fence. */
+  async upsertUser(
+    owner: Owner,
+    provider: string,
+    t: StoredToken,
+    issuance: UserProvisioningIssuance,
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<UserProvisioningResult> {
+    const prepared = await this.sealedToken(t); // KMS/envelope work happens before either lock
+    return this.withUserProvisioningFence(owner, provider, issuance, (tx) =>
+      this.writeVaultCredential(tx, owner, provider, t, prepared, afterWrite));
+  }
+
+  /** Store one synthetic dry-run user credential behind the same offboard fence. */
+  async upsertDryRunUser(
+    owner: Owner,
+    provider: string,
+    t: StoredToken,
+    issuance: UserProvisioningIssuance,
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<UserProvisioningResult> {
+    const prepared = await this.sealedToken(t);
+    let written = false;
+    const fenced = await this.withUserProvisioningFence(owner, provider, issuance, async (tx) => {
+      written = await this.writeDryRunCredential(tx, owner, provider, t, prepared, afterWrite);
+    });
+    return fenced === 'stored' && !written ? 'conflict' : fenced;
+  }
+
+  /** Store one referenced user credential behind the same offboard fence. */
+  async referenceUser(
+    owner: Owner,
+    provider: string,
+    r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
+    issuance: UserProvisioningIssuance,
+    afterWrite?: (tx: Db) => Promise<void>,
+  ): Promise<UserProvisioningResult> {
+    return this.withUserProvisioningFence(owner, provider, issuance, (tx) =>
+      this.writeReferenceCredential(tx, owner, provider, r, afterWrite));
   }
 
   /** Store a vaulted credential (Vouchr encrypts and owns refresh). A production write is always
@@ -253,8 +835,9 @@ export class Vault {
    *  `gate` (GHSA-25m2, callback path only): the OAuth callback already consumed its single-use
    *  state, then paused in token exchange; offboarding can write the tombstone and delete every
    *  credential during that pause. Gating the write ATOMICALLY against the tombstone — one
-   *  conditional statement, not a recheck-then-write (which leaves a check/write race) — makes the
-   *  final credential write refuse to resurrect an offboarded user. Same rule as
+   *  conditional statement, under the user's offboard advisory fence acquired inside the existing
+   *  credential transaction — makes the final credential write refuse to resurrect an offboarded
+   *  user while also making an upsert-first offboard wait and delete the committed row. Same rule as
    *  {@link tombstoneBlocks}, expressed in SQL because it must be atomic with the INSERT. Returns
    *  true when the credential was written; false only when the gate refused it (offboarded).
    *  `afterWrite` composes trusted config/audit companions into the same transaction. */
@@ -265,43 +848,20 @@ export class Vault {
     gate?: { mintedAt: number },
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<boolean> {
-    const now = Date.now();
-    const accessEnc = await seal(t.accessToken, this.key, this.envelope);
-    const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
-    const cols = `(id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
-            access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, dry_run, created_at, updated_at, last_used_at)`;
-    const row = `?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 0, ?, ?, ?`;
-    const params: unknown[] = [
-      randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
-      accessEnc, refreshEnc,
-      t.scopes, t.expiresAt, t.externalAccount, now, now, now,
-    ];
-    // Gated write: INSERT … SELECT … WHERE NOT EXISTS(tombstone) — the tombstone is re-evaluated
-    // atomically at INSERT time, so a tombstone written after consume() but before this write blocks
-    // the resurrection (0 rows → returns false). Ungated writes keep the plain VALUES form.
-    const src = gate
-      ? `SELECT ${row} WHERE NOT EXISTS (
-           SELECT 1 FROM offboard_tombstone WHERE team_id=? AND user_id=? AND created_at + ? >= ?)`
-      : `VALUES (${row})`;
-    if (gate) params.push(owner.teamId, owner.id, STATE_TTL_MS, gate.mintedAt);
-    return this.mutation(async (tx) => {
-      const { changes } = await tx.run(
-        `INSERT INTO connection ${cols} ${src}
-         ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-           id=excluded.id, source='vault', enterprise_id=excluded.enterprise_id,
-           access_token_enc=excluded.access_token_enc,
-           refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
-           scopes=excluded.scopes, expires_at=excluded.expires_at,
-           external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
-           created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
-        params,
-      );
-      if (gate && changes === 0) return false; // the tombstone gate refused the write — nothing landed
-      await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
-      await afterWrite?.(tx);
-      return true;
-    });
+    if (gate) return (await this.upsertUser(owner, provider, t, gate.mintedAt, afterWrite)) === 'stored';
+    if (owner.kind === 'user') {
+      const issuedAt = await this.userProvisioningIssuedAt();
+      return (await this.upsertUser(owner, provider, t, issuedAt, afterWrite)) === 'stored';
+    }
+    const issuedAt = await this.userProvisioningIssuedAt();
+    const prepared = await this.sealedToken(t);
+    const result = await this.withChannelProvisioningFence(
+      owner,
+      provider,
+      issuedAt,
+      (tx) => this.writeVaultCredential(tx, owner, provider, t, prepared, afterWrite),
+    );
+    return result.status === 'written';
   }
 
   /**
@@ -314,34 +874,19 @@ export class Vault {
    * TOCTOU window.
    */
   async upsertDryRun(owner: Owner, provider: string, t: StoredToken): Promise<boolean> {
-    const now = Date.now();
-    const accessEnc = await seal(t.accessToken, this.key, this.envelope);
-    const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
-    return this.mutation(async (tx) => {
-      const { changes } = await tx.run(
-        `INSERT INTO connection
-           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
-            access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, dry_run, created_at, updated_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'vault', ?, ?, NULL, ?, ?, ?, 1, ?, ?, ?)
-         ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-           id=excluded.id, source='vault', enterprise_id=excluded.enterprise_id,
-           access_token_enc=excluded.access_token_enc,
-           refresh_token_enc=excluded.refresh_token_enc, secret_ref=NULL,
-           scopes=excluded.scopes, expires_at=excluded.expires_at,
-           external_account=excluded.external_account, updated_at=excluded.updated_at,
-           created_at=excluded.created_at, last_used_at=excluded.last_used_at
-         WHERE connection.dry_run=1`,
-        [
-          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider,
-          accessEnc, refreshEnc,
-          t.scopes, t.expiresAt, t.externalAccount, now, now, now,
-        ],
-      );
-      if (changes === 0) return false; // a real row exists → refuse; nothing was written
-      await this.clearSatellites(tx, owner, provider); // #113 renamed clearNotifyState → also purges approvals
-      return true;
-    });
+    if (owner.kind === 'user') {
+      const issuedAt = await this.userProvisioningIssuedAt();
+      return (await this.upsertDryRunUser(owner, provider, t, issuedAt)) === 'stored';
+    }
+    const issuedAt = await this.userProvisioningIssuedAt();
+    const prepared = await this.sealedToken(t);
+    const result = await this.withChannelProvisioningFence(
+      owner,
+      provider,
+      issuedAt,
+      (tx) => this.writeDryRunCredential(tx, owner, provider, t, prepared),
+    );
+    return result.status === 'written' && result.value;
   }
 
   /** #116: whether at-rest writes go through an external KMS envelope. Dry-run refuses one at
@@ -369,28 +914,20 @@ export class Vault {
     r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
-    const now = Date.now();
-    await this.mutation(async (tx) => {
-      await tx.run(
-        `INSERT INTO connection
-           (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
-            access_token_enc, refresh_token_enc, secret_ref, scopes, expires_at,
-            external_account, dry_run, created_at, updated_at, last_used_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, NULL, ?, 0, ?, ?, ?)
-         ON CONFLICT(team_id, owner_kind, owner_id, provider) DO UPDATE SET
-           id=excluded.id, source=excluded.source, enterprise_id=excluded.enterprise_id,
-           access_token_enc=NULL, refresh_token_enc=NULL,
-           secret_ref=excluded.secret_ref, scopes=excluded.scopes, expires_at=NULL,
-           external_account=excluded.external_account, dry_run=0, updated_at=excluded.updated_at,
-           created_at=excluded.created_at, last_used_at=excluded.last_used_at`,
-        [
-          randomUUID(), owner.enterpriseId ?? null, owner.teamId, owner.kind, owner.id, provider, r.source,
-          r.secretRef, r.scopes ?? '', r.externalAccount ?? null, now, now, now,
-        ],
-      );
-      await this.clearSatellites(tx, owner, provider); // reconnect ⇒ fresh notification state (#117) + drop stale approval grants (#113)
-      await afterWrite?.(tx);
-    });
+    if (owner.kind === 'user') {
+      const issuedAt = await this.userProvisioningIssuedAt();
+      const result = await this.referenceUser(owner, provider, r, issuedAt, afterWrite);
+      if (result !== 'stored') throw new Error('user credential provisioning was refused');
+      return;
+    }
+    const issuedAt = await this.userProvisioningIssuedAt();
+    const result = await this.withChannelProvisioningFence(
+      owner,
+      provider,
+      issuedAt,
+      (tx) => this.writeReferenceCredential(tx, owner, provider, r, afterWrite),
+    );
+    if (result.status === 'revoked') throw new Error('channel credential provisioning was refused');
   }
 
   /**
@@ -403,18 +940,22 @@ export class Vault {
     owner: Owner,
     provider: string,
     t: Pick<StoredToken, 'accessToken' | 'refreshToken' | 'scopes' | 'expiresAt'>,
-  ): Promise<void> {
+    expectedId?: string,
+  ): Promise<boolean> {
+    if (expectedId !== undefined && !isInteractionId(expectedId)) return false;
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
-    await this.db.run(
+    const result = await this.db.run(
       `UPDATE connection SET access_token_enc=?, refresh_token_enc=?, scopes=?, expires_at=?, updated_at=?
-       WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND source='vault'`,
+       WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND source='vault'${expectedId !== undefined ? ' AND id=?' : ''}`,
       [
         accessEnc, refreshEnc,
         t.scopes, t.expiresAt, Date.now(),
         owner.teamId, owner.kind, owner.id, provider,
+        ...(expectedId !== undefined ? [expectedId] : []),
       ],
     );
+    return result.changes === 1;
   }
 
   /** True when the backend coordinates refresh across processes (Postgres advisory lock). */
@@ -431,9 +972,24 @@ export class Vault {
     provider: string,
     fn: (locked: Vault, tx: Db) => Promise<T>,
   ): Promise<T> {
-    const run = (tx: Db) => fn(new Vault(tx, this.key, this.ttl, this.envelope), tx);
-    const key = `${owner.teamId}:${owner.kind}:${owner.id}:${provider}`;
-    if (this.db.withRefreshLock) return this.db.withRefreshLock(key, run);
+    return this.withCredentialLocks([{ owner, provider }], fn);
+  }
+
+  /** Serialize several credential/governance keys in canonical order inside one transaction. The
+   *  owner/provider → advisory-key representation lives only here (STR-2); callers supply typed
+   *  scopes and cannot accidentally choose a lock that disagrees with refresh/mode writers. */
+  async withCredentialLocks<T>(
+    scopes: readonly { owner: Owner; provider: string }[],
+    fn: (locked: Vault, tx: Db) => Promise<T>,
+  ): Promise<T> {
+    const run = (tx: Db) => {
+      const locked = new Vault(tx, this.key, this.ttl, this.envelope);
+      locked.credentialLockHeld = true;
+      return fn(locked, tx);
+    };
+    const keys = scopes.map(({ owner, provider }) => credentialLockKey(owner, provider));
+    if (this.db.withRefreshLocks) return this.db.withRefreshLocks(keys, run);
+    if (keys.length === 1 && this.db.withRefreshLock) return this.db.withRefreshLock(keys[0], run);
     return this.mutation(run);
   }
 
@@ -450,20 +1006,57 @@ export class Vault {
   }
 
   /** Mark a connection as used now (resets the idle timer). Called after each injection. */
-  async touch(owner: Owner, provider: string): Promise<void> {
+  async touch(owner: Owner, provider: string, expectedId?: string): Promise<void> {
+    if (expectedId !== undefined && !isInteractionId(expectedId)) return;
     await this.db.run(
-      `UPDATE connection SET last_used_at=? WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?`,
-      [Date.now(), owner.teamId, owner.kind, owner.id, provider],
+      `UPDATE connection SET last_used_at=? WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=?${expectedId !== undefined ? ' AND id=?' : ''}`,
+      [Date.now(), owner.teamId, owner.kind, owner.id, provider, ...(expectedId !== undefined ? [expectedId] : [])],
     );
   }
 
-  /** A user's OWN connections (for `/vouchr status`). Never lists channel-owned creds. */
-  async listForUser(i: SlackIdentity): Promise<{ provider: string; externalAccount: string | null }[]> {
+  /** A user's OWN connections (for status and Vouchr-owned controls). Never lists channel-owned
+   * credentials. Metadata-only and TTL-independent: expired-here rows remain disconnectable.
+   * Built-in interactive renderers request the additive opaque generation; the default return
+   * shape remains unchanged for existing callers. */
+  async listForUser(
+    i: SlackIdentity,
+  ): Promise<{ provider: string; externalAccount: string | null }[]>;
+  async listForUser(
+    i: SlackIdentity,
+    withGeneration: true,
+  ): Promise<{ credentialId: string; provider: string; externalAccount: string | null }[]>;
+  async listForUser(
+    i: SlackIdentity,
+    withGeneration = false,
+  ): Promise<
+    | { provider: string; externalAccount: string | null }[]
+    | { credentialId: string; provider: string; externalAccount: string | null }[]
+  > {
     const rows = (await this.db.all(
-      `SELECT provider, external_account FROM connection WHERE team_id=? AND owner_kind='user' AND owner_id=?`,
+      `SELECT id, provider, external_account FROM connection
+       WHERE team_id=? AND owner_kind='user' AND owner_id=?`,
       [i.teamId, i.userId],
     )) as any[];
-    return rows.map((r) => ({ provider: r.provider, externalAccount: r.external_account }));
+    return rows.map((r) => ({
+      ...(withGeneration ? { credentialId: r.id } : {}),
+      provider: r.provider,
+      externalAccount: r.external_account,
+    })) as
+      | { provider: string; externalAccount: string | null }[]
+      | { credentialId: string; provider: string; externalAccount: string | null }[];
+  }
+
+  /** Resolve one opaque generation only when it belongs to the verified acting user. This is a
+   * metadata read, not authority: the destructive mutation repeats owner + generation validation
+   * under its lifecycle locks. */
+  async providerForUserGeneration(i: SlackIdentity, credentialId: unknown): Promise<string | null> {
+    if (!isInteractionId(credentialId)) return null;
+    const row = await this.db.get<{ provider: string }>(
+      `SELECT provider FROM connection
+       WHERE id=? AND team_id=? AND owner_kind='user' AND owner_id=?`,
+      [credentialId, i.teamId, i.userId],
+    );
+    return typeof row?.provider === 'string' ? row.provider : null;
   }
 
   /**
@@ -504,10 +1097,10 @@ export class Vault {
    * Every connection currently past its TTL (for the periodic sweep). Filters in SQL
    * (only expired rows cross the wire) rather than scanning the whole table in memory.
    */
-  async listExpired(): Promise<{ owner: Owner; provider: string }[]> {
+  private async listExpiredOn(db: Db): Promise<{ owner: Owner; provider: string }[]> {
     const { clauses, params } = this.expiredPredicate(Date.now());
     if (!clauses.length) return []; // empty policy → nothing expires
-    const rows = (await this.db.all(
+    const rows = (await db.all(
       `SELECT team_id, owner_kind, owner_id, provider FROM connection WHERE ${clauses.join(' OR ')}`,
       params,
     )) as any[];
@@ -515,6 +1108,10 @@ export class Vault {
       owner: { teamId: r.team_id, kind: r.owner_kind, id: r.owner_id } as Owner,
       provider: r.provider,
     }));
+  }
+
+  async listExpired(): Promise<{ owner: Owner; provider: string }[]> {
+    return this.listExpiredOn(this.db);
   }
 
   /**
@@ -525,17 +1122,23 @@ export class Vault {
    * satellites are purged (and the caller audits/notifies) only in that case, so a fresh
    * reconnect's notification state and grants are never clobbered by a stale sweep.
    */
-  async deleteExpired(owner: Owner, provider: string): Promise<boolean> {
+  private async deleteExpiredOn(db: Db, owner: Owner, provider: string): Promise<boolean> {
     const { clauses, params } = this.expiredPredicate(Date.now());
     if (!clauses.length) return false; // empty policy → nothing expires
-    return this.mutation(async (tx) => {
-      const { changes } = await tx.run(
-        `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND (${clauses.join(' OR ')})`,
-        [owner.teamId, owner.kind, owner.id, provider, ...params],
-      );
-      if (changes > 0) await this.clearSatellites(tx, owner, provider);
-      return changes > 0;
-    });
+    const { changes } = await db.run(
+      `DELETE FROM connection WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND (${clauses.join(' OR ')})`,
+      [owner.teamId, owner.kind, owner.id, provider, ...params],
+    );
+    if (changes > 0) await this.clearSatellites(db, owner, provider);
+    return changes > 0;
+  }
+
+  async deleteExpired(owner: Owner, provider: string): Promise<boolean> {
+    return this.withCredentialLock(
+      owner,
+      provider,
+      async (_locked, tx) => this.deleteExpiredOn(tx, owner, provider),
+    );
   }
 
   /**
@@ -554,7 +1157,10 @@ export class Vault {
    * for its approaching max-age may still die of a short idle TTL first, and "expires in ~Nh"
    * must not overstate its lifetime.
    */
-  async listExpiringSoon(withinMs: number): Promise<{ owner: Owner; provider: string; expiresAt: number }[]> {
+  private async listExpiringSoonOn(
+    withinMs: number,
+    db: Db,
+  ): Promise<{ owner: Owner; provider: string; expiresAt: number }[]> {
     const now = Date.now();
     const horizon = now + withinMs;
     const warnIdle = this.ttl.idleMs != null && this.ttl.idleMs > withinMs;
@@ -570,7 +1176,7 @@ export class Vault {
       params.push(horizon - this.ttl.maxAgeMs!);
     }
     if (!clauses.length) return []; // no warnable dimension → nothing to warn about
-    const rows = (await this.db.all(
+    const rows = (await db.all(
       `SELECT enterprise_id, team_id, owner_kind, owner_id, provider, created_at, last_used_at
          FROM connection WHERE ${clauses.join(' OR ')}`,
       params,
@@ -592,6 +1198,20 @@ export class Vault {
     });
   }
 
+  async listExpiringSoon(withinMs: number): Promise<{ owner: Owner; provider: string; expiresAt: number }[]> {
+    return this.listExpiringSoonOn(withinMs, this.db);
+  }
+
+  /** Bind expiry primitives to the lifecycle coordinator's already table-locked transaction. The
+   * unexported symbol keeps the no-advisory-lock path off the public Vault instance API. */
+  [BIND_VAULT_EXPIRY_TRANSACTION](transaction: Db): VaultExpiryTransaction {
+    return {
+      listExpired: () => this.listExpiredOn(transaction),
+      deleteExpired: (owner, provider) => this.deleteExpiredOn(transaction, owner, provider),
+      listExpiringSoon: (withinMs) => this.listExpiringSoonOn(withinMs, transaction),
+    };
+  }
+
   /**
    * Returns whether a row was atomically claimed, so callers derive a truthful `removed` from the
    * delete itself — not from whether the token happened to be readable/unexpired (GHSA-25m2).
@@ -611,6 +1231,27 @@ export class Vault {
    * rows.
    */
   async delete(owner: Owner, provider: string): Promise<boolean> {
-    return (await this.claimDelete(owner, provider)) != null;
+    const { row, fenced, fenceError } = await this.claimDeleteFenced(owner, provider);
+    if (!fenced) {
+      throw fenceError instanceof Error
+        ? fenceError
+        : new Error('credential provisioning fence could not be confirmed; retry');
+    }
+    return row != null;
   }
+}
+
+/** @internal Prepare a vaulted token without holding credential/revocation/offboard locks. This
+ * module export is intentionally not re-exported by the package entry points. */
+export function prepareVaultCredentialWrite(
+  vault: Vault,
+  token: StoredToken,
+): Promise<PreparedVaultCredentialWrite> {
+  return vault[PREPARE_VAULT_CREDENTIAL_WRITE](token);
+}
+
+/** @internal Bind expiry operations to the lifecycle coordinator's table-locked transaction. This
+ * module export is intentionally not re-exported by the package entry points. */
+export function bindVaultExpiryTransaction(vault: Vault, transaction: Db): VaultExpiryTransaction {
+  return vault[BIND_VAULT_EXPIRY_TRANSACTION](transaction);
 }

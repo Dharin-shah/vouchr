@@ -196,17 +196,19 @@ into many actions, or to skip the approval entirely.
   secret is read. A grant is SINGLE-USE — consumed with the same atomic
   `DELETE ... RETURNING` as the OAuth `state`, so two concurrent retries cannot both
   spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
-  (method, host, path, query) it was minted for: not a prefix, not a pattern, never a
+  (method, origin, path, query) it was minted for: not a prefix, not a pattern, never a
   class of actions. The query is bound BYTE-EXACT, as a digest of the exact query string
   sent upstream — no sorting or normalization, since upstream parsers legitimately treat
   reordered or duplicated parameters differently — so a replanning or prompt-injected
   agent cannot spend an approval of `POST /transfer?to=alice&amount=10` on
   `?to=attacker&amount=1000000` (or on any reordering); any textual change re-prompts.
   Query parameter names and values are BOTH caller-controlled and may carry tokens,
-  signed-URL material, or PII, so neither is ever persisted, audited, logged, or
-  rendered: the prompt shows only the parameter COUNT and states the exact query string
-  is bound byte-for-byte. (A provider-declared safe action renderer is the future shape
-  if humans must inspect action-defining fields.) When `approval.paths` is set it
+  signed-URL material, or PII, so neither is ever persisted, audited, logged, or rendered.
+  Origin binds scheme, hostname, and effective port, so a loopback approval on one development port
+  cannot authorize another. Raw paths can carry sensitive material, so Slack, public errors, and audit show a fixed-size action
+  fingerprint instead. It includes the random, non-output credential generation and every exact
+  action field, preventing dictionary reversal of a low-entropy path; the prompt shows only that
+  fingerprint and the parameter count. When `approval.paths` is set it
   inherits the egress path lock's fail-closed
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential
@@ -217,20 +219,31 @@ into many actions, or to skip the approval entirely.
   (disconnect, offboard, bulk-revoke, reconnect, TTL-expiry — all route through the one
   vault mutation surface), so it can't survive a revocation or be spent after a
   reconnect. Approve/Deny clicks are re-authorized server-side (provider re-validated
-  against the registry, approver eligibility re-checked at the mutation; ineligible
-  clicks are rejected and audited) — nothing in the interaction payload is trusted.
+  against the registry; current owner, live credential, mode/session, policy, tool bit,
+  signed conversation, and approver eligibility re-checked before the mutation; ineligible
+  clicks are rejected and audited) — nothing in the interaction payload is trusted. Decision and
+  consume mutations share a PostgreSQL transaction with their audit companion, so an audit failure
+  grants or spends nothing. Mode/tool writers use the same canonical channel/provider lock and
+  atomically purge every dependent pending request and grant; a session→per-user→session or
+  enabled→disabled→enabled ABA cannot revive old authority. Exact-action dedup uses a bounded
+  length-framed SHA-256 lookup key because PostgreSQL cannot btree-index a multi-KiB raw path, but
+  every request/consume still compares all full action fields — the digest is never authority.
+  Paths are capped at 16 KiB before mutable state or secret reads; the internal pending row keeps the
+  bounded raw path solely for exact matching. Once a Slack call begins, rejection
+  is an unknown acceptance outcome: the short database-clock lease and request are retained so a
+  possibly-visible button remains decidable and an immediate retry cannot post a duplicate.
 - **Accepted tradeoff:** the request BODY is not hashed into the grant key. Bodies are
   legitimately rebuilt on retry (fresh timestamps, idempotency keys), so binding to the
   payload bytes would break the approve-then-retry flow outright. Be explicit about what
   that means: for an API whose write target or amount lives in the BODY (JSON/RPC), an
-  approval pins the endpoint + method + query but NOT the body parameters — an agent
+  approval pins the origin + endpoint + method + query but NOT the body parameters — an agent
   that rebuilds the body differently between the prompt and the retry spends the grant
   on the rebuilt payload. Do not treat approval as covering the exact action for such
   endpoints; scope `approval.paths` tightly and prefer APIs that carry the
   action-defining parameters in the URL. (A digest over declared-stable body fields, or
   a provider-supplied action fingerprint, would close this; no built-in provider ships
-  one today.) This is also why approval prompts show the method, host+path, and query,
-  and deliberately never render the body (which may carry user content).
+  one today.) Approval prompts therefore show method, host, the salted action fingerprint, and query
+  parameter count, while deliberately withholding the raw path/query and body.
 
 ### Replayed OAuth callback / state
 
@@ -249,12 +262,25 @@ user or reuse a callback.
 A user is deactivated in Slack but a pending OAuth or stored connection could let the
 agent keep acting as them.
 
-- **Mitigated.** On Slack's `user_change` with `deleted: true`, `offboardUser` deletes
-  all the user's own connections **and** purges any in-flight consent so a pending
-  "Connect" click can't resurrect a connection after offboarding
-  (`src/core/offboard.ts`, `consent.deleteForUser`; wired in
-  `registerOffboarding`). Local delete happens first (the security-meaningful action);
-  upstream revoke is best-effort.
+- **Mitigated.** On Slack's `user_change` with `deleted: true`, `offboardUser` first commits a
+  monotonic `(team_id, user_id)` tombstone, then deletes all the user's own connections and
+  best-effort purges in-flight consent, key-setup requests, and thread sessions. Every later
+  user-owned OAuth, static-key, dry-run, or reference write checks that tombstone under the same
+  cross-replica locks as its credential mutation. Retained Bolt handles and headless assertions
+  compare their trusted receipt time with the same tombstone before stateful use/secret access and
+  again at provider send. This applies to channel-owned credentials, which intentionally survive for
+  other current actors. Pending and granted approvals requested by the departed user are purged
+  best-effort; approval decision and consumption also fence their trusted actor/request creation
+  times, so cleanup failure cannot revive old authority. Grid/SCIM offboarding commits an
+  enterprise/unscoped/global scope tombstone **before** artifact discovery, so even an empty
+  workspace is fenced. On the packaged broker route the admin assertion must sign the exact
+  `offboardTargetUserId`; a direct SCIM integration instead binds the target from its authenticated
+  directory event. The tombstone itself is durable scope state, not a signed object. Purge success is
+  not the security boundary; the durable tombstone is
+  (`src/core/offboard.ts`, `consent.ts`, `provisioning.ts`, `vault.ts`; wired in
+  `registerOffboarding`). Local credential deletion remains security-meaningful; upstream revoke is
+  best-effort. Once a request passes the final provider-send fence and is dispatched, later
+  offboarding cannot recall it.
 - **Honest limit:** disconnect/offboard guarantees local deletion first, but upstream
   provider revocation is best-effort only. A real revocable external-reference row (or an unreadable
   vaulted token) cannot supply a token to the revoke endpoint; Vouchr treats the result as
@@ -263,6 +289,20 @@ agent keep acting as them.
   event path is scoped to the `(team_id, user_id)` the event carries; org-wide Grid deprovisioning
   should go through SCIM (SECURITY.md, "Disconnect/offboard revoke is best-effort"; offboarding
   scoping note in `bolt.ts`).
+
+### Stale shared-channel setup
+
+An admin begins shared-credential setup, but another credential, mode, or tool mutation commits
+while Slack opens the loading view or Vouchr checks channel/admin state. The older handler must not
+later overwrite the newer state.
+
+- **Mitigated.** Every effective channel/provider credential or governance mutation advances a
+  PostgreSQL-clock `channel_interaction_tombstone` atomically with dependent-control cleanup. The
+  setup request and final consume compare that marker with the verified handler receipt under the
+  same credential lock. Thus the request either persists first and the newer mutation deletes it,
+  or the mutation persists first and the older receipt is refused. Same-value governance retries
+  do not invalidate a live form. Envelope/KMS wrapping is performed before lifecycle locks, so a
+  stalled external KMS cannot prevent actor offboarding from establishing its fence.
 
 ### Slack Connect cross-org exposure
 
@@ -292,10 +332,20 @@ These mirror what the code (and the test suite) enforce:
    audited as the human who triggered the call (`injector.ts`, `owner.ts`).
 4. **Channel credentials are refused in externally shared channels** (and other
    ineligible classes), fail-closed (`channelConfig.ts`).
-5. **OAuth `state` is single-use and expiring**: atomic `DELETE ... RETURNING` +
-   10-minute TTL (`consent.ts`).
-6. **Offboarding clears pending consent** so a deactivated user's in-flight OAuth
-   can't resurrect a connection (`offboard.ts`).
+5. **OAuth `state` and credential-setup requests are single-use and expiring**: authority is bound
+   in PostgreSQL and consumed with atomic `DELETE ... RETURNING` under the final mutation
+   transaction, with a 10-minute TTL (`consent.ts`, `provisioning.ts`). Ordinary credential deletion
+   establishes a durable exact-owner provisioning marker first, and effective channel mutations
+   advance a channel/provider tombstone checked against the original Slack receipt. Bounded-row
+   cleanup is convergence, not the resurrection barrier. Channel/provider metadata carried by a
+   Slack modal is not authority.
+6. **Offboarding durably fences every user authority path.** Monotonic team and
+   enterprise/unscoped/global tombstones are checked under the credential/offboard locks before
+   OAuth, static-key, dry-run, or reference writes. Retained handles and assertions are checked
+   before secret access and provider send, and requester-bound approvals compare their creation
+   times at decision and consumption. Consent/setup/session/approval cleanup is bounded-state
+   hygiene, not the resurrection barrier (`offboard.ts`, `consent.ts`, `provisioning.ts`, `vault.ts`,
+   `approval.ts`, `injector.ts`).
 7. **Refresh cannot bypass the max-age TTL.** Silent refresh uses `updateTokens`,
    which leaves `created_at` intact; only a reconnect (`upsert`) resets it
    (`vault.ts`, `injector.ts:doRefresh`).

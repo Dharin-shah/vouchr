@@ -1,21 +1,26 @@
 import { test, type TestContext } from 'node:test';
-import { openTestDb } from './support/pg';
+import { openTestDb, testDbUrl } from './support/pg';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
-import { ChannelTools } from '../src/core/tools';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner, channelOwner } from '../src/core/owner';
-import { ChannelConfig } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { MAX_SECRET_REFERENCE_BYTES } from '../src/core/reference';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
+import { openDb } from '../src/core/db';
+import { Consent } from '../src/core/consent';
+import { offboardUser, offboardUserEverywhere } from '../src/core/offboard';
+import { ChannelProvisioningRequests } from '../src/core/provisioning';
 import { identityKid, normalizeIdentityConfig } from '../src/adapters/http/identity';
 import {
   signIdentity,
+  mintIdentity,
   verifyIdentity,
   identityConfig,
   IdentityError,
@@ -312,6 +317,43 @@ test('fetch: non-GET/HEAD -> 405 BEFORE the vault/upstream is touched', async (t
   }
 });
 
+test('fetch: invalid methods return 400 with no side effects; canonical method reaches upstream', async (t) => {
+  const writeAcme = { ...acme, egressMethods: ['GET', 'POST'] } as Provider;
+  const { server, vault, db, port } = await makeBroker(t, { providers: [writeAcme], allowWrites: true });
+  const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
+  const realGet = vault.get.bind(vault);
+  let credentialReads = 0;
+  (vault as any).get = (...args: any[]) => {
+    credentialReads += 1;
+    return (realGet as any)(...args);
+  };
+  const request = (method: unknown) => post(port, '/v1/fetch', {
+    handle: { provider: 'acme', owner: 'user' },
+    identityToken: signIdentity(claims(), SECRET),
+    method,
+    path: '/data',
+  });
+  try {
+    for (const method of ['', ' ', 'PO ST', 'POST\n', '\tGET', 'GE\u007fT', 'POſT', 'CONNECT', 'TRACE', 'TRACK', null, undefined]) {
+      const response = await request(method);
+      assert.equal(response.status, 400);
+      assert.deepEqual(response.json, { error: 'invalid method' });
+    }
+    assert.equal(up.seen.length, 0);
+    assert.equal(credentialReads, 0);
+    assert.equal((await db.all(`SELECT 1 FROM approval_request`)).length, 0);
+    assert.equal((await db.all(`SELECT 1 FROM audit`)).length, 0);
+
+    const canonical = await request(' post ');
+    assert.equal(canonical.status, 200);
+    assert.equal(up.seen[0].method, 'POST', 'the canonical method is the one sent upstream');
+    assert.equal(credentialReads, 1);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('fetch: allowWrites + provider egressMethods lets a POST body reach upstream, with audit method', async (t) => {
   const events: any[] = [];
   const writeAcme = { ...acme, egressMethods: ['GET', 'POST'] } as Provider;
@@ -479,18 +521,23 @@ test('fetch: write requests still enforce host, path, validator, and replay chec
       method: 'POST', host: 'evil.example.com', path: '/allowed', query: { ok: '1' }, body: '{}',
     });
     assert.equal(blockedHost.status, 403);
+    assert.deepEqual(blockedHost.json, {
+      error: 'egress blocked', code: 'egress_blocked', retryable: false, recovery: 'fix_configuration',
+    });
 
     const blockedPath = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
       method: 'POST', path: '/blocked', query: { ok: '1' }, body: '{}',
     });
     assert.equal(blockedPath.status, 403);
+    assert.deepEqual(blockedPath.json, blockedHost.json);
 
     const blockedValidator = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
       method: 'POST', path: '/allowed', query: { ok: '0' }, body: '{}',
     });
     assert.equal(blockedValidator.status, 403);
+    assert.deepEqual(blockedValidator.json, blockedHost.json);
     assert.equal(up.seen.length, 0, 'egress denials happen before upstream');
 
     const token = signIdentity(claims(), SECRET);
@@ -604,6 +651,9 @@ test('fetch: body-supplied identity is IGNORED; cross-tenant probe gets the atta
     } as any);
     // U2 has no acme credential, so the broker resolves U2's owner (from the token) and finds nothing.
     assert.equal(r.status, 409, 'resolved the token owner (U2), not the body-supplied U1');
+    assert.deepEqual(r.json, {
+      error: 'not connected', code: 'not_connected', retryable: false, recovery: 'connect',
+    });
     assert.equal(up.seen.length, 0, 'U1\'s token was never read, so nothing went upstream');
   } finally {
     up.restore();
@@ -631,6 +681,12 @@ test('fetch: disallowed content-type is rejected before the body is returned', a
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
     assert.equal(r.status, 502);
+    assert.deepEqual(r.json, {
+      error: 'disallowed content-type',
+      code: 'response_blocked',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
     assert.ok(!r.raw.includes('injection'), 'disallowed body never relayed');
   } finally {
     up.restore();
@@ -827,7 +883,7 @@ test('fetch: write requests still honor Policy before injection', async (t) => {
 test('fetch: a ChannelTools allowlist that disables the provider here -> 403, credential NEVER injected', async (t) => {
   const { server, db, port } = await makeBrokerOn(t, (db) => ({ channelTools: new ChannelTools(db) }));
   // Configure the channel as an allowlist that does NOT include acme -> acme is disabled here.
-  await new ChannelTools(db).setEnabled('T1', 'C1', 'other', true);
+  await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'other', true);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET), method: 'GET', path: '/x' });
@@ -846,7 +902,7 @@ test('fetch: write requests still honor ChannelTools before injection', async (t
     allowWrites: true,
     channelTools: new ChannelTools(db),
   }));
-  await new ChannelTools(db).setEnabled('T1', 'C1', 'other', true);
+  await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'other', true);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -928,16 +984,51 @@ test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; f
   }
 });
 
-// ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
-
-/** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
-async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user') {
+test('#194 session-mode broker denial has stable request-approval recovery metadata', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  await channelConfig.setMode('T1', 'C1', 'acme', mode);
-  if (mode === 'shared') {
+  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const server = createBroker({
+    providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims({ threadTs: '1700000000.000001' }), SECRET),
+      method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 403);
+    assert.deepEqual(r.json, {
+      error: 'provider requires a thread-scoped session approval',
+      code: 'session_approval_required',
+      retryable: false,
+      recovery: 'request_approval',
+    });
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+// ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
+
+/** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
+async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user', seedShared = true) {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const channelConfig = new ChannelConfig(db);
+  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', mode);
+  if (mode === 'shared' && seedShared) {
     // The channel owns one credential every member injects.
     await vault.upsert(channelOwner('T1', 'C1'), 'acme', {
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -953,6 +1044,24 @@ function channelToken(over: Partial<IdentityClaims> = {}): string {
   return signIdentity(claims({ ownerKind: 'channel', channelEligible: true, ...over }), SECRET);
 }
 
+test('#194 shared owner missing a credential returns configuration recovery, never personal connect', async (t) => {
+  const { server, port } = await makeChannelBroker(t, 'shared', false);
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const r = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
+    });
+    assert.equal(r.status, 409);
+    assert.deepEqual(r.json, {
+      error: 'not connected', code: 'not_connected', retryable: false, recovery: 'fix_configuration',
+    });
+    assert.equal(up.seen.length, 0);
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
 test('#51 shared: owner:"channel" resolves to the channel credential and injects it', async (t) => {
   const { server, db, port } = await makeChannelBroker(t, 'shared');
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -966,6 +1075,55 @@ test('#51 shared: owner:"channel" resolves to the channel credential and injects
     const row = (await db.get(`SELECT user_id, channel FROM audit WHERE action='inject' ORDER BY at DESC LIMIT 1`)) as any;
     assert.equal(row.user_id, 'U1'); // the real acting human, never the channel
     assert.equal(row.channel, 'C1'); // attributed to the channel that owns the credential
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
+
+test('#194 shared use rejects a pre-offboard assertion while preserving the channel credential', async (t) => {
+  const { server, vault, db, port } = await makeChannelBroker(t, 'shared');
+  const owner = channelOwner('T1', 'C1');
+  const sharedId = await vault.liveId(owner, 'acme');
+  assert.ok(sharedId);
+  const stale = channelToken();
+  await new Consent(db).markOffboarded({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  const up = mockUpstream(() => new Response('{}', {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  }));
+  try {
+    const refused = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' },
+      identityToken: stale,
+      method: 'GET',
+      path: '/x',
+    });
+    assert.equal(refused.status, 409);
+    assert.equal(refused.json.code, 'interaction_state_changed');
+    assert.equal(refused.json.retryable, false);
+    assert.equal(refused.json.recovery, 'resolve_again');
+    assert.equal(up.seen.length, 0);
+    assert.equal(
+      (await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='inject'`))?.n,
+      0,
+    );
+    assert.equal(await vault.liveId(owner, 'acme'), sharedId);
+
+    // Headless issuance mapping subtracts the accepted 30s clock-skew window, so a trusted minter
+    // must be observably newer than that uncertainty before it can represent re-onboarding.
+    await db.run(
+      `UPDATE offboard_tombstone SET created_at=created_at-? WHERE team_id=? AND user_id=?`,
+      [IDENTITY_SKEW_MS + 1, 'T1', 'U1'],
+    );
+    const fresh = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'channel' },
+      identityToken: channelToken(),
+      method: 'GET',
+      path: '/x',
+    });
+    assert.equal(fresh.status, 200, 'a post-tombstone assertion represents a re-onboarded actor');
+    assert.equal(up.seen.length, 1);
   } finally {
     up.restore();
     server.close();
@@ -1125,12 +1283,59 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
 test('#54 /v1/disconnect removes the acting user\'s connection; resolve then needs_consent', async (t) => {
   const { server, port, vault } = await makeBroker(t); // seeds U1's acme cred
   try {
-    const d = await post(port, '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    const credentialId = await vault.liveId(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+    const d = await post(port, '/v1/disconnect', { handle: { provider: 'acme', credentialId }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(d.status, 200);
     assert.deepEqual(d.json.revoked, ['acme']);
     assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
     const rv = await post(port, '/v1/resolve', { handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(rv.json.consentState, 'needs_consent');
+  } finally {
+    server.close();
+  }
+});
+
+test('#194 resolve can bind an immediate headless disconnect to one exact credential generation', async (t) => {
+  const { server, port, vault } = await makeBroker(t);
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  try {
+    const resolvedA = await post(port, '/v1/resolve', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      includeCredentialId: true,
+    });
+    assert.equal(resolvedA.status, 200);
+    assert.equal(resolvedA.json.connected, true);
+    assert.equal(typeof resolvedA.json.credentialId, 'string');
+
+    await vault.upsert(owner, 'acme', {
+      accessToken: 'GENERATION_B', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+    });
+    const generationB = await vault.liveId(owner, 'acme');
+    assert.ok(generationB);
+    assert.notEqual(generationB, resolvedA.json.credentialId);
+
+    const stale = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme', credentialId: resolvedA.json.credentialId },
+      identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(stale.status, 409);
+    assert.equal(stale.json.code, 'interaction_state_changed');
+    assert.equal(await vault.liveId(owner, 'acme'), generationB);
+
+    const resolvedB = await post(port, '/v1/resolve', {
+      handle: { provider: 'acme', owner: 'user' },
+      identityToken: signIdentity(claims(), SECRET),
+      includeCredentialId: true,
+    });
+    assert.equal(resolvedB.json.credentialId, generationB);
+    const current = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme', credentialId: resolvedB.json.credentialId },
+      identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(current.status, 200);
+    assert.deepEqual(current.json, { ok: true, revoked: ['acme'] });
+    assert.equal(await vault.has(owner, 'acme'), false);
   } finally {
     server.close();
   }
@@ -1143,7 +1348,8 @@ test('#54 /v1/disconnect acts only on the token identity (a different user is un
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   try {
-    await post(port, '/v1/disconnect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET) });
+    const credentialId = await vault.liveId(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+    await post(port, '/v1/disconnect', { handle: { provider: 'acme', credentialId }, identityToken: signIdentity(claims({ userId: 'U1' }), SECRET) });
     assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
     assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), 'U2 must be untouched');
   } finally {
@@ -1167,8 +1373,9 @@ test('/v1/disconnect reports a referenced revocable credential as only locally r
     return new Response('', { status: 200 });
   }) as any;
   try {
+    const credentialId = await vault.liveId(owner, 'acme');
     const r = await post(port, '/v1/disconnect', {
-      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET),
+      handle: { provider: 'acme', credentialId }, identityToken: signIdentity(claims(), SECRET),
     });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json, { ok: false, revoked: ['acme'] });
@@ -1207,8 +1414,9 @@ test('/v1/disconnect removes a stale stored provider and preserves the success w
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   try {
+    const credentialId = await vault.liveId(owner, 'retired');
     const r = await post(port, '/v1/disconnect', {
-      handle: { provider: 'retired' }, identityToken: signIdentity(claims(), SECRET),
+      handle: { provider: 'retired', credentialId }, identityToken: signIdentity(claims(), SECRET),
     });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json, { ok: false, revoked: ['retired'] });
@@ -1226,8 +1434,9 @@ test('/v1/disconnect reports a committed delete when auditing fails without expo
   const { server, port, vault } = await makeBroker(t, { audit: badAudit });
   const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
   try {
+    const credentialId = await vault.liveId(owner, 'acme');
     const r = await post(port, '/v1/disconnect', {
-      handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET),
+      handle: { provider: 'acme', credentialId }, identityToken: signIdentity(claims(), SECRET),
     });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json, { ok: false, revoked: ['acme'] });
@@ -1238,16 +1447,283 @@ test('/v1/disconnect reports a committed delete when auditing fails without expo
   }
 });
 
+test('/v1/disconnect reports an incomplete fence without losing the committed local removal', async (t) => {
+  const { server, port, vault, db } = await makeBroker(t);
+  const sentinel = 'ghp_HTTP_FENCE_FAILURE_MUST_NOT_ESCAPE';
+  await db.exec(`
+    CREATE FUNCTION fail_http_provisioning_fence() RETURNS trigger AS $$
+    BEGIN
+      RAISE EXCEPTION '${sentinel}';
+    END;
+    $$ LANGUAGE plpgsql;
+    CREATE TRIGGER fail_http_provisioning_fence
+      BEFORE INSERT OR UPDATE ON provisioning_revocation_tombstone
+      FOR EACH ROW EXECUTE FUNCTION fail_http_provisioning_fence();
+  `);
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  try {
+    const credentialId = await vault.liveId(owner, 'acme');
+    const r = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme', credentialId }, identityToken: signIdentity(claims(), SECRET),
+    });
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.json, { ok: false, revoked: ['acme'] });
+    assert.equal(await vault.has(owner, 'acme'), false);
+    assert.ok(!r.raw.includes(sentinel));
+    const row = await db.get<{ meta: string }>(
+      `SELECT meta FROM audit WHERE action='revoke' AND provider='acme'`,
+    );
+    assert.deepEqual(JSON.parse(row!.meta), { ok: false, upstream: 'skipped' });
+    assert.ok(!row!.meta.includes(sentinel));
+  } finally {
+    server.close();
+  }
+});
+
+test('#194 a delayed pre-offboard disconnect cannot revoke a fresh post-offboard credential', async (t) => {
+  const databaseUrl = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl }),
+    openDb({ databaseUrl }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const provider = defineProvider({
+    ...acme,
+    revokeUrl: 'https://acme.example/revoke',
+  });
+  const vaultA = new Vault(dbA, KEY);
+  const vaultB = new Vault(dbB, KEY);
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vaultA.upsert(owner, 'acme', {
+    accessToken: 'OLD_TOKEN', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const staleAssertion = signIdentity(claims(), SECRET);
+  const server = createBroker({
+    providers: [provider], vault: vaultA, audit: new Audit(dbA), db: dbA,
+    identitySecret: identityConfig(SECRET),
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+
+  await offboardUser(vaultB, new Audit(dbB), new Consent(dbB), {
+    enterpriseId: null, teamId: 'T1', userId: 'U1',
+  });
+  // A legitimate new setup occurs after the tombstones. Keep it a separate credential generation.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(await vaultB.upsert(owner, 'acme', {
+    accessToken: 'FRESH_TOKEN', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  }), true);
+  const freshId = await vaultB.liveId(owner, 'acme');
+  assert.ok(freshId);
+  const auditBefore = (await dbB.get<{ n: number }>(
+    `SELECT COUNT(*)::int AS n FROM audit WHERE action='revoke' AND provider='acme'`,
+  ))!.n;
+  const markerBefore = await dbB.get<{ created_at: number }>(
+    `SELECT created_at FROM provisioning_revocation_tombstone
+      WHERE provider='acme' AND scope_kind='team-user'`,
+  );
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  try {
+    const response = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: staleAssertion,
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.json, {
+      error: 'authorization changed; resolve and retry',
+      code: 'interaction_state_changed',
+      retryable: false,
+      recovery: 'resolve_again',
+    });
+    assert.equal(await vaultB.liveId(owner, 'acme'), freshId);
+    assert.equal((await vaultB.get(owner, 'acme'))?.accessToken, 'FRESH_TOKEN');
+    assert.equal(upstreamCalls, 0, 'the stale request must not revoke either token generation');
+    assert.equal((await dbB.get<{ n: number }>(
+      `SELECT COUNT(*)::int AS n FROM audit WHERE action='revoke' AND provider='acme'`,
+    ))!.n, auditBefore);
+    assert.deepEqual(
+      await dbB.get<{ created_at: number }>(
+        `SELECT created_at FROM provisioning_revocation_tombstone
+          WHERE provider='acme' AND scope_kind='team-user'`,
+      ),
+      markerBefore,
+      'a stale disconnect must not advance the provisioning revocation fence',
+    );
+    const replay = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: staleAssertion,
+    });
+    assert.equal(replay.status, 401);
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
+});
+
+test('#194 a delayed assertion cannot retarget disconnect onto a later reconnect', async (t) => {
+  const databaseUrl = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([
+    openDb({ databaseUrl }),
+    openDb({ databaseUrl }),
+  ]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const provider = defineProvider({
+    ...acme,
+    revokeUrl: 'https://acme.example/revoke',
+  });
+  const vaultA = new Vault(dbA, KEY);
+  const vaultB = new Vault(dbB, KEY);
+  const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+  await vaultA.upsert(owner, 'acme', {
+    accessToken: 'GENERATION_A', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const staleAssertion = signIdentity(claims(), SECRET);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await vaultB.upsert(owner, 'acme', {
+    accessToken: 'GENERATION_B', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const generationB = await vaultB.liveId(owner, 'acme');
+  assert.ok(generationB);
+
+  const server = createBroker({
+    providers: [provider], vault: vaultA, audit: new Audit(dbA), db: dbA,
+    identitySecret: identityConfig(SECRET),
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const port = (server.address() as any).port;
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('', { status: 200 });
+  }) as any;
+  try {
+    const response = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: staleAssertion,
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.json, {
+      error: 'connection changed; resolve and retry',
+      code: 'interaction_state_changed',
+      retryable: false,
+      recovery: 'resolve_again',
+    });
+    assert.equal(await vaultB.liveId(owner, 'acme'), generationB);
+    assert.equal((await vaultB.get(owner, 'acme'))?.accessToken, 'GENERATION_B');
+    assert.equal(upstreamCalls, 0);
+    assert.equal(
+      (await dbB.get<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM provisioning_revocation_tombstone`,
+      ))!.n,
+      0,
+    );
+    assert.equal(
+      (await dbB.get<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM audit WHERE action='revoke'`,
+      ))!.n,
+      0,
+    );
+    const replay = await post(port, '/v1/disconnect', {
+      handle: { provider: 'acme' }, identityToken: staleAssertion,
+    });
+    assert.equal(replay.status, 401);
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
+});
+
 test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user', async (t) => {
-  const { server, port, vault } = await makeBroker(t);
+  const { server, port, vault, db } = await makeBroker(t);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
+  const setup = new ChannelProvisioningRequests(db, vault);
+  const target = { enterpriseId: null, teamId: 'T1', userId: 'U2' };
+  assert.ok(await setup.issue(
+    target,
+    'C1',
+    'acme',
+    await vault.userProvisioningIssuedAt(),
+  ));
   try {
     const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET), targetUserId: 'U2' });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.revoked, ['acme']);
     assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), null);
+    assert.equal(
+      (await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM channel_provisioning_request`))?.n,
+      0,
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('#194 team admin offboard reports incomplete when upstream revocation fails', async (t) => {
+  const revocableAcme = defineProvider({
+    ...acme,
+    revokeUrl: 'https://acme.example/revoke',
+  });
+  const { server, port, vault, db } = await makeBroker(t, { providers: [revocableAcme] });
+  const target = { enterpriseId: null, teamId: 'T1', userId: 'U2' };
+  await vault.upsert(userOwner(target), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const realFetch = globalThis.fetch;
+  let upstreamCalls = 0;
+  globalThis.fetch = (async () => {
+    upstreamCalls++;
+    return new Response('refused', { status: 500 });
+  }) as any;
+  try {
+    const response = await post(port, '/v1/admin/offboard', {
+      identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET),
+      targetUserId: target.userId,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.json, { ok: false, revoked: ['acme'] });
+    assert.equal(await vault.get(userOwner(target), 'acme'), null, 'local deletion still commits');
+    assert.equal(upstreamCalls, 1);
+    const row = await db.get<{ meta: string }>(
+      `SELECT meta FROM audit WHERE action='revoke' AND team_id=? AND user_id=?`,
+      [target.teamId, target.userId],
+    );
+    assert.equal(JSON.parse(row!.meta).ok, false);
+    assert.ok(!response.raw.includes(SECRET_TOKEN));
+    assert.ok(!row!.meta.includes(SECRET_TOKEN));
+  } finally {
+    globalThis.fetch = realFetch;
+    server.close();
+  }
+});
+
+test('#194 team admin offboard reports incomplete when its audit row cannot be recorded', async (t) => {
+  let auditCalls = 0;
+  const failingAudit = {
+    record: async () => {
+      auditCalls++;
+      throw new Error('audit unavailable');
+    },
+  } as unknown as Audit;
+  const { server, port, vault } = await makeBroker(t, { audit: failingAudit });
+  const target = { enterpriseId: null, teamId: 'T1', userId: 'U2' };
+  await vault.upsert(userOwner(target), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    const response = await post(port, '/v1/admin/offboard', {
+      identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET),
+      targetUserId: target.userId,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.json, { ok: false, revoked: ['acme'] });
+    assert.equal(await vault.get(userOwner(target), 'acme'), null, 'local deletion still commits');
+    assert.equal(auditCalls, 1);
+    assert.ok(!response.raw.includes(SECRET_TOKEN));
   } finally {
     server.close();
   }
@@ -1268,12 +1744,135 @@ test('#54 /v1/admin/offboard without the signed isAdmin claim -> 403 (forged bod
   }
 });
 
+test('#194 /v1/admin/offboard rejects an assertion issued before the acting admin was offboarded', async (t) => {
+  const { server, port, vault, db } = await makeBroker(t);
+  const actor = { enterpriseId: null, teamId: 'T1', userId: 'ADMIN' };
+  const target = { enterpriseId: null, teamId: 'T1', userId: 'U2' };
+  await vault.upsert(userOwner(target), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const stale = signIdentity(claims({ userId: actor.userId, isAdmin: true }), SECRET);
+  await new Consent(db).markOffboarded(actor);
+  try {
+    const response = await post(port, '/v1/admin/offboard', {
+      identityToken: stale,
+      targetUserId: target.userId,
+    });
+    assert.equal(response.status, 409);
+    assert.equal(response.json.code, 'interaction_state_changed');
+    assert.equal(response.json.recovery, 'resolve_again');
+    assert.ok(await vault.get(userOwner(target), 'acme'), 'the stale admin cannot remove the target');
+    assert.equal(
+      (await db.get<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
+        [target.teamId, target.userId],
+      ))?.n,
+      0,
+      'the refused actor writes no target tombstone',
+    );
+  } finally {
+    server.close();
+  }
+});
+
 test('#54 /v1/admin/offboard requires a targetUserId', async (t) => {
   const { server, port } = await makeBroker(t);
   try {
     const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ isAdmin: true }), SECRET) });
     assert.equal(r.status, 400);
   } finally {
+    server.close();
+  }
+});
+
+test('#194 enterprise offboard binds the target in the signed admin assertion', async (t) => {
+  const { server, port, vault, db } = await makeBroker(t);
+  const foreign = { enterpriseId: null, teamId: 'T_FOREIGN', userId: 'U_FOREIGN' };
+  await vault.upsert(userOwner(foreign), 'acme', {
+    accessToken: 'FOREIGN_USER_TOKEN', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    const forged = await post(port, '/v1/admin/offboard', {
+      identityToken: signIdentity(claims({
+        userId: 'ADMIN',
+        isAdmin: true,
+        enterpriseId: 'E1',
+        offboardTargetUserId: 'U_E1_MEMBER',
+      }), SECRET),
+      targetUserId: foreign.userId,
+    });
+    assert.equal(forged.status, 403);
+    assert.deepEqual(forged.json, { error: 'signed offboard target required' });
+    assert.ok(await vault.get(userOwner(foreign), 'acme'));
+    assert.equal(
+      (await db.get<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM user_offboard_scope_tombstone WHERE user_id=?`,
+        [foreign.userId],
+      ))?.n,
+      0,
+      'a body-selected foreign target must not gain even an unscoped tombstone',
+    );
+  } finally {
+    server.close();
+  }
+});
+
+test('#194 enterprise offboard accepts the exact signed target', async (t) => {
+  const { server, port, vault } = await makeBroker(t);
+  const target = { enterpriseId: 'E1', teamId: 'T_E1_MEMBER', userId: 'U_E1_MEMBER' };
+  await vault.upsert(userOwner(target), 'acme', {
+    accessToken: 'E1_USER_TOKEN', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  try {
+    const response = await post(port, '/v1/admin/offboard', {
+      identityToken: mintIdentity({
+        teamId: 'T1',
+        userId: 'ADMIN',
+        channel: 'C1',
+        isAdmin: true,
+        enterpriseId: target.enterpriseId,
+        offboardTargetUserId: target.userId,
+      }, SECRET),
+      targetUserId: target.userId,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.json, { ok: true, revoked: ['acme'] });
+    assert.equal(await vault.get(userOwner(target), 'acme'), null);
+  } finally {
+    server.close();
+  }
+});
+
+test('#194 enterprise admin offboard includes a team with upstream debt in incompleteTeams', async (t) => {
+  const revocableAcme = defineProvider({
+    ...acme,
+    revokeUrl: 'https://acme.example/revoke',
+  });
+  const { server, port, vault } = await makeBroker(t, { providers: [revocableAcme] });
+  const target = { enterpriseId: 'E1', teamId: 'T_E1_MEMBER', userId: 'U_E1_MEMBER' };
+  await vault.upsert(userOwner(target), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response('refused', { status: 500 })) as any;
+  try {
+    const response = await post(port, '/v1/admin/offboard', {
+      identityToken: mintIdentity({
+        teamId: 'T1',
+        userId: 'ADMIN',
+        channel: 'C1',
+        isAdmin: true,
+        enterpriseId: target.enterpriseId,
+        offboardTargetUserId: target.userId,
+      }, SECRET),
+      targetUserId: target.userId,
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.json, { ok: false, revoked: ['acme'], incompleteTeams: 1 });
+    assert.equal(await vault.get(userOwner(target), 'acme'), null, 'local deletion still commits');
+    assert.ok(!response.raw.includes(SECRET_TOKEN));
+  } finally {
+    globalThis.fetch = realFetch;
     server.close();
   }
 });
@@ -1593,7 +2192,7 @@ test('#53 admin reference rejects invalid input before connection, mode, or audi
 
 test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async (t) => {
   const { server, port, channelConfig } = await makeAdminBroker(t);
-  await channelConfig.setMode('T1', 'C1', 'acme', 'per-user');
+  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'per-user');
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
@@ -1623,6 +2222,168 @@ async function makeMultiBroker(t: TestContext, extra: Partial<Parameters<typeof 
   await new Promise<void>((r) => server.listen(0, r));
   return { server, db, port: (server.address() as any).port };
 }
+
+test('#194 stale assertions cannot read resolve, status, or the channel manifest and remain single-use', async (t) => {
+  const { server, db, port } = await makeMultiBroker(t);
+  const routes = [
+    {
+      name: 'resolve',
+      path: '/v1/resolve',
+      body: (identityToken: string) => ({
+        handle: { provider: 'acme', owner: 'user' },
+        identityToken,
+      }),
+      assertFresh: (json: any) => assert.deepEqual(json, {
+        connected: true,
+        consentState: 'connected',
+      }),
+    },
+    {
+      name: 'status',
+      path: '/v1/status',
+      body: (identityToken: string) => ({ identityToken }),
+      assertFresh: (json: any) => {
+        const byId = Object.fromEntries(json.providers.map((provider: any) => [provider.provider, provider]));
+        assert.deepEqual(byId.acme, { provider: 'acme', connected: true, consentState: 'connected' });
+        assert.deepEqual(byId.other, { provider: 'other', connected: false, consentState: 'needs_consent' });
+        assert.equal(byId.svc, undefined);
+      },
+    },
+    {
+      name: 'channel manifest',
+      path: '/v1/manifest',
+      body: (identityToken: string) => ({ identityToken }),
+      assertFresh: (json: any) => {
+        const byId = Object.fromEntries(json.tools.map((tool: any) => [tool.provider, tool]));
+        assert.deepEqual(byId.acme, { provider: 'acme', mode: null, enabled: true, identity: 'acting_human' });
+        assert.equal(byId.svc.identity, 'service');
+      },
+    },
+  ].map((route) => ({ ...route, staleBody: route.body(signIdentity(claims(), SECRET)) }));
+  await new Consent(db).markOffboarded({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+
+  try {
+    for (const route of routes) {
+      const refused = await post(port, route.path, route.staleBody);
+      assert.equal(refused.status, 409, `${route.name} must reject the pre-offboard assertion`);
+      assert.deepEqual(refused.json, {
+        error: 'authorization changed; resolve and retry',
+        code: 'interaction_state_changed',
+        retryable: false,
+        recovery: 'resolve_again',
+      });
+      const replay = await post(port, route.path, route.staleBody);
+      assert.equal(replay.status, 401, `${route.name} must spend even a refused assertion`);
+      assert.deepEqual(replay.json, { error: 'invalid identity token' });
+    }
+
+    // Headless issuance mapping subtracts the accepted clock-skew window. Move the test marker back
+    // by that uncertainty to represent enough elapsed time for genuine post-tombstone assertions.
+    await db.run(
+      `UPDATE offboard_tombstone SET created_at=created_at-? WHERE team_id=? AND user_id=?`,
+      [IDENTITY_SKEW_MS + 1, 'T1', 'U1'],
+    );
+    for (const route of routes) {
+      const fresh = await post(port, route.path, route.body(signIdentity(claims(), SECRET)));
+      assert.equal(fresh.status, 200, `${route.name} accepts a post-tombstone assertion`);
+      route.assertFresh(fresh.json);
+    }
+  } finally {
+    server.close();
+  }
+});
+
+test('#194 stale assertions reach no mutation-route probe, denial audit, or state', async (t) => {
+  const { server, db, port } = await makeBrokerOn(t, (sharedDb) => ({
+    providers: [acme, svc],
+    baseUrl: 'https://broker.example',
+    channelConfig: new ChannelConfig(sharedDb),
+    channelTools: new ChannelTools(sharedDb),
+    resolvers: { 'aws-sm': async () => SECRET_TOKEN },
+  }));
+  const staleClaims = { isAdmin: false, channelEligible: false };
+  const routes = [
+    {
+      name: 'disconnect',
+      path: '/v1/disconnect',
+      body: (identityToken: string) => ({
+        handle: { provider: 'not-registered' },
+        identityToken,
+      }),
+    },
+    {
+      name: 'admin offboard',
+      path: '/v1/admin/offboard',
+      body: (identityToken: string) => ({ identityToken, targetUserId: 'U2' }),
+    },
+    {
+      name: 'admin reference',
+      path: '/v1/admin/reference',
+      body: (identityToken: string) => ({
+        handle: { provider: 'not-registered' },
+        identityToken,
+        secretRef: 'not-a-reference',
+      }),
+    },
+    {
+      name: 'admin mode',
+      path: '/v1/admin/mode',
+      body: (identityToken: string) => ({
+        provider: 'not-registered', mode: 'shared', identityToken,
+      }),
+    },
+    {
+      name: 'admin tools',
+      path: '/v1/admin/tools',
+      body: (identityToken: string) => ({
+        provider: 'not-registered', enabled: false, identityToken,
+      }),
+    },
+    {
+      name: 'connect',
+      path: '/v1/connect',
+      body: (identityToken: string) => ({
+        handle: { provider: 'not-registered' }, identityToken,
+      }),
+    },
+    {
+      name: 'user reference',
+      path: '/v1/user/reference',
+      body: (identityToken: string) => ({
+        handle: { provider: 'not-registered' },
+        identityToken,
+        secretRef: 'not-a-reference',
+      }),
+    },
+  ].map((route) => ({
+    ...route,
+    request: route.body(signIdentity(claims(staleClaims), SECRET)),
+  }));
+  await new Consent(db).markOffboarded({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
+
+  try {
+    for (const route of routes) {
+      const refused = await post(port, route.path, route.request);
+      assert.equal(refused.status, 409, `${route.name} must reject before route-specific work`);
+      assert.deepEqual(refused.json, {
+        error: 'authorization changed; resolve and retry',
+        code: 'interaction_state_changed',
+        retryable: false,
+        recovery: 'resolve_again',
+      });
+      const replay = await post(port, route.path, route.request);
+      assert.equal(replay.status, 401, `${route.name} must spend the refused assertion`);
+      assert.deepEqual(replay.json, { error: 'invalid identity token' });
+    }
+    assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit`))!.n, 0);
+    assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM connection`))!.n, 1);
+    assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))!.n, 0);
+    assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM channel_config`))!.n, 0);
+    assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM channel_tool`))!.n, 0);
+  } finally {
+    server.close();
+  }
+});
 
 test('#55 /v1/status batches connection state across brokered providers (service omitted)', async (t) => {
   const { server, port } = await makeMultiBroker(t);
@@ -1718,10 +2479,117 @@ test('#58 user reference stores the acting user\'s ref; their fetch resolves it 
   }
 });
 
+test('#194 a pre-offboard identity token cannot recreate a user reference on another replica', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([openDb({ databaseUrl: url }), openDb({ databaseUrl: url })]);
+  t.after(() => Promise.all([dbA.close(), dbB.close()]));
+  const vaultA = new Vault(dbA, KEY);
+  const server = createBroker({
+    providers: [acme],
+    vault: vaultA,
+    audit: new Audit(dbA),
+    db: dbA,
+    identitySecret: identityConfig(SECRET),
+    resolvers: { 'aws-sm': async () => SECRET_TOKEN },
+    baseUrl: 'https://broker.example',
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  t.after(() => server.close());
+  const port = (server.address() as any).port;
+  const oldReferenceToken = signIdentity(claims(), SECRET);
+  const oldConnectToken = signIdentity(claims(), SECRET);
+
+  await offboardUser(
+    new Vault(dbB, KEY),
+    new Audit(dbB),
+    new Consent(dbB),
+    { enterpriseId: null, teamId: 'T1', userId: 'U1' },
+  );
+  const response = await post(port, '/v1/user/reference', {
+    handle: { provider: 'acme' },
+    identityToken: oldReferenceToken,
+    secretRef: AWS_USER_REF,
+  });
+
+  assert.equal(response.status, 409);
+  assert.deepEqual(response.json, {
+    error: 'authorization changed; resolve and retry',
+    code: 'interaction_state_changed',
+    retryable: false,
+    recovery: 'resolve_again',
+  });
+  assert.equal(await vaultA.has(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), false);
+  assert.equal((await dbA.get<any>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='config'`)).n, 0);
+
+  const connect = await post(port, '/v1/connect', {
+    handle: { provider: 'acme' },
+    identityToken: oldConnectToken,
+  });
+  assert.equal(connect.status, 409);
+  assert.deepEqual(connect.json, response.json);
+  assert.equal((await dbA.get<any>(`SELECT COUNT(*)::int AS n FROM consent_request`)).n, 0);
+});
+
+test('#194 enterprise offboard fences old headless setup on an artifact-free team', async (t) => {
+  const url = await testDbUrl(t);
+  const [dbA, dbB] = await Promise.all([openDb({ databaseUrl: url }), openDb({ databaseUrl: url })]);
+  t.after(() => Promise.all([dbA.close(), dbB.close()]));
+  const vaultA = new Vault(dbA, KEY);
+  const server = createBroker({
+    providers: [acme],
+    vault: vaultA,
+    audit: new Audit(dbA),
+    db: dbA,
+    identitySecret: identityConfig(SECRET),
+    resolvers: { 'aws-sm': async () => SECRET_TOKEN },
+    baseUrl: 'https://broker.example',
+  });
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  t.after(() => server.close());
+  const port = (server.address() as any).port;
+  const identity = { enterpriseId: 'E1', teamId: 'T_EMPTY', userId: 'U_EMPTY' };
+  const oldReferenceToken = signIdentity(claims(identity), SECRET);
+  const oldConnectToken = signIdentity(claims(identity), SECRET);
+
+  const summary = await offboardUserEverywhere(
+    dbB,
+    new Vault(dbB, KEY),
+    new Audit(dbB),
+    new Consent(dbB),
+    { enterpriseId: identity.enterpriseId, userId: identity.userId },
+  );
+  assert.deepEqual(summary, [], 'precondition: no team artifact existed for discovery');
+
+  const reference = await post(port, '/v1/user/reference', {
+    handle: { provider: 'acme' },
+    identityToken: oldReferenceToken,
+    secretRef: AWS_USER_REF,
+  });
+  assert.equal(reference.status, 409);
+  assert.deepEqual(reference.json, {
+    error: 'authorization changed; resolve and retry',
+    code: 'interaction_state_changed',
+    retryable: false,
+    recovery: 'resolve_again',
+  });
+
+  const connect = await post(port, '/v1/connect', {
+    handle: { provider: 'acme' },
+    identityToken: oldConnectToken,
+  });
+  assert.equal(connect.status, 409);
+  assert.deepEqual(connect.json, reference.json);
+  assert.equal(await vaultA.has(userOwner(identity), 'acme'), false);
+  assert.equal((await dbA.get<any>(`SELECT COUNT(*)::int AS n FROM consent_request`)).n, 0);
+  assert.equal((await dbA.get<any>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='config'`)).n, 0);
+});
+
 test('#58 resolver failure returns a stable code without resolver text or the reference', async (t) => {
   const sentinel = 'ghp_RESOLVER_WIRE_SENTINEL';
+  const events: VouchrEvent[] = [];
   const { server, port } = await makeRefBroker(t, {
     resolvers: { 'aws-sm': async () => { throw new Error(`${sentinel}:${AWS_USER_REF}`); } },
+    onEvent: (event) => events.push(event),
   });
   try {
     const configured = await post(port, '/v1/user/reference', {
@@ -1735,19 +2603,30 @@ test('#58 resolver failure returns a stable code without resolver text or the re
       path: '/x',
     });
     assert.equal(response.status, 502);
-    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.deepEqual(response.json, {
+      error: 'credential resolution failed',
+      code: 'resolver_failed',
+      retryable: true,
+      recovery: 'retry_later',
+    });
     assert.ok(!response.raw.includes(sentinel));
     assert.ok(!response.raw.includes(AWS_USER_REF));
+    assert.deepEqual(
+      events.filter((event) => event.type === 'resolver_failed'),
+      [{ type: 'resolver_failed', provider: 'acme', source: 'aws-sm' }],
+    );
   } finally {
     server.close();
   }
 });
 
-test('#58 malformed stored reference returns resolver_failed before resolver or provider I/O', async (t) => {
+test('#58 malformed stored reference returns resolver_configuration_error before resolver or provider I/O', async (t) => {
   const malformed = 'arn:aws:secretsmanager:malformed-reference-sentinel';
   let resolverCalls = 0;
+  const events: VouchrEvent[] = [];
   const { server, port, vault } = await makeRefBroker(t, {
     resolvers: { 'aws-sm': async () => { resolverCalls++; return SECRET_TOKEN; } },
+    onEvent: (event) => events.push(event),
   });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
@@ -1764,9 +2643,15 @@ test('#58 malformed stored reference returns resolver_failed before resolver or 
       path: '/x',
     });
     assert.equal(response.status, 502);
-    assert.deepEqual(response.json, { error: 'credential resolution failed', code: 'resolver_failed' });
+    assert.deepEqual(response.json, {
+      error: 'credential resolution failed',
+      code: 'resolver_configuration_error',
+      retryable: false,
+      recovery: 'fix_configuration',
+    });
     assert.equal(resolverCalls, 0);
     assert.equal(up.seen.length, 0);
+    assert.equal(events.filter((event) => event.type === 'resolver_failed').length, 0);
     assert.ok(!response.raw.includes(malformed));
   } finally {
     up.restore();

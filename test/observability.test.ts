@@ -8,6 +8,7 @@ import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { github, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
+import { TokenEndpointError } from '../src/core/tokens';
 
 const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -203,7 +204,12 @@ test('observability: a throwing refresh cancels the discarded 401 body and still
     return new Response(body, { status: 401 });
   }) as any;
   try {
-    await assert.rejects(() => handle.fetch('https://api.acme.example/data'), /token endpoint down/);
+    await assert.rejects(
+      () => handle.fetch('https://api.acme.example/data'),
+      (error: unknown) => error instanceof TokenEndpointError
+        && error.kind === 'transient'
+        && error.message === 'Token endpoint request failed',
+    );
   } finally {
     globalThis.fetch = realFetch;
   }

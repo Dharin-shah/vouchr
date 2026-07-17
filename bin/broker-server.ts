@@ -11,14 +11,15 @@ import http from 'node:http';
 import { openDb, type Db } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { createBroker, normalizeBrokerResourceBounds, type BrokerOptions } from '../src/adapters/http/broker';
+import {
+  createBroker,
+  normalizeBrokerResourceBounds,
+  type BrokerOptions,
+  type BrokerServer,
+} from '../src/adapters/http/broker';
 import { loadIdentityConfig, type IdentityConfig } from '../src/adapters/http/identity';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
-import { Consent } from '../src/core/consent';
-import { SessionGrants } from '../src/core/session';
-import { sweepExpired } from '../src/core/sweep';
-import { Approvals } from '../src/core/approval';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
 import { loadProviders } from './providerConfig';
@@ -30,7 +31,7 @@ function fail(msg: string): never {
 }
 
 export interface BuiltBroker {
-  server: http.Server;
+  server: BrokerServer;
   db: Db;
   port: number;
   backend: 'postgres';
@@ -38,8 +39,9 @@ export interface BuiltBroker {
   allowWrites: boolean;
   /** #116 dry-run: real gates, no real network on any edge (VOUCHR_DRY_RUN). */
   dryRun: boolean;
-  /** #54 TTL sweep: delete expired connections + stale consent + expired thread grants. Idempotent,
-   *  so overlapping runs across replicas are safe (noisy, not destructive). Returns the count swept. */
+  /** Backward-compatible alias for server.sweepExpired(). The broker-owned sweep also reclaims its
+   *  private interaction rows without exposing their mutation stores; the number counts expired
+   *  credentials only. */
   sweep: () => Promise<number>;
   /** #54 sweep interval (ms); 0 disables the timer (VOUCHR_SWEEP_INTERVAL_MS). Default hourly. */
   sweepIntervalMs: number;
@@ -221,9 +223,8 @@ export async function buildBrokerServer(
   // #116 startup hard-fail (createBroker re-runs the same check lazily): never dry-run a real vault.
   if (dryRun) await assertDryRunVault(db);
   const vault = new Vault(db, masterKey, ttl, envelope);
-  // #116: the SAME marked audit instance goes to createBroker AND the local sweep closure below, so
-  // sweep-written rows (revoke reason 'expired') carry meta.dry_run too — createBroker only wraps
-  // its own copy, which would leave the sweep writing unmarked rows.
+  // #116: the SAME marked audit instance goes to createBroker and its broker-owned sweep, so
+  // sweep-written rows (revoke reason 'expired') carry meta.dry_run too.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
   // createBroker always uses DbReplayStore (shared jti table), so a scaled fleet gets cluster-wide
   // single-use with no alternate replay path to wire here. #100/#212.
@@ -259,16 +260,10 @@ export async function buildBrokerServer(
     onCredentialHealth: overrides.onCredentialHealth,
   });
 
-  // #54 TTL sweep, wired the same way the Bolt path does (core sweepExpired + session-grant sweep).
-  const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
-  const approvals = new Approvals(db); // #113: expired approval prompts/grants are reclaimed (and audited) too
-  const sweep = async (): Promise<number> => {
-    // #117: the deployer's onCredentialHealth override (if any) also hears expiring_soon/expired.
-    const n = await sweepExpired(vault, audit, consent, undefined, overrides.onCredentialHealth, approvals);
-    await sessions.sweepExpired();
-    return n;
-  };
+  // Preserve BuiltBroker.sweep for existing packaged-server integrations while delegating to the
+  // same broker-owned facade direct createBroker consumers use. That facade owns every private
+  // interaction store, so the packaged and direct paths cannot drift.
+  const sweep = () => server.sweepExpired();
   if (configuredPolicy?.defaultDeny && configuredPolicy.ruleCount === 0) {
     console.warn('[vouchr] static policy has defaultDeny=true and zero rules; all providers are denied');
   }

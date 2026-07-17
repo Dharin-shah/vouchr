@@ -1,6 +1,9 @@
 {
   "status": 504,
   "shape": {
-    "error": "string"
+    "code": "string",
+    "error": "string",
+    "recovery": "string",
+    "retryable": "boolean"
   }
 }

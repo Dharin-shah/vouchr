@@ -7,7 +7,138 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
-- **Declarative packaged channel policy** (#236). The standalone broker now accepts static
+- **Broker-owned lifecycle sweep** (#194). Direct `createBroker()` deployments now receive a typed
+  `BrokerServer.sweepExpired()` facade that reclaims expired credentials and every private consent,
+  approval, session, and provisioning family without exporting raw interaction mutators.
+  `buildBrokerServer()` delegates its existing `sweep()` alias to the same method, so packaged and
+  direct deployments cannot drift. The numeric result remains the expired-credential deletion
+  count for compatibility; all interaction families are still swept on every call, and configured
+  event/credential-health hooks fire only after committed cleanup.
+- **Offboard-fenced user provisioning** (#194). Every user credential write now passes one core
+  PostgreSQL fence: OAuth (including dry-run), direct/static keys, and external references cannot
+  commit after an earlier offboard intent. Slack key setup mints one opaque, actor/provider-bound
+  request when the prompt is produced; its button carries only that id, repeated prompts converge,
+  and final single-use consumption, credential write, satellite invalidation, and config audit are
+  atomic across replicas. Channel credential setup now uses the same shape: Slack's trigger is
+  consumed into an authority-free loading view before admin/channel reads, then PostgreSQL binds an
+  opaque actor/channel/provider request that the final credential transaction consumes exactly once.
+  Duplicate submits cannot rotate the credential or duplicate its audit, a modal opened before a
+  confirmed revoke cannot later recreate authority, and Slack open/update rejection is reported as
+  unknown acceptance rather than definite failure. A PostgreSQL channel-interaction tombstone binds
+  setup to the original Slack receipt, so a credential, mode, or tool mutation that commits while
+  the loading view or admin checks are pending prevents stale form hydration; same-value governance
+  retries preserve live forms. Envelope/KMS preparation happens before lifecycle locks, so external
+  key wrapping cannot delay an acting admin's offboarding fence. A prompt/modal delivered before
+  offboarding, or before a sibling credential write, cannot later recreate or overwrite access.
+  Retained Bolt handles and headless assertions are also compared with the acting user's tombstone
+  before secret access and again at the provider-send boundary. This applies when a current shared
+  channel credential intentionally survives another user's departure: the departed actor loses use,
+  while a current actor can resolve fresh authority and continue using the channel credential.
+  Authenticated broker reads and mutations reject a pre-offboard assertion with exact typed `409
+  interaction_state_changed` before provider, registry, config, credential, or audit discovery; the
+  consumed assertion then replays as `401`, while every mutation retains its final under-lock fence.
+  Pending and granted exact-action approvals requested by the departed user are purged best-effort;
+  their trusted creation times remain tombstone-fenced at decision and consumption, and an approver's
+  own pre-offboard control receipt cannot decide later. A requester-stale decision also removes the
+  exact parked row atomically, so it cannot block an identical fresh request until TTL. Once a request passes the final provider-send
+  fence and is dispatched, later offboarding cannot recall it. Headless OAuth/reference provisioning
+  and retained use derive a conservative
+  PostgreSQL-clock issuance from the verified deployment-bound identity token, so an old token cannot
+  gain or exercise fresh authority merely by being presented later. Enterprise/global
+  offboarding writes a scope tombstone before artifact discovery, so the same rule covers a Grid
+  workspace in which the user had no row yet; the Grid target itself is bound into the signed admin
+  assertion rather than trusted from the request body. Team and Grid admin-offboard responses now
+  retain locally removed providers but set `ok:false` for known upstream-revocation or audit debt;
+  Grid counts the affected workspace in `incompleteTeams`. The public `offboardUser` array remains
+  source-compatible and means local removal only. Schema v10 adds the bounded
+  `user_provisioning_request`, `channel_provisioning_request`, `channel_interaction_tombstone`,
+  `user_offboard_scope_tombstone`, and `provisioning_revocation_tombstone` tables. Ordinary
+  disconnect/delete also establishes the exact provisioning marker before local removal, so a
+  cleanup fallback cannot let an older key form or OAuth callback recreate a credential while the
+  deletion is reported complete. Vouchr-owned Home/config Disconnect controls carry the opaque
+  credential-generation id; an old delivered button cannot delete, revoke, or audit a replacement
+  connection. Provider-addressed Slack/headless disconnects additionally compare the trusted
+  receipt/assertion time with a PostgreSQL `connection.generation_at` boundary, so a delayed request
+  cannot retarget a reconnect created after it was issued. Existing rows receive that boundary at
+  the required drained v10 migration; idempotent migration preserves it. Headless `/v1/resolve`
+  optionally returns the authority-free opaque generation for an exact `/v1/disconnect` retry,
+  avoiding a clock-skew wait while preserving the default resolve response. A confirmed break-glass revoke commits one exact
+  provider+owner scope marker before cleanup, so an older matching OAuth/key/reference or shared
+  channel write cannot land after the CLI reports no local access. Scope ids persist only as fixed
+  hashes; sibling scopes and genuinely new post-marker setup remain usable. The schema requires the
+  documented drained v8 (or prerelease-v9) → v10 migration. Long-lived
+  refresh-failure DMs no longer contain a reconnect action; legacy buttons only return fixed stale
+  guidance and never mint consent, so a pre-offboard notification cannot become post-offboard authority.
+- **Stable typed recovery contract** (#194, API/integrator slice). Both `@vouchr/core` and the
+  Bolt-free `@vouchr/core/headless` entrypoint now export the same operational error classes,
+  runtime machine-code/recovery registries, and one core `mapSafeError()` result:
+  `{ code, message, retryable, recovery, retryAfterMs? }` (`retryAfterMs` is milliseconds).
+  Recovery is a closed `connect` / `request_approval` / `resolve_again` / `retry_later` /
+  `fix_configuration` / `contact_admin` category, so trusted hosts no longer match prose. The Bolt `safeUserMessage()`
+  helper delegates to that mapper. Foreign provider/resolver/KMS/database messages and class names
+  collapse to fixed `internal_error` copy; exported error constructors that accept text are not
+  treated as a rendering trust boundary. `UserFacingError` remains the deliberate explicit opt-in
+  for fixed Vouchr-authored copy, with runtime validation that rejects recovery values outside the
+  published registry. Token endpoint errors retain the legacy `definitive` boolean and add a closed
+  `credential` / `configuration` / `transient` kind so `invalid_grant`, OAuth client/config errors,
+  and RFC transient codes plus 408/429/5xx/network/timeout failures cannot share false retry advice.
+  Resolver configuration failures and invalid fulfilled values use non-retryable
+  `resolver_configuration_error`; configured throws and deadlines retain retryable
+  `resolver_failed`. Both fail before provider egress without being misreported as unknown upstream
+  outcomes. Policy and channel-tool governance denials now have
+  distinct non-retryable `policy_denied` / `tool_disabled` codes routed to `contact_admin`.
+  Packed Node 22 consumers import and `instanceof`
+  every documented class and exercise
+  the mapper from both supported entrypoints; the headless graph remains Slack/Bolt-free.
+- **Persistent, single-use Slack interaction state** (#194). Thread-session prompts now store one
+  short-lived opaque request per exact workspace/user/channel/thread/provider context in PostgreSQL;
+  Block Kit carries only that id. Repeated turns converge on one row/request audit and use a delivery
+  lease for best-effort prompt deduplication; an ambiguous Slack timeout can still lead to another
+  externally delivered prompt after lease takeover. Clicks bind to the Slack-signed conversation,
+  acknowledge before dependency work, and revalidate current provider,
+  mode, policy, and tool access under the same cross-replica lifecycle locks as governance writers.
+  Request/grant consumption and audit companions commit atomically; audit failure rolls back the
+  control mutation, duplicate clicks get one success plus a fixed stale receipt, reconnect/offboard/
+  expiry and mode/tool changes purge dependent state, and a durable offboard fence closes the
+  grant-vs-deprovision race. Generic write approvals now use the same persisted discipline: exact
+  live actions deduplicate across replicas, decision and consumption audits are atomic, current
+  owner/mode/policy/tool/credential state is rechecked at the mutation, and governance ABA changes
+  invalidate both pending controls and live grants. The dedup index uses a bounded, length-framed
+  SHA-256 action key while every SQL authority check still compares all full fields, so multi-KiB
+  paths remain exact without exceeding PostgreSQL btree limits. Raw paths never enter Slack, public
+  errors, or audit; those surfaces receive a credential-salted exact-action fingerprint. Approval
+  authority also binds the canonical URL origin (scheme, hostname, and effective port), while the
+  existing hostname-only Slack/audit shape remains stable; schema v9 stores that exact origin and
+  drains any pre-origin pending rows fail-closed.
+  Request methods are canonicalized once at the core boundary; malformed, empty, control-character,
+  Unicode-lookalike, and Fetch-forbidden values fail before approval, audit, Slack, or credential
+  state is touched, and the exact canonical method used for policy decisions is sent upstream.
+  Same-value tool configuration retries no longer purge valid interaction authority; only an
+  effective bit change does. Gated OAuth credential writes now take the user's durable offboard
+  fence inside the credential transaction, so either the write commits first and offboarding sees
+  and deletes it, or the tombstone commits first and the write is refused.
+  Paths are capped at 16 KiB before mutable gates or secret reads, and oversized input fails with
+  fixed retry guidance and leaves no pending row. Schema version 9 adds `session_request` and the
+  bounded approval action key plus exact `credential_id` bindings; those v9 additions clear pre-v9
+  approval/session authority and legacy application-clock consent/tombstone rows fail-closed. Schema
+  v10 separately adds the provisioning-fence tables and invalidates all pre-v10 consent while
+  preserving already-bound v9 session/approval rows. Both paths require the drained cutover and
+  old-assertion horizon documented in the deployment guide. Prompt-delivery leases, consent/offboard
+  fences, and session/approval interaction TTLs use the PostgreSQL clock, so replica clock skew cannot
+  steal or stretch authority. Ambiguous Slack request/network failure retains a decidable live
+  lease and blocks immediate duplicate delivery. SDK-confirmed platform rejection or rate limiting
+  instead clears only the caller's claimed lease (or removes its newly created row), so recovery is
+  truthful and a later retry is not parked behind a prompt Slack definitely did not deliver. This is an
+  intentional source-breaking security cutover: `SessionGrants` and `Approvals` are no longer
+  package exports until the safe headless interaction bridge lands, and `ChannelConfig`/
+  `ChannelTools` are read stores whose raw `setMode`, `setEnabled`, and `applyEnabled` methods are
+  removed. `ApprovalRequiredError.path` is replaced by the bounded, salted `actionFingerprint` field.
+  Supported writes use packaged Bolt/App Home or the broker admin routes so authorization,
+  lifecycle locks, dependent-state purge, and audit cannot be bypassed. The shared typed recovery
+  contract adds `interaction_state_changed` with `recovery: 'resolve_again'` and
+  `approval_path_too_large` with `recovery: 'fix_configuration'`; both are non-retryable so callers
+  must never blindly replay the original request.
+- **Declarative packaged channel policy** (#236). The standalone broker accepts static
   provider-by-channel policy through exactly one of `VOUCHR_POLICY` (inline JSON) or
   `VOUCHR_POLICY_FILE` (the same JSON from a file). Configuration is validated fail-closed at boot:
   unknown fields, invalid rule shapes, conflicting sources, and provider IDs absent from the
@@ -44,7 +175,9 @@ All notable changes to this project are documented here. This project adheres to
   updates the credential but replays only idempotent methods — a non-idempotent write is never
   auto-resent. The exported `BrokerError` wire type now describes overload `scope` and retry hints;
   new `BrokerOptions` configure fetch, admission, and inbound timeout bounds, while the packaged
-  broker exposes a separate graceful-shutdown deadline. Opt-in load harness: `npm run bench:perf`.
+  broker exposes a separate graceful-shutdown deadline. The AWS Secrets Manager example resolver
+  forwards Vouchr's optional `AbortSignal` into the SDK request, with a regression proving the
+  underlying operation receives cancellation. Opt-in load harness: `npm run bench:perf`.
 - **Deployment-bound, replay-safe broker identity assertions** (#212). A signed identity token is now
   bound to one deployment: the packaged broker builds an `IdentityConfig` from env
   (`loadIdentityConfig`) with a verified issuer (`VOUCHR_IDENTITY_ISSUER`, default `vouchr`) and
@@ -99,6 +232,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **Breaking wire expansion — typed broker recovery metadata** (#194). Typed `/v1/fetch` and
+  `/v1/mcp` failures now add stable `code`, `retryable`, and `recovery` fields (plus the existing
+  millisecond `retryAfterMs` where applicable) while retaining established `error` prose and HTTP
+  status. This covers not-connected (with distinct user-connect vs shared-channel-configuration
+  recovery), session/human approval, egress/response policy, resolver configuration/runtime failure,
+  token endpoint classification, unknown-outcome timeouts, MCP opt-in/path policy, rate limiting,
+  overload, and masked pre-handle/extension failures; `approvalId` remains an opaque pending handle, not
+  authority. `BrokerError` now types those fields and `approvalId`. Clients that require an exact
+  JSON key set must accept the additive fields and branch on `code`/`recovery`, never `error` text.
 - **Breaking wire expansion — service-tool governance** (#240). `GET /v1/admin/config` now includes
   registered `identity:'service'` providers with `mode:null` and their real channel `enabled` bit,
   matching `POST /v1/manifest`. Clients that assumed every config row was a brokered credential
@@ -188,7 +330,7 @@ All notable changes to this project are documented here. This project adheres to
   creation moves to a separately invoked, advisory-locked `vouchr migrate` command run with a
   schema-owner role; runtime replicas connect with a DML-only role and never create tables (`openDb`
   verifies the schema version and fails closed if un-migrated). The schema version stays monotonic
-  (`SCHEMA_VERSION = 8`, past the pre-#204 max of 6); `migrate` carries legacy v6/v7 databases to
+  (`SCHEMA_VERSION = 10`, past the pre-#204 max of 6); `migrate` carries legacy v6/v7/v8/v9 databases to
   head, dropping `union_optin`/`channel_preview` and converting stored `union` modes to `per-user`. TLS is native
   (`sslmode=` in the URL); the pool sets `application_name`, a validated `VOUCHR_PG_POOL_MAX`, and a
   connection lifetime. Tests and CI run against a real PostgreSQL container (`npm run pg:up`).
@@ -573,10 +715,13 @@ All notable changes to this project are documented here. This project adheres to
 
 - `vouchr revoke` CLI — break-glass bulk revocation for incident response:
   `vouchr revoke --provider <id> [--team|--user|--channel] [--yes]`. Dry-run by default (prints a
-  no-secret table, mutates nothing); `--yes` deletes each matched credential locally FIRST, then
-  best-effort upstream revoke, and clears pending consent + thread grants for the scope (even where no
-  live connection matched). Local deletion is guaranteed even if the master key / provider config is
-  unavailable; refuses to run without `--provider` or with an empty scope flag. (#103)
+  no-secret table and writes no fence); `--yes` first records the exact hashed provider+owner scope,
+  clears matching pending authority, deletes each matched credential locally, then attempts upstream
+  revoke best-effort. `--user` and `--channel` are mutually exclusive owner scopes; a consent's
+  channel is origin, not shared ownership. Matching older writes serialize with the marker and are
+  either included in the post-fence scan or refused. Local deletion remains available without a
+  master key or current provider config when the exact provider exists in durable Vouchr state;
+  arbitrary/invalid provider values cannot create a marker. (#103)
 
 - `/vouchr stats` — admin per-channel usage analytics (last 30 days). For each brokered tool enabled in
   the channel: total injections, distinct acting humans, last-used time, and a `never used` flag for
