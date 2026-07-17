@@ -1996,7 +1996,7 @@ export async function createVouchr(opts: VouchrOptions) {
         emit({ type: 'connected', provider: result.provider });
         const response = res
           .set('content-type', 'text/html')
-          .send(connectedHtml(result.provider, result.account, result.scopes));
+          .send(connectedHtml(result.provider, result.account, result.scopes, result.identity));
         void notifyOAuthConnected(result).catch(() => undefined);
         return response;
       } catch {

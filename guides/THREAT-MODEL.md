@@ -258,6 +258,26 @@ user or reuse a callback.
   rechecking offboard/revoke tombstones and live-credential absence. PKCE (S256) is sent when the
   provider enables it; the verifier is stored server-side in the consent row, not in the redirect.
 
+### Forwarded consent link
+
+A workspace insider forwards their own private Connect link to a colleague, who completes the
+browser OAuth. The `state` binds the *initiating* Slack identity, so the colleague's provider
+account is stored under the initiator's Slack user — and the agent then uses it on the
+initiator's turns.
+
+- **Reduced; honestly not eliminated.** The browser session completing OAuth has no Slack
+  authentication, so Vouchr cannot prove the person clicking is the person who asked — the
+  structural limit of every start-in-chat, finish-in-browser flow (cf. RFC 8628 §5.4).
+  Bounds: the link is delivered only as a private ephemeral/DM, the state is single-use with a
+  10-minute TTL, and one active generation exists per workspace/user/provider. Detection: the
+  success page names the bound Slack user and workspace (`connectedHtml`), so whoever completes
+  a forwarded link sees immediately whose agent it empowers; the provider's own consent screen
+  names the app; and the initiator receives the success DM naming the connected provider
+  account. Deliberate insider misuse remains inside the workspace-trust boundary (see
+  "Malicious user"). Full elimination would require binding the browser session to the Slack
+  identity (Sign in with Slack / OIDC) before starting the provider OAuth — a friction
+  trade-off deliberately not taken at this stage.
+
 ### Deactivated user
 
 A user is deactivated in Slack but a pending OAuth or stored connection could let the

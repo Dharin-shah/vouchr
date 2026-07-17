@@ -120,6 +120,19 @@ test('connectedHtml: escapes provider-controlled markup (no XSS on the callback 
   assert.match(html, /&lt;img/); // and so is the scope markup
 });
 
+test('connectedHtml: names the bound Slack identity so a forwarded link is detectable', () => {
+  const html = connectedHtml('github', 'octocat', 'repo', { userId: 'U0FORWARD', teamId: 'T0WORKSPACE' });
+  assert.match(html, /U0FORWARD/); // whoever completes the OAuth sees whose agent it empowers
+  assert.match(html, /T0WORKSPACE/);
+  assert.match(html, /Not you\?/);
+  // Escaped like everything else on this page, and absent when no identity is supplied.
+  assert.doesNotMatch(
+    connectedHtml('github', null, undefined, { userId: '<script>x</script>', teamId: 'T' }),
+    /<script/i,
+  );
+  assert.doesNotMatch(connectedHtml('github', 'octocat', 'repo'), /Not you\?/);
+});
+
 test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
   const b = connectBlocks('github', 'https://auth') as any[];
   assert.equal(b.length, 2); // intro section + actions
