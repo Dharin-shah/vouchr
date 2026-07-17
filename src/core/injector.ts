@@ -74,6 +74,8 @@ export type VouchrEvent =
   | { type: 'approval_requested'; provider: string; host: string }
   | { type: 'approval_approved'; provider: string; host: string }
   | { type: 'approval_denied'; provider: string; host: string }
+  // A configured resolver threw or hit Vouchr's deadline before provider egress. Configuration and
+  // resolver-contract failures deliberately do not emit this retryable-outage signal.
   | { type: 'resolver_failed'; provider: string; source: string }
   | { type: 'connect_prompted'; provider: string }
   | { type: 'connected'; provider: string }
@@ -854,7 +856,6 @@ export class ConnectionHandle {
     try {
       assertStoredSecretReference(cred.source, cred.secretRef);
     } catch {
-      this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
       throw new ResolverConfigurationError();
     }
     let secret: unknown;
@@ -875,7 +876,6 @@ export class ConnectionHandle {
     // value. Refuse undefined, non-strings, and empty strings before injection; never stringify or
     // reflect the value because it may itself contain credential material.
     if (typeof secret !== 'string' || secret.length === 0) {
-      this.emit({ type: 'resolver_failed', provider: this.provider.id, source: cred.source });
       throw new ResolverConfigurationError();
     }
     return secret;

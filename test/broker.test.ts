@@ -2586,8 +2586,10 @@ test('#194 enterprise offboard fences old headless setup on an artifact-free tea
 
 test('#58 resolver failure returns a stable code without resolver text or the reference', async (t) => {
   const sentinel = 'ghp_RESOLVER_WIRE_SENTINEL';
+  const events: VouchrEvent[] = [];
   const { server, port } = await makeRefBroker(t, {
     resolvers: { 'aws-sm': async () => { throw new Error(`${sentinel}:${AWS_USER_REF}`); } },
+    onEvent: (event) => events.push(event),
   });
   try {
     const configured = await post(port, '/v1/user/reference', {
@@ -2609,6 +2611,10 @@ test('#58 resolver failure returns a stable code without resolver text or the re
     });
     assert.ok(!response.raw.includes(sentinel));
     assert.ok(!response.raw.includes(AWS_USER_REF));
+    assert.deepEqual(
+      events.filter((event) => event.type === 'resolver_failed'),
+      [{ type: 'resolver_failed', provider: 'acme', source: 'aws-sm' }],
+    );
   } finally {
     server.close();
   }
@@ -2617,8 +2623,10 @@ test('#58 resolver failure returns a stable code without resolver text or the re
 test('#58 malformed stored reference returns resolver_configuration_error before resolver or provider I/O', async (t) => {
   const malformed = 'arn:aws:secretsmanager:malformed-reference-sentinel';
   let resolverCalls = 0;
+  const events: VouchrEvent[] = [];
   const { server, port, vault } = await makeRefBroker(t, {
     resolvers: { 'aws-sm': async () => { resolverCalls++; return SECRET_TOKEN; } },
+    onEvent: (event) => events.push(event),
   });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
@@ -2643,6 +2651,7 @@ test('#58 malformed stored reference returns resolver_configuration_error before
     });
     assert.equal(resolverCalls, 0);
     assert.equal(up.seen.length, 0);
+    assert.equal(events.filter((event) => event.type === 'resolver_failed').length, 0);
     assert.ok(!response.raw.includes(malformed));
   } finally {
     up.restore();

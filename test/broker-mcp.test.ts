@@ -130,7 +130,17 @@ function postRaw(
     const data = Buffer.from(JSON.stringify(body));
     let sawResponse = false;
     const req = http.request(
-      { host: '127.0.0.1', port, path, method: 'POST', headers: { 'content-type': 'application/json', 'content-length': data.length } },
+      {
+        host: '127.0.0.1',
+        port,
+        path,
+        method: 'POST',
+        // Node 22's global Agent keeps sockets alive. Each test below owns a short-lived server on
+        // an ephemeral port, so pooling can attach a later request to a stale socket after port
+        // reuse under full-suite load. A dedicated socket keeps this transport test deterministic.
+        agent: false,
+        headers: { 'content-type': 'application/json', 'content-length': data.length },
+      },
       (res) => {
         sawResponse = true;
         const chunks: Buffer[] = [];

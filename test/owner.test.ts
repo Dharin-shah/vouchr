@@ -4,7 +4,12 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ConnectionHandle, ResolverConfigurationError, ResolverFailedError } from '../src/core/injector';
+import {
+  ConnectionHandle,
+  ResolverConfigurationError,
+  ResolverFailedError,
+  type VouchrEvent,
+} from '../src/core/injector';
 import { offboardUser } from '../src/core/offboard';
 import { Consent } from '../src/core/consent';
 import { userOwner, channelOwner } from '../src/core/owner';
@@ -137,6 +142,7 @@ test('referenced secret-source: invalid fulfilled resolver values fail closed be
   globalThis.fetch = (async () => { providerCalls++; return new Response('unexpected'); }) as any;
   try {
     for (const value of [undefined, 42, '', { secret: 'ghp_invalid_resolver_value' }] as const) {
+      const events: VouchrEvent[] = [];
       const handle = new ConnectionHandle(
         provider,
         owner,
@@ -144,12 +150,19 @@ test('referenced secret-source: invalid fulfilled resolver values fail closed be
         vault,
         new Audit(db),
         { 'aws-sm': (async () => value) as any },
+        new Map(),
+        (event) => events.push(event),
       );
       await assert.rejects(
         () => handle.fetch('https://api.test/x'),
         (error: unknown) => error instanceof ResolverConfigurationError
           && error.message === 'External credential resolver is not configured correctly.'
           && !error.message.includes('ghp_invalid_resolver_value'),
+      );
+      assert.equal(
+        events.filter((event) => event.type === 'resolver_failed').length,
+        0,
+        'invalid fulfilled output is configuration state, not a retryable resolver outage',
       );
     }
     assert.equal(providerCalls, 0);

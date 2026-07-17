@@ -153,8 +153,8 @@ class PgClientDb implements Db {
 
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
- * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so this PostgreSQL
- * PostgreSQL baseline started at 7 — never reset it to 1, or a v6 database would be wrongly refused
+ * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so the PostgreSQL
+ * baseline started at 7 — never reset it to 1, or a v6 database would be wrongly refused
  * as "newer" by {@link guardSchemaVersion}. Version 8 removed private previews; version 9 adds
  * persistent, generation-bound single-use interaction state and exact-action approval deduplication;
  * version 10 adds durable user/channel-provisioning requests, cross-team offboard tombstones,
