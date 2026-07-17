@@ -91,7 +91,7 @@ requires stopping v8 and restoring the pre-migration database backup before star
 Share/Dismiss buttons cannot publish data after cutover; v8 acknowledges them with fixed expiry
 guidance.
 
-### Required v8 (or prerelease v9) → v10 drained cutover
+### Required v8, prerelease v9, or v10 → v11 drained cutover
 
 Schema v9 introduced persistent thread-session controls, exact credential-generation bindings, and
 the bounded exact-action key for approval deduplication. Schema v10 retains those rules and adds
@@ -102,16 +102,21 @@ an effective channel credential/mode/tool mutation from persisting or committing
 `user_offboard_scope_tombstone`, which fences enterprise/global offboarding before artifact
 discovery; and `provisioning_revocation_tombstone`, whose fixed hashed scope selectors fence older
 user and shared-channel writes during confirmed break-glass revocation. Treat this as a maintenance
-cutover, not a mixed-version rolling upgrade:
+cutover, not a mixed-version rolling upgrade. Schema v11 adds one active OAuth generation per
+workspace/user/provider, callback consumption/supersession state, cross-replica Slack delivery
+leases, and the partial unique active-generation index. Every pre-v11 consent row is deleted
+fail-closed because it cannot prove the v11 generation and delivery invariants.
 
 1. Back up PostgreSQL and verify that the backup can be restored.
 2. Quiesce Slack and broker traffic **including identity-assertion minting**, drain in-flight
-   fetches/interactions, and stop **every** v8 or prerelease-v9 replica.
-3. Wait at least **6 minutes 30 seconds after the last old assertion was minted** (the 5-minute
+   fetches/interactions, and stop **every** pre-v11 replica.
+3. When upgrading from v8 or prerelease v9, wait at least **6 minutes 30 seconds after the last old
+   assertion was minted** (the 5-minute
    maximum lifetime plus the conservative 90-second cluster-skew horizon documented below). Do not
    restore the minter during this interval. This closes the stateless authority that a prerelease-v9
-   artifact-free enterprise offboard could not record in a scope tombstone.
-4. Run the v10 `vouchr migrate` command with the schema-owner role. From v8, it creates
+   artifact-free enterprise offboard could not record in a scope tombstone. A v10 deployment may
+   proceed after the traffic drain because it already has that durable scope fence.
+4. Run this build's v11 `vouchr migrate` command with the schema-owner role. From v8, it creates
    `session_request`, adds exact credential-generation bindings and the bounded approval action key,
    and deletes every pre-v9 approval/session grant fail-closed because those rows cannot identify
    which connection generation was authorized. It also clears pre-v9 consent requests and offboard
@@ -122,11 +127,14 @@ cutover, not a mixed-version rolling upgrade:
    and scoped break-glass tombstone tables and their indexes. The migration also adds
    `connection.generation_at` using PostgreSQL time; existing rows receive the drained-cutover
    boundary, and later reconnects replace it atomically with their own generation time. This is what
-   lets a delayed provider-addressed command/assertion prove it cannot target a newer row.
-5. Start only v10 replicas, confirm readiness, and restore traffic and assertion minting. Users
+   lets a delayed provider-addressed command/assertion prove it cannot target a newer row. From every
+   older accepted marker, v11 then drains old OAuth state and installs the consumption,
+   supersession, delivery-lease, and active-generation constraints atomically with the version stamp.
+5. Start only v11 replicas, confirm readiness, and restore traffic and assertion minting. Users
    coming from v8 make fresh
    decisions; setup buttons rendered by v8 or prerelease v9 are rejected with fixed
-   ask-the-agent-again guidance because they do not carry a v10 provisioning-request id.
+   ask-the-agent-again guidance because they do not carry a provisioning-request id. Every pre-v11
+   OAuth URL is intentionally stale and must be requested again.
 
 This is a source-breaking security cutover for low-level headless integrations. `SessionGrants` and
 `Approvals` are no longer package exports; a complete safe broker-to-Slack interaction facade remains
@@ -134,18 +142,19 @@ a later #194 slice. `ChannelConfig` and `ChannelTools` remain public read stores
 `setEnabled`, and `applyEnabled` writes are removed. Migrate governance writes to packaged Bolt/App
 Home or `POST /v1/admin/mode` and `POST /v1/admin/tools`; those paths keep authorization, lifecycle
 locks, dependent-state purge, and audit atomic. Do not write the interaction/config tables directly:
-v10 deliberately makes old authority unusable after the connection row changes.
+v11 deliberately makes old authority unusable after the connection row changes and old OAuth state
+unusable after the generation-model cutover.
 `ApprovalRequiredError` no longer exposes the raw `path`: its constructor now takes the bounded
 `actionFingerprint` and opaque `approvalId` before `queryParamCount` and `newRequest`. Update any
 catch-site field access and direct construction together; never reconstruct an approval decision
 from those display/routing fields.
 
-Do not leave a v8 or prerelease-v9 process live during or after migration. Neither re-checks the
-marker after startup; v8 cannot supply the required approval action key, while v9 can still accept
-an unfenced static/reference write. Runtime startup requires the exact schema version, so mixed
-v8/v9/v10 service is unsupported. Rollback requires stopping v10, restoring the matching
-pre-migration backup, and only then starting the v8 or prerelease-v9 binary that created it; running
-either older binary against schema v10 is refused and unsafe.
+Do not leave any pre-v11 process live during or after migration. Older processes do not re-check the
+marker after startup; v8 cannot supply the required approval action key, v9 can still accept an
+unfenced static/reference write, and v10 does not enforce the single-generation OAuth contract.
+Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11 service is unsupported.
+Rollback requires stopping v11, restoring the matching pre-migration backup, and only then starting
+the binary that created it; running an older binary against schema v11 is refused and unsafe.
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
@@ -161,8 +170,8 @@ either older binary against schema v10 is refused and unsafe.
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
   if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
-  Job / initContainer) to completion before new runtime replicas start. For v7 → v8 and
-  v8/prerelease-v9 → v10, use the applicable drained maintenance sequence above instead.
+  Job / initContainer) to completion before new runtime replicas start. For v7 → v8 and any
+  supported pre-v11 marker → v11, use the applicable drained maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 
@@ -326,9 +335,14 @@ core state/PKCE/exchange the Bolt adapter uses, no duplicated crypto:
   for the **verified** user (state is bound to the signed identity, never the body). Your host presents
   `authorizeUrl` to the user however it likes — the broker owns **no** chat/messaging surface.
 - `GET <callbackPath>` (default `/oauth/callback`, override with `VOUCHR_CALLBACK_PATH`) — the OAuth
-  redirect target. Consumes the single-use state, exchanges the code, vaults the token, audits, and
-  returns a minimal HTML landing page. Register `"$VOUCHR_BASE_URL$callbackPath"` as the provider's
-  redirect URI. A `?error=` denial fires the `consent_denied` audit and stores nothing.
+  redirect target. Spends the single-use state, exchanges the code, and finalizes the exact current
+  generation, encrypted credential, lifecycle fences, and connect audit in one transaction. It
+  returns a minimal fixed-copy HTML landing page. Register `"$VOUCHR_BASE_URL$callbackPath"` as the
+  provider's redirect URI. Denial, incomplete authorization, expiry, supersession, setup change,
+  and provider/token failure never reflect the provider's query/body text. This headless broker has
+  no Slack client; a trusted host must present the safe outcome. After returning the browser response,
+  the Bolt control plane instead makes at most one immediate, best-effort private recovery-DM attempt;
+  a process failure can drop it.
 
 When a `/v1/resolve` returns `needs_consent`, drive the user through `POST /v1/connect`; the next
 `/v1/fetch` for that user then succeeds. The broker never handles a raw token itself — it is only ever

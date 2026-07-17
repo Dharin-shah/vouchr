@@ -193,9 +193,8 @@ into many actions, or to skip the approval entirely.
 
 - **Mitigated.** The gate runs in the injector strictly AFTER every egress gate (an
   egress-denied target never even prompts — approval can widen nothing) and BEFORE the
-  secret is read. A grant is SINGLE-USE — consumed with the same atomic
-  `DELETE ... RETURNING` as the OAuth `state`, so two concurrent retries cannot both
-  spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
+  secret is read. A grant is SINGLE-USE — consumed with atomic `DELETE ... RETURNING`,
+  so two concurrent retries cannot both spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
   (method, origin, path, query) it was minted for: not a prefix, not a pattern, never a
   class of actions. The query is bound BYTE-EXACT, as a digest of the exact query string
   sent upstream — no sorting or normalization, since upstream parsers legitimately treat
@@ -250,12 +249,14 @@ into many actions, or to skip the approval entirely.
 An attacker replays or forges an OAuth `state` to bind a connection to the wrong
 user or reuse a callback.
 
-- **Mitigated.** `state` is 32 random bytes, single-use, and expiring. `consume()`
-  does an atomic `DELETE ... RETURNING` so two concurrent callbacks can't both pass
-  (no get-then-delete TOCTOU, correct even on multi-instance Postgres), and rejects
-  rows older than the 10-minute TTL (`src/core/consent.ts`). PKCE (S256) is sent when
-  the provider enables it; the verifier is stored server-side in the consent row, not
-  in the redirect.
+- **Mitigated.** `state` is 32 random bytes, single-use, and has a 10-minute authority TTL.
+  `consume()` atomically stamps `consumed_at` only when it is null, so two concurrent callbacks
+  cannot both pass (no get-then-update TOCTOU, correct even on multi-instance PostgreSQL). The
+  authority-free row has a 24-hour retention threshold so an authentic expired link can receive fixed
+  private guidance before the next sweep reclaims it; unknown/replayed input remains generic. After token exchange,
+  the credential transaction conditionally deletes the exact still-active generation while
+  rechecking offboard/revoke tombstones and live-credential absence. PKCE (S256) is sent when the
+  provider enables it; the verifier is stored server-side in the consent row, not in the redirect.
 
 ### Deactivated user
 
@@ -332,9 +333,13 @@ These mirror what the code (and the test suite) enforce:
    audited as the human who triggered the call (`injector.ts`, `owner.ts`).
 4. **Channel credentials are refused in externally shared channels** (and other
    ineligible classes), fail-closed (`channelConfig.ts`).
-5. **OAuth `state` and credential-setup requests are single-use and expiring**: authority is bound
-   in PostgreSQL and consumed with atomic `DELETE ... RETURNING` under the final mutation
-   transaction, with a 10-minute TTL (`consent.ts`, `provisioning.ts`). Ordinary credential deletion
+5. **OAuth `state` and credential-setup requests are single-use and expiring**: OAuth authority is
+   bound in PostgreSQL, atomically stamped consumed before exchange, limited to ten minutes, and
+   conditionally deletes its exact current generation inside the final credential transaction. Its
+   authority-free recovery row has a 24-hour retention threshold and is reclaimed by the next sweep.
+   Credential-setup requests are
+   consumed with atomic `DELETE ... RETURNING` under their final mutation transaction
+   (`consent.ts`, `provisioning.ts`). Ordinary credential deletion
    establishes a durable exact-owner provisioning marker first, and effective channel mutations
    advance a channel/provider tombstone checked against the original Slack receipt. Bounded-row
    cleanup is convergence, not the resurrection barrier. Channel/provider metadata carried by a

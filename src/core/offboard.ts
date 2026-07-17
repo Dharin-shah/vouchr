@@ -311,8 +311,8 @@ export async function offboardUserDetailed(
   // credential deletes below — they are the security-meaningful action. Session grants are
   // TTL-bound and swept.
   // Best-effort: the tombstone above is the fence, so a failed consent-row purge is not fatal —
-  // the stale rows are reclaimed by the TTL sweep (consent.sweepStale).
-  try { await consent.deleteForUser(identity); } catch { /* fenced by the tombstone; TTL-swept */ }
+  // the stale rows are reclaimed by the retention sweep (consent.sweepStale).
+  try { await consent.deleteForUser(identity); } catch { /* fenced by the tombstone; retention-swept */ }
   try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
   try { await provisioning?.revokeForUser(identity); } catch { /* provisioning requests are TTL-bound */ }
   try { await channelProvisioning?.revokeForUser(identity); } catch { /* provisioning requests are TTL-bound */ }

@@ -7,6 +7,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Single-generation OAuth recovery** (#194). OAuth consent is now one active PostgreSQL-backed
+  generation per workspace/user/provider, with exact supersession, a ten-minute bound, and a
+  cross-replica Slack delivery lease. Repeated connect demand reuses a delivered prompt instead of
+  posting duplicates; a known Slack rejection releases only its lease and never deletes a URL that
+  another adapter may already have presented. Callback state is spent once but retained until sweep
+  long enough to distinguish authentic expiry and supersession from unknown/replayed input. The
+  final state claim, offboard/revoke fences, live-credential absence check, encrypted credential
+  write, and connect audit share the credential transaction, so an older callback cannot overwrite
+  a newer prompt or connection. Denial, incomplete authorization, expiry, supersession, setup
+  changes, and token/provider failures return a closed fixed-copy outcome; provider-controlled error
+  text is never reflected. Attributable Bolt failures make at most one immediate, best-effort attempt
+  to send a fixed private recovery DM, while unknown/replayed state remains generic and cannot trigger
+  duplicate attempts. Callback Slack notifications use a finite timeout with no SDK retry and never
+  delay the browser response; a process failure can drop the DM. Audit
+  failure preserves the real denial/lifecycle outcome instead of inventing an exchange failure.
+  Schema v11 adds consent consumption, supersession, and delivery columns plus active-generation and
+  recovery-retention indexes; retention deletes run in bounded batches, and the required drained
+  migration deletes pre-v11 consent authority.
+  `Consent.begin()`/`beginFenced()` now return the minimal `ConsentRequest`
+  `{ authorizeUrl, state }`, and `Consent.consume()` uses the classified claim contract directly;
+  no legacy wrapper or callback-result compatibility shape is retained.
 - **Broker-owned lifecycle sweep** (#194). Direct `createBroker()` deployments now receive a typed
   `BrokerServer.sweepExpired()` facade that reclaims expired credentials and every private consent,
   approval, session, and provisioning family without exporting raw interaction mutators.

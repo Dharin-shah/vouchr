@@ -155,8 +155,11 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
   const consent = new Consent(db);
   const id = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
   const { state } = await consent.begin(id, github({ clientId: 'a', clientSecret: 'b' }), 'https://x/cb', 'C1');
-  assert.equal((await consent.consume(state))?.identity.userId, 'U1');
-  assert.equal(await consent.consume(state), null); // single-use
+  const consentClaim = await consent.consume(state);
+  assert.equal(consentClaim.status, 'active');
+  if (consentClaim.status !== 'active') assert.fail('fresh consent was not claimable');
+  assert.equal(consentClaim.row.identity.userId, 'U1');
+  assert.equal((await consent.consume(state)).status, 'unavailable'); // single-use
 
   // Channel config mode persists.
   const cfg = new ChannelConfig(db);

@@ -682,6 +682,10 @@ test('P1-B: a concurrent real write is never clobbered by a synthetic consent (a
       await vouchr.vault.delete(userOwner(ID), 'acme'); // reset to empty
       // Each attempt is a new Slack delivery received after the reset's lifecycle marker. Reusing
       // one old context would correctly exercise the stale-interaction fence instead of this race.
+      // The marker and the receipt are millisecond clocks: on a fast machine both can land in the
+      // SAME ms and tombstoneBlocks' >= fence then (correctly, fail-closed) refuses the connect.
+      // Step strictly past the marker so this test exercises the write race, not the tie fence.
+      await new Promise((resolve) => setTimeout(resolve, 2));
       const { ctx } = await boltContext(vouchr);
       await assert.rejects(() => ctx.connect('acme'), ConsentRequiredError); // records a fresh consent state
       // Barrier: both ops constructed, then released together — arrival order into the FIFO decides
@@ -848,7 +852,7 @@ test('dry-run broker: callback refuses a foreign code and never clobbers a real 
     const c2 = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: tok('shh') });
     const u2 = new URL(c2.json.authorizeUrl);
     const r2 = await get(port, u2.pathname + u2.search); // code=dry-run, valid single-use state
-    assert.equal(r2.status, 500);
+    assert.equal(r2.status, 409); // precise setup_changed outcome: the live credential won
     const cred = await vault.get(userOwner(ID), 'acme');
     assert.equal(cred?.accessToken, 'real-token'); // not clobbered
     assert.equal(cred?.externalAccount, 'octocat');

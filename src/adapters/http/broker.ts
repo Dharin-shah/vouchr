@@ -34,6 +34,7 @@ import {
   Consent,
   markUserOffboardedByActor,
   markUserOffboardedEverywhereByActor,
+  type ConsentRequest,
   userInteractionIsCurrent,
 } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
@@ -1672,7 +1673,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * else. The broker handles no raw token here; the token is only ever written to the vault inside the
    * callback below. Refuses service tools (no human cred) and key providers (no OAuth handshake).
    */
-  async function handleConnect(body: { handle?: { provider?: unknown }; identityToken: string }): Promise<Record<string, unknown>> {
+  async function handleConnect(
+    body: { handle?: { provider?: unknown }; identityToken: string },
+  ): Promise<ConsentRequest> {
     const providerId = body.handle?.provider;
     if (typeof providerId !== 'string') throw new HttpError(400, { error: 'invalid handle' });
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
@@ -1893,7 +1896,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       let requestAbort: AbortController | undefined;
       const send = (
         status: number,
-        payload: Record<string, unknown>,
+        payload: object,
         headers?: Record<string, string>,
         closeConnection = false,
       ) => {

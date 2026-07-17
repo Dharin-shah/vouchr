@@ -11,6 +11,7 @@ import {
   connectedHtml,
   connectionLine,
   consentDeniedBlocks,
+  oauthRecoveryBlocks,
   statusBlocks,
   disconnectConfirmBlocks,
   homeView,
@@ -281,6 +282,27 @@ test('consentDeniedBlocks: escapes provider in mrkdwn', () => {
   const rendered = j(consentDeniedBlocks('<!channel>'));
   assert.doesNotMatch(rendered, /<!channel>/);
   assert.match(rendered, /&lt;!channel&gt;/);
+});
+
+test('oauthRecoveryBlocks: closed callback outcomes render fixed, escaped private recovery', () => {
+  const provider = '<!channel>&acme';
+  const cases = [
+    ['denied', 'contact_admin'],
+    ['incomplete', 'connect'],
+    ['incomplete', 'contact_admin'],
+    ['state_expired', 'connect'],
+    ['state_stale', 'resolve_again'],
+    ['setup_changed', 'contact_admin'],
+    ['exchange_failed', 'fix_configuration'],
+    ['exchange_failed', 'retry_later'],
+    ['exchange_failed', 'connect'],
+  ] as const;
+  for (const [outcome, recovery] of cases) {
+    const rendered = j(oauthRecoveryBlocks(provider, outcome, recovery));
+    assert.doesNotMatch(rendered, /<!channel>/);
+    assert.match(rendered, /&lt;!channel&gt;&amp;acme/);
+    assert.match(rendered, /connection not completed/i);
+  }
 });
 
 test('statusBlocks: empty state explains on-demand connection without a phantom command', () => {

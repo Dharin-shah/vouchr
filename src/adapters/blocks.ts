@@ -2,6 +2,8 @@ import type { AuditRow, StatsRow } from '../core/audit';
 import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
 import { isBrokeredProvider } from '../core/providers';
 import { SECRET_REFERENCE_SOURCES, type SecretReferenceSource } from '../core/reference';
+import type { VouchrRecovery } from '../core/errors';
+import type { AttributedOAuthCallbackOutcome } from '../core/oauthCallback';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -708,6 +710,50 @@ export function consentDeniedBlocks(provider: string, reason?: string): unknown[
     {
       type: 'context',
       elements: [{ type: 'mrkdwn', text: 'Re-run the request to be prompted to connect again.' }],
+    },
+  ];
+}
+
+/** Fixed private recovery after an attributable OAuth callback failure. The closed core outcome and
+ * recovery category select copy; provider-controlled query/error text is never accepted here. */
+export function oauthRecoveryBlocks(
+  provider: string,
+  outcome: AttributedOAuthCallbackOutcome,
+  recovery: VouchrRecovery,
+): unknown[] {
+  if (outcome === 'denied' && recovery !== 'contact_admin') return consentDeniedBlocks(provider);
+  const p = escapeMrkdwn(provider);
+  let detail: string;
+  if (outcome === 'denied') {
+    detail = 'Authorization was denied, but Vouchr could not record the outcome. Contact an administrator.';
+  } else if (outcome === 'incomplete' && recovery === 'contact_admin') {
+    detail = 'Authorization did not finish, and Vouchr could not record the outcome. Contact an administrator.';
+  } else if (outcome === 'incomplete') {
+    detail = 'Authorization did not finish, so no connection was saved. Ask the agent for a new private prompt.';
+  } else if (outcome === 'state_expired') {
+    detail = 'That connection request expired. Ask the agent for a new private prompt.';
+  } else if (outcome === 'state_stale') {
+    detail = 'That connection request is no longer current. Use the newest prompt, or ask the agent again.';
+  } else if (outcome === 'setup_changed') {
+    detail = recovery === 'contact_admin'
+      ? 'Your account or connection setup changed before authorization finished. Contact an administrator before trying again.'
+      : 'Connection setup changed before authorization finished. Ask the agent to resolve it again.';
+  } else if (recovery === 'fix_configuration') {
+    detail = 'The provider rejected Vouchr’s OAuth configuration. Ask an administrator to check it.';
+  } else if (recovery === 'retry_later') {
+    detail = 'The provider is temporarily unavailable. Wait, then ask the agent for a new private prompt.';
+  } else if (recovery === 'connect') {
+    detail = 'The provider rejected this connection attempt. Ask the agent for a new private prompt.';
+  } else {
+    detail = 'The connection could not be saved. Ask an administrator to check Vouchr before trying again.';
+  }
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text: `*${p} connection not completed*\n${detail}`,
+      },
     },
   ];
 }

@@ -225,9 +225,11 @@ parallel when it does not create conflicting foundations.
   runtime database and migration/runtime roles are separated.
 - [#194](https://github.com/Dharin-shah/vouchr/issues/194): the commands/rendering/disconnect slice
   landed in [PR #244](https://github.com/Dharin-shah/vouchr/pull/244), and Vouchr-owned private
-  previews are removed. Persistent single-use interaction state, OAuth/API recovery, offboarding
-  fences, and typed errors are complete. The remaining focused slice is the trusted broker-to-Slack
-  recovery bridge.
+  previews are removed. Persistent single-use interaction state, offboarding fences, API recovery,
+  and typed errors are complete. OAuth connect now converges on one active owner/provider generation,
+  one cross-replica prompt-delivery lease, transaction-bound callback finalization, fixed browser
+  outcomes, and private Bolt recovery. The remaining focused slice is the trusted broker-to-Slack
+  connect/session/approval recovery bridge and its two-process proof.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility
 project would require a new explicit product decision backed by a concrete deployed lineage; it is

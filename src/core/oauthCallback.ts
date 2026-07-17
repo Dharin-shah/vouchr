@@ -9,6 +9,7 @@ import { exchangeCode, normalizeGrantedScopes, type TokenResponse } from './toke
 import { DRY_RUN_ACCOUNT, DRY_RUN_CODE, DryRunVaultError, dryRunTokenResponse } from './dryRun';
 import { safeEmit } from './safe-emit';
 import type { Db } from './db';
+import { mapSafeError, type VouchrRecovery } from './errors';
 
 export interface CallbackDeps {
   registry: ProviderRegistry;
@@ -48,9 +49,90 @@ function emitConsent(
   safeEmit(deps.auditSink, e);
 }
 
+export const OAUTH_CALLBACK_OUTCOMES = Object.freeze([
+  'connected',
+  'denied',
+  'incomplete',
+  'state_unavailable',
+  'state_expired',
+  'state_stale',
+  'exchange_failed',
+  'setup_changed',
+] as const);
+
+export type OAuthCallbackOutcome = (typeof OAUTH_CALLBACK_OUTCOMES)[number];
+export type AttributedOAuthCallbackOutcome = Exclude<
+  OAuthCallbackOutcome,
+  'connected' | 'state_unavailable'
+>;
+
+interface CallbackContext {
+  identity: SlackIdentity;
+  provider: string;
+}
+
 export type CallbackResult =
-  | { ok: true; provider: string; account: string | null; scopes: string; identity: SlackIdentity }
-  | { ok: false; status: number; error: string };
+  | {
+      ok: true;
+      outcome: 'connected';
+      status: 200;
+      provider: string;
+      account: string | null;
+      scopes: string;
+      identity: SlackIdentity;
+    }
+  | {
+      ok: false;
+      outcome: 'state_unavailable';
+      status: 400;
+      error: string;
+      retryable: false;
+      recovery: 'connect';
+    }
+  | {
+      ok: false;
+      outcome: AttributedOAuthCallbackOutcome;
+      status: number;
+      error: string;
+      retryable: false;
+      recovery: VouchrRecovery;
+      context: CallbackContext;
+    };
+
+function unavailable(error: string): CallbackResult {
+  return {
+    ok: false,
+    outcome: 'state_unavailable',
+    status: 400,
+    error,
+    retryable: false,
+    recovery: 'connect',
+  };
+}
+
+function attributedFailure(
+  outcome: AttributedOAuthCallbackOutcome,
+  status: number,
+  error: string,
+  recovery: VouchrRecovery,
+  context: CallbackContext,
+): CallbackResult {
+  return { ok: false, outcome, status, error, retryable: false, recovery, context };
+}
+
+async function recordDenied(
+  deps: CallbackDeps,
+  identity: SlackIdentity,
+  provider: string,
+  reason: 'consent_denied' | 'consent_incomplete' | 'offboarded' | 'revoked',
+): Promise<boolean> {
+  try {
+    await deps.audit.record('denied', identity, provider, { reason });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Shared OAuth callback handling: consume the single-use state, exchange the code,
@@ -66,23 +148,98 @@ export async function handleOAuthCallback(
 ): Promise<CallbackResult> {
   // State is required even on the error path: without it there's no identity to attribute the denial
   // to. Consuming it on a denial is correct — state is single-use, so this also prevents replay.
-  if (!state) return { ok: false, status: 400, error: 'Missing code/state.' };
+  if (!state) return unavailable('Missing code/state.');
 
-  const row = await deps.consent.consume(state);
-  if (!row) return { ok: false, status: 400, error: 'Invalid or expired state. Please retry.' };
+  const claim = await deps.consent.consume(state);
+  if (claim.status === 'unavailable') {
+    return unavailable('Invalid or expired state. Please retry.');
+  }
+  const row = claim.row;
+  const context = { identity: row.identity, provider: row.provider };
+  if (claim.status === 'expired') {
+    return attributedFailure(
+      'state_expired',
+      400,
+      'This connection request expired. Ask the agent for a new connection prompt.',
+      'connect',
+      context,
+    );
+  }
+  if (claim.status === 'superseded') {
+    return attributedFailure(
+      'state_stale',
+      409,
+      'This connection request is no longer current. Use the newest prompt or ask the agent again.',
+      'connect',
+      context,
+    );
+  }
+  if (claim.status === 'invalidated') {
+    return attributedFailure(
+      'setup_changed',
+      claim.reason === 'offboarded' ? 403 : 409,
+      claim.reason === 'offboarded'
+        ? 'This account is no longer active. Reconnect is unavailable.'
+        : 'Connection setup changed while authorization was completing. Start a new connection request.',
+      claim.reason === 'offboarded' ? 'contact_admin' : 'connect',
+      context,
+    );
+  }
+  if (!deps.registry.has(row.provider)) {
+    return attributedFailure(
+      'state_stale',
+      409,
+      'This connection request is no longer current. Ask the agent to resolve the provider again.',
+      'resolve_again',
+      context,
+    );
+  }
 
   const provider = deps.registry.get(row.provider);
-  // Provider-side denial (the user clicked "Deny" → ?error=access_denied). This is the REAL
-  // consent_denied: it fires before any token exchange, attributed to the resolved identity.
-  if (error) {
-    // Authoritative table copy: attribute the denial to the CONSUMED-state identity (never the request).
-    await deps.audit.record('denied', row.identity, provider.id, { reason: 'consent_denied' });
-    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 400);
-    // The provider-controlled query value can contain markup or credential material. It is useful
-    // only as a branch signal; never reflect it into the browser, Slack, logs, or audit output.
-    return { ok: false, status: 400, error: 'OAuth authorization was denied. Please try again.' };
+  // Provider-side denial is definitive and happens before token exchange. Keep it outside the
+  // exchange catch so audit trouble cannot rewrite a real denial as `exchange_failed`.
+  if (error !== undefined) {
+    const recorded = await recordDenied(deps, row.identity, provider.id, 'consent_denied');
+    emitConsent(
+      deps,
+      row.identity,
+      provider.id,
+      new URL(provider.tokenUrl).hostname,
+      'consent_denied',
+      recorded ? 400 : 500,
+    );
+    // The provider-controlled query value is only a branch signal. Never reflect it into the
+    // browser, Slack, logs, or audit output.
+    return attributedFailure(
+      'denied',
+      recorded ? 400 : 500,
+      recorded
+        ? 'OAuth authorization was denied. Please try again.'
+        : 'OAuth authorization was denied, but Vouchr could not record the outcome. Contact an administrator.',
+      recorded ? 'connect' : 'contact_admin',
+      context,
+    );
   }
-  if (!code) return { ok: false, status: 400, error: 'Missing code/state.' };
+  if (!code) {
+    const recorded = await recordDenied(deps, row.identity, provider.id, 'consent_incomplete');
+    emitConsent(
+      deps,
+      row.identity,
+      provider.id,
+      new URL(provider.tokenUrl).hostname,
+      'consent_denied',
+      recorded ? 400 : 500,
+    );
+    return attributedFailure(
+      'incomplete',
+      recorded ? 400 : 500,
+      recorded
+        ? 'Connection authorization did not complete. Ask the agent for a new connection prompt.'
+        : 'Connection authorization did not complete, and Vouchr could not record the outcome. Contact an administrator.',
+      recorded ? 'connect' : 'contact_admin',
+      context,
+    );
+  }
   try {
     // #116 dry-run: the token-exchange edge. The single-use state was already consumed by the real
     // machinery above; only the provider round-trips (code exchange + account probe) are replaced —
@@ -141,9 +298,10 @@ export async function handleOAuthCallback(
     const owner = userOwner(row.identity);
     const recordConnect = (tx: Db) =>
       deps.audit.record('connect', row.identity, provider.id, { account }, undefined, tx);
+    const finalize = (tx: Db) => deps.consent.finalizeProvisioning(row, tx);
     const provisioned = deps.dryRun
-      ? await deps.vault.upsertDryRunUser(owner, provider.id, token, row.createdAt, recordConnect)
-      : await deps.vault.upsertUser(owner, provider.id, token, row.createdAt, recordConnect);
+      ? await deps.vault.upsertDryRunUser(owner, provider.id, token, finalize, recordConnect)
+      : await deps.vault.upsertUser(owner, provider.id, token, finalize, recordConnect);
     if (deps.dryRun && provisioned === 'conflict') {
       // ATOMIC no-clobber: one conditional statement that only overwrites an existing SYNTHETIC row,
       // so a REAL credential a sibling process wrote — even between boot and now — survives untouched.
@@ -154,25 +312,68 @@ export async function handleOAuthCallback(
       // GHSA-25m2: offboarding won the race between consume() and this write — it wrote the
       // tombstone and deleted every credential while we were in token exchange. The atomic gate
       // refused to resurrect the credential (nothing landed). Audit as denied; write nothing.
-      await deps.audit.record('denied', row.identity, provider.id, { reason: 'offboarded' });
-      emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 403);
-      return { ok: false, status: 403, error: 'This account is no longer active. Reconnect is unavailable.' };
+      const recorded = await recordDenied(deps, row.identity, provider.id, 'offboarded');
+      emitConsent(
+        deps,
+        row.identity,
+        provider.id,
+        new URL(provider.tokenUrl).hostname,
+        'consent_denied',
+        recorded ? 403 : 500,
+      );
+      return attributedFailure(
+        'setup_changed',
+        recorded ? 403 : 500,
+        recorded
+          ? 'This account is no longer active. Reconnect is unavailable.'
+          : 'This account is no longer active, but Vouchr could not record the outcome. Contact an administrator.',
+        'contact_admin',
+        context,
+      );
     }
-    if (provisioned !== 'stored') {
+    if (provisioned === 'revoked') {
       // A confirmed break-glass revoke linearized while this already-consumed OAuth state was in
       // token exchange. This is not account deactivation and unchanged retries of the old state are
       // not useful: refuse the write and direct the user to start one genuinely new setup.
-      await deps.audit.record('denied', row.identity, provider.id, { reason: 'revoked' });
-      emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 409);
-      return {
-        ok: false,
-        status: 409,
-        error: 'Connection setup changed while authorization was completing. Start a new connection request.',
-      };
+      const recorded = await recordDenied(deps, row.identity, provider.id, 'revoked');
+      emitConsent(
+        deps,
+        row.identity,
+        provider.id,
+        new URL(provider.tokenUrl).hostname,
+        'consent_denied',
+        recorded ? 409 : 500,
+      );
+      return attributedFailure(
+        'setup_changed',
+        recorded ? 409 : 500,
+        recorded
+          ? 'Connection setup changed while authorization was completing. Start a new connection request.'
+          : 'Connection setup changed, but Vouchr could not record the outcome. Contact an administrator.',
+        recorded ? 'connect' : 'contact_admin',
+        context,
+      );
+    }
+    if (provisioned === 'stale' || provisioned === 'conflict') {
+      return attributedFailure(
+        'state_stale',
+        409,
+        'This connection request is no longer current. Use the newest prompt or ask the agent again.',
+        'connect',
+        context,
+      );
     }
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_granted', 200);
-    return { ok: true, provider: provider.id, account, scopes, identity: row.identity };
-  } catch {
+    return {
+      ok: true,
+      outcome: 'connected',
+      status: 200,
+      provider: provider.id,
+      account,
+      scopes,
+      identity: row.identity,
+    };
+  } catch (error) {
     // Post-consent connection FAILURE (token exchange / account probe / vault write threw) — not a
     // user denial, but the closest action on the lossy stream. status 500 here is synthetic (the host
     // distinguishes the real user-denial above by its 400). See VouchrAuditEvent.status doc.
@@ -183,6 +384,13 @@ export async function handleOAuthCallback(
       await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
     } catch { /* audit store unavailable; return the fixed failure below */ }
     emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 500);
-    return { ok: false, status: 500, error: 'Connection failed. Please try again.' };
+    const safe = mapSafeError(error);
+    return attributedFailure(
+      'exchange_failed',
+      500,
+      'Connection failed. Please try again.',
+      safe.recovery,
+      context,
+    );
   }
 }

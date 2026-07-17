@@ -56,11 +56,14 @@ Two phases:
 
 - **Connect phase** (first time). `context.vouchr.connect('github')` finds no stored
   credential, so the adapter posts an ephemeral Block Kit "Connect" button (only the
-  user sees it), records a single-use OAuth `state` + PKCE verifier, and throws
+  user sees it), records one active workspace/user/provider OAuth `state` + PKCE verifier,
+  and throws
   `ConsentRequiredError` (control flow, not an error). The browser OAuth returns to the
-  callback route, which consumes the state, exchanges the code, and vaults the encrypted
-  token. Key providers instead get a private modal where the user pastes a key or an
-  external reference.
+  callback route, which spends the state, exchanges the code, and vaults the encrypted
+  token. A PostgreSQL delivery lease deduplicates Slack prompts across replicas. Attributable
+  failures get fixed browser copy plus at most one immediate, best-effort private recovery-DM attempt;
+  a process failure can drop it, and unknown/replayed state stays generic. Key providers instead get
+  a private modal where the user pastes a key or an external reference.
 - **Use phase** (every call after). `connect()` finds the stored credential and returns
   a `ConnectionHandle`. `handle.fetch(url)` checks the egress allowlist, reads the
   secret, injects it, calls the provider, refreshes on 401 if needed, and records an
@@ -84,6 +87,15 @@ re-implementing them. The eligibility classification, owner keying, egress check
 all decided in one place; an adapter only supplies verified inputs (e.g.
 `conversations.info` output is passed to `channelIneligibleReason`, which fails closed on
 `null`).
+
+### Low-level core consent API
+
+For trusted custom adapters only: `Consent.begin()` and `beginFenced()` return the minimal
+`ConsentRequest` `{ authorizeUrl, state }`, and `Consent.consume()` returns the classified
+claim directly. This is a greenfield breaking contract — there is no legacy nullable-row
+wrapper, and the internal callback row (including PKCE material) is not a root-package
+export. Prefer the packaged Bolt or broker callback path unless implementing another
+trusted adapter.
 
 ### Wiring without `install()`
 
@@ -109,7 +121,7 @@ Tables (`schema()` in `db.ts`):
 | --- | --- | --- |
 | `meta` | Exact schema-version downgrade/startup guard | PK `key` |
 | `connection` | Credentials (vaulted or external-reference), with PostgreSQL `generation_at` for delayed provider-addressed disconnect fencing | UNIQUE `(team_id, owner_kind, owner_id, provider)` |
-| `consent_request` | In-flight OAuth `state` + PKCE verifier | PK `state` |
+| `consent_request` | Bounded OAuth generation, PKCE, consumption/supersession, and Slack delivery lease | PK `state`; partial UNIQUE active `(team_id, user_id, provider)` |
 | `user_provisioning_request` | Opaque, single-use Slack user-key setup intent | PK `id`; UNIQUE `(team_id, user_id, provider)` |
 | `channel_provisioning_request` | Opaque, single-use Slack channel-key setup intent | PK `id`; UNIQUE `(team_id, channel, user_id, provider)` |
 | `channel_interaction_tombstone` | Latest channel/provider credential or effective-governance mutation; fences older setup receipts | PK `(team_id, channel, provider)` |
@@ -172,13 +184,21 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
 consent → callback → vault → inject → refresh → TTL/sweep → offboard/revoke
 ```
 
-1. **Consent** (`src/core/consent.ts`). `begin()` mints a single-use `state` (32 random
-   bytes) + PKCE verifier, persists the consent row, and builds the provider authorize
-   URL. Headless/user flows use `beginFenced()` so an assertion or Slack demand that predates
-   offboarding cannot mint fresh callback authority after the fence.
-2. **Callback** (`src/core/oauthCallback.ts`). `consume()` atomically deletes the state
-   (`DELETE ... RETURNING`, single-use, 10-min TTL), the code is exchanged for tokens,
-   an optional `accountProbe` fetches a human-readable label, and the token is vaulted.
+1. **Consent** (`src/core/consent.ts`). `begin()` mints or reuses one active generation per
+   workspace/user/provider: a single-use `state` (32 random bytes) + PKCE verifier with a ten-minute
+   bound. A channel/context change or fresh post-tombstone setup supersedes the old generation.
+   Headless/user flows use `beginFenced()` so an assertion or Slack demand that predates offboarding
+   cannot mint fresh callback authority after the fence. Bolt separately claims a short PostgreSQL
+   delivery lease; confirmed delivery is reused, known rejection releases only that exact lease,
+   and ambiguous delivery keeps it until takeover.
+2. **Callback** (`src/core/oauthCallback.ts`). `consume()` atomically stamps `consumed_at` once,
+   retaining the bounded row so authentic expiry/supersession can receive precise fixed recovery
+   while unknown and replayed values remain generic. After token exchange and optional account
+   probe, `finalizeProvisioning()` deletes the exact still-current generation inside Vault's
+   credential transaction. That same transaction rechecks offboard/revoke tombstones and live
+   credential absence, vaults the token, and writes the connect audit, so a paused older callback
+   cannot overwrite newer authority. Bolt returns the browser result independently, then uses a
+   finite-timeout/no-retry Slack client for one best-effort private recovery or success DM.
 3. **Vault** (`src/core/vault.ts`). `upsert` stores a vaulted credential (resets
    `created_at`); `reference` stores an external-ref credential; both are owner-keyed. Every
    user-owned OAuth, static-key, dry-run, and reference write converges on one credential-lock →

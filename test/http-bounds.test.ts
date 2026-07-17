@@ -541,8 +541,11 @@ test('OAuth callback cancellation aborts token exchange and cannot write a crede
       registry: new ProviderRegistry([provider]),
       consent: {
         consume: async () => ({
-          state: 'state', identity: IDENTITY, provider: provider.id, channel: 'C1',
-          pkceVerifier: 'verifier', createdAt: Date.now(),
+          status: 'active',
+          row: {
+            state: 'state', identity: IDENTITY, provider: provider.id, channel: 'C1',
+            pkceVerifier: 'verifier', createdAt: Date.now(),
+          },
         }),
       } as any,
       vault: { upsert: async () => { writes++; return true; } } as any,
@@ -552,7 +555,9 @@ test('OAuth callback cancellation aborts token exchange and cannot write a crede
     await tokenStarted;
     caller.abort(new DOMException('client disconnected', 'AbortError'));
     const result = await pending;
-    assert.deepEqual(result, { ok: false, status: 500, error: 'Connection failed. Please try again.' });
+    assert.equal(result.ok, false);
+    assert.equal(!result.ok && result.outcome, 'exchange_failed');
+    assert.equal(!result.ok && result.retryable, false);
     assert.equal(tokenSignal?.aborted, true);
     assert.equal(writes, 0);
   } finally {
@@ -581,8 +586,11 @@ test('OAuth callback cancellation aborts its account probe and cannot write a cr
       registry: new ProviderRegistry([provider]),
       consent: {
         consume: async () => ({
-          state: 'state', identity: IDENTITY, provider: provider.id, channel: 'C1',
-          pkceVerifier: 'verifier', createdAt: Date.now(),
+          status: 'active',
+          row: {
+            state: 'state', identity: IDENTITY, provider: provider.id, channel: 'C1',
+            pkceVerifier: 'verifier', createdAt: Date.now(),
+          },
         }),
       } as any,
       vault: { upsert: async () => { writes++; return true; } } as any,
@@ -618,8 +626,15 @@ test('OAuth callback normalizes a custom accountProbe before persistence and aud
       registry: new ProviderRegistry([provider]),
       consent: {
         consume: async () => ({
-          state: 'state', identity, provider: provider.id, channel: 'C1',
-          pkceVerifier: 'verifier', createdAt: Date.now(),
+          status: 'active',
+          row: {
+            state: 'state', identity, provider: provider.id, channel: 'C1',
+            pkceVerifier: 'verifier', createdAt: Date.now(),
+          },
+        }),
+        finalizeProvisioning: async (row: { createdAt: number }) => ({
+          issuedAt: row.createdAt,
+          requireAbsent: true,
         }),
       } as any,
       vault: {
@@ -672,8 +687,15 @@ test('OAuth callback drops an account label containing credential material (SEC-
       registry: new ProviderRegistry([provider]),
       consent: {
         consume: async () => ({
-          state: 'state-value', identity: IDENTITY, provider: provider.id, channel: 'C1',
-          pkceVerifier: 'verifier-value', createdAt: Date.now(),
+          status: 'active',
+          row: {
+            state: 'state-value', identity: IDENTITY, provider: provider.id, channel: 'C1',
+            pkceVerifier: 'verifier-value', createdAt: Date.now(),
+          },
+        }),
+        finalizeProvisioning: async (row: { createdAt: number }) => ({
+          issuedAt: row.createdAt,
+          requireAbsent: true,
         }),
       } as any,
       vault: {
