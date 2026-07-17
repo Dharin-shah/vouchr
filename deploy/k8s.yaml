@@ -27,6 +27,11 @@ spec:
       labels: { app: vouchr-broker }
     spec:
       restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # the `node` user in the official Node.js images
+        runAsGroup: 1000
+        seccompProfile: { type: RuntimeDefault }
       containers:
         - name: migrate
           image: REPLACE_ME/vouchr-broker:latest # SAME image/tag as the Deployment below
@@ -54,6 +59,10 @@ spec:
       # serviceAccountName: vouchr-broker
       securityContext:
         runAsNonRoot: true
+        # The image's `USER node` is non-numeric, so the kubelet cannot prove non-root at admission:
+        # without an explicit UID every pod fails with CreateContainerConfigError before starting.
+        runAsUser: 1000 # the `node` user in the official Node.js images
+        runAsGroup: 1000
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: broker
