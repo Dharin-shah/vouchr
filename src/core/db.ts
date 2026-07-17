@@ -135,8 +135,8 @@ class PgClientDb implements Db {
 
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
- * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so this PostgreSQL
- * PostgreSQL baseline started at 7 — never reset it to 1, or a v6 database would be wrongly refused
+ * The lineage stays MONOTONIC: the pre-#204 dual-backend builds stamped up to 6, so the PostgreSQL
+ * baseline started at 7 — never reset it to 1, or a v6 database would be wrongly refused
  * as "newer" by {@link guardSchemaVersion}. Version 8 removes the retired private-preview table.
  * `migrate()` accepts v6/v7 and applies both idempotent cleanups (remove union borrowing and preview
  * configuration) before stamping 8. The `meta` marker fails a downgrade closed (old code vs a newer
