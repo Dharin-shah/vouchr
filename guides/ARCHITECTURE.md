@@ -195,9 +195,10 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    retaining the bounded row so authentic expiry/supersession can receive precise fixed recovery
    while unknown and replayed values remain generic. After token exchange and optional account
    probe, `finalizeProvisioning()` deletes the exact still-current generation inside Vault's
-   credential transaction. That same transaction rechecks offboard/revoke tombstones and live
-   credential absence, vaults the token, and writes the connect audit, so a paused older callback
-   cannot overwrite newer authority. Bolt returns the browser result independently, then uses a
+   credential transaction. That same transaction rechecks offboard/revoke tombstones and generation
+   ordering (a live credential written at-or-after this consent was minted wins; a consent minted
+   over an older live credential replaces it, so deliberate re-auth works), vaults the token, and
+   writes the connect audit, so a paused older callback cannot overwrite newer authority. Bolt returns the browser result independently, then uses a
    finite-timeout/no-retry Slack client for one best-effort private recovery or success DM.
 3. **Vault** (`src/core/vault.ts`). `upsert` stores a vaulted credential (resets
    `created_at`); `reference` stores an external-ref credential; both are owner-keyed. Every

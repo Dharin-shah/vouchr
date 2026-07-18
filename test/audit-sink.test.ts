@@ -139,7 +139,7 @@ test('audit-sink: consent_denied fires on a REAL user denial (?error=access_deni
   assert.equal((await consent.consume(state)).status, 'unavailable');
 });
 
-test('audit-sink: consent_denied fires when the token exchange fails', async (t) => {
+test('audit-sink: a token-exchange failure emits consent_failed, not consent_denied', async (t) => {
   const events: VouchrAuditEvent[] = [];
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
@@ -156,9 +156,51 @@ test('audit-sink: consent_denied fires when the token exchange fails', async (t)
     globalThis.fetch = realFetch;
   }
   assert.equal(events.length, 1);
-  assert.equal(events[0].action, 'consent_denied');
+  assert.equal(events[0].action, 'consent_failed', 'a provider/exchange failure must not claim a human denial');
   assert.equal(events[0].userId, 'U1');
   assert.ok(events[0].jti, 'jti missing');
+});
+
+test('audit-sink: a provider redirect error emits consent_failed, but access_denied stays consent_denied', async (t) => {
+  const db = await openTestDb(t);
+  const registry = new ProviderRegistry([ACME]);
+  const mk = () => ({ vault: new Vault(db, KEY), audit: new Audit(db), consent: new Consent(db), registry, redirectUri: 'https://app.example/cb' });
+
+  const denied: VouchrAuditEvent[] = [];
+  const s1 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
+  await handleOAuthCallback({ ...mk(), auditSink: (e) => denied.push(e) }, undefined, s1, 'access_denied');
+  assert.equal(denied[0].action, 'consent_denied', 'a real user denial is consent_denied');
+
+  const failed: VouchrAuditEvent[] = [];
+  const s2 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
+  await handleOAuthCallback({ ...mk(), auditSink: (e) => failed.push(e) }, undefined, s2, 'temporarily_unavailable');
+  assert.equal(failed[0].action, 'consent_failed', 'a provider-side error is consent_failed');
+});
+
+test('audit-sink: an offboard/revoke race during exchange emits consent_failed, not consent_denied', async (t) => {
+  const db = await openTestDb(t);
+  const registry = new ProviderRegistry([ACME]);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'x' }), {
+    status: 200, headers: { 'content-type': 'application/json' },
+  })) as any;
+  try {
+    for (const outcome of ['offboarded', 'revoked'] as const) {
+      const consent = new Consent(db);
+      const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+      const events: VouchrAuditEvent[] = [];
+      // The lifecycle invalidation wins the fence during token exchange (upsert returns the outcome).
+      const vault = { upsertUser: async () => outcome } as any;
+      const res = await handleOAuthCallback(
+        { registry, vault, audit: new Audit(db), consent, redirectUri: 'https://app.example/cb', auditSink: (e) => events.push(e) },
+        'code', state,
+      );
+      assert.equal(res.ok, false);
+      assert.equal(events.at(-1)?.action, 'consent_failed', `${outcome} must not claim a human denial`);
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 test('audit-sink: unset sink is a no-op and a throwing sink never breaks the request', async (t) => {

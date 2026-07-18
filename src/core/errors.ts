@@ -79,12 +79,25 @@ export { UpstreamTimeoutError } from './httpBounds';
 
 const USER_FACING_ERRORS = new WeakSet<object>();
 
-/** Thrown by `connect()` after a Connect prompt is posted: stop this turn. */
+/** Whether the private Connect prompt was freshly posted this turn, or a still-live earlier prompt
+ * was reused rather than re-posted. `reused` matters because an in-channel prompt is a Slack
+ * ephemeral that vanishes on reload/device-switch, so "the prompt is on screen" may be false —
+ * a typed discriminator, never free-form text, so the safe mapper can emit fixed leak-safe copy. */
+export type ConsentPromptState = 'posted' | 'reused';
+
+/** Thrown by `connect()` after a Connect prompt is posted (or an earlier one reused): stop this
+ * turn. Hosts branch on the class/`code`/`promptState`, never on message text. `promptState` is
+ * REQUIRED (no default) so every throw site states it explicitly — an omission cannot silently
+ * become `posted` and resurrect the false "the prompt is on screen" copy for a reused ephemeral. */
 export class ConsentRequiredError extends Error {
   readonly code = 'consent_required' as const;
 
-  constructor(public provider: string) {
-    super(`Consent required for "${provider}". A Connect prompt was posted to the user.`);
+  constructor(public provider: string, readonly promptState: ConsentPromptState) {
+    super(
+      promptState === 'reused'
+        ? `Consent required for "${provider}". A Connect prompt was already posted; if it is no longer visible, ask again after the current request expires (up to 10 minutes).`
+        : `Consent required for "${provider}". A Connect prompt was posted to the user.`,
+    );
     this.name = 'ConsentRequiredError';
   }
 }
@@ -165,7 +178,11 @@ export function mapSafeError(error: unknown): VouchrSafeError {
     if (error instanceof ConsentRequiredError) {
       return {
         code: 'consent_required',
-        message: 'Consent is required. Complete the private Connect prompt, then retry.',
+        // Fixed, leak-safe copy selected by the typed prompt state — never a forwarded message. A
+        // reused ephemeral may no longer be visible, so do not claim it is on screen.
+        message: error.promptState === 'reused'
+          ? 'Consent is required. A Connect prompt was already posted; if it is no longer visible, ask again after it expires (up to 10 minutes).'
+          : 'Consent is required. Complete the private Connect prompt, then retry.',
         retryable: false,
         recovery: 'connect',
       };

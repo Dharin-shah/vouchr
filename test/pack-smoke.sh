@@ -45,8 +45,16 @@ echo "==> require() every published entrypoint (CJS exports map)"
       || !Array.isArray(surface.TOKEN_ENDPOINT_FAILURE_KINDS)) {
       throw new Error('missing packed typed-error registries');
     }
+    // The reused prompt state must yield distinct fixed copy that admits the ephemeral may be gone.
+    if (surface.safeUserMessage(new surface.ConsentRequiredError('github', 'posted'))
+      === surface.safeUserMessage(new surface.ConsentRequiredError('github', 'reused'))) {
+      throw new Error('packed ConsentRequiredError prompt-state copy did not differ');
+    }
+    if (!surface.safeUserMessage(new surface.ConsentRequiredError('github', 'reused')).includes('no longer visible')) {
+      throw new Error('packed reused-prompt copy is missing the visibility caveat');
+    }
     const errors = [
-      new surface.ConsentRequiredError('github'),
+      new surface.ConsentRequiredError('github', 'posted'),
       new surface.SessionApprovalRequiredError('github'),
       new surface.ApprovalRequiredError(
         'github', 'self', 'POST', 'api.github.com', 'hmac-sha256:' + 'a'.repeat(64),
@@ -162,6 +170,7 @@ import {
   UpstreamTimeoutError, UserFacingError,
   mapSafeError, safeUserMessage, TOKEN_ENDPOINT_FAILURE_KINDS, VOUCHR_ERROR_CODES, VOUCHR_RECOVERY_ACTIONS,
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type BrokerServer, type IdentityConfig,
+  type ConsentPromptState,
   type SecretReferenceErrorCode, type TokenEndpointFailureKind, type VouchrErrorCode,
   type VouchrRecovery, type VouchrSafeError,
 } from '@vouchr/core/headless';
@@ -238,8 +247,17 @@ void overload;
 const referenceCode: SecretReferenceErrorCode = new SecretReferenceError('invalid_reference').code;
 const referenceFailure: BrokerError = { error: 'invalid reference', code: referenceCode };
 void referenceFailure;
+// ConsentPromptState is a required discriminator (no default) and is exported for consumers.
+const promptStates: ConsentPromptState[] = ['posted', 'reused'];
+if (safeUserMessage(new ConsentRequiredError('github', 'posted')) === safeUserMessage(new ConsentRequiredError('github', 'reused'))) {
+  throw new Error('packed ConsentRequiredError prompt-state copy did not differ');
+}
+if (!safeUserMessage(new ConsentRequiredError('github', 'reused')).includes('no longer visible')) {
+  throw new Error('packed reused-prompt copy is missing the visibility caveat');
+}
+void promptStates;
 const documentedErrors = [
-  new ConsentRequiredError('github'),
+  new ConsentRequiredError('github', 'posted'),
   new SessionApprovalRequiredError('github'),
   new ApprovalRequiredError(
     'github', 'self', 'POST', 'api.github.com', 'hmac-sha256:' + 'a'.repeat(64),

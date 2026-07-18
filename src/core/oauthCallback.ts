@@ -31,7 +31,7 @@ function emitConsent(
   identity: SlackIdentity,
   provider: string,
   egressHost: string,
-  action: 'consent_granted' | 'consent_denied',
+  action: 'consent_granted' | 'consent_denied' | 'consent_failed',
   status: number,
 ): void {
   const e: VouchrAuditEvent = {
@@ -49,18 +49,19 @@ function emitConsent(
   safeEmit(deps.auditSink, e);
 }
 
-export const OAUTH_CALLBACK_OUTCOMES = Object.freeze([
-  'connected',
-  'denied',
-  'incomplete',
-  'state_unavailable',
-  'state_expired',
-  'state_stale',
-  'exchange_failed',
-  'setup_changed',
-] as const);
+/** RFC 6749 §4.1.2.1 authorization-endpoint errors that are genuinely retryable-as-is. Every other
+ * value — the permanent config/request codes and anything unrecognized — is non-transient. */
+const TRANSIENT_OAUTH_ERRORS = new Set(['server_error', 'temporarily_unavailable']);
 
-export type OAuthCallbackOutcome = (typeof OAUTH_CALLBACK_OUTCOMES)[number];
+export type OAuthCallbackOutcome =
+  | 'connected'
+  | 'denied'
+  | 'incomplete'
+  | 'state_unavailable'
+  | 'state_expired'
+  | 'state_stale'
+  | 'exchange_failed'
+  | 'setup_changed';
 export type AttributedOAuthCallbackOutcome = Exclude<
   OAuthCallbackOutcome,
   'connected' | 'state_unavailable'
@@ -196,9 +197,13 @@ export async function handleOAuthCallback(
   }
 
   const provider = deps.registry.get(row.provider);
-  // Provider-side denial is definitive and happens before token exchange. Keep it outside the
-  // exchange catch so audit trouble cannot rewrite a real denial as `exchange_failed`.
-  if (error !== undefined) {
+  // A user denial is exactly `error=access_denied` (RFC 6749 §4.1.2.1). Every other redirect error
+  // (`server_error`, `temporarily_unavailable`, `invalid_scope`, or anything unrecognized) is a
+  // provider-side failure the user never decided — classifying it as a denial would DM a false
+  // "you haven't allowed this" claim. Both branches treat the provider-controlled query value as a
+  // branch signal only: never reflected into the browser, Slack, logs, or audit output (SEC-4).
+  // Denial stays outside the exchange catch so audit trouble cannot rewrite it as `exchange_failed`.
+  if (error === 'access_denied') {
     const recorded = await recordDenied(deps, row.identity, provider.id, 'consent_denied');
     emitConsent(
       deps,
@@ -208,8 +213,6 @@ export async function handleOAuthCallback(
       'consent_denied',
       recorded ? 400 : 500,
     );
-    // The provider-controlled query value is only a branch signal. Never reflect it into the
-    // browser, Slack, logs, or audit output.
     return attributedFailure(
       'denied',
       recorded ? 400 : 500,
@@ -220,14 +223,38 @@ export async function handleOAuthCallback(
       context,
     );
   }
+  if (error !== undefined) {
+    try {
+      await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
+    } catch { /* audit store unavailable; return the fixed failure below */ }
+    // Closed classification (RFC 6749 §4.1.2.1): only server_error and temporarily_unavailable are
+    // transient. invalid_request/unauthorized_client/unsupported_response_type/invalid_scope — and
+    // any unrecognized value — are permanent configuration/request faults; telling the user to retry
+    // unchanged config is false. Default to fix_configuration so an unknown value never claims
+    // transient. The raw value is still never reflected or persisted (SEC-4).
+    const transient = TRANSIENT_OAUTH_ERRORS.has(error);
+    const status = transient ? 502 : 500;
+    // A provider-side redirect error is NOT a human denial: emit consent_failed on the stream.
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_failed', status);
+    return attributedFailure(
+      'exchange_failed',
+      status,
+      transient
+        ? 'The provider is temporarily unavailable. Wait a moment, then ask the agent for a new connection prompt.'
+        : 'The provider rejected this authorization. Ask an administrator to check the Vouchr OAuth configuration.',
+      transient ? 'retry_later' : 'fix_configuration',
+      context,
+    );
+  }
   if (!code) {
     const recorded = await recordDenied(deps, row.identity, provider.id, 'consent_incomplete');
+    // Authorization that never returned a code is not a human denial: emit consent_failed.
     emitConsent(
       deps,
       row.identity,
       provider.id,
       new URL(provider.tokenUrl).hostname,
-      'consent_denied',
+      'consent_failed',
       recorded ? 400 : 500,
     );
     return attributedFailure(
@@ -311,14 +338,15 @@ export async function handleOAuthCallback(
     if (provisioned === 'offboarded') {
       // GHSA-25m2: offboarding won the race between consume() and this write — it wrote the
       // tombstone and deleted every credential while we were in token exchange. The atomic gate
-      // refused to resurrect the credential (nothing landed). Audit as denied; write nothing.
+      // refused to resurrect the credential (nothing landed). Lifecycle invalidation, NOT a human
+      // denial: audit table reason 'offboarded', but emit consent_failed on the stream.
       const recorded = await recordDenied(deps, row.identity, provider.id, 'offboarded');
       emitConsent(
         deps,
         row.identity,
         provider.id,
         new URL(provider.tokenUrl).hostname,
-        'consent_denied',
+        'consent_failed',
         recorded ? 403 : 500,
       );
       return attributedFailure(
@@ -334,14 +362,15 @@ export async function handleOAuthCallback(
     if (provisioned === 'revoked') {
       // A confirmed break-glass revoke linearized while this already-consumed OAuth state was in
       // token exchange. This is not account deactivation and unchanged retries of the old state are
-      // not useful: refuse the write and direct the user to start one genuinely new setup.
+      // not useful: refuse the write and direct the user to start one genuinely new setup. Lifecycle
+      // invalidation, NOT a human denial: audit table reason 'revoked', stream action consent_failed.
       const recorded = await recordDenied(deps, row.identity, provider.id, 'revoked');
       emitConsent(
         deps,
         row.identity,
         provider.id,
         new URL(provider.tokenUrl).hostname,
-        'consent_denied',
+        'consent_failed',
         recorded ? 409 : 500,
       );
       return attributedFailure(
@@ -383,7 +412,8 @@ export async function handleOAuthCallback(
     try {
       await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
     } catch { /* audit store unavailable; return the fixed failure below */ }
-    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 500);
+    // Post-consent connection failure is not a human denial: emit consent_failed on the stream.
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_failed', 500);
     const safe = mapSafeError(error);
     return attributedFailure(
       'exchange_failed',
