@@ -80,6 +80,46 @@ The worker then calls `POST /v1/fetch`:
 The broker resolves the user from the signed token, performs the provider request inside Vouchr, and
 returns only the provider response.
 
+### Typed errors: exported classes
+
+Both package entrypoints (`@vouchr/core` and `@vouchr/core/headless`) export the same Bolt-free
+error contract. `mapSafeError()` returns `{ code, message, retryable, recovery, retryAfterMs? }`;
+`retryAfterMs` is always milliseconds, and `recovery` is one of `connect`, `request_approval`,
+`resolve_again`, `retry_later`, `fix_configuration`, or `contact_admin`. The exported
+`VOUCHR_ERROR_CODES` / `VOUCHR_RECOVERY_ACTIONS` are the runtime registries, and token failures
+also publish the closed `TOKEN_ENDPOINT_FAILURE_KINDS` registry (`credential`, `configuration`, or
+`transient`). The fixed `message` is safe to render privately, but remains presentation text, not
+control flow. Foreign errors — including custom provider, resolver, KMS, and database messages —
+map to fixed `internal_error` copy without revealing their message or class name. `UserFacingError`
+is the deliberate exception: constructing it explicitly opts Vouchr-authored fixed text into
+rendering; never wrap a caught third-party error with it. JavaScript callers cannot extend the
+recovery vocabulary through `UserFacingError`: an invalid runtime recovery value fails closed to
+`internal_error`. `safeUserMessage(error)` remains the text-only convenience wrapper and delegates
+to the same core mapper. `retryable: true` means the condition can clear later; it never authorizes
+automatic replay of an uncertain or non-idempotent write.
+
+| Exported error | Stable code | Recovery | Meaning |
+| --- | --- | --- | --- |
+| `ConsentRequiredError` | `consent_required` | `connect` | A private connection prompt was posted; stop the turn. |
+| `SessionApprovalRequiredError` | `session_approval_required` | `request_approval` | A thread-scoped session prompt was posted; stop the turn. |
+| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. |
+| `ApprovalPathTooLongError` | `approval_path_too_large` | `fix_configuration` | The approval endpoint exceeds the bounded exact-action path; narrow it before retrying. |
+| `InteractionStateChangedError` | `interaction_state_changed` | `resolve_again` | The credential generation or current authorization changed; discard the stale handle and resolve current access before retrying. |
+| `PolicyDeniedError` | `policy_denied` | `contact_admin` | Provider/channel policy denied the request; retrying cannot change governance. |
+| `ToolDisabledError` | `tool_disabled` | `contact_admin` | The channel allowlist disabled the provider; an eligible admin must change it. |
+| `NoConnectionError` | `not_connected` | `connect` for user credentials; `fix_configuration` for shared channel credentials | No usable credential exists for the resolved owner. |
+| `EgressBlockedError` | `egress_blocked` | `fix_configuration` | Host/path/method/validator policy refused the request before credential use. |
+| `ResponseBlockedError` | `response_blocked` | `fix_configuration` | Provider response policy withheld the response. |
+| `ResolverConfigurationError` | `resolver_configuration_error` | `fix_configuration` | Resolver wiring, a stored reference, or a fulfilled resolver value is missing/malformed; unchanged retries cannot repair it. |
+| `ResolverFailedError` | `resolver_failed` | `retry_later` | A configured resolver threw or timed out before provider egress, so a later retry can be safe. |
+| `UpstreamTimeoutError` | `upstream_timeout` | `retry_later`, but `retryable: false` | Provider outcome may be unknown; never authorize an automatic replay. |
+| `RateLimitedError` | `rate_limited` | `retry_later` | Back pressure includes a millisecond retry hint. |
+| `SecretReferenceError` | `invalid_reference`, `source_mismatch`, `invalid_scopes`, or `resolver_unavailable` | `fix_configuration` | Reference input/configuration failed before persistence. Existing codes are unchanged. |
+| `TokenEndpointError` | `token_endpoint_failed` | `connect` for `credential`; `fix_configuration` for `configuration`; `retry_later` for `transient` | Distinguishes `invalid_grant`, OAuth client/configuration rejection, and RFC transient codes plus 408/429/5xx/network/timeout failures. The legacy `definitive` boolean remains true only for `credential`. |
+| `UserFacingError` | `user_facing` | chosen at construction (default `fix_configuration`) | Explicit opt-in for fixed Vouchr-authored refusal/validation copy. |
+
+The broker maps the same codes and recovery fields onto its HTTP responses — the wire view follows.
+
 ### Bounded failure and retry contract
 
 The exported `BrokerError` type describes functional-route JSON errors (`/readyz` deliberately uses
