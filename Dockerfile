@@ -18,9 +18,20 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json ./package.json
-# For KMS-backed deployments, insert this before USER node:
+# For KMS-backed deployments, insert this before the USER line:
 #   RUN npm install --no-save @aws-sdk/client-kms && npm cache clean --force
-USER node
+# Set HOME explicitly. uid 1000 already resolves to /home/node via the base image's passwd entry
+# (os.homedir() works), but Docker leaves the HOME env var unset for a numeric USER, and some tooling
+# reads $HOME directly rather than the passwd entry. Pinning it gives every user — including an
+# arbitrary platform-assigned uid with no passwd entry — a stable, existing path for $HOME rather
+# than an unset value. It is not owned by an arbitrary uid, and the root filesystem is read-only, so
+# nothing writes there; the broker needs no writable home.
+ENV HOME=/home/node
+# Numeric non-root user (the official Node image's `node` is uid:gid 1000:1000). A NUMERIC id lets
+# the kubelet verify `runAsNonRoot` from the image config alone, so no manifest UID is required —
+# `USER node` (a name) cannot be verified and fails closed as CreateContainerConfigError. Restricted
+# platforms that allocate a namespace UID range still override this with their own numeric runAsUser.
+USER 1000:1000
 EXPOSE 3000
 # Liveness without curl: hit /healthz over loopback and exit non-zero on failure.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 CMD \

@@ -13,7 +13,7 @@ export {
   mapSafeError,
   safeUserMessage,
 } from './core/errors';
-export type { VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
+export type { ConsentPromptState, VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
 // Headless HTTP broker (non-Bolt agent runtimes): signed identity + fail-closed read-only egress.
 export { createBroker } from './adapters/http/broker';
 export type {

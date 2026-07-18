@@ -92,7 +92,7 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
     true,
   );
   const cases = [
-    [new ConsentRequiredError('github'), 'consent_required', 'connect', false, undefined,
+    [new ConsentRequiredError('github', 'posted'), 'consent_required', 'connect', false, undefined,
       'Consent is required. Complete the private Connect prompt, then retry.'],
     [new SessionApprovalRequiredError('github'), 'session_approval_required', 'request_approval', false, undefined,
       'Thread-scoped session approval is required. Approve the private prompt, then retry.'],
@@ -150,7 +150,7 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
 test('mapSafeError does not trust arbitrary messages merely because they use an exported error class', () => {
   const secret = 'ghp_known_class_spoof_must_not_render';
   const errors = [
-    new ConsentRequiredError(secret),
+    new ConsentRequiredError(secret, 'posted'),
     new SessionApprovalRequiredError(secret),
     new ApprovalRequiredError(
       secret, 'self', secret, secret, secret,

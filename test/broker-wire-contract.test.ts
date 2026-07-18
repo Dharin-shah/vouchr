@@ -61,6 +61,12 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
+  // Backdate the seed's generation to a prior session (realistic): a fresh request's skew-backdated
+  // issuance is then still newer than the stored credential, so the newest-generation fence lets a
+  // legitimate re-reference proceed instead of treating the just-seeded row as concurrent.
+  await db.run(
+    `UPDATE connection SET generation_at = generation_at - 3600000 WHERE team_id='T1' AND owner_id='U1' AND provider='acme'`,
+  );
   const server = createBroker({
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),

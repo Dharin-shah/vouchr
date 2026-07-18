@@ -20,8 +20,10 @@ DEPLOYMENT_ID="smoke-deployment" # #212 required: binds identity assertions to t
 MASTER_KEY="$(openssl rand -base64 32)"
 PROVIDERS='[{"id":"smoke","credential":"key","egressAllow":["api.example.com"]}]'
 
+ARB_NAME=vouchr-smoke-arb
 cleanup() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker rm -f "$ARB_NAME" >/dev/null 2>&1 || true
   docker rm -f "$PG_NAME" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
 }
@@ -47,6 +49,20 @@ DB_URL="postgres://vouchr:vouchr@${PG_NAME}:5432/vouchr"
 # The runtime no longer creates tables (it connects with a DML-only role and fails closed on an
 # unmigrated DB), so migrate the schema first using the SAME image. `vouchr migrate` is idempotent
 # and advisory-locked. Fail the smoke if it errors — a broken migrate path must not reach a deploy.
+# Kubernetes `runAsNonRoot` can only verify the IMAGE's declared user (Config.User) when it is a
+# non-root NUMERIC uid — a name like `node` cannot be resolved at admission and the pod fails with
+# CreateContainerConfigError. Assert the built image actually declares one, so reverting to `USER node`
+# fails CI here instead of only at deploy time. (Runtime `id` output is numeric either way, so it
+# cannot guard this — inspect the image config.)
+IMAGE_USER="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
+echo "==> image Config.User = '${IMAGE_USER}'"
+# Require an exact canonical non-zero numeric uid, optionally :gid. This anchored shape rejects a
+# name (`node`), empty, literal `0`/`0:0`, zero-padded root equivalents (`00`, `00:1000`), and
+# malformed colon forms — all of which either run as root or cannot be verified by the kubelet.
+if ! [[ "$IMAGE_USER" =~ ^[1-9][0-9]*(:[0-9]+)?$ ]]; then
+  echo "FAIL: image Config.User must be a canonical non-zero numeric uid (optionally uid:gid); got '${IMAGE_USER}'"; exit 1
+fi
+echo "    image declares a numeric non-root user"
 echo "==> migrate the schema (vouchr migrate) against Postgres"
 docker run --rm --network "$NET" \
   -e VOUCHR_DATABASE_URL="$DB_URL" \
@@ -85,4 +101,28 @@ if echo "$LOGS" | grep -qF "$SECRET" || echo "$LOGS" | grep -qF "$MASTER_KEY"; t
 fi
 echo "    logs clean of secrets"
 
-echo "==> PASS: image builds, boots, serves /readyz (store reachable), logs no secrets"
+# The reference manifest pins no UID and requires a read-only root filesystem, so the image must run
+# under an ARBITRARY numeric non-root user (a Restricted platform assigns one from its range) with
+# root read-only. Prove that here, not only at deploy time (#216, #258).
+echo "==> the image boots as an arbitrary non-root UID with a read-only root filesystem"
+ARB_PORT=3011
+docker run -d --name "$ARB_NAME" --network "$NET" \
+  --user 12345:12345 --read-only --tmpfs /tmp \
+  -e VOUCHR_IDENTITY_SECRET="$SECRET" \
+  -e VOUCHR_DEPLOYMENT_ID="$DEPLOYMENT_ID" \
+  -e VOUCHR_MASTER_KEY="$MASTER_KEY" \
+  -e VOUCHR_PROVIDERS="$PROVIDERS" \
+  -e VOUCHR_PORT="$ARB_PORT" \
+  -e VOUCHR_DATABASE_URL="$DB_URL" \
+  -p "$ARB_PORT:$ARB_PORT" "$IMAGE" >/dev/null
+arb_ok=""
+for i in $(seq 1 30); do
+  if [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$ARB_PORT/readyz" || true)" = "200" ]; then
+    arb_ok=1; echo "    arbitrary-UID (12345) + read-only root: readyz 200 after ${i}s"; break
+  fi
+  if [ -z "$(docker ps -q -f name="$ARB_NAME")" ]; then echo "FAIL: arbitrary-UID container exited early"; docker logs "$ARB_NAME"; exit 1; fi
+  sleep 1
+done
+[ -n "$arb_ok" ] || { echo "FAIL: arbitrary-UID/read-only container never served /readyz"; docker logs "$ARB_NAME"; exit 1; }
+
+echo "==> PASS: image builds, boots (default + arbitrary UID / read-only root), serves /readyz, logs no secrets"

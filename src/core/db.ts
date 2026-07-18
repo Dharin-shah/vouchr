@@ -2,6 +2,14 @@ import { Pool, types, type PoolClient } from 'pg';
 import { isPostgresUrl, optionalPositiveEnv } from './options';
 import { POSTGRES_NOW_MS_SQL } from './interaction';
 
+/** Runtime pool bounds used by lease-sensitive callers when reserving enough time for one final
+ * database mutation. Keep the pool configuration and those callers on these single sources of truth. */
+export const DB_CONNECTION_TIMEOUT_MS = 5_000;
+/** End-to-end client read bound for one runtime query after pool acquisition. The server statement
+ * bound matches it so a timed-out query is also cancelled at PostgreSQL instead of running on. */
+export const DB_RUNTIME_QUERY_TIMEOUT_MS = 10_000;
+export const DB_RUNTIME_STATEMENT_TIMEOUT_MS = DB_RUNTIME_QUERY_TIMEOUT_MS;
+
 /**
  * Minimal async data handle over the store. Vouchr is PostgreSQL-only (#204): multi-replica
  * Postgres is the one supported production shape, so there is a single backend and no embedded
@@ -68,7 +76,7 @@ class PgDb implements Db {
         connectionString: this.connectionString,
         application_name: 'vouchr-refresh', // distinct in pg_stat_activity from the main pool
         max: 4, // bounded: a stuck token endpoint caps at this many pinned backends, never the read pool
-        connectionTimeoutMillis: 5_000,
+        connectionTimeoutMillis: DB_CONNECTION_TIMEOUT_MS,
         idleTimeoutMillis: 30_000,
         maxLifetimeSeconds: 3600,
       });
@@ -478,13 +486,28 @@ function poolMax(): number | undefined {
   return optionalPositiveEnv(process.env.VOUCHR_PG_POOL_MAX, 'VOUCHR_PG_POOL_MAX', { integer: true });
 }
 
+/** pg lets connection-string parameters override Pool object options. Pin both timeout parameters in
+ * the URL passed to the main pool so `?statement_timeout=60000` / `?query_timeout=60000` cannot
+ * silently invalidate a lease-sensitive runtime bound. Keep the original URL for the refresh pool,
+ * whose advisory-lock wait intentionally precedes its local statement timeout. */
+function boundedMainPoolUrl(url: string, timeoutMs: number): string {
+  const bounded = new URL(url);
+  bounded.searchParams.set('statement_timeout', String(timeoutMs));
+  bounded.searchParams.set('query_timeout', String(timeoutMs));
+  return bounded.toString();
+}
+
 /** Resolve + validate the connection string and build a pool. No DDL, no schema check — the shared
  *  guts of {@link openDb} and {@link migrate}. TLS is native: put `sslmode=require` (or stricter) in
  *  the connection string and the pg driver negotiates it; there is no separate TLS knob to drift.
  *  `statementTimeoutMs` defaults to the runtime's tight 10s; the migration path passes a longer one
  *  so a slow DDL, data conversion, or advisory-lock WAIT (a concurrent migrate holding the lock)
  *  isn't cancelled mid-migration. */
-function connectDb(opts: DbOptions, statementTimeoutMs = 10_000, appName = 'vouchr'): PgDb {
+function connectDb(
+  opts: DbOptions,
+  statementTimeoutMs = DB_RUNTIME_STATEMENT_TIMEOUT_MS,
+  appName = 'vouchr',
+): PgDb {
   const url = opts.databaseUrl ?? process.env.VOUCHR_DATABASE_URL;
   if (!isPostgresUrl(url)) {
     throw new Error(
@@ -495,16 +518,17 @@ function connectDb(opts: DbOptions, statementTimeoutMs = 10_000, appName = 'vouc
   }
   types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
   const pool = new Pool({
-    connectionString: url,
+    connectionString: boundedMainPoolUrl(url, statementTimeoutMs),
     application_name: appName, // names the backend in pg_stat_activity for operators
     // Explicit pool size (VOUCHR_PG_POOL_MAX; pg's default 10 otherwise). Deployments size this to
     // their `max_connections` / replica count. NOTE: each replica also lazily opens a SEPARATE 4-conn
     // refresh pool (application_name 'vouchr-refresh') on first token refresh — budget max + 4 per replica.
     max: poolMax(),
-    connectionTimeoutMillis: 5_000,
+    connectionTimeoutMillis: DB_CONNECTION_TIMEOUT_MS,
     idleTimeoutMillis: 30_000,
     maxLifetimeSeconds: 3600, // recycle a backend after an hour so a long-lived pod doesn't pin aging connections
     statement_timeout: statementTimeoutMs,
+    query_timeout: statementTimeoutMs,
   });
   // pg emits 'error' on idle backend clients (DB restart, network drop). With no listener this
   // throws and kills the whole process; swallow it, pg reconnects on the next query.

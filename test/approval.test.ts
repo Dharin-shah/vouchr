@@ -15,7 +15,11 @@ import {
   queryDigest,
   type ApprovalKey,
 } from '../src/core/approval';
-import { approvalActionKey, InteractionStateChangedError } from '../src/core/interaction';
+import {
+  approvalActionKey,
+  InteractionStateChangedError,
+  PROMPT_DELIVERY_LEASE_MS,
+} from '../src/core/interaction';
 import { approvalNeeded, ConnectionHandle, EgressBlockedError } from '../src/core/injector';
 import { defineProvider, github, ProviderRegistry, type Provider } from '../src/core/providers';
 import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
@@ -23,11 +27,26 @@ import { setChannelCredentialMode } from '../src/core/channelCredential';
 import { ChannelTools, configureChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { sweepExpired } from '../src/core/sweep';
-import { ConnectContext, createVouchr, safeUserMessage, UserFacingError } from '../src/adapters/bolt';
+import {
+  APPROVAL_DELIVERY_SAFETY_MARGIN_MS,
+  APPROVAL_FANOUT_CONCURRENCY,
+  APPROVAL_FANOUT_DEADLINE_MS,
+  ConnectContext,
+  createVouchr,
+  safeUserMessage,
+  SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+  UserFacingError,
+} from '../src/adapters/bolt';
 import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION } from '../src/adapters/blocks';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity } from './support/identity';
-import { openDb, type Db } from '../src/core/db';
+import {
+  DB_CONNECTION_TIMEOUT_MS,
+  DB_RUNTIME_QUERY_TIMEOUT_MS,
+  DB_RUNTIME_STATEMENT_TIMEOUT_MS,
+  openDb,
+  type Db,
+} from '../src/core/db';
 import { Policy } from '../src/core/policy';
 import { SessionGrants } from '../src/core/session';
 import { mapSafeError, type VouchrRecovery } from '../src/core/errors';
@@ -1236,6 +1255,157 @@ test("admin approver: prompts go to eligible admins; forged/ineligible clicks ar
   });
 });
 
+test('admin approval fan-out posts concurrently, staying inside the delivery lease', async (t) => {
+  const admins = Array.from({ length: 12 }, (_, i) => `U_ADM_${i}`);
+  const POST_MS = 80;
+  const { ctx } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'admin' } }),
+    slackAdmins: admins,
+    members: ['U1', ...admins],
+    // Each prompt post takes POST_MS. Sequential fan-out would be admins.length × POST_MS (~960ms),
+    // which for a larger channel exceeds the 30s lease and permits a replica takeover + duplicate
+    // controls. Concurrent (bounded) fan-out finishes in ~one POST_MS wave.
+    postEphemeral: async () => { await new Promise((r) => setTimeout(r, POST_MS)); return {}; },
+  });
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const start = Date.now();
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    const elapsed = Date.now() - start;
+    assert.ok(
+      elapsed < POST_MS * admins.length / 2,
+      `admin fan-out was not concurrent: ${elapsed}ms for ${admins.length} sequential-would-be ${POST_MS * admins.length}ms`,
+    );
+  });
+});
+
+test('a later-wave first delivery commits before its tail finishes, blocking a second replica', async (t) => {
+  const url = await testDbUrl(t);
+  const dbA = await openDb({ databaseUrl: url });
+  const dbB = await openDb({ databaseUrl: url });
+  t.after(async () => {
+    await Promise.all([dbA.close(), dbB.close()]);
+  });
+  const admins = Array.from({ length: 20 }, (_, i) => `U_ADM_${i}`);
+  let postsStarted = 0;
+  let promptSettled = false;
+  let signalFirst!: () => void;
+  let releaseTail!: () => void;
+  const firstPosted = new Promise<void>((resolve) => { signalFirst = resolve; });
+  const tailGate = new Promise<void>((resolve) => { releaseTail = resolve; });
+  const { ctx } = await harness(t, {
+    db: dbA,
+    provider: approvalProvider({ approval: { approver: 'admin' } }),
+    slackAdmins: admins,
+    members: ['U1', ...admins],
+    postEphemeral: async () => {
+      const index = postsStarted++;
+      if (index < APPROVAL_FANOUT_CONCURRENCY) {
+        throw slackWebApiError(SlackErrorCode.PlatformError);
+      }
+      if (index === APPROVAL_FANOUT_CONCURRENCY) {
+        signalFirst();
+        return {};
+      }
+      await tailGate;
+      return {};
+    },
+  });
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const prompted = expectApprovalRequired(
+      handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }),
+    );
+    void prompted.then(
+      () => { promptSettled = true; },
+      () => { promptSettled = true; },
+    );
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        firstPosted,
+        prompted.then(() => { throw new Error('approval flow settled before a later-wave delivery'); }),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('timed out waiting for a later-wave delivery')), 5_000);
+        }),
+      ]);
+      let row: { id: string; delivered_at: number | null } | undefined;
+      for (let attempt = 0; attempt < 100; attempt++) {
+        row = await dbB.get(`SELECT id, delivered_at FROM approval_request LIMIT 1`);
+        if (row?.delivered_at != null) break;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      assert.ok(row?.delivered_at != null, 'the first delivery was not committed on the shared store');
+      assert.ok(postsStarted > APPROVAL_FANOUT_CONCURRENCY, 'the first wave did not fail before delivery');
+      assert.equal(promptSettled, false, 'the best-effort tail unexpectedly finished before confirmation');
+      assert.deepEqual(
+        await new Approvals(dbB).claimDelivery(row.id),
+        { status: 'delivered' },
+        'a second replica must observe delivery instead of reclaiming the lease',
+      );
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      releaseTail();
+      await prompted;
+    }
+  });
+});
+
+test('approval fan-out reserves a post, pool wait, query confirmation, and margin inside the lease', () => {
+  assert.ok(APPROVAL_FANOUT_DEADLINE_MS > 0, 'the posting window must remain usable');
+  assert.ok(
+    DB_RUNTIME_STATEMENT_TIMEOUT_MS <= DB_RUNTIME_QUERY_TIMEOUT_MS,
+    'PostgreSQL must cancel no later than the client completion bound',
+  );
+  assert.equal(
+    APPROVAL_FANOUT_DEADLINE_MS
+      + SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS
+      + DB_CONNECTION_TIMEOUT_MS
+      + DB_RUNTIME_QUERY_TIMEOUT_MS
+      + APPROVAL_DELIVERY_SAFETY_MARGIN_MS,
+    PROMPT_DELIVERY_LEASE_MS,
+    'the component bounds and explicit safety margin must exactly consume the lease budget',
+  );
+});
+
+test('an elapsed start budget sends nothing, releases its lease, and reports known non-delivery', async (t) => {
+  const hrtime = process.hrtime as typeof process.hrtime & { bigint: () => bigint };
+  const realHrtime = hrtime.bigint;
+  let monotonicNow = 0n;
+  hrtime.bigint = () => monotonicNow;
+  try {
+    for (const approver of ['self', 'admin'] as const) {
+      monotonicNow = 0n;
+      const admin = approver === 'admin';
+      const { ctx, approvalRows, ephemerals, dms } = await harness(t, {
+        provider: approvalProvider({ approval: { approver } }),
+        slackAdmins: admin ? ['U_ADM'] : [],
+        members: admin ? ['U1', 'U_ADM'] : ['U1'],
+      });
+      const approvals = (ctx as any).approvals;
+      const realClaim = approvals.claimDelivery.bind(approvals);
+      approvals.claimDelivery = async (...args: unknown[]) => {
+        const claim = await realClaim(...args);
+        monotonicNow = BigInt((APPROVAL_FANOUT_DEADLINE_MS + 1) * 1_000_000);
+        return claim;
+      };
+      await withFetch(async () => {
+        const handle = await ctx.connect('acme');
+        await expectUserRecovery(
+          handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
+          'retry_later',
+          /delivery window elapsed before a prompt could be sent/i,
+        );
+      });
+      assert.equal(ephemerals.length, 0, `${approver}: no Slack request was started`);
+      assert.equal(dms.length, 0, `${approver}: no Slack request was started`);
+      assert.equal((await approvalRows()).length, 0, `${approver}: the newly minted row was released`);
+    }
+  } finally {
+    hrtime.bigint = realHrtime;
+  }
+});
+
 test('admin approver: deny notifies the requester ephemerally and audits the admin as actor', async (t) => {
   const { ctx, ephemerals, click, auditRows } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'admin' } }),
@@ -1578,8 +1748,31 @@ test('approval prompt confirmation drift reports resolve-again recovery', async 
     await expectUserRecovery(
       handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
       'resolve_again',
-      /request changed before confirmation/i,
+      /state was already handled or changed before confirmation/i,
     );
+  });
+});
+
+test('approval prompt confirmation failure reports an unknown outcome without leaking database text', async (t) => {
+  const sentinel = 'RAW_DATABASE_CONFIRMATION_ERROR_MUST_NOT_ESCAPE';
+  const { ctx, approvalRows, ephemerals } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'admin' } }),
+    slackAdmins: ['U_ADM'],
+    members: ['U1', 'U_ADM'],
+  });
+  (ctx as any).approvals.confirmDelivery = async () => { throw new Error(sentinel); };
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const error = await expectUserRecovery(
+      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
+      'retry_later',
+      /delivered, but Vouchr could not confirm its delivery state/i,
+    );
+    assert.ok(!error.message.includes(sentinel));
+    assert.ok(!JSON.stringify(ephemerals).includes(sentinel));
+    assert.deepEqual(ephemerals.map((prompt) => prompt.user), ['U_ADM']);
+    const [row] = await approvalRows();
+    assert.ok(row?.delivery_token, 'an unknown confirmation outcome must retain the delivery lease');
   });
 });
 

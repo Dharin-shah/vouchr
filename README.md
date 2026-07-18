@@ -67,6 +67,16 @@ the agent just works:
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
+`ConsentRequiredError` carries a `promptState`: `'posted'` means a fresh prompt was just
+posted; `'reused'` means a still-live prompt from a moment ago was reused rather than
+re-posted — and an in-channel prompt is an ephemeral, so it may no longer be visible.
+Branch on the class or `code`, never on message text (the `mapSafeError` copy differs by
+state). If your Bolt `App` uses a non-default Slack transport (a proxy, a custom
+`slackApiUrl`, or a TLS agent), pass the same options as `slackClientOptions` to
+`createVouchr` so Vouchr's prompt and DM posts use your transport too — Vouchr always
+layers a finite timeout, zero retries, rate-limit rejection, and lease-safe queue concurrency
+on top.
+
 Run the in-repo demo (Node ≥ 22 and PostgreSQL required; Slack app config starts from
 [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)):
 
