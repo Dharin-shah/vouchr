@@ -1,7 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
-import { openDb } from '../src/core/db';
+import {
+  DB_RUNTIME_QUERY_TIMEOUT_MS,
+  DB_RUNTIME_STATEMENT_TIMEOUT_MS,
+  openDb,
+} from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -24,6 +28,23 @@ import { openTestDb, testDbUrl, pgReachable } from './support/pg';
 const SKIP = 'Postgres not reachable. Run `npm run pg:up` to exercise the PG backend';
 const KEY = randomBytes(32);
 const tok = (accessToken: string) => ({ accessToken, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+
+test('postgres runtime pins query bounds over connection-string overrides', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const url = new URL(await testDbUrl(t));
+  url.searchParams.set('statement_timeout', '60000');
+  url.searchParams.set('query_timeout', '1');
+  const db = await openDb({ databaseUrl: url.toString() });
+  t.after(() => db.close());
+
+  const setting = await db.get<{ ms: number }>(
+    `SELECT setting::int AS ms FROM pg_settings WHERE name='statement_timeout'`,
+  );
+  assert.equal(setting?.ms, DB_RUNTIME_STATEMENT_TIMEOUT_MS);
+  assert.equal(DB_RUNTIME_QUERY_TIMEOUT_MS, DB_RUNTIME_STATEMENT_TIMEOUT_MS);
+  // If the URL's 1ms client bound won, this deliberately longer query would reject.
+  await db.get(`SELECT pg_sleep(0.025)`);
+});
 
 test('postgres backend: channel setup and mode changes serialize in both race directions', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);

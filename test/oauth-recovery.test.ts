@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import {
+  APPROVAL_FANOUT_CONCURRENCY,
   createVouchr,
   MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS,
   PromptFanoutDeadlineError,
@@ -854,7 +855,7 @@ test('supersession fails the equal-millisecond consent closed too (matches the >
   assert.equal((await consent.consume(pending.state)).status, 'superseded', 'the equal-time consent must be superseded');
 });
 
-test('the approval fan-out honors an overall deadline across many waves (cannot outlive its lease)', async () => {
+test('the approval fan-out stops starting its tail after the monotonic start deadline', async () => {
   const N = 60;
   const items = Array.from({ length: N }, (_, i) => i);
   let started = 0;
@@ -869,8 +870,8 @@ test('the approval fan-out honors an overall deadline across many waves (cannot 
   assert.ok(started < N, 'the deadline must stop starting the tail');
   assert.equal(results.length, N, 'every item still has a recorded outcome');
   assert.ok(
-    results.some((r) => r.status === 'rejected' && r.reason instanceof PromptFanoutDeadlineError),
-    'skipped items are recorded as deadline errors (classified ambiguous → lease retained)',
+    results.some((r) => r.status === 'skipped' && r.reason instanceof PromptFanoutDeadlineError),
+    'items that never started are distinct from rejected delivery attempts',
   );
 });
 
@@ -947,6 +948,37 @@ test('a delivered but possibly-vanished ephemeral prompt is not claimed as fresh
   assert.equal(posts.length, 1, 'the live prompt is reused, not reposted');
 });
 
+test('connection prompt confirmation failure is fixed-copy unknown, not a raw database error', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  const sentinel = 'RAW_CONSENT_CONFIRMATION_ERROR_MUST_NOT_ESCAPE';
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db });
+  const posts: unknown[] = [];
+  const context = await contextFor(vouchr, {
+    chat: {
+      postEphemeral: async (args: unknown) => { posts.push(args); },
+      postMessage: async (args: unknown) => { posts.push(args); },
+    },
+  });
+  (context as any).consent.confirmDelivery = async () => { throw new Error(sentinel); };
+
+  await assert.rejects(
+    () => context.connect('acme'),
+    (error: unknown) => {
+      assert.ok(error instanceof UserFacingError);
+      assert.equal(error.recovery, 'retry_later');
+      assert.match(error.message, /could not confirm its delivery state/i);
+      assert.ok(!error.message.includes(sentinel));
+      assert.equal(mapSafeError(error).recovery, 'retry_later');
+      return true;
+    },
+  );
+  assert.equal(posts.length, 1);
+  assert.ok(!JSON.stringify(posts).includes(sentinel));
+  const row = await db.get<{ delivery_token: string | null }>(`SELECT delivery_token FROM consent_request`);
+  assert.ok(row?.delivery_token, 'an unknown confirmation outcome retains the delivery lease');
+});
+
 test('a leased prompt post is bounded AND preserves the operator Slack transport', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   const db = await openTestDb(t);
@@ -955,9 +987,18 @@ test('a leased prompt post is bounded AND preserves the operator Slack transport
     providers: [provider],
     baseUrl: 'https://vouchr.test',
     db,
-    slackClientOptions: { slackApiUrl: 'https://slack-proxy.internal/api/' },
+    slackClientOptions: {
+      slackApiUrl: 'https://slack-proxy.internal/api/',
+      maxRequestConcurrency: 1,
+    },
   });
-  const posted: Array<{ retries: unknown; rejectRateLimited: unknown; timeout: unknown; apiUrl: unknown }> = [];
+  const posted: Array<{
+    retries: unknown;
+    rejectRateLimited: unknown;
+    timeout: unknown;
+    apiUrl: unknown;
+    concurrency: unknown;
+  }> = [];
   const prototype = WebClient.prototype as any;
   const realApiCall = prototype.apiCall;
   prototype.apiCall = async function (this: any) {
@@ -966,6 +1007,7 @@ test('a leased prompt post is bounded AND preserves the operator Slack transport
       rejectRateLimited: this.rejectRateLimitedCalls,
       timeout: this.requestConfig?.timeout ?? this.timeout,
       apiUrl: this.slackApiUrl,
+      concurrency: this.requestQueue?.concurrency,
     });
     return { ok: true };
   };
@@ -976,6 +1018,11 @@ test('a leased prompt post is bounded AND preserves the operator Slack transport
     assert.equal(posted[0].retries, 0, 'a leased prompt post must not queue SDK retries past its lease');
     assert.equal(posted[0].rejectRateLimited, true, 'a 429 must fail the leased post, not park it in the SDK queue');
     assert.equal(posted[0].apiUrl, 'https://slack-proxy.internal/api/', 'the operator transport must survive the bound');
+    assert.equal(
+      posted[0].concurrency,
+      APPROVAL_FANOUT_CONCURRENCY,
+      'the SDK queue cannot serialize one bounded fan-out wave beyond its lease',
+    );
   } finally {
     prototype.apiCall = realApiCall;
   }

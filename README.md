@@ -74,7 +74,8 @@ Branch on the class or `code`, never on message text (the `mapSafeError` copy di
 state). If your Bolt `App` uses a non-default Slack transport (a proxy, a custom
 `slackApiUrl`, or a TLS agent), pass the same options as `slackClientOptions` to
 `createVouchr` so Vouchr's prompt and DM posts use your transport too — Vouchr always
-layers a finite timeout, zero retries, and rate-limit rejection on top.
+layers a finite timeout, zero retries, rate-limit rejection, and lease-safe queue concurrency
+on top.
 
 Run the in-repo demo (Node ≥ 22 and PostgreSQL required; Slack app config starts from
 [`examples/slack-manifest.yml`](./examples/slack-manifest.yml)):

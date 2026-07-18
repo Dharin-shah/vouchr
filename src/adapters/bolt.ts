@@ -1,6 +1,11 @@
 import { ErrorCode as SlackErrorCode, WebClient, type WebClientOptions } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
-import { openDb, type Db } from '../core/db';
+import {
+  DB_CONNECTION_TIMEOUT_MS,
+  DB_RUNTIME_QUERY_TIMEOUT_MS,
+  openDb,
+  type Db,
+} from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, type Provider } from '../core/providers';
 import { Vault, type TtlPolicy } from '../core/vault';
@@ -170,12 +175,16 @@ function optionalBlockFallback(blocks: unknown[]): { text: string } | Record<str
   }
 }
 
+export const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
+export const APPROVAL_FANOUT_CONCURRENCY = 16;
 const SLACK_NOTIFICATION_CLIENT_OPTIONS = Object.freeze({
   retryConfig: { retries: 0 },
-  timeout: 3_000,
+  timeout: SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
   rejectRateLimitedCalls: true,
+  // The SDK's request timeout starts only AFTER its internal p-queue. A lower operator-supplied
+  // concurrency could therefore serialize one 16-wide wave beyond the delivery lease.
+  maxRequestConcurrency: APPROVAL_FANOUT_CONCURRENCY,
 });
-const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
 /** A custom installation store has no cancellation contract. Cap distinct unresolved workspace
  * lookups so a broken shared store cannot turn callback traffic into unbounded retained work. */
 export const MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS = 32;
@@ -189,30 +198,38 @@ function slackNotificationClient(token: string, base?: WebClientOptions): WebCli
   return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS });
 }
 
-/** Skipped because the fan-out's overall deadline elapsed before this item was started — treated as
- * an ambiguous (fail-safe: lease retained) outcome, since a takeover may have begun. */
+/** Skipped because the fan-out's start deadline elapsed before this item was started. */
 export class PromptFanoutDeadlineError extends Error {}
 
+type SettledWithLimitResult = PromiseSettledResult<void> | {
+  status: 'skipped';
+  reason: PromptFanoutDeadlineError;
+};
+
+function monotonicElapsedMs(startNs: bigint): number {
+  return Number(process.hrtime.bigint() - startNs) / 1e6;
+}
+
 /** Fan `task` out over `items` with at most `limit` in flight, returning settled outcomes in order.
- * `deadlineMs` (optional) caps the WHOLE fan-out: once elapsed, remaining items are recorded as a
- * `PromptFanoutDeadlineError` skip WITHOUT being started, so a very large `items` list can never make
- * the operation outlive its bound (the cap alone bounds each wave, not the total). Approval prompts
- * run through this so K bounded posts finish in ~one post's time and the fan-out stays inside the
- * delivery lease no matter how many admins are eligible. */
+ * `deadlineMs` (optional) caps the start window: once elapsed, remaining items are recorded as a
+ * `PromptFanoutDeadlineError` skip WITHOUT being started. Already-started work remains bounded by
+ * the caller's per-operation timeout. */
 export async function settledWithLimit<T>(
   items: readonly T[],
   limit: number,
   task: (item: T) => Promise<void>,
   deadlineMs?: number,
-): Promise<PromiseSettledResult<void>[]> {
-  const results = new Array<PromiseSettledResult<void>>(items.length);
-  const start = Date.now();
+): Promise<SettledWithLimitResult[]> {
+  const results = new Array<SettledWithLimitResult>(items.length);
+  // Monotonic clock: this bounds a lease-relevant duration, and Date.now() can jump (NTP/clock set),
+  // which could either blow the budget or never expire it. hrtime never runs backward.
+  const startNs = process.hrtime.bigint();
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < items.length) {
       const i = next++;
-      if (deadlineMs !== undefined && Date.now() - start >= deadlineMs) {
-        results[i] = { status: 'rejected', reason: new PromptFanoutDeadlineError('fan-out deadline elapsed') };
+      if (deadlineMs !== undefined && monotonicElapsedMs(startNs) >= deadlineMs) {
+        results[i] = { status: 'skipped', reason: new PromptFanoutDeadlineError('fan-out deadline elapsed') };
         continue;
       }
       try {
@@ -226,16 +243,15 @@ export async function settledWithLimit<T>(
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
   return results;
 }
-/** In-flight cap for the admin approval fan-out. At the bounded 3s per-post timeout this keeps the
- * common case (≤ this many eligible admins) to a single ~3s wave, well inside PROMPT_DELIVERY_LEASE_MS. */
-const APPROVAL_FANOUT_CONCURRENCY = 16;
-/** Overall wall-clock budget for STARTING approval posts, leaving headroom below the delivery lease
- * for the last in-flight wave plus confirmDelivery, so even a channel with hundreds of eligible
- * admins can never let the fan-out outlive the lease and permit a replica takeover. */
-const APPROVAL_FANOUT_DEADLINE_MS = Math.max(
-  SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
-  PROMPT_DELIVERY_LEASE_MS - 2 * SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
-);
+/** Reserve one bounded Slack post, the runtime pool wait + query timeout, and event-loop margin
+ * before the 30s lease. The timer begins BEFORE claimDelivery, conservatively including its round
+ * trip, so even a late-wave first success starts confirmation with the supported database budget. */
+export const APPROVAL_DELIVERY_SAFETY_MARGIN_MS = 1_000;
+export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_MS
+  - SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS
+  - DB_CONNECTION_TIMEOUT_MS
+  - DB_RUNTIME_QUERY_TIMEOUT_MS
+  - APPROVAL_DELIVERY_SAFETY_MARGIN_MS;
 
 function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
   return new Promise((resolve) => {
@@ -255,8 +271,38 @@ function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
 /** No actionable Slack recipient exists, so delivery is known not to have happened. Network/API
  * rejection is deliberately NOT this type: Slack may have accepted before the caller saw failure. */
 class NoApprovalDecisionSurfaceError extends Error {}
+/** The local start budget expired before any corresponding Slack request began. Unlike a transport
+ * failure this is known-undelivered, so the token-fenced lease can be released safely. */
+class ApprovalPromptNotStartedError extends Error {}
 
 type SlackPromptDeliveryFailure = 'platform-rejected' | 'rate-limited' | 'ambiguous';
+type ApprovalPromptConfirmation = 'confirmed' | 'changed' | 'unknown';
+
+async function promptConfirmationOutcome(confirm: () => Promise<boolean>): Promise<ApprovalPromptConfirmation> {
+  try {
+    return (await confirm()) ? 'confirmed' : 'changed';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function requirePromptConfirmation(
+  confirmation: ApprovalPromptConfirmation,
+  surface: 'approval' | 'session' | 'private connection',
+): void {
+  if (confirmation === 'changed') {
+    throw new UserFacingError(
+      `The ${surface} prompt was delivered, but its state was already handled or changed before confirmation. Ask the agent to resolve the current state before continuing.`,
+      'resolve_again',
+    );
+  }
+  if (confirmation === 'unknown') {
+    throw new UserFacingError(
+      `The ${surface} prompt was delivered, but Vouchr could not confirm its delivery state. If it appears, use it; otherwise ask the agent to retry shortly.`,
+      'retry_later',
+    );
+  }
+}
 
 /** Preserve one classified outcome after an admin fan-out without retaining/rendering any foreign
  * Slack error content. A single ambiguous send dominates definite rejections because Slack may have
@@ -292,6 +338,14 @@ function isNoApprovalDecisionSurface(error: unknown): boolean {
   }
 }
 
+function isApprovalPromptNotStarted(error: unknown): boolean {
+  try {
+    return error instanceof ApprovalPromptNotStartedError;
+  } catch {
+    return false;
+  }
+}
+
 function slackPromptDeliveryRecovery(
   outcome: SlackPromptDeliveryFailure,
   surface: 'approval' | 'connection' | 'session',
@@ -317,11 +371,13 @@ function slackPromptDeliveryRecovery(
 async function abandonKnownUndeliveredPrompt(
   abandon: () => Promise<boolean>,
   surface: 'approval' | 'connection' | 'session',
-  cause: 'slack-rejected' | 'no-decision-surface' = 'slack-rejected',
+  cause: 'slack-rejected' | 'no-decision-surface' | 'deadline' = 'slack-rejected',
 ): Promise<void> {
   const description = cause === 'slack-rejected'
     ? `Slack rejected the ${surface} prompt`
-    : `Vouchr found no ${surface} decision surface`;
+    : cause === 'no-decision-surface'
+      ? `Vouchr found no ${surface} decision surface`
+      : `Vouchr's ${surface} delivery window elapsed before posting`;
   let released: boolean;
   try {
     released = await abandon();
@@ -385,9 +441,9 @@ export interface VouchrOptions {
   botToken?: string;
   /** Transport options for the bounded clients Vouchr builds to post prompts and best-effort DMs
    *  (custom `slackApiUrl`, `agent`/proxy, `tls`, `headers`). Vouchr always enforces finite timeout,
-   *  zero retries, and rate-limit rejection on top — those cannot be overridden. Set this to match
-   *  your Bolt `App`'s `clientOptions` when it uses a non-default transport, or those prompts/DMs
-   *  would bypass it. */
+   *  zero retries, rate-limit rejection, and lease-safe queue concurrency on top — those cannot be
+   *  overridden. Set this to match your Bolt `App`'s `clientOptions` when it uses a non-default
+   *  transport, or those prompts/DMs would bypass it. */
   slackClientOptions?: WebClientOptions;
   /**
    * Multi-workspace token source. When set, post-OAuth success and recovery DMs are sent with the
@@ -728,6 +784,10 @@ export class ConnectContext {
           // off-channel approvals need no enumeration. The posts themselves run on the bounded
           // promptClient, so the lease window then covers only bounded work.
           const approvers = e.approver === 'admin' && this.channel ? await this.eligibleApprovers() : [];
+          // Start the conservative local budget BEFORE the claim round-trip. PostgreSQL creates the
+          // lease during that call, so including the whole round-trip can only shorten our posting
+          // window; it can never make us believe more lease remains than actually does.
+          const deliveryLeaseStartedAtNs = process.hrtime.bigint();
           const delivery = await this.approvals?.claimDelivery(e.approvalId);
           if (!delivery || delivery.status === 'stale') {
             throw new UserFacingError(
@@ -742,9 +802,35 @@ export class ConnectContext {
             );
           }
           if (delivery.status === 'claimed') {
+            let confirmation: ApprovalPromptConfirmation;
             try {
-              await this.postApprovalPrompt(e, prompt, approvers);
+              // postApprovalPrompt owns confirmation: it confirms the FIRST successful delivery
+              // immediately (single-flight). Its posting budget reserves the full bounded database
+              // confirmation window even when every earlier wave failed.
+              confirmation = await this.postApprovalPrompt(
+                e, prompt, approvers,
+                () => this.approvals!.confirmDelivery(e.approvalId, delivery.token),
+                deliveryLeaseStartedAtNs,
+              );
             } catch (deliveryError) {
+              const notStarted = isApprovalPromptNotStarted(deliveryError);
+              if (notStarted) {
+                if (this.approvals) {
+                  await abandonKnownUndeliveredPrompt(
+                    () => this.approvals!.abandonDelivery(
+                      e.approvalId,
+                      delivery.token,
+                      e.newRequest,
+                    ),
+                    'approval',
+                    'deadline',
+                  );
+                }
+                throw new UserFacingError(
+                  'Vouchr’s approval delivery window elapsed before a prompt could be sent. Ask the agent to retry shortly.',
+                  'retry_later',
+                );
+              }
               const noSurface = isNoApprovalDecisionSurface(deliveryError);
               if (noSurface) {
                 if (this.approvals) {
@@ -776,12 +862,9 @@ export class ConnectContext {
               }
               throw slackPromptDeliveryRecovery(outcome, 'approval');
             }
-            if (!(await this.approvals?.confirmDelivery(e.approvalId, delivery.token))) {
-              throw new UserFacingError(
-                'The approval prompt was delivered, but its request changed before confirmation. Ask the agent to retry.',
-                'resolve_again',
-              );
-            }
+            // Confirmation outcomes are typed return values, outside the Slack-delivery catch: a
+            // database failure can never be mistaken for either Slack rejection or request drift.
+            requirePromptConfirmation(confirmation, 'approval');
           }
         }
         throw e;
@@ -889,17 +972,37 @@ export class ConnectContext {
     e: ApprovalRequiredError,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
     approvers: string[],
-  ): Promise<void> {
+    /** Marks the prompt delivered and consumes the lease; returns false if the request changed
+     * first. Owned here so the FIRST successful delivery confirms immediately, before a large
+     * best-effort fan-out finishes. */
+    confirm: () => Promise<boolean>,
+    /** Monotonic instant captured before claimDelivery; the posting deadline includes that round trip. */
+    deliveryLeaseStartedAtNs: bigint,
+  ): Promise<ApprovalPromptConfirmation> {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
     const threadArg = this.thread ? { thread_ts: this.thread } : {};
+    // Convert rejection immediately so a background confirmation can never become an unhandled
+    // rejection while the remaining fan-out settles. Preserve false (state drift) separately from
+    // rejection (database outcome unknown) so recovery copy stays truthful.
+    let confirmPromise: Promise<ApprovalPromptConfirmation> | undefined;
+    const confirmOnce = (): Promise<ApprovalPromptConfirmation> => (
+      confirmPromise ??= promptConfirmationOutcome(confirm)
+    );
+    const remainingPostingBudget = (): number => Math.max(
+      0,
+      APPROVAL_FANOUT_DEADLINE_MS - monotonicElapsedMs(deliveryLeaseStartedAtNs),
+    );
     if (e.approver === 'self') {
+      if (remainingPostingBudget() <= 0) {
+        throw new ApprovalPromptNotStartedError('approval delivery budget elapsed before posting');
+      }
       if (this.channel) {
         await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
       } else {
         await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
       }
-      return;
+      return confirmOnce();
     }
     // 'admin': the channel is the approval surface. Off-channel (a DM) there are no channel admins
     // to prompt — tell the requester why nothing can proceed instead of failing silently (STR-5).
@@ -914,19 +1017,27 @@ export class ConnectContext {
     let sawAmbiguousFailure = false;
     let ambiguousFailure: unknown;
     let definiteFailure: Exclude<SlackPromptDeliveryFailure, 'ambiguous'> | undefined;
-    // Post to every eligible admin CONCURRENTLY (bounded): sequential awaits of the 3s-bounded post
-    // would sum past the delivery lease for a large channel and let another replica take over and
-    // duplicate the controls. The confirmDelivery token fence after this still rejects a takeover.
+    let skippedForDeadline = false;
+    // Post to every eligible admin CONCURRENTLY (bounded in-flight + start deadline). The FIRST
+    // successful post triggers confirmation once in the background. The start deadline reserves the
+    // supported post + database budgets, so planned fan-out cannot exhaust the lease first.
     const channel = this.channel;
     const results = await settledWithLimit(
       approvers,
       APPROVAL_FANOUT_CONCURRENCY,
-      (admin) => client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback }).then(() => undefined),
-      APPROVAL_FANOUT_DEADLINE_MS,
+      async (admin) => {
+        await client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback });
+        void confirmOnce();
+      },
+      remainingPostingBudget(),
     );
     for (const result of results) {
       if (result.status === 'fulfilled') {
         delivered = true;
+        continue;
+      }
+      if (result.status === 'skipped') {
+        skippedForDeadline = true;
         continue;
       }
       // If any send has an ambiguous transport outcome, the aggregate must remain ambiguous even when
@@ -955,8 +1066,13 @@ export class ConnectContext {
         throw ambiguousFailure ?? new Error('approval prompt delivery outcome is unknown');
       }
       if (definiteFailure !== undefined) throw new SlackPromptDeliveryError(definiteFailure);
+      if (skippedForDeadline) {
+        throw new ApprovalPromptNotStartedError('approval delivery budget elapsed before posting');
+      }
       throw new Error('approval prompt delivery outcome is unknown');
     }
+    // At least one admin was delivered, so confirmation was triggered on the first success.
+    return confirmPromise ?? 'unknown';
   }
 
   /**
@@ -1105,12 +1221,12 @@ export class ConnectContext {
               }
               throw slackPromptDeliveryRecovery(outcome, 'session');
             }
-            if (!(await this.sessions.confirmDelivery(pending.id, delivery.token))) {
-              throw new UserFacingError(
-                'The session prompt was delivered, but its request changed before confirmation. Ask the agent again.',
-                'resolve_again',
-              );
-            }
+            requirePromptConfirmation(
+              await promptConfirmationOutcome(
+                () => this.sessions!.confirmDelivery(pending.id, delivery.token),
+              ),
+              'session',
+            );
           } else if (delivery.status === 'in-flight') {
             throw new UserFacingError(
               'A session approval prompt is still being delivered. Ask the agent to retry shortly.',
@@ -1206,12 +1322,12 @@ export class ConnectContext {
       }
       throw slackPromptDeliveryRecovery(outcome, 'connection');
     }
-    if (!(await this.consent.confirmDelivery(pendingConsent.state, delivery.token))) {
-      throw new UserFacingError(
-        'Vouchr posted a private connection prompt but could not confirm its current state. Use it if it appears; otherwise ask the agent again.',
-        'resolve_again',
-      );
-    }
+    requirePromptConfirmation(
+      await promptConfirmationOutcome(
+        () => this.consent.confirmDelivery(pendingConsent.state, delivery.token),
+      ),
+      'private connection',
+    );
     this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId, 'posted');
   }

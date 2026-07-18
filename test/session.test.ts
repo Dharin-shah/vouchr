@@ -661,8 +661,23 @@ test('session prompt confirmation drift reports resolve-again recovery', async (
   await expectUserRecovery(
     ctx.connect('gh'),
     'resolve_again',
-    /request changed before confirmation/i,
+    /state was already handled or changed before confirmation/i,
   );
+});
+
+test('session prompt confirmation failure reports an unknown outcome without leaking database text', async (t) => {
+  const sentinel = 'RAW_SESSION_CONFIRMATION_ERROR_MUST_NOT_ESCAPE';
+  const { db, ctx, ephemerals } = await sessionHarness(t);
+  (ctx as any).sessions.confirmDelivery = async () => { throw new Error(sentinel); };
+  const error = await expectUserRecovery(
+    ctx.connect('gh'),
+    'retry_later',
+    /could not confirm its delivery state/i,
+  );
+  assert.ok(!error.message.includes(sentinel));
+  assert.ok(!JSON.stringify(ephemerals).includes(sentinel));
+  const row = await db.get<any>(`SELECT delivery_token FROM session_request`);
+  assert.ok(row?.delivery_token, 'an unknown confirmation outcome retains the delivery lease');
 });
 
 test('session prompt-audit failure rolls back before Slack delivery and a later retry can prompt', async (t) => {

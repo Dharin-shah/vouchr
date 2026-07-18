@@ -642,6 +642,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Approval delivery reserves confirmation time inside its lease regardless of channel size**
+  (#194). The admin fan-out confirms the first successful delivery immediately (single-flight), and
+  its monotonic posting deadline starts before the claim round-trip and reserves one bounded Slack
+  post plus the runtime pool and query-timeout budgets. The bounded Slack client also overrides a
+  lower operator queue concurrency, whose pre-request wait is not covered by the SDK timeout, and
+  runtime connection-string parameters cannot raise the reserved database bounds. A late-wave first
+  success therefore starts confirmation before planned work can exhaust the lease. Confirmation
+  failures use fixed unknown-outcome recovery across approval, session, and connection prompts rather
+  than false request drift or raw database errors. The public `VouchrAuditEvent` doc now lists every
+  consent status, including audit-write failure and the 400/403/409/500/502 `consent_failed` outcomes.
 - **The reference Kubernetes deployment can start, and is Restricted-policy clean** (#216). The
   broker image now runs as a numeric non-root user (`USER 1000:1000`), so the kubelet verifies
   `runAsNonRoot` from the image config — previously `USER node` (a name) with `runAsNonRoot: true`
@@ -690,8 +700,9 @@ All notable changes to this project are documented here. This project adheres to
   client now carries the operator's `slackClientOptions` (custom `slackApiUrl`, agent/proxy, TLS,
   headers) so a non-default Slack transport is not bypassed. Admin approval recipients are enumerated
   *before* the lease is claimed, and the prompts are posted **concurrently under a bounded in-flight
-  cap and an overall wall-clock deadline** (derived from the lease), so even a channel with hundreds
-  of eligible admins finishes well inside the lease instead of summing per-post timeouts. A reused still-live prompt throws `ConsentRequiredError` with
+  cap and an overall monotonic start deadline** (derived from the lease), so even a channel with
+  hundreds of eligible admins finishes well inside the lease instead of summing per-post timeouts. A
+  reused still-live prompt throws `ConsentRequiredError` with
   a **required** typed `promptState` (`'posted' | 'reused'`, exported as `ConsentPromptState`; no
   default, so an omission cannot silently mean `posted`); the safe mapper renders fixed leak-safe copy
   from it (no free-form message) that says the ephemeral may no longer be visible instead of claiming

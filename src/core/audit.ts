@@ -23,18 +23,21 @@ export interface VouchrAuditEvent {
   provider: string;
   ownerKind: 'user' | 'channel';
   ownerId: string; // user id or channel id that OWNS the credential
-  // `consent_denied` is ONLY a real human denial (the user clicked Deny). A provider-side or
-  // Vouchr-side failure that is not the user's decision — token-exchange failure, a non-`access_denied`
-  // OAuth redirect error, or authorization that never completed — is `consent_failed`, so a stream
-  // consumer is never told a human refused when they did not.
+  // `consent_denied` is ONLY a real human denial (the user clicked Deny). Any non-user outcome that
+  // is not a grant — token-exchange failure, a non-`access_denied` OAuth redirect error, authorization
+  // that never completed, or an offboard/revoke lifecycle race during exchange — is `consent_failed`,
+  // so a stream consumer is never told a human refused when they did not.
   action: 'fetch' | 'refresh' | 'consent_granted' | 'consent_denied' | 'consent_failed';
   egressHost: string;
   /** HTTP method for fetch events. Omitted for refresh/consent events. */
   method?: string;
   // HTTP-ish status. Only 'fetch' carries a REAL upstream status; the others are synthetic: 'refresh'
   // is hardcoded 200 (it only emits after refresh already succeeded), 'consent_granted' is 200,
-  // 'consent_denied' is 400 (a real user denial), and 'consent_failed' is 500/502 for a non-user
-  // failure. Don't treat `status` as a uniform provider response code across actions; key on `action` first.
+  // 'consent_denied' is 400 when its canonical audit write succeeds and 500 when that write fails;
+  // it remains a real user denial in both cases. 'consent_failed' spans 400 (incomplete
+  // authorization), 403 (offboarded), 409 (revoked), and 500/502 (provider/system failure) — always
+  // the same non-denial meaning. Don't treat `status` as a uniform provider response code across
+  // actions; key on `action` first.
   status: number;
   jti: string;
 }
