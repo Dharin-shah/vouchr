@@ -1260,6 +1260,41 @@ test('admin approval fan-out posts concurrently, staying inside the delivery lea
   });
 });
 
+test('admin fan-out confirms the FIRST delivery before finishing the rest (no lease-takeover window)', async (t) => {
+  const admins = Array.from({ length: 20 }, (_, i) => `U_ADM_${i}`);
+  const POST_MS = 60;
+  let completed = 0;
+  const prototype = Approvals.prototype as any;
+  const realConfirm = prototype.confirmDelivery;
+  const postsDoneWhenConfirmed: number[] = [];
+  // Spy: record how many posts had completed at the moment confirmation ran. With confirm-first,
+  // the lease is consumed after the FIRST delivery — long before a large fan-out finishes — so
+  // another replica can never reclaim the lease and duplicate the controls.
+  prototype.confirmDelivery = async function (this: unknown, ...args: unknown[]) {
+    postsDoneWhenConfirmed.push(completed);
+    return realConfirm.apply(this, args);
+  };
+  try {
+    const { ctx } = await harness(t, {
+      provider: approvalProvider({ approval: { approver: 'admin' } }),
+      slackAdmins: admins,
+      members: ['U1', ...admins],
+      postEphemeral: async () => { await new Promise((r) => setTimeout(r, POST_MS)); completed++; return {}; },
+    });
+    await withFetch(async () => {
+      const handle = await ctx.connect('acme');
+      await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    });
+    assert.equal(postsDoneWhenConfirmed.length, 1, 'delivery is confirmed exactly once (single-flight)');
+    assert.ok(
+      postsDoneWhenConfirmed[0] < admins.length,
+      `confirmation waited for the whole fan-out (${postsDoneWhenConfirmed[0]}/${admins.length} posts) instead of the first delivery`,
+    );
+  } finally {
+    prototype.confirmDelivery = realConfirm;
+  }
+});
+
 test('admin approver: deny notifies the requester ephemerally and audits the admin as actor', async (t) => {
   const { ctx, ephemerals, click, auditRows } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'admin' } }),

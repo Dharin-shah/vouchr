@@ -185,7 +185,8 @@ test('audit-sink: an offboard/revoke race during exchange emits consent_failed, 
     status: 200, headers: { 'content-type': 'application/json' },
   })) as any;
   try {
-    for (const outcome of ['offboarded', 'revoked'] as const) {
+    // consent_failed spans distinct lifecycle statuses: 403 offboarded, 409 revoked (contract doc).
+    for (const [outcome, status] of [['offboarded', 403], ['revoked', 409]] as const) {
       const consent = new Consent(db);
       const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
       const events: VouchrAuditEvent[] = [];
@@ -197,6 +198,7 @@ test('audit-sink: an offboard/revoke race during exchange emits consent_failed, 
       );
       assert.equal(res.ok, false);
       assert.equal(events.at(-1)?.action, 'consent_failed', `${outcome} must not claim a human denial`);
+      assert.equal(events.at(-1)?.status, status, `${outcome} consent_failed carries status ${status}`);
     }
   } finally {
     globalThis.fetch = realFetch;

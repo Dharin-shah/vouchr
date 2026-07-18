@@ -642,6 +642,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **Approval delivery confirms within its lease regardless of channel size** (#194). The admin
+  fan-out now confirms the FIRST successful delivery immediately (single-flight), consuming the
+  delivery lease within roughly one post's time — so however long a large best-effort fan-out runs,
+  another replica can never reclaim the lease and duplicate the controls. The fan-out's overall
+  deadline uses a monotonic clock (`process.hrtime`) rather than `Date.now()`, which can jump. The
+  public `VouchrAuditEvent` doc now lists every `consent_failed` status (400 incomplete, 403
+  offboarded, 409 revoked, 500/502 provider/system) — the action's non-denial meaning is unchanged.
 - **Re-authorization over a live credential no longer dead-ends** (#194). Every user-owned
   credential write — OAuth callback, direct key, and external reference — is now fenced by generation
   ordering: a write loses (`stale`, no audit) when a live credential's `generation_at` is at or after

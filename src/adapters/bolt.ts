@@ -206,12 +206,15 @@ export async function settledWithLimit<T>(
   deadlineMs?: number,
 ): Promise<PromiseSettledResult<void>[]> {
   const results = new Array<PromiseSettledResult<void>>(items.length);
-  const start = Date.now();
+  // Monotonic clock: this bounds a lease-relevant duration, and Date.now() can jump (NTP/clock set),
+  // which could either blow the budget or never expire it. hrtime never runs backward.
+  const startNs = process.hrtime.bigint();
+  const elapsedMs = (): number => Number(process.hrtime.bigint() - startNs) / 1e6;
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < items.length) {
       const i = next++;
-      if (deadlineMs !== undefined && Date.now() - start >= deadlineMs) {
+      if (deadlineMs !== undefined && elapsedMs() >= deadlineMs) {
         results[i] = { status: 'rejected', reason: new PromptFanoutDeadlineError('fan-out deadline elapsed') };
         continue;
       }
@@ -287,6 +290,15 @@ function classifySlackPromptDeliveryFailure(error: unknown): SlackPromptDelivery
 function isNoApprovalDecisionSurface(error: unknown): boolean {
   try {
     return error instanceof NoApprovalDecisionSurfaceError;
+  } catch {
+    return false;
+  }
+}
+
+/** Safe `instanceof UserFacingError` — a hostile Slack error proxy can trap the operator. */
+function isUserFacing(error: unknown): boolean {
+  try {
+    return error instanceof UserFacingError;
   } catch {
     return false;
   }
@@ -743,8 +755,19 @@ export class ConnectContext {
           }
           if (delivery.status === 'claimed') {
             try {
-              await this.postApprovalPrompt(e, prompt, approvers);
+              // postApprovalPrompt owns confirmation: it confirms the FIRST successful delivery
+              // immediately (single-flight) so the lease is consumed within ~one post's time, long
+              // before a large fan-out could finish and let another replica reclaim it.
+              await this.postApprovalPrompt(
+                e, prompt, approvers,
+                () => this.approvals!.confirmDelivery(e.approvalId, delivery.token),
+              );
             } catch (deliveryError) {
+              // postApprovalPrompt owns confirmation now, so a confirmation-drift (`resolve_again`)
+              // or any other already-user-facing error must pass through unchanged — only genuine
+              // Slack POST failures get abandon + delivery-failure classification below. The
+              // instanceof is wrapped because a hostile Slack error proxy can trap it.
+              if (isUserFacing(deliveryError)) throw deliveryError;
               const noSurface = isNoApprovalDecisionSurface(deliveryError);
               if (noSurface) {
                 if (this.approvals) {
@@ -775,12 +798,6 @@ export class ConnectContext {
                 );
               }
               throw slackPromptDeliveryRecovery(outcome, 'approval');
-            }
-            if (!(await this.approvals?.confirmDelivery(e.approvalId, delivery.token))) {
-              throw new UserFacingError(
-                'The approval prompt was delivered, but its request changed before confirmation. Ask the agent to retry.',
-                'resolve_again',
-              );
             }
           }
         }
@@ -889,16 +906,29 @@ export class ConnectContext {
     e: ApprovalRequiredError,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
     approvers: string[],
+    /** Marks the prompt delivered and consumes the lease; returns false if the request changed
+     * first. Owned here so the FIRST successful delivery confirms immediately, before a large
+     * best-effort fan-out finishes — a takeover after confirmation is impossible. */
+    confirm: () => Promise<boolean>,
   ): Promise<void> {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
     const threadArg = this.thread ? { thread_ts: this.thread } : {};
+    const confirmedOrThrow = async (): Promise<void> => {
+      if (!(await confirm())) {
+        throw new UserFacingError(
+          'The approval prompt was delivered, but its request changed before confirmation. Ask the agent to retry.',
+          'resolve_again',
+        );
+      }
+    };
     if (e.approver === 'self') {
       if (this.channel) {
         await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
       } else {
         await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
       }
+      await confirmedOrThrow();
       return;
     }
     // 'admin': the channel is the approval surface. Off-channel (a DM) there are no channel admins
@@ -914,14 +944,20 @@ export class ConnectContext {
     let sawAmbiguousFailure = false;
     let ambiguousFailure: unknown;
     let definiteFailure: Exclude<SlackPromptDeliveryFailure, 'ambiguous'> | undefined;
-    // Post to every eligible admin CONCURRENTLY (bounded): sequential awaits of the 3s-bounded post
-    // would sum past the delivery lease for a large channel and let another replica take over and
-    // duplicate the controls. The confirmDelivery token fence after this still rejects a takeover.
+    // Post to every eligible admin CONCURRENTLY (bounded in-flight + overall deadline). The FIRST
+    // successful post triggers confirmation once, in the background, so the lease is consumed within
+    // ~one post + confirm time — however long the remaining best-effort fan-out runs, no replica can
+    // reclaim the lease and duplicate controls.
     const channel = this.channel;
+    let confirmPromise: Promise<boolean> | undefined;
+    const confirmOnce = (): Promise<boolean> => (confirmPromise ??= confirm().catch(() => false));
     const results = await settledWithLimit(
       approvers,
       APPROVAL_FANOUT_CONCURRENCY,
-      (admin) => client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback }).then(() => undefined),
+      async (admin) => {
+        await client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback });
+        void confirmOnce();
+      },
       APPROVAL_FANOUT_DEADLINE_MS,
     );
     for (const result of results) {
@@ -956,6 +992,14 @@ export class ConnectContext {
       }
       if (definiteFailure !== undefined) throw new SlackPromptDeliveryError(definiteFailure);
       throw new Error('approval prompt delivery outcome is unknown');
+    }
+    // At least one admin was delivered, so confirmation was triggered on the first success. Surface
+    // its outcome: a false result means the request changed before the lease could be consumed.
+    if (!(await (confirmPromise ?? Promise.resolve(false)))) {
+      throw new UserFacingError(
+        'The approval prompt was delivered, but its request changed before confirmation. Ask the agent to retry.',
+        'resolve_again',
+      );
     }
   }
 
