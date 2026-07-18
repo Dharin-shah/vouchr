@@ -76,8 +76,9 @@ export {
   UserFacingError,
   safeUserMessage,
 } from '../core/errors';
+import { connectedHtml } from './landing';
 import {
-  connectBlocks, connectedHtml, configureModal, CONFIGURE_CALLBACK,
+  connectBlocks, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
   privateStatusModal,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,
@@ -2105,7 +2106,7 @@ export async function createVouchr(opts: VouchrOptions) {
         emit({ type: 'connected', provider: result.provider });
         const response = res
           .set('content-type', 'text/html')
-          .send(connectedHtml(result.provider, result.account, result.scopes));
+          .send(connectedHtml(result.provider, result.account, result.scopes, result.identity));
         void notifyOAuthConnected(result).catch(() => undefined);
         return response;
       } catch {

@@ -260,6 +260,39 @@ user or reuse a callback.
   credential so re-authorization cannot dead-end. PKCE (S256) is sent when the
   provider enables it; the verifier is stored server-side in the consent row, not in the redirect.
 
+### Forwarded consent link
+
+A workspace insider forwards their own private Connect link to a colleague, who completes the
+browser OAuth. The `state` binds the *initiating* Slack identity, so the colleague's provider
+account is stored under the initiator's Slack user — and the agent then uses it on the
+initiator's turns.
+
+- **Not prevented; impact and detection reduced.** This is a real credential-confusion attack by
+  a malicious workspace user — the same actor the "Malicious user" section models as an attacker,
+  so it is **not** inside the trusted boundary. The disclosure controls below reduce its impact and
+  make it detectable; they do not stop a determined insider. The browser session completing OAuth
+  has no Slack authentication, so Vouchr cannot prove the person clicking is the person who asked —
+  the structural limit of every start-in-chat, finish-in-browser flow (cf. RFC 8628 §5.4).
+
+  **Delivery of the link differs by adapter, and only Bolt keeps it private:**
+  - **Bolt** posts the Connect link as a private ephemeral (or DM), single-use, with a 10-minute
+    TTL, one active generation per workspace/user/provider. Forwarding is a deliberate act by the
+    initiator.
+  - **The headless broker** does NOT deliver the link. `POST /v1/connect` returns
+    `{ authorizeUrl, state }` to the calling host, which owns presentation entirely. Vouchr makes
+    **no** privacy guarantee there — a headless operator MUST keep the authorize URL out of models,
+    logs, public channels, and any surface a third party can reach, and is responsible for showing
+    it only to the identity the `state` is bound to.
+
+  Detection (both surfaces): the callback landing page (`connectedHtml`) names the bound Slack user
+  and workspace AND links to that user's Slack profile (a `slack://user` deep link, so the completer
+  can recognize *who* it is, not just an opaque id), and — when a provider account label is known
+  (it can be null) — names that account. On Bolt, the initiator also receives the success DM. The
+  provider's own consent screen names the app. Prevention (not yet shipped) requires binding the
+  browser session to the Slack identity (Sign in with Slack / OIDC) before starting the provider
+  OAuth — tracked privately; opt-in and ON-by-default for GA, not required for a supervised
+  single-workspace pilot.
+
 ### Deactivated user
 
 A user is deactivated in Slack but a pending OAuth or stored connection could let the
