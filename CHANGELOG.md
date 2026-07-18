@@ -642,6 +642,18 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **The reference Kubernetes deployment can start, and is Restricted-policy clean** (#216). The
+  broker image now runs as a numeric non-root user (`USER 1000:1000`), so the kubelet verifies
+  `runAsNonRoot` from the image config — previously `USER node` (a name) with `runAsNonRoot: true`
+  failed every pod with `CreateContainerConfigError` before start. The manifest no longer pins a UID
+  (a Restricted platform assigns an arbitrary one from its namespace range), and the schema-owner
+  migrate Job now carries the same container-level Restricted controls as the runtime
+  (`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, read-only root filesystem). Both
+  workloads now set a **CPU limit** (not just a request, which only affects scheduling) alongside
+  the memory limit. The docker smoke asserts the image's `Config.User` is a numeric non-root uid
+  (so reverting to `USER node` fails CI, not only at deploy) and boots the image under an arbitrary
+  UID with a read-only root filesystem; a static test validates both pod templates carry the
+  security controls and bound CPU + memory in both requests and limits.
 - **Re-authorization over a live credential no longer dead-ends** (#194). Every user-owned
   credential write — OAuth callback, direct key, and external reference — is now fenced by generation
   ordering: a write loses (`stale`, no audit) when a live credential's `generation_at` is at or after
