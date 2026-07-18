@@ -50,7 +50,7 @@ spec:
             capabilities: { drop: ["ALL"] }
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
-            limits: { memory: "128Mi" }
+            limits: { cpu: "500m", memory: "128Mi" }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -131,7 +131,7 @@ spec:
             capabilities: { drop: ["ALL"] }
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
-            limits: { memory: "256Mi" }
+            limits: { cpu: "1", memory: "256Mi" }
       # volumes:
       #   - name: vouchr-policy
       #     configMap: { name: vouchr-policy }

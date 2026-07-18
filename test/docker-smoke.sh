@@ -49,7 +49,20 @@ DB_URL="postgres://vouchr:vouchr@${PG_NAME}:5432/vouchr"
 # The runtime no longer creates tables (it connects with a DML-only role and fails closed on an
 # unmigrated DB), so migrate the schema first using the SAME image. `vouchr migrate` is idempotent
 # and advisory-locked. Fail the smoke if it errors — a broken migrate path must not reach a deploy.
-echo "==> image runtime identity (must be numeric non-root): $(docker run --rm "$IMAGE" id 2>&1)"
+# Kubernetes `runAsNonRoot` can only verify the IMAGE's declared user (Config.User) when it is a
+# non-root NUMERIC uid — a name like `node` cannot be resolved at admission and the pod fails with
+# CreateContainerConfigError. Assert the built image actually declares one, so reverting to `USER node`
+# fails CI here instead of only at deploy time. (Runtime `id` output is numeric either way, so it
+# cannot guard this — inspect the image config.)
+IMAGE_USER="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
+echo "==> image Config.User = '${IMAGE_USER}'"
+case "$IMAGE_USER" in
+  ""|0|0:*|root|root:*)
+    echo "FAIL: image user must be non-root; got '${IMAGE_USER}'"; exit 1 ;;
+  *[!0-9:]*)
+    echo "FAIL: image user '${IMAGE_USER}' is not numeric — Kubernetes runAsNonRoot cannot verify it"; exit 1 ;;
+esac
+echo "    image declares a numeric non-root user"
 echo "==> migrate the schema (vouchr migrate) against Postgres"
 docker run --rm --network "$NET" \
   -e VOUCHR_DATABASE_URL="$DB_URL" \

@@ -622,9 +622,12 @@ All notable changes to this project are documented here. This project adheres to
   failed every pod with `CreateContainerConfigError` before start. The manifest no longer pins a UID
   (a Restricted platform assigns an arbitrary one from its namespace range), and the schema-owner
   migrate Job now carries the same container-level Restricted controls as the runtime
-  (`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, read-only root filesystem, bounded
-  resources). The docker smoke additionally boots the image under an arbitrary UID with a read-only
-  root filesystem, and a static test validates both pod templates.
+  (`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, read-only root filesystem). Both
+  workloads now set a **CPU limit** (not just a request, which only affects scheduling) alongside
+  the memory limit. The docker smoke asserts the image's `Config.User` is a numeric non-root uid
+  (so reverting to `USER node` fails CI, not only at deploy) and boots the image under an arbitrary
+  UID with a read-only root filesystem; a static test validates both pod templates carry the
+  security controls and bound CPU + memory in both requests and limits.
 - **External-reference configuration now enforces its reference-only boundary** (#53). The Bolt
   key-reference flow and both headless routes (`/v1/admin/reference`, `/v1/user/reference`) share one
   core validator: only bounded supported AWS Secrets Manager, GCP Secret Manager, Azure Key Vault,

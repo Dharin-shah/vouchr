@@ -20,9 +20,10 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json ./package.json
 # For KMS-backed deployments, insert this before the USER line:
 #   RUN npm install --no-save @aws-sdk/client-kms && npm cache clean --force
-# A numeric USER has no /etc/passwd name lookup, so Docker does not set HOME for it — set it
-# explicitly to the node user's home (owned by uid 1000) so tooling that reads HOME works. An
-# arbitrary-UID platform override lands on `/` for HOME; the broker writes nothing there.
+# Set HOME explicitly. uid 1000 already resolves to /home/node via the base image's passwd entry
+# (os.homedir() works), but Docker leaves the HOME env var unset for a numeric USER, and some tooling
+# reads $HOME directly rather than the passwd entry. Pinning it here fixes that AND persists a sane,
+# owned HOME even when a platform overrides the container to an arbitrary UID with no passwd entry.
 ENV HOME=/home/node
 # Numeric non-root user (the official Node image's `node` is uid:gid 1000:1000). A NUMERIC id lets
 # the kubelet verify `runAsNonRoot` from the image config alone, so no manifest UID is required —

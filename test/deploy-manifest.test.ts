@@ -34,6 +34,17 @@ test('both containers carry the Restricted container-level controls', () => {
     assert.match(doc, /allowPrivilegeEscalation:\s*false/, `${kindOf(doc)} container must set allowPrivilegeEscalation: false`);
     assert.match(doc, /readOnlyRootFilesystem:\s*true/, `${kindOf(doc)} container must set readOnlyRootFilesystem: true`);
     assert.match(doc, /capabilities:\s*\{\s*drop:\s*\["ALL"\]\s*\}/, `${kindOf(doc)} container must drop ALL capabilities`);
-    assert.match(doc, /resources:/, `${kindOf(doc)} container must bound resources`);
+  }
+});
+
+test('both containers bound CPU and memory in requests AND limits', () => {
+  // A request only affects scheduling; a limit is the hard ceiling. Require both dimensions on both.
+  for (const doc of podTemplates) {
+    const requests = doc.match(/requests:\s*\{([^}]*)\}/)?.[1] ?? '';
+    const limits = doc.match(/limits:\s*\{([^}]*)\}/)?.[1] ?? '';
+    assert.match(requests, /cpu:/, `${kindOf(doc)} must request cpu`);
+    assert.match(requests, /memory:/, `${kindOf(doc)} must request memory`);
+    assert.match(limits, /cpu:/, `${kindOf(doc)} must set a cpu LIMIT (a request is not a ceiling)`);
+    assert.match(limits, /memory:/, `${kindOf(doc)} must set a memory limit`);
   }
 });
