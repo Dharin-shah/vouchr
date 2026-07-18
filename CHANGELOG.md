@@ -642,13 +642,28 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
-- **Approval delivery confirms within its lease regardless of channel size** (#194). The admin
-  fan-out now confirms the FIRST successful delivery immediately (single-flight), consuming the
-  delivery lease within roughly one post's time — so however long a large best-effort fan-out runs,
-  another replica can never reclaim the lease and duplicate the controls. The fan-out's overall
-  deadline uses a monotonic clock (`process.hrtime`) rather than `Date.now()`, which can jump. The
-  public `VouchrAuditEvent` doc now lists every `consent_failed` status (400 incomplete, 403
-  offboarded, 409 revoked, 500/502 provider/system) — the action's non-denial meaning is unchanged.
+- **Approval delivery reserves confirmation time inside its lease regardless of channel size**
+  (#194). The admin fan-out confirms the first successful delivery immediately (single-flight), and
+  its monotonic posting deadline starts before the claim round-trip and reserves one bounded Slack
+  post plus the runtime pool and query-timeout budgets. The bounded Slack client also overrides a
+  lower operator queue concurrency, whose pre-request wait is not covered by the SDK timeout, and
+  runtime connection-string parameters cannot raise the reserved database bounds. A late-wave first
+  success therefore starts confirmation before planned work can exhaust the lease. Confirmation
+  failures use fixed unknown-outcome recovery across approval, session, and connection prompts rather
+  than false request drift or raw database errors. The public `VouchrAuditEvent` doc now lists every
+  consent status, including audit-write failure and the 400/403/409/500/502 `consent_failed` outcomes.
+- **The reference Kubernetes deployment can start, and is Restricted-policy clean** (#216). The
+  broker image now runs as a numeric non-root user (`USER 1000:1000`), so the kubelet verifies
+  `runAsNonRoot` from the image config — previously `USER node` (a name) with `runAsNonRoot: true`
+  failed every pod with `CreateContainerConfigError` before start. The manifest no longer pins a UID
+  (a Restricted platform assigns an arbitrary one from its namespace range), and the schema-owner
+  migrate Job now carries the same container-level Restricted controls as the runtime
+  (`allowPrivilegeEscalation: false`, `capabilities.drop: [ALL]`, read-only root filesystem). Both
+  workloads now set a **CPU limit** (not just a request, which only affects scheduling) alongside
+  the memory limit. The docker smoke asserts the image's `Config.User` is a numeric non-root uid
+  (so reverting to `USER node` fails CI, not only at deploy) and boots the image under an arbitrary
+  UID with a read-only root filesystem; a static test validates both pod templates carry the
+  security controls and bound CPU + memory in both requests and limits.
 - **Re-authorization over a live credential no longer dead-ends** (#194). Every user-owned
   credential write — OAuth callback, direct key, and external reference — is now fenced by generation
   ordering: a write loses (`stale`, no audit) when a live credential's `generation_at` is at or after
@@ -685,8 +700,9 @@ All notable changes to this project are documented here. This project adheres to
   client now carries the operator's `slackClientOptions` (custom `slackApiUrl`, agent/proxy, TLS,
   headers) so a non-default Slack transport is not bypassed. Admin approval recipients are enumerated
   *before* the lease is claimed, and the prompts are posted **concurrently under a bounded in-flight
-  cap and an overall wall-clock deadline** (derived from the lease), so even a channel with hundreds
-  of eligible admins finishes well inside the lease instead of summing per-post timeouts. A reused still-live prompt throws `ConsentRequiredError` with
+  cap and an overall monotonic start deadline** (derived from the lease), so even a channel with
+  hundreds of eligible admins finishes well inside the lease instead of summing per-post timeouts. A
+  reused still-live prompt throws `ConsentRequiredError` with
   a **required** typed `promptState` (`'posted' | 'reused'`, exported as `ConsentPromptState`; no
   default, so an omission cannot silently mean `posted`); the safe mapper renders fixed leak-safe copy
   from it (no free-form message) that says the ephemeral may no longer be visible instead of claiming
