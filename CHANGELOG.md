@@ -253,6 +253,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **OAuth success page discloses the bound Slack identity** (#194). Every supported callback
+  surface (Bolt route and headless broker) now names the bound Slack user and workspace on the
+  connect success page AND links to that user's Slack profile (a `slack://user` deep link, so the
+  completer can recognize *who* it is instead of parsing an opaque `U…`/`T…` id), plus the provider
+  account when known (it can be null). One shared adapter-layer renderer (`src/adapters/landing.ts`,
+  reusing the single HTML escaper) serves both surfaces with a mandatory identity argument, so no
+  surface can omit it and transport-agnostic core carries no browser HTML. This is a
+  security-detection control for the **forwarded consent link** limitation: consent binds the
+  *initiating* Slack identity, so an insider who forwards their private Connect link has a
+  colleague's provider account bound under the initiator. The disclosure lets the completer
+  recognize they linked their own account to someone else; it does not *prevent* the attack —
+  browser-side Slack identity binding (Sign in with Slack / OIDC) is the prevention, tracked
+  privately and slated ON-by-default for GA. `guides/THREAT-MODEL.md` documents the limitation, the
+  residual risk, and that private link delivery is a Bolt guarantee only — the headless broker
+  returns `{ authorizeUrl, state }` to the host, which owns keeping it private.
 - **README rewritten as a product page** (~140 lines): what Vouchr does, quickstart,
   credential modes, and links out — the how moved to its natural guides: the exported
   typed-error table to `guides/HEADLESS.md#typed-errors-exported-classes`,
