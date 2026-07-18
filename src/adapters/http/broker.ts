@@ -18,7 +18,7 @@ import { mapSafeError, SessionApprovalRequiredError, UpstreamTimeoutError } from
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
 import { channelOwner, userOwner, type Owner } from '../../core/owner';
-import { connectedHtml } from '../../core/landing';
+import { connectedHtml, escapeHtml } from '../landing';
 import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
 import { setChannelCredentialMode } from '../../core/channelCredential';
 import {
@@ -440,12 +440,6 @@ function requestBody(body: unknown): string | undefined {
     throw new HttpError(413, { error: 'request body too large' });
   }
   return body;
-}
-
-/** Escape for HTML text context — the OAuth landing page interpolates provider/account/error, and
- *  `error`/`account` are attacker- or provider-influenced, so this is a reflected-XSS guard (#52). */
-function escapeHtml(s: string): string {
-  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]!));
 }
 
 /** Minimal browser landing page for the OAuth callback (headless has no chat surface to nudge back to).
@@ -1720,7 +1714,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     );
     // Every supported callback surface must disclose the bound Slack identity (mandatory arg): a
     // forwarded /v1/connect URL otherwise binds the completer's provider account to the initiator
-    // with no signal. Shared renderer keeps that disclosure in one place (see core/landing.ts).
+    // with no signal. Shared renderer keeps that disclosure in one place (see adapters/landing.ts).
     if (result.ok) return { status: 200, html: connectedHtml(result.provider, result.account, result.scopes, result.identity) };
     return { status: result.status, html: landingHtml('Connection failed', result.error) };
   }

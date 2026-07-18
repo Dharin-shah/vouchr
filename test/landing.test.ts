@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { connectedHtml } from '../src/core/landing';
+import { connectedHtml } from '../src/adapters/landing';
 
 const ID = { enterpriseId: null, teamId: 'T0WORKSPACE', userId: 'U0FORWARD' };
 
@@ -14,13 +14,22 @@ test('connectedHtml: shows the provider account and granted scopes', () => {
   assert.doesNotMatch(html, /acting as you/);
 });
 
-test('connectedHtml: names the bound Slack identity so a forwarded link is detectable', () => {
+test('connectedHtml: the bound identity is human-recognizable (deep link), not only raw ids', () => {
   const html = connectedHtml('github', 'octocat', 'repo', ID);
-  assert.match(html, /U0FORWARD/); // whoever completes the OAuth sees which Slack user it empowers
+  assert.match(html, /U0FORWARD/); // the id is present...
   assert.match(html, /T0WORKSPACE/);
+  // ...but the completer also gets a clickable slack:// profile link to see WHO it actually is,
+  // rather than being asked to recognize an opaque U…/T… id.
+  assert.match(html, /href="slack:\/\/user\?team=T0WORKSPACE&amp;id=U0FORWARD"/);
   assert.match(html, /not you/i);
-  // The concrete provider account is the human-recognizable anchor (not only opaque U/T ids).
-  assert.match(html, /your github account \(octocat\) to someone else/i);
+});
+
+test('connectedHtml: the disclosure holds when the provider account is null', () => {
+  // account can be null (no probe / provider returns none); the copy must not depend on it.
+  const html = connectedHtml('github', null, undefined, ID);
+  assert.match(html, /connected this github account to someone else/i);
+  assert.match(html, /href="slack:\/\/user/); // the recognizable anchor is still the deep link
+  assert.doesNotMatch(html, /\(\)/); // no empty "( )" where the account name would be
 });
 
 test('connectedHtml: escapes every provider- and user-controlled value (no XSS)', () => {
