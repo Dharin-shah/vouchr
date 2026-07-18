@@ -33,7 +33,8 @@ export interface VouchrAuditEvent {
   method?: string;
   // HTTP-ish status. Only 'fetch' carries a REAL upstream status; the others are synthetic: 'refresh'
   // is hardcoded 200 (it only emits after refresh already succeeded), 'consent_granted' is 200,
-  // 'consent_denied' is 400 (a real user denial), and 'consent_failed' spans 400 (incomplete
+  // 'consent_denied' is 400 when its canonical audit write succeeds and 500 when that write fails;
+  // it remains a real user denial in both cases. 'consent_failed' spans 400 (incomplete
   // authorization), 403 (offboarded), 409 (revoked), and 500/502 (provider/system failure) — always
   // the same non-denial meaning. Don't treat `status` as a uniform provider response code across
   // actions; key on `action` first.

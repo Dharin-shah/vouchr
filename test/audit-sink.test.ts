@@ -139,6 +139,31 @@ test('audit-sink: consent_denied fires on a REAL user denial (?error=access_deni
   assert.equal((await consent.consume(state)).status, 'unavailable');
 });
 
+test('audit-sink: a real denial carries status 500 when its canonical audit write fails', async (t) => {
+  const events: VouchrAuditEvent[] = [];
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const registry = new ProviderRegistry([ACME]);
+  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const res = await handleOAuthCallback(
+    {
+      registry,
+      vault: new Vault(db, KEY),
+      audit: { record: async () => { throw new Error('audit unavailable'); } } as any,
+      consent,
+      redirectUri: 'https://app.example/cb',
+      auditSink: (event) => events.push(event),
+    },
+    undefined,
+    state,
+    'access_denied',
+  );
+  assert.equal(res.ok, false);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].action, 'consent_denied');
+  assert.equal(events[0].status, 500);
+});
+
 test('audit-sink: a token-exchange failure emits consent_failed, not consent_denied', async (t) => {
   const events: VouchrAuditEvent[] = [];
   const db = await openTestDb(t);
@@ -157,6 +182,7 @@ test('audit-sink: a token-exchange failure emits consent_failed, not consent_den
   }
   assert.equal(events.length, 1);
   assert.equal(events[0].action, 'consent_failed', 'a provider/exchange failure must not claim a human denial');
+  assert.equal(events[0].status, 500, 'a token-exchange/system failure carries synthetic status 500');
   assert.equal(events[0].userId, 'U1');
   assert.ok(events[0].jti, 'jti missing');
 });
@@ -175,6 +201,13 @@ test('audit-sink: a provider redirect error emits consent_failed, but access_den
   const s2 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
   await handleOAuthCallback({ ...mk(), auditSink: (e) => failed.push(e) }, undefined, s2, 'temporarily_unavailable');
   assert.equal(failed[0].action, 'consent_failed', 'a provider-side error is consent_failed');
+  assert.equal(failed[0].status, 502, 'a transient provider redirect carries status 502');
+
+  const incomplete: VouchrAuditEvent[] = [];
+  const s3 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
+  await handleOAuthCallback({ ...mk(), auditSink: (e) => incomplete.push(e) }, undefined, s3);
+  assert.equal(incomplete[0].action, 'consent_failed', 'an incomplete callback is consent_failed');
+  assert.equal(incomplete[0].status, 400, 'an audited incomplete callback carries status 400');
 });
 
 test('audit-sink: an offboard/revoke race during exchange emits consent_failed, not consent_denied', async (t) => {
