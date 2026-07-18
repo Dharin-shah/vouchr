@@ -188,6 +188,35 @@ function slackNotificationClient(token: string, base?: WebClientOptions): WebCli
   return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS });
 }
 
+/** Fan `task` out over `items` with at most `limit` in flight, returning settled outcomes in order.
+ * Approval prompts to eligible admins run through this so K bounded posts finish in roughly one
+ * post's time instead of their sum, keeping the whole fan-out inside the delivery lease, while never
+ * opening an unbounded number of concurrent Slack calls. */
+async function settledWithLimit<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<void>,
+): Promise<PromiseSettledResult<void>[]> {
+  const results = new Array<PromiseSettledResult<void>>(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      try {
+        await task(items[i]);
+        results[i] = { status: 'fulfilled', value: undefined };
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+/** In-flight cap for the admin approval fan-out. At the bounded 3s per-post timeout this keeps the
+ * common case (≤ this many eligible admins) to a single ~3s wave, well inside PROMPT_DELIVERY_LEASE_MS. */
+const APPROVAL_FANOUT_CONCURRENCY = 16;
+
 function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
   return new Promise((resolve) => {
     let settled = false;
@@ -865,21 +894,25 @@ export class ConnectContext {
     let sawAmbiguousFailure = false;
     let ambiguousFailure: unknown;
     let definiteFailure: Exclude<SlackPromptDeliveryFailure, 'ambiguous'> | undefined;
-    for (const admin of approvers) {
-      try {
-        await client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, ...fallback });
+    // Post to every eligible admin CONCURRENTLY (bounded): sequential awaits of the 3s-bounded post
+    // would sum past the delivery lease for a large channel and let another replica take over and
+    // duplicate the controls. The confirmDelivery token fence after this still rejects a takeover.
+    const channel = this.channel;
+    const results = await settledWithLimit(approvers, APPROVAL_FANOUT_CONCURRENCY, (admin) =>
+      client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback }).then(() => undefined));
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
         delivered = true;
-      } catch (error) {
-        // Try every eligible admin before declaring failure. If any send has an ambiguous transport
-        // outcome, the aggregate must remain ambiguous even when every sibling was definitely
-        // rejected: at least one actionable prompt may still have reached Slack.
-        const outcome = classifySlackPromptDeliveryFailure(error);
-        if (outcome === 'ambiguous') {
-          sawAmbiguousFailure = true;
-          ambiguousFailure ??= error;
-        }
-        else if (outcome === 'rate-limited' || definiteFailure === undefined) definiteFailure = outcome;
+        continue;
       }
+      // If any send has an ambiguous transport outcome, the aggregate must remain ambiguous even when
+      // every sibling was definitely rejected: at least one actionable prompt may still have reached Slack.
+      const outcome = classifySlackPromptDeliveryFailure(result.reason);
+      if (outcome === 'ambiguous') {
+        sawAmbiguousFailure = true;
+        ambiguousFailure ??= result.reason;
+      }
+      else if (outcome === 'rate-limited' || definiteFailure === undefined) definiteFailure = outcome;
     }
     if (!approvers.length) {
       // No eligible admin visible from here (fail-closed member/admin reads): the requester should
@@ -1101,7 +1134,7 @@ export class ConnectContext {
     if (provider.credential === 'key') {
       await this.postKeySetupPrompt(providerId, connectIssuedAt);
       this.emit({ type: 'connect_prompted', provider: providerId });
-      throw new ConsentRequiredError(providerId);
+      throw new ConsentRequiredError(providerId, 'posted');
     }
 
     const pendingConsent = await this.consent.beginFenced(
@@ -1156,7 +1189,7 @@ export class ConnectContext {
       );
     }
     this.emit({ type: 'connect_prompted', provider: providerId });
-    throw new ConsentRequiredError(providerId);
+    throw new ConsentRequiredError(providerId, 'posted');
   }
 
   /**

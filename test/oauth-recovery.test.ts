@@ -788,6 +788,49 @@ test('Bolt caps hung notification lookups across distinct workspaces', async (t)
   for (const settle of settleLookups.slice(1)) settle({});
 });
 
+test('an equal-generation write is fenced (millisecond tie fails closed), no sleeps', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const owner = userOwner(ID);
+  const tok = { accessToken: 'first', refreshToken: null, scopes: 'read', expiresAt: null, externalAccount: null };
+  assert.equal(await vault.upsertUser(owner, provider.id, tok, await vault.userProvisioningIssuedAt()), 'stored');
+  // Read the exact generation the credential committed at, then issue a write AT that same
+  // millisecond. Integer-ms clocks make this tie reachable in production; it must fail closed (`>=`),
+  // so a stale write can never win the tie and overwrite a causally-newer credential.
+  const gen = (await db.get<{ generation_at: number }>(
+    `SELECT generation_at FROM connection WHERE team_id=? AND owner_id=? AND provider=?`,
+    [owner.teamId, owner.id, provider.id],
+  ))!.generation_at;
+  const result = await vault.upsertUser(
+    owner, provider.id, { ...tok, accessToken: 'tie-write' }, gen,
+  );
+  assert.equal(result, 'stale', 'a write issued at the exact existing generation must fail closed');
+  assert.equal((await vault.get(owner, provider.id))?.accessToken, 'first');
+});
+
+test('a direct credential write supersedes an older pending consent so fresh demand never reuses a dead URL', async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const vault = new Vault(db, KEY);
+  const owner = userOwner(ID);
+  // A pending "Connect" exists...
+  const old = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  // ...then a credential commits by another path (e.g. a key set, or a broker connect that landed).
+  assert.equal(
+    await vault.upsertUser(owner, provider.id, {
+      accessToken: 'live', refreshToken: null, scopes: 'read', expiresAt: null, externalAccount: null,
+    }, await vault.userProvisioningIssuedAt()),
+    'stored',
+  );
+  // The old consent is now superseded (its callback would lose the generation fence), so a fresh
+  // connect mints a NEW generation rather than reusing the guaranteed-stale URL.
+  assert.equal((await consent.consume(old.state)).status, 'superseded');
+  const fresh = await consent.beginFenced(ID, provider, 'https://vouchr.test/callback', 'C1', await vault.userProvisioningIssuedAt());
+  assert.ok(fresh);
+  assert.notEqual(fresh.state, old.state, 'fresh demand must not reuse the superseded state');
+});
+
 test('re-authorization over a live credential replaces it; a delayed stale callback still loses', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
@@ -945,7 +988,7 @@ test("an offboarded user's surviving expired link is account-inactive, not \"ask
 });
 
 test('mapSafeError emits fixed copy for a reused (possibly-hidden) Connect prompt', () => {
-  const posted = mapSafeError(new ConsentRequiredError('acme'));
+  const posted = mapSafeError(new ConsentRequiredError('acme', 'posted'));
   const reused = mapSafeError(new ConsentRequiredError('acme', 'reused'));
   assert.equal(posted.recovery, 'connect');
   assert.equal(reused.recovery, 'connect');

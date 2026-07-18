@@ -31,7 +31,7 @@ function emitConsent(
   identity: SlackIdentity,
   provider: string,
   egressHost: string,
-  action: 'consent_granted' | 'consent_denied',
+  action: 'consent_granted' | 'consent_denied' | 'consent_failed',
   status: number,
 ): void {
   const e: VouchrAuditEvent = {
@@ -234,7 +234,8 @@ export async function handleOAuthCallback(
     // transient. The raw value is still never reflected or persisted (SEC-4).
     const transient = TRANSIENT_OAUTH_ERRORS.has(error);
     const status = transient ? 502 : 500;
-    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', status);
+    // A provider-side redirect error is NOT a human denial: emit consent_failed on the stream.
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_failed', status);
     return attributedFailure(
       'exchange_failed',
       status,
@@ -247,12 +248,13 @@ export async function handleOAuthCallback(
   }
   if (!code) {
     const recorded = await recordDenied(deps, row.identity, provider.id, 'consent_incomplete');
+    // Authorization that never returned a code is not a human denial: emit consent_failed.
     emitConsent(
       deps,
       row.identity,
       provider.id,
       new URL(provider.tokenUrl).hostname,
-      'consent_denied',
+      'consent_failed',
       recorded ? 400 : 500,
     );
     return attributedFailure(
@@ -408,7 +410,8 @@ export async function handleOAuthCallback(
     try {
       await deps.audit.record('denied', row.identity, provider.id, { reason: 'exchange_failed' });
     } catch { /* audit store unavailable; return the fixed failure below */ }
-    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_denied', 500);
+    // Post-consent connection failure is not a human denial: emit consent_failed on the stream.
+    emitConsent(deps, row.identity, provider.id, new URL(provider.tokenUrl).hostname, 'consent_failed', 500);
     const safe = mapSafeError(error);
     return attributedFailure(
       'exchange_failed',

@@ -617,12 +617,12 @@ export class Vault {
         if (tombstoneBlocks(offboardedAt, issuedAt)) return 'offboarded';
         if (tombstoneBlocks(revokedAt, issuedAt)) return 'revoked';
         // Newest-generation fence for EVERY user write, whatever the issuance shape. A credential
-        // written STRICTLY AFTER this request was issued is newer and must never be overwritten: a
-        // stalled OAuth/key/reference request (whose issuance is strictly earlier than a rotation
-        // that committed while it was in flight) loses. Equality is not "stale" — a same-instant
-        // legitimate replacement (re-key, re-reference) is a concurrent write, not a delayed one, so
-        // it proceeds. A request issued at or after the live credential (deliberate re-auth over a
-        // provider-dead or scope-upgraded token) still replaces it.
+        // whose generation (write time) is at or after this request's issuance must never be
+        // overwritten — EQUALITY FAILS CLOSED (`>=`): both are integer PostgreSQL milliseconds, so a
+        // credential that committed just after an older request can compare equal, and a strict `>`
+        // would let the stale write win the tie. A stalled OAuth/key/reference request therefore
+        // loses. Legitimate replacements are not ties: each real re-key/re-reference/re-auth arrives
+        // on a fresh interaction receipt strictly later than the prior write's generation.
         const existing = await fencedTx.get<{
           created_at: number;
           last_used_at: number | null;
@@ -635,11 +635,23 @@ export class Vault {
         if (
           existing
           && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)
-          && existing.generation_at > issuedAt
+          && existing.generation_at >= issuedAt
         ) {
           return 'stale';
         }
         await write(fencedTx);
+        // A committed user credential makes every strictly-older pending consent obsolete: its
+        // callback would now lose the generation fence and return state_stale. Supersede those rows
+        // in the SAME transaction (under the provisioning lock) so a fresh connect cannot reuse a
+        // guaranteed-stale OAuth URL. The consent that minted THIS write (OAuth) is already consumed
+        // and deleted by finalizeProvisioning; a newer pending consent (created_at >= issuedAt) is
+        // deliberately left alone.
+        await fencedTx.run(
+          `UPDATE consent_request SET superseded_at=${POSTGRES_NOW_MS_SQL}
+           WHERE team_id=? AND user_id=? AND provider=?
+             AND superseded_at IS NULL AND consumed_at IS NULL AND created_at < ?`,
+          [owner.teamId, owner.id, provider, issuedAt],
+        );
         return 'stored';
       }));
   }

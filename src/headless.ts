@@ -53,7 +53,7 @@ export {
   mapSafeError,
   safeUserMessage,
 } from './core/errors';
-export type { VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
+export type { ConsentPromptState, VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
 // The broker maps this typed control-flow error to 403. Interaction stores are not exported: until
 // the later hybrid bridge lands, only packaged Bolt/broker paths own safe interaction mutations.
 export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval';

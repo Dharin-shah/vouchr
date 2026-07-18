@@ -23,14 +23,18 @@ export interface VouchrAuditEvent {
   provider: string;
   ownerKind: 'user' | 'channel';
   ownerId: string; // user id or channel id that OWNS the credential
-  action: 'fetch' | 'refresh' | 'consent_granted' | 'consent_denied';
+  // `consent_denied` is ONLY a real human denial (the user clicked Deny). A provider-side or
+  // Vouchr-side failure that is not the user's decision — token-exchange failure, a non-`access_denied`
+  // OAuth redirect error, or authorization that never completed — is `consent_failed`, so a stream
+  // consumer is never told a human refused when they did not.
+  action: 'fetch' | 'refresh' | 'consent_granted' | 'consent_denied' | 'consent_failed';
   egressHost: string;
   /** HTTP method for fetch events. Omitted for refresh/consent events. */
   method?: string;
   // HTTP-ish status. Only 'fetch' carries a REAL upstream status; the others are synthetic: 'refresh'
-  // is hardcoded 200 (it only emits after refresh already succeeded), 'consent_granted' is 200, and
-  // 'consent_denied' is 400 for a real user denial or 500 for a post-consent connection failure.
-  // Don't treat `status` as a uniform provider response code across actions; key on `action` first.
+  // is hardcoded 200 (it only emits after refresh already succeeded), 'consent_granted' is 200,
+  // 'consent_denied' is 400 (a real user denial), and 'consent_failed' is 500/502 for a non-user
+  // failure. Don't treat `status` as a uniform provider response code across actions; key on `action` first.
   status: number;
   jti: string;
 }

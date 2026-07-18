@@ -86,11 +86,13 @@ const USER_FACING_ERRORS = new WeakSet<object>();
 export type ConsentPromptState = 'posted' | 'reused';
 
 /** Thrown by `connect()` after a Connect prompt is posted (or an earlier one reused): stop this
- * turn. Hosts branch on the class/`code`/`promptState`, never on message text. */
+ * turn. Hosts branch on the class/`code`/`promptState`, never on message text. `promptState` is
+ * REQUIRED (no default) so every throw site states it explicitly — an omission cannot silently
+ * become `posted` and resurrect the false "the prompt is on screen" copy for a reused ephemeral. */
 export class ConsentRequiredError extends Error {
   readonly code = 'consent_required' as const;
 
-  constructor(public provider: string, readonly promptState: ConsentPromptState = 'posted') {
+  constructor(public provider: string, readonly promptState: ConsentPromptState) {
     super(
       promptState === 'reused'
         ? `Consent required for "${provider}". A Connect prompt was already posted; if it is no longer visible, ask again after the current request expires (up to 10 minutes).`
