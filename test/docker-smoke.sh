@@ -56,12 +56,12 @@ DB_URL="postgres://vouchr:vouchr@${PG_NAME}:5432/vouchr"
 # cannot guard this — inspect the image config.)
 IMAGE_USER="$(docker image inspect --format '{{.Config.User}}' "$IMAGE")"
 echo "==> image Config.User = '${IMAGE_USER}'"
-case "$IMAGE_USER" in
-  ""|0|0:*|root|root:*)
-    echo "FAIL: image user must be non-root; got '${IMAGE_USER}'"; exit 1 ;;
-  *[!0-9:]*)
-    echo "FAIL: image user '${IMAGE_USER}' is not numeric — Kubernetes runAsNonRoot cannot verify it"; exit 1 ;;
-esac
+# Require an exact canonical non-zero numeric uid, optionally :gid. This anchored shape rejects a
+# name (`node`), empty, literal `0`/`0:0`, zero-padded root equivalents (`00`, `00:1000`), and
+# malformed colon forms — all of which either run as root or cannot be verified by the kubelet.
+if ! [[ "$IMAGE_USER" =~ ^[1-9][0-9]*(:[0-9]+)?$ ]]; then
+  echo "FAIL: image Config.User must be a canonical non-zero numeric uid (optionally uid:gid); got '${IMAGE_USER}'"; exit 1
+fi
 echo "    image declares a numeric non-root user"
 echo "==> migrate the schema (vouchr migrate) against Postgres"
 docker run --rm --network "$NET" \
