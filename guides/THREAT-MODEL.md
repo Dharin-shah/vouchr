@@ -255,7 +255,9 @@ user or reuse a callback.
   authority-free row has a 24-hour retention threshold so an authentic expired link can receive fixed
   private guidance before the next sweep reclaims it; unknown/replayed input remains generic. After token exchange,
   the credential transaction conditionally deletes the exact still-active generation while
-  rechecking offboard/revoke tombstones and live-credential absence. PKCE (S256) is sent when the
+  rechecking offboard/revoke tombstones and generation ordering — a live credential written
+  at-or-after the consent was minted refuses the write, while a newer consent replaces an older
+  credential so re-authorization cannot dead-end. PKCE (S256) is sent when the
   provider enables it; the verifier is stored server-side in the consent row, not in the redirect.
 
 ### Forwarded consent link

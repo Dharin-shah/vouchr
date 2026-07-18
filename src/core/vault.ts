@@ -31,14 +31,9 @@ export interface StoredToken {
 }
 
 /** A user-provisioning intent is either a trusted server timestamp or an atomic resolver that
- * consumes a persisted opaque request inside the credential transaction. */
-export interface UserProvisioningGate {
-  issuedAt: number;
-  /** Slack key-setup prompts are issued only for an absent live credential. Reassert that predicate
-   * under the final credential lock so a delayed modal cannot overwrite a sibling write. */
-  requireAbsent: true;
-}
-export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | UserProvisioningGate | null>);
+ * consumes a persisted opaque request inside the credential transaction and yields its issuance
+ * time (or null to abort). Every user write is fenced by generation ordering regardless of shape. */
+export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | null>);
 export type UserProvisioningResult = 'stored' | 'stale' | 'offboarded' | 'revoked' | 'conflict';
 
 const PREPARE_VAULT_CREDENTIAL_WRITE = Symbol('prepare-vault-credential-write');
@@ -610,9 +605,8 @@ export class Vault {
     };
     return this.withCredentialLock(owner, provider, async (_locked, tx) =>
       withUserProvisioningLock(tx, identity, provider, async (fencedTx) => {
-        const resolved = typeof issuance === 'number' ? issuance : await issuance(fencedTx);
-        if (resolved == null) return 'stale';
-        const issuedAt = typeof resolved === 'number' ? resolved : resolved.issuedAt;
+        const issuedAt = typeof issuance === 'number' ? issuance : await issuance(fencedTx);
+        if (issuedAt == null) return 'stale';
         if (!Number.isSafeInteger(issuedAt)) throw new Error('invalid user provisioning issuance');
         const offboardedAt = await latestUserOffboardTombstone(fencedTx, identity);
         const revokedAt = await latestProvisioningRevocationTombstone(
@@ -622,20 +616,44 @@ export class Vault {
         );
         if (tombstoneBlocks(offboardedAt, issuedAt)) return 'offboarded';
         if (tombstoneBlocks(revokedAt, issuedAt)) return 'revoked';
-        if (typeof resolved !== 'number' && resolved.requireAbsent) {
-          const existing = await fencedTx.get<{
-            created_at: number;
-            last_used_at: number | null;
-          }>(
-            `SELECT created_at, last_used_at FROM connection
-             WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
-            [owner.teamId, owner.id, provider],
-          );
-          if (existing && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)) {
-            return 'stale';
-          }
+        // Newest-generation fence for EVERY user write, whatever the issuance shape. A credential
+        // whose generation (write time) is at or after this request's issuance must never be
+        // overwritten — EQUALITY FAILS CLOSED (`>=`): both are integer PostgreSQL milliseconds, so a
+        // credential that committed just after an older request can compare equal, and a strict `>`
+        // would let the stale write win the tie. A stalled OAuth/key/reference request therefore
+        // loses. Legitimate replacements are not ties: each real re-key/re-reference/re-auth arrives
+        // on a fresh interaction receipt strictly later than the prior write's generation.
+        const existing = await fencedTx.get<{
+          created_at: number;
+          last_used_at: number | null;
+          generation_at: number;
+        }>(
+          `SELECT created_at, last_used_at, generation_at FROM connection
+           WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
+          [owner.teamId, owner.id, provider],
+        );
+        if (
+          existing
+          && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)
+          && existing.generation_at >= issuedAt
+        ) {
+          return 'stale';
         }
         await write(fencedTx);
+        // A committed user credential makes every consent at-or-before its issuance obsolete: the
+        // generation fence would fail that consent's callback closed (`>=`), so its URL is dead.
+        // Supersede those rows in the SAME transaction (under the provisioning lock) so a fresh
+        // connect cannot reuse one. The threshold MUST match the fence: `<= issuedAt` fails the
+        // equal-millisecond consent closed too — a strict `<` would leave a same-ms consent reusable
+        // even though its callback can never complete. The consent that minted THIS write (OAuth) is
+        // already consumed and deleted by finalizeProvisioning; a strictly-newer pending consent
+        // (created_at > issuedAt) is deliberately left alone.
+        await fencedTx.run(
+          `UPDATE consent_request SET superseded_at=${POSTGRES_NOW_MS_SQL}
+           WHERE team_id=? AND user_id=? AND provider=?
+             AND superseded_at IS NULL AND consumed_at IS NULL AND created_at <= ?`,
+          [owner.teamId, owner.id, provider, issuedAt],
+        );
         return 'stored';
       }));
   }

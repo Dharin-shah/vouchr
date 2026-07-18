@@ -34,12 +34,16 @@ async function ctx(
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const c = new ConnectContext({
+  // Each ConnectContext captures its own receipt instant — the per-request provisioning issuance.
+  // In production every modal submit is a SEPARATE Slack event → a fresh context; a test that needs
+  // a second logical write must build a fresh context too, or the generation fence (correctly) sees
+  // the second write's issuance as older than the first write's committed credential.
+  const newContext = () => new ConnectContext({
     identity: ID, channel, client, registry: new ProviderRegistry([keyProvider]), vault, audit,
     consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
     channelConfig: new ChannelConfig(db), resolvers,
   });
-  return { c, db, vault, audit };
+  return { c: newContext(), db, vault, audit, newContext };
 }
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
 
@@ -73,11 +77,13 @@ test('setUserSecret: secret never leaks to audit/return', async (t) => {
 });
 
 test('setUserSecret preserves the prior credential when a replacement audit fails', async (t) => {
-  const { c, db, vault, audit } = await ctx(t);
+  const { c, db, vault, audit, newContext } = await ctx(t);
   await c.setUserSecret('customdb', 'previous-key');
   audit.record = async () => { throw new Error('audit unavailable'); };
 
-  await assert.rejects(() => c.setUserSecret('customdb', SECRET), /audit unavailable/);
+  // A real replacement is a second modal submit → a fresh context (a later receipt instant), so its
+  // issuance is newer than the prior credential and the generation fence lets it attempt the write.
+  await assert.rejects(() => newContext().setUserSecret('customdb', SECRET), /audit unavailable/);
   assert.equal((await vault.get(userOwner(ID), 'customdb'))?.accessToken, 'previous-key');
   assert.deepEqual((await auditRows(db)).map((row) => row.action), ['config']);
 });

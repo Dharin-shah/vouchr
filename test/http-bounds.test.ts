@@ -632,10 +632,7 @@ test('OAuth callback normalizes a custom accountProbe before persistence and aud
             pkceVerifier: 'verifier', createdAt: Date.now(),
           },
         }),
-        finalizeProvisioning: async (row: { createdAt: number }) => ({
-          issuedAt: row.createdAt,
-          requireAbsent: true,
-        }),
+        finalizeProvisioning: async (row: { createdAt: number }) => row.createdAt,
       } as any,
       vault: {
         upsertUser: async (
@@ -693,10 +690,7 @@ test('OAuth callback drops an account label containing credential material (SEC-
             pkceVerifier: 'verifier-value', createdAt: Date.now(),
           },
         }),
-        finalizeProvisioning: async (row: { createdAt: number }) => ({
-          issuedAt: row.createdAt,
-          requireAbsent: true,
-        }),
+        finalizeProvisioning: async (row: { createdAt: number }) => row.createdAt,
       } as any,
       vault: {
         upsertUser: async (

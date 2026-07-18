@@ -1236,6 +1236,30 @@ test("admin approver: prompts go to eligible admins; forged/ineligible clicks ar
   });
 });
 
+test('admin approval fan-out posts concurrently, staying inside the delivery lease', async (t) => {
+  const admins = Array.from({ length: 12 }, (_, i) => `U_ADM_${i}`);
+  const POST_MS = 80;
+  const { ctx } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'admin' } }),
+    slackAdmins: admins,
+    members: ['U1', ...admins],
+    // Each prompt post takes POST_MS. Sequential fan-out would be admins.length × POST_MS (~960ms),
+    // which for a larger channel exceeds the 30s lease and permits a replica takeover + duplicate
+    // controls. Concurrent (bounded) fan-out finishes in ~one POST_MS wave.
+    postEphemeral: async () => { await new Promise((r) => setTimeout(r, POST_MS)); return {}; },
+  });
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const start = Date.now();
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    const elapsed = Date.now() - start;
+    assert.ok(
+      elapsed < POST_MS * admins.length / 2,
+      `admin fan-out was not concurrent: ${elapsed}ms for ${admins.length} sequential-would-be ${POST_MS * admins.length}ms`,
+    );
+  });
+});
+
 test('admin approver: deny notifies the requester ephemerally and audits the admin as actor', async (t) => {
   const { ctx, ephemerals, click, auditRows } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'admin' } }),

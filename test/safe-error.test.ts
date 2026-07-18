@@ -104,8 +104,12 @@ test('safeUserMessage: masks a custom error class and its secret message', () =>
 // Typed errors map to Vouchr-owned fixed copy; constructor text is not a trust boundary.
 test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe copy", () => {
   assert.equal(
-    safeUserMessage(new ConsentRequiredError('github')),
+    safeUserMessage(new ConsentRequiredError('github', 'posted')),
     'Consent is required. Complete the private Connect prompt, then retry.',
+  );
+  assert.match(
+    safeUserMessage(new ConsentRequiredError('github', 'reused')),
+    /no longer visible/,
   );
   assert.equal(
     safeUserMessage(new SessionApprovalRequiredError('github')),
@@ -1207,7 +1211,7 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
 // Regression: the ConsentRequiredError path is unaffected — its user-facing message is preserved
 // (it is one of Vouchr's own classes), so the connect prompt still reads normally, not the generic form.
 test('regression: ConsentRequiredError still shows its own connect-prompt message', () => {
-  const e = new ConsentRequiredError('github');
+  const e = new ConsentRequiredError('github', 'posted');
   assert.equal(safeUserMessage(e), 'Consent is required. Complete the private Connect prompt, then retry.');
   assert.match(safeUserMessage(e), /Connect prompt/);
 });

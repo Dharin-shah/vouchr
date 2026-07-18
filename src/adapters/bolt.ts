@@ -1,4 +1,4 @@
-import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
+import { ErrorCode as SlackErrorCode, WebClient, type WebClientOptions } from '@slack/web-api';
 import type { InstallationStore } from '@slack/bolt';
 import { openDb, type Db } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
@@ -38,7 +38,7 @@ import {
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
-import { InteractionStateChangedError, isInteractionId } from '../core/interaction';
+import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
 import {
   ChannelProvisioningRequests,
   configureUserCredential,
@@ -180,9 +180,62 @@ const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
  * lookups so a broken shared store cannot turn callback traffic into unbounded retained work. */
 export const MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS = 32;
 
-function slackNotificationClient(token: string): WebClient {
-  return new WebClient(token, SLACK_NOTIFICATION_CLIENT_OPTIONS);
+/** A bounded client for lease-guarded prompt posts and best-effort DMs. Preserves the operator's
+ * transport (`base`: custom slackApiUrl, agent/proxy, tls, headers) so a deployment using a
+ * non-default Slack endpoint is not bypassed; Vouchr's finite timeout, zero retries, and rate-limit
+ * rejection are applied ON TOP and always win (spread last), so a slow post can never outlive its
+ * delivery lease. */
+function slackNotificationClient(token: string, base?: WebClientOptions): WebClient {
+  return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS });
 }
+
+/** Skipped because the fan-out's overall deadline elapsed before this item was started — treated as
+ * an ambiguous (fail-safe: lease retained) outcome, since a takeover may have begun. */
+export class PromptFanoutDeadlineError extends Error {}
+
+/** Fan `task` out over `items` with at most `limit` in flight, returning settled outcomes in order.
+ * `deadlineMs` (optional) caps the WHOLE fan-out: once elapsed, remaining items are recorded as a
+ * `PromptFanoutDeadlineError` skip WITHOUT being started, so a very large `items` list can never make
+ * the operation outlive its bound (the cap alone bounds each wave, not the total). Approval prompts
+ * run through this so K bounded posts finish in ~one post's time and the fan-out stays inside the
+ * delivery lease no matter how many admins are eligible. */
+export async function settledWithLimit<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<void>,
+  deadlineMs?: number,
+): Promise<PromiseSettledResult<void>[]> {
+  const results = new Array<PromiseSettledResult<void>>(items.length);
+  const start = Date.now();
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const i = next++;
+      if (deadlineMs !== undefined && Date.now() - start >= deadlineMs) {
+        results[i] = { status: 'rejected', reason: new PromptFanoutDeadlineError('fan-out deadline elapsed') };
+        continue;
+      }
+      try {
+        await task(items[i]);
+        results[i] = { status: 'fulfilled', value: undefined };
+      } catch (reason) {
+        results[i] = { status: 'rejected', reason };
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+/** In-flight cap for the admin approval fan-out. At the bounded 3s per-post timeout this keeps the
+ * common case (≤ this many eligible admins) to a single ~3s wave, well inside PROMPT_DELIVERY_LEASE_MS. */
+const APPROVAL_FANOUT_CONCURRENCY = 16;
+/** Overall wall-clock budget for STARTING approval posts, leaving headroom below the delivery lease
+ * for the last in-flight wave plus confirmDelivery, so even a channel with hundreds of eligible
+ * admins can never let the fan-out outlive the lease and permit a replica takeover. */
+const APPROVAL_FANOUT_DEADLINE_MS = Math.max(
+  SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+  PROMPT_DELIVERY_LEASE_MS - 2 * SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+);
 
 function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
   return new Promise((resolve) => {
@@ -330,6 +383,12 @@ export interface VouchrOptions {
   policy?: Policy;
   /** Bot token used only for post-callback success and recovery DMs. */
   botToken?: string;
+  /** Transport options for the bounded clients Vouchr builds to post prompts and best-effort DMs
+   *  (custom `slackApiUrl`, `agent`/proxy, `tls`, `headers`). Vouchr always enforces finite timeout,
+   *  zero retries, and rate-limit rejection on top — those cannot be overridden. Set this to match
+   *  your Bolt `App`'s `clientOptions` when it uses a non-default transport, or those prompts/DMs
+   *  would bypass it. */
+  slackClientOptions?: WebClientOptions;
   /**
    * Multi-workspace token source. When set, post-OAuth success and recovery DMs are sent with the
    * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
@@ -485,6 +544,8 @@ export interface ConnectContextDeps {
   /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
    *  VouchrOptions.dryRun). Default false: unchanged behavior. */
   dryRun?: boolean;
+  /** Transport options for bounded prompt/DM clients (see VouchrOptions.slackClientOptions). */
+  slackClientOptions?: WebClientOptions;
 }
 
 // Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
@@ -547,6 +608,7 @@ export class ConnectContext {
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
   private dryRun: boolean;
+  private slackClientOptions?: WebClientOptions;
   private provisioningReceivedAt: bigint;
   private channelProvisioningIssuance?: ChannelProvisioningIssuance;
 
@@ -576,6 +638,7 @@ export class ConnectContext {
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
     this.dryRun = deps.dryRun ?? false;
+    this.slackClientOptions = deps.slackClientOptions;
     this.provisioningReceivedAt =
       (deps as InternalConnectContextDeps)[INTERNAL_PROVISIONING_RECEIVED_AT]
       ?? process.hrtime.bigint();
@@ -659,6 +722,12 @@ export class ConnectContext {
               'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
             );
           }
+          // Resolve the admin recipients BEFORE claiming the delivery lease: member enumeration is an
+          // unbounded Slack read, and running it *inside* the lease could let the lease expire (and
+          // another replica take over) before this worker posts, producing a duplicate. 'self' and
+          // off-channel approvals need no enumeration. The posts themselves run on the bounded
+          // promptClient, so the lease window then covers only bounded work.
+          const approvers = e.approver === 'admin' && this.channel ? await this.eligibleApprovers() : [];
           const delivery = await this.approvals?.claimDelivery(e.approvalId);
           if (!delivery || delivery.status === 'stale') {
             throw new UserFacingError(
@@ -674,7 +743,7 @@ export class ConnectContext {
           }
           if (delivery.status === 'claimed') {
             try {
-              await this.postApprovalPrompt(e, prompt);
+              await this.postApprovalPrompt(e, prompt, approvers);
             } catch (deliveryError) {
               const noSurface = isNoApprovalDecisionSurface(deliveryError);
               if (noSurface) {
@@ -800,55 +869,79 @@ export class ConnectContext {
     };
   }
 
-  /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. */
+  /** Client for lease-guarded prompt posts. A leased post must terminate well inside its
+   * PROMPT_DELIVERY_LEASE_MS: the default WebClient has no request timeout and silently queues
+   * rate-limited retries for up to ~30 minutes, so a slow post outlives its lease and a takeover
+   * replica double-delivers the prompt (the caller then also mis-reports its own landed post).
+   * Real Bolt clients carry their resolved token — post through a bounded twin (no retries, short
+   * timeout, 429 rejected). A test double without a token string is already immediate; use as-is. */
+  private promptClient(): WebClient {
+    const token = (this.client as { token?: unknown }).token;
+    return typeof token === 'string' && token.length > 0
+      ? slackNotificationClient(token, this.slackClientOptions)
+      : this.client;
+  }
+
+  /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. `approvers` is
+   * resolved by the caller BEFORE the delivery lease is claimed (member enumeration is unbounded and
+   * must not run inside the lease); it is empty for 'self'/off-channel approvals that need none. */
   private async postApprovalPrompt(
     e: ApprovalRequiredError,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
+    approvers: string[],
   ): Promise<void> {
+    const client = this.promptClient();
     const { blocks, fallback } = prompt;
     const threadArg = this.thread ? { thread_ts: this.thread } : {};
     if (e.approver === 'self') {
       if (this.channel) {
-        await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
+        await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
       } else {
-        await this.client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
+        await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
       }
       return;
     }
     // 'admin': the channel is the approval surface. Off-channel (a DM) there are no channel admins
     // to prompt — tell the requester why nothing can proceed instead of failing silently (STR-5).
     if (!this.channel) {
-      await this.client.chat.postMessage({
+      await client.chat.postMessage({
         channel: this.identity.userId,
         text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval — run it in a channel so an admin can approve it.`,
       }).catch(() => undefined);
       throw new NoApprovalDecisionSurfaceError('admin approval requires a channel decision surface');
     }
-    const approvers = await this.eligibleApprovers();
     let delivered = false;
     let sawAmbiguousFailure = false;
     let ambiguousFailure: unknown;
     let definiteFailure: Exclude<SlackPromptDeliveryFailure, 'ambiguous'> | undefined;
-    for (const admin of approvers) {
-      try {
-        await this.client.chat.postEphemeral({ channel: this.channel, user: admin, ...threadArg, blocks, ...fallback });
+    // Post to every eligible admin CONCURRENTLY (bounded): sequential awaits of the 3s-bounded post
+    // would sum past the delivery lease for a large channel and let another replica take over and
+    // duplicate the controls. The confirmDelivery token fence after this still rejects a takeover.
+    const channel = this.channel;
+    const results = await settledWithLimit(
+      approvers,
+      APPROVAL_FANOUT_CONCURRENCY,
+      (admin) => client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback }).then(() => undefined),
+      APPROVAL_FANOUT_DEADLINE_MS,
+    );
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
         delivered = true;
-      } catch (error) {
-        // Try every eligible admin before declaring failure. If any send has an ambiguous transport
-        // outcome, the aggregate must remain ambiguous even when every sibling was definitely
-        // rejected: at least one actionable prompt may still have reached Slack.
-        const outcome = classifySlackPromptDeliveryFailure(error);
-        if (outcome === 'ambiguous') {
-          sawAmbiguousFailure = true;
-          ambiguousFailure ??= error;
-        }
-        else if (outcome === 'rate-limited' || definiteFailure === undefined) definiteFailure = outcome;
+        continue;
       }
+      // If any send has an ambiguous transport outcome, the aggregate must remain ambiguous even when
+      // every sibling was definitely rejected: at least one actionable prompt may still have reached Slack.
+      const outcome = classifySlackPromptDeliveryFailure(result.reason);
+      if (outcome === 'ambiguous') {
+        sawAmbiguousFailure = true;
+        ambiguousFailure ??= result.reason;
+      }
+      else if (outcome === 'rate-limited' || definiteFailure === undefined) definiteFailure = outcome;
     }
     if (!approvers.length) {
       // No eligible admin visible from here (fail-closed member/admin reads): the requester should
       // know the request is parked, not silently dropped.
-      await this.client.chat.postEphemeral({
+      await client.chat.postEphemeral({
         channel: this.channel, user: this.identity.userId, ...threadArg,
         text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval, but no eligible admin was found in this channel.`,
       }).catch(() => undefined);
@@ -1065,7 +1158,7 @@ export class ConnectContext {
     if (provider.credential === 'key') {
       await this.postKeySetupPrompt(providerId, connectIssuedAt);
       this.emit({ type: 'connect_prompted', provider: providerId });
-      throw new ConsentRequiredError(providerId);
+      throw new ConsentRequiredError(providerId, 'posted');
     }
 
     const pendingConsent = await this.consent.beginFenced(
@@ -1086,7 +1179,10 @@ export class ConnectContext {
     const prompt = this.connectPrompt(providerId, pendingConsent.authorizeUrl);
     const delivery = await this.consent.claimDelivery(pendingConsent.state);
     if (delivery.status !== 'claimed') {
-      if (delivery.status === 'delivered') throw new ConsentRequiredError(providerId);
+      // 'delivered' reuses the live prompt instead of re-posting — but an in-channel prompt is an
+      // ephemeral, which vanishes on reload/device switch. The typed 'reused' state drives fixed
+      // copy (here and in the safe mapper) instead of claiming a fresh post.
+      if (delivery.status === 'delivered') throw new ConsentRequiredError(providerId, 'reused');
       if (delivery.status === 'in-flight') {
         throw new UserFacingError(
           'A private connection prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
@@ -1117,7 +1213,7 @@ export class ConnectContext {
       );
     }
     this.emit({ type: 'connect_prompted', provider: providerId });
-    throw new ConsentRequiredError(providerId);
+    throw new ConsentRequiredError(providerId, 'posted');
   }
 
   /**
@@ -1363,7 +1459,7 @@ export class ConnectContext {
    *  Caller guarantees we're in a channel + thread. */
   private async postSessionApprovalPrompt(providerId: string, requestId: string, thread: string): Promise<void> {
     const blocks = sessionApprovalBlocks(providerId, requestId);
-    await this.client.chat.postEphemeral({
+    await this.promptClient().chat.postEphemeral({
       channel: this.channel!,
       user: this.identity.userId,
       thread_ts: thread,
@@ -1414,16 +1510,17 @@ export class ConnectContext {
     blocks: unknown[];
     fallback: { text: string } | Record<string, never>;
   }): Promise<void> {
+    const client = this.promptClient();
     const { blocks, fallback } = prompt;
     if (this.channel) {
-      await this.client.chat.postEphemeral({
+      await client.chat.postEphemeral({
         channel: this.channel,
         user: this.identity.userId,
         blocks: blocks as any,
         ...fallback,
       });
     } else {
-      await this.client.chat.postMessage({
+      await client.chat.postMessage({
         channel: this.identity.userId,
         blocks: blocks as any,
         ...fallback,
@@ -1548,7 +1645,7 @@ export async function createVouchr(opts: VouchrOptions) {
     (source) => Object.hasOwn(resolvers, source) && typeof resolvers[source] === 'function',
   );
   const botToken = opts.botToken ?? process.env.SLACK_BOT_TOKEN;
-  const confirmClient = botToken ? slackNotificationClient(botToken) : null;
+  const confirmClient = botToken ? slackNotificationClient(botToken, opts.slackClientOptions) : null;
   const inflight = new Map<string, Promise<string | null>>(); // shared single-flight refresh map
   // Shared per-(owner, provider) rate-limit buckets (provider.rateLimit); per-process by default.
   const rateLimits: RateLimitStore = opts.rateLimitStore ?? new MemoryRateLimitStore();
@@ -1840,25 +1937,36 @@ export async function createVouchr(opts: VouchrOptions) {
     const key = JSON.stringify([identity.enterpriseId, identity.teamId]);
     let entry = notificationClientLookups.get(key);
     if (!entry) {
-      if (notificationClientLookups.size >= MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS) return null;
+      if (notificationClientLookups.size >= MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS) {
+        // Bounded, non-fatal: skip this best-effort DM rather than start unbounded work behind a
+        // hung installation store. Logged so a persistently full cap (a wedged store) is diagnosable
+        // instead of silent. A custom store has no cancellation contract, so the slot must count
+        // *unresolved* work — releasing it on a mere timeout would let a new lookup start every
+        // window and defeat the cap. A store that never settles holds its slot until restart; that
+        // bounded degradation is the deliberate trade for never exceeding the concurrency cap.
+        console.error('[vouchr] notification-client lookup cap reached; skipping this best-effort DM');
+        return null;
+      }
       const raw = Promise.resolve().then(async () => {
         const inst = await opts.installationStore!.fetchInstallation({
           teamId: identity.teamId,
           enterpriseId: identity.enterpriseId ?? undefined,
           isEnterpriseInstall: false,
         });
-        return inst.bot?.token ? slackNotificationClient(inst.bot.token) : null;
+        return inst.bot?.token ? slackNotificationClient(inst.bot.token, opts.slackClientOptions) : null;
       }).catch(() => null);
-      entry = { raw, bounded: boundedNotificationResolution(raw) };
+      const exactEntry: NotificationClientLookup = { raw, bounded: boundedNotificationResolution(raw) };
+      entry = exactEntry;
       notificationClientLookups.set(key, entry);
-      const exactEntry = entry;
-      void raw.then(() => {
-        if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key);
-      });
+      // Release the slot ONLY when the underlying store operation actually settles, so the cap
+      // bounds unresolved concurrency, not just map size.
+      void raw.then(
+        () => { if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key); },
+        () => { if (notificationClientLookups.get(key) === exactEntry) notificationClientLookups.delete(key); },
+      );
     }
-    // A custom installation store has no cancellation contract. Bound each caller, but keep the raw
-    // lookup and its single timeout wrapper deduplicated until it actually settles. This prevents
-    // repeated callbacks from piling up either store work or promise reactions on one hung lookup.
+    // A custom installation store has no cancellation contract. Bound each caller (so a callback
+    // never waits on a hung store), but keep the raw lookup deduplicated until it actually settles.
     return entry.bounded;
   }
 
@@ -1943,6 +2051,7 @@ export async function createVouchr(opts: VouchrOptions) {
         auditSink,
         health,
         dryRun,
+        slackClientOptions: opts.slackClientOptions,
       });
     }
     await args.next();
@@ -2024,6 +2133,7 @@ export async function createVouchr(opts: VouchrOptions) {
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, approvals, auditSink, health, dryRun,
+      slackClientOptions: opts.slackClientOptions,
     };
     if (provisioningReceivedAt != null) {
       deps[INTERNAL_PROVISIONING_RECEIVED_AT] = provisioningReceivedAt;
