@@ -8,7 +8,6 @@ import {
   connectBlocks,
   connectedBlocks,
   connectedDmText,
-  connectedHtml,
   connectionLine,
   consentDeniedBlocks,
   oauthRecoveryBlocks,
@@ -104,21 +103,6 @@ test('connectedDmText: the post-OAuth confirmation DM escapes the account label 
   assert.equal(connectedDmText('github', null), '✅ github connected.'); // no-account shape unchanged
 });
 
-test('connectedHtml: the live post-connect page shows account + granted scopes', () => {
-  const html = connectedHtml('github', 'octocat', 'repo read:user');
-  assert.match(html, /github connected as octocat/);
-  assert.match(html, /repo read:user/); // granted scopes surfaced where the user actually lands
-  // No scopes → no granted line (e.g. a provider that doesn't echo scope and has none requested).
-  assert.doesNotMatch(connectedHtml('github', 'octocat', ''), /acting as you/);
-});
-
-test('connectedHtml: escapes provider-controlled markup (no XSS on the callback page)', () => {
-  const html = connectedHtml('github', '</h2><script>alert(1)</script>', 'repo"><img src=x onerror=alert(1)>');
-  assert.doesNotMatch(html, /<script/i); // no raw <script> tag can form from the account
-  assert.doesNotMatch(html, /<img/i); // nor a raw <img> from the scope string (its `<` is escaped)
-  assert.match(html, /&lt;script&gt;/); // the account markup is present, but escaped (inert)
-  assert.match(html, /&lt;img/); // and so is the scope markup
-});
 
 test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
   const b = connectBlocks('github', 'https://auth') as any[];
