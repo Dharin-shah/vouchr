@@ -10,6 +10,8 @@
  * Run: npm run example:dry-run   (or: node --import tsx --test examples/dry-run/app.test.ts)
  */
 import { test } from 'node:test';
+// Repo-internal helper (not shipped in the npm package): in YOUR repo, replace this with a
+// database URL pointing at a fresh, dedicated PostgreSQL schema for the dry run.
 import { testDbUrl } from '../../test/support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';

@@ -253,6 +253,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **OAuth success page discloses the bound Slack identity** (#194). Every supported callback
+  surface (Bolt route and headless broker) now names the bound Slack user and workspace on the
+  connect success page AND links to that user's Slack profile (a `slack://user` deep link, so the
+  completer can recognize *who* it is instead of parsing an opaque `U…`/`T…` id), plus the provider
+  account when known (it can be null). One shared adapter-layer renderer (`src/adapters/landing.ts`,
+  reusing the single HTML escaper) serves both surfaces with a mandatory identity argument, so no
+  surface can omit it and transport-agnostic core carries no browser HTML. This is a
+  security-detection control for the **forwarded consent link** limitation: consent binds the
+  *initiating* Slack identity, so an insider who forwards their private Connect link has a
+  colleague's provider account bound under the initiator. The disclosure lets the completer
+  recognize they linked their own account to someone else; it does not *prevent* the attack —
+  browser-side Slack identity binding (Sign in with Slack / OIDC) is the prevention, tracked
+  privately and slated ON-by-default for GA. `guides/THREAT-MODEL.md` documents the limitation, the
+  residual risk, and that private link delivery is a Bolt guarantee only — the headless broker
+  returns `{ authorizeUrl, state }` to the host, which owns keeping it private.
+- **README rewritten as a product page** (~140 lines): what Vouchr does, quickstart,
+  credential modes, and links out — the how moved to its natural guides: the exported
+  typed-error table to `guides/HEADLESS.md#typed-errors-exported-classes`,
+  prompt-delivery/idempotency semantics to `guides/ARCHITECTURE.md#lifecycle`, piecewise
+  `install()` wiring to `guides/ARCHITECTURE.md`, `egressResponse` response-constraint
+  details to `guides/DEPLOYMENT.md#provider-response-constraints-egressresponse`, the
+  `onCredentialHealth` notification contract to `guides/DEPLOYMENT.md`, and dry-run safety
+  rails to `examples/dry-run/README.md` (new). Also: the quickstart snippet now catches
+  `ConsentRequiredError`, `databricks()` and the previously unlinked examples (databricks,
+  mcp-gateway, prometheus, scim) are listed, the hardcoded coverage badge is gone, and the intro
+  warns that the published `v0.2.0` artifacts predate the current PostgreSQL-only architecture.
 - **Breaking wire expansion — typed broker recovery metadata** (#194). Typed `/v1/fetch` and
   `/v1/mcp` failures now add stable `code`, `retryable`, and `recovery` fields (plus the existing
   millisecond `retryAfterMs` where applicable) while retaining established `error` prose and HTTP
