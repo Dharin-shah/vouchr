@@ -637,8 +637,9 @@ All notable changes to this project are documented here. This project adheres to
   receipt strictly later than the prior write. Previously the check ran only for the resolver-object
   issuance shape, so a delayed direct key/reference write could overwrite a newer credential, and
   every OAuth callback over a live credential returned a false `state_stale` forever and discarded the
-  fresh token. A committed credential also **supersedes every strictly-older pending consent** in the
-  same transaction, so a fresh connect never reuses a guaranteed-stale OAuth URL. Removes the
+  fresh token. A committed credential also **supersedes every pending consent at or before its
+  issuance** (`<=`, matching the fence's `>=` so the equal-millisecond consent is superseded too) in
+  the same transaction, so a fresh connect never reuses a guaranteed-stale OAuth URL. Removes the
   unreleased `UserProvisioningGate`/`requireNewest` distinction (the fence is unconditional).
 - **Provider-side OAuth redirect errors are classified by a closed table** (#194). Only
   `error=access_denied` audits and messages as a denial. `server_error` and `temporarily_unavailable`
@@ -646,9 +647,10 @@ All notable changes to this project are documented here. This project adheres to
   (`invalid_scope`, `unauthorized_client`, `unsupported_response_type`, `invalid_request`) and any
   unrecognized value is a permanent configuration fault (500, `fix_configuration`) — the user is no
   longer told to retry unchanged config. The error value itself is never persisted or reflected. The
-  audit stream also distinguishes a real human denial (`consent_denied`) from a provider/exchange
-  failure or incomplete authorization (new `consent_failed` action), so a consumer is never told a
-  human refused when they did not.
+  audit stream also distinguishes a real human denial (`consent_denied`) from every non-denial
+  outcome — provider/exchange failure, incomplete authorization, and offboard/revoke lifecycle races
+  during exchange (new `consent_failed` action) — so a consumer is never told a human refused when
+  they did not.
 - **Callback lifecycle classification is timestamp-ordered** (#194). When an offboard/revoke
   tombstone blocks a consumed state, it wins over supersession or expiry UNLESS a supersession
   happened strictly after the tombstone (a legitimately re-onboarded generation). This prevents an
@@ -661,8 +663,8 @@ All notable changes to this project are documented here. This project adheres to
   client now carries the operator's `slackClientOptions` (custom `slackApiUrl`, agent/proxy, TLS,
   headers) so a non-default Slack transport is not bypassed. Admin approval recipients are enumerated
   *before* the lease is claimed, and the prompts are posted **concurrently under a bounded in-flight
-  cap** so a large channel's fan-out finishes in roughly one post's time instead of the sum, keeping
-  the whole operation inside the lease. A reused still-live prompt throws `ConsentRequiredError` with
+  cap and an overall wall-clock deadline** (derived from the lease), so even a channel with hundreds
+  of eligible admins finishes well inside the lease instead of summing per-post timeouts. A reused still-live prompt throws `ConsentRequiredError` with
   a **required** typed `promptState` (`'posted' | 'reused'`, exported as `ConsentPromptState`; no
   default, so an omission cannot silently mean `posted`); the safe mapper renders fixed leak-safe copy
   from it (no free-form message) that says the ephemeral may no longer be visible instead of claiming

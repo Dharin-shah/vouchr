@@ -640,16 +640,18 @@ export class Vault {
           return 'stale';
         }
         await write(fencedTx);
-        // A committed user credential makes every strictly-older pending consent obsolete: its
-        // callback would now lose the generation fence and return state_stale. Supersede those rows
-        // in the SAME transaction (under the provisioning lock) so a fresh connect cannot reuse a
-        // guaranteed-stale OAuth URL. The consent that minted THIS write (OAuth) is already consumed
-        // and deleted by finalizeProvisioning; a newer pending consent (created_at >= issuedAt) is
-        // deliberately left alone.
+        // A committed user credential makes every consent at-or-before its issuance obsolete: the
+        // generation fence would fail that consent's callback closed (`>=`), so its URL is dead.
+        // Supersede those rows in the SAME transaction (under the provisioning lock) so a fresh
+        // connect cannot reuse one. The threshold MUST match the fence: `<= issuedAt` fails the
+        // equal-millisecond consent closed too — a strict `<` would leave a same-ms consent reusable
+        // even though its callback can never complete. The consent that minted THIS write (OAuth) is
+        // already consumed and deleted by finalizeProvisioning; a strictly-newer pending consent
+        // (created_at > issuedAt) is deliberately left alone.
         await fencedTx.run(
           `UPDATE consent_request SET superseded_at=${POSTGRES_NOW_MS_SQL}
            WHERE team_id=? AND user_id=? AND provider=?
-             AND superseded_at IS NULL AND consumed_at IS NULL AND created_at < ?`,
+             AND superseded_at IS NULL AND consumed_at IS NULL AND created_at <= ?`,
           [owner.teamId, owner.id, provider, issuedAt],
         );
         return 'stored';

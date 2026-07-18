@@ -5,6 +5,8 @@ import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import {
   createVouchr,
   MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS,
+  PromptFanoutDeadlineError,
+  settledWithLimit,
 } from '../src/adapters/bolt';
 import { Audit } from '../src/core/audit';
 import {
@@ -829,6 +831,47 @@ test('a direct credential write supersedes an older pending consent so fresh dem
   const fresh = await consent.beginFenced(ID, provider, 'https://vouchr.test/callback', 'C1', await vault.userProvisioningIssuedAt());
   assert.ok(fresh);
   assert.notEqual(fresh.state, old.state, 'fresh demand must not reuse the superseded state');
+});
+
+test('supersession fails the equal-millisecond consent closed too (matches the >= fence), no sleeps', async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const vault = new Vault(db, KEY);
+  const owner = userOwner(ID);
+  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  // Read the consent's exact created_at and write a credential issued at THAT same millisecond. The
+  // fence would fail this consent's callback closed (`>=`), so cleanup must supersede it too (`<=`);
+  // a strict `<` would leave the equal-time consent reusable as a dead URL.
+  const createdAt = (await db.get<{ created_at: number }>(
+    `SELECT created_at FROM consent_request WHERE state=?`, [pending.state],
+  ))!.created_at;
+  assert.equal(
+    await vault.upsertUser(owner, provider.id, {
+      accessToken: 'live', refreshToken: null, scopes: 'read', expiresAt: null, externalAccount: null,
+    }, createdAt),
+    'stored',
+  );
+  assert.equal((await consent.consume(pending.state)).status, 'superseded', 'the equal-time consent must be superseded');
+});
+
+test('the approval fan-out honors an overall deadline across many waves (cannot outlive its lease)', async () => {
+  const N = 60;
+  const items = Array.from({ length: N }, (_, i) => i);
+  let started = 0;
+  const start = Date.now();
+  const results = await settledWithLimit(items, 4, async () => {
+    started++;
+    await new Promise((r) => setTimeout(r, 100));
+  }, 150);
+  const elapsed = Date.now() - start;
+  // Sequential/uncapped would be (N/4) × 100ms = 1500ms; the deadline caps it near 150ms + one wave.
+  assert.ok(elapsed < 500, `fan-out ignored its deadline: ${elapsed}ms for ${N} items`);
+  assert.ok(started < N, 'the deadline must stop starting the tail');
+  assert.equal(results.length, N, 'every item still has a recorded outcome');
+  assert.ok(
+    results.some((r) => r.status === 'rejected' && r.reason instanceof PromptFanoutDeadlineError),
+    'skipped items are recorded as deadline errors (classified ambiguous → lease retained)',
+  );
 });
 
 test('re-authorization over a live credential replaces it; a delayed stale callback still loses', async (t) => {

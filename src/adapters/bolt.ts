@@ -38,7 +38,7 @@ import {
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
-import { InteractionStateChangedError, isInteractionId } from '../core/interaction';
+import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
 import {
   ChannelProvisioningRequests,
   configureUserCredential,
@@ -188,20 +188,32 @@ function slackNotificationClient(token: string, base?: WebClientOptions): WebCli
   return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS });
 }
 
+/** Skipped because the fan-out's overall deadline elapsed before this item was started — treated as
+ * an ambiguous (fail-safe: lease retained) outcome, since a takeover may have begun. */
+export class PromptFanoutDeadlineError extends Error {}
+
 /** Fan `task` out over `items` with at most `limit` in flight, returning settled outcomes in order.
- * Approval prompts to eligible admins run through this so K bounded posts finish in roughly one
- * post's time instead of their sum, keeping the whole fan-out inside the delivery lease, while never
- * opening an unbounded number of concurrent Slack calls. */
-async function settledWithLimit<T>(
+ * `deadlineMs` (optional) caps the WHOLE fan-out: once elapsed, remaining items are recorded as a
+ * `PromptFanoutDeadlineError` skip WITHOUT being started, so a very large `items` list can never make
+ * the operation outlive its bound (the cap alone bounds each wave, not the total). Approval prompts
+ * run through this so K bounded posts finish in ~one post's time and the fan-out stays inside the
+ * delivery lease no matter how many admins are eligible. */
+export async function settledWithLimit<T>(
   items: readonly T[],
   limit: number,
   task: (item: T) => Promise<void>,
+  deadlineMs?: number,
 ): Promise<PromiseSettledResult<void>[]> {
   const results = new Array<PromiseSettledResult<void>>(items.length);
+  const start = Date.now();
   let next = 0;
   const worker = async (): Promise<void> => {
     while (next < items.length) {
       const i = next++;
+      if (deadlineMs !== undefined && Date.now() - start >= deadlineMs) {
+        results[i] = { status: 'rejected', reason: new PromptFanoutDeadlineError('fan-out deadline elapsed') };
+        continue;
+      }
       try {
         await task(items[i]);
         results[i] = { status: 'fulfilled', value: undefined };
@@ -216,6 +228,13 @@ async function settledWithLimit<T>(
 /** In-flight cap for the admin approval fan-out. At the bounded 3s per-post timeout this keeps the
  * common case (≤ this many eligible admins) to a single ~3s wave, well inside PROMPT_DELIVERY_LEASE_MS. */
 const APPROVAL_FANOUT_CONCURRENCY = 16;
+/** Overall wall-clock budget for STARTING approval posts, leaving headroom below the delivery lease
+ * for the last in-flight wave plus confirmDelivery, so even a channel with hundreds of eligible
+ * admins can never let the fan-out outlive the lease and permit a replica takeover. */
+const APPROVAL_FANOUT_DEADLINE_MS = Math.max(
+  SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+  PROMPT_DELIVERY_LEASE_MS - 2 * SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+);
 
 function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
   return new Promise((resolve) => {
@@ -898,8 +917,12 @@ export class ConnectContext {
     // would sum past the delivery lease for a large channel and let another replica take over and
     // duplicate the controls. The confirmDelivery token fence after this still rejects a takeover.
     const channel = this.channel;
-    const results = await settledWithLimit(approvers, APPROVAL_FANOUT_CONCURRENCY, (admin) =>
-      client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback }).then(() => undefined));
+    const results = await settledWithLimit(
+      approvers,
+      APPROVAL_FANOUT_CONCURRENCY,
+      (admin) => client.chat.postEphemeral({ channel, user: admin, ...threadArg, blocks, ...fallback }).then(() => undefined),
+      APPROVAL_FANOUT_DEADLINE_MS,
+    );
     for (const result of results) {
       if (result.status === 'fulfilled') {
         delivered = true;

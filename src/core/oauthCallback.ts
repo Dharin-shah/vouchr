@@ -338,14 +338,15 @@ export async function handleOAuthCallback(
     if (provisioned === 'offboarded') {
       // GHSA-25m2: offboarding won the race between consume() and this write — it wrote the
       // tombstone and deleted every credential while we were in token exchange. The atomic gate
-      // refused to resurrect the credential (nothing landed). Audit as denied; write nothing.
+      // refused to resurrect the credential (nothing landed). Lifecycle invalidation, NOT a human
+      // denial: audit table reason 'offboarded', but emit consent_failed on the stream.
       const recorded = await recordDenied(deps, row.identity, provider.id, 'offboarded');
       emitConsent(
         deps,
         row.identity,
         provider.id,
         new URL(provider.tokenUrl).hostname,
-        'consent_denied',
+        'consent_failed',
         recorded ? 403 : 500,
       );
       return attributedFailure(
@@ -361,14 +362,15 @@ export async function handleOAuthCallback(
     if (provisioned === 'revoked') {
       // A confirmed break-glass revoke linearized while this already-consumed OAuth state was in
       // token exchange. This is not account deactivation and unchanged retries of the old state are
-      // not useful: refuse the write and direct the user to start one genuinely new setup.
+      // not useful: refuse the write and direct the user to start one genuinely new setup. Lifecycle
+      // invalidation, NOT a human denial: audit table reason 'revoked', stream action consent_failed.
       const recorded = await recordDenied(deps, row.identity, provider.id, 'revoked');
       emitConsent(
         deps,
         row.identity,
         provider.id,
         new URL(provider.tokenUrl).hostname,
-        'consent_denied',
+        'consent_failed',
         recorded ? 409 : 500,
       );
       return attributedFailure(
