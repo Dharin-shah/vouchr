@@ -263,6 +263,17 @@ All notable changes to this project are documented here. This project adheres to
   account to someone else; it does not *prevent* the attack — browser-side Slack identity binding
   (Sign in with Slack / OIDC) is the prevention, tracked privately and slated ON-by-default for GA.
   `guides/THREAT-MODEL.md` documents the limitation and residual risk honestly.
+- **README rewritten as a product page** (~140 lines): what Vouchr does, quickstart,
+  credential modes, and links out — the how moved to its natural guides: the exported
+  typed-error table to `guides/HEADLESS.md#typed-errors-exported-classes`,
+  prompt-delivery/idempotency semantics to `guides/ARCHITECTURE.md#lifecycle`, piecewise
+  `install()` wiring to `guides/ARCHITECTURE.md`, `egressResponse` response-constraint
+  details to `guides/DEPLOYMENT.md#provider-response-constraints-egressresponse`, the
+  `onCredentialHealth` notification contract to `guides/DEPLOYMENT.md`, and dry-run safety
+  rails to `examples/dry-run/README.md` (new). Also: the quickstart snippet now catches
+  `ConsentRequiredError`, `databricks()` and the previously unlinked examples (databricks,
+  mcp-gateway, prometheus, scim) are listed, the hardcoded coverage badge is gone, and the intro
+  warns that the published `v0.2.0` artifacts predate the current PostgreSQL-only architecture.
 - **Breaking wire expansion — typed broker recovery metadata** (#194). Typed `/v1/fetch` and
   `/v1/mcp` failures now add stable `code`, `retryable`, and `recovery` fields (plus the existing
   millisecond `retryAfterMs` where applicable) while retaining established `error` prose and HTTP

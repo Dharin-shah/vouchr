@@ -650,6 +650,21 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
 ]
 ```
 
+### Provider response constraints (`egressResponse`)
+
+`egressResponse: { maxBytes?, allowContentTypes?, stripHeaders? }` adds structural constraints on
+the provider's **response** at the injection boundary — shape only, deliberately no content/PII
+inspection. `maxBytes` caps the body (fast-fail on `Content-Length`, then enforced while streaming;
+an over-cap body is aborted at the cap, never returned even partially — a `SELECT *` gone wrong
+can't blow out the model context). `allowContentTypes` allowlists exact bare media types —
+parameters like `; charset=` are ignored, so `['application/json']` admits
+`application/json; charset=utf-8` but never `application/jsonp-evil` — and an HTML login page is
+refused instead of being fed to the model as data. `stripHeaders` removes extra response headers —
+and `Set-Cookie` is **always** stripped from every provider response, opt-in or not, 3xx included:
+it is a credential-adjacent artifact the agent has no business seeing. A breach denies like an
+egress denial: a thrown error (never the body), a `response_denied` event, and an audit row. Absent
+= unchanged behavior (bar the unconditional cookie strip).
+
 ### Static channel policy (declarative)
 
 The packaged broker accepts the existing provider-by-channel `Policy` through one optional,
@@ -788,6 +803,14 @@ the already-committed local/upstream outcome as `audited: false`. For source com
 `offboardUser` still returns only the locally removed provider ids; that array is not a claim that
 upstream revocation or audit succeeded. Integrations that need the detailed contract should use
 `POST /v1/admin/offboard` and inspect its `ok` field.
+
+### Credential health notifications (`onCredentialHealth`)
+
+When a refresh token dies for real (a definitive provider rejection, not a transient failure) or a
+connection nears its TTL ceiling, the owner gets at most one private Slack DM per day; the daily
+claim is taken atomically in PostgreSQL, so replicas never double-notify. Hosts that want to route
+these events themselves (pager, email, dashboard) can pass `onCredentialHealth` to `createVouchr` —
+the event carries the owner, provider, and reason, never token material.
 
 ### Replay (multi-replica)
 
