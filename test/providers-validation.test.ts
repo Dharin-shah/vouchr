@@ -61,6 +61,24 @@ test('defineProvider: a non-https revokeUrl is rejected (the revoke POST carries
   assert.doesNotThrow(() => base({ revokeUrl: 'https://acme.example/revoke' }));
 });
 
+test('defineProvider: refresh-capable revocation declares access/refresh/both/grant explicitly', () => {
+  assert.throws(
+    () => base({ refresh: 'rotating', revokeUrl: 'https://acme.example/revoke' }),
+    /revokeTarget.*must declare/,
+  );
+  for (const revokeTarget of ['access', 'refresh', 'both', 'grant'] as const) {
+    assert.equal(
+      base({ refresh: 'rotating', revokeUrl: 'https://acme.example/revoke', revokeTarget }).revokeTarget,
+      revokeTarget,
+    );
+  }
+  assert.throws(() => base({ revokeTarget: 'access' }), /revokeTarget.*requires/);
+  assert.throws(
+    () => base({ refresh: 'none', revokeUrl: 'https://acme.example/revoke', revokeTarget: 'refresh' }),
+    /cannot require a refresh token/,
+  );
+});
+
 test('defineProvider: loopback OAuth endpoints may use http on an explicit port (the test-only local carve-out)', () => {
   // Mirrors the mock OAuth server used by the integration suite (http://127.0.0.1:<port>).
   assert.doesNotThrow(() => base({ authorizeUrl: 'http://127.0.0.1:5000/a', tokenUrl: 'http://127.0.0.1:5000/t' }));

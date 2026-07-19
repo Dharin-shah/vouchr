@@ -3,12 +3,12 @@ import type { Audit } from './audit';
 import {
   markProvisioningRevoked,
   markUserOffboardedEverywhere,
-  type Consent,
+  Consent,
 } from './consent';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import { isValidProviderId, type ProviderRegistry } from './providers';
-import { revokeToken } from './tokens';
+import { revokeProviderCredential } from './tokens';
 import { channelOwner, userOwner, type Owner } from './owner';
 import { SessionGrants } from './session';
 import { ChannelProvisioningRequests, UserProvisioningRequests } from './provisioning';
@@ -62,18 +62,10 @@ async function removeUserConnection(
     // #116: a dry-run credential is synthetic — an upstream revoke would be a REAL network call
     // POSTing it to the provider. Keyed off the trusted dry_run column (no flag here), so the CLI
     // is covered too, and a REAL account labelled "dry-run" still revokes normally.
-    if (revocable && claimed.accessToken && !claimed.dryRun) {
-      attempted = true;
-      try {
-        await revokeToken(p, claimed.accessToken);
-      } catch {
-        ok = false; // network/HTTP failure: local access is already gone; nothing is faked
-      }
-    } else if (revocable && removed && !claimed.dryRun) {
-      // A real revocable row with no usable token is unresolved upstream debt whether decryption
-      // failed OR the row intentionally stores only an external reference. Neither case made a
-      // revoke attempt, so reporting clean success would be false.
-      ok = false;
+    if (revocable && removed && !claimed.dryRun) {
+      const upstream = await revokeProviderCredential(p, claimed);
+      attempted = upstream.attempted;
+      if (!upstream.ok) ok = false;
     }
   }
   return { removed, ok, attempted, fenced: claimed.fenced };
@@ -400,13 +392,15 @@ export interface RevokeRow {
 }
 
 /** {@link RevokeRow} plus the per-row outcome. `removed` is the security-meaningful local delete.
- *  `upstreamAttempted` is true only when a real upstream revoke call was actually made (the provider
- *  has a revoke endpoint AND a token was decryptable); when false the upstream revoke was SKIPPED, not
- *  succeeded — don't report a skip as a success. `upstreamOk` is meaningful only when attempted. */
+ *  `upstreamAttempted` is true only when at least one real upstream revoke call was made. `upstreamOk`
+ *  is false when a required call failed or a provider-required token was unreadable/missing; the
+ *  companion flags preserve that distinction without returning secret material. */
 export interface RevokeOutcome extends RevokeRow {
   removed: boolean;
   upstreamAttempted: boolean;
   upstreamOk: boolean;
+  upstreamUnreadable: boolean;
+  upstreamMissing: boolean;
 }
 
 /**
@@ -611,6 +605,7 @@ export async function revokeConnection(
   registry: ProviderRegistry | undefined,
   row: RevokeRow,
   provider: string,
+  options: { auditScope?: 'owner' | 'deployment' } = {},
 ): Promise<RevokeOutcome> {
   const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
   const current = registry?.has(provider) ? registry.get(provider) : null;
@@ -620,38 +615,72 @@ export async function revokeConnection(
   let claimed = {
     removed: false,
     accessToken: null as string | null,
+    refreshToken: null as string | null,
+    accessUnreadable: false,
+    refreshUnreadable: false,
     dryRun: false,
-    readFailed: false,
     fenced: true,
   };
   try { claimed = await vault.deleteForRevoke(owner, provider, registered); } catch { /* removed stays false */ }
   const removed = claimed.removed;
-  if (!removed) return { ...row, removed: false, upstreamAttempted: false, upstreamOk: true };
+  if (!removed) {
+    return {
+      ...row,
+      removed: false,
+      upstreamAttempted: false,
+      upstreamOk: false,
+      upstreamUnreadable: false,
+      upstreamMissing: true,
+    };
+  }
   // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
   // token — otherwise it's a no-op that must be reported as SKIPPED, never as a success. A dry-run
   // row (#116) is always SKIPPED: its token is synthetic and must never be POSTed to a real endpoint.
   let upstreamAttempted = false;
   let upstreamOk = true;
-  if (current && claimed.accessToken && !claimed.dryRun) {
+  let upstreamUnreadable = false;
+  let upstreamMissing = false;
+  if (current && !claimed.dryRun) {
     const p = current;
     if (p.revoke || p.revokeUrl) {
-      upstreamAttempted = true;
-      try { await revokeToken(p, claimed.accessToken); } catch { upstreamOk = false; }
+      const upstream = await revokeProviderCredential(p, claimed);
+      upstreamAttempted = upstream.attempted;
+      upstreamOk = upstream.ok;
+      upstreamUnreadable = upstream.unreadable;
+      upstreamMissing = upstream.missing;
     }
   }
-  // Attribute the audit row to the OWNER (team + owner id); a channel row has no Slack user actor.
+  // A surgical revoke attributes to the owner. The deployment-wide path assumes the database may
+  // be attacker-controlled, so it records only fixed system identity plus a registry-trusted
+  // provider id (or the constant `unregistered`) — never stored owner/provider text (SEC-1/SEC-4).
   // Everything after the local delete is BEST-EFFORT and wrapped so one row's audit/consent/session
   // failure (e.g. a transient DB error) can never throw out of the bulk-revoke loop and strand the
   // remaining rows. The security-meaningful delete already happened above.
-  const actor: SlackIdentity = { enterpriseId: null, teamId: row.teamId, userId: row.ownerId };
-  const meta: Record<string, unknown> = { owner: row.ownerKind, reason: 'break-glass' };
+  const deployment = options.auditScope === 'deployment';
+  const actor: SlackIdentity = deployment
+    ? { enterpriseId: null, teamId: 'system', userId: 'system' }
+    : { enterpriseId: null, teamId: row.teamId, userId: row.ownerId };
+  const auditProvider = deployment ? (registered ? provider : 'unregistered') : provider;
+  const meta: Record<string, unknown> = {
+    owner: deployment ? 'deployment' : row.ownerKind,
+    reason: 'break-glass',
+  };
   if (upstreamAttempted) meta.ok = upstreamOk; else meta.upstream = 'skipped';
-  try { await audit.record('revoke', actor, provider, meta); } catch { /* best-effort */ }
+  try { await audit.record('revoke', actor, auditProvider, meta, deployment ? 'system' : undefined); }
+  catch { /* best-effort */ }
   if (row.ownerKind === 'user') {
     try { await consent.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
     try { await sessions.clearForProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
   }
-  return { ...row, ...(removed ? { dryRun: claimed.dryRun } : {}), removed, upstreamAttempted, upstreamOk };
+  return {
+    ...row,
+    ...(removed ? { dryRun: claimed.dryRun } : {}),
+    removed,
+    upstreamAttempted,
+    upstreamOk,
+    upstreamUnreadable,
+    upstreamMissing,
+  };
 }
 
 /**
@@ -771,14 +800,18 @@ export const RESURRECTION_TABLES = [
 /** Per-connection disposition of the local delete + upstream revoke attempt. Reported in aggregate,
  *  never per-owner, so the report carries no owner-identifying or secret data (SEC-1). */
 export type RevokeCategory =
+  /** dry-run only: metadata says this row would enter the provider revoke path. */
+  | 'would_attempt'
   /** registered revocable provider, token decrypted, upstream revoke returned success. */
   | 'revoked'
-  /** registered revocable provider, upstream revoke attempted but failed (HTTP error OR timeout). */
+  /** registered revocable provider, but the required operation did not fully succeed. */
   | 'revoke_failed'
   /** provider has no revoke endpoint, or is unregistered/removed — no upstream call is possible. */
   | 'unsupported'
   /** registered revocable provider, but the stored token could not be decrypted (KMS/key missing). */
   | 'undecryptable'
+  /** the row could not be claimed or its provider-required token was absent; manual review remains. */
+  | 'unresolved'
   /** the secret lives in an external manager (`secret_ref`); rotate it THERE — deleting the pointer
    *  is not upstream invalidation. */
   | 'external_reference'
@@ -786,7 +819,8 @@ export type RevokeCategory =
   | 'synthetic';
 
 const REVOKE_CATEGORIES: readonly RevokeCategory[] = [
-  'revoked', 'revoke_failed', 'unsupported', 'undecryptable', 'external_reference', 'synthetic',
+  'would_attempt', 'revoked', 'revoke_failed', 'unsupported', 'undecryptable', 'unresolved',
+  'external_reference', 'synthetic',
 ];
 
 const zeroCategories = (): Record<RevokeCategory, number> =>
@@ -795,38 +829,52 @@ const zeroCategories = (): Record<RevokeCategory, number> =>
 export interface RevokeAllDeps {
   vault: Vault;
   audit: Audit;
-  consent: Consent;
-  sessions: SessionGrants;
   /** Best-effort: absent/broken config disables upstream revoke + decrypt, never the local wipe. */
   registry?: ProviderRegistry;
 }
 
-/** No-secret result of a global revoke. Counts and provider ids only; safe to print to CI/logs. */
+export interface RevokeLocalCounts {
+  connections: number;
+  consents: number;
+  sessionRequests: number;
+  sessionGrants: number;
+  approvals: number;
+  userProvisioning: number;
+  channelProvisioning: number;
+  notifications: number;
+  installations: number;
+}
+
+/** Per-provider upstream disposition. `provider` comes only from the trusted runtime registry;
+ * removed/unregistered database values are aggregated separately and never leave core. */
+export interface RevokeProviderReport {
+  provider: string;
+  connections: number;
+  /** Connection rows for which at least one real provider revoke call was made. */
+  attempted: number;
+  upstream: Record<RevokeCategory, number>;
+}
+
+/** No-secret result of a global revoke. Safe counts + registry-trusted provider ids only. */
 export interface RevokeAllReport {
   executed: boolean;
-  /** Stored provider ids enumerated from PostgreSQL, including removed/unregistered ones. */
-  providers: string[];
-  /** Total connection rows matched (all owners, all providers). */
-  connections: number;
+  /** Distinct stored provider ids, including removed/unregistered ones; raw DB values are not returned. */
+  providerCount: number;
+  /** Registered providers can be named safely because the id comes from trusted deployment config. */
+  byProvider: RevokeProviderReport[];
+  /** Removed/unregistered DB provider values are counts only (the compromised DB is untrusted output). */
+  unregistered: RevokeProviderReport & { provider: 'unregistered'; providers: number };
+  /** Rows present at the initial inventory. Never means they were deleted. */
+  matched: RevokeLocalCounts;
   /** Local connection deletes that actually committed (0 on dry-run). */
   removedLocal: number;
-  /** Per-category disposition. On dry-run this is the *would-attempt* classification. */
+  /** Aggregate upstream disposition. Dry-run uses `would_attempt`, never `revoked`. */
   upstream: Record<RevokeCategory, number>;
-  /** Rows removed from each authorization/resurrection table + installations (0 on dry-run; a `-1`
+  /** Connection rows for which at least one real provider revoke call was made (always 0 on dry-run). */
+  upstreamAttempted: number;
+  /** Rows actually removed from each authorization/resurrection table + installations (0 on dry-run; a `-1`
    *  marks a table whose blanket delete threw — surfaced, never a partial silent success). */
-  cleared: {
-    connections: number;
-    consents: number;
-    sessionRequests: number;
-    sessionGrants: number;
-    approvals: number;
-    userProvisioning: number;
-    channelProvisioning: number;
-    notifications: number;
-    installations: number;
-  };
-  /** Locally stored Slack installation credentials (bot/user tokens) matched. */
-  installations: number;
+  cleared: RevokeLocalCounts;
   /** Rows still present after the sweep. On a clean execute every field is 0. */
   remaining: { credentials: number; authorizations: number; installations: number };
   /** True only when execute completed AND nothing remains. The CLI returns non-zero when false. */
@@ -857,12 +905,11 @@ function isRegisteredRevocable(registry: ProviderRegistry | undefined, provider:
   return !!(p.revoke || p.revokeUrl);
 }
 
-/** Classify one row from METADATA alone (dry-run preview): no decrypt, no upstream call. `revoked`
- *  here means "would attempt an upstream revoke", not that one happened. */
+/** Classify one row from METADATA alone (dry-run preview): no decrypt and no upstream call. */
 function previewCategory(row: RevokeRow, revocable: boolean): RevokeCategory {
   if (row.dryRun) return 'synthetic';
   if (row.source !== 'vault' || row.hasReference) return 'external_reference';
-  return revocable ? 'revoked' : 'unsupported';
+  return revocable ? 'would_attempt' : 'unsupported';
 }
 
 /** Classify one row after execution, using the actual delete/upstream outcome. */
@@ -870,15 +917,50 @@ function executeCategory(row: RevokeRow, outcome: RevokeOutcome, revocable: bool
   if (row.dryRun) return 'synthetic';
   if (row.source !== 'vault' || row.hasReference) return 'external_reference';
   if (!revocable) return 'unsupported';
+  if (!outcome.removed) return 'unresolved';
+  // A partial `both` operation can revoke one readable token while another required token remains
+  // unreadable or absent. Report the actionable uncertainty instead of disguising it as an HTTP
+  // failure merely because at least one provider call was attempted.
+  if (outcome.upstreamUnreadable) return 'undecryptable';
+  if (outcome.upstreamMissing) return 'unresolved';
   if (outcome.upstreamAttempted) return outcome.upstreamOk ? 'revoked' : 'revoke_failed';
-  // Registered + revocable + vaulted + real, yet no upstream attempt was made ⇒ the token was
-  // unreadable (KMS/key unavailable). The local row is gone but upstream is untouched — say so.
-  return 'undecryptable';
+  return 'unresolved';
 }
 
 async function countRows(db: Db, table: string): Promise<number> {
   const row = (await db.get(`SELECT COUNT(*) AS n FROM ${table}`)) as { n: number } | undefined;
   return Number(row?.n ?? 0);
+}
+
+const zeroLocalCounts = (): RevokeLocalCounts => ({
+  connections: 0,
+  consents: 0,
+  sessionRequests: 0,
+  sessionGrants: 0,
+  approvals: 0,
+  userProvisioning: 0,
+  channelProvisioning: 0,
+  notifications: 0,
+  installations: 0,
+});
+
+async function localCounts(db: Db): Promise<RevokeLocalCounts> {
+  return {
+    connections: await countRows(db, 'connection'),
+    consents: await countRows(db, 'consent_request'),
+    sessionRequests: await countRows(db, 'session_request'),
+    sessionGrants: await countRows(db, 'session_grant'),
+    approvals: await countRows(db, 'approval_request'),
+    userProvisioning: await countRows(db, 'user_provisioning_request'),
+    channelProvisioning: await countRows(db, 'channel_provisioning_request'),
+    notifications: await countRows(db, 'notification_state'),
+    installations: await countRows(db, 'installation'),
+  };
+}
+
+function authorizationCount(c: RevokeLocalCounts): number {
+  return c.consents + c.sessionRequests + c.sessionGrants + c.approvals
+    + c.userProvisioning + c.channelProvisioning + c.notifications;
 }
 
 /**
@@ -898,7 +980,7 @@ async function countRows(db: Db, table: string): Promise<number> {
  * (VOUCHR_LOCKDOWN — the running workload refuses to serve/mint), established by the runbook BEFORE
  * this runs. This command itself neither reads nor trusts that DB state; a row a writer commits after
  * the sweep is caught by the recount and reported as remaining (non-zero), never a silent success.
- * ponytail: containment is the operator's lockdown/quarantine step, not a fence this command writes —
+ * Containment is the operator's lockdown/quarantine step, not a fence this command writes —
  * writing a permanent global fence here would block legitimate post-recovery reconnects.
  */
 export async function revokeAllCredentials(
@@ -906,62 +988,99 @@ export async function revokeAllCredentials(
   deps: RevokeAllDeps,
   opts: { execute: boolean },
 ): Promise<RevokeAllReport> {
-  const providers = await enumerateStoredProviders(db);
+  const storedProviders = await enumerateStoredProviders(db);
+  const matched = await localCounts(db);
   const upstream = zeroCategories();
-  let connections = 0;
+  const byProvider: RevokeProviderReport[] = [];
+  const unregistered: RevokeAllReport['unregistered'] = {
+    provider: 'unregistered',
+    providers: 0,
+    connections: 0,
+    attempted: 0,
+    upstream: zeroCategories(),
+  };
   let removedLocal = 0;
+  let upstreamAttempted = 0;
+
+  const bucketFor = (provider: string): RevokeProviderReport => {
+    if (deps.registry?.has(provider)) {
+      const report = {
+        provider: deps.registry.get(provider).id,
+        connections: 0,
+        attempted: 0,
+        upstream: zeroCategories(),
+      };
+      byProvider.push(report);
+      return report;
+    }
+    unregistered.providers++;
+    return unregistered;
+  };
+  const mark = (bucket: RevokeProviderReport, category: RevokeCategory): void => {
+    bucket.upstream[category]++;
+    upstream[category]++;
+  };
 
   if (!opts.execute) {
-    for (const provider of providers) {
+    for (const provider of storedProviders) {
+      const bucket = bucketFor(provider);
       const revocable = isRegisteredRevocable(deps.registry, provider);
       for (const row of await selectRevocations(db, { provider })) {
-        connections++;
-        upstream[previewCategory(row, revocable)]++;
+        bucket.connections++;
+        mark(bucket, previewCategory(row, revocable));
       }
     }
-    const cleared = {
-      connections,
-      consents: await countRows(db, 'consent_request'),
-      sessionRequests: await countRows(db, 'session_request'),
-      sessionGrants: await countRows(db, 'session_grant'),
-      approvals: await countRows(db, 'approval_request'),
-      userProvisioning: await countRows(db, 'user_provisioning_request'),
-      channelProvisioning: await countRows(db, 'channel_provisioning_request'),
-      notifications: await countRows(db, 'notification_state'),
-      installations: await countRows(db, 'installation'),
-    };
     return {
       executed: false,
-      providers,
-      connections,
+      providerCount: storedProviders.length,
+      byProvider,
+      unregistered,
+      matched,
       removedLocal: 0,
       upstream,
-      cleared: { ...cleared, connections: 0 }, // dry-run deletes nothing
-      installations: cleared.installations,
-      remaining: { credentials: 0, authorizations: 0, installations: 0 },
+      upstreamAttempted: 0,
+      cleared: zeroLocalCounts(),
+      remaining: {
+        credentials: matched.connections,
+        authorizations: authorizationCount(matched),
+        installations: matched.installations,
+      },
       ok: false,
     };
   }
 
-  const installations = await countRows(db, 'installation');
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
   // Phase 1: per-provider upstream revoke + attributed local delete, via the shared helper.
-  for (const provider of providers) {
+  for (const provider of storedProviders) {
+    const bucket = bucketFor(provider);
     const revocable = isRegisteredRevocable(deps.registry, provider);
     for (const row of await selectRevocations(db, { provider })) {
-      connections++;
+      bucket.connections++;
       let outcome: RevokeOutcome;
       try {
         outcome = await revokeConnection(
-          deps.vault, deps.audit, deps.consent, deps.sessions, deps.registry, row, provider,
+          deps.vault,
+          deps.audit,
+          consent,
+          sessions,
+          deps.registry,
+          row,
+          provider,
+          { auditScope: 'deployment' },
         );
       } catch {
         // A provider/KMS extension may throw with credential material inside; never serialize it
         // (SEC-1). The blanket delete below still removes this row, so the sweep stays complete.
+        mark(bucket, 'unresolved');
         continue;
       }
-      if (!outcome.removed) continue;
-      removedLocal++;
-      upstream[executeCategory(row, outcome, revocable)]++;
+      if (outcome.removed) removedLocal++;
+      if (outcome.upstreamAttempted) {
+        bucket.attempted++;
+        upstreamAttempted++;
+      }
+      mark(bucket, executeCategory(row, outcome, revocable));
     }
   }
 
@@ -994,12 +1113,14 @@ export async function revokeAllCredentials(
   const remainingInstallations = await countRows(db, 'installation');
   return {
     executed: true,
-    providers,
-    connections,
+    providerCount: storedProviders.length,
+    byProvider,
+    unregistered,
+    matched,
     removedLocal,
     upstream,
+    upstreamAttempted,
     cleared,
-    installations,
     remaining: { credentials, authorizations, installations: remainingInstallations },
     ok: credentials === 0 && authorizations === 0 && remainingInstallations === 0,
   };

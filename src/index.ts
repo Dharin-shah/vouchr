@@ -49,7 +49,7 @@ export { Audit } from './core/audit';
 export { Consent } from './core/consent';
 export type { ConsentRequest } from './core/consent';
 export { github, google, gitlab, notion, databricks, defineProvider, ProviderRegistry } from './core/providers';
-export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy } from './core/providers';
+export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy, RevokeTarget } from './core/providers';
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
 export { PolicyDeniedError, ToolDisabledError } from './core/authz';
@@ -131,8 +131,14 @@ export { offboardUser, disconnectProvider } from './core/offboard';
 // #239 deployment-wide emergency invalidation, exported so a headless host can drive the same
 // break-glass the `vouchr revoke --all` CLI does. Containment (VOUCHR_LOCKDOWN) is wired at the Vault
 // (see CredentialLockdownError); this is the local-delete + best-effort upstream-revoke primitive.
-export { revokeAllCredentials, enumerateStoredProviders } from './core/offboard';
-export type { RevokeAllDeps, RevokeAllReport, RevokeCategory } from './core/offboard';
+export { revokeAllCredentials } from './core/offboard';
+export type {
+  RevokeAllDeps,
+  RevokeAllReport,
+  RevokeCategory,
+  RevokeLocalCounts,
+  RevokeProviderReport,
+} from './core/offboard';
 export { sweepExpired } from './core/sweep';
 // Exported wire RESPONSE types for the HTTP broker — the request types (BrokerFetchRequest,
 // ConnectionHandleRef) were already exported; these give clients the response contract too, so they

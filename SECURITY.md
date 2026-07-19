@@ -93,15 +93,20 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   treated as full credential exposure. For that case, `vouchr revoke --all --confirm ALL-CREDENTIALS`
   locally deletes every stored credential, external reference, pending consent, session grant/request,
   action approval, notification-state row, and Slack installation, then attempts best-effort upstream
-  revocation per provider and reports the outcome per category. Local deletion is guaranteed even with
-  the master key or provider config unavailable; it is dry-run by default and requires the exact
-  confirmation token to execute. **Local deletion is not upstream revocation.** A token an attacker
+  revocation per provider and reports real attempted counts separately from success/failure. A
+  refresh-capable revocable provider must declare whether invalidation targets the access token,
+  refresh token, both, or the whole grant; Vouchr does not infer that contract. Local deletion is
+  guaranteed even with the master key or provider config unavailable; it is dry-run by default and
+  requires the exact confirmation token to execute. **Local deletion is not upstream revocation.** A token an attacker
   already copied stays valid at the provider until it expires or is rotated; providers without a
   revoke endpoint, undecryptable tokens, and external references require manual rotation; invalidated
   Slack installations require each workspace to reinstall the app. Rotate master keys, OAuth client
   secrets, Slack credentials, database and resolver roles per the incident scope, and require users to
-  reconnect, before serving traffic again — otherwise restoring a pre-incident backup can make old
-  rows usable. The command exits non-zero while any local credential/authorization row remains.
+  reconnect, before serving traffic again. Remove a compromised direct key from every active keyring
+  and revoke/disable the old KMS grant or key for serving workloads; merely adding a new primary still
+  decrypts old rows. A pre-incident backup may be restored only into an isolated locked-down deployment
+  for an explicit global invalidation before ingress returns. The command exits non-zero while any
+  local credential/authorization row remains.
 - **Containment must come from outside the credential database.** Set `VOUCHR_LOCKDOWN=1` on the
   deployment (never a flag inside the potentially-compromised database) to fail closed: readiness
   reports 503 (so an orchestrator pulls the replica from rotation) and credential serving, refresh,

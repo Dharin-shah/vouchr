@@ -35,6 +35,7 @@ const revocable = defineProvider({
   refresh: 'rotating',
   pkce: true,
   revokeUrl: 'https://acme.example/revoke',
+  revokeTarget: 'both',
   clientId: 'id',
   clientSecret: 'sec',
 });

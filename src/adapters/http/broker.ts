@@ -213,14 +213,6 @@ export interface BrokerOptions {
    * `egressMethods`; providers with no method allowlist remain GET/HEAD-only.
    */
   allowWrites?: boolean;
-  /**
-   * #239 deployment-wide containment. When true (from VOUCHR_LOCKDOWN, deployment config OUTSIDE the
-   * credential database), readiness reports 503 and EVERY functional route is refused 503 before any
-   * credential access — liveness (/healthz) stays 200 so the host can still scrape/scheduler it. The
-   * Vault this broker is built with should be constructed with the same flag as defense-in-depth, but
-   * this gate does not depend on that: it fails closed on its own.
-   */
-  lockdown?: boolean;
   /** #26 content-type allowlist (lower-cased, charset-stripped match). Default application/json. */
   allowedContentTypes?: string[];
   /** #26 response size cap in bytes; over-cap is rejected 413, never truncated. Default 1 MiB.
@@ -698,6 +690,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   // #212 production broker boundary: no legacy bare-secret mode. Normalize once into a defensive,
   // deep-frozen config so caller mutation cannot change issuer/audience/keys after construction.
   const identityConfig = normalizeIdentityConfig(rawOpts.identitySecret);
+  // #239 one immutable source of truth: a broker cannot claim route lockdown while its Vault still
+  // serves secrets (or vice versa). Direct and packaged construction both derive from the Vault.
+  const lockdown = rawOpts.vault.lockdownEnabled;
   // Direct constructors do not pass through the env loader, but they still expose the broker bearer
   // and provider client secrets here. Enforce the same purpose-separation invariant before startup.
   assertIdentityPurposeDistinct(identityConfig, [
@@ -1864,7 +1859,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   async function handleReadyz(): Promise<{ status: number; payload: Record<string, unknown> }> {
     // #239: a deployment in operator-declared lockdown is deliberately NOT ready — k8s pulls it from
     // rotation. Reported before the DB probe so containment holds even if the store is unreachable.
-    if (opts.lockdown) return { status: 503, payload: { ok: false } };
+    if (lockdown) return { status: 503, payload: { ok: false } };
     if (!readinessFlight) {
       // allSettled is load-bearing: one check may fail immediately while its sibling DB query is
       // still running. Keep ownership until BOTH settle, otherwise the next probe starts another pair.
@@ -1943,7 +1938,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         // #239 containment: once the deployment is locked down, refuse EVERY functional route 503
         // before touching the admission lease, perimeter, identity, or vault — no credential is
         // served, minted, refreshed, or resolved. Liveness/readiness were handled above.
-        if (opts.lockdown) return send(503, { ok: false, error: 'locked_down' });
+        if (lockdown) return send(503, { ok: false, error: 'locked_down' });
 
         // #209 one true global admission lease for every functional request. It is acquired before
         // async perimeter authorization or body buffering and released only after BOTH the handler

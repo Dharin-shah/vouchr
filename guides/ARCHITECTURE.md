@@ -165,12 +165,15 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
   key or an external reference into a private modal.
 - **Revoke** is declarative (RFC 7009 `revokeUrl` + optional `revokeAuth: 'body'`) with a
   `revoke` function escape hatch for non-standard endpoints (GitHub's DELETE + Basic
-  auth). Honest no-op when a provider has no documented endpoint (Notion).
+  auth). `revokeTarget` declares whether complete invalidation requires the access token, refresh
+  token, both, or one grant-level operation; refresh-capable revocable providers must be explicit.
+  Honest no-op when a provider has no documented endpoint (Notion).
 - **Envelope encryption** is runtime-optional and backward-compatible (`EnvelopeProvider`,
   `src/core/crypto.ts`): a fresh per-secret data key encrypts the secret and is wrapped by an external
   KEK (KMS/Vault). The production vision requires it for Vault connection tokens. Without it,
   secrets use direct master-key encryption; reads dispatch on the stored format, so both modes remain
-  readable during migration. Slack installation tokens still use direct encryption pending #241.
+  readable during migration. Revocation-only unwraps have a fixed deadline and pass an optional
+  `AbortSignal` to the provider. Slack installation tokens still use direct encryption pending #241.
 - **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
   an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
   non-secret ref and resolves it JIT at injection time. The **resolved secret value** is

@@ -257,7 +257,6 @@ export async function buildBrokerServer(
     baseUrl,
     callbackPath,
     dryRun,
-    lockdown,
     ...resourceBounds,
     authorize: overrides.authorize,
     resolvers: overrides.resolvers,

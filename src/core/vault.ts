@@ -36,6 +36,38 @@ export interface StoredToken {
 export type UserProvisioningIssuance = number | ((tx: Db) => Promise<number | null>);
 export type UserProvisioningResult = 'stored' | 'stale' | 'offboarded' | 'revoked' | 'conflict';
 
+/** A KMS/envelope read during break-glass must not stall later local deletions indefinitely. This is
+ * deliberately fixed rather than deployment-tunable: making the emergency upper bound optional
+ * would turn a provider adapter mistake into an unbounded containment path. */
+export const REVOKE_DECRYPT_TIMEOUT_MS = 10_000;
+
+async function openForRevoke(
+  ciphertext: Buffer,
+  key: MasterKeys,
+  envelope: EnvelopeProvider | undefined,
+): Promise<string> {
+  // Direct/keyed rows are local crypto and cannot block on I/O. Avoid one controller/timer per token
+  // for the common path; an envelope-enabled 0x01 row still takes the bound because it may be a real
+  // envelope or the documented legacy-IV collision that `open` disambiguates.
+  if (!envelope || ciphertext[0] !== 0x01) return open(ciphertext, key, envelope);
+  const controller = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    // Keep this timer ref'd: the one-shot CLI must remain alive long enough to classify a hung KMS
+    // operation and continue the local wipe.
+    timer = setTimeout(() => {
+      const error = new Error('revocation credential read timed out');
+      reject(error);
+      controller.abort(error);
+    }, REVOKE_DECRYPT_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([open(ciphertext, key, envelope, undefined, controller.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const PREPARE_VAULT_CREDENTIAL_WRITE = Symbol('prepare-vault-credential-write');
 const BIND_VAULT_EXPIRY_TRANSACTION = Symbol('bind-vault-expiry-transaction');
 export type PreparedVaultCredentialWrite = (
@@ -132,6 +164,9 @@ export class Vault {
   private assertNotLockedDown(): void {
     if (this.lockdown) throw new CredentialLockdownError();
   }
+
+  /** One immutable source of truth for a direct broker's route gate and this Vault's secret gate. */
+  get lockdownEnabled(): boolean { return this.lockdown; }
 
   private isExpired(createdAt: number, lastUsedAt: number, now = Date.now()): boolean {
     if (this.ttl.idleMs != null && now - lastUsedAt > this.ttl.idleMs) return true;
@@ -550,7 +585,7 @@ export class Vault {
 
   /**
    * Delete one connection for the revocation path and, only for the winning caller, optionally decode
-   * its access token after the local delete committed. Unregistered/stale providers pass
+   * its access + refresh tokens after the local delete committed. Unregistered/stale providers pass
    * `decrypt=false`: their trusted `dry_run` bit remains available without touching ciphertext.
    */
   async deleteForRevoke(
@@ -566,8 +601,10 @@ export class Vault {
   ): Promise<{
     removed: boolean;
     accessToken: string | null;
+    refreshToken: string | null;
+    accessUnreadable: boolean;
+    refreshUnreadable: boolean;
     dryRun: boolean;
-    readFailed: boolean;
     fenced: boolean;
   }> {
     let row: Awaited<ReturnType<Vault['claimDelete']>>;
@@ -588,23 +625,48 @@ export class Vault {
       return {
         removed: false,
         accessToken: null,
+        refreshToken: null,
+        accessUnreadable: false,
+        refreshUnreadable: false,
         dryRun: false,
-        readFailed: false,
         fenced,
       };
     }
     const dryRun = row.dry_run === 1;
     if (!decrypt || dryRun) {
-      return { removed: true, accessToken: null, dryRun, readFailed: false, fenced };
+      return {
+        removed: true,
+        accessToken: null,
+        refreshToken: null,
+        accessUnreadable: false,
+        refreshUnreadable: false,
+        dryRun,
+        fenced,
+      };
     }
-    try {
-      const accessToken = row.access_token_enc
-        ? await open(toBuffer(row.access_token_enc), this.key, this.envelope)
-        : null;
-      return { removed: true, accessToken, dryRun, readFailed: false, fenced };
-    } catch {
-      return { removed: true, accessToken: null, dryRun, readFailed: true, fenced };
-    }
+    const decode = async (value: unknown): Promise<{ token: string | null; unreadable: boolean }> => {
+      if (!value) return { token: null, unreadable: false };
+      try {
+        return { token: await openForRevoke(toBuffer(value), this.key, this.envelope), unreadable: false };
+      } catch {
+        return { token: null, unreadable: true };
+      }
+    };
+    // Access and refresh ciphertext are independent. Bound and decode them in parallel so a row with
+    // two hung KMS unwraps still costs one deadline, not two, while preserving per-token reporting.
+    const [access, refresh] = await Promise.all([
+      decode(row.access_token_enc),
+      decode(row.refresh_token_enc),
+    ]);
+    return {
+      removed: true,
+      accessToken: access.token,
+      refreshToken: refresh.token,
+      accessUnreadable: access.unreadable,
+      refreshUnreadable: refresh.unreadable,
+      dryRun,
+      fenced,
+    };
   }
 
   /** PostgreSQL-clock timestamp for a direct trusted user-provisioning call. Capture this before
@@ -717,6 +779,9 @@ export class Vault {
     refreshEnc: Buffer | null;
     now: number;
   }> {
+    // Check BEFORE envelope/KMS work: lockdown promises that a callback/configuration write is
+    // refused before the secret reaches any crypto or external dependency (#239).
+    this.assertNotLockedDown();
     return {
       accessEnc: await seal(t.accessToken, this.key, this.envelope),
       refreshEnc: t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null,
@@ -876,6 +941,7 @@ export class Vault {
     issuance: UserProvisioningIssuance,
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<UserProvisioningResult> {
+    this.assertNotLockedDown();
     return this.withUserProvisioningFence(owner, provider, issuance, (tx) =>
       this.writeReferenceCredential(tx, owner, provider, r, afterWrite));
   }
@@ -900,6 +966,7 @@ export class Vault {
     gate?: { mintedAt: number },
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<boolean> {
+    this.assertNotLockedDown();
     if (gate) return (await this.upsertUser(owner, provider, t, gate.mintedAt, afterWrite)) === 'stored';
     if (owner.kind === 'user') {
       const issuedAt = await this.userProvisioningIssuedAt();
@@ -926,6 +993,7 @@ export class Vault {
    * TOCTOU window.
    */
   async upsertDryRun(owner: Owner, provider: string, t: StoredToken): Promise<boolean> {
+    this.assertNotLockedDown();
     if (owner.kind === 'user') {
       const issuedAt = await this.userProvisioningIssuedAt();
       return (await this.upsertDryRunUser(owner, provider, t, issuedAt)) === 'stored';
@@ -966,6 +1034,7 @@ export class Vault {
     r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
+    this.assertNotLockedDown();
     if (owner.kind === 'user') {
       const issuedAt = await this.userProvisioningIssuedAt();
       const result = await this.referenceUser(owner, provider, r, issuedAt, afterWrite);

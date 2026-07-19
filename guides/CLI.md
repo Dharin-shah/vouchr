@@ -80,7 +80,8 @@ consent row's channel is request origin, not shared-credential ownership. Durabl
 a fixed hash of the selected scope. A provider must be currently registered or already present under
 that exact validated id in Vouchr's durable state; an unrecognized typo cannot create a marker. The
 command exits non-zero if the fence cannot be established or matching local access remains. Upstream
-attempted, failed, and skipped counts are reported separately; a skip is never called success.
+attempted, failed, unresolved (a required token was missing/unreadable), and skipped counts are
+reported separately; a skip is never called success.
 
 #### Deployment-wide revoke (`--all`)
 
@@ -99,11 +100,13 @@ provider id from PostgreSQL — **including removed/unregistered ones** — then
 best-effort upstream revocation, and finally blanket-deletes every `connection`, external reference,
 pending consent, session grant/request, action approval, notification-state row, and **Slack
 installation** credential. Local deletion needs no master key, KMS, provider config, or upstream
-availability, so it completes even when those are broken. The upstream report separates six cases:
-`revoked`, `failed` (incl. timeouts), `unsupported` (no revoke endpoint / unregistered), `undecryptable`
-(token unreadable — upstream **not** revoked), `external_reference` (rotate in the source manager), and
-`synthetic` (dry-run rows). It exits non-zero while any local credential/authorization row remains, and
-is idempotent — a second run reports zero.
+availability, so it completes even when those are broken. Dry-run reports `would_attempt` without
+claiming success. Execution reports, per registered provider, attempted rows plus `revoked`, `failed`
+(including timeouts), `unsupported`, `undecryptable`, `unresolved`, `external_reference`, and
+`synthetic`; removed/unregistered provider ids are aggregated without printing their raw database
+values. Providers that can refresh and support revocation declare whether Vouchr must revoke the
+access token, refresh token, both, or the whole grant. The command exits non-zero while any local
+credential/authorization row remains, and is idempotent — a second run reports zero.
 
 Deleting ciphertext does **not** revoke a bearer an attacker already copied. See
 [SECURITY.md](../SECURITY.md) for the full incident procedure: enable containment (`VOUCHR_LOCKDOWN=1`,

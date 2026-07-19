@@ -12,17 +12,21 @@ All notable changes to this project are documented here. This project adheres to
   compromised live replica — not a read-only dump with the key intact), `vouchr revoke --all
   --confirm ALL-CREDENTIALS` locally deletes every stored credential, external reference, pending
   consent, session grant/request, action approval, notification-state row, and **Slack installation**
-  in one pass. It enumerates every stored provider id from PostgreSQL including removed/unregistered
-  ones, attempts best-effort bounded upstream revocation per provider, and reports six distinct
-  categories (`revoked`, `failed`, `unsupported`, `undecryptable`, `external_reference`, `synthetic`).
-  Dry-run is the default and prints counts only; execution requires the exact stronger confirmation
-  token (not `--yes`), takes no owner scope, and cannot be combined with `--provider`. Local deletion
-  is guaranteed even with the master key, KMS, or provider config unavailable, is idempotent (a second
-  run reports zero), and exits non-zero while any local credential/authorization row remains. New core
-  primitives `revokeAllCredentials` / `enumerateStoredProviders` (with `RevokeAllReport` /
-  `RevokeCategory` / `RevokeAllDeps`) are exported for headless hosts. The report and CLI never print a
-  token, reference value, or owner data. **Local deletion is not upstream revocation:** a bearer an
-  attacker already copied stays valid at the provider until it expires or is rotated — see SECURITY.md.
+  in one pass. It inventories every stored provider id from PostgreSQL, including removed/unregistered
+  ones, and attempts bounded upstream revocation under the provider's explicit `revokeTarget`
+  (`access`/`refresh`/`both`/`grant`) contract. Dry-run reports `would_attempt`; execution reports real
+  attempted rows per registered provider plus `revoked`, `failed`, `unsupported`, `undecryptable`,
+  `unresolved`, `external_reference`, and `synthetic`. Removed/unregistered database ids are aggregated
+  without printing their raw values. Dry-run is the default; execution requires the exact stronger
+  confirmation token (not `--yes`), takes no owner scope, and cannot be combined with `--provider`.
+  Local deletion is guaranteed even with the master key, KMS, or provider config unavailable, is
+  idempotent (a second run reports zero), and exits non-zero while any local credential/authorization
+  row remains. `revokeAllCredentials` and its no-secret report types are exported from both package
+  entrypoints for embedded/headless hosts; raw provider enumeration remains internal. Revocation-only
+  KMS unwraps are deadline-bounded and pass the optional `EnvelopeProvider.unwrapDataKey` signal so a
+  stalled KMS call cannot block later local deletes. **Local deletion
+  is not upstream revocation:** a bearer an attacker already copied stays valid at the provider until
+  it expires or is rotated — see SECURITY.md.
 - **Containment lockdown** (#239). `VOUCHR_LOCKDOWN=1` (deployment config, never a flag inside the
   potentially-compromised database) fails readiness (broker `/readyz` → 503; every functional route →
   503) and makes the Vault refuse to serve (`get`), mint (`upsert`/`reference`), or refresh a
