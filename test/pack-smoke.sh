@@ -38,12 +38,17 @@ echo "==> require() every published entrypoint (CJS exports map)"
       'ResolverConfigurationError', 'ResolverFailedError',
       'ResponseBlockedError', 'RateLimitedError', 'SecretReferenceError', 'TokenEndpointError',
       'UpstreamTimeoutError', 'UserFacingError',
-      'mapSafeError', 'safeUserMessage']) {
+      'isVouchrErrorCode', 'mapSafeError', 'safeUserMessage']) {
       if (typeof surface[name] !== 'function') throw new Error('missing packed export: ' + name);
     }
     if (!Array.isArray(surface.VOUCHR_ERROR_CODES) || !Array.isArray(surface.VOUCHR_RECOVERY_ACTIONS)
       || !Array.isArray(surface.TOKEN_ENDPOINT_FAILURE_KINDS)) {
       throw new Error('missing packed typed-error registries');
+    }
+    if (!surface.isVouchrErrorCode('not_connected')
+      || surface.isVouchrErrorCode('not_a_vouchr_code')
+      || surface.isVouchrErrorCode(42)) {
+      throw new Error('packed Vouchr error-code guard is missing or does not fail closed');
     }
     // The reused prompt state must yield distinct fixed copy that admits the ephemeral may be gone.
     if (surface.safeUserMessage(new surface.ConsentRequiredError('github', 'posted'))
@@ -118,6 +123,12 @@ echo "==> require() every published entrypoint (CJS exports map)"
   if (!/^hmac-sha256:[0-9a-f]{64}$/.test(approval.actionFingerprint)) {
     throw new Error('packed approval action fingerprint is missing');
   }
+  if (typeof root.ConnectContext?.prototype?.recoverBrokerDenial !== 'function') {
+    throw new Error('packed root ConnectContext is missing recoverBrokerDenial');
+  }
+  if ('ConnectContext' in headless) {
+    throw new Error('Bolt ConnectContext leaked into the headless runtime entrypoint');
+  }
   const config = new headless.ChannelConfig({});
   const tools = new headless.ChannelTools({});
   for (const [instance, names] of [[config, ['setMode']], [tools, ['setEnabled', 'applyEnabled']]]) {
@@ -158,7 +169,8 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import {
-  createVouchr, disconnectProvider, type ConnectContext,
+  createVouchr, disconnectProvider, isVouchrErrorCode as isRootVouchrErrorCode,
+  type BrokerDenialRecovery, type ConnectContext,
 } from '@vouchr/core';
 import {
   ChannelConfig, ChannelTools, Vault, createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
@@ -168,7 +180,8 @@ import {
   ResolverConfigurationError, ResolverFailedError,
   ResponseBlockedError, RateLimitedError, SecretReferenceError, TokenEndpointError,
   UpstreamTimeoutError, UserFacingError,
-  mapSafeError, safeUserMessage, TOKEN_ENDPOINT_FAILURE_KINDS, VOUCHR_ERROR_CODES, VOUCHR_RECOVERY_ACTIONS,
+  isVouchrErrorCode, mapSafeError, safeUserMessage,
+  TOKEN_ENDPOINT_FAILURE_KINDS, VOUCHR_ERROR_CODES, VOUCHR_RECOVERY_ACTIONS,
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type BrokerServer, type IdentityConfig,
   type ConsentPromptState,
   type SecretReferenceErrorCode, type TokenEndpointFailureKind, type VouchrErrorCode,
@@ -187,6 +200,16 @@ const noReplayOverride: false = null as unknown as HasReplayOverride;
 const noSkewKnob: false = null as unknown as HasSkewKnob;
 type HasPreview = 'preview' extends keyof ConnectContext ? true : false;
 type HasPreviewConfig = 'setChannelVisibility' extends keyof ConnectContext ? true : false;
+type HasBrokerDenialRecovery = 'recoverBrokerDenial' extends keyof ConnectContext ? true : false;
+type BrokerRecoveryStatus = BrokerDenialRecovery['status'];
+type ExpectedBrokerRecoveryStatus =
+  | 'resolved'
+  | 'connect_prompted'
+  | 'session_prompted'
+  | 'approval_prompted'
+  | 'configuration_required'
+  | 'stale'
+  | 'not_bridgeable';
 type RootSurface = typeof import('@vouchr/core');
 type HeadlessSurface = typeof import('@vouchr/core/headless');
 type RootHasSessions = 'SessionGrants' extends keyof RootSurface ? true : false;
@@ -208,6 +231,11 @@ type VaultDeleteExpiredArity = Parameters<Vault['deleteExpired']>['length'];
 type VaultListExpiringSoonArity = Parameters<Vault['listExpiringSoon']>['length'];
 const noPreview: false = null as unknown as HasPreview;
 const noPreviewConfig: false = null as unknown as HasPreviewConfig;
+const hasBrokerDenialRecovery: true = null as unknown as HasBrokerDenialRecovery;
+const exactBrokerRecoveryStatuses: [true, true] = null as unknown as [
+  BrokerRecoveryStatus extends ExpectedBrokerRecoveryStatus ? true : false,
+  ExpectedBrokerRecoveryStatus extends BrokerRecoveryStatus ? true : false,
+];
 const noUnsafeInteractionExports: [false, false, false, false] = null as unknown as [
   RootHasSessions, RootHasApprovals, HeadlessHasSessions, HeadlessHasApprovals,
 ];
@@ -227,6 +255,8 @@ void noReplayOverride;
 void noSkewKnob;
 void noPreview;
 void noPreviewConfig;
+void hasBrokerDenialRecovery;
+void exactBrokerRecoveryStatuses;
 void noUnsafeInteractionExports;
 void safeBrokerLifecycle;
 void noRawGovernanceWrites;
@@ -288,6 +318,14 @@ for (const error of documentedErrors) {
 }
 void VOUCHR_ERROR_CODES;
 void VOUCHR_RECOVERY_ACTIONS;
+const wireCode: unknown = 'not_connected';
+if (isVouchrErrorCode(wireCode)) {
+  const typedCode: VouchrErrorCode = wireCode;
+  void typedCode;
+}
+if (!isRootVouchrErrorCode('approval_required') || isRootVouchrErrorCode('not_a_vouchr_code')) {
+  throw new Error('packed root error-code guard did not fail closed');
+}
 const tokenKind: TokenEndpointFailureKind = TOKEN_ENDPOINT_FAILURE_KINDS[0];
 void tokenKind;
 const oversizedApproval: BrokerError = {

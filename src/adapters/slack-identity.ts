@@ -69,12 +69,72 @@ export async function isChannelAdmin(
   }
 }
 
+interface ChannelMemberPaginationBounds {
+  maxMembers: number;
+  maxPages: number;
+  continue: () => boolean;
+}
+
+type ConversationsMembersClient = {
+  conversations: {
+    members: (a: { channel: string; cursor?: string; limit?: number }) => Promise<any>;
+  };
+};
+
+/** One finite, cursor-validated traversal shared by membership checks and complete audience reads.
+ * `true` means the visitor found its target, `false` means the complete list was read, and `null`
+ * means Slack could not prove a result within the caller's deadline/work cap. */
+async function scanChannelMembers(
+  client: ConversationsMembersClient,
+  channel: string,
+  bounds: ChannelMemberPaginationBounds,
+  visit: (member: string) => boolean,
+): Promise<boolean | null> {
+  if (
+    !Number.isSafeInteger(bounds.maxMembers) || bounds.maxMembers < 1
+    || !Number.isSafeInteger(bounds.maxPages) || bounds.maxPages < 1
+  ) return null;
+  const members = new Set<string>();
+  const cursors = new Set<string>();
+  let scannedEntries = 0;
+  let scannedPages = 0;
+  try {
+    let cursor: string | undefined;
+    do {
+      scannedPages += 1;
+      if (scannedPages > bounds.maxPages || !bounds.continue()) return null;
+      const res = await client.conversations.members({ channel, cursor, limit: 1000 });
+      if (
+        !bounds.continue()
+        || !Array.isArray(res?.members)
+        || res.members.length > 1000
+      ) return null;
+      for (const member of res.members) {
+        scannedEntries += 1;
+        if (scannedEntries > bounds.maxMembers || !bounds.continue()) return null;
+        if (typeof member !== 'string' || member.length === 0 || member.length > 255) return null;
+        if (members.has(member)) continue;
+        members.add(member);
+        if (visit(member)) return true;
+      }
+      const next = res?.response_metadata?.next_cursor;
+      if (next == null || next === '') cursor = undefined;
+      else {
+        if (typeof next !== 'string' || next.length > 1024 || cursors.has(next)) return null;
+        cursors.add(next);
+        cursor = next;
+      }
+    } while (cursor);
+    return false;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Whether `userId` is a member of `channel`, the gate for using a SHARED channel credential when
- * `requireChannelMembership` is on. Fail-closed: any API error (or a member list we can't read)
- * → not a member, so a non-member can never borrow the channel's cred. Pages conversations.members
- * (Slack returns at most 1000/page) until the user is seen or the cursor runs out; a missing/empty
- * page is treated as "not found", not "allow".
+ * `requireChannelMembership` is on. Fail-closed: any API error or incomplete/bounded traversal
+ * → not a member, so a non-member can never borrow the channel's cred.
  */
 export async function isChannelMember(
   client: {
@@ -84,24 +144,16 @@ export async function isChannelMember(
   },
   channel: string,
   userId: string,
+  bounds: ChannelMemberPaginationBounds,
 ): Promise<boolean> {
-  try {
-    let cursor: string | undefined;
-    do {
-      const res = await client.conversations.members({ channel, cursor, limit: 1000 });
-      if (Array.isArray(res?.members) && res.members.includes(userId)) return true;
-      cursor = res?.response_metadata?.next_cursor || undefined;
-    } while (cursor);
-    return false;
-  } catch {
-    return false;
-  }
+  return (await scanChannelMembers(client, channel, bounds, (member) => member === userId)) === true;
 }
 
 /**
  * The user ids of every member of `channel`, paged from conversations.members. Used to find the
- * channel's eligible approvers (#113). Fail-closed: any API error yields an empty list, so a read we
- * can't complete never silently widens the candidate set.
+ * channel's eligible approvers (#113). `null` means the complete current set could not be proven
+ * because an API read failed, the caller's overall deadline elapsed, or the configured work cap was
+ * exceeded; an empty array means the complete set was read and contained no members.
  */
 export async function listChannelMembers(
   client: {
@@ -110,17 +162,13 @@ export async function listChannelMembers(
     };
   },
   channel: string,
-): Promise<string[]> {
-  const out: string[] = [];
-  try {
-    let cursor: string | undefined;
-    do {
-      const res = await client.conversations.members({ channel, cursor, limit: 1000 });
-      if (Array.isArray(res?.members)) out.push(...res.members);
-      cursor = res?.response_metadata?.next_cursor || undefined;
-    } while (cursor);
-  } catch {
-    return [];
-  }
-  return out;
+  bounds: ChannelMemberPaginationBounds,
+): Promise<string[] | null> {
+  const out = new Set<string>();
+  const complete = await scanChannelMembers(client, channel, bounds, (member) => {
+    out.add(member);
+    return false;
+  });
+  if (complete === null) return null;
+  return [...out];
 }

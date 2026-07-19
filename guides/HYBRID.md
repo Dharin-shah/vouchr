@@ -500,7 +500,7 @@ Session mode uses the same preflight but binds the grant to the verified Slack t
 ![Thread-scoped session prompt](../assets/slack-session-thread.svg)
 
 ```ts
-app.event('app_mention', async ({ context, event, say }) => {
+app.event('app_mention', async ({ context, event, client, say }) => {
   try {
     // Resolve mode and show the built-in OAuth/key/session prompt when needed.
     await context.vouchr.connect('internal-mcp');
@@ -532,8 +532,28 @@ app.event('app_mention', async ({ context, event, say }) => {
     // connect/key prompt, the thread session prompt, admin configuration direction, or the
     // Approve/Deny decision surface for the pending approvalId.
     const recovery = await context.vouchr.recoverBrokerDenial('internal-mcp', result.brokerDenial);
-    if (recovery.status !== 'resolved') return; // a private prompt/direction is live — stop this turn
-    // 'resolved': the denial is stale against current state — retry with a FRESH assertion.
+    if (recovery.status === 'resolved' || recovery.status === 'stale') {
+      // Current state must be resolved again. Do NOT reuse the spent assertion or automatically
+      // replay this operation: it may be a non-idempotent write. A new user-triggered turn starts
+      // again at preflight and mints a fresh single-use assertion.
+      await client.chat.postEphemeral({
+        channel: event.channel,
+        user: event.user,
+        text: 'Vouchr state changed. Ask the agent to try the tool again.',
+      });
+      return;
+    }
+    if (recovery.status === 'not_bridgeable') {
+      // The bridge owns only connect/session/approval denials. Keep every other safe broker
+      // failure private; never fall through and publish it to the channel with say().
+      await client.chat.postEphemeral({
+        channel: event.channel,
+        user: event.user,
+        text: result.safeText,
+      });
+      return;
+    }
+    return; // a private prompt or configuration direction is live — stop this turn
   }
   await say(result.safeText);
 });
@@ -542,10 +562,14 @@ app.event('app_mention', async ({ context, event, say }) => {
 The host-specific `isVouchrPrompt` and `dispatchTrustedGateway` functions are intentionally not Vouchr
 APIs. The important ordering is: verified Slack event → Vouchr preflight → stop on prompt → trusted
 server-side mode lookup → identity mint → private broker call → on a typed broker denial, relay the
-body to `recoverBrokerDenial` from the same verified context and stop unless it reports `resolved`. If the model chooses a tool only after
-planning, intercept the proposed tool in the trusted host, run the same preflight, and add the
-identity assertion out of band. It must never be a model-visible tool argument. A mode change between
-preflight and egress fails closed; rerun preflight instead of guessing.
+body to `recoverBrokerDenial` from the same verified context. Prompt/configuration outcomes stop the
+turn. `resolved` and `stale` mean only that a new attempt may re-resolve current state; they are not
+replay authority. The example asks the user to start a new turn so the host repeats preflight and
+mints a fresh assertion instead of automatically replaying a possibly non-idempotent operation.
+`not_bridgeable` stays private and follows the broker's safe typed guidance. If the model chooses a
+tool only after planning, intercept the proposed tool in the trusted host, run the same preflight,
+and add the identity assertion out of band. It must never be a model-visible tool argument. A mode
+change between preflight and egress fails closed; rerun preflight instead of guessing.
 
 For a broker call, the worker sends only a handle and request shape; the signed assertion determines
 the owner:

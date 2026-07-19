@@ -15,11 +15,21 @@ All notable changes to this project are documented here. This project adheres to
   `not_connected` re-runs the full connect flow (deduplicated private OAuth/key prompt for user
   ownership; for a shared owner, an admin-eligible actor is directed in place and otherwise the
   last configuring admin gets one debounced DM per 24h window via the shared `NotificationState`,
-  never a personal connect prompt). `session_approval_required` creates/reuses the one thread-scoped
-  session prompt. `approval_required` re-reads the pending row named by the opaque `approvalId`,
-  binds it to the verified team/user/channel, re-derives the self/admin rule from the registry, and
-  delivers the Approve/Deny surface through the same leased path as in-process approvals — the
-  delivery logic is now one shared helper for both doors. `connectChannel`'s missing-credential
+  never a personal connect prompt). Static-key setup now uses a PostgreSQL delivery lease shared
+  across replicas, bounded Slack delivery, and the same definite-versus-ambiguous failure handling
+  as the OAuth path. `session_approval_required` creates/reuses the one exact thread-scoped session
+  prompt. `approval_required` re-reads the pending row named by the opaque `approvalId`, binds it to
+  the verified team/user/channel/thread/provider, and revalidates current credential, lifecycle,
+  policy, tool, shared-channel, requester-membership, and approver authority. Its current recipient
+  audience is discovered with deadline- and size-bounded complete Slack pagination plus bounded
+  concurrent admin checks; delivery is leased against a digest of that exact audience, so a prior
+  self/admin or obsolete-admin delivery cannot suppress the current approvers. The Approve/Deny
+  surface uses the same delivery helper for broker and in-process requests. Every channel-membership
+  proof shares the same deadline, size cap, and cursor-cycle rejection, so malformed Slack/proxy
+  pagination fails closed before a prompt, lease, or channel-context DM. Schema v12 adds the
+  key-prompt delivery lease and approval-audience columns; its drained migration clears pre-v12
+  global approval delivery markers while preserving the pending exact action for truthful
+  redelivery. `connectChannel`'s missing-credential
   failure is now the typed `NoConnectionError` (owner `channel`; message unchanged). The packaged
   broker's readiness line reports the OS-bound port so `VOUCHR_PORT=0` is usable. Proven by a
   two-process integration test (`test/broker-bridge.test.ts`): a spawned `vouchr-broker` process and

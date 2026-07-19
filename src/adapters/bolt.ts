@@ -45,7 +45,10 @@ import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
 import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
 import {
+  abandonUserProvisioningDelivery,
   ChannelProvisioningRequests,
+  claimUserProvisioningDelivery,
+  confirmUserProvisioningDelivery,
   configureUserCredential,
   issueUserProvisioningRequest,
   UserProvisioningRequests,
@@ -55,6 +58,7 @@ import {
   ApprovalRequiredError,
   DEFAULT_APPROVAL_TTL_MS,
   approvalActionFingerprint,
+  approvalDeliveryAudienceKey,
   approvalDecisionLockOwners,
   approvalOwnerStillCurrent,
   credentialUseStateFenced,
@@ -180,6 +184,15 @@ function optionalBlockFallback(blocks: unknown[]): { text: string } | Record<str
 
 export const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
 export const APPROVAL_FANOUT_CONCURRENCY = 16;
+/** One complete, current approval-recipient snapshot must resolve promptly before delivery is
+ * claimed. This bounds pagination plus admin checks even for direct test/custom clients that do not
+ * inherit WebClient's request timeout. */
+export const APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS = SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS;
+/** Fail closed instead of retaining unbounded member/admin work for an exceptionally large or
+ * hostile paginated response. */
+export const MAX_APPROVAL_AUDIENCE_MEMBERS = 5_000;
+/** Bound empty/tiny pages with ever-changing cursors independently of the member-entry cap. */
+export const MAX_CHANNEL_MEMBER_PAGES = 100;
 const SLACK_NOTIFICATION_CLIENT_OPTIONS = Object.freeze({
   retryConfig: { retries: 0 },
   timeout: SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
@@ -211,6 +224,63 @@ type SettledWithLimitResult = PromiseSettledResult<void> | {
 
 function monotonicElapsedMs(startNs: bigint): number {
   return Number(process.hrtime.bigint() - startNs) / 1e6;
+}
+
+class ApprovalAudienceResolutionError extends Error {}
+
+/** Await one audience-resolution stage only through the shared monotonic overall deadline. The
+ * underlying bounded WebClient call may finish later, but Promise.race owns its rejection and no
+ * later result can mutate delivery state. */
+async function withinApprovalAudienceDeadline<T>(
+  work: Promise<T>,
+  startedAtNs: bigint,
+): Promise<T> {
+  const remaining = APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS - monotonicElapsedMs(startedAtNs);
+  if (remaining <= 0) throw new ApprovalAudienceResolutionError('approval audience deadline elapsed');
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new ApprovalAudienceResolutionError('approval audience deadline elapsed')),
+      remaining,
+    );
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([work, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/** Fail-closed channel-membership proof under the same finite cursor/member/deadline contract used
+ * for approval audiences. This covers every shared-credential use and interaction revalidation,
+ * including custom clients whose pagination is malformed or whose request never settles. */
+async function boundedChannelMembership(
+  client: WebClient,
+  channel: string,
+  userId: string,
+  clientOptions?: WebClientOptions,
+): Promise<boolean> {
+  const startedAtNs = process.hrtime.bigint();
+  const withinDeadline = (): boolean => (
+    monotonicElapsedMs(startedAtNs) < APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS
+  );
+  try {
+    const token = (client as { token?: unknown }).token;
+    const memberClient = typeof token === 'string' && token.length > 0
+      ? slackNotificationClient(token, clientOptions)
+      : client;
+    return await withinApprovalAudienceDeadline(
+      isChannelMember(memberClient, channel, userId, {
+        maxMembers: MAX_APPROVAL_AUDIENCE_MEMBERS,
+        maxPages: MAX_CHANNEL_MEMBER_PAGES,
+        continue: withinDeadline,
+      }),
+      startedAtNs,
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Fan `task` out over `items` with at most `limit` in flight, returning settled outcomes in order.
@@ -639,7 +709,8 @@ type ApprovalPromptSpec = {
  * identity assertion.
  *
  * - `resolved` — current verified state no longer produces that denial (stale relay, mode change,
- *   or the approval rule no longer applies). Retry the brokered call.
+ *   or the approval rule no longer applies). This is not replay authority: stop this turn and let a
+ *   new user-triggered turn repeat preflight and mint a fresh single-use assertion.
  * - `connect_prompted` — the private connect/key-setup flow posted (or reused) its prompt; stop
  *   this turn (`promptState` mirrors ConsentRequiredError).
  * - `session_prompted` — the thread-scoped session approval prompt is live in the thread.
@@ -647,7 +718,8 @@ type ApprovalPromptSpec = {
  * - `configuration_required` — shared-owner credential is missing; an eligible admin was directed
  *   to channel configuration (never a personal connect prompt).
  * - `stale` — no live pending approval matches the relayed reference: it was decided, expired, or
- *   never existed. Retry the brokered call — it re-evaluates and re-mints if still needed.
+ *   never existed. This is not replay authority: a new user-triggered turn must repeat preflight and
+ *   mint a fresh assertion, re-evaluating and re-minting the request if still needed.
  * - `not_bridgeable` — the relayed code is not a broker denial this bridge recovers (or the input
  *   was not a valid BrokerError shape). Handle it with mapSafeError guidance instead.
  */
@@ -860,17 +932,21 @@ export class ConnectContext {
         'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
       );
     }
-    // Resolve the admin recipients BEFORE claiming the delivery lease: member enumeration is an
-    // unbounded Slack read, and running it *inside* the lease could let the lease expire (and
-    // another replica take over) before this worker posts, producing a duplicate. 'self' and
-    // off-channel approvals need no enumeration. The posts themselves run on the bounded
-    // promptClient, so the lease window then covers only bounded work.
+    // Resolve the complete current admin recipient set BEFORE claiming the delivery lease. The
+    // bounded client plus one overall deadline/cap prevents pagination or member-by-member admin
+    // checks from hanging recovery. The exact set also binds the persisted delivered marker: a
+    // self→admin rule or admin-roster change must produce a fresh usable surface.
     const approvers = spec.approver === 'admin' && this.channel ? await this.eligibleApprovers() : [];
+    const audience = approvalDeliveryAudienceKey(
+      spec.approvalId,
+      spec.approver,
+      spec.approver === 'self' ? [this.identity.userId] : approvers,
+    );
     // Start the conservative local budget BEFORE the claim round-trip. PostgreSQL creates the
     // lease during that call, so including the whole round-trip can only shorten our posting
     // window; it can never make us believe more lease remains than actually does.
     const deliveryLeaseStartedAtNs = process.hrtime.bigint();
-    const delivery = await this.approvals?.claimDelivery(spec.approvalId);
+    const delivery = await this.approvals?.claimDelivery(spec.approvalId, audience);
     if (!delivery || delivery.status === 'stale') {
       throw new UserFacingError(
         'The approval request changed before delivery. Ask the agent to retry the action.',
@@ -891,7 +967,7 @@ export class ConnectContext {
         // confirmation window even when every earlier wave failed.
         confirmation = await this.postApprovalPrompt(
           spec, prompt, approvers,
-          () => this.approvals!.confirmDelivery(spec.approvalId, delivery.token),
+          () => this.approvals!.confirmDelivery(spec.approvalId, delivery.token, audience),
           deliveryLeaseStartedAtNs,
         );
       } catch (deliveryError) {
@@ -902,6 +978,7 @@ export class ConnectContext {
               () => this.approvals!.abandonDelivery(
                 spec.approvalId,
                 delivery.token,
+                audience,
                 spec.newRequest,
               ),
               'approval',
@@ -920,6 +997,7 @@ export class ConnectContext {
               () => this.approvals!.abandonDelivery(
                 spec.approvalId,
                 delivery.token,
+                audience,
                 spec.newRequest,
               ),
               'approval',
@@ -937,6 +1015,7 @@ export class ConnectContext {
             () => this.approvals!.abandonDelivery(
               spec.approvalId,
               delivery.token,
+              audience,
               spec.newRequest,
             ),
             'approval',
@@ -993,7 +1072,12 @@ export class ConnectContext {
         } catch {
           return false;
         }
-        if (!(await isChannelMember(this.client, channel, this.identity.userId))) return false;
+        if (!(await boundedChannelMembership(
+          this.client,
+          channel,
+          this.identity.userId,
+          this.slackClientOptions,
+        ))) return false;
       }
       return this.vault.withCredentialLocks(
         [
@@ -1043,8 +1127,8 @@ export class ConnectContext {
   }
 
   /** Post the Approve/Deny prompt for one pending approval to whoever may decide it. `approvers` is
-   * resolved by the caller BEFORE the delivery lease is claimed (member enumeration is unbounded and
-   * must not run inside the lease); it is empty for 'self'/off-channel approvals that need none. */
+   * resolved by the caller BEFORE the delivery lease is claimed because even bounded Slack reads
+   * consume a separate pre-delivery budget; it is empty for 'self'/off-channel approvals. */
   private async postApprovalPrompt(
     spec: ApprovalPromptSpec,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
@@ -1155,18 +1239,57 @@ export class ConnectContext {
   /**
    * Channel members who may decide an 'admin' approval: the SAME eligibility rule as every channel
    * config mutation (adminEligible — custom override, else workspace admin OR the channel creator
-   * when opted in). Fail-closed reads: an unreadable member list yields nobody.
+   * when opted in). Incomplete/over-budget reads fail with fixed retry guidance before delivery is
+   * claimed; an empty complete snapshot means there is currently no usable decision surface.
    */
-  // ponytail: linear scan of members × one users.info each; fine for normal channels. Cache admin
-  // flags with a short TTL if a huge channel makes this hot.
   private async eligibleApprovers(): Promise<string[]> {
-    const out: string[] = [];
-    for (const userId of await listChannelMembers(this.client, this.channel!)) {
-      if (await adminEligible(this.client, userId, this.identity.teamId, this.channel!, this.adminCheck, this.allowChannelCreatorConfig)) {
-        out.push(userId);
+    const startedAtNs = process.hrtime.bigint();
+    const withinDeadline = (): boolean => (
+      monotonicElapsedMs(startedAtNs) < APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS
+    );
+    const client = this.promptClient();
+    try {
+      const members = await withinApprovalAudienceDeadline(
+        listChannelMembers(client, this.channel!, {
+          maxMembers: MAX_APPROVAL_AUDIENCE_MEMBERS,
+          maxPages: MAX_CHANNEL_MEMBER_PAGES,
+          continue: withinDeadline,
+        }),
+        startedAtNs,
+      );
+      if (!members) throw new ApprovalAudienceResolutionError('incomplete channel member set');
+      const out: string[] = [];
+      const results = await withinApprovalAudienceDeadline(
+        settledWithLimit(
+          members,
+          APPROVAL_FANOUT_CONCURRENCY,
+          async (userId) => {
+            if (!withinDeadline()) {
+              throw new ApprovalAudienceResolutionError('approval audience deadline elapsed');
+            }
+            if (await adminEligible(
+              client,
+              userId,
+              this.identity.teamId,
+              this.channel!,
+              this.adminCheck,
+              this.allowChannelCreatorConfig,
+            )) out.push(userId);
+          },
+          Math.max(0, APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS - monotonicElapsedMs(startedAtNs)),
+        ),
+        startedAtNs,
+      );
+      if (results.some((result) => result.status !== 'fulfilled')) {
+        throw new ApprovalAudienceResolutionError('incomplete approval audience');
       }
+      return out.sort();
+    } catch {
+      throw new UserFacingError(
+        'Vouchr could not verify the current approval recipients in time. Ask the agent to retry shortly.',
+        'retry_later',
+      );
     }
-    return out;
   }
 
   /**
@@ -1349,9 +1472,9 @@ export class ConnectContext {
 
     // Key providers have no OAuth: post a self-service "set up your key" prompt instead.
     if (provider.credential === 'key') {
-      await this.postKeySetupPrompt(providerId, connectIssuedAt);
+      const promptState = await this.postKeySetupPrompt(providerId, connectIssuedAt);
       this.emit({ type: 'connect_prompted', provider: providerId });
-      throw new ConsentRequiredError(providerId, 'posted');
+      throw new ConsentRequiredError(providerId, promptState);
     }
 
     const pendingConsent = await this.consent.beginFenced(
@@ -1610,7 +1733,12 @@ export class ConnectContext {
     }
     // Governance (opt-in): a shared cred is only usable by an actual channel member. Fail-closed.
     // isChannelMember returns false on any error, so an unverifiable membership refuses the cred.
-    if (this.requireMembership && !(await isChannelMember(this.client, channel, this.identity.userId))) {
+    if (this.requireMembership && !(await boundedChannelMembership(
+      this.client,
+      channel,
+      this.identity.userId,
+      this.slackClientOptions,
+    ))) {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'not-member' });
       throw new Error(`You must be a member of this channel to use its shared "${providerId}" credential.`);
     }
@@ -1725,6 +1853,7 @@ export class ConnectContext {
         || row.teamId !== this.identity.teamId
         || row.userId !== this.identity.userId
         || row.channel !== this.channel
+        || row.thread !== this.thread
       ) {
         return { status: 'stale', provider: providerId };
       }
@@ -1734,6 +1863,48 @@ export class ConnectContext {
       const approval = provider.approval;
       if (!approval || !approvalNeeded(approval, row.method, row.path)) {
         return { status: 'resolved', provider: providerId };
+      }
+      // A broker denial can sit in transit while a session expires, the user is offboarded, the
+      // credential is replaced, or channel governance changes. Re-run the ONE core authority check
+      // before showing a decision surface. This is only a delivery-time snapshot; the click repeats
+      // it under lifecycle locks before creating any grant.
+      const current = await this.approvals.ownerStillCurrent(row, {
+        registry: this.registry,
+        policy: this.policy,
+        vault: this.vault,
+        enterpriseId: this.identity.enterpriseId,
+        actorIssuedAt: row.createdAt,
+        channelTools: this.channelTools ?? null,
+        channelConfig: this.channelConfig ?? null,
+      });
+      if (!current) {
+        await this.approvals.discardPending(row.id).catch(() => undefined);
+        return { status: 'stale', provider: providerId };
+      }
+      // Core cannot query Slack. A shared-credential action additionally requires the same live
+      // channel-class and requester-membership facts the decision mutation checks. Never post a
+      // doomed/confidential prompt after Slack Connect conversion or requester removal.
+      if (row.ownerKind === 'channel') {
+        if (!row.channel) {
+          await this.approvals.discardPending(row.id).catch(() => undefined);
+          return { status: 'stale', provider: providerId };
+        }
+        const client = this.promptClient();
+        try {
+          await assertChannelEligible(client, row.channel);
+        } catch (error) {
+          await this.approvals.discardPending(row.id).catch(() => undefined);
+          throw error;
+        }
+        if (!(await boundedChannelMembership(
+          client,
+          row.channel,
+          row.userId,
+          this.slackClientOptions,
+        ))) {
+          await this.approvals.discardPending(row.id).catch(() => undefined);
+          return { status: 'stale', provider: providerId };
+        }
       }
       await this.deliverApprovalPrompt({
         provider: providerId,
@@ -1768,39 +1939,64 @@ export class ConnectContext {
         `"${providerId}" uses a shared channel credential. Ask in the channel where the agent should use it.`,
       );
     }
+    // A channel can become externally shared or archived after shared mode was configured. Recheck
+    // the same fail-closed class rule as the actual configuration mutation before directing anyone
+    // to an operation Vouchr must refuse.
+    const client = this.promptClient();
+    await assertChannelEligible(client, channel);
     const actorIsAdmin = await adminEligible(
-      this.client, this.identity.userId, this.identity.teamId, channel,
+      client, this.identity.userId, this.identity.teamId, channel,
       this.adminCheck, this.allowChannelCreatorConfig,
     );
     let text: string;
     if (actorIsAdmin) {
       text = `No shared ${p} credential is configured in this channel. Run \`/vouchr configure ${p}\` here to set one up.`;
     } else {
-      let adminAsked = false;
+      let adminDirection: 'confirmed' | 'possible' | 'none' = 'none';
       const admin = await this.audit.lastChannelConfigActor(this.identity.teamId, channel, providerId);
-      if (admin && this.notifications) {
+      // Audit identifies who configured it last, not who is authorized now. Recheck BOTH current
+      // membership and the canonical admin predicate before disclosing private channel context.
+      const adminIsCurrent = !!admin
+        && await boundedChannelMembership(client, channel, admin, this.slackClientOptions)
+        && await adminEligible(
+          client, admin, this.identity.teamId, channel,
+          this.adminCheck, this.allowChannelCreatorConfig,
+        );
+      if (admin && adminIsCurrent && this.notifications) {
         const owner = channelOwner(this.identity.teamId, channel, this.identity.enterpriseId ?? undefined);
         const claimedAt = Date.now();
         if (await this.notifications.claim(owner, providerId, 'not_configured', claimedAt)) {
           try {
-            await this.client.chat.postMessage({
+            await client.chat.postMessage({
               channel: admin,
               text: `The shared ${p} credential in <#${escapeMrkdwn(channel)}> is missing. Run \`/vouchr configure ${p}\` there to set it up.`,
             });
-            adminAsked = true;
-          } catch {
-            await this.notifications.release(owner, providerId, 'not_configured', claimedAt).catch(() => undefined);
+            adminDirection = 'confirmed';
+          } catch (deliveryError) {
+            // Request/network failures are ambiguous: Slack may have accepted the DM, so retain the
+            // debounce claim and report only that an admin MAY have been notified. Only definite
+            // rejection releases the claim for a later relay to retry.
+            const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+            if (outcome === 'ambiguous') adminDirection = 'possible';
+            else {
+              await this.notifications.release(owner, providerId, 'not_configured', claimedAt).catch(() => undefined);
+            }
           }
         } else {
-          adminAsked = true; // an admin was already asked within this window — do not re-DM
+          // Another replica may have delivered, may still be delivering, or may have crashed after
+          // claiming. The persisted claim proves only that duplicate delivery must stop, not that a
+          // human definitely received the DM.
+          adminDirection = 'possible';
         }
       }
-      text = adminAsked
+      text = adminDirection === 'confirmed'
         ? `No shared ${p} credential is configured in this channel. A channel admin has been asked to configure it.`
-        : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr configure ${p}\` here.`;
+        : adminDirection === 'possible'
+          ? `No shared ${p} credential is configured in this channel. A channel admin may already have been notified; ask one directly if setup is still blocked.`
+          : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr configure ${p}\` here.`;
     }
     try {
-      await this.client.chat.postEphemeral({ channel, user: this.identity.userId, text });
+      await client.chat.postEphemeral({ channel, user: this.identity.userId, text });
     } catch (deliveryError) {
       throw slackPromptDeliveryRecovery(classifySlackPromptDeliveryFailure(deliveryError), 'configuration');
     }
@@ -1819,8 +2015,13 @@ export class ConnectContext {
     });
   }
 
-  /** Ephemeral JIT prompt for a key provider: a button that opens the per-user key modal. */
-  private async postKeySetupPrompt(providerId: string, issuedAt: number): Promise<void> {
+  /** Durable private JIT prompt for a key provider: a button that opens the per-user key modal.
+   * The existing core provisioning row owns the cross-replica delivery lease, exactly as consent
+   * owns OAuth prompt delivery. */
+  private async postKeySetupPrompt(
+    providerId: string,
+    issuedAt: number,
+  ): Promise<ConsentPromptState> {
     // Mint when the prompt is produced, not when it is clicked. The PostgreSQL timestamp is the
     // authority's true start, so a prompt already delivered before offboarding can never mint a
     // post-offboard credential merely because its button was clicked later.
@@ -1838,11 +2039,76 @@ export class ConnectContext {
     }
     const blocks = keySetupBlocks(providerId, requestId);
     const text = blocksFallbackText(blocks);
-    if (this.channel) {
-      await this.client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, blocks: blocks as any, text });
-    } else {
-      await this.client.chat.postMessage({ channel: this.identity.userId, blocks: blocks as any, text });
+    const delivery = await claimUserProvisioningDelivery(
+      this.vault,
+      this.identity,
+      providerId,
+      requestId,
+    );
+    if (delivery.status === 'delivered') return 'reused';
+    if (delivery.status === 'in-flight') {
+      throw new UserFacingError(
+        'A private key-setup prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
+        'retry_later',
+      );
     }
+    if (delivery.status === 'stale') {
+      throw new UserFacingError(
+        'The key-setup request changed before its prompt could be delivered. Ask the agent again.',
+        'resolve_again',
+      );
+    }
+    if (delivery.status !== 'claimed') {
+      throw new UserFacingError(
+        'Vouchr could not establish key-setup prompt delivery. Ask the agent to retry shortly.',
+        'retry_later',
+      );
+    }
+    try {
+      const client = this.promptClient();
+      if (this.channel) {
+        await client.chat.postEphemeral({
+          channel: this.channel,
+          user: this.identity.userId,
+          blocks: blocks as any,
+          text,
+        });
+      } else {
+        await client.chat.postMessage({
+          channel: this.identity.userId,
+          blocks: blocks as any,
+          text,
+        });
+      }
+    } catch (deliveryError) {
+      const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+      if (outcome !== 'ambiguous') {
+        await abandonKnownUndeliveredPrompt(
+          () => abandonUserProvisioningDelivery(
+            this.vault,
+            this.identity,
+            providerId,
+            requestId,
+            delivery.token,
+          ),
+          'connection',
+        );
+      }
+      throw slackPromptDeliveryRecovery(outcome, 'connection');
+    }
+    requirePromptConfirmation(
+      await promptConfirmationOutcome(
+        () => confirmUserProvisioningDelivery(
+          this.vault,
+          this.identity,
+          providerId,
+          requestId,
+          delivery.token,
+        ),
+      ),
+      'private connection',
+    );
+    return 'posted';
   }
 
   private connectPrompt(providerId: string, url: string): {
@@ -3714,7 +3980,12 @@ export async function createVouchr(opts: VouchrOptions) {
             }
             if (
               sharedOwnerFactsValid &&
-              !(await isChannelMember(client, pending.channel, pending.userId))
+              !(await boundedChannelMembership(
+                client,
+                pending.channel,
+                pending.userId,
+                opts.slackClientOptions,
+              ))
             ) sharedOwnerFactsValid = false;
           }
         }

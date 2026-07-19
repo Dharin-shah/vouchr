@@ -91,7 +91,7 @@ requires stopping v8 and restoring the pre-migration database backup before star
 Share/Dismiss buttons cannot publish data after cutover; v8 acknowledges them with fixed expiry
 guidance.
 
-### Required v8, prerelease v9, or v10 → v11 drained cutover
+### Required v8, prerelease v9, v10, or v11 → v12 drained cutover
 
 Schema v9 introduced persistent thread-session controls, exact credential-generation bindings, and
 the bounded exact-action key for approval deduplication. Schema v10 retains those rules and adds
@@ -104,19 +104,23 @@ discovery; and `provisioning_revocation_tombstone`, whose fixed hashed scope sel
 user and shared-channel writes during confirmed break-glass revocation. Treat this as a maintenance
 cutover, not a mixed-version rolling upgrade. Schema v11 adds one active OAuth generation per
 workspace/user/provider, callback consumption/supersession state, cross-replica Slack delivery
-leases, and the partial unique active-generation index. Every pre-v11 consent row is deleted
-fail-closed because it cannot prove the v11 generation and delivery invariants.
+leases, and the partial unique active-generation index. Schema v12 extends cross-replica delivery
+leases to static-key setup and binds approval delivery to the current approver class and exact
+recipient set. Every pre-v11 consent row is deleted fail-closed because it cannot prove the v11
+generation and delivery invariants. A v11→v12 migration preserves v11 OAuth state and pending exact
+actions, but clears the old global approval-delivery marker so current eligible recipients get a
+truthful surface.
 
 1. Back up PostgreSQL and verify that the backup can be restored.
 2. Quiesce Slack and broker traffic **including identity-assertion minting**, drain in-flight
-   fetches/interactions, and stop **every** pre-v11 replica.
+   fetches/interactions, and stop **every** pre-v12 replica.
 3. When upgrading from v8 or prerelease v9, wait at least **6 minutes 30 seconds after the last old
    assertion was minted** (the 5-minute
    maximum lifetime plus the conservative 90-second cluster-skew horizon documented below). Do not
    restore the minter during this interval. This closes the stateless authority that a prerelease-v9
-   artifact-free enterprise offboard could not record in a scope tombstone. A v10 deployment may
-   proceed after the traffic drain because it already has that durable scope fence.
-4. Run this build's v11 `vouchr migrate` command with the schema-owner role. From v8, it creates
+   artifact-free enterprise offboard could not record in a scope tombstone. A v10 or v11 deployment
+   may proceed after the traffic drain because it already has that durable scope fence.
+4. Run this build's v12 `vouchr migrate` command with the schema-owner role. From v8, it creates
    `session_request`, adds exact credential-generation bindings and the bounded approval action key,
    and deletes every pre-v9 approval/session grant fail-closed because those rows cannot identify
    which connection generation was authorized. It also clears pre-v9 consent requests and offboard
@@ -127,10 +131,13 @@ fail-closed because it cannot prove the v11 generation and delivery invariants.
    and scoped break-glass tombstone tables and their indexes. The migration also adds
    `connection.generation_at` using PostgreSQL time; existing rows receive the drained-cutover
    boundary, and later reconnects replace it atomically with their own generation time. This is what
-   lets a delayed provider-addressed command/assertion prove it cannot target a newer row. From every
-   older accepted marker, v11 then drains old OAuth state and installs the consumption,
-   supersession, delivery-lease, and active-generation constraints atomically with the version stamp.
-5. Start only v11 replicas, confirm readiness, and restore traffic and assertion minting. Users
+   lets a delayed provider-addressed command/assertion prove it cannot target a newer row. For
+   v8-v10 markers, v12 then drains old OAuth state and installs the consumption, supersession,
+   delivery-lease, and active-generation constraints atomically with the version stamp. From every
+   accepted pre-v12 marker, it adds key-prompt delivery leases and audience-bound approval delivery.
+   The v11→v12 carry preserves v11 OAuth generations and pending key/approval actions, while clearing
+   only approval delivery state that cannot identify its recipient audience.
+5. Start only v12 replicas, confirm readiness, and restore traffic and assertion minting. Users
    coming from v8 make fresh
    decisions; setup buttons rendered by v8 or prerelease v9 are rejected with fixed
    ask-the-agent-again guidance because they do not carry a provisioning-request id. Every pre-v11
@@ -142,19 +149,19 @@ This is a source-breaking security cutover for low-level headless integrations. 
 `setEnabled`, and `applyEnabled` writes are removed. Migrate governance writes to packaged Bolt/App
 Home or `POST /v1/admin/mode` and `POST /v1/admin/tools`; those paths keep authorization, lifecycle
 locks, dependent-state purge, and audit atomic. Do not write the interaction/config tables directly:
-v11 deliberately makes old authority unusable after the connection row changes and old OAuth state
+v12 deliberately makes old authority unusable after the connection row changes and old OAuth state
 unusable after the generation-model cutover.
 `ApprovalRequiredError` no longer exposes the raw `path`: its constructor now takes the bounded
 `actionFingerprint` and opaque `approvalId` before `queryParamCount` and `newRequest`. Update any
 catch-site field access and direct construction together; never reconstruct an approval decision
 from those display/routing fields.
 
-Do not leave any pre-v11 process live during or after migration. Older processes do not re-check the
+Do not leave any pre-v12 process live during or after migration. Older processes do not re-check the
 marker after startup; v8 cannot supply the required approval action key, v9 can still accept an
 unfenced static/reference write, and v10 does not enforce the single-generation OAuth contract.
-Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11 service is unsupported.
-Rollback requires stopping v11, restoring the matching pre-migration backup, and only then starting
-the binary that created it; running an older binary against schema v11 is refused and unsafe.
+Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11/v12 service is unsupported.
+Rollback requires stopping v12, restoring the matching pre-migration backup, and only then starting
+the binary that created it; running an older binary against schema v12 is refused and unsafe.
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
@@ -171,7 +178,7 @@ the binary that created it; running an older binary against schema v11 is refuse
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
   if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
   Job / initContainer) to completion before new runtime replicas start. For v7 → v8 and any
-  supported pre-v11 marker → v11, use the applicable drained maintenance sequence above instead.
+  supported pre-v12 marker → v12, use the applicable drained maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 
