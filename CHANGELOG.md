@@ -7,6 +7,24 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Trusted broker-to-Slack recovery bridge** (#194, final slice). New public
+  `ConnectContext.recoverBrokerDenial(provider, denial)` (typed result `BrokerDenialRecovery`): the
+  trusted control plane relays a packaged-broker denial body — untrusted routing guidance, validated
+  against the closed code registry via the new `isVouchrErrorCode` guard (exported from both
+  entrypoints) — and Vouchr takes the correct private recovery action from verified Slack state.
+  `not_connected` re-runs the full connect flow (deduplicated private OAuth/key prompt for user
+  ownership; for a shared owner, an admin-eligible actor is directed in place and otherwise the
+  last configuring admin gets one debounced DM per 24h window via the shared `NotificationState`,
+  never a personal connect prompt). `session_approval_required` creates/reuses the one thread-scoped
+  session prompt. `approval_required` re-reads the pending row named by the opaque `approvalId`,
+  binds it to the verified team/user/channel, re-derives the self/admin rule from the registry, and
+  delivers the Approve/Deny surface through the same leased path as in-process approvals — the
+  delivery logic is now one shared helper for both doors. `connectChannel`'s missing-credential
+  failure is now the typed `NoConnectionError` (owner `channel`; message unchanged). The packaged
+  broker's readiness line reports the OS-bound port so `VOUCHR_PORT=0` is usable. Proven by a
+  two-process integration test (`test/broker-bridge.test.ts`): a spawned `vouchr-broker` process and
+  an in-process Bolt control plane over one PostgreSQL schema drive connect, session, and approval
+  recovery end-to-end, including single-use assertion replay refusal and single-use grants.
 - **Single-generation OAuth recovery** (#194). OAuth consent is now one active PostgreSQL-backed
   generation per workspace/user/provider, with exact supersession, a ten-minute bound, and a
   cross-replica Slack delivery lease. Repeated connect demand reuses a delivered prompt instead of

@@ -50,6 +50,7 @@ export {
   UserFacingError,
   VOUCHR_ERROR_CODES,
   VOUCHR_RECOVERY_ACTIONS,
+  isVouchrErrorCode,
   mapSafeError,
   safeUserMessage,
 } from './core/errors';

@@ -128,7 +128,10 @@ Validate your allowlists and consent handling in CI: [`examples/dry-run/`](./exa
 
 Slack-facing service and agent workers in separate processes? A private HTTP broker
 performs credential use under the same rules — the token still never leaves Vouchr, in any
-language. See the [hybrid architecture](./guides/HYBRID.md) and the
+language. When the broker denies (`not_connected`, `session_approval_required`,
+`approval_required`), the trusted Slack side relays the typed denial to
+`context.vouchr.recoverBrokerDenial(provider, denial)` and Vouchr posts the correct private
+recovery prompt from verified state. See the [hybrid architecture](./guides/HYBRID.md) and the
 [headless guide](./guides/HEADLESS.md).
 
 ## Learn more

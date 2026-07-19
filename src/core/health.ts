@@ -35,6 +35,12 @@ export type CredentialHealthHook = (e: CredentialHealthEvent) => void;
 /** At most one user-facing notification per (owner, provider, type) per 24h. */
 export const HEALTH_NOTIFY_DEBOUNCE_MS = 24 * 60 * 60 * 1000;
 
+/** The debounced notification families sharing {@link NotificationState}: the #117 credential-health
+ * DMs, plus `'not_configured'` — the recovery bridge's admin direction for a shared channel whose
+ * credential is missing (#194). One closed union so a new family is a deliberate addition here, not
+ * an arbitrary string in the state table. */
+export type NotificationKind = CredentialHealthEvent['type'] | 'not_configured';
+
 /**
  * Persistent per-(connection, type) notification debounce (#117). DB-backed on purpose: the 24h
  * window spans process restarts and a multi-day sweep cadence, so an in-memory map would re-notify
@@ -60,7 +66,7 @@ export class NotificationState {
    * changed and loses. Same statement on both backends (SQLite `changes` / Postgres `rowCount`,
    * already normalized by Db.run).
    */
-  async claim(owner: Owner, provider: string, type: CredentialHealthEvent['type'], now = Date.now()): Promise<boolean> {
+  async claim(owner: Owner, provider: string, type: NotificationKind, now = Date.now()): Promise<boolean> {
     const { changes } = await this.db.run(
       `INSERT INTO notification_state (team_id, owner_kind, owner_id, provider, type, last_notified_at)
        VALUES (?,?,?,?,?,?)
@@ -77,7 +83,7 @@ export class NotificationState {
    * later successful one (deleting is equivalent to the pre-claim state — an absent row, or one
    * older than the window, both allow the next claim).
    */
-  async release(owner: Owner, provider: string, type: CredentialHealthEvent['type'], claimedAt: number): Promise<void> {
+  async release(owner: Owner, provider: string, type: NotificationKind, claimedAt: number): Promise<void> {
     await this.db.run(
       `DELETE FROM notification_state WHERE team_id=? AND owner_kind=? AND owner_id=? AND provider=? AND type=? AND last_notified_at=?`,
       [owner.teamId, owner.kind, owner.id, provider, type, claimedAt],

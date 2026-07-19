@@ -137,8 +137,8 @@ fail-closed because it cannot prove the v11 generation and delivery invariants.
    OAuth URL is intentionally stale and must be requested again.
 
 This is a source-breaking security cutover for low-level headless integrations. `SessionGrants` and
-`Approvals` are no longer package exports; a complete safe broker-to-Slack interaction facade remains
-a later #194 slice. `ChannelConfig` and `ChannelTools` remain public read stores, but raw `setMode`,
+`Approvals` are no longer package exports; the safe broker-to-Slack interaction facade is
+`ConnectContext.recoverBrokerDenial` in the trusted control plane (#194). `ChannelConfig` and `ChannelTools` remain public read stores, but raw `setMode`,
 `setEnabled`, and `applyEnabled` writes are removed. Migrate governance writes to packaged Bolt/App
 Home or `POST /v1/admin/mode` and `POST /v1/admin/tools`; those paths keep authorization, lifecycle
 locks, dependent-state purge, and audit atomic. Do not write the interaction/config tables directly:

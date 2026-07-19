@@ -23,7 +23,7 @@ import {
   buildToolManifestSnapshot,
   ToolDisabledError,
 } from '../core/authz';
-import { ConnectionHandle, approvalNeeded, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
+import { ConnectionHandle, NoConnectionError, approvalNeeded, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
@@ -54,6 +54,7 @@ import {
   Approvals,
   ApprovalRequiredError,
   DEFAULT_APPROVAL_TTL_MS,
+  approvalActionFingerprint,
   approvalDecisionLockOwners,
   approvalOwnerStillCurrent,
   credentialUseStateFenced,
@@ -73,7 +74,9 @@ import {
   ConsentRequiredError,
   SessionApprovalRequiredError,
   UserFacingError,
+  isVouchrErrorCode,
   safeUserMessage,
+  type ConsentPromptState,
 } from '../core/errors';
 export {
   ConsentRequiredError,
@@ -348,7 +351,7 @@ function isApprovalPromptNotStarted(error: unknown): boolean {
 
 function slackPromptDeliveryRecovery(
   outcome: SlackPromptDeliveryFailure,
-  surface: 'approval' | 'connection' | 'session',
+  surface: 'approval' | 'connection' | 'session' | 'configuration',
 ): UserFacingError {
   if (outcome === 'platform-rejected') {
     return new UserFacingError(
@@ -597,12 +600,65 @@ export interface ConnectContextDeps {
   auditSink?: AuditSink;
   /** #117 credential-health hook threaded to every ConnectionHandle (see VouchrOptions). Default no-op. */
   health?: CredentialHealthHook;
+  /** Cross-replica notification debounce (shared with the #117 health DMs). The recovery bridge's
+   *  admin channel-configuration direction claims it so repeated broker denials cannot spam the
+   *  responsible admin. Absent = the bridge skips the admin DM (actor guidance still posts). */
+  notifications?: NotificationState;
   /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
    *  VouchrOptions.dryRun). Default false: unchanged behavior. */
   dryRun?: boolean;
   /** Transport options for bounded prompt/DM clients (see VouchrOptions.slackClientOptions). */
   slackClientOptions?: WebClientOptions;
 }
+
+/** Everything the Approve/Deny delivery needs, whether hydrated from an in-process
+ * ApprovalRequiredError (the fetch wrapper) or from a broker-minted pending row plus the current
+ * registry rule (the recovery bridge). `thread` is the conversation the pending action is bound
+ * to: the wrapper passes the event thread; the bridge passes the stored row's thread so the click
+ * lands in — and binds to — the same context the broker enforces at consume time. */
+type ApprovalPromptSpec = {
+  provider: string;
+  approver: 'self' | 'admin';
+  method: string;
+  host: string;
+  actionFingerprint: string;
+  approvalId: string;
+  /** `null` = query present, exact count not retained (see approvalBlocks). */
+  queryParamCount: number | null;
+  /** True only for the creator of the deduplicated pending row: an abandoned known-undelivered
+   * prompt then removes the row. False (a reused id, or a broker-minted row the bridge delivers)
+   * only releases the delivery lease so a later attempt can post. */
+  newRequest: boolean;
+  thread: string | null;
+};
+
+/**
+ * Typed outcome of {@link ConnectContext.recoverBrokerDenial}: which private Slack recovery action
+ * the trusted control plane took for a relayed broker denial. Hosts branch on `status`; the worker
+ * retries a brokered call only after the human acts, and always with a freshly minted single-use
+ * identity assertion.
+ *
+ * - `resolved` — current verified state no longer produces that denial (stale relay, mode change,
+ *   or the approval rule no longer applies). Retry the brokered call.
+ * - `connect_prompted` — the private connect/key-setup flow posted (or reused) its prompt; stop
+ *   this turn (`promptState` mirrors ConsentRequiredError).
+ * - `session_prompted` — the thread-scoped session approval prompt is live in the thread.
+ * - `approval_prompted` — the Approve/Deny decision surface is live (`approver` says whose).
+ * - `configuration_required` — shared-owner credential is missing; an eligible admin was directed
+ *   to channel configuration (never a personal connect prompt).
+ * - `stale` — no live pending approval matches the relayed reference: it was decided, expired, or
+ *   never existed. Retry the brokered call — it re-evaluates and re-mints if still needed.
+ * - `not_bridgeable` — the relayed code is not a broker denial this bridge recovers (or the input
+ *   was not a valid BrokerError shape). Handle it with mapSafeError guidance instead.
+ */
+export type BrokerDenialRecovery =
+  | { status: 'resolved'; provider: string }
+  | { status: 'connect_prompted'; provider: string; promptState: ConsentPromptState }
+  | { status: 'session_prompted'; provider: string }
+  | { status: 'approval_prompted'; provider: string; approver: 'self' | 'admin' }
+  | { status: 'configuration_required'; provider: string }
+  | { status: 'stale'; provider: string }
+  | { status: 'not_bridgeable' };
 
 // Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
 // caller nor any forgeable Slack field can choose a newer provisioning issuance. Normal direct
@@ -663,6 +719,7 @@ export class ConnectContext {
   private approvals: Approvals | null;
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
+  private notifications: NotificationState | null;
   private dryRun: boolean;
   private slackClientOptions?: WebClientOptions;
   private provisioningReceivedAt: bigint;
@@ -693,6 +750,7 @@ export class ConnectContext {
     this.approvals = deps.approvals ?? null;
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
+    this.notifications = deps.notifications ?? null;
     this.dryRun = deps.dryRun ?? false;
     this.slackClientOptions = deps.slackClientOptions;
     this.provisioningReceivedAt =
@@ -757,120 +815,139 @@ export class ConnectContext {
         return await fetch(input, init);
       } catch (e) {
         if (e instanceof ApprovalRequiredError) {
-          let prompt: { blocks: any; fallback: { text: string } | Record<string, never> };
-          try {
-            const blocks = approvalBlocks({
-              provider: e.provider,
-              method: e.method,
-              host: e.host,
-              actionFingerprint: e.actionFingerprint,
-              queryParamCount: e.queryParamCount,
-              requester: this.identity.userId,
-              id: e.approvalId,
-              approver: e.approver,
-            }) as any;
-            prompt = { blocks, fallback: optionalBlockFallback(blocks) };
-          } catch {
-            // Rendering happens before a delivery claim or Slack call, so this is a KNOWN no-post
-            // failure. Remove the impossible request rather than parking it behind an unknown lease.
-            await this.approvals?.discardPending(e.approvalId).catch(() => undefined);
-            throw new UserFacingError(
-              'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
-            );
-          }
-          // Resolve the admin recipients BEFORE claiming the delivery lease: member enumeration is an
-          // unbounded Slack read, and running it *inside* the lease could let the lease expire (and
-          // another replica take over) before this worker posts, producing a duplicate. 'self' and
-          // off-channel approvals need no enumeration. The posts themselves run on the bounded
-          // promptClient, so the lease window then covers only bounded work.
-          const approvers = e.approver === 'admin' && this.channel ? await this.eligibleApprovers() : [];
-          // Start the conservative local budget BEFORE the claim round-trip. PostgreSQL creates the
-          // lease during that call, so including the whole round-trip can only shorten our posting
-          // window; it can never make us believe more lease remains than actually does.
-          const deliveryLeaseStartedAtNs = process.hrtime.bigint();
-          const delivery = await this.approvals?.claimDelivery(e.approvalId);
-          if (!delivery || delivery.status === 'stale') {
-            throw new UserFacingError(
-              'The approval request changed before delivery. Ask the agent to retry the action.',
-              'resolve_again',
-            );
-          }
-          if (delivery.status === 'in-flight') {
-            throw new UserFacingError(
-              'An approval prompt is still being delivered. Ask the agent to retry shortly.',
-              'retry_later',
-            );
-          }
-          if (delivery.status === 'claimed') {
-            let confirmation: ApprovalPromptConfirmation;
-            try {
-              // postApprovalPrompt owns confirmation: it confirms the FIRST successful delivery
-              // immediately (single-flight). Its posting budget reserves the full bounded database
-              // confirmation window even when every earlier wave failed.
-              confirmation = await this.postApprovalPrompt(
-                e, prompt, approvers,
-                () => this.approvals!.confirmDelivery(e.approvalId, delivery.token),
-                deliveryLeaseStartedAtNs,
-              );
-            } catch (deliveryError) {
-              const notStarted = isApprovalPromptNotStarted(deliveryError);
-              if (notStarted) {
-                if (this.approvals) {
-                  await abandonKnownUndeliveredPrompt(
-                    () => this.approvals!.abandonDelivery(
-                      e.approvalId,
-                      delivery.token,
-                      e.newRequest,
-                    ),
-                    'approval',
-                    'deadline',
-                  );
-                }
-                throw new UserFacingError(
-                  'Vouchr’s approval delivery window elapsed before a prompt could be sent. Ask the agent to retry shortly.',
-                  'retry_later',
-                );
-              }
-              const noSurface = isNoApprovalDecisionSurface(deliveryError);
-              if (noSurface) {
-                if (this.approvals) {
-                  await abandonKnownUndeliveredPrompt(
-                    () => this.approvals!.abandonDelivery(
-                      e.approvalId,
-                      delivery.token,
-                      e.newRequest,
-                    ),
-                    'approval',
-                    'no-decision-surface',
-                  );
-                }
-                throw new UserFacingError(
-                  'Vouchr could not find an approval decision surface. Ask the agent to retry in an eligible channel.',
-                  'fix_configuration',
-                );
-              }
-              const outcome = classifySlackPromptDeliveryFailure(deliveryError);
-              if (outcome !== 'ambiguous' && this.approvals) {
-                await abandonKnownUndeliveredPrompt(
-                  () => this.approvals!.abandonDelivery(
-                    e.approvalId,
-                    delivery.token,
-                    e.newRequest,
-                  ),
-                  'approval',
-                );
-              }
-              throw slackPromptDeliveryRecovery(outcome, 'approval');
-            }
-            // Confirmation outcomes are typed return values, outside the Slack-delivery catch: a
-            // database failure can never be mistaken for either Slack rejection or request drift.
-            requirePromptConfirmation(confirmation, 'approval');
-          }
+          await this.deliverApprovalPrompt({
+            provider: e.provider,
+            approver: e.approver,
+            method: e.method,
+            host: e.host,
+            actionFingerprint: e.actionFingerprint,
+            approvalId: e.approvalId,
+            queryParamCount: e.queryParamCount,
+            newRequest: e.newRequest,
+            thread: this.thread,
+          });
         }
         throw e;
       }
     };
     return handle;
+  }
+
+  /** Render, lease, post, and confirm the Approve/Deny prompt for ONE pending approval. The single
+   * delivery path for both doors (STR-3): the in-process fetch wrapper builds the spec from its
+   * ApprovalRequiredError; the broker-to-Slack recovery bridge hydrates it from the stored pending
+   * row plus the current registry rule. Throws typed UserFacingError recovery on every failure;
+   * returns normally when the prompt is delivered (or a live delivery already was). */
+  private async deliverApprovalPrompt(spec: ApprovalPromptSpec): Promise<void> {
+    let prompt: { blocks: any; fallback: { text: string } | Record<string, never> };
+    try {
+      const blocks = approvalBlocks({
+        provider: spec.provider,
+        method: spec.method,
+        host: spec.host,
+        actionFingerprint: spec.actionFingerprint,
+        queryParamCount: spec.queryParamCount,
+        requester: this.identity.userId,
+        id: spec.approvalId,
+        approver: spec.approver,
+      }) as any;
+      prompt = { blocks, fallback: optionalBlockFallback(blocks) };
+    } catch {
+      // Rendering happens before a delivery claim or Slack call, so this is a KNOWN no-post
+      // failure. Remove the impossible request rather than parking it behind an unknown lease.
+      await this.approvals?.discardPending(spec.approvalId).catch(() => undefined);
+      throw new UserFacingError(
+        'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
+      );
+    }
+    // Resolve the admin recipients BEFORE claiming the delivery lease: member enumeration is an
+    // unbounded Slack read, and running it *inside* the lease could let the lease expire (and
+    // another replica take over) before this worker posts, producing a duplicate. 'self' and
+    // off-channel approvals need no enumeration. The posts themselves run on the bounded
+    // promptClient, so the lease window then covers only bounded work.
+    const approvers = spec.approver === 'admin' && this.channel ? await this.eligibleApprovers() : [];
+    // Start the conservative local budget BEFORE the claim round-trip. PostgreSQL creates the
+    // lease during that call, so including the whole round-trip can only shorten our posting
+    // window; it can never make us believe more lease remains than actually does.
+    const deliveryLeaseStartedAtNs = process.hrtime.bigint();
+    const delivery = await this.approvals?.claimDelivery(spec.approvalId);
+    if (!delivery || delivery.status === 'stale') {
+      throw new UserFacingError(
+        'The approval request changed before delivery. Ask the agent to retry the action.',
+        'resolve_again',
+      );
+    }
+    if (delivery.status === 'in-flight') {
+      throw new UserFacingError(
+        'An approval prompt is still being delivered. Ask the agent to retry shortly.',
+        'retry_later',
+      );
+    }
+    if (delivery.status === 'claimed') {
+      let confirmation: ApprovalPromptConfirmation;
+      try {
+        // postApprovalPrompt owns confirmation: it confirms the FIRST successful delivery
+        // immediately (single-flight). Its posting budget reserves the full bounded database
+        // confirmation window even when every earlier wave failed.
+        confirmation = await this.postApprovalPrompt(
+          spec, prompt, approvers,
+          () => this.approvals!.confirmDelivery(spec.approvalId, delivery.token),
+          deliveryLeaseStartedAtNs,
+        );
+      } catch (deliveryError) {
+        const notStarted = isApprovalPromptNotStarted(deliveryError);
+        if (notStarted) {
+          if (this.approvals) {
+            await abandonKnownUndeliveredPrompt(
+              () => this.approvals!.abandonDelivery(
+                spec.approvalId,
+                delivery.token,
+                spec.newRequest,
+              ),
+              'approval',
+              'deadline',
+            );
+          }
+          throw new UserFacingError(
+            'Vouchr’s approval delivery window elapsed before a prompt could be sent. Ask the agent to retry shortly.',
+            'retry_later',
+          );
+        }
+        const noSurface = isNoApprovalDecisionSurface(deliveryError);
+        if (noSurface) {
+          if (this.approvals) {
+            await abandonKnownUndeliveredPrompt(
+              () => this.approvals!.abandonDelivery(
+                spec.approvalId,
+                delivery.token,
+                spec.newRequest,
+              ),
+              'approval',
+              'no-decision-surface',
+            );
+          }
+          throw new UserFacingError(
+            'Vouchr could not find an approval decision surface. Ask the agent to retry in an eligible channel.',
+            'fix_configuration',
+          );
+        }
+        const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+        if (outcome !== 'ambiguous' && this.approvals) {
+          await abandonKnownUndeliveredPrompt(
+            () => this.approvals!.abandonDelivery(
+              spec.approvalId,
+              delivery.token,
+              spec.newRequest,
+            ),
+            'approval',
+          );
+        }
+        throw slackPromptDeliveryRecovery(outcome, 'approval');
+      }
+      // Confirmation outcomes are typed return values, outside the Slack-delivery catch: a
+      // database failure can never be mistaken for either Slack rejection or request drift.
+      requirePromptConfirmation(confirmation, 'approval');
+    }
   }
 
   /** Recheck channel-governance facts while Approvals holds both the channel and credential locks. */
@@ -969,7 +1046,7 @@ export class ConnectContext {
    * resolved by the caller BEFORE the delivery lease is claimed (member enumeration is unbounded and
    * must not run inside the lease); it is empty for 'self'/off-channel approvals that need none. */
   private async postApprovalPrompt(
-    e: ApprovalRequiredError,
+    spec: ApprovalPromptSpec,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
     approvers: string[],
     /** Marks the prompt delivered and consumes the lease; returns false if the request changed
@@ -981,7 +1058,7 @@ export class ConnectContext {
   ): Promise<ApprovalPromptConfirmation> {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
-    const threadArg = this.thread ? { thread_ts: this.thread } : {};
+    const threadArg = spec.thread ? { thread_ts: spec.thread } : {};
     // Convert rejection immediately so a background confirmation can never become an unhandled
     // rejection while the remaining fan-out settles. Preserve false (state drift) separately from
     // rejection (database outcome unknown) so recovery copy stays truthful.
@@ -993,7 +1070,7 @@ export class ConnectContext {
       0,
       APPROVAL_FANOUT_DEADLINE_MS - monotonicElapsedMs(deliveryLeaseStartedAtNs),
     );
-    if (e.approver === 'self') {
+    if (spec.approver === 'self') {
       if (remainingPostingBudget() <= 0) {
         throw new ApprovalPromptNotStartedError('approval delivery budget elapsed before posting');
       }
@@ -1009,7 +1086,7 @@ export class ConnectContext {
     if (!this.channel) {
       await client.chat.postMessage({
         channel: this.identity.userId,
-        text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval — run it in a channel so an admin can approve it.`,
+        text: `This ${escapeMrkdwn(spec.provider)} action needs an admin's approval — run it in a channel so an admin can approve it.`,
       }).catch(() => undefined);
       throw new NoApprovalDecisionSurfaceError('admin approval requires a channel decision surface');
     }
@@ -1054,7 +1131,7 @@ export class ConnectContext {
       // know the request is parked, not silently dropped.
       await client.chat.postEphemeral({
         channel: this.channel, user: this.identity.userId, ...threadArg,
-        text: `This ${escapeMrkdwn(e.provider)} action needs an admin's approval, but no eligible admin was found in this channel.`,
+        text: `This ${escapeMrkdwn(spec.provider)} action needs an admin's approval, but no eligible admin was found in this channel.`,
       }).catch(() => undefined);
     }
     // A requester-only explanation is not an approval surface. Reject when zero eligible admins or
@@ -1526,7 +1603,10 @@ export class ConnectContext {
     }
     const credentialId = await this.vault.liveId(owner, providerId);
     if (!credentialId || !(await this.vault.get(owner, providerId, undefined, credentialId))) {
-      throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
+      // Typed (code 'not_connected', owner 'channel' → recovery 'fix_configuration'): the same fact
+      // the broker's shared-owner 409 reports, so the recovery bridge and in-process hosts branch on
+      // one class instead of prose. Message text unchanged.
+      throw new NoConnectionError(`No channel credential configured for "${providerId}" in this channel.`, 'channel');
     }
     // Governance (opt-in): a shared cred is only usable by an actual channel member. Fail-closed.
     // isChannelMember returns false on any error, so an unverifiable membership refuses the cred.
@@ -1542,7 +1622,9 @@ export class ConnectContext {
     // from the broker's. Eligibility is verified live above and mode is asserted 'shared', so eligible:true
     // and the helper always resolves (to channelOwner(teamId, channel) + this.identity — today's values).
     const r = resolveCredentialOwner({ path: 'channel', mode: 'shared', principal: this.identity, channel, eligible: true });
-    if (r.status !== 'resolved') throw new Error(`No channel credential configured for "${providerId}" in this channel.`);
+    if (r.status !== 'resolved') {
+      throw new NoConnectionError(`No channel credential configured for "${providerId}" in this channel.`, 'channel');
+    }
     // originChannel keeps its default (null): the channel-owned cred is attributed to its owning channel.
     return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
       provider, r.owner, r.acting, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
@@ -1569,6 +1651,159 @@ export class ConnectContext {
       channelTools: this.channelTools, channelConfig: this.channelConfig,
       principal: this.identity, channel: this.channel,
     });
+  }
+
+  /**
+   * The trusted broker-to-Slack recovery bridge (#194). A hybrid host's untrusted worker calls the
+   * packaged HTTP broker; when the broker denies with a stable machine code, the host relays the
+   * denial body here — from the SAME verified Slack event context that produced the worker's
+   * identity assertion — and Vouchr takes the correct private recovery action:
+   *
+   *  - `not_connected` / `session_approval_required` → the full connect flow re-runs from current
+   *    verified state: the private connect or key-setup prompt (deduplicated), the thread-scoped
+   *    session approval prompt (single pending request per thread, click revalidated at the
+   *    mutation), or — shared owner with no channel credential — an eligible admin is directed to
+   *    channel configuration (never a personal connect prompt).
+   *  - `approval_required` → the pending approval row named by `approvalId` is re-read from
+   *    storage, bound to this verified team/user/channel and the relayed provider, the approver
+   *    rule is re-derived from the registry (never the row or the wire), and the Approve/Deny
+   *    decision surface is delivered through the same leased path as in-process approvals.
+   *
+   * The denial body is UNTRUSTED routing guidance, never authority (SEC-3/SEC-4): the code is
+   * validated against VOUCHR_ERROR_CODES, `approvalId` is only a lookup handle, and every identity,
+   * owner, mode, policy, and eligibility fact is re-resolved server-side here and again at the
+   * click. Repeated relays of the same denial converge on one prompt (delivery leases / dedup
+   * rows), and the worker's retry after a human acts must mint a fresh single-use assertion.
+   * Typed denials that surface during recovery (policy, tool, rate limit…) throw as usual —
+   * render them with safeUserMessage/mapSafeError.
+   */
+  async recoverBrokerDenial(providerId: string, denial: unknown): Promise<BrokerDenialRecovery> {
+    // SEC-4: validate the provider against the registry (and refuse service tools) before any
+    // read, write, audit, or Slack post. Throws on an unknown id.
+    const provider = this.brokerable(providerId);
+    const rawCode = typeof denial === 'object' && denial !== null
+      ? (denial as { code?: unknown }).code
+      : undefined;
+    const code = isVouchrErrorCode(rawCode) ? rawCode : null;
+
+    if (code === 'not_connected' || code === 'session_approval_required') {
+      try {
+        // connect() IS the recovery flow: it re-resolves mode/policy/credential/session from
+        // current verified state, dedups prompts, and throws typed control-flow errors.
+        await this.connect(providerId);
+        return { status: 'resolved', provider: providerId };
+      } catch (e) {
+        if (e instanceof ConsentRequiredError) {
+          return { status: 'connect_prompted', provider: providerId, promptState: e.promptState };
+        }
+        if (e instanceof SessionApprovalRequiredError) {
+          return { status: 'session_prompted', provider: providerId };
+        }
+        if (e instanceof NoConnectionError && e.owner === 'channel') {
+          await this.directChannelConfiguration(providerId);
+          return { status: 'configuration_required', provider: providerId };
+        }
+        throw e;
+      }
+    }
+
+    if (code === 'approval_required') {
+      if (!this.approvals) {
+        throw new UserFacingError('Approval state is not available. Ask an admin to check Vouchr.');
+      }
+      // Same audited gate as connect(): a decision surface is never delivered for a provider the
+      // channel's current policy/tool state forbids.
+      await this.requireProviderAuthorized(providerId);
+      const rawApprovalId = (denial as { approvalId?: unknown }).approvalId;
+      const row = typeof rawApprovalId === 'string' ? await this.approvals.get(rawApprovalId) : null;
+      // Bind the stored row to THIS verified context: the requester, workspace, channel, and the
+      // provider the host says it called. Any mismatch is treated as "no live pending approval" —
+      // the id is a lookup handle, never authority.
+      if (
+        !row
+        || row.provider !== providerId
+        || row.teamId !== this.identity.teamId
+        || row.userId !== this.identity.userId
+        || row.channel !== this.channel
+      ) {
+        return { status: 'stale', provider: providerId };
+      }
+      // Re-derive the approver rule from the current registry — never the stored row or the wire.
+      // If the provider no longer requires approval for this action, the pending row is moot: the
+      // retry re-evaluates against current state (and the sweep reclaims the row).
+      const approval = provider.approval;
+      if (!approval || !approvalNeeded(approval, row.method, row.path)) {
+        return { status: 'resolved', provider: providerId };
+      }
+      await this.deliverApprovalPrompt({
+        provider: providerId,
+        approver: approval.approver,
+        method: row.method,
+        host: row.host,
+        actionFingerprint: approvalActionFingerprint(row),
+        approvalId: row.id,
+        // The row binds the exact query byte-for-byte as a digest; the parameter COUNT is not
+        // retained, and the renderer says "parameters present" instead of fabricating a number.
+        queryParamCount: row.queryHash === '' ? 0 : null,
+        newRequest: false,
+        thread: row.thread,
+      });
+      return { status: 'approval_prompted', provider: providerId, approver: approval.approver };
+    }
+
+    return { status: 'not_bridgeable' };
+  }
+
+  /** Shared-owner recovery for a missing channel credential: direct an eligible admin to channel
+   * configuration, privately and without spam. An admin-eligible actor is directed in place;
+   * otherwise the last configuring admin (audit-derived — the mode change itself writes 'config',
+   * so a shared-mode channel always has one) gets one DM per 24h window via the shared
+   * NotificationState debounce, and the actor gets truthful private guidance either way. */
+  private async directChannelConfiguration(providerId: string): Promise<void> {
+    const channel = this.channel;
+    const p = escapeMrkdwn(providerId);
+    if (!channel) {
+      // Shared mode only resolves inside a channel; without one there is no configuration surface.
+      throw new UserFacingError(
+        `"${providerId}" uses a shared channel credential. Ask in the channel where the agent should use it.`,
+      );
+    }
+    const actorIsAdmin = await adminEligible(
+      this.client, this.identity.userId, this.identity.teamId, channel,
+      this.adminCheck, this.allowChannelCreatorConfig,
+    );
+    let text: string;
+    if (actorIsAdmin) {
+      text = `No shared ${p} credential is configured in this channel. Run \`/vouchr configure ${p}\` here to set one up.`;
+    } else {
+      let adminAsked = false;
+      const admin = await this.audit.lastChannelConfigActor(this.identity.teamId, channel, providerId);
+      if (admin && this.notifications) {
+        const owner = channelOwner(this.identity.teamId, channel, this.identity.enterpriseId ?? undefined);
+        const claimedAt = Date.now();
+        if (await this.notifications.claim(owner, providerId, 'not_configured', claimedAt)) {
+          try {
+            await this.client.chat.postMessage({
+              channel: admin,
+              text: `The shared ${p} credential in <#${escapeMrkdwn(channel)}> is missing. Run \`/vouchr configure ${p}\` there to set it up.`,
+            });
+            adminAsked = true;
+          } catch {
+            await this.notifications.release(owner, providerId, 'not_configured', claimedAt).catch(() => undefined);
+          }
+        } else {
+          adminAsked = true; // an admin was already asked within this window — do not re-DM
+        }
+      }
+      text = adminAsked
+        ? `No shared ${p} credential is configured in this channel. A channel admin has been asked to configure it.`
+        : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr configure ${p}\` here.`;
+    }
+    try {
+      await this.client.chat.postEphemeral({ channel, user: this.identity.userId, text });
+    } catch (deliveryError) {
+      throw slackPromptDeliveryRecovery(classifySlackPromptDeliveryFailure(deliveryError), 'configuration');
+    }
   }
 
   /** Ephemeral in-thread prompt to approve a thread-scoped session. Only the acting user sees it.
@@ -2166,6 +2401,7 @@ export async function createVouchr(opts: VouchrOptions) {
         approvals,
         auditSink,
         health,
+        notifications: notifyState,
         dryRun,
         slackClientOptions: opts.slackClientOptions,
       });
@@ -2248,7 +2484,7 @@ export async function createVouchr(opts: VouchrOptions) {
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, approvals, auditSink, health, dryRun,
+      thread: null, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
       slackClientOptions: opts.slackClientOptions,
     };
     if (provisioningReceivedAt != null) {

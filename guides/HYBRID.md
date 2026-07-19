@@ -14,7 +14,7 @@ product boundaries remain in [`vision.md`](../vision.md); the security model rem
 | Shape | Choose it when | Slack experience | Credential-use path |
 | --- | --- | --- | --- |
 | Embedded Bolt | The agent and Vouchr run in the same Node/Bolt process. | Built in | `context.vouchr.connect()` then `handle.fetch()` |
-| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Admin, connect, and session preflight are built in; headless write-approval bridging remains host-owned (#194) | Private `/v1/fetch` or `/v1/mcp` broker call |
+| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Admin, connect, session, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
 | Pure headless | There is no Slack control plane, or the host intentionally owns every UI. | Host-built | Private broker API |
 
 If the agent already runs in the same Bolt process, embedded Bolt is simpler. Hybrid is not a
@@ -477,15 +477,17 @@ admin status alone does not authorize choosing an arbitrary global user.
 ## 5. Bridge the Slack experience to the worker
 
 The broker has no Slack client. Shared PostgreSQL lets both planes see the same state, but a broker
-`403` or `409` does not automatically post a prompt. The trusted Bolt/tool-router layer must own the
-user-facing transition.
+`403` or `409` does not automatically post a prompt. The trusted Bolt control plane owns the
+user-facing transition through the supported bridge: relay the broker's typed denial body to
+`context.vouchr.recoverBrokerDenial(provider, denial)` from the same verified Slack event context
+that produced the worker's identity assertion, and Vouchr takes the correct private recovery action.
+The denial body is routing guidance only — every identity, owner, mode, policy, and eligibility fact
+is re-resolved from verified state, and again at any button click.
 
 Provider OAuth callbacks mounted on the Bolt control plane are already closed-loop: one active
 owner/provider generation is finalized transactionally, fixed browser outcomes return without
 waiting for Slack, and attributable failures make at most one immediate, best-effort private
-recovery-DM attempt. A process failure can drop that message. The bridge still required by #194 is
-for typed outcomes returned by the separate broker process (connect, session, and write approval),
-not for Bolt's own callback route.
+recovery-DM attempt. A process failure can drop that message.
 
 For **every brokered mode**, preflight with the in-process Bolt context before dispatching the remote
 worker. In shared mode this rechecks current mode, policy/tool state, credential presence, channel
@@ -524,13 +526,23 @@ app.event('app_mention', async ({ context, event, say }) => {
     provider: 'internal-mcp',
     ownerKind,
   });
+  if (result.brokerDenial) {
+    // The supported #194 bridge: relay the typed broker denial body from this verified context.
+    // Vouchr re-resolves everything server-side and takes the correct private action — the
+    // connect/key prompt, the thread session prompt, admin configuration direction, or the
+    // Approve/Deny decision surface for the pending approvalId.
+    const recovery = await context.vouchr.recoverBrokerDenial('internal-mcp', result.brokerDenial);
+    if (recovery.status !== 'resolved') return; // a private prompt/direction is live — stop this turn
+    // 'resolved': the denial is stale against current state — retry with a FRESH assertion.
+  }
   await say(result.safeText);
 });
 ```
 
 The host-specific `isVouchrPrompt` and `dispatchTrustedGateway` functions are intentionally not Vouchr
 APIs. The important ordering is: verified Slack event → Vouchr preflight → stop on prompt → trusted
-server-side mode lookup → identity mint → private broker call. If the model chooses a tool only after
+server-side mode lookup → identity mint → private broker call → on a typed broker denial, relay the
+body to `recoverBrokerDenial` from the same verified context and stop unless it reports `resolved`. If the model chooses a tool only after
 planning, intercept the proposed tool in the trusted host, run the same preflight, and add the
 identity assertion out of band. It must never be a model-visible tool argument. A mode change between
 preflight and egress fails closed; rerun preflight instead of guessing.
@@ -720,9 +732,9 @@ state; recovery metadata is routing guidance, not authority.
 
 | Signal | Meaning | Safe response |
 | --- | --- | --- |
-| `409`, code `not_connected` | No usable owner credential | Follow `recovery`: `connect` for user ownership; `fix_configuration` for shared ownership so an eligible admin configures the channel credential. Do not loop broker retries |
-| `403`, code `session_approval_required` | No live thread grant | Follow `request_approval` in that verified thread; current automatic cross-plane bridge is tracked by #194 |
-| `403`, code `approval_required` | A write needs a human grant | Stop. The headless route is enforcement-only until #194 ships a safe decision bridge; the opaque `approvalId` is not authority. Do not enable approval-gated writes on headless-only actions |
+| `409`, code `not_connected` | No usable owner credential | Relay to `recoverBrokerDenial`: user ownership gets the private connect/key flow; shared ownership directs an eligible admin to channel configuration. Do not loop broker retries |
+| `403`, code `session_approval_required` | No live thread grant | Relay to `recoverBrokerDenial` from the verified thread context: it creates/reuses the one thread-scoped approval prompt, and the click re-validates everything at the mutation. Retry only after the grant, with a fresh assertion |
+| `403`, code `approval_required` | A write needs a human grant | Relay to `recoverBrokerDenial`: the opaque `approvalId` is a lookup handle, never authority — the bridge re-reads the pending row, re-derives the self/admin rule from the registry, and delivers the decision surface. Retry only after one live grant, with a fresh assertion |
 | `policy_denied` or `tool_disabled` | Provider is not authorized here | Follow non-retryable `contact_admin`; never silently widen scope or loop retries |
 | `429` code `rate_limited` or `503` code `overloaded` | Bounded back-pressure | Only `retry_later` outcomes are retryable; honor `Retry-After`, mint a fresh assertion, and retry only when the operation is safe |
 | `504`, code `upstream_timeout`, `retryable: false` | Provider outcome may be unknown | `retry_later` describes the operator/user action, not replay permission. Retry only a known-idempotent operation; never auto-replay an uncertain write |
@@ -841,8 +853,9 @@ Run this proof against at least two broker replicas and one shared PostgreSQL da
     resolver/KMS IAM and prove there is no plaintext fallback and no secret in output/audit. Cancel
     one resolver call and prove the underlying SDK work ends.
 12. Prove a remote `approval_required` stops the turn, exposes no decision authority, and performs
-    no credential read or upstream I/O. Defer decision, denial, expiry, double-click, and single-use
-    bridge coverage until #194 lands the supported headless interaction bridge.
+    no credential read or upstream I/O. Then relay the denial to `recoverBrokerDenial` and prove
+    decision, expiry, double-click, and single-use convergence through the delivered surface
+    (`test/broker-bridge.test.ts` is the repository's two-process reference proof).
 13. Drain one broker under load, restore PostgreSQL from backup, prove #239's containment state
     prevents post-backup deletes/offboarding/replay windows from resurrecting access, and complete
     one request in every supported credential mode before returning traffic.
@@ -865,9 +878,9 @@ vision and the open blocker set above.
 - **ARN saves but egress fails:** verify the resolver is wired on the broker, region/IAM/KMS rights,
   and the secret value is the exact credential shape the provider expects.
 - **Broker returns session/approval denial with no Slack prompt:** shared storage alone does not
-  bridge UI; run Bolt preflight for sessions. Generic write approval is enforcement-only on the
-  headless route: do not enable approval-gated headless-only actions or mutate interaction tables;
-  wait for #194's supported bridge.
+  bridge UI; relay the typed denial body to `recoverBrokerDenial` from the verified event context
+  (or run Bolt preflight before dispatch). Never mutate interaction tables directly — the bridge and
+  the click handlers own those mutations.
 - **Identity fails only on some replicas:** compare deployment ID, issuer, active/previous key set,
   clock sync, and rollout phase across minters and every broker.
 - **OAuth succeeds but worker cannot use the connection:** compare provider IDs/config, database,

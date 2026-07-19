@@ -13,9 +13,11 @@ If Slack should remain the built-in human/admin experience, start with the
 > PostgreSQL. They are independent gates: both must allow a provider.
 >
 > [!WARNING]
-> Broker denials do not automatically render Slack recovery prompts
-> ([#194](https://github.com/Dharin-shah/vouchr/issues/194)); the trusted Slack-facing host still owns
-> that bridge.
+> Broker denials do not render Slack recovery prompts by themselves. The supported bridge lives in
+> the trusted Bolt control plane: relay the typed denial body to
+> `context.vouchr.recoverBrokerDenial(provider, denial)` from the verified Slack event context (see
+> the [hybrid guide](./HYBRID.md#5-bridge-the-slack-experience-to-the-worker)). A pure headless host
+> with no Slack control plane still owns its own recovery UI.
 
 Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 
@@ -129,7 +131,7 @@ only `{ "ok": false }`). Failures a worker should handle explicitly include:
 | --- | --- | --- |
 | `400` | `{ "error": "…", "code": "invalid_reference", "retryable": false, "recovery": "fix_configuration" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
 | `403` | `{ "error": "egress blocked", "code": "egress_blocked", "retryable": false, "recovery": "fix_configuration" }` | Correct the provider/egress configuration; unchanged retries remain denied. |
-| `403` | `{ "error": "approval_required", "approvalId": "…", "code": "approval_required", "retryable": false, "recovery": "request_approval" }` | Stop the turn. The broker currently enforces this gate but exposes no supported headless decision bridge; do not treat the opaque id as authority. |
+| `403` | `{ "error": "approval_required", "approvalId": "…", "code": "approval_required", "retryable": false, "recovery": "request_approval" }` | Stop the turn and relay the body to the trusted control plane's `recoverBrokerDenial`, which delivers the decision surface. The opaque id is a lookup handle, never authority. |
 | `403` / `409` | `{ "error": "authorization changed; resolve and retry", "code": "interaction_state_changed", "retryable": false, "recovery": "resolve_again" }` (`409` uses connection-changed prose) | Discard the stale handle, re-resolve current credential/mode/tool/session authority, mint a fresh identity token, and retry only if the operation is still allowed. |
 | `403` | `{ "error": "policy denies this provider in this channel", "code": "policy_denied", "retryable": false, "recovery": "contact_admin" }` | Static/channel policy denied use. Retrying cannot change governance; contact an eligible admin. |
 | `403` | `{ "error": "provider is not enabled in this channel", "code": "tool_disabled", "retryable": false, "recovery": "contact_admin" }` | The channel tool allowlist disabled the provider; contact an eligible admin. |
@@ -174,8 +176,8 @@ Every exported typed error (`ConsentRequiredError`, `SessionApprovalRequiredErro
 `TokenEndpointError`, `UpstreamTimeoutError`, and the explicit `UserFacingError` marker) is available
 from both package entrypoints. Unknown errors never
 expose their message or class name. `UserFacingError` is an explicit opt-in for fixed,
-Vouchr-authored copy—never wrap a caught resolver/provider/KMS/database error in it. See the root
-README's [typed error table](../README.md#typed-errors-and-recovery) for thrown control-flow vs
+Vouchr-authored copy—never wrap a caught resolver/provider/KMS/database error in it. See the
+[typed error table](#typed-errors-exported-classes) above for thrown control-flow vs
 operational meanings.
 
 Identity assertions are single-use. **Mint a fresh `identityToken` for every retry**, including a
@@ -237,7 +239,7 @@ One core, two front doors — both reach the same credential boundary.
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ rejected; reference routes never accept raw values |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `POST /v1/admin/reference` (channel) · `POST /v1/user/reference` (self) |
-| Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons for in-process use | ⚠️ broker enforces 403 `approval_required`; no automatic Slack bridge (#194) |
+| Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons for in-process use | ✅ broker enforces 403 `approval_required`; the trusted control plane delivers the decision surface via `recoverBrokerDenial` |
 | Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
 ## Writes are opt-in
@@ -282,17 +284,19 @@ render Approve/Deny buttons**, so the split is deliberate:
   }
   ```
 
-- The Bolt adapter renders Approve/Deny automatically only when its own in-process handle starts the
-  write. A headless 403 does not trigger that UI. The package does not yet expose a safe headless
-  decision/session facade: the required Slack eligibility checks, lifecycle locks, current-state
-  validation, mutation, and audit must stay one canonical operation. Do not mutate interaction
-  tables or import internal stores. The supported broker-to-Slack bridge remains a later focused
-  slice of [#194](https://github.com/Dharin-shah/vouchr/issues/194).
+- The Bolt adapter renders Approve/Deny automatically when its own in-process handle starts the
+  write, and — the #194 bridge — when the trusted control plane relays a broker 403 body to
+  `context.vouchr.recoverBrokerDenial(provider, denial)`: the pending row named by the opaque
+  `approvalId` is re-read from shared storage, bound to the verified team/user/channel, the
+  self/admin rule is re-derived from the registry, and the same leased delivery + click-time
+  revalidation path runs. The required Slack eligibility checks, lifecycle locks, current-state
+  validation, mutation, and audit stay one canonical operation. Do not mutate interaction tables or
+  import internal stores.
 
-Therefore approval on a headless-only request path is currently **enforcement-only**: it will deny
-the matching write, but there is no supported API that can complete the human decision. Leave the
-provider's `approval` knob disabled for such a path until the #194 bridge lands, or route that action
-through the packaged in-process Bolt surface that owns its private prompt and handlers.
+On a PURE headless deployment — no Slack control plane at all — approval remains **enforcement-only**:
+the broker denies the matching write, and no supported API outside the trusted Bolt surface can
+complete the human decision. Leave the provider's `approval` knob disabled for such a path, or run
+the hybrid shape so the Slack control plane owns the decision surface.
 
 The grant matches ONLY the exact (method, origin, path, byte-exact query digest) it was minted for.
 Origin includes scheme, hostname, and effective port; the human/audit surface still shows hostname only. It
@@ -303,7 +307,7 @@ secret. On the packaged Bolt path, decisions and spends commit with their audit 
 owner/credential/mode/policy/tool/conversation state is revalidated, and mode/tool changes purge old
 pending controls and grants so flip-back cannot revive them. Expired prompts/grants are reclaimed by
 the standard TTL sweep (audited, actor `system`). These lifecycle guarantees do not imply a supported
-custom headless decision UI before the bridge above lands.
+custom headless decision UI; the decision surface stays in the trusted control plane.
 
 Bolt prompts and approval audits expose only method, host, parameter count, and a salted action
 fingerprint. Raw paths/queries may contain secrets or PII and stay out of Slack, public errors, and
@@ -467,7 +471,8 @@ Legacy assertions without a verified `iat` fail closed at the production broker 
   uses the durable PostgreSQL `DbReplayStore`, so a `jti` spent on one pod is rejected on the others.
   The replay store is not configurable; the exported in-memory `ReplayGuard` is only for direct
   verifier unit tests, never broker construction or production.
-- **Not connected yet?** Route the user back through the Slack connect/approval flow.
+- **Not connected yet?** Relay the `not_connected` body to the control plane's
+  `recoverBrokerDenial` (or route the user back through the Slack connect flow yourself).
 - **OAuth dependency deadline.** Set `oauthTimeoutMs` on a provider definition when its token,
   revoke, or account endpoint legitimately needs longer than the 10-second default. The same finite
   bound applies to token exchange/refresh, revoke, and built-in account probes on both front doors.
