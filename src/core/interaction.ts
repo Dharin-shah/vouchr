@@ -11,16 +11,19 @@ export const PENDING_INTERACTION_TTL_MS = 10 * 60 * 1000;
 export const PROMPT_DELIVERY_LEASE_MS = 30_000;
 
 /**
- * Re-delivery debounce (#194 UX). A private prompt (Connect / key-setup / session / approval) is a
- * Slack ephemeral that vanishes on reload/device-switch, which used to dead-end a user for the full
- * PENDING_INTERACTION_TTL_MS (10 min) because a delivered prompt was never re-posted. This debounce
- * lets a genuine re-ask RE-POST the SAME generation once its last delivery is older than the window,
- * while rapid/concurrent identical asks (Slack event retries, agent retry loops, two replicas) still
- * dedup to one prompt. The atomic delivery lease is the RACE guard; this is only the UX cooldown.
- * Same value as the lease (they are conceptually distinct; keep the constants separate so either can
- * change independently).
+ * Re-delivery debounce (#194 UX). Transient prompt surfaces can vanish on reload/device-switch, so
+ * an adapter may explicitly let a genuine re-ask re-post the same generation once its last delivery
+ * is older than this window. Durable surfaces must leave the option off so retries do not duplicate
+ * messages. The atomic delivery lease is the race guard; this is only the UX cooldown. Same value as
+ * the lease (they are conceptually distinct and may change independently).
  */
 export const PROMPT_REDELIVERY_DEBOUNCE_MS = 30_000;
+
+/** Delivery policy supplied by the adapter that owns the actual prompt surface. Defaulting to
+ * false preserves durable-message deduplication for direct core callers. */
+export interface PromptDeliveryOptions {
+  redeliverDelivered?: boolean;
+}
 
 /** PostgreSQL is the one clock for cross-replica delivery leases. Application clocks may differ by
  * more than the lease itself; using Date.now() here would let a fast pod steal a live claim. */

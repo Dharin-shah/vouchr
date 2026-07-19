@@ -12,6 +12,7 @@ import {
   PROMPT_DELIVERY_LEASE_MS,
   PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
+  type PromptDeliveryOptions,
 } from './interaction';
 
 export const STATE_TTL_MS = 10 * 60 * 1000;
@@ -806,12 +807,12 @@ export class Consent {
       : null;
   }
 
-  /** Cross-replica lease for the private Slack Connect prompt. A DELIVERED prompt is re-claimable
-   *  once its delivery is older than PROMPT_REDELIVERY_DEBOUNCE_MS: the ephemeral can vanish, so a
-   *  genuine re-ask re-posts the SAME generation (re-arm delivered_at) rather than dead-ending, while
-   *  rapid/concurrent asks within the window still dedup to 'delivered'. The lease remains the race
-   *  guard. */
-  async claimDelivery(state: string): Promise<PromptDeliveryClaim> {
+  /** Cross-replica lease for the private Connect prompt. Transient surfaces may explicitly reclaim
+   * a delivered generation after the debounce; durable surfaces remain delivered. */
+  async claimDelivery(
+    state: string,
+    options: PromptDeliveryOptions = {},
+  ): Promise<PromptDeliveryClaim> {
     if (!isConsentState(state)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
@@ -820,10 +821,20 @@ export class Consent {
          SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
          WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
            AND created_at >= ${POSTGRES_NOW_MS_SQL}-?
-           AND (delivered_at IS NULL OR delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+           AND (
+             delivered_at IS NULL
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+           )
            AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
          RETURNING state`,
-        [token, PROMPT_DELIVERY_LEASE_MS, state, STATE_TTL_MS, PROMPT_REDELIVERY_DEBOUNCE_MS],
+        [
+          token,
+          PROMPT_DELIVERY_LEASE_MS,
+          state,
+          STATE_TTL_MS,
+          options.redeliverDelivered === true,
+          PROMPT_REDELIVERY_DEBOUNCE_MS,
+        ],
       );
       if (claimed) return { status: 'claimed', token };
       const current = await this.db.get<{

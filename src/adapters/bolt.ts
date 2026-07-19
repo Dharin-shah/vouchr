@@ -957,7 +957,9 @@ export class ConnectContext {
     // lease during that call, so including the whole round-trip can only shorten our posting
     // window; it can never make us believe more lease remains than actually does.
     const deliveryLeaseStartedAtNs = process.hrtime.bigint();
-    const delivery = await this.approvals?.claimDelivery(spec.approvalId, audience);
+    const delivery = await this.approvals?.claimDelivery(spec.approvalId, audience, {
+      redeliverDelivered: !!this.channel,
+    });
     if (!delivery || delivery.status === 'stale') {
       throw new UserFacingError(
         'The approval request changed before delivery. Ask the agent to retry the action.',
@@ -1415,7 +1417,9 @@ export class ConnectContext {
           },
         });
         if (pending.status === 'requested') {
-          const delivery = await this.sessions.claimDelivery(pending.id);
+          const delivery = await this.sessions.claimDelivery(pending.id, {
+            redeliverDelivered: true,
+          });
           if (delivery.status === 'claimed') {
             try {
               await this.postSessionApprovalPrompt(providerId, pending.id, this.thread!);
@@ -1505,7 +1509,9 @@ export class ConnectContext {
     // Render before claiming delivery. A local registry/render failure is a known no-send and must
     // not park this reusable consent generation behind an ambiguous Slack lease.
     const prompt = this.connectPrompt(providerId, pendingConsent.authorizeUrl);
-    const delivery = await this.consent.claimDelivery(pendingConsent.state);
+    const delivery = await this.consent.claimDelivery(pendingConsent.state, {
+      redeliverDelivered: !!this.channel,
+    });
     if (delivery.status !== 'claimed') {
       // 'delivered' reuses the live prompt instead of re-posting — but an in-channel prompt is an
       // ephemeral, which vanishes on reload/device switch. The typed 'reused' state drives fixed
@@ -2033,9 +2039,9 @@ export class ConnectContext {
     });
   }
 
-  /** Durable private JIT prompt for a key provider: a button that opens the per-user key modal.
-   * The existing core provisioning row owns the cross-replica delivery lease, exactly as consent
-   * owns OAuth prompt delivery. */
+  /** Private JIT prompt for a key provider: ephemeral in-channel, or a durable DM off-channel. The
+   * button opens the per-user key modal. The existing core provisioning row owns the cross-replica
+   * delivery lease, exactly as consent owns OAuth prompt delivery. */
   private async postKeySetupPrompt(
     providerId: string,
     issuedAt: number,
@@ -2062,6 +2068,7 @@ export class ConnectContext {
       this.identity,
       providerId,
       requestId,
+      { redeliverDelivered: !!this.channel },
     );
     if (delivery.status === 'delivered') return 'reused';
     if (delivery.status === 'in-flight') {

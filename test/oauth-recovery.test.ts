@@ -19,7 +19,10 @@ import {
   STATE_TTL_MS,
 } from '../src/core/consent';
 import { userOwner } from '../src/core/owner';
-import { PROMPT_REDELIVERY_DEBOUNCE_MS } from '../src/core/interaction';
+import {
+  POSTGRES_NOW_MS_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
+} from '../src/core/interaction';
 import { openDb, type Db } from '../src/core/db';
 import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
@@ -262,7 +265,7 @@ test('OAuth delivery cleanup is exact and ambiguous delivery retains its lease',
   );
 });
 
-test('a delivered connect prompt re-posts on a re-ask once past the re-delivery debounce (#194)', async (t) => {
+test('a delivered connect prompt is reclaimed only for a transient delivery surface (#194)', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
   const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
@@ -274,18 +277,23 @@ test('a delivered connect prompt re-posts on a re-ask once past the re-delivery 
   // WITHIN the debounce window: a rapid re-ask reuses the live prompt (dedup — no double-post).
   assert.deepEqual(await consent.claimDelivery(pending.state), { status: 'delivered' });
 
-  // Age the last delivery PAST the debounce (the ephemeral has since vanished). A genuine re-ask now
-  // RE-CLAIMS the SAME generation and re-posts, instead of dead-ending for the full 10-minute TTL.
+  // Age the last delivery past the debounce. The core remains durable by default; an adapter that
+  // owns a transient surface can opt in to reclaiming the same generation.
   await db.run(
     `UPDATE consent_request
-       SET delivered_at = ${'(extract(epoch from clock_timestamp()) * 1000)::bigint'} - ?
+       SET delivered_at = ${POSTGRES_NOW_MS_SQL} - ?
      WHERE state=?`,
     [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, pending.state],
   );
+  assert.deepEqual(
+    await consent.claimDelivery(pending.state),
+    { status: 'delivered' },
+    'durable delivery remains deduplicated even after the transient debounce',
+  );
   assert.equal(
-    (await consent.claimDelivery(pending.state)).status,
+    (await consent.claimDelivery(pending.state, { redeliverDelivered: true })).status,
     'claimed',
-    'a re-ask after the debounce re-posts the connect prompt',
+    'a transient surface can re-post after the debounce',
   );
 });
 

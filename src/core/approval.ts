@@ -19,6 +19,7 @@ import {
   PROMPT_DELIVERY_LEASE_MS,
   PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
+  type PromptDeliveryOptions,
 } from './interaction';
 import { channelOwner, userOwner, type Owner } from './owner';
 import type { Policy } from './policy';
@@ -532,14 +533,16 @@ export class Approvals {
   /** Cross-replica Slack-delivery lease, bound to the current exact recipient class/set. Headless
    * callers do not claim it; Bolt derives the audience from current Slack facts immediately before
    * posting. No transaction/advisory lock is held over Slack I/O. */
-  async claimDelivery(id: string, audience: string): Promise<PromptDeliveryClaim> {
+  async claimDelivery(
+    id: string,
+    audience: string,
+    options: PromptDeliveryOptions = {},
+  ): Promise<PromptDeliveryClaim> {
     if (!isInteractionId(id) || !/^[0-9a-f]{64}$/.test(audience)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
-      // Re-claim when: a different audience needs it (self→admin escalation, immediate), the prompt
-      // was never delivered, OR its last delivery to THIS audience is older than the re-delivery
-      // debounce (a vanished ephemeral re-posts on re-ask). Rapid/concurrent same-audience asks within
-      // the window still dedup to 'delivered'.
+      // A changed audience always needs a fresh decision surface. Re-delivery to the same audience
+      // remains an explicit adapter decision because some private surfaces are durable messages.
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE approval_request
          SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?,
@@ -550,10 +553,18 @@ export class Approvals {
            )
            AND (
              delivery_audience IS DISTINCT FROM ? OR delivered_at IS NULL
-             OR delivered_at <= ${POSTGRES_NOW_MS_SQL}-?
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
            )
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, audience, id, audience, PROMPT_REDELIVERY_DEBOUNCE_MS],
+        [
+          token,
+          PROMPT_DELIVERY_LEASE_MS,
+          audience,
+          id,
+          audience,
+          options.redeliverDelivered === true,
+          PROMPT_REDELIVERY_DEBOUNCE_MS,
+        ],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await this.db.get<{

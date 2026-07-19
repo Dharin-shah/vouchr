@@ -7,13 +7,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
-- **Private prompts re-post on a genuine re-ask instead of dead-ending** (#194). A Connect /
-  key-setup / session / approval prompt is a Slack ephemeral that vanishes on reload/device-switch;
-  a delivered prompt used to be reused-not-reposted for the full 10-minute request TTL, leaving a
-  user with no way to re-summon it. All four `claimDelivery` paths now re-post the SAME generation
-  once the last delivery is older than a 30s re-delivery debounce (`PROMPT_REDELIVERY_DEBOUNCE_MS`),
-  while rapid/concurrent identical asks (Slack event retries, agent retry loops, two replicas) still
-  dedup to one prompt and the atomic delivery lease still owns the race. The precise
+- **Vanished ephemeral prompts can be recovered on a genuine re-ask** (#194). Connect, key-setup,
+  session, and approval prompts posted with Slack `postEphemeral` may be re-delivered after a 30s
+  debounce; durable DM prompts remain deduplicated. Re-delivery reuses the same request generation,
+  while the atomic lease still suppresses rapid retries and concurrent replicas. The precise
   dedup-per-triggering-request model is tracked in
   [#275](https://github.com/Dharin-shah/vouchr/issues/275).
 
