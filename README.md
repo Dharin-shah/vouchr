@@ -113,6 +113,21 @@ scoped as narrowly as you choose. Any other OAuth2 API takes ~10 lines with
 `defineProvider`; API-key tools and secret-manager-backed credentials (AWS, GCP, Azure,
 Vault) work too — see [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
 
+**Least privilege — request only the scopes you use.** Scopes come from the provider
+definition, so pass exactly what you need: `github({ scopes: ['read:user'] })` shows the
+user only "Read your profile", not the broad `repo` default. Need *different* scopes for the
+same provider in different channels? Scopes are per-provider, not per-channel (yet —
+[#272](https://github.com/Dharin-shah/vouchr/issues/272)), so define the provider twice under
+distinct ids and gate them with channel tools/policy — explicit and easy:
+
+```ts
+providers: [
+  github({ scopes: ['read:user'] }),                                       // id: 'github' — read-only
+  defineProvider({ ...github({ scopes: ['read:user', 'repo'] }), id: 'github-write' }),
+]
+// then: enable `github-write` only where writes are needed, `github` elsewhere.
+```
+
 Runnable examples: [Google user credentials](./examples/google-user) ·
 [internal API keys](./examples/internal-api-key) · [Databricks](./examples/databricks) ·
 [AWS Secrets Manager](./examples/aws-secrets-manager) ·
