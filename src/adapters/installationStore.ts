@@ -1,5 +1,5 @@
 import type { Db } from '../core/db';
-import { encrypt, decrypt, toBuffer, type MasterKeys } from '../core/crypto';
+import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from '../core/crypto';
 import type { Installation, InstallationQuery, InstallationStore, Logger } from '@slack/bolt';
 
 /**
@@ -8,11 +8,18 @@ import type { Installation, InstallationQuery, InstallationStore, Logger } from 
  * the single env bot token and just one workspace works.
  *
  * The full Installation carries the bot (and user) tokens, which are secrets, so the JSON is
- * encrypted at rest with the master key, exactly like the Vault. Rows are keyed by
+ * encrypted at rest, exactly like the Vault. Both columns go through `seal`/`open` (#241): with an
+ * `EnvelopeProvider` configured they are per-secret DEK + external-KEK envelope ciphertext (scheme
+ * 0x01), the same at-rest scheme Vault credentials use — so a database + direct-master compromise
+ * cannot read installation bot tokens when the operator relies on KMS. Without a provider the direct
+ * (scheme-0 / keyed) path is byte-for-byte unchanged. Legacy direct/keyed rows stay readable and
+ * convert to envelope on their next write (re-install/re-auth), mirroring Vault; a KMS unwrap
+ * failure fails closed with the envelope error, never a silent direct fallback. Pass the SAME
+ * envelope instance the deployment wires into `createVouchr({ envelope })`. Rows are keyed by
  * (enterprise_id, team_id) using the same shape Bolt's own stores use.
  */
 export class DbInstallationStore implements InstallationStore {
-  constructor(private db: Db, private key: MasterKeys) {}
+  constructor(private db: Db, private key: MasterKeys, private envelope?: EnvelopeProvider) {}
 
   /**
    * Deterministic row key. Mirrors Bolt's keying: an enterprise (org-wide) install is
@@ -38,6 +45,10 @@ export class DbInstallationStore implements InstallationStore {
     // fetchInstallation. Kept for ops lookups without decrypting the whole blob. Both columns are
     // encrypted at rest.
     const botToken = installation.bot?.token ?? null;
+    // Seal both columns BEFORE the write: a KMS wrap failure (envelope path) throws here, so the
+    // INSERT never runs and no partial installation row is committed.
+    const botTokenEnc = botToken ? await seal(botToken, this.key, this.envelope) : null;
+    const dataEnc = await seal(JSON.stringify(installation), this.key, this.envelope);
     await this.db.run(
       `INSERT INTO installation (id, enterprise_id, team_id, bot_token, data, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)
@@ -48,8 +59,8 @@ export class DbInstallationStore implements InstallationStore {
         DbInstallationStore.rowKey(enterpriseId, teamId, isOrg),
         enterpriseId ?? null,
         isOrg ? null : (teamId ?? null),
-        botToken ? encrypt(botToken, this.key) : null,
-        encrypt(JSON.stringify(installation), this.key),
+        botTokenEnc,
+        dataEnc,
         Date.now(),
       ],
     );
@@ -67,7 +78,9 @@ export class DbInstallationStore implements InstallationStore {
     }
     for (const id of keys) {
       const row = (await this.db.get(`SELECT data FROM installation WHERE id=?`, [id])) as { data: unknown } | undefined;
-      if (row) return JSON.parse(decrypt(toBuffer(row.data), this.key)) as Installation;
+      // `open` reads legacy direct/keyed rows and envelope rows alike; on a KMS unwrap failure it
+      // re-raises the (secret-free) envelope error rather than falling back to a direct decrypt.
+      if (row) return JSON.parse(await open(toBuffer(row.data), this.key, this.envelope)) as Installation;
     }
     throw new Error(`No installation found (enterprise_id: ${query.enterpriseId}, team_id: ${query.teamId})`);
   }

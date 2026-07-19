@@ -63,7 +63,10 @@ app.event('app_mention', async ({ context, event, client }) => {
   // shutdown (an injected `db` is the caller's to close — createVouchr won't close what it didn't open).
   const key = loadKeyring();
   const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL });
-  const installationStore = new DbInstallationStore(db, key);
+  // Pass the SAME envelope to the installation store as to createVouchr below, so multi-workspace
+  // Slack bot tokens get the same KMS envelope (per-secret DEK + external KEK) as Vault credentials
+  // (#241). Omit it and installation tokens would stay direct-master-encrypted under a configured KMS.
+  const installationStore = new DbInstallationStore(db, key, kmsEnvelope);
 
   const vouchr = await createVouchr({
     providers: [github(), google()],

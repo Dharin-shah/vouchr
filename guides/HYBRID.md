@@ -216,6 +216,8 @@ import { App, ExpressReceiver } from '@slack/bolt';
 import { createVouchr, DbInstallationStore, loadKeyring, openDb } from '@vouchr/core';
 
 const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL! });
+// With a KMS envelope, pass it as the third argument so multi-workspace bot tokens are
+// envelope-encrypted like Vault credentials (#241): new DbInstallationStore(db, loadKeyring(), envelope).
 const store = new DbInstallationStore(db, loadKeyring());
 
 const receiver = new ExpressReceiver({
@@ -241,11 +243,12 @@ Enterprise-wide deprovisioning requires the documented SCIM/admin offboarding pa
 workspace. Because `db` was injected, `install().stop()` does not close it; shutdown must stop Bolt,
 stop the Vouchr lifecycle, and then `await db.close()`.
 
-> [!WARNING]
-> `DbInstallationStore` currently direct-master encrypts Slack installation tokens even when Vault
-> credentials use a KMS envelope. That contradicts the production KMS boundary and is tracked by
-> [#241](https://github.com/Dharin-shah/vouchr/issues/241); multi-workspace hybrid is not production-
-> ready until it is fixed and migration/restore behavior is proven.
+> [!NOTE]
+> `DbInstallationStore` accepts the same `EnvelopeProvider` as `createVouchr` (#241), so with a KMS
+> envelope configured multi-workspace Slack installation `bot_token`/`data` are envelope-encrypted
+> (per-secret DEK + external KEK), the same boundary as Vault credentials. Pass the envelope as the
+> store's third argument in production; omit it and installation tokens stay direct-master-encrypted.
+> Legacy direct rows convert to envelope on their next write; a KMS unwrap failure fails closed.
 
 ## 3. Run the private broker
 

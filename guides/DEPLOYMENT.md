@@ -225,8 +225,13 @@ instance** to both Bolt's OAuth `installationStore` and `createVouchr`. When usi
 `ExpressReceiver`, the OAuth installer configuration belongs on the receiver; `new App({ receiver })`
 does not consume installer options placed on `App`:
 
+When you run with a KMS envelope (next section), pass the **same** `envelope` instance to the store
+as its third argument — `new DbInstallationStore(db, masterKey, envelope)` — so multi-workspace bot
+tokens get the same per-secret DEK + external-KEK protection as Vault credentials (#241). Omit it
+and installation `bot_token`/`data` stay direct-master-encrypted even under a configured KMS.
+
 ```ts
-const store = new DbInstallationStore(db, masterKey);
+const store = new DbInstallationStore(db, masterKey, envelope); // omit `envelope` if not using KMS
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
@@ -274,9 +279,13 @@ are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manage
 
 The runtime supports direct encryption with `VOUCHR_MASTER_KEY`, which remains useful for development,
 transition, and backward reads. The adopted production vision requires an `EnvelopeProvider` for
-Vault connection tokens: new writes wrap a fresh per-secret data key (DEK) with your KMS key (KEK),
-storing the wrapped DEK alongside the ciphertext. Enabling the envelope is backward-compatible, so
-existing direct rows still decrypt during migration.
+Vault connection tokens **and** multi-workspace Slack installation tokens (#241): new writes wrap a
+fresh per-secret data key (DEK) with your KMS key (KEK), storing the wrapped DEK alongside the
+ciphertext. Enabling the envelope is backward-compatible, so existing direct rows still decrypt
+during migration and convert to envelope format on their next write (a token refresh, or a
+re-install for installation rows). `vouchr rekey` rotates the direct-path master key across both the
+`connection` and `installation` tables; it skips envelope rows (which you rotate in the KMS) and does
+not convert direct rows to envelope — that conversion happens on write.
 
 The interface (`src/core/crypto.ts`) is two async methods:
 
@@ -313,11 +322,15 @@ const kmsEnvelope: EnvelopeProvider = {
 };
 
 const vouchr = await createVouchr({ /* ... */, envelope: kmsEnvelope });
+// Multi-workspace: hand the SAME envelope to the installation store, or its bot tokens stay
+// direct-master-encrypted (#241).
+const installationStore = new DbInstallationStore(db, masterKey, kmsEnvelope);
 ```
 
 IAM: `kms:Encrypt` and `kms:Decrypt` on that one key. See `test/envelope.test.ts` for the worked
-sketch this is drawn from. Pass the optional `signal` to the KMS client: emergency revocation bounds
-each unwrap and continues local deletion when KMS stalls.
+sketch this is drawn from, and `test/installation.test.ts` for the multi-workspace round-trip. Pass
+the optional `signal` to the KMS client: emergency revocation bounds each unwrap and continues local
+deletion when KMS stalls.
 
 ## Standalone headless broker (no Slack)
 
