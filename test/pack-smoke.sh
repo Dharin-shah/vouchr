@@ -169,8 +169,10 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import {
-  createVouchr, disconnectProvider, isVouchrErrorCode as isRootVouchrErrorCode,
-  type BrokerDenialRecovery, type ConnectContext,
+  createVouchr, disconnectProvider, type ConnectContext,
+} from '@vouchr/core';
+import {
+  isVouchrErrorCode as isRootVouchrErrorCode, type BrokerDenialRecovery,
 } from '@vouchr/core';
 import {
   ChannelConfig, ChannelTools, Vault, createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
