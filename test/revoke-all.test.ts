@@ -11,10 +11,14 @@ import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { userOwner, channelOwner } from '../src/core/owner';
 import {
   revokeAllCredentials,
+  revokeConnection,
   enumerateStoredProviders,
   RESURRECTION_TABLES,
+  selectRevocations,
   type RevokeAllDeps,
 } from '../src/core/offboard';
+import { Consent } from '../src/core/consent';
+import { SessionGrants } from '../src/core/session';
 
 const KEY = randomBytes(32);
 
@@ -306,6 +310,56 @@ test('a hung envelope read is bounded after the local credential delete commits'
   assert.equal(claimed.refreshUnreadable, true);
   assert.equal(aborts, 2, 'both KMS unwraps receive cancellation at the deadline');
   t.mock.timers.reset();
+});
+
+test('a provider without upstream revoke deletes locally without decrypting its token', async (t) => {
+  const db = await openTestDb(t);
+  const identityEnvelope = {
+    wrapDataKey: async (dataKey: Buffer) => dataKey,
+    unwrapDataKey: async (wrapped: Buffer) => wrapped,
+  };
+  await new Vault(db, KEY, {}, identityEnvelope).upsert(U('U1'), 'norevoke', tok('NO_REVOKE_TOKEN'));
+
+  let unwraps = 0;
+  const vault = new Vault(db, KEY, {}, {
+    wrapDataKey: async (dataKey: Buffer) => dataKey,
+    unwrapDataKey: async () => {
+      unwraps++;
+      throw new Error('should not decrypt');
+    },
+  });
+  const report = await withFetch((calls) =>
+    revokeAllCredentials(db, deps(db, vault), { execute: true }).then((result) => {
+      assert.equal(calls.length, 0);
+      return result;
+    }),
+  );
+
+  assert.equal(unwraps, 0, 'no revoke capability means no secret access is necessary');
+  assert.equal(report.upstream.unsupported, 1);
+  assert.equal(report.removedLocal, 1);
+  assert.equal(await count(db, 'connection'), 0);
+});
+
+test('a revoke loser reports no token disposition when the row is already gone', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  await vault.upsert(U('U1'), 'revok_ok', tok('ONE_TIME_TOKEN'));
+  const [row] = await selectRevocations(db, { provider: 'revok_ok' });
+  assert.ok(row);
+  const audit = new Audit(db);
+  const consent = new Consent(db);
+  const sessions = new SessionGrants(db);
+
+  await withFetch(async () => {
+    const winner = await revokeConnection(vault, audit, consent, sessions, REGISTRY, row, 'revok_ok');
+    assert.equal(winner.removed, true);
+    const loser = await revokeConnection(vault, audit, consent, sessions, REGISTRY, row, 'revok_ok');
+    assert.equal(loser.removed, false);
+    assert.equal(loser.upstreamAttempted, false);
+    assert.equal(loser.upstreamUnreadable, false);
+    assert.equal(loser.upstreamMissing, false, 'no token was read, so its presence is unknown');
+  });
 });
 
 test('second run is safe and reports zero remaining (idempotent)', async (t) => {

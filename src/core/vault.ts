@@ -585,8 +585,9 @@ export class Vault {
 
   /**
    * Delete one connection for the revocation path and, only for the winning caller, optionally decode
-   * its access + refresh tokens after the local delete committed. Unregistered/stale providers pass
-   * `decrypt=false`: their trusted `dry_run` bit remains available without touching ciphertext.
+   * its access + refresh tokens after the local delete committed. Providers without an upstream
+   * revoke capability pass `decrypt=false`: their trusted `dry_run` bit remains available without
+   * touching ciphertext.
    */
   async deleteForRevoke(
     owner: Owner,

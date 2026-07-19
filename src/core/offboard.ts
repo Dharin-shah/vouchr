@@ -610,6 +610,7 @@ export async function revokeConnection(
   const owner: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId, enterpriseId: null };
   const current = registry?.has(provider) ? registry.get(provider) : null;
   const registered = current != null;
+  const revocable = isRegisteredRevocable(registry, provider);
   // Atomically claim the row before decoding: a concurrent revoke loser receives no token and cannot
   // double-call the provider. A decrypt/delete failure stays per-row best-effort for the bulk loop.
   let claimed = {
@@ -621,7 +622,7 @@ export async function revokeConnection(
     dryRun: false,
     fenced: true,
   };
-  try { claimed = await vault.deleteForRevoke(owner, provider, registered); } catch { /* removed stays false */ }
+  try { claimed = await vault.deleteForRevoke(owner, provider, revocable); } catch { /* removed stays false */ }
   const removed = claimed.removed;
   if (!removed) {
     return {
@@ -630,7 +631,7 @@ export async function revokeConnection(
       upstreamAttempted: false,
       upstreamOk: false,
       upstreamUnreadable: false,
-      upstreamMissing: true,
+      upstreamMissing: false,
     };
   }
   // Upstream revoke is ATTEMPTED only when the provider actually has a revoke endpoint and we hold a
@@ -640,15 +641,13 @@ export async function revokeConnection(
   let upstreamOk = true;
   let upstreamUnreadable = false;
   let upstreamMissing = false;
-  if (current && !claimed.dryRun) {
+  if (current && revocable && !claimed.dryRun) {
     const p = current;
-    if (p.revoke || p.revokeUrl) {
-      const upstream = await revokeProviderCredential(p, claimed);
-      upstreamAttempted = upstream.attempted;
-      upstreamOk = upstream.ok;
-      upstreamUnreadable = upstream.unreadable;
-      upstreamMissing = upstream.missing;
-    }
+    const upstream = await revokeProviderCredential(p, claimed);
+    upstreamAttempted = upstream.attempted;
+    upstreamOk = upstream.ok;
+    upstreamUnreadable = upstream.unreadable;
+    upstreamMissing = upstream.missing;
   }
   // A surgical revoke attributes to the owner. The deployment-wide path assumes the database may
   // be attacker-controlled, so it records only fixed system identity plus a registry-trusted
