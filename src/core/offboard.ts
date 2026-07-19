@@ -388,6 +388,12 @@ export interface RevokeRow {
   ownerKind: 'user' | 'channel';
   ownerId: string;
   externalAccount: string | null;
+  /** Resolver id (`vault` for a Vouchr-held token; a source id for an externally-referenced secret).
+   *  Never a secret — it is the reference *kind*, not the reference value (SEC-1). */
+  source: string;
+  /** True when the row stores an external `secret_ref` instead of a vaulted token: local deletion
+   *  removes the pointer, NOT the upstream secret, which must be rotated in its source manager. */
+  hasReference: boolean;
   /** #116 trusted synthetic-provenance marker; a dry-run row's upstream revoke is skipped. */
   dryRun: boolean;
   createdAt: number;
@@ -416,13 +422,16 @@ export async function selectRevocations(db: Db, f: RevokeFilter): Promise<Revoke
   if (f.userId) { where.push("owner_kind='user' AND owner_id=?"); params.push(f.userId); }
   if (f.channel) { where.push("owner_kind='channel' AND owner_id=?"); params.push(f.channel); }
   const rows = (await db.all(
-    `SELECT team_id, owner_kind, owner_id, external_account, dry_run, created_at
+    `SELECT team_id, owner_kind, owner_id, external_account, source, (secret_ref IS NOT NULL) AS has_reference, dry_run, created_at
      FROM connection WHERE ${where.join(' AND ')} ORDER BY team_id, owner_kind, owner_id`,
     params,
   )) as any[];
   return rows.map((r) => ({
     teamId: r.team_id, ownerKind: r.owner_kind, ownerId: r.owner_id,
-    externalAccount: r.external_account, dryRun: r.dry_run === 1, createdAt: r.created_at,
+    externalAccount: r.external_account, source: r.source,
+    // pg BOOLEAN → true/false; a defensive `=== 1` also covers a 1/0 shim. Fail closed to "referenced".
+    hasReference: r.has_reference === true || r.has_reference === 1,
+    dryRun: r.dry_run === 1, createdAt: r.created_at,
   }));
 }
 
@@ -733,4 +742,265 @@ export async function offboardUserEverywhere(
     }
   }
   return summary;
+}
+
+// ---------------------------------------------------------------------------------------------
+// #239 deployment-wide emergency invalidation (`vouchr revoke --all`). The provider-scoped path
+// above is surgical ("provider X is compromised"); this one is for a compromise of the Vouchr
+// database/decryption boundary itself, where every reachable credential must be assumed exposed.
+// ---------------------------------------------------------------------------------------------
+
+/** Every secret-bearing or resurrection-path table a global revoke must clear. Deliberately EXCLUDES:
+ *  the `*_tombstone` fences (they are the anti-resurrection barrier — deleting them removes
+ *  protection), `audit` (incident evidence), `broker_jti` (single-use identity replay guard),
+ *  `channel_config`/`channel_tool` (policy, not credentials — the surgical revoke leaves them too),
+ *  and `meta`. `connection` and `installation` are handled with their own counts, so this list is the
+ *  authorization/resurrection set. Adding a new secret-bearing table without adding it here (or to the
+ *  documented keep-list) is the "'all' silently omits another secret table" failure the issue calls
+ *  out — `test/revoke-all.test.ts` diffs this set against the live schema to catch exactly that. */
+export const RESURRECTION_TABLES = [
+  'consent_request',
+  'session_request',
+  'session_grant',
+  'approval_request',
+  'user_provisioning_request',
+  'channel_provisioning_request',
+  'notification_state',
+] as const;
+
+/** Per-connection disposition of the local delete + upstream revoke attempt. Reported in aggregate,
+ *  never per-owner, so the report carries no owner-identifying or secret data (SEC-1). */
+export type RevokeCategory =
+  /** registered revocable provider, token decrypted, upstream revoke returned success. */
+  | 'revoked'
+  /** registered revocable provider, upstream revoke attempted but failed (HTTP error OR timeout). */
+  | 'revoke_failed'
+  /** provider has no revoke endpoint, or is unregistered/removed — no upstream call is possible. */
+  | 'unsupported'
+  /** registered revocable provider, but the stored token could not be decrypted (KMS/key missing). */
+  | 'undecryptable'
+  /** the secret lives in an external manager (`secret_ref`); rotate it THERE — deleting the pointer
+   *  is not upstream invalidation. */
+  | 'external_reference'
+  /** #116 dry-run synthetic row: never POSTed to a real endpoint. */
+  | 'synthetic';
+
+const REVOKE_CATEGORIES: readonly RevokeCategory[] = [
+  'revoked', 'revoke_failed', 'unsupported', 'undecryptable', 'external_reference', 'synthetic',
+];
+
+const zeroCategories = (): Record<RevokeCategory, number> =>
+  Object.fromEntries(REVOKE_CATEGORIES.map((c) => [c, 0])) as Record<RevokeCategory, number>;
+
+export interface RevokeAllDeps {
+  vault: Vault;
+  audit: Audit;
+  consent: Consent;
+  sessions: SessionGrants;
+  /** Best-effort: absent/broken config disables upstream revoke + decrypt, never the local wipe. */
+  registry?: ProviderRegistry;
+}
+
+/** No-secret result of a global revoke. Counts and provider ids only; safe to print to CI/logs. */
+export interface RevokeAllReport {
+  executed: boolean;
+  /** Stored provider ids enumerated from PostgreSQL, including removed/unregistered ones. */
+  providers: string[];
+  /** Total connection rows matched (all owners, all providers). */
+  connections: number;
+  /** Local connection deletes that actually committed (0 on dry-run). */
+  removedLocal: number;
+  /** Per-category disposition. On dry-run this is the *would-attempt* classification. */
+  upstream: Record<RevokeCategory, number>;
+  /** Rows removed from each authorization/resurrection table + installations (0 on dry-run; a `-1`
+   *  marks a table whose blanket delete threw — surfaced, never a partial silent success). */
+  cleared: {
+    connections: number;
+    consents: number;
+    sessionRequests: number;
+    sessionGrants: number;
+    approvals: number;
+    userProvisioning: number;
+    channelProvisioning: number;
+    notifications: number;
+    installations: number;
+  };
+  /** Locally stored Slack installation credentials (bot/user tokens) matched. */
+  installations: number;
+  /** Rows still present after the sweep. On a clean execute every field is 0. */
+  remaining: { credentials: number; authorizations: number; installations: number };
+  /** True only when execute completed AND nothing remains. The CLI returns non-zero when false. */
+  ok: boolean;
+}
+
+/** Distinct provider ids present anywhere credentials or authorization can originate, INCLUDING ids
+ *  that are no longer in the runtime registry (removed/renamed providers). `installation` has no
+ *  provider column (Slack workspace tokens) and is handled separately. */
+export async function enumerateStoredProviders(db: Db): Promise<string[]> {
+  const rows = (await db.all(
+    `SELECT provider FROM connection
+     UNION SELECT provider FROM consent_request
+     UNION SELECT provider FROM session_request
+     UNION SELECT provider FROM session_grant
+     UNION SELECT provider FROM approval_request
+     UNION SELECT provider FROM user_provisioning_request
+     UNION SELECT provider FROM channel_provisioning_request
+     UNION SELECT provider FROM notification_state`,
+  )) as { provider: string }[];
+  return rows.map((r) => r.provider).sort();
+}
+
+/** Whether `provider` is registered AND declares an upstream revoke capability. */
+function isRegisteredRevocable(registry: ProviderRegistry | undefined, provider: string): boolean {
+  if (!registry?.has(provider)) return false;
+  const p = registry.get(provider);
+  return !!(p.revoke || p.revokeUrl);
+}
+
+/** Classify one row from METADATA alone (dry-run preview): no decrypt, no upstream call. `revoked`
+ *  here means "would attempt an upstream revoke", not that one happened. */
+function previewCategory(row: RevokeRow, revocable: boolean): RevokeCategory {
+  if (row.dryRun) return 'synthetic';
+  if (row.source !== 'vault' || row.hasReference) return 'external_reference';
+  return revocable ? 'revoked' : 'unsupported';
+}
+
+/** Classify one row after execution, using the actual delete/upstream outcome. */
+function executeCategory(row: RevokeRow, outcome: RevokeOutcome, revocable: boolean): RevokeCategory {
+  if (row.dryRun) return 'synthetic';
+  if (row.source !== 'vault' || row.hasReference) return 'external_reference';
+  if (!revocable) return 'unsupported';
+  if (outcome.upstreamAttempted) return outcome.upstreamOk ? 'revoked' : 'revoke_failed';
+  // Registered + revocable + vaulted + real, yet no upstream attempt was made ⇒ the token was
+  // unreadable (KMS/key unavailable). The local row is gone but upstream is untouched — say so.
+  return 'undecryptable';
+}
+
+async function countRows(db: Db, table: string): Promise<number> {
+  const row = (await db.get(`SELECT COUNT(*) AS n FROM ${table}`)) as { n: number } | undefined;
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * Deployment-wide emergency invalidation. Dry-run (`execute:false`) enumerates and classifies with
+ * ZERO mutation and ZERO decryption. Execute:
+ *  1. per enumerated provider, runs the shared {@link revokeConnection} (local delete FIRST, then
+ *     best-effort bounded upstream revoke, audit, and per-user consent/grant clear) so upstream
+ *     reporting and the mutation+audit contract are the SAME code the surgical path uses (STR-3);
+ *  2. then BLANKET-deletes every authorization/resurrection table + `connection` + `installation`,
+ *     which needs no decryption/KMS/provider config and also removes pending authority that has no
+ *     connection row (a bare "Connect" consent), malformed-provider rows, and anything a concurrent
+ *     writer committed during step 1 — making the command idempotent and complete;
+ *  3. recounts and reports residual rows. `ok` is false (CLI exit 1) while any local credential or
+ *     authorization row remains.
+ *
+ * Concurrency: the anti-resurrection guarantee during an incident is the deployment lockdown gate
+ * (VOUCHR_LOCKDOWN — the running workload refuses to serve/mint), established by the runbook BEFORE
+ * this runs. This command itself neither reads nor trusts that DB state; a row a writer commits after
+ * the sweep is caught by the recount and reported as remaining (non-zero), never a silent success.
+ * ponytail: containment is the operator's lockdown/quarantine step, not a fence this command writes —
+ * writing a permanent global fence here would block legitimate post-recovery reconnects.
+ */
+export async function revokeAllCredentials(
+  db: Db,
+  deps: RevokeAllDeps,
+  opts: { execute: boolean },
+): Promise<RevokeAllReport> {
+  const providers = await enumerateStoredProviders(db);
+  const upstream = zeroCategories();
+  let connections = 0;
+  let removedLocal = 0;
+
+  if (!opts.execute) {
+    for (const provider of providers) {
+      const revocable = isRegisteredRevocable(deps.registry, provider);
+      for (const row of await selectRevocations(db, { provider })) {
+        connections++;
+        upstream[previewCategory(row, revocable)]++;
+      }
+    }
+    const cleared = {
+      connections,
+      consents: await countRows(db, 'consent_request'),
+      sessionRequests: await countRows(db, 'session_request'),
+      sessionGrants: await countRows(db, 'session_grant'),
+      approvals: await countRows(db, 'approval_request'),
+      userProvisioning: await countRows(db, 'user_provisioning_request'),
+      channelProvisioning: await countRows(db, 'channel_provisioning_request'),
+      notifications: await countRows(db, 'notification_state'),
+      installations: await countRows(db, 'installation'),
+    };
+    return {
+      executed: false,
+      providers,
+      connections,
+      removedLocal: 0,
+      upstream,
+      cleared: { ...cleared, connections: 0 }, // dry-run deletes nothing
+      installations: cleared.installations,
+      remaining: { credentials: 0, authorizations: 0, installations: 0 },
+      ok: false,
+    };
+  }
+
+  const installations = await countRows(db, 'installation');
+  // Phase 1: per-provider upstream revoke + attributed local delete, via the shared helper.
+  for (const provider of providers) {
+    const revocable = isRegisteredRevocable(deps.registry, provider);
+    for (const row of await selectRevocations(db, { provider })) {
+      connections++;
+      let outcome: RevokeOutcome;
+      try {
+        outcome = await revokeConnection(
+          deps.vault, deps.audit, deps.consent, deps.sessions, deps.registry, row, provider,
+        );
+      } catch {
+        // A provider/KMS extension may throw with credential material inside; never serialize it
+        // (SEC-1). The blanket delete below still removes this row, so the sweep stays complete.
+        continue;
+      }
+      if (!outcome.removed) continue;
+      removedLocal++;
+      upstream[executeCategory(row, outcome, revocable)]++;
+    }
+  }
+
+  // Phase 2: blanket local purge. Guarantees every resurrection path is gone regardless of provider
+  // validity, decryptability, or a connection existing — and makes a second run converge to zero.
+  const del = async (table: string): Promise<number> => {
+    try {
+      return (await db.run(`DELETE FROM ${table}`)).changes; // table name is a fixed literal, not input
+    } catch {
+      return -1; // a failed table delete is surfaced (and caught by the recount), never hidden
+    }
+  };
+  const cleared = {
+    connections: await del('connection'),
+    consents: await del('consent_request'),
+    sessionRequests: await del('session_request'),
+    sessionGrants: await del('session_grant'),
+    approvals: await del('approval_request'),
+    userProvisioning: await del('user_provisioning_request'),
+    channelProvisioning: await del('channel_provisioning_request'),
+    notifications: await del('notification_state'),
+    installations: await del('installation'),
+  };
+
+  // Phase 3: honest residual accounting. Non-zero exit while ANY local credential/authorization row
+  // remains (a delete that failed, or a row a concurrent writer committed after containment lapsed).
+  const credentials = await countRows(db, 'connection');
+  let authorizations = 0;
+  for (const table of RESURRECTION_TABLES) authorizations += await countRows(db, table);
+  const remainingInstallations = await countRows(db, 'installation');
+  return {
+    executed: true,
+    providers,
+    connections,
+    removedLocal,
+    upstream,
+    cleared,
+    installations,
+    remaining: { credentials, authorizations, installations: remainingInstallations },
+    ok: credentials === 0 && authorizations === 0 && remainingInstallations === 0,
+  };
 }

@@ -542,13 +542,48 @@ POST /v1/admin/reference
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
+| `VOUCHR_LOCKDOWN` | no | `1`/`true` puts this replica into #239 containment: readiness → 503 and credential serving, refresh, OAuth-callback writes, resolver access, and credential/reference setup are denied before any secret is read. `0`/`false` disables; any other value refuses boot. Break-glass `vouchr revoke` still works during lockdown. Authority is this env, **outside** the credential database. See [Incident break-glass](#incident-break-glass-239). |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 
 Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
-prints one line: port, backend, provider ids, `allowWrites`, and `dryRun=true` when dry-run is on).
-A configured `defaultDeny: true` policy with zero rules also emits a warning that every provider is
-denied; this is valid configuration, not a startup failure.
+prints one line: port, backend, provider ids, `allowWrites`, `dryRun=true` when dry-run is on, and
+`lockdown=true` when locked down). A configured `defaultDeny: true` policy with zero rules also emits
+a warning that every provider is denied; this is valid configuration, not a startup failure.
+
+### Incident break-glass (#239)
+
+Two credential-store incidents demand different responses:
+
+- **Read-only PostgreSQL dump, master key / KMS uncompromised.** Token columns stay encrypted; only
+  owner/provider/scope/timestamp metadata leaks. Contain the database incident and review KMS access
+  logs. Global token revocation is a risk decision here, not automatically required.
+- **Database dump *plus* a decryption path** — leaked master key, compromised KMS/workload role, or a
+  compromised live replica. Assume every reachable access/refresh token, static credential, Slack
+  installation token, and resolved external credential may have been copied. Run the full procedure:
+
+  1. **Contain outside the process first.** Remove broker/Slack ingress and provider egress, quarantine
+     every replica, and revoke the workload's database/KMS/resolver identity. Set `VOUCHR_LOCKDOWN=1`
+     on any replica you keep running: it fails readiness (drops from rotation) and denies serving,
+     refresh, callback writes, resolver access, and setup before secret access. A flag inside the
+     compromised database would not be trustworthy — the authority is the deployment env.
+  2. **Invalidate locally.** `vouchr revoke --all` (dry-run) to preview counts, then
+     `vouchr revoke --all --confirm ALL-CREDENTIALS`. It deletes every credential, external reference,
+     pending consent, session grant/request, action approval, notification-state row, and Slack
+     installation — no key/KMS/provider config required — and attempts bounded best-effort upstream
+     revocation per provider, reporting `revoked`/`failed`/`unsupported`/`undecryptable`/
+     `external_reference`/`synthetic` separately. It exits non-zero while any local row remains and is
+     safe to re-run.
+  3. **Rotate and recover.** Rotate master keys/KMS permissions, broker identity-signing keys, OAuth
+     client secrets, Slack installation credentials, database credentials, and resolver roles per the
+     incident scope. Deploy from a trusted image, clear `VOUCHR_LOCKDOWN`, and require users/admins to
+     reconnect. Rotating the master key is also what stops a restored pre-incident backup from making
+     old encrypted rows usable — the ciphertext no longer decrypts under the new key.
+
+  **Local deletion is not upstream revocation.** A bearer an attacker already copied stays valid at the
+  provider until it expires or is rotated; providers with no revoke endpoint, undecryptable tokens, and
+  external references need manual rotation; invalidated installations require each workspace to
+  reinstall the Slack app. The tabletop/drill that exercises this end to end is tracked under #216.
 
 ### Provider config (declarative)
 

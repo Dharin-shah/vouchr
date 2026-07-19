@@ -856,3 +856,54 @@ test('CLI revoke does not echo a token-shaped positional or unknown-flag secret 
   assert.match(unknownCommand.stderr, /Unknown command/);
   assert.doesNotMatch(unknownCommand.stderr + unknownCommand.stdout, /ghp_TOPSECRET/);
 });
+
+// -------------------------------------------------------------------------------------------------
+// #239 deployment-wide revoke: `revoke --all --confirm ALL-CREDENTIALS`
+// -------------------------------------------------------------------------------------------------
+
+test('CLI revoke --all rejects owner scope, --provider, --yes, and a wrong/absent-scope --confirm', async (t) => {
+  const dbPath = await testDbUrl(t);
+  const keyB64 = randomBytes(32).toString('base64');
+  const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: keyB64, VOUCHR_PROVIDERS: '[]' };
+  for (const entry of [
+    { args: ['--all', '--provider', 'revocable', '--confirm', 'ALL-CREDENTIALS'], error: /do not combine it with --provider/ },
+    { args: ['--all', '--team', 'T1', '--confirm', 'ALL-CREDENTIALS'], error: /takes no owner scope/ },
+    { args: ['--all', '--yes'], error: /requires --confirm ALL-CREDENTIALS/ },
+    { args: ['--all', '--confirm', 'nope'], error: /must be exactly ALL-CREDENTIALS/ },
+    { args: ['--confirm', 'ALL-CREDENTIALS', '--provider', 'revocable'], error: /only valid with --all/ },
+  ]) {
+    const res = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', ...entry.args], { env, encoding: 'utf8' });
+    assert.equal(res.status, 2, entry.args.join(' '));
+    assert.match(res.stderr, entry.error);
+  }
+});
+
+test('CLI revoke --all is dry-run by default and wipes everything with --confirm ALL-CREDENTIALS', async (t) => {
+  const dbPath = await testDbUrl(t);
+  const keyB64 = randomBytes(32).toString('base64');
+  const db = await openDb({ databaseUrl: dbPath });
+  const vault = new Vault(db, Buffer.from(keyB64, 'base64'));
+  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable', tok('ALL_SECRET_TOKEN'));
+  await vault.upsert(channelOwner('T1', 'C1'), 'norevoke', tok('ANOTHER_SECRET'));
+  await db.run(`INSERT INTO installation (id, team_id, data, updated_at) VALUES ('i1', 'T1', $1, $2)`, [randomBytes(16), Date.now()]);
+  await db.close();
+
+  const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: keyB64, VOUCHR_PROVIDERS: '[]' };
+  // Dry-run: no confirmation → nothing deleted, no secret printed.
+  const dry = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--all'], { env, encoding: 'utf8' });
+  assert.equal(dry.status, 0);
+  assert.match(dry.stdout, /DRY-RUN revoke --all/);
+  assert.doesNotMatch(dry.stdout + dry.stderr, /ALL_SECRET_TOKEN|ANOTHER_SECRET/);
+  const mid = await openDb({ databaseUrl: dbPath });
+  assert.equal((await mid.get<any>('SELECT COUNT(*)::int AS n FROM connection')).n, 2, 'dry-run deletes nothing');
+  await mid.close();
+
+  // Execute: exact confirmation → every credential + installation gone, exit 0, no secret printed.
+  const go = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--all', '--confirm', 'ALL-CREDENTIALS'], { env, encoding: 'utf8' });
+  assert.equal(go.status, 0);
+  assert.doesNotMatch(go.stdout + go.stderr, /ALL_SECRET_TOKEN|ANOTHER_SECRET/);
+  const after = await openDb({ databaseUrl: dbPath });
+  assert.equal((await after.get<any>('SELECT COUNT(*)::int AS n FROM connection')).n, 0);
+  assert.equal((await after.get<any>('SELECT COUNT(*)::int AS n FROM installation')).n, 0);
+  await after.close();
+});

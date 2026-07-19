@@ -235,3 +235,33 @@ test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async (
     assert.equal(r.status, 405);
   } finally { server.close(); }
 });
+
+// ── (#239) containment: VOUCHR_LOCKDOWN fails readiness + refuses every functional route ──────────
+
+function getStatus(port: number, path: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method: 'GET' }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('lockdown broker: liveness stays 200, readiness is 503, and functional routes are refused before secret access', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), lockdown: true });
+  const port = await listen(server);
+  const up = mockUpstream();
+  try {
+    assert.equal(await getStatus(port, '/healthz'), 200, 'liveness must stay up');
+    assert.equal(await getStatus(port, '/readyz'), 503, 'a locked-down replica must not be ready');
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
+    assert.equal(r.status, 503, 'functional routes must be refused under lockdown');
+    assert.equal(up.seen.length, 0, 'no credential may be served under lockdown');
+  } finally { up.restore(); server.close(); }
+});

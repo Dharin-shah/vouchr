@@ -88,6 +88,23 @@ export interface TtlPolicy {
   maxAgeMs?: number;
 }
 
+/**
+ * Thrown by the Vault when the deployment is in operator-declared lockdown (`VOUCHR_LOCKDOWN`,
+ * #239 containment): credential SERVING (`get`), MINTING (`upsert`/`reference`) and refresh WRITES
+ * fail closed, so a compromised deployment cannot serve or resurrect a credential while an incident
+ * is being contained. Break-glass DELETION (`deleteForRevoke`) and metadata-only reads stay open so
+ * `vouchr revoke` still works during lockdown. Carries no secret; `mapSafeError` deliberately has no
+ * branch for it, so it collapses to the generic internal-error copy and never advertises the incident
+ * state to a caller. Its authority is deployment configuration outside the credential database — a DB
+ * flag would not be trustworthy once the database itself is the compromised boundary. */
+export class CredentialLockdownError extends Error {
+  readonly code = 'credential_lockdown' as const;
+  constructor() {
+    super('credential access is locked down');
+    this.name = 'CredentialLockdownError';
+  }
+}
+
 /** Encrypted credential store, keyed by the owning principal (user OR channel). */
 export class Vault {
   /** Set only on the transaction-bound facade created by withCredentialLocks. Deletion through
@@ -105,7 +122,16 @@ export class Vault {
     // 0x01); when absent, NEW writes use the legacy direct-to-master format (current behavior).
     // Reads dispatch on the stored format regardless, so either mode reads existing rows.
     private envelope?: EnvelopeProvider,
+    // #239 containment: when true, serving/minting/refresh fail closed (deletion + metadata stay
+    // open). Set from deployment config (VOUCHR_LOCKDOWN) by the boot paths, never from the DB.
+    private lockdown = false,
   ) {}
+
+  /** #239: fail closed on any credential serve/mint/refresh while the deployment is locked down.
+   *  Deletion and metadata reads deliberately do NOT call this — break-glass must work in lockdown. */
+  private assertNotLockedDown(): void {
+    if (this.lockdown) throw new CredentialLockdownError();
+  }
 
   private isExpired(createdAt: number, lastUsedAt: number, now = Date.now()): boolean {
     if (this.ttl.idleMs != null && now - lastUsedAt > this.ttl.idleMs) return true;
@@ -124,6 +150,7 @@ export class Vault {
     onDecrypt?: () => void,
     expectedId?: string,
   ): Promise<StoredCredential | null> {
+    this.assertNotLockedDown(); // serving a credential is denied under lockdown (#239)
     if (expectedId !== undefined && !isInteractionId(expectedId)) return null;
     const row = await this.fetchRow(owner, provider, expectedId);
     if (!row) return null;
@@ -136,6 +163,10 @@ export class Vault {
    * past its local TTL may still be live at the provider, so disconnect/offboard must still hand
    * its token to the revoke endpoint. Never use this for injection — `get` stays the only read
    * gated on the TTL policy.
+   *
+   * Deliberately NOT `assertNotLockedDown`-gated (#239): like `deleteForRevoke`, this is a
+   * revocation-scoped read that break-glass must keep working during a lockdown/incident. Serving a
+   * credential to an agent goes through `get`, which IS gated — do not route injection through here.
    */
   async getForRevoke(owner: Owner, provider: string): Promise<StoredCredential | null> {
     const row = await this.fetchRow(owner, provider);
@@ -716,6 +747,7 @@ export class Vault {
     prepared: Awaited<ReturnType<Vault['sealedToken']>>,
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
+    this.assertNotLockedDown(); // minting a credential is denied under lockdown (#239)
     await tx.run(
       `INSERT INTO connection
          (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
@@ -748,6 +780,7 @@ export class Vault {
     prepared: Awaited<ReturnType<Vault['sealedToken']>>,
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<boolean> {
+    this.assertNotLockedDown(); // minting a (dry-run) credential is denied under lockdown (#239)
     const { changes } = await tx.run(
       `INSERT INTO connection
          (id, enterprise_id, team_id, owner_kind, owner_id, provider, source,
@@ -782,6 +815,7 @@ export class Vault {
     r: { source: string; secretRef: string; scopes?: string; externalAccount?: string | null },
     afterWrite?: (tx: Db) => Promise<void>,
   ): Promise<void> {
+    this.assertNotLockedDown(); // minting a referenced credential is denied under lockdown (#239)
     const now = Date.now();
     await tx.run(
       `INSERT INTO connection
@@ -961,6 +995,7 @@ export class Vault {
     expectedId?: string,
   ): Promise<boolean> {
     if (expectedId !== undefined && !isInteractionId(expectedId)) return false;
+    this.assertNotLockedDown(); // a silent refresh write is denied under lockdown (#239)
     const accessEnc = await seal(t.accessToken, this.key, this.envelope);
     const refreshEnc = t.refreshToken ? await seal(t.refreshToken, this.key, this.envelope) : null;
     const result = await this.db.run(
@@ -1001,7 +1036,7 @@ export class Vault {
     fn: (locked: Vault, tx: Db) => Promise<T>,
   ): Promise<T> {
     const run = (tx: Db) => {
-      const locked = new Vault(tx, this.key, this.ttl, this.envelope);
+      const locked = new Vault(tx, this.key, this.ttl, this.envelope, this.lockdown);
       locked.credentialLockHeld = true;
       return fn(locked, tx);
     };

@@ -44,7 +44,7 @@ export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval
 // sweepExpired() method; the lower-level core sweepExpired/TtlPolicy remain exported below.
 export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
-export { Vault } from './core/vault';
+export { Vault, CredentialLockdownError } from './core/vault';
 export { Audit } from './core/audit';
 export { Consent } from './core/consent';
 export type { ConsentRequest } from './core/consent';
@@ -128,6 +128,11 @@ export { offboardUserEverywhere } from './core/offboard';
 // #54 single-user lifecycle helpers, exported so a headless host can drive offboarding / TTL sweep
 // in-process (the same core the /v1/disconnect, /v1/admin/offboard routes and broker-server timer use).
 export { offboardUser, disconnectProvider } from './core/offboard';
+// #239 deployment-wide emergency invalidation, exported so a headless host can drive the same
+// break-glass the `vouchr revoke --all` CLI does. Containment (VOUCHR_LOCKDOWN) is wired at the Vault
+// (see CredentialLockdownError); this is the local-delete + best-effort upstream-revoke primitive.
+export { revokeAllCredentials, enumerateStoredProviders } from './core/offboard';
+export type { RevokeAllDeps, RevokeAllReport, RevokeCategory } from './core/offboard';
 export { sweepExpired } from './core/sweep';
 // Exported wire RESPONSE types for the HTTP broker — the request types (BrokerFetchRequest,
 // ConnectionHandleRef) were already exported; these give clients the response contract too, so they

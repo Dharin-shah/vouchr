@@ -35,7 +35,9 @@ permissions, their consent.
 - **Governed in Slack.** Admins choose per channel: personal accounts, thread-scoped
   approvals, or one shared team credential — via `/vouchr` or the App Home tab.
 - **Accountable and revocable.** Every action is tied to the Slack identity that authorized
-  it; deactivating someone in Slack revokes their credentials.
+  it; deactivating someone in Slack revokes their credentials. For a full compromise, one tested
+  break-glass — `vouchr revoke --all --confirm ALL-CREDENTIALS` plus `VOUCHR_LOCKDOWN` containment —
+  wipes every stored credential and denies all serving before secret access (see [SECURITY.md](./SECURITY.md)).
 - **Self-hosted.** Your infrastructure, your PostgreSQL, your keys (or your KMS).
 
 ## Quickstart

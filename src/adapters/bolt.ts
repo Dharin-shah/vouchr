@@ -41,6 +41,7 @@ import {
   disconnectConnectionGeneration,
 } from '../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
+import { booleanEnv } from '../core/options';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
 import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
@@ -2243,7 +2244,12 @@ export async function createVouchr(opts: VouchrOptions) {
       throw e;
     }
   }
-  const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
+  // #239 deployment-wide containment, from deployment env OUTSIDE the credential DB. When set, this
+  // control plane's Vault refuses to serve/mint/refresh credentials so a compromised deployment
+  // cannot be used to inject or resurrect one while the incident is contained; break-glass deletion
+  // stays open. A config typo fails boot closed (booleanEnv).
+  const lockdown = booleanEnv(process.env.VOUCHR_LOCKDOWN, 'VOUCHR_LOCKDOWN');
+  const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope, lockdown);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
   const consent = new Consent(db, dryRun);

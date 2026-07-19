@@ -32,7 +32,7 @@ export type { BuiltBroker } from '../bin/broker-server';
 // @slack in the graph. ──
 export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
-export { Vault } from './core/vault';
+export { Vault, CredentialLockdownError } from './core/vault';
 export type { TtlPolicy } from './core/vault';
 // #115 master keys for the direct-construction path: `new Vault(db, loadKeyring())`.
 export { loadKeyring } from './core/crypto';
