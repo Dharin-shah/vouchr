@@ -225,15 +225,20 @@ instance** to both Bolt's OAuth `installationStore` and `createVouchr`. When usi
 `ExpressReceiver`, the OAuth installer configuration belongs on the receiver; `new App({ receiver })`
 does not consume installer options placed on `App`:
 
+When you run with a KMS envelope (next section), pass the **same** `envelope` instance to the store
+as its third argument — `new DbInstallationStore(db, masterKey, envelope)` — so multi-workspace bot
+tokens get the same per-secret DEK + external-KEK protection as Vault credentials (#241). Omit it
+and installation `bot_token`/`data` stay direct-master-encrypted even under a configured KMS.
+
 ```ts
-const store = new DbInstallationStore(db, masterKey);
+const store = new DbInstallationStore(db, masterKey, envelope); // omit `envelope` if not using KMS
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
   clientId: process.env.SLACK_CLIENT_ID!,
   clientSecret: process.env.SLACK_CLIENT_SECRET!,
   stateSecret: process.env.SLACK_STATE_SECRET!,
-  scopes: ['chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
   installationStore: store,
 });
 const app = new App({ receiver });
@@ -242,9 +247,17 @@ const vouchr = await createVouchr({
   providers: [github()],
   baseUrl: process.env.PUBLIC_URL!,
   db,                       // inject the SAME handle the store uses → one shared pool, not two
+  envelope,                 // the SAME KMS boundary protects Vault connection tokens
   installationStore: store, // confirmation DM uses the connecting user's workspace token
 });
 ```
+
+The built-in store parses `VOUCHR_LOCKDOWN` itself because Bolt can fetch an installation before
+Vouchr middleware runs. During containment, `fetchInstallation` and `storeInstallation` fail before
+PostgreSQL/KMS access; deletion stays available. A direct host can additionally pass
+`{ lockdown: true }` as the fourth constructor argument. `false` cannot override the deployment env.
+Custom installation stores must apply the same external gate; `createVouchr` will not query one for
+notification delivery while its own deployment lockdown is active.
 
 ## AWS Secrets Manager resolver
 
@@ -274,16 +287,24 @@ are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manage
 
 The runtime supports direct encryption with `VOUCHR_MASTER_KEY`, which remains useful for development,
 transition, and backward reads. The adopted production vision requires an `EnvelopeProvider` for
-Vault connection tokens: new writes wrap a fresh per-secret data key (DEK) with your KMS key (KEK),
-storing the wrapped DEK alongside the ciphertext. Enabling the envelope is backward-compatible, so
-existing direct rows still decrypt during migration.
+Vault connection tokens **and** multi-workspace Slack installation tokens (#241): new writes wrap a
+fresh per-secret data key (DEK) with your KMS key (KEK), storing the wrapped DEK alongside the
+ciphertext. Vault can read existing direct rows while their direct key remains configured. An
+envelope-enabled `DbInstallationStore` is stricter: it rejects direct/keyed rows unless the operator
+temporarily passes `{ allowDirectRowsDuringMigration: true }` as the fourth constructor argument.
+During that explicit cutover, reinstall/re-auth each workspace so the next write converts its row,
+then remove the option and perform a strict installation fetch/auth smoke for every workspace.
+Do not infer the stored scheme from the first byte alone: a historical unprefixed IV can equal the
+envelope marker. `vouchr rekey` rotates the
+direct-path master key across both tables; it skips envelope rows (which rotate in KMS) and does not
+convert direct rows to envelope.
 
 The interface (`src/core/crypto.ts`) is two async methods:
 
 ```ts
 interface EnvelopeProvider {
-  wrapDataKey(dek: Buffer): Promise<Buffer>;
-  unwrapDataKey(wrapped: Buffer): Promise<Buffer>;
+  wrapDataKey(dek: Buffer, signal?: AbortSignal): Promise<Buffer>;
+  unwrapDataKey(wrapped: Buffer, signal?: AbortSignal): Promise<Buffer>;
 }
 ```
 
@@ -299,21 +320,32 @@ const kmsEnvelope: EnvelopeProvider = {
   // seal() mints its own DEK, so we KMS-Encrypt it to get the wrapped form.
   // (GenerateDataKey, which returns plaintext + ciphertext DEK in one call, is the
   //  alternative if you let KMS mint the DEK instead.)
-  async wrapDataKey(dek) {
-    const r = await kms.send(new EncryptCommand({ KeyId: KEY_ID, Plaintext: dek }));
+  async wrapDataKey(dek, signal) {
+    const r = await kms.send(
+      new EncryptCommand({ KeyId: KEY_ID, Plaintext: dek }),
+      signal ? { abortSignal: signal } : undefined,
+    );
     return Buffer.from(r.CiphertextBlob!);
   },
-  async unwrapDataKey(wrapped) {
-    const r = await kms.send(new DecryptCommand({ KeyId: KEY_ID, CiphertextBlob: wrapped }));
+  async unwrapDataKey(wrapped, signal) {
+    const r = await kms.send(
+      new DecryptCommand({ KeyId: KEY_ID, CiphertextBlob: wrapped }),
+      signal ? { abortSignal: signal } : undefined,
+    );
     return Buffer.from(r.Plaintext!);
   },
 };
 
 const vouchr = await createVouchr({ /* ... */, envelope: kmsEnvelope });
+// Multi-workspace: hand the SAME envelope to the installation store, or its bot tokens stay
+// direct-master-encrypted.
+const installationStore = new DbInstallationStore(db, masterKey, kmsEnvelope);
 ```
 
 IAM: `kms:Encrypt` and `kms:Decrypt` on that one key. See `test/envelope.test.ts` for the worked
-sketch this is drawn from.
+sketch this is drawn from, and `test/installation.test.ts` for the multi-workspace round-trip. Pass
+the optional `signal` to the KMS client: emergency revocation bounds each unwrap and continues local
+deletion when KMS stalls.
 
 ## Standalone headless broker (no Slack)
 
@@ -542,13 +574,53 @@ POST /v1/admin/reference
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
+| `VOUCHR_LOCKDOWN` | no | `1`/`true` puts this replica into #239 containment: readiness → 503 and credential serving, refresh, OAuth-callback writes, resolver access, credential/reference setup, and built-in Slack installation reads/writes are denied before any secret is read. `0`/`false` disables; any other value refuses boot. Break-glass deletion still works during lockdown. Authority is this env, **outside** the credential database. See [Incident break-glass](#incident-break-glass-239). |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 
 Boot validation is fail-fast and names the missing variable; nothing sensitive is logged (startup
-prints one line: port, backend, provider ids, `allowWrites`, and `dryRun=true` when dry-run is on).
-A configured `defaultDeny: true` policy with zero rules also emits a warning that every provider is
-denied; this is valid configuration, not a startup failure.
+prints one line: port, backend, provider ids, `allowWrites`, `dryRun=true` when dry-run is on, and
+`lockdown=true` when locked down). A configured `defaultDeny: true` policy with zero rules also emits
+a warning that every provider is denied; this is valid configuration, not a startup failure.
+
+### Incident break-glass (#239)
+
+Two credential-store incidents demand different responses:
+
+- **Read-only PostgreSQL dump, master key / KMS uncompromised.** Token columns stay encrypted; only
+  owner/provider/scope/timestamp metadata leaks. Contain the database incident and review KMS access
+  logs. Global token revocation is a risk decision here, not automatically required.
+- **Database dump *plus* a decryption path** — leaked master key, compromised KMS/workload role, or a
+  compromised live replica. Assume every reachable access/refresh token, static credential, Slack
+  installation token, and resolved external credential may have been copied. Run the full procedure:
+
+  1. **Contain outside the process first.** Remove broker/Slack ingress and provider egress, quarantine
+     every replica, and revoke the workload's database/KMS/resolver identity. Set `VOUCHR_LOCKDOWN=1`
+     on any replica you keep running: it fails readiness (drops from rotation) and denies serving,
+     refresh, callback writes, resolver access, and setup before secret access. A flag inside the
+     compromised database would not be trustworthy — the authority is the deployment env.
+  2. **Invalidate locally.** `vouchr revoke --all` (dry-run) to preview counts, then
+     `vouchr revoke --all --confirm ALL-CREDENTIALS`. It deletes every credential, external reference,
+     pending consent, session grant/request, action approval, notification-state row, and Slack
+     installation — no key/KMS/provider config required — and attempts bounded best-effort upstream
+     revocation per provider. Dry-run uses `would_attempt`; execution reports attempted rows plus
+     `revoked`/`failed`/`unsupported`/`undecryptable`/`unresolved`/`external_reference`/`synthetic`.
+     Removed/unregistered ids are aggregated without printing untrusted database text. It exits
+     non-zero while any local row remains and is safe to re-run.
+  3. **Rotate and recover.** Rotate master keys/KMS permissions, broker identity-signing keys, OAuth
+     client secrets, Slack installation credentials, database credentials, and resolver roles per the
+     incident scope. Deploy from a trusted image, clear `VOUCHR_LOCKDOWN`, and require users/admins to
+     reconnect. Do not leave the compromised direct key in `VOUCHR_MASTER_KEYS`, or leave the old KMS
+     key/grant usable by a serving workload: adding a new primary alone does not make old ciphertext
+     unreadable. Quarantine pre-incident backups. If one must be restored, restore it only into an
+     isolated deployment that is still locked down, run the global invalidation there, and move to
+     fresh keys before any ingress is restored. That is the explicit, audited break-glass decision;
+     restoring an old database directly into a serving deployment is not supported recovery.
+
+  **Local deletion is not upstream revocation.** A bearer an attacker already copied stays valid at the
+  provider until it expires or is rotated; providers with no revoke endpoint, undecryptable tokens, and
+  external references need manual rotation; invalidated installations require each workspace to
+  reinstall the Slack app. The tabletop/drill that exercises this end to end is tracked under #216.
 
 ### Provider config (declarative)
 
@@ -587,6 +659,9 @@ The validator is strict and fail-fast at config load:
   revoke, and the built-in account probe. It defaults to `10000` and must be a positive safe integer
   within Node's timer range. Configure it on the provider definition/JSON, not as a process-global
   environment variable, so a deliberately slow OAuth provider does not weaken every other provider.
+- **`revokeTarget`** — `access`, `refresh`, `both`, or `grant`. It declares what must be invalidated
+  upstream. A provider with a revoke endpoint and possible refresh tokens must set it explicitly;
+  Vouchr refuses startup rather than assume revoking an access token also kills refresh authority.
 - **`egressAllow`** hosts are lower-cased and must be bare hostnames (no scheme/port/path);
   **`egressPaths`** must be absolute (`/repos`); **`egressMethods`** are normalized (`" post "` →
   `POST`). Canonicalizing once at load means the value the injector compares at egress is exactly what
@@ -598,9 +673,9 @@ The validator is strict and fail-fast at config load:
   `redirect_uri` would defeat the single-use CSRF `state`.
 - The full declarative surface also includes `scopeDescriptions` (non-blank, escaped per-scope
   consent copy; scope ids/descriptions are at most 512 characters and the default list at most 48),
-  `publicClient` (PKCE-only, no secret), `revokeAuth` (`none`/`body`), `oauthTimeoutMs`, `egressResponse`
-  (`maxBytes` / `allowContentTypes` / `stripHeaders`), and `rateLimit` (`perMinute` / `burst`) —
-  each validated identically to its in-code form.
+  `publicClient` (PKCE-only, no secret), `revokeAuth` (`none`/`body`), `revokeTarget`,
+  `oauthTimeoutMs`, `egressResponse` (`maxBytes` / `allowContentTypes` / `stripHeaders`), and
+  `rateLimit` (`perMinute` / `burst`) — each validated identically to its in-code form.
 
 Validation produces the immutable snapshot used at runtime; mutating the object originally passed by
 code cannot add an egress host, path, or method after registration. `callbackPath` is likewise a
@@ -949,14 +1024,16 @@ recommend:
 
 - **A KMS envelope** (`VOUCHR_KMS_KEY_ID`) — per-secret KMS-wrapped data keys for Vault connection
   tokens, not just storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA
-  ServiceAccount. Multi-workspace installation tokens remain direct-master encrypted until #241.
+  ServiceAccount. In a multi-workspace control plane, pass the same envelope to
+  `DbInstallationStore` so Slack installation `bot_token`/`data` use that boundary too.
 - **Static channel policy** (`VOUCHR_POLICY_FILE`) for sensitive providers — keep the reviewed JSON
   beside the deployment manifest and use `defaultDeny: true` when every provider must be explicitly
   scoped. Runtime `ChannelTools` remains a second, independently enforced admin control.
 
 The runtime will boot without KMS, but the adopted production vision requires it. Enabling KMS in the
-reference manifest means uncommenting `VOUCHR_KMS_KEY_ID` and adding `@aws-sdk/client-kms` to the
-image together; a multi-workspace production claim additionally waits for #241.
+reference manifest means uncommenting `VOUCHR_KMS_KEY_ID`, adding `@aws-sdk/client-kms` to the
+image, and—when Bolt serves multiple workspaces—passing the resulting envelope to the shared
+`DbInstallationStore`.
 
 ### Resource bounds and the scaling envelope (#209)
 
@@ -1057,7 +1134,7 @@ static-policy enforcement, rather than assuming a Slack control write reaches ev
 | Slack scopes / events / interactivity applied from the manifest | operator (manifest provided) |
 | TTL sweep scheduled (`sweepExpired()` on a timer) | Vouchr provides; Bolt: schedule `vouchr.sweepExpired()`. Headless: `broker-server` runs it automatically; direct brokers schedule `server.sweepExpired()` (#54) |
 | Offboarding wired so deactivated users lose access | Vouchr provides; Bolt: `registerOffboarding`. Headless: `POST /v1/admin/offboard` from your deprovision hook (#54) |
-| KMS envelope configured for production Vault token columns; multi-workspace installation-token gap #241 closed before launch | Vouchr/operator; currently blocked for multi-workspace |
+| Same KMS envelope configured for production Vault token columns and multi-workspace `DbInstallationStore`; wrap/unwrap failure alerts exercised | Vouchr/operator |
 | Backups of the credential store (and a restore drill) | operator |
 | Monitoring/alerting on resolver and KMS failures, and on auth/refresh errors | operator |
 | No-secret event callbacks feed operator-owned telemetry; callbacks remain best-effort/lossy and do not replace the audit table | operator (Vouchr provides hooks) |
@@ -1109,15 +1186,16 @@ Rotation is instead built in via `VOUCHR_MASTER_KEYS` (#115):
    redeploy. Keep a copy of the old key in your secret manager until backups that
    predate the rotation have aged out — restoring such a backup needs it.
 
-**Compromise response**: rotate as above, but treat the data as exposed — a leaked
-master key means the ciphertext may already be decrypted. Revoke the affected provider
-tokens upstream (`vouchr revoke`) regardless; rekeying does not un-leak them.
+**Compromise response:** do not use the availability-preserving sequence above as the incident
+procedure: retaining the old key keeps pre-incident ciphertext usable. Follow
+[Incident break-glass](#incident-break-glass-239), revoke upstream where possible, remove the old key
+from every serving keyring, and quarantine affected backups. Rekeying does not un-leak a secret.
 
 **Direct vs envelope — which to run?** Direct multi-key mode is the local/development
-and transition path. It is zero-dependency, but each rotation rewrites every direct
-row. The adopted production vision requires envelope mode for Vault connection
-tokens. Multi-workspace Slack installation rows still require the direct key until
-#241 closes, so a current mixed deployment must protect and rotate both boundaries.
+and explicit transition path. It is zero-dependency, but each rotation rewrites every direct
+row. The adopted production vision requires envelope mode for both Vault connection tokens and
+multi-workspace Slack installation `bot_token`/`data`. Pass the same envelope instance to
+`createVouchr` and `DbInstallationStore`.
 
 ### Envelope mode (KMS-wrapped data keys): required by the production vision
 
@@ -1125,8 +1203,8 @@ With an `EnvelopeProvider`, each secret has its own data key (DEK) wrapped by yo
 external key-encryption key (KEK) in KMS/Vault. Scheme `0x01` rows store the *wrapped*
 DEK alongside the ciphertext; decryption calls `unwrapDataKey` (a KMS `Decrypt`).
 
-This currently applies to Vault connection rows only. `DbInstallationStore` still
-uses direct master-key encryption for Slack installation `bot_token`/`data`; see #241.
+This applies to Vault connection rows and, when the same provider is passed as its third
+constructor argument, both encrypted `DbInstallationStore` columns.
 
 - **Rotate the KEK in KMS, not the rows.** AWS KMS (and equivalents) version the key
   under a stable key id / alias: rotation creates a new backing key while the old
@@ -1137,10 +1215,10 @@ uses direct master-key encryption for Slack installation `bot_token`/`data`; see
   wrapped under) remains available to `unwrapDataKey`. Do not disable or schedule
   deletion of an old KEK version while rows wrapped under it still exist.
 - **`VOUCHR_MASTER_KEY`/`VOUCHR_MASTER_KEYS` in envelope mode** still decrypt any
-  *direct* rows written before you enabled envelope (reads dispatch on format). Don't
-  drop them until those rows are gone. Note `vouchr rekey` rotates direct rows between
-  *direct* keys; it does not convert rows to envelope — that happens as users
-  reconnect (each `upsert` re-seals in the current mode).
+  *direct Vault rows* written before you enabled envelope (reads dispatch on format). Installation
+  rows require the explicit migration option above. Don't drop a direct key until its rows and
+  dependent backups are gone. `vouchr rekey` rotates direct rows between direct keys; it does not
+  convert rows to envelope — that happens on a current credential/install write.
 
 ## Audit retention (#208)
 
@@ -1202,11 +1280,11 @@ The credential store and the key that protects it must be backed up **separately
   backup.** A backup that contains both the ciphertext and the key is a single point
   of compromise that leaks everything; a DB backup without the key is useless to an
   attacker (and useless to you for restore, hence "separately", not "not at all").
-- **Envelope mode:** Vault connection-token DEKs are wrapped by the KMS KEK, so those
-  ciphertexts need KMS access. Retain the KEK and every backing version needed by the
-  backup. In a current multi-workspace deployment, installation rows remain direct-
-  master encrypted (#241), so the matching direct key must also be backed up separately.
-  Treat scheduled KEK deletion or direct-key loss as a backup-invalidating event.
+- **Envelope mode:** Vault connection-token and multi-workspace Slack installation DEKs are
+  wrapped by the KMS KEK, so those ciphertexts need KMS access. Retain the KEK and every backing
+  version needed by the backup. If an explicit transition still retains direct rows, preserve their
+  matching direct key separately until those rows and every dependent backup have been replaced.
+  Treat scheduled KEK deletion or required-key loss as a backup-invalidating event.
 - **Validated external-reference rows** created through Bolt/headless contain no secret at all
   (only a supported `secret_ref`); the secret lives in the external manager and is backed up there,
   on its own policy. Privileged low-level `Vault.reference()` callers must preserve that invariant.
@@ -1220,6 +1298,11 @@ The credential store and the key that protects it must be backed up **separately
   Store the copy encrypted at rest.
 
 ### Restoring
+
+For routine disaster recovery, retain the matching keys as described below. After a suspected key,
+KMS-role, or live-replica compromise, that routine is deliberately unavailable: keep the restored
+environment isolated with `VOUCHR_LOCKDOWN=1`, never attach the compromised key/grant to a serving
+workload, and follow [Incident break-glass](#incident-break-glass-239) before restoring ingress.
 
 1. Restore the DB (`pg_restore` / snapshot).
 2. Make the key available to the *same* process: set `VOUCHR_MASTER_KEY` to the exact

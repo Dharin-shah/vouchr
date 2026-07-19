@@ -85,6 +85,38 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   setup requests are counted and purged with their channel/team/global scope. A fresh setup begun
   after the marker remains possible. `--user` and `--channel` are distinct owner scopes, dry-run
   writes no marker, and raw scope ids are represented durably only by fixed server-derived hashes.
+- **Deployment-wide compromise has its own break-glass.** Distinguish two incidents. A **read-only
+  PostgreSQL dump with the KMS/master key uncompromised** exposes owner/provider/scope/timestamp
+  metadata but not token plaintext — contain the database incident and check KMS access logs; global
+  revocation is a risk decision, not automatically required. A **database dump *plus* a decryption
+  path** (leaked master key, compromised KMS/workload role, or a compromised live replica) must be
+  treated as full credential exposure. For that case, `vouchr revoke --all --confirm ALL-CREDENTIALS`
+  locally deletes every stored credential, external reference, pending consent, session grant/request,
+  action approval, notification-state row, and Slack installation, then attempts best-effort upstream
+  revocation per provider and reports real attempted counts separately from success/failure. A
+  refresh-capable revocable provider must declare whether invalidation targets the access token,
+  refresh token, both, or the whole grant; Vouchr does not infer that contract. Local deletion is
+  guaranteed even with the master key or provider config unavailable; it is dry-run by default and
+  requires the exact confirmation token to execute. **Local deletion is not upstream revocation.** A token an attacker
+  already copied stays valid at the provider until it expires or is rotated; providers without a
+  revoke endpoint, undecryptable tokens, and external references require manual rotation; invalidated
+  Slack installations require each workspace to reinstall the app. Rotate master keys, OAuth client
+  secrets, Slack credentials, database and resolver roles per the incident scope, and require users to
+  reconnect, before serving traffic again. Remove a compromised direct key from every active keyring
+  and revoke/disable the old KMS grant or key for serving workloads; merely adding a new primary still
+  decrypts old rows. A pre-incident backup may be restored only into an isolated locked-down deployment
+  for an explicit global invalidation before ingress returns. The command exits non-zero while any
+  local credential/authorization row remains.
+- **Containment must come from outside the credential database.** Set `VOUCHR_LOCKDOWN=1` on the
+  deployment (never a flag inside the potentially-compromised database) to fail closed: readiness
+  reports 503 (so an orchestrator pulls the replica from rotation) and credential serving, refresh,
+  OAuth-callback writes, resolver access, and credential/reference setup are all denied *before* any
+  secret is read, on every replica configured with it. The built-in `DbInstallationStore` also denies
+  Slack installation-token reads and writes before PostgreSQL/KMS access; custom stores must enforce
+  the same gate. Break-glass deletion and metadata reads stay available so `vouchr revoke` still works
+  during lockdown. This is defense-in-depth on top of, not a replacement for, infrastructure
+  containment (removing ingress/egress and quarantining replicas when the running workload itself may
+  be compromised).
 - **Audit metadata is caller-supplied.** Vouchr's own code keeps secrets out of `audit.meta`
   (and tests enforce it), but a custom provider/`accountProbe` or caller could put sensitive data
   in metadata. Don't.
@@ -96,8 +128,9 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   [threat model](./guides/THREAT-MODEL.md#audit-completeness-is-best-effort-by-design).
 - **The Postgres database is not wholly encrypted at rest.** Credential-bearing columns are
   encrypted; the rest of the row and the database are not. Use disk/database encryption and access
-  control at the infra layer (envelope encryption via an `EnvelopeProvider` raises the bar on Vault
-  connection tokens; multi-workspace installation tokens remain direct-master encrypted until #241).
+  control at the infra layer. In production, pass the same `EnvelopeProvider` to `createVouchr`
+  and `DbInstallationStore`: Vault connection tokens and multi-workspace Slack installation
+  `bot_token`/`data` then use per-secret DEKs wrapped by the external KEK.
 
 ## Operator responsibilities
 

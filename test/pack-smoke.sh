@@ -30,6 +30,9 @@ echo "==> require() every published entrypoint (CJS exports map)"
   const root = require('@vouchr/core');
   const headless = require('@vouchr/core/headless');
   require('@vouchr/core/broker-server');
+  if (typeof root.DbInstallationStore !== 'function') {
+    throw new Error('missing packed DbInstallationStore export');
+  }
   for (const surface of [root, headless]) {
     for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity',
       'ConsentRequiredError', 'SessionApprovalRequiredError', 'ApprovalRequiredError',
@@ -38,7 +41,7 @@ echo "==> require() every published entrypoint (CJS exports map)"
       'ResolverConfigurationError', 'ResolverFailedError',
       'ResponseBlockedError', 'RateLimitedError', 'SecretReferenceError', 'TokenEndpointError',
       'UpstreamTimeoutError', 'UserFacingError',
-      'isVouchrErrorCode', 'mapSafeError', 'safeUserMessage']) {
+      'isVouchrErrorCode', 'mapSafeError', 'safeUserMessage', 'revokeAllCredentials']) {
       if (typeof surface[name] !== 'function') throw new Error('missing packed export: ' + name);
     }
     if (!Array.isArray(surface.VOUCHR_ERROR_CODES) || !Array.isArray(surface.VOUCHR_RECOVERY_ACTIONS)
@@ -169,13 +172,14 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import {
-  createVouchr, disconnectProvider, type ConnectContext,
+  createVouchr, disconnectProvider, type ConnectContext, type DbInstallationStoreOptions,
 } from '@vouchr/core';
 import {
   isVouchrErrorCode as isRootVouchrErrorCode, type BrokerDenialRecovery,
 } from '@vouchr/core';
 import {
   ChannelConfig, ChannelTools, Vault, createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
+  revokeAllCredentials,
   ConsentRequiredError, SessionApprovalRequiredError, ApprovalRequiredError,
   ApprovalPathTooLongError, InteractionStateChangedError,
   EgressBlockedError, NoConnectionError, PolicyDeniedError, ToolDisabledError,
@@ -187,13 +191,18 @@ import {
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type BrokerServer, type IdentityConfig,
   type ConsentPromptState,
   type SecretReferenceErrorCode, type TokenEndpointFailureKind, type VouchrErrorCode,
-  type VouchrRecovery, type VouchrSafeError,
+  type VouchrRecovery, type VouchrSafeError, type RevokeAllReport,
 } from '@vouchr/core/headless';
 
 const identity: IdentityConfig = loadIdentityConfig({
   VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
   VOUCHR_DEPLOYMENT_ID: 'packed-consumer',
 });
+const installationMigration: DbInstallationStoreOptions = {
+  allowDirectRowsDuringMigration: true,
+  lockdown: true,
+};
+void installationMigration;
 const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
 void verifyIdentity(identityToken, identity);
 type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : false;
@@ -218,6 +227,7 @@ type RootHasSessions = 'SessionGrants' extends keyof RootSurface ? true : false;
 type RootHasApprovals = 'Approvals' extends keyof RootSurface ? true : false;
 type HeadlessHasSessions = 'SessionGrants' extends keyof HeadlessSurface ? true : false;
 type HeadlessHasApprovals = 'Approvals' extends keyof HeadlessSurface ? true : false;
+type HeadlessHasRawProviderEnumeration = 'enumerateStoredProviders' extends keyof HeadlessSurface ? true : false;
 type DirectBroker = ReturnType<typeof createBroker>;
 type DirectBrokerHasSweep = 'sweepExpired' extends keyof DirectBroker ? true : false;
 type DirectBrokerMatchesExport = DirectBroker extends BrokerServer ? true : false;
@@ -241,6 +251,7 @@ const exactBrokerRecoveryStatuses: [true, true] = null as unknown as [
 const noUnsafeInteractionExports: [false, false, false, false] = null as unknown as [
   RootHasSessions, RootHasApprovals, HeadlessHasSessions, HeadlessHasApprovals,
 ];
+const noRawProviderEnumeration: false = null as unknown as HeadlessHasRawProviderEnumeration;
 const safeBrokerLifecycle: [true, true, true] = null as unknown as [
   DirectBrokerHasSweep, DirectBrokerMatchesExport, RootDirectBrokerHasSweep,
 ];
@@ -260,6 +271,9 @@ void noPreviewConfig;
 void hasBrokerDenialRecovery;
 void exactBrokerRecoveryStatuses;
 void noUnsafeInteractionExports;
+void noRawProviderEnumeration;
+void revokeAllCredentials;
+void (null as unknown as RevokeAllReport);
 void safeBrokerLifecycle;
 void noRawGovernanceWrites;
 void noRawApprovalPath;

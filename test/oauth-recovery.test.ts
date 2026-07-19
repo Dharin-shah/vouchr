@@ -4,6 +4,7 @@ import { test, type TestContext } from 'node:test';
 import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import {
   APPROVAL_FANOUT_CONCURRENCY,
+  ConnectContext,
   createVouchr,
   MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS,
   PromptFanoutDeadlineError,
@@ -24,7 +25,8 @@ import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core
 import type { SlackIdentity } from '../src/core/identity';
 import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
-import { Vault } from '../src/core/vault';
+import { Policy } from '../src/core/policy';
+import { CredentialLockdownError, Vault } from '../src/core/vault';
 import { openTestDb, testDbUrl } from './support/pg';
 
 const KEY = randomBytes(32);
@@ -73,6 +75,124 @@ async function openReplicaPair(t: TestContext) {
   });
   return { a, b };
 }
+
+test('lockdown refuses an OAuth callback before state consumption or token exchange', async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const deps = {
+    registry: new ProviderRegistry([provider]),
+    vault: new Vault(db, KEY, {}, undefined, true),
+    audit: new Audit(db),
+    consent,
+    redirectUri: 'https://vouchr.test/callback',
+  };
+  let calls = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    calls++;
+    return new Response(JSON.stringify({ access_token: 'MUST_NOT_BE_MINTED' }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await handleOAuthCallback(deps, 'authorization-code', pending.state);
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, 'service_unavailable');
+    assert.equal(result.status, 503);
+    assert.equal(calls, 0, 'lockdown must refuse before the provider token endpoint');
+    const row = await db.get<{ consumed_at: number | null }>(
+      'SELECT consumed_at FROM consent_request WHERE state=?',
+      [pending.state],
+    );
+    assert.equal(row?.consumed_at, null, 'lockdown must leave the single-use state untouched');
+    assert.equal(
+      (await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM connection'))?.n,
+      0,
+    );
+    assert.equal(
+      (await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM audit'))?.n,
+      0,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('lockdown refuses Bolt connect before posting a credential prompt', async (t) => {
+  const db = await openTestDb(t);
+  const posts: unknown[] = [];
+  const client = {
+    chat: {
+      postEphemeral: async (args: unknown) => { posts.push(args); },
+      postMessage: async (args: unknown) => { posts.push(args); },
+    },
+  } as unknown as WebClient;
+  const context = new ConnectContext({
+    identity: ID,
+    channel: 'C1',
+    client,
+    registry: new ProviderRegistry([provider]),
+    vault: new Vault(db, KEY, {}, undefined, true),
+    audit: new Audit(db),
+    consent: new Consent(db),
+    policy: new Policy(),
+    redirectUri: 'https://vouchr.test/callback',
+  });
+
+  await assert.rejects(() => context.connect('acme'), CredentialLockdownError);
+  assert.equal(posts.length, 0, 'lockdown must not ask a human to authorize a credential');
+  assert.equal(
+    (await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM consent_request'))?.n,
+    0,
+    'lockdown must not mint pending setup authority',
+  );
+});
+
+test('lockdown lifecycle notifications never query a custom Slack installation store', async (t) => {
+  const db = await openTestDb(t);
+  const hour = 60 * 60 * 1_000;
+  const seed = new Vault(db, KEY, { maxAgeMs: 100 * hour });
+  await seed.upsert(userOwner(ID), provider.id, {
+    accessToken: 'seed-token',
+    refreshToken: null,
+    scopes: '',
+    expiresAt: null,
+    externalAccount: null,
+  });
+  const aged = Date.now() - 30 * hour;
+  await db.run(
+    'UPDATE connection SET created_at=?, last_used_at=? WHERE team_id=? AND owner_id=? AND provider=?',
+    [aged, aged, ID.teamId, ID.userId, provider.id],
+  );
+
+  const previousKey = process.env.VOUCHR_MASTER_KEY;
+  const previousLockdown = process.env.VOUCHR_LOCKDOWN;
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  process.env.VOUCHR_LOCKDOWN = '1';
+  let lookups = 0;
+  try {
+    const vouchr = await createVouchr({
+      providers: [provider],
+      baseUrl: 'https://vouchr.test',
+      db,
+      ttl: { maxAgeMs: 100 * hour },
+      installationStore: {
+        async fetchInstallation() {
+          lookups++;
+          throw new Error('custom store must not be queried during lockdown');
+        },
+      } as any,
+    });
+    await vouchr.sweepExpired();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(lookups, 0);
+  } finally {
+    if (previousKey === undefined) delete process.env.VOUCHR_MASTER_KEY;
+    else process.env.VOUCHR_MASTER_KEY = previousKey;
+    if (previousLockdown === undefined) delete process.env.VOUCHR_LOCKDOWN;
+    else process.env.VOUCHR_LOCKDOWN = previousLockdown;
+  }
+});
 
 test('OAuth consent is one owner/provider generation and one delivered prompt across replicas', async (t) => {
   const { a, b } = await openReplicaPair(t);
@@ -650,7 +770,12 @@ test('Bolt callback response does not wait for a non-settling Slack recovery DM'
   );
   const prototype = WebClient.prototype as any;
   const realApiCall = prototype.apiCall;
-  prototype.apiCall = async () => new Promise(() => {});
+  let slackStartedResolve!: () => void;
+  const slackStarted = new Promise<void>((resolve) => { slackStartedResolve = resolve; });
+  prototype.apiCall = async () => {
+    slackStartedResolve();
+    return new Promise(() => {});
+  };
   try {
     const vouchr = await createVouchr({
       providers: [provider],
@@ -661,17 +786,14 @@ test('Bolt callback response does not wait for a non-settling Slack recovery DM'
     let callback: any;
     vouchr.mountRoutes({ get: (_path: string, handler: any) => { callback = handler; } });
     const response = fakeResponse();
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        callback({ query: { state: pending.state, error: 'access_denied' } }, response),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('browser callback waited for Slack')), 100);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    const callbackResult = Promise.resolve(
+      callback({ query: { state: pending.state, error: 'access_denied' } }, response),
+    );
+    void callbackResult.catch(() => undefined);
+    await slackStarted;
+    // Assert ordering at the exact point the non-settling side effect begins. A wall-clock race is
+    // both weaker and flaky under a loaded CI runner: if Slack were awaited before `send`, these
+    // values would still have their fake-response defaults when `apiCall` starts.
     assert.equal(response.statusCode, 400);
     assert.equal(response.body, 'OAuth authorization was denied. Please try again.');
   } finally {

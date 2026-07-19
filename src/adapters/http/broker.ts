@@ -690,6 +690,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   // #212 production broker boundary: no legacy bare-secret mode. Normalize once into a defensive,
   // deep-frozen config so caller mutation cannot change issuer/audience/keys after construction.
   const identityConfig = normalizeIdentityConfig(rawOpts.identitySecret);
+  // #239 one immutable source of truth: a broker cannot claim route lockdown while its Vault still
+  // serves secrets (or vice versa). Direct and packaged construction both derive from the Vault.
+  const lockdown = rawOpts.vault.lockdownEnabled;
   // Direct constructors do not pass through the env loader, but they still expose the broker bearer
   // and provider client secrets here. Enforce the same purpose-separation invariant before startup.
   assertIdentityPurposeDistinct(identityConfig, [
@@ -1854,6 +1857,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   // pile a new pair of queries onto the pool every two seconds. NO auth, NO vault, no error detail.
   let readinessFlight: { work: Promise<boolean>; result: Promise<boolean> } | undefined;
   async function handleReadyz(): Promise<{ status: number; payload: Record<string, unknown> }> {
+    // #239: a deployment in operator-declared lockdown is deliberately NOT ready — k8s pulls it from
+    // rotation. Reported before the DB probe so containment holds even if the store is unreachable.
+    if (lockdown) return { status: 503, payload: { ok: false } };
     if (!readinessFlight) {
       // allSettled is load-bearing: one check may fail immediately while its sibling DB query is
       // still running. Keep ownership until BOTH settle, otherwise the next probe starts another pair.
@@ -1928,6 +1934,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           const r = await handleReadyz();
           return send(r.status, r.payload);
         }
+
+        // #239 containment: once the deployment is locked down, refuse EVERY functional route 503
+        // before touching the admission lease, perimeter, identity, or vault — no credential is
+        // served, minted, refreshed, or resolved. Liveness/readiness were handled above.
+        if (lockdown) return send(503, { ok: false, error: 'locked_down' });
 
         // #209 one true global admission lease for every functional request. It is acquired before
         // async perimeter authorization or body buffering and released only after BOTH the handler

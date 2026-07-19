@@ -39,6 +39,8 @@ export interface BuiltBroker {
   allowWrites: boolean;
   /** #116 dry-run: real gates, no real network on any edge (VOUCHR_DRY_RUN). */
   dryRun: boolean;
+  /** #239 deployment-wide containment (VOUCHR_LOCKDOWN): readiness + functional routes fail closed. */
+  lockdown: boolean;
   /** Backward-compatible alias for server.sweepExpired(). The broker-owned sweep also reclaims its
    *  private interaction rows without exposing their mutation stores; the number counts expired
    *  credentials only. */
@@ -153,6 +155,9 @@ export async function buildBrokerServer(
   const port = nonNegativeIntegerEnv(env.VOUCHR_PORT, 'VOUCHR_PORT', 3000, 65_535);
 
   const allowWrites = booleanEnv(env.VOUCHR_ALLOW_WRITES, 'VOUCHR_ALLOW_WRITES');
+  // #239 deployment-wide containment. Authority is this deployment env, OUTSIDE the credential DB.
+  // When set, readiness + every functional route fail closed and the Vault refuses to serve/mint.
+  const lockdown = booleanEnv(env.VOUCHR_LOCKDOWN, 'VOUCHR_LOCKDOWN');
   // #116 dry-run: real gates, stubbed network edges (see BrokerOptions.dryRun). Same env style as
   // VOUCHR_ALLOW_WRITES; explicit 1/true enables and 0/false disables, while typos fail boot.
   const dryRun = booleanEnv(env.VOUCHR_DRY_RUN, 'VOUCHR_DRY_RUN');
@@ -222,7 +227,7 @@ export async function buildBrokerServer(
   try {
   // #116 startup hard-fail (createBroker re-runs the same check lazily): never dry-run a real vault.
   if (dryRun) await assertDryRunVault(db);
-  const vault = new Vault(db, masterKey, ttl, envelope);
+  const vault = new Vault(db, masterKey, ttl, envelope, lockdown);
   // #116: the SAME marked audit instance goes to createBroker and its broker-owned sweep, so
   // sweep-written rows (revoke reason 'expired') carry meta.dry_run too.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
@@ -275,6 +280,7 @@ export async function buildBrokerServer(
     providerIds: providers.map((p) => p.id),
     allowWrites,
     dryRun,
+    lockdown,
     sweep,
     sweepIntervalMs,
     shutdownTimeoutMs,
@@ -318,7 +324,8 @@ async function main(): Promise<void> {
     console.log(
       `[vouchr] broker listening port=${port} backend=${built.backend} ` +
         `providers=[${built.providerIds.join(',')}] allowWrites=${built.allowWrites}` +
-        (built.dryRun ? ' dryRun=true' : ''),
+        (built.dryRun ? ' dryRun=true' : '') +
+        (built.lockdown ? ' lockdown=true' : ''),
     );
   });
 

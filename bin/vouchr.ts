@@ -17,7 +17,7 @@
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
 import { openDb, migrate, type Db } from '../src/core/db';
-import { loadKeyring, type Keyring } from '../src/core/crypto';
+import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
 import {
@@ -34,7 +34,16 @@ import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { SessionGrants } from '../src/core/session';
 import { SECRET_REFERENCE_SOURCES } from '../src/core/reference';
-import { selectRevocations, revokeConnection, countPendingForProvider, purgePendingForProvider, type RevokeFilter } from '../src/core/offboard';
+import {
+  selectRevocations,
+  revokeConnection,
+  countPendingForProvider,
+  purgePendingForProvider,
+  revokeAllCredentials,
+  type RevokeFilter,
+  type RevokeAllReport,
+  type RevokeCategory,
+} from '../src/core/offboard';
 import { loadProviders } from './providerConfig';
 
 type Flags = { values: Record<string, string>; positional: string[] };
@@ -114,16 +123,40 @@ function destructiveIntent(v: StrictValues): 'go' | 'dry-run' | { error: string 
   return v.yes === true ? 'go' : 'dry-run';
 }
 
-const REVOKE_SPEC: FlagSpec = { db: 'string', provider: 'string', team: 'string', user: 'string', channel: 'string', yes: 'boolean', 'dry-run': 'boolean' };
+const REVOKE_SPEC: FlagSpec = { db: 'string', provider: 'string', team: 'string', user: 'string', channel: 'string', all: 'boolean', confirm: 'string', yes: 'boolean', 'dry-run': 'boolean' };
 const PRUNE_SPEC: FlagSpec = { db: 'string', 'older-than-days': 'string', batch: 'string', yes: 'boolean', 'dry-run': 'boolean' };
 
-type RevokePlan = { db?: string; filter: RevokeFilter; dryRun: boolean };
+/** The exact confirmation token a deployment-wide revoke requires — stronger than the surgical
+ *  path's bare `--yes` (#239: global execution must be intentionally difficult to trigger). */
+const REVOKE_ALL_CONFIRMATION = 'ALL-CREDENTIALS';
 
-/** Validate revoke's arguments BEFORE any DB opens: `--provider` is required, and the exact-bare-
- *  `--yes` confirmation is resolved here — so invalid usage exits 2 even if Postgres is unreachable. */
+type RevokePlan =
+  | { mode: 'provider'; db?: string; filter: RevokeFilter; dryRun: boolean }
+  | { mode: 'all'; db?: string; execute: boolean };
+
+/** Validate revoke's arguments BEFORE any DB opens so invalid usage exits 2 even if Postgres is
+ *  unreachable. Two shapes: the surgical provider-scoped path (`--provider` required, exact-bare
+ *  `--yes`) and the deployment-wide `--all` path (no owner scope; `--confirm ALL-CREDENTIALS`). */
 function planRevoke(v: StrictValues): RevokePlan | { error: string } {
+  if (v.all === true) {
+    // `--all` is the deployment-wide scope. It must not be narrowed (that would contradict "all")
+    // and uses its own stronger confirmation instead of `--yes`.
+    if (v.provider !== undefined) return { error: '--all revokes every provider; do not combine it with --provider' };
+    if (v.team !== undefined || v.user !== undefined || v.channel !== undefined) {
+      return { error: '--all takes no owner scope; it revokes every credential in the store' };
+    }
+    if (v.yes === true) return { error: `--all requires --confirm ${REVOKE_ALL_CONFIRMATION} (not --yes)` };
+    const confirm = v.confirm as string | undefined;
+    if (confirm === undefined) return { mode: 'all', db: v.db as string | undefined, execute: false };
+    if (v['dry-run'] === true) return { error: '--confirm and --dry-run are mutually exclusive' };
+    if (confirm !== REVOKE_ALL_CONFIRMATION) {
+      return { error: `--confirm must be exactly ${REVOKE_ALL_CONFIRMATION} to revoke every credential` };
+    }
+    return { mode: 'all', db: v.db as string | undefined, execute: true };
+  }
+  if (v.confirm !== undefined) return { error: `--confirm is only valid with --all (use --yes for a --provider revoke)` };
   const provider = v.provider as string | undefined;
-  if (!provider) return { error: '--provider <id> is required (refusing to revoke across every provider)' };
+  if (!provider) return { error: '--provider <id> is required (refusing to revoke across every provider); use --all --confirm ' + REVOKE_ALL_CONFIRMATION + ' for a deployment-wide revoke' };
   if (!isValidProviderId(provider)) return { error: '--provider must be a valid provider id' };
   if (v.user !== undefined && v.channel !== undefined) {
     return { error: '--user and --channel are mutually exclusive owner scopes' };
@@ -131,6 +164,7 @@ function planRevoke(v: StrictValues): RevokePlan | { error: string } {
   const intent = destructiveIntent(v);
   if (typeof intent === 'object') return intent;
   return {
+    mode: 'provider',
     db: v.db as string | undefined,
     filter: { provider, teamId: v.team as string | undefined, userId: v.user as string | undefined, channel: v.channel as string | undefined },
     dryRun: intent === 'dry-run',
@@ -222,7 +256,7 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
  * the upstream revoke, never to stdout. Pending consent/session/key-setup authority is cleared too.
  */
-async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
+async function cmdRevoke(db: Db, plan: Extract<RevokePlan, { mode: 'provider' }>): Promise<number> {
   const { filter, dryRun } = plan;
   const rows = await selectRevocations(db, filter);
   // SEC-1: scope values came directly from argv and may be credential-shaped. Report which canonical
@@ -285,7 +319,7 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
     console.error('revoke: master key unavailable; token decrypt + upstream revoke disabled — local deletion will proceed');
     key = Buffer.alloc(32); // never used to decrypt successfully; vault.delete needs no key
   }
-  const vault = new Vault(db, key);
+  const vault = new Vault(db, key, {}, await loadRevokeEnvelope());
   const audit = new Audit(db);
   const consent = new Consent(db);
   const sessions = new SessionGrants(db);
@@ -293,6 +327,7 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   let localRemoved = 0;
   let upstreamAttempted = 0;
   let upstreamFailures = 0;
+  let upstreamUnresolved = 0;
   let upstreamSkipped = 0;
   const revokeRows = async (batch: typeof rows) => {
     for (const row of batch) {
@@ -302,8 +337,13 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
         const r = await revokeConnection(vault, audit, consent, sessions, registry, row, filter.provider);
         if (r.removed) {
           localRemoved++;
-          if (r.upstreamAttempted) { upstreamAttempted++; if (!r.upstreamOk) upstreamFailures++; }
-          else upstreamSkipped++;
+          if (r.upstreamAttempted) {
+            upstreamAttempted++;
+            if (r.upstreamUnreadable || r.upstreamMissing) upstreamUnresolved++;
+            else if (!r.upstreamOk) upstreamFailures++;
+          }
+          else if (row.source !== 'vault' || row.hasReference || r.upstreamOk) upstreamSkipped++;
+          else upstreamUnresolved++;
         }
       } catch {
         // A provider/KMS extension may include credential material in a thrown value. Keep the
@@ -319,9 +359,13 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   if (settledRows.length) await revokeRows(settledRows);
   const remaining = await selectRevocations(db, filter);
   console.log(`\nRevoked ${localRemoved} locally; ${remaining.length} matching connection(s) remain.`);
-  // Report upstream honestly: attempted vs skipped (no revoke endpoint / no decryptable token) are NOT
-  // the same as success. A skip is not a failure, but it is not a revoke either.
-  console.log(`Upstream revoke: ${upstreamAttempted} attempted (${upstreamFailures} failed), ${upstreamSkipped} skipped (no revoke endpoint or no decryptable token).`);
+  // Report upstream honestly: unsupported/external/synthetic skips differ from required token
+  // material that could not be read or was absent. Neither is upstream success.
+  console.log(
+    `Upstream revoke: ${upstreamAttempted} attempted (${upstreamFailures} failed), ` +
+    `${upstreamUnresolved} unresolved (required token unavailable), ${upstreamSkipped} skipped ` +
+    '(unsupported provider, external reference, or synthetic row).',
+  );
   console.log(
     `Cleared ${purged.consents} pending consent + ${purged.requests} session request(s) + ` +
     `${purged.grants} session grant(s) + ${purged.provisioning} user setup request(s) + ` +
@@ -329,6 +373,141 @@ async function cmdRevoke(db: Db, plan: RevokePlan): Promise<number> {
   );
   // Non-zero only when local access remains; upstream failures do not fail the local kill.
   return remaining.length ? 1 : 0;
+}
+
+/** Best-effort KMS wiring for upstream revoke. The local delete never depends on this; an SDK,
+ * credential, KMS, or network failure only moves affected rows into the undecryptable bucket. */
+async function loadRevokeEnvelope(): Promise<EnvelopeProvider | undefined> {
+  const keyId = process.env.VOUCHR_KMS_KEY_ID;
+  if (!keyId) return undefined;
+  try {
+    const { kmsEnvelope, awsKmsClient } = await import('../src/adapters/kms.js');
+    return kmsEnvelope(keyId, await awsKmsClient({ region: process.env.AWS_REGION }));
+  } catch {
+    console.error('revoke: KMS unavailable; envelope token decrypt + upstream revoke disabled — local deletion will proceed');
+    return undefined;
+  }
+}
+
+/** Print a {@link RevokeAllReport} — safe counts and registry-trusted provider ids only (SEC-1). */
+function printRevokeAllReport(report: RevokeAllReport): void {
+  const cat = (c: RevokeCategory): number => report.upstream[c];
+  if (!report.executed) {
+    console.log(`DRY-RUN revoke --all: ${report.matched.connections} connection(s) across ${report.providerCount} provider(s).`);
+    console.log(
+      `  would attempt upstream revoke: ${cat('would_attempt')}; external reference (rotate in source manager): ${cat('external_reference')}; ` +
+      `no upstream revoke available: ${cat('unsupported')}; synthetic/dry-run: ${cat('synthetic')}.`,
+    );
+    if (report.byProvider.length || report.unregistered.providers) {
+      printTable(
+        ['provider', 'connections', 'would_attempt', 'unsupported', 'external', 'synthetic'],
+        [
+          ...report.byProvider.map((p) => [
+            p.provider, String(p.connections), String(p.upstream.would_attempt),
+            String(p.upstream.unsupported), String(p.upstream.external_reference), String(p.upstream.synthetic),
+          ]),
+          ...(report.unregistered.providers ? [[
+            `unregistered (${report.unregistered.providers})`, String(report.unregistered.connections),
+            String(report.unregistered.upstream.would_attempt), String(report.unregistered.upstream.unsupported),
+            String(report.unregistered.upstream.external_reference), String(report.unregistered.upstream.synthetic),
+          ]] : []),
+        ],
+      );
+    }
+    const m = report.matched;
+    console.log(
+      `Would also clear ${m.consents} pending consent + ${m.sessionRequests} session request(s) + ` +
+      `${m.sessionGrants} session grant(s) + ${m.approvals} approval(s) + ` +
+      `${m.userProvisioning} user setup + ${m.channelProvisioning} channel setup request(s) + ` +
+      `${m.notifications} notification state row(s), and invalidate ${m.installations} Slack installation(s).`,
+    );
+    console.log(`\nNo changes made. Re-run with --confirm ${REVOKE_ALL_CONFIRMATION} to revoke every credential.`);
+    return;
+  }
+  console.log(`REVOKE --all: ${report.matched.connections} connection(s) across ${report.providerCount} provider(s).`);
+  console.log(`Locally removed ${report.removedLocal} connection(s) via the per-provider sweep.`);
+  console.log(
+    `Upstream: ${report.upstreamAttempted} attempted; ${cat('revoked')} revoked, ` +
+    `${cat('revoke_failed')} failed (incl. timeouts), ` +
+    `${cat('unsupported')} unsupported (no revoke endpoint / unregistered provider), ` +
+    `${cat('undecryptable')} undecryptable (token unreadable — upstream NOT revoked), ` +
+    `${cat('unresolved')} unresolved (claim/required token unavailable), ` +
+    `${cat('external_reference')} external reference (rotate in the source manager), ` +
+    `${cat('synthetic')} synthetic.`,
+  );
+  if (report.byProvider.length || report.unregistered.providers) {
+    printTable(
+      ['provider', 'connections', 'attempted', 'revoked', 'failed', 'unsupported', 'undecryptable', 'unresolved', 'external', 'synthetic'],
+      [
+        ...report.byProvider.map((p) => [
+          p.provider, String(p.connections), String(p.attempted), String(p.upstream.revoked), String(p.upstream.revoke_failed),
+          String(p.upstream.unsupported), String(p.upstream.undecryptable), String(p.upstream.unresolved),
+          String(p.upstream.external_reference), String(p.upstream.synthetic),
+        ]),
+        ...(report.unregistered.providers ? [[
+          `unregistered (${report.unregistered.providers})`, String(report.unregistered.connections),
+          String(report.unregistered.attempted), String(report.unregistered.upstream.revoked),
+          String(report.unregistered.upstream.revoke_failed),
+          String(report.unregistered.upstream.unsupported), String(report.unregistered.upstream.undecryptable),
+          String(report.unregistered.upstream.unresolved), String(report.unregistered.upstream.external_reference),
+          String(report.unregistered.upstream.synthetic),
+        ]] : []),
+      ],
+    );
+  }
+  const c = report.cleared;
+  const bad = (n: number) => (n < 0 ? 'FAILED' : String(n));
+  console.log(
+    `Purged locally: ${bad(c.connections)} connection(s), ${bad(c.consents)} consent(s), ${bad(c.sessionRequests)} session request(s), ` +
+    `${bad(c.sessionGrants)} session grant(s), ${bad(c.approvals)} approval(s), ${bad(c.userProvisioning)} user setup, ` +
+    `${bad(c.channelProvisioning)} channel setup, ${bad(c.notifications)} notification state, ${bad(c.installations)} Slack installation(s).`,
+  );
+  console.log(
+    `\nLocal invalidation is complete when 0 remain: ${report.remaining.credentials} credential(s), ` +
+    `${report.remaining.authorizations} authorization row(s), ${report.remaining.installations} installation(s) remain.`,
+  );
+  // Residual-exposure honesty (#239): never claim deleting ciphertext kills an already-copied bearer.
+  console.log(
+    'NOTE: local deletion does not revoke a token an attacker already copied. Vouchr follows each configured ' +
+    'provider\'s access/refresh/both/grant revoke contract, but any access/refresh token ' +
+    'exfiltrated before this run stays valid at the provider until it expires or is rotated. Providers ' +
+    'without a revoke endpoint, undecryptable tokens, and external references require MANUAL rotation. ' +
+    'Invalidated Slack installations require each workspace to reinstall the app. Rotate master keys, ' +
+    'OAuth client secrets, and Slack credentials, and require users/admins to reconnect, before serving again.',
+  );
+}
+
+/**
+ * Deployment-wide emergency invalidation (#239): kill EVERY stored credential + authorization path
+ * for a compromise of the Vouchr database/decryption boundary itself. Dry-run by default; execution
+ * needs the exact `--confirm ALL-CREDENTIALS`. Local deletion is guaranteed even with the master key
+ * or provider config unavailable (they gate only the best-effort upstream revoke). Never prints a
+ * secret. Exits non-zero if any local credential/authorization row remains.
+ */
+async function cmdRevokeAll(db: Db, execute: boolean): Promise<number> {
+  let registry: ProviderRegistry | undefined;
+  try {
+    registry = new ProviderRegistry(loadProviders(process.env));
+  } catch {
+    console.error('revoke: provider config unavailable; upstream revoke disabled — local deletion will proceed');
+  }
+  let key: Buffer | Keyring;
+  try {
+    key = loadKeyring();
+  } catch {
+    console.error('revoke: master key unavailable; token decrypt + upstream revoke disabled — local deletion will proceed');
+    key = Buffer.alloc(32); // never decrypts successfully; the local delete needs no key
+  }
+  // The operator CLI is NOT lockdown-gated: break-glass must work during an incident (it deletes and
+  // never serves), so this Vault is constructed without the VOUCHR_LOCKDOWN flag.
+  const deps = {
+    vault: new Vault(db, key, {}, execute ? await loadRevokeEnvelope() : undefined),
+    audit: new Audit(db),
+    registry,
+  };
+  const report = await revokeAllCredentials(db, deps, { execute });
+  printRevokeAllReport(report);
+  return report.executed ? (report.ok ? 0 : 1) : 0;
 }
 
 /**
@@ -513,13 +692,23 @@ Commands:
                 --team <id>      filter by team
   revoke      Break-glass bulk revocation for an incident (delete locally, then
               best-effort upstream revoke; audited, no secrets printed).
-                --provider <id>  REQUIRED (refuses to run without it)
+                --provider <id>  REQUIRED for a surgical revoke (refuses without it)
                 --team <id>      narrow to one team
                 --user <id>      narrow to one user's own credentials
                 --channel <id>   narrow to one channel's shared credentials
                                   (--user and --channel are mutually exclusive)
                 --yes            actually revoke (default is a dry-run)
                 exits non-zero if any LOCAL deletion failed
+              Deployment-wide (database/decryption compromise, #239):
+                --all            revoke EVERY stored credential + authorization path
+                                  (no owner scope; enumerates unregistered providers;
+                                   invalidates Slack installations; local delete needs
+                                   no key/KMS/provider config)
+                --confirm ALL-CREDENTIALS  required to execute (dry-run otherwise)
+                exits non-zero if any local credential/authorization row remains.
+                Local deletion is NOT upstream revocation — rotate keys/secrets and
+                have users reconnect; see SECURITY.md. Enable containment first
+                (VOUCHR_LOCKDOWN) so no replica serves/mints during the wipe.
   doctor      Diagnostics (PASS/FAIL): master key(s), DB reachability, row counts.
                 exits non-zero if any check fails
   rekey       Re-encrypt every stored ciphertext under the PRIMARY master key
@@ -582,7 +771,7 @@ async function main(): Promise<number> {
       if ('error' in plan) { console.error(`revoke: ${plan.error}`); return 2; }
       const db = await openDb({ databaseUrl: plan.db });
       try {
-        return await cmdRevoke(db, plan);
+        return plan.mode === 'all' ? await cmdRevokeAll(db, plan.execute) : await cmdRevoke(db, plan);
       } finally {
         await db.close();
       }

@@ -80,7 +80,47 @@ consent row's channel is request origin, not shared-credential ownership. Durabl
 a fixed hash of the selected scope. A provider must be currently registered or already present under
 that exact validated id in Vouchr's durable state; an unrecognized typo cannot create a marker. The
 command exits non-zero if the fence cannot be established or matching local access remains. Upstream
-attempted, failed, and skipped counts are reported separately; a skip is never called success.
+attempted, failed, unresolved (a required token was missing/unreadable), and skipped counts are
+reported separately; a skip is never called success.
+
+#### Deployment-wide revoke (`--all`)
+
+For a compromise of the Vouchr **database/decryption boundary itself** (leaked master key, compromised
+KMS/workload role, or a compromised live replica — not a read-only dump with the key intact), the
+provider-scoped form is the wrong tool. `--all` is the deployment-wide break-glass:
+
+```bash
+vouchr revoke --all                              # dry-run: counts only, deletes nothing
+vouchr revoke --all --confirm ALL-CREDENTIALS    # execute: wipe every stored credential + authz path
+```
+
+`--all` takes **no** owner scope and cannot be combined with `--provider` (it revokes everything); it
+uses the stronger `--confirm ALL-CREDENTIALS` token instead of `--yes`. It enumerates every stored
+provider id from PostgreSQL — **including removed/unregistered ones** — then per provider attempts
+best-effort upstream revocation, and finally blanket-deletes every `connection`, external reference,
+pending consent, session grant/request, action approval, notification-state row, and **Slack
+installation** credential. Local deletion needs no master key, KMS, provider config, or upstream
+availability, so it completes even when those are broken. Dry-run reports `would_attempt` without
+claiming success. Execution reports, per registered provider, attempted rows plus `revoked`, `failed`
+(including timeouts), `unsupported`, `undecryptable`, `unresolved`, `external_reference`, and
+`synthetic`; removed/unregistered provider ids are aggregated without printing their raw database
+values. Providers that can refresh and support revocation declare whether Vouchr must revoke the
+access token, refresh token, both, or the whole grant. The command exits non-zero while any local
+credential/authorization row remains, and is idempotent — a second run reports zero.
+
+Deleting ciphertext does **not** revoke a bearer an attacker already copied. See
+[SECURITY.md](../SECURITY.md) for the full incident procedure: enable containment (`VOUCHR_LOCKDOWN=1`,
+below) first so no replica serves or mints during the wipe, then rotate master keys / OAuth client
+secrets / Slack credentials / DB + resolver roles and require users to reconnect before serving again.
+
+#### Containment (`VOUCHR_LOCKDOWN`)
+
+`VOUCHR_LOCKDOWN=1` on the running broker/Bolt deployment (authority **outside** the credential
+database) fails readiness (503) and denies credential serving, refresh, OAuth-callback writes,
+resolver access, credential/reference setup, and built-in Slack installation reads/writes before any
+secret is read. Break-glass deletion and metadata reads stay open, so the `revoke` CLI still works
+during lockdown. A config typo fails boot closed. Unset it (and redeploy from a trusted image) only
+as the recovery step.
 
 ### `doctor`
 Diagnostics printed as `PASS`/`FAIL` (plus `INFO` lines). Exits non-zero if any check

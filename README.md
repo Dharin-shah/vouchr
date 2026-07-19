@@ -35,10 +35,16 @@ permissions, their consent.
 - **Governed in Slack.** Admins choose per channel: personal accounts, thread-scoped
   approvals, or one shared team credential — via `/vouchr` or the App Home tab.
 - **Accountable and revocable.** Every action is tied to the Slack identity that authorized
-  it; deactivating someone in Slack revokes their credentials.
+  it; deactivating someone in Slack revokes their credentials. For a full compromise, one tested
+  break-glass — `vouchr revoke --all --confirm ALL-CREDENTIALS` plus `VOUCHR_LOCKDOWN` containment —
+  wipes every stored credential and denies all serving before secret access (see [SECURITY.md](./SECURITY.md)).
 - **Self-hosted.** Your infrastructure, your PostgreSQL, your keys (or your KMS).
 
 ## Quickstart
+
+> In a hurry? **[QUICKSTART.md](./QUICKSTART.md)** is the full zero-to-running walkthrough — create a
+> Slack workspace + app, a GitHub OAuth app, and see the bot act as you in ~5 minutes (with a script
+> for recording a demo).
 
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
@@ -90,6 +96,16 @@ npm run example:github                # then @-mention the bot in a channel
 Full setup — Slack scopes, provider OAuth apps, migrations, KMS, Kubernetes:
 [deployment guide](./guides/DEPLOYMENT.md).
 
+For a multi-workspace Slack app, construct `DbInstallationStore(db, keyring, envelope)` and pass
+that same store to Bolt's OAuth receiver and `createVouchr`. The third argument is the same
+`EnvelopeProvider` used by `createVouchr`; production installation `bot_token`/`data` then receive
+the same per-secret KMS envelope as provider credentials.
+Envelope-enabled installation reads reject direct rows by default; the fourth-argument
+`{ allowDirectRowsDuringMigration: true }` option exists only for an explicit, temporary cutover.
+The built-in store automatically honors `VOUCHR_LOCKDOWN`; direct hosts may also pass
+`{ lockdown: true }`, and `false` never overrides the deployment flag. Custom installation stores
+must enforce the same external containment gate.
+
 ## Credential modes
 
 Each channel chooses how a provider is authorized; your handler code never changes —
@@ -108,6 +124,21 @@ covers a whole account — a single `google()` consent can span Calendar, Gmail,
 scoped as narrowly as you choose. Any other OAuth2 API takes ~10 lines with
 `defineProvider`; API-key tools and secret-manager-backed credentials (AWS, GCP, Azure,
 Vault) work too — see [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
+
+**Least privilege — request only the scopes you use.** Scopes come from the provider
+definition, so pass exactly what you need: `github({ scopes: ['read:user'] })` shows the
+user only "Read your profile", not the broad `repo` default. Need *different* scopes for the
+same provider in different channels? Scopes are per-provider, not per-channel (yet —
+[#272](https://github.com/Dharin-shah/vouchr/issues/272)), so define the provider twice under
+distinct ids and gate them with channel tools/policy — explicit and easy:
+
+```ts
+providers: [
+  github({ scopes: ['read:user'] }),                                       // id: 'github' — read-only
+  defineProvider({ ...github({ scopes: ['read:user', 'repo'] }), id: 'github-write' }),
+]
+// then: enable `github-write` only where writes are needed, `github` elsewhere.
+```
 
 Runnable examples: [Google user credentials](./examples/google-user) ·
 [internal API keys](./examples/internal-api-key) · [Databricks](./examples/databricks) ·

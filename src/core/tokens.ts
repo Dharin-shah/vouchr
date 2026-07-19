@@ -319,6 +319,92 @@ export async function revokeToken(
   }
 }
 
+/** The token material claimed by a local delete, plus per-column decrypt failures. A missing token
+ * is distinct from an unreadable ciphertext so incident reporting can say what remains uncertain
+ * without ever returning the token itself. */
+export interface RevocationCredential {
+  accessToken: string | null;
+  refreshToken: string | null;
+  accessUnreadable?: boolean;
+  refreshUnreadable?: boolean;
+}
+
+/** No-secret result for the provider-declared revoke contract. `attempted` is per credential row,
+ * not per HTTP call; `ok` means every required operation completed. */
+export interface ProviderRevocationResult {
+  attempted: boolean;
+  ok: boolean;
+  unreadable: boolean;
+  missing: boolean;
+}
+
+/**
+ * Revoke the authority a provider declares in `revokeTarget` (#239). Refresh-capable providers must
+ * declare access/refresh/both/grant at registration, so disconnect and global break-glass cannot
+ * silently call an access-token endpoint and strand a live refresh token. `both` keeps going when
+ * either bounded call fails. A grant operation uses one token (refresh preferred) because the
+ * provider contract asserts that one success invalidates the whole authorization.
+ */
+export async function revokeProviderCredential(
+  provider: Provider,
+  credential: RevocationCredential,
+): Promise<ProviderRevocationResult> {
+  if (!provider.revoke && !provider.revokeUrl) {
+    return { attempted: false, ok: true, unreadable: false, missing: false };
+  }
+
+  const target = provider.revokeTarget ?? 'access';
+  const required: { token: string | null; unreadable: boolean }[] = [];
+  if (target === 'access') {
+    required.push({ token: credential.accessToken, unreadable: credential.accessUnreadable === true });
+  } else if (target === 'refresh') {
+    required.push({ token: credential.refreshToken, unreadable: credential.refreshUnreadable === true });
+  } else if (target === 'both') {
+    if (credential.accessToken || credential.accessUnreadable) {
+      required.push({ token: credential.accessToken, unreadable: credential.accessUnreadable === true });
+    }
+    if (credential.refreshToken || credential.refreshUnreadable) {
+      required.push({ token: credential.refreshToken, unreadable: credential.refreshUnreadable === true });
+    }
+  } else {
+    // A readable refresh token is the strongest handle for a grant-level operation. If it is
+    // unavailable, a readable access token is still valid input for providers such as Google.
+    const token = credential.refreshToken ?? credential.accessToken;
+    required.push({
+      token,
+      unreadable: token === null && (credential.refreshUnreadable === true || credential.accessUnreadable === true),
+    });
+  }
+
+  if (required.length === 0) required.push({ token: null, unreadable: false });
+  let attempted = false;
+  let ok = true;
+  let unreadable = false;
+  let missing = false;
+  const seen = new Set<string>();
+  for (const item of required) {
+    if (item.unreadable) {
+      unreadable = true;
+      ok = false;
+      continue;
+    }
+    if (!item.token) {
+      missing = true;
+      ok = false;
+      continue;
+    }
+    if (seen.has(item.token)) continue;
+    seen.add(item.token);
+    attempted = true;
+    try {
+      await revokeToken(provider, item.token);
+    } catch {
+      ok = false;
+    }
+  }
+  return { attempted, ok: attempted && ok, unreadable, missing };
+}
+
 /** The default RFC 7009 revoke (form POST of `token=` to `revokeUrl`). */
 async function standardRevoke(provider: Provider, token: string, signal: AbortSignal): Promise<void> {
   const fields: Record<string, string> = { token };

@@ -32,7 +32,7 @@ export type { BuiltBroker } from '../bin/broker-server';
 // @slack in the graph. ──
 export { openDb, migrate } from './core/db';
 export type { Db, DbOptions } from './core/db';
-export { Vault } from './core/vault';
+export { Vault, CredentialLockdownError } from './core/vault';
 export type { TtlPolicy } from './core/vault';
 // #115 master keys for the direct-construction path: `new Vault(db, loadKeyring())`.
 export { loadKeyring } from './core/crypto';
@@ -41,6 +41,16 @@ export { Audit } from './core/audit';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';
 export type { ConsentRequest } from './core/consent';
+// #239 deployment-wide break-glass for an embedded/headless operator. Raw stored provider ids stay
+// internal; the report contains safe counts and registry-trusted ids only.
+export { revokeAllCredentials } from './core/offboard';
+export type {
+  RevokeAllDeps,
+  RevokeAllReport,
+  RevokeCategory,
+  RevokeLocalCounts,
+  RevokeProviderReport,
+} from './core/offboard';
 // Shared typed operational failures + the single safe recovery mapper. These imports are all core,
 // so the headless graph stays independent of Bolt/Slack packages.
 export {
@@ -87,7 +97,7 @@ export type { KmsClientLike } from './adapters/kms';
 
 // ── provider helpers ──
 export { github, google, gitlab, notion, databricks, defineProvider, ProviderRegistry } from './core/providers';
-export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy } from './core/providers';
+export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy, RevokeTarget } from './core/providers';
 
 // ── owner model (user- vs channel-owned credentials) ──
 export { userOwner, channelOwner } from './core/owner';

@@ -243,8 +243,7 @@ it does not gate independent storage or broker-security changes.
 ### 3. Finish the retained security and performance boundary
 
 After the PostgreSQL-only foundation, these issues may proceed independently where their files and
-state machines do not conflict. #192, #208, #209, #211, and #212 are complete. #241 must close the
-documented KMS boundary before a multi-workspace production claim.
+state machines do not conflict. #192, #208, #209, #211, #212, and #241 are complete.
 
 - [#192](https://github.com/Dharin-shah/vouchr/issues/192) is complete: credential lifecycle
   mutations are atomic and idempotent across replicas and retries.
@@ -257,8 +256,9 @@ documented KMS boundary before a multi-workspace production claim.
   and egress validation boundary is enforced.
 - [#212](https://github.com/Dharin-shah/vouchr/issues/212) is complete: short-lived broker identity is
   deployment-bound with safe rotation and cross-replica replay protection.
-- [#241](https://github.com/Dharin-shah/vouchr/issues/241): extend the KMS-envelope boundary to
-  multi-workspace Slack installation tokens and prove migration/rotation behavior.
+- [#241](https://github.com/Dharin-shah/vouchr/issues/241) is complete: the same bounded KMS
+  envelope protects Vault credentials and multi-workspace Slack installation tokens, with
+  fail-closed storage, rotation overlap, and backup/restore evidence.
 
 ### 4. Prove one production deployment
 

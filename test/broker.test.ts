@@ -1110,11 +1110,12 @@ test('#194 shared use rejects a pre-offboard assertion while preserving the chan
     );
     assert.equal(await vault.liveId(owner, 'acme'), sharedId);
 
-    // Headless issuance mapping subtracts the accepted 30s clock-skew window, so a trusted minter
-    // must be observably newer than that uncertainty before it can represent re-onboarding.
+    // The stale path above proves the fence. Pin the marker to a known earlier instant so this fresh
+    // assertion is unambiguously post-tombstone under both PostgreSQL and process clocks; a 1ms
+    // boundary races the broker's conservative assertion-age calculation under coverage.
     await db.run(
-      `UPDATE offboard_tombstone SET created_at=created_at-? WHERE team_id=? AND user_id=?`,
-      [IDENTITY_SKEW_MS + 1, 'T1', 'U1'],
+      `UPDATE offboard_tombstone SET created_at=0 WHERE team_id=? AND user_id=?`,
+      ['T1', 'U1'],
     );
     const fresh = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'channel' },
@@ -2281,11 +2282,11 @@ test('#194 stale assertions cannot read resolve, status, or the channel manifest
       assert.deepEqual(replay.json, { error: 'invalid identity token' });
     }
 
-    // Headless issuance mapping subtracts the accepted clock-skew window. Move the test marker back
-    // by that uncertainty to represent enough elapsed time for genuine post-tombstone assertions.
+    // Make fresh assertions unambiguously post-tombstone without a wall-clock race. Exact boundary
+    // behavior belongs to the core fence tests; these route tests verify every adapter gate.
     await db.run(
-      `UPDATE offboard_tombstone SET created_at=created_at-? WHERE team_id=? AND user_id=?`,
-      [IDENTITY_SKEW_MS + 1, 'T1', 'U1'],
+      `UPDATE offboard_tombstone SET created_at=0 WHERE team_id=? AND user_id=?`,
+      ['T1', 'U1'],
     );
     for (const route of routes) {
       const fresh = await post(port, route.path, route.body(signIdentity(claims(), SECRET)));

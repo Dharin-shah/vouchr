@@ -5,8 +5,8 @@ import type { EnvelopeProvider } from '../core/crypto';
  * KEK. Injectable so the envelope is testable with a fake and carries NO hard cloud-SDK dependency.
  */
 export interface KmsClientLike {
-  encrypt(keyId: string, plaintext: Buffer): Promise<Buffer>;
-  decrypt(ciphertext: Buffer): Promise<Buffer>;
+  encrypt(keyId: string, plaintext: Buffer, signal?: AbortSignal): Promise<Buffer>;
+  decrypt(ciphertext: Buffer, signal?: AbortSignal): Promise<Buffer>;
 }
 
 /**
@@ -16,8 +16,8 @@ export interface KmsClientLike {
  */
 export function kmsEnvelope(keyId: string, client: KmsClientLike): EnvelopeProvider {
   return {
-    wrapDataKey: (dek) => client.encrypt(keyId, dek),
-    unwrapDataKey: (wrapped) => client.decrypt(wrapped),
+    wrapDataKey: (dek, signal) => client.encrypt(keyId, dek, signal),
+    unwrapDataKey: (wrapped, signal) => client.decrypt(wrapped, signal),
   };
 }
 
@@ -33,12 +33,18 @@ export async function awsKmsClient(opts: { region?: string } = {}): Promise<KmsC
   const mod: any = await import(specifier);
   const client = new mod.KMSClient(opts.region ? { region: opts.region } : {});
   return {
-    encrypt: async (keyId, plaintext) => {
-      const out = await client.send(new mod.EncryptCommand({ KeyId: keyId, Plaintext: plaintext }));
+    encrypt: async (keyId, plaintext, signal) => {
+      const out = await client.send(
+        new mod.EncryptCommand({ KeyId: keyId, Plaintext: plaintext }),
+        signal ? { abortSignal: signal } : undefined,
+      );
       return Buffer.from(out.CiphertextBlob);
     },
-    decrypt: async (ciphertext) => {
-      const out = await client.send(new mod.DecryptCommand({ CiphertextBlob: ciphertext }));
+    decrypt: async (ciphertext, signal) => {
+      const out = await client.send(
+        new mod.DecryptCommand({ CiphertextBlob: ciphertext }),
+        signal ? { abortSignal: signal } : undefined,
+      );
       return Buffer.from(out.Plaintext);
     },
   };

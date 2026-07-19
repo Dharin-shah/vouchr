@@ -19,6 +19,35 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Deployment-wide emergency credential invalidation** (#239). For a compromise of the Vouchr
+  database/decryption boundary itself (leaked master key, compromised KMS/workload role, or a
+  compromised live replica — not a read-only dump with the key intact), `vouchr revoke --all
+  --confirm ALL-CREDENTIALS` locally deletes every stored credential, external reference, pending
+  consent, session grant/request, action approval, notification-state row, and **Slack installation**
+  in one pass. It inventories every stored provider id from PostgreSQL, including removed/unregistered
+  ones, and attempts bounded upstream revocation under the provider's explicit `revokeTarget`
+  (`access`/`refresh`/`both`/`grant`) contract. Dry-run reports `would_attempt`; execution reports real
+  attempted rows per registered provider plus `revoked`, `failed`, `unsupported`, `undecryptable`,
+  `unresolved`, `external_reference`, and `synthetic`. Removed/unregistered database ids are aggregated
+  without printing their raw values. Dry-run is the default; execution requires the exact stronger
+  confirmation token (not `--yes`), takes no owner scope, and cannot be combined with `--provider`.
+  Local deletion is guaranteed even with the master key, KMS, or provider config unavailable, is
+  idempotent (a second run reports zero), and exits non-zero while any local credential/authorization
+  row remains. `revokeAllCredentials` and its no-secret report types are exported from both package
+  entrypoints for embedded/headless hosts; raw provider enumeration remains internal. Revocation-only
+  KMS unwraps are deadline-bounded and pass the optional `EnvelopeProvider.unwrapDataKey` signal so a
+  stalled KMS call cannot block later local deletes. **Local deletion
+  is not upstream revocation:** a bearer an attacker already copied stays valid at the provider until
+  it expires or is rotated — see SECURITY.md.
+- **Containment lockdown** (#239/#241). `VOUCHR_LOCKDOWN=1` (deployment config, never a flag inside the
+  potentially-compromised database) fails readiness (broker `/readyz` → 503; every functional route →
+  503) and makes the Vault refuse to serve (`get`), mint (`upsert`/`reference`), or refresh a
+  credential. The built-in `DbInstallationStore` independently refuses Slack installation-token
+  reads/writes before PostgreSQL or KMS access, and Vouchr does not query a custom installation store
+  while locked down. This denies injection, OAuth-callback writes, resolver access, credential setup,
+  and Slack installation use on both the Bolt control plane and packaged broker. Break-glass deletion
+  (`deleteForRevoke`/`deleteInstallation`) and metadata reads stay open so invalidation still works.
+  A config typo fails boot closed. New exported `CredentialLockdownError`.
 - **Trusted broker-to-Slack recovery bridge** (#194, final slice). New public
   `ConnectContext.recoverBrokerDenial(provider, denial)` (typed result `BrokerDenialRecovery`): the
   trusted control plane relays a packaged-broker denial body — untrusted routing guidance, validated
@@ -293,6 +322,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **KMS envelope encryption for multi-workspace Slack installation tokens** (#241). `DbInstallationStore`
+  now accepts an optional `EnvelopeProvider` (third constructor argument) and seals both `bot_token`
+  and `data` through the shared `crypto.ts:seal`/`open`, the same per-secret DEK + external-KEK scheme
+  (`0x01`) Vault credentials use. With a KMS envelope configured, a database + direct-master compromise
+  no longer exposes installation bot tokens — closing a gap where the threat model claimed KMS
+  protection the store did not provide. Pass the same envelope instance to the store as to
+  `createVouchr`. Envelope-enabled installation reads reject direct/keyed rows by default; an operator
+  must opt into the explicit `allowDirectRowsDuringMigration` cutover window, rewrite every install,
+  and then remove that option. KMS work is bounded to two seconds and 16 genuinely unresolved
+  operations per provider, propagates cancellation to the shipped AWS SDK adapter, and returns only
+  fixed secret-free failures. Malformed decrypted installation JSON also maps to fixed copy rather
+  than Node's input-reflecting parser error. `vouchr rekey` covers both `installation` columns and
+  skips envelope rows unchanged. The production template now wires one envelope-backed store into
+  Bolt OAuth and Vouchr; real-PostgreSQL tests inspect both scheme bytes, exercise failure/overload,
+  and restore exact Vault + installation ciphertext under overlapping/retired KEK versions.
 - **OAuth success page discloses the bound Slack identity** (#194). Every supported callback
   surface (Bolt route and headless broker) now names the bound Slack user and workspace on the
   connect success page AND links to that user's Slack profile (a `slack://user` deep link, so the

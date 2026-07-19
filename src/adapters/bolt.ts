@@ -8,7 +8,7 @@ import {
 } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, type Provider } from '../core/providers';
-import { Vault, type TtlPolicy } from '../core/vault';
+import { CredentialLockdownError, Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
@@ -41,6 +41,7 @@ import {
   disconnectConnectionGeneration,
 } from '../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
+import { booleanEnv } from '../core/options';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
 import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
@@ -522,7 +523,10 @@ export interface VouchrOptions {
    * Multi-workspace token source. When set, post-OAuth success and recovery DMs are sent with the
    * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
    * so an app installed to many workspaces / org-wide works. When omitted, Vouchr uses the single
-   * `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
+   * `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`. The built-in
+   * `DbInstallationStore` honors `VOUCHR_LOCKDOWN` itself; a custom store wired into Bolt's receiver
+   * must enforce the same external gate. Vouchr never queries this store while its own lockdown is
+   * active.
    */
   installationStore?: InstallationStore;
   /** Connection lifetime. Defaults to idle 7d / max-age 30d. Pass `{}` to disable expiry. */
@@ -837,6 +841,13 @@ export class ConnectContext {
    * uncertainty can only make the issuance older (fail closed), never newer than the request. */
   private async provisioningIssuedAt(): Promise<number> {
     return provisioningIssuedAtFromReceipt(this.vault, this.provisioningReceivedAt);
+  }
+
+  /** Refuse every prompt/recovery/setup entry before it can ask a human for a new credential. The
+   * Vault repeats the check at read/write boundaries; this earlier adapter gate keeps lockdown from
+   * collecting OAuth grants, static keys, or external references that it will only discard. */
+  private assertCredentialAccessAvailable(): void {
+    if (this.vault.lockdownEnabled) throw new CredentialLockdownError();
   }
 
   /** Fire the sink, swallowing any error. A bad sink must never break a request. */
@@ -1329,6 +1340,7 @@ export class ConnectContext {
   }
 
   async connect(providerId: string): Promise<ConnectionHandle> {
+    this.assertCredentialAccessAvailable();
     // Refuse service-to-service tools BEFORE any consent flow — no Connect prompt, no vault lookup.
     const provider = this.brokerable(providerId);
     // Capture the intent in PostgreSQL's clock domain before ANY asynchronous read. Policy, mode,
@@ -1538,6 +1550,7 @@ export class ConnectContext {
    * secret never enters audit meta, the return value, or any error string.
    */
   async setUserSecret(providerId: string, secret: string): Promise<void> {
+    this.assertCredentialAccessAvailable();
     this.brokerable(providerId);
     const issuance = await this.provisioningIssuedAt();
     const result = await configureUserCredential({
@@ -1563,6 +1576,7 @@ export class ConnectContext {
     providerId: string,
     r: { source?: string; secretRef: string; scopes?: string },
   ): Promise<void> {
+    this.assertCredentialAccessAvailable();
     const provider = this.brokerable(providerId);
     const reference = normalizeSecretReference(r, this.resolvers, provider.scopesDefault);
     const issuance = await this.provisioningIssuedAt();
@@ -1624,6 +1638,7 @@ export class ConnectContext {
    * `referenceChannelSecret` so rotation stays in your secret manager.
    */
   async setChannelSecret(providerId: string, secret: string): Promise<void> {
+    this.assertCredentialAccessAvailable();
     this.brokerable(providerId); // validate provider exists + refuse service tools
     const { cfg, channel } = this.channelTarget();
     const issuance = this.channelProvisioningIssuance ?? await this.provisioningIssuedAt();
@@ -1657,6 +1672,7 @@ export class ConnectContext {
     providerId: string,
     r: { source?: string; secretRef: string; scopes?: string },
   ): Promise<void> {
+    this.assertCredentialAccessAvailable();
     const provider = this.brokerable(providerId);
     const { cfg, channel } = this.channelTarget();
     const issuance = this.channelProvisioningIssuance ?? await this.provisioningIssuedAt();
@@ -1705,6 +1721,7 @@ export class ConnectContext {
    * channel is per-user-locked or has no shared cred configured.
    */
   async connectChannel(providerId: string): Promise<ConnectionHandle> {
+    this.assertCredentialAccessAvailable();
     const provider = this.brokerable(providerId);
     const connectIssuedAt = await this.provisioningIssuedAt();
     const { cfg, owner, channel } = this.channelTarget();
@@ -1806,6 +1823,7 @@ export class ConnectContext {
    * render them with safeUserMessage/mapSafeError.
    */
   async recoverBrokerDenial(providerId: string, denial: unknown): Promise<BrokerDenialRecovery> {
+    this.assertCredentialAccessAvailable();
     // SEC-4: validate the provider against the registry (and refuse service tools) before any
     // read, write, audit, or Slack post. Throws on an unknown id.
     const provider = this.brokerable(providerId);
@@ -2217,6 +2235,9 @@ export function healthNotifier(deps: {
 
 export async function createVouchr(opts: VouchrOptions) {
   const dryRun = assertDryRunFlag(opts.dryRun, 'createVouchr'); // SEC-4: fail closed before any wiring
+  // Parse containment before key/provider validation or opening an owned pool. A typo fails boot
+  // closed without leaking a Postgres pool acquired earlier in startup (#239).
+  const lockdown = booleanEnv(process.env.VOUCHR_LOCKDOWN, 'VOUCHR_LOCKDOWN');
   // #116: external KMS makes real wrap/unwrap network calls — refuse fail-closed before opening the
   // db, so the "no real network on any edge" guarantee holds. Local master key only in dry-run.
   if (dryRun) assertDryRunLocalKey(!!opts.envelope);
@@ -2243,7 +2264,8 @@ export async function createVouchr(opts: VouchrOptions) {
       throw e;
     }
   }
-  const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope);
+  // #239 containment comes from deployment configuration outside the credential database.
+  const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope, lockdown);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
   const consent = new Consent(db, dryRun);
@@ -2368,6 +2390,8 @@ export async function createVouchr(opts: VouchrOptions) {
 
   const CHANNEL_CREDENTIAL_UNAVAILABLE =
     'This tool uses service-managed credentials and cannot be configured here.';
+  const CREDENTIAL_SETUP_LOCKED =
+    'Credential setup is temporarily unavailable. Contact an administrator.';
 
   /** Consume Slack's short-lived trigger before any network/database gate, reserve opaque setup
    * authority immediately after Slack confirms the loading view, then hydrate it only after the
@@ -2382,7 +2406,10 @@ export async function createVouchr(opts: VouchrOptions) {
     triggerId: string,
     provisioningReceivedAt: bigint,
     verifyChannel?: () => Promise<string | null>,
-  ): Promise<'ok' | 'denied' | 'unavailable' | 'unconfirmed' | 'unsupported'> => {
+  ): Promise<'ok' | 'denied' | 'locked' | 'unavailable' | 'unconfirmed' | 'unsupported'> => {
+    // Refuse before opening even a loading modal: lockdown must not invite a human to submit a
+    // credential or create setup authority that the Vault will reject later.
+    if (vault.lockdownEnabled) return 'locked';
     // A forged App Home action and the slash command share this eligibility boundary. Reject
     // service-only tools before consuming the trigger, reading Slack/DB state, or minting setup
     // authority: Vouchr must never ask an admin to enter a credential it cannot use.
@@ -2550,6 +2577,9 @@ export async function createVouchr(opts: VouchrOptions) {
   };
   const notificationClientLookups = new Map<string, NotificationClientLookup>();
   async function confirmClientFor(identity: SlackIdentity): Promise<WebClient | null> {
+    // A custom InstallationStore is outside Vault and may not implement Vouchr's deployment gate.
+    // Never ask it for a Slack credential while this control plane is contained.
+    if (lockdown) return null;
     if (!opts.installationStore) return confirmClient;
     const key = JSON.stringify([identity.enterpriseId, identity.teamId]);
     let entry = notificationClientLookups.get(key);
@@ -2961,6 +2991,7 @@ export async function createVouchr(opts: VouchrOptions) {
           if (result === 'denied') {
             return respond(adminOnly(allowChannelCreatorConfig, 'configure channel credentials'));
           }
+          if (result === 'locked') return respond(CREDENTIAL_SETUP_LOCKED);
           if (result === 'unsupported') return respond(CHANNEL_CREDENTIAL_UNAVAILABLE);
         } catch (e) {
           return respond(safeUserMessage(e)); // ineligible channel class → the core reason, nothing else
@@ -3092,6 +3123,14 @@ export async function createVouchr(opts: VouchrOptions) {
     // pending view remains as unknown-state recovery if both result update and DM delivery fail.
     // The typed value is never echoed, posted, logged, or put in audit meta (invariant 8 / T7).
     const handleSecretSubmit = async ({ ack, body, view, client }: any, kind: 'channel' | 'user') => {
+      // Check before reading view.state: a modal opened before containment must not reach normal
+      // credential parsing or mutation once lockdown is active.
+      if (vault.lockdownEnabled) {
+        return ack({
+          response_action: 'update',
+          view: privateStatusModal('Setup unavailable', CREDENTIAL_SETUP_LOCKED),
+        });
+      }
       const identity = resolveIdentity({ body });
       let provider: unknown;
       let requestId: unknown;
@@ -3676,6 +3715,7 @@ export async function createVouchr(opts: VouchrOptions) {
         if (result === 'denied') {
           await dmActor(client, identity, adminOnly(allowChannelCreatorConfig, 'configure channel credentials')); // denial audited inside
         }
+        if (result === 'locked') await dmActor(client, identity, CREDENTIAL_SETUP_LOCKED);
         if (result === 'unsupported') await dmActor(client, identity, CHANNEL_CREDENTIAL_UNAVAILABLE);
       } catch (e) {
         await dmActor(client, identity, safeUserMessage(e)); // ineligible channel class → the core reason
@@ -3761,6 +3801,10 @@ export async function createVouchr(opts: VouchrOptions) {
     app.action(SETUP_KEY_ACTION, async ({ ack, body, client }: any) => {
       await ack();
       const identity = resolveIdentity({ body });
+      if (vault.lockdownEnabled) {
+        if (identity) await dmActor(client, identity, CREDENTIAL_SETUP_LOCKED);
+        return;
+      }
       const requestId = body.actions?.[0]?.value;
       const staleText = 'This credential setup button is no longer valid. Ask the agent to request setup again.';
       const unconfirmedText = 'Vouchr could not confirm whether credential setup is available. Close this window and use the setup button again; if it keeps failing, ask the agent to request setup again.';
