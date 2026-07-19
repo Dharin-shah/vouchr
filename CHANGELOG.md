@@ -27,13 +27,15 @@ All notable changes to this project are documented here. This project adheres to
   stalled KMS call cannot block later local deletes. **Local deletion
   is not upstream revocation:** a bearer an attacker already copied stays valid at the provider until
   it expires or is rotated — see SECURITY.md.
-- **Containment lockdown** (#239). `VOUCHR_LOCKDOWN=1` (deployment config, never a flag inside the
+- **Containment lockdown** (#239/#241). `VOUCHR_LOCKDOWN=1` (deployment config, never a flag inside the
   potentially-compromised database) fails readiness (broker `/readyz` → 503; every functional route →
   503) and makes the Vault refuse to serve (`get`), mint (`upsert`/`reference`), or refresh a
-  credential — denying injection, OAuth-callback writes, resolver access, and credential/reference
-  setup before any secret is read, on both the Bolt control plane and the packaged broker. Break-glass
-  deletion (`deleteForRevoke`) and metadata reads stay open so `vouchr revoke` still works during
-  lockdown. A config typo fails boot closed. New exported `CredentialLockdownError`.
+  credential. The built-in `DbInstallationStore` independently refuses Slack installation-token
+  reads/writes before PostgreSQL or KMS access, and Vouchr does not query a custom installation store
+  while locked down. This denies injection, OAuth-callback writes, resolver access, credential setup,
+  and Slack installation use on both the Bolt control plane and packaged broker. Break-glass deletion
+  (`deleteForRevoke`/`deleteInstallation`) and metadata reads stay open so invalidation still works.
+  A config typo fails boot closed. New exported `CredentialLockdownError`.
 - **Trusted broker-to-Slack recovery bridge** (#194, final slice). New public
   `ConnectContext.recoverBrokerDenial(provider, denial)` (typed result `BrokerDenialRecovery`): the
   trusted control plane relays a packaged-broker denial body — untrusted routing guidance, validated

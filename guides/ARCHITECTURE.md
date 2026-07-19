@@ -176,7 +176,8 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
   installation rows additionally require the temporary `allowDirectRowsDuringMigration` option and
   are rewritten in the active format on their next install write. Production defaults fail closed.
   Every external wrap/unwrap is deadline- and admission-bounded and receives an `AbortSignal`;
-  deployment-wide revocation can therefore continue local invalidation when KMS stalls.
+  deployment-wide revocation can therefore continue local invalidation when KMS stalls. The built-in
+  installation store also enforces the deployment lockdown before database or KMS access.
 - **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
   an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
   non-secret ref and resolves it JIT at injection time. The **resolved secret value** is

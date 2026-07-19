@@ -146,6 +146,53 @@ test('lockdown refuses Bolt connect before posting a credential prompt', async (
   );
 });
 
+test('lockdown lifecycle notifications never query a custom Slack installation store', async (t) => {
+  const db = await openTestDb(t);
+  const hour = 60 * 60 * 1_000;
+  const seed = new Vault(db, KEY, { maxAgeMs: 100 * hour });
+  await seed.upsert(userOwner(ID), provider.id, {
+    accessToken: 'seed-token',
+    refreshToken: null,
+    scopes: '',
+    expiresAt: null,
+    externalAccount: null,
+  });
+  const aged = Date.now() - 30 * hour;
+  await db.run(
+    'UPDATE connection SET created_at=?, last_used_at=? WHERE team_id=? AND owner_id=? AND provider=?',
+    [aged, aged, ID.teamId, ID.userId, provider.id],
+  );
+
+  const previousKey = process.env.VOUCHR_MASTER_KEY;
+  const previousLockdown = process.env.VOUCHR_LOCKDOWN;
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  process.env.VOUCHR_LOCKDOWN = '1';
+  let lookups = 0;
+  try {
+    const vouchr = await createVouchr({
+      providers: [provider],
+      baseUrl: 'https://vouchr.test',
+      db,
+      ttl: { maxAgeMs: 100 * hour },
+      installationStore: {
+        async fetchInstallation() {
+          lookups++;
+          throw new Error('custom store must not be queried during lockdown');
+        },
+      } as any,
+    });
+    await vouchr.sweepExpired();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(lookups, 0);
+  } finally {
+    if (previousKey === undefined) delete process.env.VOUCHR_MASTER_KEY;
+    else process.env.VOUCHR_MASTER_KEY = previousKey;
+    if (previousLockdown === undefined) delete process.env.VOUCHR_LOCKDOWN;
+    else process.env.VOUCHR_LOCKDOWN = previousLockdown;
+  }
+});
+
 test('OAuth consent is one owner/provider generation and one delivered prompt across replicas', async (t) => {
   const { a, b } = await openReplicaPair(t);
   const consentA = new Consent(a);

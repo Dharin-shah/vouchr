@@ -102,6 +102,9 @@ that same store to Bolt's OAuth receiver and `createVouchr`. The third argument 
 the same per-secret KMS envelope as provider credentials.
 Envelope-enabled installation reads reject direct rows by default; the fourth-argument
 `{ allowDirectRowsDuringMigration: true }` option exists only for an explicit, temporary cutover.
+The built-in store automatically honors `VOUCHR_LOCKDOWN`; direct hosts may also pass
+`{ lockdown: true }`, and `false` never overrides the deployment flag. Custom installation stores
+must enforce the same external containment gate.
 
 ## Credential modes
 

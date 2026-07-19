@@ -130,8 +130,9 @@ export { offboardUserEverywhere } from './core/offboard';
 // in-process (the same core the /v1/disconnect, /v1/admin/offboard routes and broker-server timer use).
 export { offboardUser, disconnectProvider } from './core/offboard';
 // #239 deployment-wide emergency invalidation, exported so a headless host can drive the same
-// break-glass the `vouchr revoke --all` CLI does. Containment (VOUCHR_LOCKDOWN) is wired at the Vault
-// (see CredentialLockdownError); this is the local-delete + best-effort upstream-revoke primitive.
+// break-glass the `vouchr revoke --all` CLI does. Containment (VOUCHR_LOCKDOWN) is wired at Vault and
+// the built-in installation store (see CredentialLockdownError); this is the local-delete +
+// best-effort upstream-revoke primitive.
 export { revokeAllCredentials } from './core/offboard';
 export type {
   RevokeAllDeps,

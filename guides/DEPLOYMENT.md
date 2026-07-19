@@ -247,9 +247,17 @@ const vouchr = await createVouchr({
   providers: [github()],
   baseUrl: process.env.PUBLIC_URL!,
   db,                       // inject the SAME handle the store uses → one shared pool, not two
+  envelope,                 // the SAME KMS boundary protects Vault connection tokens
   installationStore: store, // confirmation DM uses the connecting user's workspace token
 });
 ```
+
+The built-in store parses `VOUCHR_LOCKDOWN` itself because Bolt can fetch an installation before
+Vouchr middleware runs. During containment, `fetchInstallation` and `storeInstallation` fail before
+PostgreSQL/KMS access; deletion stays available. A direct host can additionally pass
+`{ lockdown: true }` as the fourth constructor argument. `false` cannot override the deployment env.
+Custom installation stores must apply the same external gate; `createVouchr` will not query one for
+notification delivery while its own deployment lockdown is active.
 
 ## AWS Secrets Manager resolver
 
@@ -566,7 +574,7 @@ POST /v1/admin/reference
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
-| `VOUCHR_LOCKDOWN` | no | `1`/`true` puts this replica into #239 containment: readiness → 503 and credential serving, refresh, OAuth-callback writes, resolver access, and credential/reference setup are denied before any secret is read. `0`/`false` disables; any other value refuses boot. Break-glass `vouchr revoke` still works during lockdown. Authority is this env, **outside** the credential database. See [Incident break-glass](#incident-break-glass-239). |
+| `VOUCHR_LOCKDOWN` | no | `1`/`true` puts this replica into #239 containment: readiness → 503 and credential serving, refresh, OAuth-callback writes, resolver access, credential/reference setup, and built-in Slack installation reads/writes are denied before any secret is read. `0`/`false` disables; any other value refuses boot. Break-glass deletion still works during lockdown. Authority is this env, **outside** the credential database. See [Incident break-glass](#incident-break-glass-239). |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
 

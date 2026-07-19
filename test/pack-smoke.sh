@@ -198,7 +198,10 @@ const identity: IdentityConfig = loadIdentityConfig({
   VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
   VOUCHR_DEPLOYMENT_ID: 'packed-consumer',
 });
-const installationMigration: DbInstallationStoreOptions = { allowDirectRowsDuringMigration: true };
+const installationMigration: DbInstallationStoreOptions = {
+  allowDirectRowsDuringMigration: true,
+  lockdown: true,
+};
 void installationMigration;
 const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
 void verifyIdentity(identityToken, identity);

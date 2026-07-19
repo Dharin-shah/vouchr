@@ -111,10 +111,12 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   deployment (never a flag inside the potentially-compromised database) to fail closed: readiness
   reports 503 (so an orchestrator pulls the replica from rotation) and credential serving, refresh,
   OAuth-callback writes, resolver access, and credential/reference setup are all denied *before* any
-  secret is read, on every replica configured with it. Break-glass deletion and metadata reads stay
-  available so `vouchr revoke` still works during lockdown. This is defense-in-depth on top of, not a
-  replacement for, infrastructure containment (removing ingress/egress and quarantining replicas when
-  the running workload itself may be compromised).
+  secret is read, on every replica configured with it. The built-in `DbInstallationStore` also denies
+  Slack installation-token reads and writes before PostgreSQL/KMS access; custom stores must enforce
+  the same gate. Break-glass deletion and metadata reads stay available so `vouchr revoke` still works
+  during lockdown. This is defense-in-depth on top of, not a replacement for, infrastructure
+  containment (removing ingress/egress and quarantining replicas when the running workload itself may
+  be compromised).
 - **Audit metadata is caller-supplied.** Vouchr's own code keeps secrets out of `audit.meta`
   (and tests enforce it), but a custom provider/`accountProbe` or caller could put sensitive data
   in metadata. Don't.

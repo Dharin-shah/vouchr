@@ -16,7 +16,7 @@ import {
   type EnvelopeProvider,
 } from '../src/core/crypto';
 import type { Db } from '../src/core/db';
-import { Vault } from '../src/core/vault';
+import { CredentialLockdownError, Vault } from '../src/core/vault';
 import { userOwner } from '../src/core/owner';
 
 const KEY = randomBytes(32);
@@ -204,6 +204,87 @@ test('installation-store migration options reject non-plain and mistyped input',
     () => new DbInstallationStore(db, KEY, undefined, { allowDirectRowsDuringMigration: 'true' } as any),
     /allowDirectRowsDuringMigration must be boolean/,
   );
+  assert.throws(
+    () => new DbInstallationStore(db, KEY, undefined, { lockdown: 'true' } as any),
+    /lockdown must be boolean/,
+  );
+
+  const previous = process.env.VOUCHR_LOCKDOWN;
+  const sentinel = 'xoxb-misplaced-secret';
+  let providerReads = 0;
+  const provider = Object.defineProperty({}, 'wrapDataKey', {
+    get() {
+      providerReads++;
+      throw new Error('provider accessor must not run');
+    },
+  });
+  process.env.VOUCHR_LOCKDOWN = sentinel;
+  try {
+    assert.throws(
+      () => new DbInstallationStore(db, KEY, provider as EnvelopeProvider),
+      (error: Error) => {
+        assert.match(error.message, /VOUCHR_LOCKDOWN/);
+        assert.ok(!error.message.includes(sentinel));
+        return true;
+      },
+    );
+    assert.equal(providerReads, 0, 'deployment containment must parse before provider access');
+  } finally {
+    if (previous === undefined) delete process.env.VOUCHR_LOCKDOWN;
+    else process.env.VOUCHR_LOCKDOWN = previous;
+  }
+});
+
+test('lockdown refuses installation token reads and writes before DB or KMS access but permits deletion', async () => {
+  let dbCalls = 0;
+  let kmsCalls = 0;
+  const db: Db = {
+    async get() { dbCalls++; throw new Error('database must not be read'); },
+    async all() { dbCalls++; throw new Error('database must not be read'); },
+    async run() { dbCalls++; return { changes: 1 }; },
+    async exec() { dbCalls++; throw new Error('database must not be changed'); },
+    async close() {},
+  };
+  const envelope: EnvelopeProvider = {
+    async wrapDataKey(dek) { kmsCalls++; return dek; },
+    async unwrapDataKey(wrapped) { kmsCalls++; return wrapped; },
+  };
+  const firstReplica = new DbInstallationStore(db, KEY, envelope, { lockdown: true });
+  const secondReplica = new DbInstallationStore(db, KEY, envelope, { lockdown: true });
+  const query = { teamId: 'T1', enterpriseId: undefined, isEnterpriseInstall: false } as const;
+
+  await assert.rejects(() => firstReplica.fetchInstallation(query), CredentialLockdownError);
+  await assert.rejects(
+    () => secondReplica.storeInstallation(teamInstall('T1', 'xoxb-NEVER-TOUCHED')),
+    CredentialLockdownError,
+  );
+  assert.equal(dbCalls, 0, 'containment must refuse before reading or writing PostgreSQL');
+  assert.equal(kmsCalls, 0, 'containment must refuse before wrapping or unwrapping a token');
+
+  await firstReplica.deleteInstallation(query);
+  assert.equal(dbCalls, 1, 'local invalidation remains available during containment');
+});
+
+test('VOUCHR_LOCKDOWN cannot be disabled by the installation-store host option', async () => {
+  const previous = process.env.VOUCHR_LOCKDOWN;
+  process.env.VOUCHR_LOCKDOWN = '1';
+  try {
+    const db: Db = {
+      async get() { throw new Error('database must not be read'); },
+      async all() { throw new Error('database must not be read'); },
+      async run() { throw new Error('database must not be written'); },
+      async exec() { throw new Error('database must not be changed'); },
+      async close() {},
+    };
+    const store = new DbInstallationStore(db, KEY, undefined, { lockdown: false });
+    await assert.rejects(
+      () => store.fetchInstallation({ teamId: 'T1', enterpriseId: undefined, isEnterpriseInstall: false }),
+      CredentialLockdownError,
+    );
+  } finally {
+    if (previous === undefined) delete process.env.VOUCHR_LOCKDOWN;
+    else process.env.VOUCHR_LOCKDOWN = previous;
+  }
 });
 
 test('envelope: invalid runtime provider values cannot silently downgrade to direct encryption', async (t) => {

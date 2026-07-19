@@ -1,4 +1,6 @@
 import type { Db } from '../core/db';
+import { booleanEnv } from '../core/options';
+import { CredentialLockdownError } from '../core/vault';
 import {
   boundedEnvelopeProvider,
   seal,
@@ -13,6 +15,8 @@ import type { Installation, InstallationQuery, InstallationStore, Logger } from 
 export interface DbInstallationStoreOptions {
   /** Temporary cutover only: permit legacy direct/keyed rows while they are explicitly rewritten. */
   allowDirectRowsDuringMigration?: boolean;
+  /** Host-controlled containment in addition to VOUCHR_LOCKDOWN; false never overrides the env. */
+  lockdown?: boolean;
 }
 
 /**
@@ -29,12 +33,15 @@ export interface DbInstallationStoreOptions {
  * ciphertext by default: direct rows are accepted only through the explicit temporary
  * `allowDirectRowsDuringMigration` option and convert on their next write (re-install/re-auth). A KMS
  * unwrap failure fails closed with a fixed error, never a silent direct fallback. Pass the SAME
- * envelope instance the deployment wires into `createVouchr({ envelope })`. Rows are keyed by
+ * envelope instance the deployment wires into `createVouchr({ envelope })`. The built-in store
+ * honors `VOUCHR_LOCKDOWN` independently because Bolt may call it before Vouchr middleware; reads
+ * and writes fail before PostgreSQL/KMS access while deletion remains available. Rows are keyed by
  * (enterprise_id, team_id) using the same shape Bolt's own stores use.
  */
 export class DbInstallationStore implements InstallationStore {
   private envelope?: EnvelopeProvider;
   private allowDirectRowsDuringMigration: boolean;
+  private lockdown: boolean;
 
   constructor(
     private db: Db,
@@ -50,10 +57,23 @@ export class DbInstallationStore implements InstallationStore {
       && typeof options.allowDirectRowsDuringMigration !== 'boolean') {
       throw new Error('DbInstallationStore: allowDirectRowsDuringMigration must be boolean');
     }
+    if (options.lockdown !== undefined && typeof options.lockdown !== 'boolean') {
+      throw new Error('DbInstallationStore: lockdown must be boolean');
+    }
+    // The deployment flag is authoritative and cannot be weakened by a false host option. Parse it
+    // before touching the provider: Bolt calls its InstallationStore before Vouchr's listeners, so
+    // gating only Vault would still decrypt a Slack bot token during containment. A bad flag also
+    // fails closed without invoking an operator-supplied provider accessor.
+    this.lockdown = booleanEnv(process.env.VOUCHR_LOCKDOWN, 'VOUCHR_LOCKDOWN')
+      || (options.lockdown ?? false);
     // Bolt resolves an installation before listener acknowledgement. Bound both the KMS wait and
     // genuinely-unsettled work so an outage cannot pin every Slack request or grow promises forever.
     this.envelope = envelope === undefined ? undefined : boundedEnvelopeProvider(envelope);
     this.allowDirectRowsDuringMigration = options.allowDirectRowsDuringMigration ?? false;
+  }
+
+  private assertNotLockedDown(): void {
+    if (this.lockdown) throw new CredentialLockdownError();
   }
 
   /**
@@ -73,6 +93,7 @@ export class DbInstallationStore implements InstallationStore {
   }
 
   async storeInstallation<A extends 'v1' | 'v2'>(installation: Installation<A, boolean>, _logger?: Logger): Promise<void> {
+    this.assertNotLockedDown();
     const isOrg = installation.isEnterpriseInstall === true;
     const enterpriseId = installation.enterprise?.id;
     const teamId = installation.team?.id;
@@ -102,6 +123,7 @@ export class DbInstallationStore implements InstallationStore {
   }
 
   async fetchInstallation(query: InstallationQuery<boolean>, _logger?: Logger): Promise<Installation<'v1' | 'v2', boolean>> {
+    this.assertNotLockedDown();
     if (query.isEnterpriseInstall && query.enterpriseId === undefined) {
       throw new Error('enterpriseId is required to fetch an enterprise installation');
     }

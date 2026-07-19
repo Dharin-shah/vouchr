@@ -12,7 +12,8 @@ It wires the three things a real deployment wants:
   fresh data key wrapped by your KMS key; rotating the KMS key never touches the rows.
 - **`installationStore`**: a db-backed `DbInstallationStore` so one deployment serves
   many workspaces (and Enterprise Grid org-wide installs). Wire the **same** store
-  into Bolt's OAuth installer.
+  into Bolt's OAuth installer. It reads `VOUCHR_LOCKDOWN` itself, so Bolt cannot decrypt or replace
+  an installation token before Vouchr middleware runs during containment.
 
 ```ts
 const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL }); // one shared pool
@@ -72,4 +73,5 @@ PUBLIC_URL=https://your.domain
 VOUCHR_DATABASE_URL=postgres://user:pass@host:5432/vouchr
 VOUCHR_MASTER_KEY=$(openssl rand -base64 32)   # 32 bytes, base64
 VOUCHR_KMS_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/...
+VOUCHR_LOCKDOWN=0  # switch to 1 during incident containment; store reads/writes then fail closed
 ```
