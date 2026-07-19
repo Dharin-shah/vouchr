@@ -213,12 +213,16 @@ with:
 
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
-import { createVouchr, DbInstallationStore, loadKeyring, openDb } from '@vouchr/core';
+import {
+  createVouchr, DbInstallationStore, loadKeyring, openDb, kmsEnvelope, awsKmsClient,
+} from '@vouchr/core';
 
 const db = await openDb({ databaseUrl: process.env.VOUCHR_DATABASE_URL! });
-// With a KMS envelope, pass it as the third argument so multi-workspace bot tokens are
-// envelope-encrypted like Vault credentials (#241): new DbInstallationStore(db, loadKeyring(), envelope).
-const store = new DbInstallationStore(db, loadKeyring());
+const envelope = kmsEnvelope(
+  process.env.VOUCHR_KMS_KEY_ID!,
+  await awsKmsClient({ region: process.env.AWS_REGION }),
+);
+const store = new DbInstallationStore(db, loadKeyring(), envelope);
 
 const receiver = new ExpressReceiver({
   signingSecret: process.env.SLACK_SIGNING_SECRET!,
@@ -234,6 +238,7 @@ const vouchr = await createVouchr({
   providers,
   baseUrl: process.env.PUBLIC_URL!,
   db,
+  envelope,
   installationStore: store,
 });
 ```
@@ -244,11 +249,13 @@ workspace. Because `db` was injected, `install().stop()` does not close it; shut
 stop the Vouchr lifecycle, and then `await db.close()`.
 
 > [!NOTE]
-> `DbInstallationStore` accepts the same `EnvelopeProvider` as `createVouchr` (#241), so with a KMS
+> `DbInstallationStore` accepts the same `EnvelopeProvider` as `createVouchr`, so with a KMS
 > envelope configured multi-workspace Slack installation `bot_token`/`data` are envelope-encrypted
 > (per-secret DEK + external KEK), the same boundary as Vault credentials. Pass the envelope as the
 > store's third argument in production; omit it and installation tokens stay direct-master-encrypted.
-> Legacy direct rows convert to envelope on their next write; a KMS unwrap failure fails closed.
+> Envelope mode rejects direct installation rows by default. During an explicit cutover only, pass
+> `{ allowDirectRowsDuringMigration: true }` as the fourth argument, rewrite every workspace through
+> reinstall/re-auth, verify no direct rows remain, and remove the option. KMS failures fail closed.
 
 ## 3. Run the private broker
 
@@ -326,13 +333,13 @@ their IDs, credential semantics, and channel rules match. The Bolt path is code-
 packaged broker reads `VOUCHR_PROVIDERS` / `VOUCHR_PROVIDERS_FILE` and `VOUCHR_POLICY` /
 `VOUCHR_POLICY_FILE`; deployment automation must prevent drift.
 
-When using KMS envelope encryption, the packaged broker wires `VOUCHR_KMS_KEY_ID`, but
-`createVouchr()` needs the matching `envelope` option explicitly. Both planes must use the same KMS
-key identity/region and possess the encrypt/decrypt rights needed for their reads and writes. Do not
-mistake KMS envelope encryption for an external-reference resolver; they are separate integrations.
-The AWS KMS SDK dependency is not bundled in the published package/image, so KMS deployments need a
-custom package/image layer containing it. Multi-workspace installation tokens remain outside the
-envelope until [#241](https://github.com/Dharin-shah/vouchr/issues/241) closes.
+When using KMS envelope encryption, the packaged broker wires `VOUCHR_KMS_KEY_ID`, while the Bolt
+control plane passes the matching `envelope` explicitly to both `createVouchr()` and
+`DbInstallationStore`. Both planes must use the same KMS key identity/region and possess the
+encrypt/decrypt rights needed for their reads and writes. Do not mistake KMS envelope encryption
+for an external-reference resolver; they are separate integrations. The AWS KMS SDK dependency is
+not bundled in the published package/image, so KMS deployments need a custom package/image layer
+containing it.
 
 > [!NOTE]
 > The packaged broker enforces both the static operator `Policy` above and PostgreSQL-backed
@@ -735,7 +742,7 @@ generic bearer/key injector does not implement AWS SigV4 request signing.
 | Setting | Control service | Broker | Rule |
 | --- | --- | --- | --- |
 | `VOUCHR_DATABASE_URL` | yes | yes | Same migrated cluster/database; runtime roles are DML-only |
-| Master key/keyring | yes | yes | Required even with envelope encryption; both planes must decrypt existing/direct-key rows |
+| Master key/keyring | yes | yes | Required by the storage API and for any explicitly retained direct-transition rows; production credential writes use the envelope |
 | KMS envelope (production) | explicit `envelope` option | `VOUCHR_KMS_KEY_ID` + SDK layer | Required by the production vision; same KMS key identity/region and compatible IAM, additional to the master keyring |
 | Provider IDs and credential semantics | yes | yes | Deploy from one versioned source; broker also needs refresh client credentials |
 | `ChannelTools` runtime state | writes through Bolt/App Home | reads, writes, and enforces the same PostgreSQL rows | Brokered manifest/fetch/MCP enforce it; service-tool egress remains host-enforced |
@@ -832,8 +839,7 @@ Before a production claim, verify all of the following with the exact image and 
 
 This checklist is not sufficient by itself. The canonical release contract remains
 [#226](https://github.com/Dharin-shah/vouchr/issues/226): complete the containment/recovery gate in
-[#239](https://github.com/Dharin-shah/vouchr/issues/239), the multi-workspace envelope boundary in
-[#241](https://github.com/Dharin-shah/vouchr/issues/241), the exact-image, two-replica,
+[#239](https://github.com/Dharin-shah/vouchr/issues/239), the exact-image, two-replica,
 failover/rolling/load proof in [#216](https://github.com/Dharin-shah/vouchr/issues/216), the
 protected reproducible scanned release gate in
 [#217](https://github.com/Dharin-shah/vouchr/issues/217), and the independent source-assisted

@@ -167,10 +167,11 @@ An attacker with read access to the Postgres database.
   follow the same scheme (#241): `DbInstallationStore` accepts the same envelope instance
   and seals both columns through `crypto.ts:seal`, so with a KMS envelope configured they
   are per-secret DEK + external-KEK envelope ciphertext (scheme `0x01`) — a database +
-  direct-master compromise no longer exposes installation bot tokens. Legacy direct rows
-  written before the envelope was enabled stay readable and convert to envelope on their
-  next write (re-install / token refresh); a KMS unwrap failure fails closed with the
-  envelope error, never a silent direct fallback. `vouchr rekey` rotates direct-path master
+  direct-master compromise no longer exposes installation bot tokens. Envelope-enabled
+  installation reads reject direct/keyed rows unless the operator explicitly opens the temporary
+  `allowDirectRowsDuringMigration` cutover and rewrites them through re-install/re-auth; the
+  production default never silently falls back. KMS timeout, overload, wrap, unwrap, malformed
+  plaintext, and parser failures return fixed secret-free errors. `vouchr rekey` rotates direct-path master
   keys (it skips envelope rows, which rotate in the KMS) and does not itself convert direct
   rows to envelope.
 - **Not mitigated by Vouchr:** the rest of each row (provider id, scopes, owner key,

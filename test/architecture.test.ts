@@ -70,3 +70,16 @@ test('#64 block builders + callback ids are exported from the package root as us
   assert.ok(JSON.stringify(blocks).includes('https://issuer.example/authorize?x=1'));
   assert.equal(typeof SETUP_KEY_ACTION, 'string');
 });
+
+// #241: the production KMS template is a supported wiring artifact, not illustrative pseudocode.
+// Keep one envelope-backed store on both sides of Bolt's installation contract so a future example
+// cleanup cannot silently leave Slack installation tokens on the direct-key path.
+test('#241 Postgres+KMS template wires one envelope-backed installation store into Bolt and Vouchr', () => {
+  const source = readFileSync(join(process.cwd(), 'examples', 'postgres-kms', 'app.ts'), 'utf8');
+  assert.match(source, /const envelope = kmsEnvelope\(kmsKeyId, await awsKmsClient\(/);
+  assert.match(source, /new DbInstallationStore\(db, key, envelope\)/);
+  assert.match(source, /new ExpressReceiver\(\{[\s\S]*?installationStore,[\s\S]*?\}\)/);
+  assert.match(source, /createVouchr\(\{[\s\S]*?envelope,[\s\S]*?installationStore,[\s\S]*?\}\)/);
+  assert.doesNotMatch(source, /new App\(\{\s*token:/, 'multi-workspace template must not bypass the installation store');
+  assert.doesNotMatch(source, /KMS envelope provider is not configured/, 'production template must not ship a placeholder provider');
+});

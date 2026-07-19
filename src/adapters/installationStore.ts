@@ -1,6 +1,19 @@
 import type { Db } from '../core/db';
-import { seal, open, toBuffer, type EnvelopeProvider, type MasterKeys } from '../core/crypto';
+import {
+  boundedEnvelopeProvider,
+  seal,
+  open,
+  openEnvelope,
+  toBuffer,
+  type EnvelopeProvider,
+  type MasterKeys,
+} from '../core/crypto';
 import type { Installation, InstallationQuery, InstallationStore, Logger } from '@slack/bolt';
+
+export interface DbInstallationStoreOptions {
+  /** Temporary cutover only: permit legacy direct/keyed rows while they are explicitly rewritten. */
+  allowDirectRowsDuringMigration?: boolean;
+}
 
 /**
  * DB-backed Slack Bolt `InstallationStore` so ONE Vouchr deployment serves MANY
@@ -12,14 +25,36 @@ import type { Installation, InstallationQuery, InstallationStore, Logger } from 
  * `EnvelopeProvider` configured they are per-secret DEK + external-KEK envelope ciphertext (scheme
  * 0x01), the same at-rest scheme Vault credentials use — so a database + direct-master compromise
  * cannot read installation bot tokens when the operator relies on KMS. Without a provider the direct
- * (scheme-0 / keyed) path is byte-for-byte unchanged. Legacy direct/keyed rows stay readable and
- * convert to envelope on their next write (re-install/re-auth), mirroring Vault; a KMS unwrap
- * failure fails closed with the envelope error, never a silent direct fallback. Pass the SAME
+ * (scheme-0 / keyed) path is byte-for-byte unchanged. With a provider, reads require envelope
+ * ciphertext by default: direct rows are accepted only through the explicit temporary
+ * `allowDirectRowsDuringMigration` option and convert on their next write (re-install/re-auth). A KMS
+ * unwrap failure fails closed with a fixed error, never a silent direct fallback. Pass the SAME
  * envelope instance the deployment wires into `createVouchr({ envelope })`. Rows are keyed by
  * (enterprise_id, team_id) using the same shape Bolt's own stores use.
  */
 export class DbInstallationStore implements InstallationStore {
-  constructor(private db: Db, private key: MasterKeys, private envelope?: EnvelopeProvider) {}
+  private envelope?: EnvelopeProvider;
+  private allowDirectRowsDuringMigration: boolean;
+
+  constructor(
+    private db: Db,
+    private key: MasterKeys,
+    envelope?: EnvelopeProvider,
+    options: DbInstallationStoreOptions = {},
+  ) {
+    if (typeof options !== 'object' || options === null || Array.isArray(options)
+      || Object.getPrototypeOf(options) !== Object.prototype) {
+      throw new Error('DbInstallationStore: options must be a plain object');
+    }
+    if (options.allowDirectRowsDuringMigration !== undefined
+      && typeof options.allowDirectRowsDuringMigration !== 'boolean') {
+      throw new Error('DbInstallationStore: allowDirectRowsDuringMigration must be boolean');
+    }
+    // Bolt resolves an installation before listener acknowledgement. Bound both the KMS wait and
+    // genuinely-unsettled work so an outage cannot pin every Slack request or grow promises forever.
+    this.envelope = envelope === undefined ? undefined : boundedEnvelopeProvider(envelope);
+    this.allowDirectRowsDuringMigration = options.allowDirectRowsDuringMigration ?? false;
+  }
 
   /**
    * Deterministic row key. Mirrors Bolt's keying: an enterprise (org-wide) install is
@@ -78,9 +113,24 @@ export class DbInstallationStore implements InstallationStore {
     }
     for (const id of keys) {
       const row = (await this.db.get(`SELECT data FROM installation WHERE id=?`, [id])) as { data: unknown } | undefined;
-      // `open` reads legacy direct/keyed rows and envelope rows alike; on a KMS unwrap failure it
-      // re-raises the (secret-free) envelope error rather than falling back to a direct decrypt.
-      if (row) return JSON.parse(await open(toBuffer(row.data), this.key, this.envelope)) as Installation;
+      // Production reads use the envelope-only path. The format-dispatching `open` path exists only
+      // inside the explicit temporary migration window; either path surfaces fixed KMS failures.
+      if (row) {
+        const ciphertext = toBuffer(row.data);
+        const plaintext = this.envelope && !this.allowDirectRowsDuringMigration
+          ? await openEnvelope(ciphertext, this.envelope)
+          : await open(ciphertext, this.key, this.envelope);
+        try {
+          const parsed: unknown = JSON.parse(plaintext);
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error();
+          return parsed as Installation;
+        } catch {
+          // JSON.parse includes fragments of its input in Node's error text. Never preserve it as a
+          // cause: authenticated-but-misplaced ciphertext (for example bot_token copied into data)
+          // would otherwise turn a Slack token into an AuthorizationError/log message (SEC-1).
+          throw new Error('vouchr: stored Slack installation data is invalid');
+        }
+      }
     }
     throw new Error(`No installation found (enterprise_id: ${query.enterpriseId}, team_id: ${query.teamId})`);
   }

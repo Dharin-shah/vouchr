@@ -99,6 +99,25 @@ test('kmsEnvelope: wraps and unwraps a data key', async () => {
   assert.deepEqual(await env.unwrapDataKey(wrapped), dek);
 });
 
+test('kmsEnvelope: propagates cancellation to the KMS client in both directions', async () => {
+  const controller = new AbortController();
+  const observed: Array<AbortSignal | undefined> = [];
+  const client: KmsClientLike = {
+    async encrypt(_keyId, plaintext, signal) {
+      observed.push(signal);
+      return Buffer.from(plaintext);
+    },
+    async decrypt(ciphertext, signal) {
+      observed.push(signal);
+      return Buffer.from(ciphertext);
+    },
+  };
+  const envelope = kmsEnvelope('key-1', client);
+  const wrapped = await envelope.wrapDataKey(Buffer.alloc(32, 1), controller.signal);
+  await envelope.unwrapDataKey(wrapped, controller.signal);
+  assert.deepEqual(observed, [controller.signal, controller.signal]);
+});
+
 test('kmsEnvelope: a Vault write round-trips through envelope encryption (scheme 0x01)', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32), {}, kmsEnvelope('key-1', fakeKms()));

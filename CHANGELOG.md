@@ -314,13 +314,15 @@ All notable changes to this project are documented here. This project adheres to
   (`0x01`) Vault credentials use. With a KMS envelope configured, a database + direct-master compromise
   no longer exposes installation bot tokens — closing a gap where the threat model claimed KMS
   protection the store did not provide. Pass the same envelope instance to the store as to
-  `createVouchr`. Backward-compatible: legacy direct/keyed rows stay readable and convert to envelope
-  on their next write (re-install / token refresh); a KMS unwrap failure fails closed with the
-  envelope error, never a silent direct decrypt. `vouchr rekey` already covers both `installation`
-  columns and skips envelope rows unchanged. `guides/THREAT-MODEL.md`, `guides/DEPLOYMENT.md`, and
-  `guides/HYBRID.md` now state the implemented boundary; a multi-workspace test inspects the stored
-  ciphertext scheme bytes and proves the envelope is invoked so a future wiring refactor cannot
-  silently fall back to direct encryption.
+  `createVouchr`. Envelope-enabled installation reads reject direct/keyed rows by default; an operator
+  must opt into the explicit `allowDirectRowsDuringMigration` cutover window, rewrite every install,
+  and then remove that option. KMS work is bounded to two seconds and 16 genuinely unresolved
+  operations per provider, propagates cancellation to the shipped AWS SDK adapter, and returns only
+  fixed secret-free failures. Malformed decrypted installation JSON also maps to fixed copy rather
+  than Node's input-reflecting parser error. `vouchr rekey` covers both `installation` columns and
+  skips envelope rows unchanged. The production template now wires one envelope-backed store into
+  Bolt OAuth and Vouchr; real-PostgreSQL tests inspect both scheme bytes, exercise failure/overload,
+  and restore exact Vault + installation ciphertext under overlapping/retired KEK versions.
 - **OAuth success page discloses the bound Slack identity** (#194). Every supported callback
   surface (Bolt route and headless broker) now names the bound Slack user and workspace on the
   connect success page AND links to that user's Slack profile (a `slack://user` deep link, so the

@@ -126,8 +126,9 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   [threat model](./guides/THREAT-MODEL.md#audit-completeness-is-best-effort-by-design).
 - **The Postgres database is not wholly encrypted at rest.** Credential-bearing columns are
   encrypted; the rest of the row and the database are not. Use disk/database encryption and access
-  control at the infra layer (envelope encryption via an `EnvelopeProvider` raises the bar on Vault
-  connection tokens; multi-workspace installation tokens remain direct-master encrypted until #241).
+  control at the infra layer. In production, pass the same `EnvelopeProvider` to `createVouchr`
+  and `DbInstallationStore`: Vault connection tokens and multi-workspace Slack installation
+  `bot_token`/`data` then use per-secret DEKs wrapped by the external KEK.
 
 ## Operator responsibilities
 
