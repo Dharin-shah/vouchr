@@ -30,6 +30,9 @@ echo "==> require() every published entrypoint (CJS exports map)"
   const root = require('@vouchr/core');
   const headless = require('@vouchr/core/headless');
   require('@vouchr/core/broker-server');
+  if (typeof root.DbInstallationStore !== 'function') {
+    throw new Error('missing packed DbInstallationStore export');
+  }
   for (const surface of [root, headless]) {
     for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity',
       'ConsentRequiredError', 'SessionApprovalRequiredError', 'ApprovalRequiredError',
@@ -169,7 +172,7 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import {
-  createVouchr, disconnectProvider, type ConnectContext,
+  createVouchr, disconnectProvider, type ConnectContext, type DbInstallationStoreOptions,
 } from '@vouchr/core';
 import {
   isVouchrErrorCode as isRootVouchrErrorCode, type BrokerDenialRecovery,
@@ -195,6 +198,11 @@ const identity: IdentityConfig = loadIdentityConfig({
   VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
   VOUCHR_DEPLOYMENT_ID: 'packed-consumer',
 });
+const installationMigration: DbInstallationStoreOptions = {
+  allowDirectRowsDuringMigration: true,
+  lockdown: true,
+};
+void installationMigration;
 const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
 void verifyIdentity(identityToken, identity);
 type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : false;

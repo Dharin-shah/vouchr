@@ -19,7 +19,15 @@ import {
   withUserInteractionFence,
   withUserProvisioningLock,
 } from './consent';
-import { seal, open, toBuffer, toKeyring, type EnvelopeProvider, type MasterKeys } from './crypto';
+import {
+  boundedEnvelopeProvider,
+  seal,
+  open,
+  toBuffer,
+  toKeyring,
+  type EnvelopeProvider,
+  type MasterKeys,
+} from './crypto';
 
 /** Input for a vaulted (Vouchr-encrypted) connection. */
 export interface StoredToken {
@@ -143,6 +151,7 @@ export class Vault {
    * that facade already rolls satellite cleanup back with its outer mutation, so it must not try
    * to establish a provisioning marker while holding the credential lock. */
   private credentialLockHeld = false;
+  private envelope?: EnvelopeProvider;
 
   constructor(
     private db: Db,
@@ -153,11 +162,16 @@ export class Vault {
     // Optional KMS envelope binding. When supplied, NEW writes use envelope encryption (scheme
     // 0x01); when absent, NEW writes use the legacy direct-to-master format (current behavior).
     // Reads dispatch on the stored format regardless, so either mode reads existing rows.
-    private envelope?: EnvelopeProvider,
+    envelope?: EnvelopeProvider,
     // #239 containment: when true, serving/minting/refresh fail closed (deletion + metadata stay
     // open). Set from deployment config (VOUCHR_LOCKDOWN) by the boot paths, never from the DB.
     private lockdown = false,
-  ) {}
+  ) {
+    // Share the same cached deadline/admission wrapper as DbInstallationStore when both receive the
+    // deployment's one EnvelopeProvider. Direct seal/open helpers intentionally remain unwrapped for
+    // low-level crypto use and focused format tests.
+    this.envelope = envelope === undefined ? undefined : boundedEnvelopeProvider(envelope);
+  }
 
   /** #239: fail closed on any credential serve/mint/refresh while the deployment is locked down.
    *  Deletion and metadata reads deliberately do NOT call this — break-glass must work in lockdown. */

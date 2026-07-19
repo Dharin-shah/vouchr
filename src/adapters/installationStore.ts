@@ -1,6 +1,23 @@
 import type { Db } from '../core/db';
-import { encrypt, decrypt, toBuffer, type MasterKeys } from '../core/crypto';
+import { booleanEnv } from '../core/options';
+import { CredentialLockdownError } from '../core/vault';
+import {
+  boundedEnvelopeProvider,
+  seal,
+  open,
+  openEnvelope,
+  toBuffer,
+  type EnvelopeProvider,
+  type MasterKeys,
+} from '../core/crypto';
 import type { Installation, InstallationQuery, InstallationStore, Logger } from '@slack/bolt';
+
+export interface DbInstallationStoreOptions {
+  /** Temporary cutover only: permit legacy direct/keyed rows while they are explicitly rewritten. */
+  allowDirectRowsDuringMigration?: boolean;
+  /** Host-controlled containment in addition to VOUCHR_LOCKDOWN; false never overrides the env. */
+  lockdown?: boolean;
+}
 
 /**
  * DB-backed Slack Bolt `InstallationStore` so ONE Vouchr deployment serves MANY
@@ -8,11 +25,56 @@ import type { Installation, InstallationQuery, InstallationStore, Logger } from 
  * the single env bot token and just one workspace works.
  *
  * The full Installation carries the bot (and user) tokens, which are secrets, so the JSON is
- * encrypted at rest with the master key, exactly like the Vault. Rows are keyed by
+ * encrypted at rest, exactly like the Vault. Both columns go through `seal`/`open` (#241): with an
+ * `EnvelopeProvider` configured they are per-secret DEK + external-KEK envelope ciphertext (scheme
+ * 0x01), the same at-rest scheme Vault credentials use — so a database + direct-master compromise
+ * cannot read installation bot tokens when the operator relies on KMS. Without a provider the direct
+ * (scheme-0 / keyed) path is byte-for-byte unchanged. With a provider, reads require envelope
+ * ciphertext by default: direct rows are accepted only through the explicit temporary
+ * `allowDirectRowsDuringMigration` option and convert on their next write (re-install/re-auth). A KMS
+ * unwrap failure fails closed with a fixed error, never a silent direct fallback. Pass the SAME
+ * envelope instance the deployment wires into `createVouchr({ envelope })`. The built-in store
+ * honors `VOUCHR_LOCKDOWN` independently because Bolt may call it before Vouchr middleware; reads
+ * and writes fail before PostgreSQL/KMS access while deletion remains available. Rows are keyed by
  * (enterprise_id, team_id) using the same shape Bolt's own stores use.
  */
 export class DbInstallationStore implements InstallationStore {
-  constructor(private db: Db, private key: MasterKeys) {}
+  private envelope?: EnvelopeProvider;
+  private allowDirectRowsDuringMigration: boolean;
+  private lockdown: boolean;
+
+  constructor(
+    private db: Db,
+    private key: MasterKeys,
+    envelope?: EnvelopeProvider,
+    options: DbInstallationStoreOptions = {},
+  ) {
+    if (typeof options !== 'object' || options === null || Array.isArray(options)
+      || Object.getPrototypeOf(options) !== Object.prototype) {
+      throw new Error('DbInstallationStore: options must be a plain object');
+    }
+    if (options.allowDirectRowsDuringMigration !== undefined
+      && typeof options.allowDirectRowsDuringMigration !== 'boolean') {
+      throw new Error('DbInstallationStore: allowDirectRowsDuringMigration must be boolean');
+    }
+    if (options.lockdown !== undefined && typeof options.lockdown !== 'boolean') {
+      throw new Error('DbInstallationStore: lockdown must be boolean');
+    }
+    // The deployment flag is authoritative and cannot be weakened by a false host option. Parse it
+    // before touching the provider: Bolt calls its InstallationStore before Vouchr's listeners, so
+    // gating only Vault would still decrypt a Slack bot token during containment. A bad flag also
+    // fails closed without invoking an operator-supplied provider accessor.
+    this.lockdown = booleanEnv(process.env.VOUCHR_LOCKDOWN, 'VOUCHR_LOCKDOWN')
+      || (options.lockdown ?? false);
+    // Bolt resolves an installation before listener acknowledgement. Bound both the KMS wait and
+    // genuinely-unsettled work so an outage cannot pin every Slack request or grow promises forever.
+    this.envelope = envelope === undefined ? undefined : boundedEnvelopeProvider(envelope);
+    this.allowDirectRowsDuringMigration = options.allowDirectRowsDuringMigration ?? false;
+  }
+
+  private assertNotLockedDown(): void {
+    if (this.lockdown) throw new CredentialLockdownError();
+  }
 
   /**
    * Deterministic row key. Mirrors Bolt's keying: an enterprise (org-wide) install is
@@ -31,6 +93,7 @@ export class DbInstallationStore implements InstallationStore {
   }
 
   async storeInstallation<A extends 'v1' | 'v2'>(installation: Installation<A, boolean>, _logger?: Logger): Promise<void> {
+    this.assertNotLockedDown();
     const isOrg = installation.isEnterpriseInstall === true;
     const enterpriseId = installation.enterprise?.id;
     const teamId = installation.team?.id;
@@ -38,6 +101,10 @@ export class DbInstallationStore implements InstallationStore {
     // fetchInstallation. Kept for ops lookups without decrypting the whole blob. Both columns are
     // encrypted at rest.
     const botToken = installation.bot?.token ?? null;
+    // Seal both columns BEFORE the write: a KMS wrap failure (envelope path) throws here, so the
+    // INSERT never runs and no partial installation row is committed.
+    const botTokenEnc = botToken ? await seal(botToken, this.key, this.envelope) : null;
+    const dataEnc = await seal(JSON.stringify(installation), this.key, this.envelope);
     await this.db.run(
       `INSERT INTO installation (id, enterprise_id, team_id, bot_token, data, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)
@@ -48,14 +115,15 @@ export class DbInstallationStore implements InstallationStore {
         DbInstallationStore.rowKey(enterpriseId, teamId, isOrg),
         enterpriseId ?? null,
         isOrg ? null : (teamId ?? null),
-        botToken ? encrypt(botToken, this.key) : null,
-        encrypt(JSON.stringify(installation), this.key),
+        botTokenEnc,
+        dataEnc,
         Date.now(),
       ],
     );
   }
 
   async fetchInstallation(query: InstallationQuery<boolean>, _logger?: Logger): Promise<Installation<'v1' | 'v2', boolean>> {
+    this.assertNotLockedDown();
     if (query.isEnterpriseInstall && query.enterpriseId === undefined) {
       throw new Error('enterpriseId is required to fetch an enterprise installation');
     }
@@ -67,7 +135,24 @@ export class DbInstallationStore implements InstallationStore {
     }
     for (const id of keys) {
       const row = (await this.db.get(`SELECT data FROM installation WHERE id=?`, [id])) as { data: unknown } | undefined;
-      if (row) return JSON.parse(decrypt(toBuffer(row.data), this.key)) as Installation;
+      // Production reads use the envelope-only path. The format-dispatching `open` path exists only
+      // inside the explicit temporary migration window; either path surfaces fixed KMS failures.
+      if (row) {
+        const ciphertext = toBuffer(row.data);
+        const plaintext = this.envelope && !this.allowDirectRowsDuringMigration
+          ? await openEnvelope(ciphertext, this.envelope)
+          : await open(ciphertext, this.key, this.envelope);
+        try {
+          const parsed: unknown = JSON.parse(plaintext);
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error();
+          return parsed as Installation;
+        } catch {
+          // JSON.parse includes fragments of its input in Node's error text. Never preserve it as a
+          // cause: authenticated-but-misplaced ciphertext (for example bot_token copied into data)
+          // would otherwise turn a Slack token into an AuthorizationError/log message (SEC-1).
+          throw new Error('vouchr: stored Slack installation data is invalid');
+        }
+      }
     }
     throw new Error(`No installation found (enterprise_id: ${query.enterpriseId}, team_id: ${query.teamId})`);
   }

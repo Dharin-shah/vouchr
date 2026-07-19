@@ -96,6 +96,16 @@ npm run example:github                # then @-mention the bot in a channel
 Full setup — Slack scopes, provider OAuth apps, migrations, KMS, Kubernetes:
 [deployment guide](./guides/DEPLOYMENT.md).
 
+For a multi-workspace Slack app, construct `DbInstallationStore(db, keyring, envelope)` and pass
+that same store to Bolt's OAuth receiver and `createVouchr`. The third argument is the same
+`EnvelopeProvider` used by `createVouchr`; production installation `bot_token`/`data` then receive
+the same per-secret KMS envelope as provider credentials.
+Envelope-enabled installation reads reject direct rows by default; the fourth-argument
+`{ allowDirectRowsDuringMigration: true }` option exists only for an explicit, temporary cutover.
+The built-in store automatically honors `VOUCHR_LOCKDOWN`; direct hosts may also pass
+`{ lockdown: true }`, and `false` never overrides the deployment flag. Custom installation stores
+must enforce the same external containment gate.
+
 ## Credential modes
 
 Each channel chooses how a provider is authorized; your handler code never changes —

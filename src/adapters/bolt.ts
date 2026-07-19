@@ -523,7 +523,10 @@ export interface VouchrOptions {
    * Multi-workspace token source. When set, post-OAuth success and recovery DMs are sent with the
    * bot token of the CONNECTING user's own workspace (resolved per (enterpriseId, teamId)),
    * so an app installed to many workspaces / org-wide works. When omitted, Vouchr uses the single
-   * `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`.
+   * `botToken`. Wire the SAME store into Bolt's OAuth `installationStore`. The built-in
+   * `DbInstallationStore` honors `VOUCHR_LOCKDOWN` itself; a custom store wired into Bolt's receiver
+   * must enforce the same external gate. Vouchr never queries this store while its own lockdown is
+   * active.
    */
   installationStore?: InstallationStore;
   /** Connection lifetime. Defaults to idle 7d / max-age 30d. Pass `{}` to disable expiry. */
@@ -2574,6 +2577,9 @@ export async function createVouchr(opts: VouchrOptions) {
   };
   const notificationClientLookups = new Map<string, NotificationClientLookup>();
   async function confirmClientFor(identity: SlackIdentity): Promise<WebClient | null> {
+    // A custom InstallationStore is outside Vault and may not implement Vouchr's deployment gate.
+    // Never ask it for a Slack credential while this control plane is contained.
+    if (lockdown) return null;
     if (!opts.installationStore) return confirmClient;
     const key = JSON.stringify([identity.enterpriseId, identity.teamId]);
     let entry = notificationClientLookups.get(key);

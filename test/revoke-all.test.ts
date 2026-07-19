@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { openTestDb, testDbUrl } from './support/pg';
 import { openDb, type Db } from '../src/core/db';
+import { boundedEnvelopeProvider } from '../src/core/crypto';
 import { Vault, CredentialLockdownError, REVOKE_DECRYPT_TIMEOUT_MS } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
@@ -298,7 +299,12 @@ test('a hung envelope read is bounded after the local credential delete commits'
       });
     },
   };
-  const vault = new Vault(db, KEY, {}, hangingEnvelope);
+  // Pre-bound above the emergency deadline so this regression proves the outer break-glass
+  // cancellation reaches the underlying provider, rather than passing on the normal 2s bound.
+  const vault = new Vault(db, KEY, {}, boundedEnvelopeProvider(hangingEnvelope, {
+    timeoutMs: REVOKE_DECRYPT_TIMEOUT_MS * 2,
+    maxUnresolved: 2,
+  }));
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const claimedPromise = vault.deleteForRevoke(U('U1'), 'revok_ok', true);
   await unwrapStarted;

@@ -66,8 +66,9 @@ Boundaries, and what crosses each:
   any tool runtime) receives a `ConnectionHandle`, never the secret
   (`src/core/injector.ts`). The handle exposes `fetch()` and `account()` only.
 - **Vouchr ↔ database.** Token material is stored encrypted with AES-256-GCM. The runtime supports
-  direct master-key encryption, while the production vision requires a KMS envelope for Vault
-  connection tokens. The rest of each row and the Postgres database are not encrypted by Vouchr
+  direct master-key encryption; with a KMS `EnvelopeProvider` configured, both Vault connection
+  tokens and multi-workspace Slack installation `bot_token`/`data` use per-secret DEKs wrapped by an
+  external KEK (#241). The rest of each row and the Postgres database are not encrypted by Vouchr
   (`src/core/crypto.ts`, `src/core/db.ts`). At-rest protection of the database itself is the
   operator's job.
 - **Vouchr ↔ external secret manager.** Two distinct integrations: `EnvelopeProvider`
@@ -159,13 +160,20 @@ or buggy.
 
 An attacker with read access to the Postgres database.
 
-- **Mitigated for token material, with a current multi-workspace gap.**
+- **Mitigated for token material.**
   `access_token_enc` / `refresh_token_enc` are AES-256-GCM encrypted; with an
   `EnvelopeProvider`, each Vault secret has its own DEK wrapped by an external KEK
-  (`crypto.ts:seal`, `vault.ts`). Installation `bot_token`/`data` are encrypted under
-  the direct master key today—`DbInstallationStore` does not yet accept the envelope.
-  [#241](https://github.com/Dharin-shah/vouchr/issues/241) tracks closing that production
-  boundary; do not claim KMS protects multi-workspace Slack installation tokens yet.
+  (`crypto.ts:seal`, `vault.ts`). Multi-workspace Slack installation `bot_token`/`data`
+  follow the same scheme (#241): `DbInstallationStore` accepts the same envelope instance
+  and seals both columns through `crypto.ts:seal`, so with a KMS envelope configured they
+  are per-secret DEK + external-KEK envelope ciphertext (scheme `0x01`) — a database +
+  direct-master compromise no longer exposes installation bot tokens. Envelope-enabled
+  installation reads reject direct/keyed rows unless the operator explicitly opens the temporary
+  `allowDirectRowsDuringMigration` cutover and rewrites them through re-install/re-auth; the
+  production default never silently falls back. KMS timeout, overload, wrap, unwrap, malformed
+  plaintext, and parser failures return fixed secret-free errors. `vouchr rekey` rotates direct-path master
+  keys (it skips envelope rows, which rotate in the KMS) and does not itself convert direct
+  rows to envelope.
 - **Not mitigated by Vouchr:** the rest of each row (provider id, scopes, owner key,
   `secret_ref`, timestamps) and the Postgres database as a whole are plaintext. The master
   key in memory/env is also out of scope here. Operator must encrypt the database at rest

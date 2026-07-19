@@ -168,12 +168,16 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
   auth). `revokeTarget` declares whether complete invalidation requires the access token, refresh
   token, both, or one grant-level operation; refresh-capable revocable providers must be explicit.
   Honest no-op when a provider has no documented endpoint (Notion).
-- **Envelope encryption** is runtime-optional and backward-compatible (`EnvelopeProvider`,
-  `src/core/crypto.ts`): a fresh per-secret data key encrypts the secret and is wrapped by an external
-  KEK (KMS/Vault). The production vision requires it for Vault connection tokens. Without it,
-  secrets use direct master-key encryption; reads dispatch on the stored format, so both modes remain
-  readable during migration. Revocation-only unwraps have a fixed deadline and pass an optional
-  `AbortSignal` to the provider. Slack installation tokens still use direct encryption pending #241.
+- **Envelope encryption** is runtime-optional (`EnvelopeProvider`, `src/core/crypto.ts`): a fresh
+  per-secret data key encrypts each secret and is wrapped by an external KEK (KMS/Vault). The
+  production vision requires the same envelope instance for Vault connection tokens and
+  multi-workspace Slack installation `bot_token`/`data`. Without it, those columns use direct
+  master-key encryption. Vault reads direct transition rows while their key remains configured;
+  installation rows additionally require the temporary `allowDirectRowsDuringMigration` option and
+  are rewritten in the active format on their next install write. Production defaults fail closed.
+  Every external wrap/unwrap is deadline- and admission-bounded and receives an `AbortSignal`;
+  deployment-wide revocation can therefore continue local invalidation when KMS stalls. The built-in
+  installation store also enforces the deployment lockdown before database or KMS access.
 - **External references** (`Resolvers`, `src/core/injector.ts`): a credential can point at
   an external secret manager (e.g. an AWS Secrets Manager ARN). Vouchr stores only the
   non-secret ref and resolves it JIT at injection time. The **resolved secret value** is

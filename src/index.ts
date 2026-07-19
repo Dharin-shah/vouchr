@@ -86,6 +86,7 @@ export type { VouchrAuditEvent, AuditSink } from './core/audit';
 export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';
 export { DbInstallationStore } from './adapters/installationStore';
+export type { DbInstallationStoreOptions } from './adapters/installationStore';
 // Re-export Bolt's installation types so consumers can wire the store without importing @slack/bolt directly.
 export type { Installation, InstallationQuery, InstallationStore } from '@slack/bolt';
 export type { ChannelMode } from './core/channelConfig';
@@ -129,8 +130,9 @@ export { offboardUserEverywhere } from './core/offboard';
 // in-process (the same core the /v1/disconnect, /v1/admin/offboard routes and broker-server timer use).
 export { offboardUser, disconnectProvider } from './core/offboard';
 // #239 deployment-wide emergency invalidation, exported so a headless host can drive the same
-// break-glass the `vouchr revoke --all` CLI does. Containment (VOUCHR_LOCKDOWN) is wired at the Vault
-// (see CredentialLockdownError); this is the local-delete + best-effort upstream-revoke primitive.
+// break-glass the `vouchr revoke --all` CLI does. Containment (VOUCHR_LOCKDOWN) is wired at Vault and
+// the built-in installation store (see CredentialLockdownError); this is the local-delete +
+// best-effort upstream-revoke primitive.
 export { revokeAllCredentials } from './core/offboard';
 export type {
   RevokeAllDeps,

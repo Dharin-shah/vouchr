@@ -117,9 +117,10 @@ secrets / Slack credentials / DB + resolver roles and require users to reconnect
 
 `VOUCHR_LOCKDOWN=1` on the running broker/Bolt deployment (authority **outside** the credential
 database) fails readiness (503) and denies credential serving, refresh, OAuth-callback writes,
-resolver access, and credential/reference setup before any secret is read. Break-glass deletion and
-metadata reads stay open, so the `revoke` CLI still works during lockdown. A config typo fails boot
-closed. Unset it (and redeploy from a trusted image) only as the recovery step.
+resolver access, credential/reference setup, and built-in Slack installation reads/writes before any
+secret is read. Break-glass deletion and metadata reads stay open, so the `revoke` CLI still works
+during lockdown. A config typo fails boot closed. Unset it (and redeploy from a trusted image) only
+as the recovery step.
 
 ### `doctor`
 Diagnostics printed as `PASS`/`FAIL` (plus `INFO` lines). Exits non-zero if any check

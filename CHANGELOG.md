@@ -27,13 +27,15 @@ All notable changes to this project are documented here. This project adheres to
   stalled KMS call cannot block later local deletes. **Local deletion
   is not upstream revocation:** a bearer an attacker already copied stays valid at the provider until
   it expires or is rotated — see SECURITY.md.
-- **Containment lockdown** (#239). `VOUCHR_LOCKDOWN=1` (deployment config, never a flag inside the
+- **Containment lockdown** (#239/#241). `VOUCHR_LOCKDOWN=1` (deployment config, never a flag inside the
   potentially-compromised database) fails readiness (broker `/readyz` → 503; every functional route →
   503) and makes the Vault refuse to serve (`get`), mint (`upsert`/`reference`), or refresh a
-  credential — denying injection, OAuth-callback writes, resolver access, and credential/reference
-  setup before any secret is read, on both the Bolt control plane and the packaged broker. Break-glass
-  deletion (`deleteForRevoke`) and metadata reads stay open so `vouchr revoke` still works during
-  lockdown. A config typo fails boot closed. New exported `CredentialLockdownError`.
+  credential. The built-in `DbInstallationStore` independently refuses Slack installation-token
+  reads/writes before PostgreSQL or KMS access, and Vouchr does not query a custom installation store
+  while locked down. This denies injection, OAuth-callback writes, resolver access, credential setup,
+  and Slack installation use on both the Bolt control plane and packaged broker. Break-glass deletion
+  (`deleteForRevoke`/`deleteInstallation`) and metadata reads stay open so invalidation still works.
+  A config typo fails boot closed. New exported `CredentialLockdownError`.
 - **Trusted broker-to-Slack recovery bridge** (#194, final slice). New public
   `ConnectContext.recoverBrokerDenial(provider, denial)` (typed result `BrokerDenialRecovery`): the
   trusted control plane relays a packaged-broker denial body — untrusted routing guidance, validated
@@ -308,6 +310,21 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- **KMS envelope encryption for multi-workspace Slack installation tokens** (#241). `DbInstallationStore`
+  now accepts an optional `EnvelopeProvider` (third constructor argument) and seals both `bot_token`
+  and `data` through the shared `crypto.ts:seal`/`open`, the same per-secret DEK + external-KEK scheme
+  (`0x01`) Vault credentials use. With a KMS envelope configured, a database + direct-master compromise
+  no longer exposes installation bot tokens — closing a gap where the threat model claimed KMS
+  protection the store did not provide. Pass the same envelope instance to the store as to
+  `createVouchr`. Envelope-enabled installation reads reject direct/keyed rows by default; an operator
+  must opt into the explicit `allowDirectRowsDuringMigration` cutover window, rewrite every install,
+  and then remove that option. KMS work is bounded to two seconds and 16 genuinely unresolved
+  operations per provider, propagates cancellation to the shipped AWS SDK adapter, and returns only
+  fixed secret-free failures. Malformed decrypted installation JSON also maps to fixed copy rather
+  than Node's input-reflecting parser error. `vouchr rekey` covers both `installation` columns and
+  skips envelope rows unchanged. The production template now wires one envelope-backed store into
+  Bolt OAuth and Vouchr; real-PostgreSQL tests inspect both scheme bytes, exercise failure/overload,
+  and restore exact Vault + installation ciphertext under overlapping/retired KEK versions.
 - **OAuth success page discloses the bound Slack identity** (#194). Every supported callback
   surface (Bolt route and headless broker) now names the bound Slack user and workspace on the
   connect success page AND links to that user's Slack profile (a `slack://user` deep link, so the
