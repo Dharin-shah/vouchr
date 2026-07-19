@@ -695,7 +695,12 @@ test('Bolt callback response does not wait for a non-settling Slack recovery DM'
   );
   const prototype = WebClient.prototype as any;
   const realApiCall = prototype.apiCall;
-  prototype.apiCall = async () => new Promise(() => {});
+  let slackStartedResolve!: () => void;
+  const slackStarted = new Promise<void>((resolve) => { slackStartedResolve = resolve; });
+  prototype.apiCall = async () => {
+    slackStartedResolve();
+    return new Promise(() => {});
+  };
   try {
     const vouchr = await createVouchr({
       providers: [provider],
@@ -706,17 +711,14 @@ test('Bolt callback response does not wait for a non-settling Slack recovery DM'
     let callback: any;
     vouchr.mountRoutes({ get: (_path: string, handler: any) => { callback = handler; } });
     const response = fakeResponse();
-    let timer: NodeJS.Timeout | undefined;
-    try {
-      await Promise.race([
-        callback({ query: { state: pending.state, error: 'access_denied' } }, response),
-        new Promise((_, reject) => {
-          timer = setTimeout(() => reject(new Error('browser callback waited for Slack')), 100);
-        }),
-      ]);
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
+    const callbackResult = Promise.resolve(
+      callback({ query: { state: pending.state, error: 'access_denied' } }, response),
+    );
+    void callbackResult.catch(() => undefined);
+    await slackStarted;
+    // Assert ordering at the exact point the non-settling side effect begins. A wall-clock race is
+    // both weaker and flaky under a loaded CI runner: if Slack were awaited before `send`, these
+    // values would still have their fake-response defaults when `apiCall` starts.
     assert.equal(response.statusCode, 400);
     assert.equal(response.body, 'OAuth authorization was denied. Please try again.');
   } finally {
