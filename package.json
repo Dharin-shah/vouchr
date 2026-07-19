@@ -48,6 +48,7 @@
     "dist/bin/**",
     "assets/**",
     "README.md",
+    "QUICKSTART.md",
     "vision.md",
     "LICENSE",
     "CHANGELOG.md",
