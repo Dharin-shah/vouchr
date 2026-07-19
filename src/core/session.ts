@@ -12,7 +12,9 @@ import {
   PENDING_INTERACTION_TTL_MS,
   POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
+  type PromptDeliveryOptions,
 } from './interaction';
 import { channelOwner, userOwner, type Owner } from './owner';
 import type { Vault } from './vault';
@@ -179,17 +181,30 @@ export class SessionGrants {
   /** Claim Slack delivery without holding a DB transaction during the network call. Exactly one
    * replica owns the short lease; a delivered row is reusable, a live lease is reported honestly as
    * in-flight, and an expired lease can be taken over after a process crash. */
-  async claimDelivery(id: string): Promise<PromptDeliveryClaim> {
+  async claimDelivery(
+    id: string,
+    options: PromptDeliveryOptions = {},
+  ): Promise<PromptDeliveryClaim> {
     if (!isInteractionId(id)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE session_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
-         WHERE id=? AND expires_at>${POSTGRES_NOW_MS_SQL} AND delivered_at IS NULL
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
+         WHERE id=? AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND (
+             delivered_at IS NULL
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+           )
            AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, id],
+        [
+          token,
+          PROMPT_DELIVERY_LEASE_MS,
+          id,
+          options.redeliverDelivered === true,
+          PROMPT_REDELIVERY_DEBOUNCE_MS,
+        ],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await this.db.get<{

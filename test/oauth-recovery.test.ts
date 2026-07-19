@@ -19,6 +19,10 @@ import {
   STATE_TTL_MS,
 } from '../src/core/consent';
 import { userOwner } from '../src/core/owner';
+import {
+  POSTGRES_NOW_MS_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
+} from '../src/core/interaction';
 import { openDb, type Db } from '../src/core/db';
 import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
@@ -258,6 +262,38 @@ test('OAuth delivery cleanup is exact and ambiguous delivery retains its lease',
     await consent.claimDelivery(replacement.state),
     { status: 'in-flight' },
     'an ambiguous sender retains the short lease and prevents an immediate duplicate',
+  );
+});
+
+test('a delivered connect prompt is reclaimed only for a transient delivery surface (#194)', async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const claim = await consent.claimDelivery(pending.state);
+  assert.equal(claim.status, 'claimed');
+  if (claim.status !== 'claimed') assert.fail('prompt delivery was not claimable');
+  assert.equal(await consent.confirmDelivery(pending.state, claim.token), true);
+
+  // WITHIN the debounce window: a rapid re-ask reuses the live prompt (dedup — no double-post).
+  assert.deepEqual(await consent.claimDelivery(pending.state), { status: 'delivered' });
+
+  // Age the last delivery past the debounce. The core remains durable by default; an adapter that
+  // owns a transient surface can opt in to reclaiming the same generation.
+  await db.run(
+    `UPDATE consent_request
+       SET delivered_at = ${POSTGRES_NOW_MS_SQL} - ?
+     WHERE state=?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, pending.state],
+  );
+  assert.deepEqual(
+    await consent.claimDelivery(pending.state),
+    { status: 'delivered' },
+    'durable delivery remains deduplicated even after the transient debounce',
+  );
+  assert.equal(
+    (await consent.claimDelivery(pending.state, { redeliverDelivered: true })).status,
+    'claimed',
+    'a transient surface can re-post after the debounce',
   );
 });
 

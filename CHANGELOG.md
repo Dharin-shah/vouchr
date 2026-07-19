@@ -5,6 +5,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Vanished ephemeral prompts can be recovered on a genuine re-ask** (#194). Connect, key-setup,
+  session, and approval prompts posted with Slack `postEphemeral` may be re-delivered after a 30s
+  debounce; durable DM prompts remain deduplicated. Re-delivery reuses the same request generation,
+  while the atomic lease still suppresses rapid retries and concurrent replicas. The precise
+  dedup-per-triggering-request model is tracked in
+  [#275](https://github.com/Dharin-shah/vouchr/issues/275).
+
 ### Added
 
 - **Deployment-wide emergency credential invalidation** (#239). For a compromise of the Vouchr

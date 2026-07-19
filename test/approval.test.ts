@@ -19,7 +19,9 @@ import {
 import {
   approvalActionKey,
   InteractionStateChangedError,
+  POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
 } from '../src/core/interaction';
 import { approvalNeeded, ConnectionHandle, EgressBlockedError } from '../src/core/injector';
 import { defineProvider, github, ProviderRegistry, type Provider } from '../src/core/providers';
@@ -148,6 +150,8 @@ async function harness(t: TestContext, o: {
   slackAdmins?: string[];
   members?: string[];
   sharedChannel?: boolean;
+  channel?: string | null;
+  thread?: string | null;
   postEphemeral?: (payload: any) => Promise<unknown>;
   db?: Db;
   onSlackRead?: () => void | Promise<void>;
@@ -186,8 +190,20 @@ async function harness(t: TestContext, o: {
       postMessage: async (p: any) => { dms.push(p); return {}; },
     },
   } as any;
-  // The real middleware builds context.vouchr from a (fake) verified Slack event: channel C1, thread TH1.
-  const args: any = { context: {}, client, event: { channel: 'C1', user: 'U1', team: 'T1', thread_ts: 'TH1' }, next: async () => {} };
+  const channel = o.channel === undefined ? 'C1' : o.channel;
+  const thread = o.thread === undefined ? 'TH1' : o.thread;
+  // The real middleware builds context.vouchr from a fake, already-verified Slack event.
+  const args: any = {
+    context: {},
+    client,
+    event: {
+      user: 'U1',
+      team: 'T1',
+      ...(channel ? { channel } : {}),
+      ...(thread ? { thread_ts: thread } : {}),
+    },
+    next: async () => {},
+  };
   await vouchr.middleware(args);
   const ctx = args.context.vouchr;
   if (o.sharedChannel) {
@@ -477,6 +493,31 @@ test('state machine: prompt → approve → consume exactly once → re-prompt',
     assert.equal('path' in consumedMeta, false);
     assert.ok(!JSON.stringify(rows).includes(BODY_SENTINEL), 'no body bytes in audit');
     assert.ok(!JSON.stringify(rows).includes(TOKEN), 'no token in audit');
+  });
+});
+
+test('an aged durable self-approval DM remains deduplicated', async (t) => {
+  const { vouchr, ctx, ephemerals, dms } = await harness(t, {
+    channel: null,
+    thread: null,
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const first = await expectApprovalRequired(
+      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
+    );
+    assert.equal(ephemerals.length, 0);
+    assert.equal(dms.length, 1);
+
+    await vouchr.db.run(
+      `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-? WHERE id=?`,
+      [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, first.approvalId],
+    );
+    await expectApprovalRequired(
+      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
+    );
+    assert.equal(dms.length, 1, 'a persistent approval DM is not posted again');
+    assert.equal(calls.length, 0, 'the unapproved action never reaches the provider');
   });
 });
 

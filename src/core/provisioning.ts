@@ -17,7 +17,9 @@ import {
   PENDING_INTERACTION_TTL_MS,
   POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
+  type PromptDeliveryOptions,
 } from './interaction';
 import { channelOwner, userOwner } from './owner';
 import { isValidProviderId } from './providers';
@@ -355,6 +357,7 @@ export async function claimUserProvisioningDelivery(
   identity: SlackIdentity,
   provider: string,
   id: string,
+  options: PromptDeliveryOptions = {},
 ): Promise<PromptDeliveryClaim> {
   if (!validUserProvisioningDeliveryBinding(identity, provider, id)) return { status: 'stale' };
   return vault.withCredentialLock(userOwner(identity), provider, async (_locked, tx) => {
@@ -362,12 +365,25 @@ export async function claimUserProvisioningDelivery(
       const token = newInteractionId();
       const claimed = await tx.get<{ id: string }>(
         `UPDATE user_provisioning_request
-           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
+           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
          WHERE id=? AND team_id=? AND user_id=? AND provider=?
-           AND expires_at>${POSTGRES_NOW_MS_SQL} AND delivered_at IS NULL
+           AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND (
+             delivered_at IS NULL
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+           )
            AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, id, identity.teamId, identity.userId, provider],
+        [
+          token,
+          PROMPT_DELIVERY_LEASE_MS,
+          id,
+          identity.teamId,
+          identity.userId,
+          provider,
+          options.redeliverDelivered === true,
+          PROMPT_REDELIVERY_DEBOUNCE_MS,
+        ],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await tx.get<{

@@ -10,6 +10,21 @@ export const PENDING_INTERACTION_TTL_MS = 10 * 60 * 1000;
  * Slack I/O; after a crashed claimant's lease expires, another turn can take over. */
 export const PROMPT_DELIVERY_LEASE_MS = 30_000;
 
+/**
+ * Re-delivery debounce (#194 UX). Transient prompt surfaces can vanish on reload/device-switch, so
+ * an adapter may explicitly let a genuine re-ask re-post the same generation once its last delivery
+ * is older than this window. Durable surfaces must leave the option off so retries do not duplicate
+ * messages. The atomic delivery lease is the race guard; this is only the UX cooldown. Same value as
+ * the lease (they are conceptually distinct and may change independently).
+ */
+export const PROMPT_REDELIVERY_DEBOUNCE_MS = 30_000;
+
+/** Delivery policy supplied by the adapter that owns the actual prompt surface. Defaulting to
+ * false preserves durable-message deduplication for direct core callers. */
+export interface PromptDeliveryOptions {
+  redeliverDelivered?: boolean;
+}
+
 /** PostgreSQL is the one clock for cross-replica delivery leases. Application clocks may differ by
  * more than the lease itself; using Date.now() here would let a fast pod steal a live claim. */
 export const POSTGRES_NOW_MS_SQL = `(extract(epoch from clock_timestamp()) * 1000)::bigint`;

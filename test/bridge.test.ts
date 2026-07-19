@@ -34,6 +34,10 @@ import {
 } from '../src/adapters/blocks';
 import type { Db } from '../src/core/db';
 import { openDb } from '../src/core/db';
+import {
+  POSTGRES_NOW_MS_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
+} from '../src/core/interaction';
 
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const TOKEN = 'sk-secret-token';
@@ -281,7 +285,7 @@ test('bridge: the provider is registry-validated before anything (SEC-4)', async
 
 // ── not_connected, user owner → the existing private connect/key flow ─────────────────────────────
 
-test('bridge: user not_connected posts ONE deduplicated private connect prompt', async (t) => {
+test('bridge: connect prompts deduplicate rapid retries and recover after an ephemeral vanishes', async (t) => {
   const h = await harness(t);
   const ctx = await h.context();
   const first = await ctx.recoverBrokerDenial('gh', { code: 'not_connected', recovery: 'connect' });
@@ -294,6 +298,40 @@ test('bridge: user not_connected posts ONE deduplicated private connect prompt',
   assert.deepEqual(again, { status: 'connect_prompted', provider: 'gh', promptState: 'reused' });
   assert.equal(h.ephemerals.length, 1, 'no duplicate prompt');
   assert.equal((await h.db.all("SELECT 1 AS x FROM consent_request WHERE superseded_at IS NULL")).length, 1);
+
+  await h.db.run(
+    `UPDATE consent_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?
+      WHERE superseded_at IS NULL`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+  );
+  const recovered = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
+  assert.deepEqual(recovered, {
+    status: 'connect_prompted', provider: 'gh', promptState: 'posted',
+  });
+  assert.equal(h.ephemerals.length, 2, 'the vanished ephemeral is re-posted after the debounce');
+});
+
+test('bridge: an aged durable connect DM remains deduplicated', async (t) => {
+  const h = await harness(t);
+  const first = await (await h.context({ channel: null, thread: null }))
+    .recoverBrokerDenial('gh', { code: 'not_connected' });
+  assert.deepEqual(first, {
+    status: 'connect_prompted', provider: 'gh', promptState: 'posted',
+  });
+  assert.equal(h.ephemerals.length, 0);
+  assert.equal(h.dms.length, 1);
+
+  await h.db.run(
+    `UPDATE consent_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?
+      WHERE superseded_at IS NULL`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+  );
+  const again = await (await h.context({ channel: null, thread: null }))
+    .recoverBrokerDenial('gh', { code: 'not_connected' });
+  assert.deepEqual(again, {
+    status: 'connect_prompted', provider: 'gh', promptState: 'reused',
+  });
+  assert.equal(h.dms.length, 1, 'a persistent DM is not posted again after the ephemeral debounce');
 });
 
 test('bridge: user not_connected for a key provider posts the key-setup prompt', async (t) => {
@@ -310,6 +348,39 @@ test('bridge: user not_connected for a key provider posts the key-setup prompt',
     status: 'connect_prompted', provider: 'vaulted', promptState: 'reused',
   });
   assert.equal(h.ephemerals.length, 1, 'the delivered key-setup prompt is not reposted');
+
+  await h.db.run(
+    `UPDATE user_provisioning_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+  );
+  const recovered = await (await h.context()).recoverBrokerDenial('vaulted', {
+    code: 'not_connected',
+  });
+  assert.deepEqual(recovered, {
+    status: 'connect_prompted', provider: 'vaulted', promptState: 'posted',
+  });
+  assert.equal(h.ephemerals.length, 2, 'the vanished key-setup ephemeral is re-posted');
+});
+
+test('bridge: an aged durable key-setup DM remains deduplicated', async (t) => {
+  const h = await harness(t, { providers: [keyProv] });
+  const first = await (await h.context({ channel: null, thread: null }))
+    .recoverBrokerDenial('vaulted', { code: 'not_connected' });
+  assert.deepEqual(first, {
+    status: 'connect_prompted', provider: 'vaulted', promptState: 'posted',
+  });
+  assert.equal(h.dms.length, 1);
+
+  await h.db.run(
+    `UPDATE user_provisioning_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+  );
+  const again = await (await h.context({ channel: null, thread: null }))
+    .recoverBrokerDenial('vaulted', { code: 'not_connected' });
+  assert.deepEqual(again, {
+    status: 'connect_prompted', provider: 'vaulted', promptState: 'reused',
+  });
+  assert.equal(h.dms.length, 1, 'a persistent key-setup DM is not posted again');
 });
 
 test('bridge: key-setup delivery deduplicates across two PostgreSQL replicas', async (t) => {
@@ -661,6 +732,16 @@ test('bridge: broker approval denial delivers ONE self decision surface; approve
   const again = await (await h.context()).recoverBrokerDenial('acme', denial);
   assert.deepEqual(again, { status: 'approval_prompted', provider: 'acme', approver: 'self' });
   assert.equal(h.ephemerals.length, 1, 'no duplicate prompt');
+
+  await h.db.run(
+    `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-? WHERE id=?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, denial.approvalId],
+  );
+  const recovered = await (await h.context()).recoverBrokerDenial('acme', denial);
+  assert.deepEqual(recovered, {
+    status: 'approval_prompted', provider: 'acme', approver: 'self',
+  });
+  assert.equal(h.ephemerals.length, 2, 'the vanished approval ephemeral is re-posted');
 
   // The existing click handler re-decides everything at the mutation; the grant is single-use.
   await h.click(APPROVAL_APPROVE_ACTION, { value: denial.approvalId });

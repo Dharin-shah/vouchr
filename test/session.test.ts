@@ -30,7 +30,11 @@ import { openDb, type Db } from '../src/core/db';
 import { ChannelTools, configureChannelTools } from '../src/core/tools';
 import { setChannelCredentialMode } from '../src/core/channelCredential';
 import { Approvals } from '../src/core/approval';
-import { InteractionStateChangedError, POSTGRES_NOW_MS_SQL } from '../src/core/interaction';
+import {
+  InteractionStateChangedError,
+  POSTGRES_NOW_MS_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
+} from '../src/core/interaction';
 import { mapSafeError, type VouchrRecovery } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
 
@@ -502,6 +506,18 @@ test('connect(): covered provider deduplicates one opaque in-thread request and 
   assert.equal(sessionRows.length, 1);
   assert.deepEqual(JSON.parse(sessionRows[0].meta), { channel: 'C1', thread: 'TH_A', event: 'request' });
   assert.ok(!sessionRows[0].meta.includes(button.value), 'opaque control ids never enter audit metadata');
+
+  await db.run(
+    `UPDATE session_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-? WHERE id=?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, button.value],
+  );
+  await assert.rejects(() => make('TH_A').connect('gh'), SessionApprovalRequiredError);
+  assert.equal(posted.length, 2, 'the vanished session ephemeral is re-posted after the debounce');
+  assert.equal(
+    (await auditRows()).filter((r) => r.action === 'session').length,
+    1,
+    're-delivery does not create or audit a second request generation',
+  );
 });
 
 test('connect(): after granting the thread, the same thread proceeds but other threads do not', async (t) => {
