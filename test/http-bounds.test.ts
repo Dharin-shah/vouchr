@@ -175,6 +175,7 @@ test('provider oauthTimeoutMs validates and configures token, revoke, and built-
   const provider = defineProvider({
     ...oauthProvider(),
     oauthTimeoutMs: timeoutMs,
+    revokeTarget: 'access',
     revoke: async (_provider, _token, signal) => {
       await new Promise<void>((resolve) => {
         if (signal?.aborted) resolve();

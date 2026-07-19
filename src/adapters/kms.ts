@@ -6,7 +6,7 @@ import type { EnvelopeProvider } from '../core/crypto';
  */
 export interface KmsClientLike {
   encrypt(keyId: string, plaintext: Buffer): Promise<Buffer>;
-  decrypt(ciphertext: Buffer): Promise<Buffer>;
+  decrypt(ciphertext: Buffer, signal?: AbortSignal): Promise<Buffer>;
 }
 
 /**
@@ -17,7 +17,7 @@ export interface KmsClientLike {
 export function kmsEnvelope(keyId: string, client: KmsClientLike): EnvelopeProvider {
   return {
     wrapDataKey: (dek) => client.encrypt(keyId, dek),
-    unwrapDataKey: (wrapped) => client.decrypt(wrapped),
+    unwrapDataKey: (wrapped, signal) => client.decrypt(wrapped, signal),
   };
 }
 
@@ -37,8 +37,11 @@ export async function awsKmsClient(opts: { region?: string } = {}): Promise<KmsC
       const out = await client.send(new mod.EncryptCommand({ KeyId: keyId, Plaintext: plaintext }));
       return Buffer.from(out.CiphertextBlob);
     },
-    decrypt: async (ciphertext) => {
-      const out = await client.send(new mod.DecryptCommand({ CiphertextBlob: ciphertext }));
+    decrypt: async (ciphertext, signal) => {
+      const out = await client.send(
+        new mod.DecryptCommand({ CiphertextBlob: ciphertext }),
+        signal ? { abortSignal: signal } : undefined,
+      );
       return Buffer.from(out.Plaintext);
     },
   };

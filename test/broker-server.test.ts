@@ -212,6 +212,7 @@ test('#211 loadProviders: the expanded declarative fields load and reach the pro
       authorizeParams: { audience: 'api.atlassian.com', prompt: 'consent' },
       revokeUrl: 'https://auth.atlassian.com/oauth/revoke',
       revokeAuth: 'body',
+      revokeTarget: 'both',
       egressResponse: { maxBytes: 1048576, allowContentTypes: ['application/json'] },
       rateLimit: { perMinute: 60, burst: 10 },
     }]),
@@ -223,6 +224,7 @@ test('#211 loadProviders: the expanded declarative fields load and reach the pro
   assert.deepEqual(p.authorizeParams, { audience: 'api.atlassian.com', prompt: 'consent' });
   assert.equal(p.revokeUrl, 'https://auth.atlassian.com/oauth/revoke');
   assert.equal(p.revokeAuth, 'body');
+  assert.equal(p.revokeTarget, 'both');
   assert.deepEqual(p.egressResponse, { maxBytes: 1048576, allowContentTypes: ['application/json'] });
   assert.deepEqual(p.rateLimit, { perMinute: 60, burst: 10 });
 });

@@ -6,7 +6,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent, offboardLockKey } from '../src/core/consent';
 import { defineProvider, github, ProviderRegistry } from '../src/core/providers';
-import { revokeToken } from '../src/core/tokens';
+import { revokeProviderCredential, revokeToken } from '../src/core/tokens';
 import { handleOAuthCallback } from '../src/core/oauthCallback';
 import {
   offboardUser,
@@ -55,6 +55,7 @@ const revocable = defineProvider({
   refresh: 'rotating',
   pkce: true,
   revokeUrl: 'https://acme.example/revoke',
+  revokeTarget: 'both',
   clientId: 'id',
   clientSecret: 'sec',
 });
@@ -90,6 +91,46 @@ test('revokeToken posts token to revokeUrl (form, no creds by default)', async (
     assert.equal(form.get('client_id'), null); // revokeAuth defaults to 'none'
     // GHSA-25m2: the revoke call is time-bounded so a hung endpoint can't stall offboarding.
     assert.ok(calls[0].init.signal instanceof AbortSignal);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('revokeProviderCredential revokes access + refresh and continues after one target fails', async () => {
+  const tokens: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    const token = new URLSearchParams(String(init?.body ?? '')).get('token')!;
+    tokens.push(token);
+    return new Response(null, { status: token === 'ACCESS' ? 500 : 200 });
+  }) as typeof fetch;
+  try {
+    const result = await revokeProviderCredential(revocable, {
+      accessToken: 'ACCESS',
+      refreshToken: 'REFRESH',
+    });
+    assert.deepEqual(tokens.sort(), ['ACCESS', 'REFRESH']);
+    assert.deepEqual(result, { attempted: true, ok: false, unreadable: false, missing: false });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('revokeProviderCredential grant target makes one call, preferring the refresh token', async () => {
+  const grant = defineProvider({ ...revocable, id: 'grant-revoke', revokeTarget: 'grant' });
+  const tokens: string[] = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    tokens.push(new URLSearchParams(String(init?.body ?? '')).get('token')!);
+    return new Response(null, { status: 200 });
+  }) as typeof fetch;
+  try {
+    const result = await revokeProviderCredential(grant, {
+      accessToken: 'ACCESS',
+      refreshToken: 'REFRESH',
+    });
+    assert.deepEqual(tokens, ['REFRESH']);
+    assert.deepEqual(result, { attempted: true, ok: true, unreadable: false, missing: false });
   } finally {
     globalThis.fetch = realFetch;
   }

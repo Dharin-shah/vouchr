@@ -7,6 +7,7 @@ import {
 import { MAX_TIMER_MS } from './options';
 
 export type RefreshStrategy = 'rotating' | 'static' | 'none';
+export type RevokeTarget = 'access' | 'refresh' | 'both' | 'grant';
 
 /** A provider is declarative OAuth2 + a refresh strategy + an egress allowlist. */
 export interface Provider {
@@ -127,6 +128,17 @@ export interface Provider {
   revokeUrl?: string;
   /** Client auth at the revoke endpoint. Default 'none'. 'body' = client_id/client_secret in the body. */
   revokeAuth?: 'none' | 'body';
+  /**
+   * Which credential must be revoked for upstream invalidation to be complete (#239):
+   *  - `access`: revoke the stored access token;
+   *  - `refresh`: revoke the stored refresh token;
+   *  - `both`: revoke every stored access/refresh token, continuing if either call fails;
+   *  - `grant`: one successful revoke invalidates the provider authorization grant. Vouchr prefers
+   *    the refresh token when present, otherwise the access token.
+   * Providers that can issue refresh tokens MUST declare this when they expose a revoke endpoint;
+   * silently assuming an access-token revoke also kills refresh authority is unsafe.
+   */
+  revokeTarget?: RevokeTarget;
   /** Escape hatch for non-standard revoke endpoints; takes precedence over `revokeUrl`.
    *  `signal` (GHSA-25m2) aborts at the revoke deadline — pass it to your fetch: the caller races
    *  the deadline regardless, but honoring the signal releases the socket instead of leaking it. */
@@ -469,7 +481,7 @@ const PROVIDER_FIELDS = new Set([
   'id', 'credential', 'identity', 'authorizeUrl', 'tokenUrl', 'scopesDefault',
   'scopeDescriptions', 'egressAllow', 'egressPaths', 'egressMethods', 'egressValidate',
   'egressResponse', 'mcp', 'rateLimit', 'approval', 'inject', 'refresh', 'pkce',
-  'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth', 'revoke',
+  'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth', 'revokeTarget', 'revoke',
   'clientId', 'clientSecret', 'publicClient', 'accountProbe', 'oauthTimeoutMs',
 ]);
 const MAX_PROVIDER_ITEMS = 128;
@@ -591,6 +603,12 @@ export function defineProvider(spec: Provider): Provider {
   const tokenAuth = optionalEnum(spec.tokenAuth, 'tokenAuth', ['body', 'basic'], 'body') as NonNullable<Provider['tokenAuth']>;
   const bodyFormat = optionalEnum(spec.bodyFormat, 'bodyFormat', ['form', 'json'], 'form') as NonNullable<Provider['bodyFormat']>;
   const revokeAuth = optionalEnum(spec.revokeAuth, 'revokeAuth', ['none', 'body'], 'none') as NonNullable<Provider['revokeAuth']>;
+  const revokeTarget = optionalEnum(
+    spec.revokeTarget,
+    'revokeTarget',
+    ['access', 'refresh', 'both', 'grant'],
+    'access',
+  ) as RevokeTarget;
   const pkce = optionalBoolean(spec.pkce, 'pkce');
   const publicClient = optionalBoolean(spec.publicClient, 'publicClient');
   const oauthTimeoutMs = spec.oauthTimeoutMs ?? DEFAULT_OAUTH_TIMEOUT_MS;
@@ -705,6 +723,14 @@ export function defineProvider(spec: Provider): Provider {
   if (spec.revokeUrl !== undefined && !spec.revokeUrl) providerError('revokeUrl', 'must be non-empty when set');
   if (spec.revokeUrl) assertSafeHttpsUrl(spec.revokeUrl, 'Provider revokeUrl');
   if (!spec.revokeUrl && revokeAuth !== 'none') providerError('revokeAuth', 'requires revokeUrl');
+  const revocable = !!(spec.revokeUrl || spec.revoke);
+  if (!revocable && spec.revokeTarget !== undefined) providerError('revokeTarget', 'requires revokeUrl or revoke');
+  if (revocable && refresh !== 'none' && spec.revokeTarget === undefined) {
+    providerError('revokeTarget', 'must declare access|refresh|both|grant when refresh tokens are possible');
+  }
+  if ((revokeTarget === 'refresh' || revokeTarget === 'both') && refresh === 'none') {
+    providerError('revokeTarget', 'cannot require a refresh token when refresh is none');
+  }
 
   if (credential === 'oauth') {
     assertSafeHttpsUrl(authorizeUrl, 'Provider authorizeUrl');
@@ -744,6 +770,7 @@ export function defineProvider(spec: Provider): Provider {
     tokenAuth,
     bodyFormat,
     revokeAuth,
+    revokeTarget: revocable ? revokeTarget : undefined,
     publicClient,
     oauthTimeoutMs,
     clientSecret: publicClient ? undefined : spec.clientSecret,
@@ -820,6 +847,7 @@ export function github(cfg: ProviderConfig = {}): Provider {
     ...egressOptions(cfg),
     refresh: 'none',
     pkce: false, // GitHub OAuth Apps use the client secret, not PKCE
+    revokeTarget: 'access',
     clientId: cfg.clientId ?? process.env.GITHUB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITHUB_CLIENT_SECRET ?? '',
     // Non-standard shape (DELETE + Basic + JSON + client_id in the path) → function escape hatch.
@@ -877,6 +905,9 @@ export function google(cfg: ProviderConfig = {}): Provider {
     pkce: true,
     authorizeParams: { access_type: 'offline', prompt: 'consent' },
     revokeUrl: 'https://oauth2.googleapis.com/revoke', // form token=<token>, no client auth
+    // Google documents access-token revocation as invalidating the corresponding refresh token and
+    // the full project grant, so one successful call is the complete provider operation.
+    revokeTarget: 'grant',
     clientId: cfg.clientId ?? process.env.GOOGLE_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GOOGLE_CLIENT_SECRET ?? '',
     accountProbe: (token, signal) =>
@@ -902,6 +933,8 @@ export function gitlab(cfg: ProviderConfig = {}): Provider {
     pkce: true,
     revokeUrl: 'https://gitlab.com/oauth/revoke', // form client_id+client_secret+token
     revokeAuth: 'body',
+    // GitLab documents token revocation, not grant-level revocation. Revoke both stored authorities.
+    revokeTarget: 'both',
     clientId: cfg.clientId ?? process.env.GITLAB_CLIENT_ID ?? '',
     clientSecret: cfg.clientSecret ?? process.env.GITLAB_CLIENT_SECRET ?? '',
     accountProbe: (token, signal) =>

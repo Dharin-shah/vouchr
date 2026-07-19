@@ -55,6 +55,7 @@ const TRANSIENT_OAUTH_ERRORS = new Set(['server_error', 'temporarily_unavailable
 
 export type OAuthCallbackOutcome =
   | 'connected'
+  | 'service_unavailable'
   | 'denied'
   | 'incomplete'
   | 'state_unavailable'
@@ -64,7 +65,7 @@ export type OAuthCallbackOutcome =
   | 'setup_changed';
 export type AttributedOAuthCallbackOutcome = Exclude<
   OAuthCallbackOutcome,
-  'connected' | 'state_unavailable'
+  'connected' | 'service_unavailable' | 'state_unavailable'
 >;
 
 interface CallbackContext {
@@ -81,6 +82,14 @@ export type CallbackResult =
       account: string | null;
       scopes: string;
       identity: SlackIdentity;
+    }
+  | {
+      ok: false;
+      outcome: 'service_unavailable';
+      status: 503;
+      error: string;
+      retryable: false;
+      recovery: 'retry_later';
     }
   | {
       ok: false;
@@ -108,6 +117,17 @@ function unavailable(error: string): CallbackResult {
     error,
     retryable: false,
     recovery: 'connect',
+  };
+}
+
+function serviceUnavailable(): CallbackResult {
+  return {
+    ok: false,
+    outcome: 'service_unavailable',
+    status: 503,
+    error: 'Connection setup is temporarily unavailable. Contact an administrator.',
+    retryable: false,
+    recovery: 'retry_later',
   };
 }
 
@@ -147,6 +167,10 @@ export async function handleOAuthCallback(
   error?: string,
   signal?: AbortSignal,
 ): Promise<CallbackResult> {
+  // #239 containment must precede state consumption and token exchange. A Vault-only write check is
+  // too late: the compromised process would already have received a freshly minted provider token.
+  // Leave the single-use state untouched so recovery can decide whether to resume or let it expire.
+  if (deps.vault.lockdownEnabled) return serviceUnavailable();
   // State is required even on the error path: without it there's no identity to attribute the denial
   // to. Consuming it on a denial is correct — state is single-use, so this also prevents replay.
   if (!state) return unavailable('Missing code/state.');

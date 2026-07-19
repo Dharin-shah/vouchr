@@ -209,7 +209,9 @@ export function decrypt(blob: Buffer, keys: MasterKeys): string {
  */
 export interface EnvelopeProvider {
   wrapDataKey(dek: Buffer): Promise<Buffer>;
-  unwrapDataKey(wrapped: Buffer): Promise<Buffer>;
+  /** `signal` is supplied by bounded reads such as deployment-wide revocation. Implementations
+   * should pass it to their network client; one-argument implementations remain compatible. */
+  unwrapDataKey(wrapped: Buffer, signal?: AbortSignal): Promise<Buffer>;
 }
 
 /** Leading byte of the envelope format. Legacy rows have NO version byte (see open()). */
@@ -263,14 +265,20 @@ export async function seal(plaintext: string, keys: MasterKeys, envelope?: Envel
  *    it FAILS the row was a true envelope row, so re-raise the ENVELOPE error — the clear KMS/tamper
  *    message, never the legacy GCM one. Either way nothing is returned unless a decrypt authenticated.
  */
-export async function open(blob: Buffer, keys: MasterKeys, envelope?: EnvelopeProvider, onUnwrap?: () => void): Promise<string> {
+export async function open(
+  blob: Buffer,
+  keys: MasterKeys,
+  envelope?: EnvelopeProvider,
+  onUnwrap?: () => void,
+  signal?: AbortSignal,
+): Promise<string> {
   if (!envelope || blob[0] !== SCHEME_ENVELOPE) return decrypt(blob, keys);
   let envErr: unknown;
   try {
     const dekLen = blob.readUInt16BE(1);
     const wrapped = blob.subarray(3, 3 + dekLen);
     const body = blob.subarray(3 + dekLen);
-    const dek = await envelope.unwrapDataKey(wrapped);
+    const dek = await envelope.unwrapDataKey(wrapped, signal);
     onUnwrap?.(); // a real KMS/Vault decrypt happened; count it for observability (never logs the DEK)
     try {
       return decryptBody(body, dek);

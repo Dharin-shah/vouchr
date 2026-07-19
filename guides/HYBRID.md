@@ -742,6 +742,7 @@ generic bearer/key injector does not implement AWS SigV4 request signing.
 | Broker perimeter auth | no | yes | mTLS/mesh, `authorize`, or a coarse bearer alternative; `authorize` replaces the bearer check |
 | External-secret resolver and IAM | resolver entry wherever references are accepted; IAM only where egress runs | resolver entry + IAM | Saving validates that a matching resolver function is configured but does not invoke it; the egress process resolves JIT and needs network/IAM access |
 | Resource bounds | control HTTP server | yes | Finite ingress, egress, pool, stream, and shutdown limits |
+| `VOUCHR_LOCKDOWN` | yes | yes | #239 containment: set per plane during an incident — readiness 503 + serving/refresh/callback-write/resolver/setup denied before secret access; break-glass `vouchr revoke` still works. Authority is this env, never a DB flag |
 
 Do not give PostgreSQL ownership/DDL rights to either runtime. Budget database connections as
 `(VOUCHR_PG_POOL_MAX + 4) × replicas` per plane that opens its own pool; share a pool inside one

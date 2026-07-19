@@ -12,6 +12,7 @@ import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { VouchrEvent } from '../src/core/injector';
 import { createBroker } from '../src/adapters/http/broker';
+import { createVouchr } from '../src/adapters/bolt';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 
 const KEY = randomBytes(32);
@@ -234,4 +235,51 @@ test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async (
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'POST', path: '/x', body: '{}' });
     assert.equal(r.status, 405);
   } finally { server.close(); }
+});
+
+// ── (#239) containment: VOUCHR_LOCKDOWN fails readiness + refuses every functional route ──────────
+
+test('createVouchr validates VOUCHR_LOCKDOWN before key or database acquisition', async () => {
+  const prior = process.env.VOUCHR_LOCKDOWN;
+  process.env.VOUCHR_LOCKDOWN = 'typo-that-must-fail-closed';
+  try {
+    await assert.rejects(
+      () => createVouchr({ providers: [acme], baseUrl: 'https://vouchr.example', databaseUrl: 'not-postgres' }),
+      /VOUCHR_LOCKDOWN/,
+    );
+  } finally {
+    if (prior === undefined) delete process.env.VOUCHR_LOCKDOWN;
+    else process.env.VOUCHR_LOCKDOWN = prior;
+  }
+});
+
+function getStatus(port: number, path: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method: 'GET' }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode ?? 0));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('lockdown broker: liveness stays 200, readiness is 503, and functional routes are refused before secret access', async (t) => {
+  const db = await openTestDb(t);
+  const seedVault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await seedVault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const vault = new Vault(db, KEY, {}, undefined, true);
+  // The route gate derives from the same immutable Vault flag; direct callers cannot wire two
+  // contradictory lockdown states.
+  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const port = await listen(server);
+  const up = mockUpstream();
+  try {
+    assert.equal(await getStatus(port, '/healthz'), 200, 'liveness must stay up');
+    assert.equal(await getStatus(port, '/readyz'), 503, 'a locked-down replica must not be ready');
+    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
+    assert.equal(r.status, 503, 'functional routes must be refused under lockdown');
+    assert.equal(up.seen.length, 0, 'no credential may be served under lockdown');
+  } finally { up.restore(); server.close(); }
 });
