@@ -27,7 +27,9 @@ app.event('app_mention', async ({ context, event, client }) => {
   // 3. Vouchr in one call: middleware + OAuth callback + /vouchr command + offboarding + TTL sweep.
   //    Requires a PostgreSQL connection string in VOUCHR_DATABASE_URL. Run `npm run cli -- migrate`
   //    once against it first — the runtime connects DML-only and never creates tables.
-  const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
+  // Least privilege: this demo only reads /user, so request read:user ONLY — not the broad `repo`
+  // scope github() defaults to. The Connect prompt then shows just "Read your profile".
+  const vouchr = await createVouchr({ providers: [github({ scopes: ['read:user'] })], baseUrl: process.env.PUBLIC_URL! });
   vouchr.install(app, receiver);
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
