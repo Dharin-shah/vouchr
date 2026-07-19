@@ -17,6 +17,7 @@ import {
   PENDING_INTERACTION_TTL_MS,
   POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
 } from './interaction';
 import { channelOwner, userOwner } from './owner';
@@ -360,14 +361,17 @@ export async function claimUserProvisioningDelivery(
   return vault.withCredentialLock(userOwner(identity), provider, async (_locked, tx) => {
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
+      // A delivered key-setup prompt is re-claimable once older than the re-delivery debounce (a
+      // vanished ephemeral re-posts on re-ask); rapid/concurrent asks within the window dedup.
       const claimed = await tx.get<{ id: string }>(
         `UPDATE user_provisioning_request
-           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
+           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
          WHERE id=? AND team_id=? AND user_id=? AND provider=?
-           AND expires_at>${POSTGRES_NOW_MS_SQL} AND delivered_at IS NULL
+           AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND (delivered_at IS NULL OR delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
            AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, id, identity.teamId, identity.userId, provider],
+        [token, PROMPT_DELIVERY_LEASE_MS, id, identity.teamId, identity.userId, provider, PROMPT_REDELIVERY_DEBOUNCE_MS],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await tx.get<{

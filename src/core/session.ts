@@ -12,6 +12,7 @@ import {
   PENDING_INTERACTION_TTL_MS,
   POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
 } from './interaction';
 import { channelOwner, userOwner, type Owner } from './owner';
@@ -183,13 +184,16 @@ export class SessionGrants {
     if (!isInteractionId(id)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
+      // A delivered session prompt is re-claimable once older than the re-delivery debounce (a
+      // vanished ephemeral re-posts on re-ask); rapid/concurrent asks within the window dedup.
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE session_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
-         WHERE id=? AND expires_at>${POSTGRES_NOW_MS_SQL} AND delivered_at IS NULL
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
+         WHERE id=? AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND (delivered_at IS NULL OR delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
            AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, id],
+        [token, PROMPT_DELIVERY_LEASE_MS, id, PROMPT_REDELIVERY_DEBOUNCE_MS],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await this.db.get<{

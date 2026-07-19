@@ -17,6 +17,7 @@ import {
   PENDING_INTERACTION_TTL_MS,
   POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
 } from './interaction';
 import { channelOwner, userOwner, type Owner } from './owner';
@@ -535,6 +536,10 @@ export class Approvals {
     if (!isInteractionId(id) || !/^[0-9a-f]{64}$/.test(audience)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
+      // Re-claim when: a different audience needs it (self→admin escalation, immediate), the prompt
+      // was never delivered, OR its last delivery to THIS audience is older than the re-delivery
+      // debounce (a vanished ephemeral re-posts on re-ask). Rapid/concurrent same-audience asks within
+      // the window still dedup to 'delivered'.
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE approval_request
          SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?,
@@ -545,9 +550,10 @@ export class Approvals {
            )
            AND (
              delivery_audience IS DISTINCT FROM ? OR delivered_at IS NULL
+             OR delivered_at <= ${POSTGRES_NOW_MS_SQL}-?
            )
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, audience, id, audience],
+        [token, PROMPT_DELIVERY_LEASE_MS, audience, id, audience, PROMPT_REDELIVERY_DEBOUNCE_MS],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await this.db.get<{

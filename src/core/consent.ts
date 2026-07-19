@@ -10,6 +10,7 @@ import {
   newInteractionId,
   POSTGRES_NOW_MS_SQL,
   PROMPT_DELIVERY_LEASE_MS,
+  PROMPT_REDELIVERY_DEBOUNCE_MS,
   type PromptDeliveryClaim,
 } from './interaction';
 
@@ -805,19 +806,24 @@ export class Consent {
       : null;
   }
 
-  /** Cross-replica lease for the private Slack Connect prompt. */
+  /** Cross-replica lease for the private Slack Connect prompt. A DELIVERED prompt is re-claimable
+   *  once its delivery is older than PROMPT_REDELIVERY_DEBOUNCE_MS: the ephemeral can vanish, so a
+   *  genuine re-ask re-posts the SAME generation (re-arm delivered_at) rather than dead-ending, while
+   *  rapid/concurrent asks within the window still dedup to 'delivered'. The lease remains the race
+   *  guard. */
   async claimDelivery(state: string): Promise<PromptDeliveryClaim> {
     if (!isConsentState(state)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
       const claimed = await this.db.get<{ state: string }>(
         `UPDATE consent_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
          WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
-           AND created_at >= ${POSTGRES_NOW_MS_SQL}-? AND delivered_at IS NULL
+           AND created_at >= ${POSTGRES_NOW_MS_SQL}-?
+           AND (delivered_at IS NULL OR delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
            AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
          RETURNING state`,
-        [token, PROMPT_DELIVERY_LEASE_MS, state, STATE_TTL_MS],
+        [token, PROMPT_DELIVERY_LEASE_MS, state, STATE_TTL_MS, PROMPT_REDELIVERY_DEBOUNCE_MS],
       );
       if (claimed) return { status: 'claimed', token };
       const current = await this.db.get<{

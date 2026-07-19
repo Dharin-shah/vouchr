@@ -18,6 +18,7 @@ import {
   STATE_TTL_MS,
 } from '../src/core/consent';
 import { userOwner } from '../src/core/owner';
+import { PROMPT_REDELIVERY_DEBOUNCE_MS } from '../src/core/interaction';
 import { openDb, type Db } from '../src/core/db';
 import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
@@ -138,6 +139,33 @@ test('OAuth delivery cleanup is exact and ambiguous delivery retains its lease',
     await consent.claimDelivery(replacement.state),
     { status: 'in-flight' },
     'an ambiguous sender retains the short lease and prevents an immediate duplicate',
+  );
+});
+
+test('a delivered connect prompt re-posts on a re-ask once past the re-delivery debounce (#194)', async (t) => {
+  const db = await openTestDb(t);
+  const consent = new Consent(db);
+  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const claim = await consent.claimDelivery(pending.state);
+  assert.equal(claim.status, 'claimed');
+  if (claim.status !== 'claimed') assert.fail('prompt delivery was not claimable');
+  assert.equal(await consent.confirmDelivery(pending.state, claim.token), true);
+
+  // WITHIN the debounce window: a rapid re-ask reuses the live prompt (dedup — no double-post).
+  assert.deepEqual(await consent.claimDelivery(pending.state), { status: 'delivered' });
+
+  // Age the last delivery PAST the debounce (the ephemeral has since vanished). A genuine re-ask now
+  // RE-CLAIMS the SAME generation and re-posts, instead of dead-ending for the full 10-minute TTL.
+  await db.run(
+    `UPDATE consent_request
+       SET delivered_at = ${'(extract(epoch from clock_timestamp()) * 1000)::bigint'} - ?
+     WHERE state=?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, pending.state],
+  );
+  assert.equal(
+    (await consent.claimDelivery(pending.state)).status,
+    'claimed',
+    'a re-ask after the debounce re-posts the connect prompt',
   );
 });
 
