@@ -52,6 +52,13 @@ export const VOUCHR_ERROR_CODES = Object.freeze([
 
 export type VouchrErrorCode = (typeof VOUCHR_ERROR_CODES)[number];
 
+/** Runtime guard for {@link VouchrErrorCode} (STR-2: lives next to the registry). Wire consumers —
+ * the broker-to-Slack recovery bridge, headless hosts parsing a BrokerError body — validate the
+ * untrusted `code` field through this before branching; anything else fails closed. */
+export function isVouchrErrorCode(value: unknown): value is VouchrErrorCode {
+  return typeof value === 'string' && (VOUCHR_ERROR_CODES as readonly string[]).includes(value);
+}
+
 /** Closed recovery categories for trusted hosts. These describe the next human/operator action;
  * they are not permission to retry a request. Use `retryable` independently. */
 export const VOUCHR_RECOVERY_ACTIONS = Object.freeze([

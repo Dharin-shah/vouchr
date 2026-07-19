@@ -75,6 +75,36 @@ export function approvalActionFingerprint(key: ApprovalKey): string {
   return `hmac-sha256:${approvalActionKey(key)}`;
 }
 
+/** Opaque, row-specific digest of the exact recipient class/set whose current prompt delivery may
+ * be reused. Slack membership/admin reads stay in Bolt, but only this bounded digest is persisted;
+ * a self→admin rule change or admin-roster change therefore cannot inherit another audience's
+ * delivered marker. */
+export function approvalDeliveryAudienceKey(
+  approvalId: string,
+  approver: 'self' | 'admin',
+  recipients: readonly string[],
+): string {
+  if (!isInteractionId(approvalId) || (approver !== 'self' && approver !== 'admin')) {
+    throw new Error('invalid approval delivery audience');
+  }
+  const normalized = [...new Set(recipients)].sort();
+  if (
+    (approver === 'self' && normalized.length !== 1)
+    || normalized.some((recipient) => (
+      typeof recipient !== 'string' || recipient.length === 0 || recipient.length > 255
+    ))
+  ) {
+    throw new Error('invalid approval delivery audience');
+  }
+  const hash = createHash('sha256');
+  for (const value of ['vouchr-approval-audience-v1', approvalId, approver, ...normalized]) {
+    hash.update(String(Buffer.byteLength(value, 'utf8')));
+    hash.update(':');
+    hash.update(value);
+  }
+  return hash.digest('hex');
+}
+
 /** Default validity of an approval once granted (#113): 5 minutes, unless the provider sets ttlMs. */
 export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
 
@@ -363,6 +393,18 @@ function toRow(r: any): ApprovalRow {
 export class Approvals {
   constructor(private db: Db) {}
 
+  /** Re-resolve the database-backed authority for a row through the canonical approval validator.
+   * The recovery bridge has an Approvals instance but deliberately has no raw Db handle; keeping
+   * this adapter on the store prevents it from copying the mode/session/offboard/credential checks.
+   * This is a delivery-time fail-closed snapshot only. The decision mutation still repeats the
+   * validation while holding its lifecycle locks. */
+  async ownerStillCurrent(
+    row: ApprovalKey,
+    input: Omit<CredentialUseValidationInput, 'binding' | 'db'>,
+  ): Promise<boolean> {
+    return approvalOwnerStillCurrent({ row, db: this.db, ...input });
+  }
+
   private keyParams(k: ApprovalKey): unknown[] {
     return [
       k.teamId,
@@ -411,7 +453,8 @@ export class Approvals {
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
-           delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL
+           delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL,
+           delivery_audience=NULL
          WHERE approval_request.team_id=excluded.team_id
            AND approval_request.user_id=excluded.user_id
            AND approval_request.owner_kind=excluded.owner_kind
@@ -485,60 +528,88 @@ export class Approvals {
     return this.db.transaction(write);
   }
 
-  /** Cross-replica Slack-delivery lease. Headless callers do not claim it; the Bolt surface claims
-   * immediately before posting. No transaction/advisory lock is held over Slack I/O. */
-  async claimDelivery(id: string): Promise<PromptDeliveryClaim> {
-    if (!isInteractionId(id)) return { status: 'stale' };
+  /** Cross-replica Slack-delivery lease, bound to the current exact recipient class/set. Headless
+   * callers do not claim it; Bolt derives the audience from current Slack facts immediately before
+   * posting. No transaction/advisory lock is held over Slack I/O. */
+  async claimDelivery(id: string, audience: string): Promise<PromptDeliveryClaim> {
+    if (!isInteractionId(id) || !/^[0-9a-f]{64}$/.test(audience)) return { status: 'stale' };
     for (let attempt = 0; attempt < 3; attempt++) {
       const token = newInteractionId();
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE approval_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
-         WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_MS_SQL} AND delivered_at IS NULL
-           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?,
+             delivered_at=NULL, delivery_audience=?
+         WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND (
+             delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL}
+           )
+           AND (
+             delivery_audience IS DISTINCT FROM ? OR delivered_at IS NULL
+           )
          RETURNING id`,
-        [token, PROMPT_DELIVERY_LEASE_MS, id],
+        [token, PROMPT_DELIVERY_LEASE_MS, audience, id, audience],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await this.db.get<{
         delivered_at: number | null;
+        delivery_token: string | null;
         delivery_lease_expires_at: number;
+        delivery_audience: string | null;
         now_ms: number;
       }>(
-        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
+        `SELECT delivered_at, delivery_token, delivery_lease_expires_at, delivery_audience,
+                ${POSTGRES_NOW_MS_SQL} AS now_ms
          FROM approval_request
          WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_MS_SQL}`,
         [id],
       );
       if (!row) return { status: 'stale' };
+      if (row.delivery_audience !== audience) {
+        if (row.delivery_token !== null && row.delivery_lease_expires_at > row.now_ms) {
+          return { status: 'in-flight' };
+        }
+        continue;
+      }
       if (row.delivered_at != null) return { status: 'delivered' };
       if (row.delivery_lease_expires_at > row.now_ms) return { status: 'in-flight' };
     }
     return { status: 'in-flight' };
   }
 
-  async confirmDelivery(id: string, token: string): Promise<boolean> {
-    if (!isInteractionId(id) || !isInteractionId(token)) return false;
+  async confirmDelivery(id: string, token: string, audience: string): Promise<boolean> {
+    if (!isInteractionId(id) || !isInteractionId(token) || !/^[0-9a-f]{64}$/.test(audience)) {
+      return false;
+    }
     return (await this.db.run(
       `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
-       WHERE id=? AND delivery_token=? AND status='pending' AND delivered_at IS NULL
+       WHERE id=? AND delivery_token=? AND delivery_audience=?
+         AND status='pending' AND delivered_at IS NULL
          AND expires_at>${POSTGRES_NOW_MS_SQL}`,
-      [id, token],
+      [id, token, audience],
     )).changes === 1;
   }
 
-  async abandonDelivery(id: string, token: string, remove: boolean): Promise<boolean> {
-    if (!isInteractionId(id) || !isInteractionId(token)) return false;
+  async abandonDelivery(
+    id: string,
+    token: string,
+    audience: string,
+    remove: boolean,
+  ): Promise<boolean> {
+    if (!isInteractionId(id) || !isInteractionId(token) || !/^[0-9a-f]{64}$/.test(audience)) {
+      return false;
+    }
     const result = remove
       ? await this.db.run(
         `DELETE FROM approval_request
-         WHERE id=? AND delivery_token=? AND status='pending' AND delivered_at IS NULL`,
-        [id, token],
+         WHERE id=? AND delivery_token=? AND delivery_audience=?
+           AND status='pending' AND delivered_at IS NULL`,
+        [id, token, audience],
       )
       : await this.db.run(
         `UPDATE approval_request SET delivery_token=NULL, delivery_lease_expires_at=0
-         WHERE id=? AND delivery_token=? AND status='pending' AND delivered_at IS NULL`,
-        [id, token],
+         WHERE id=? AND delivery_token=? AND delivery_audience=?
+           AND status='pending' AND delivered_at IS NULL`,
+        [id, token, audience],
       );
     return result.changes === 1;
   }

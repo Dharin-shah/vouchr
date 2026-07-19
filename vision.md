@@ -228,8 +228,11 @@ parallel when it does not create conflicting foundations.
   previews are removed. Persistent single-use interaction state, offboarding fences, API recovery,
   and typed errors are complete. OAuth connect now converges on one active owner/provider generation,
   one cross-replica prompt-delivery lease, transaction-bound callback finalization, fixed browser
-  outcomes, and private Bolt recovery. The remaining focused slice is the trusted broker-to-Slack
-  connect/session/approval recovery bridge and its two-process proof.
+  outcomes, and private Bolt recovery. The trusted broker-to-Slack recovery bridge is complete:
+  `context.vouchr.recoverBrokerDenial` maps the stable broker denials (`not_connected`,
+  `session_approval_required`, `approval_required`) to the correct private connect/key, thread
+  session, or self/admin approval surface from verified Slack state, with a two-process
+  Bolt + packaged-broker integration proof over one PostgreSQL database.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility
 project would require a new explicit product decision backed by a concrete deployed lineage; it is

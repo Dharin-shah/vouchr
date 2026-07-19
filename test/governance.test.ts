@@ -10,6 +10,7 @@ import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
 import { CONFIGURE_CALLBACK } from '../src/adapters/blocks';
+import { WebClient } from '@slack/web-api';
 
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' };
@@ -27,12 +28,18 @@ async function ctx(t: TestContext, opts: {
   requireMembership?: boolean;
   members?: string[] | 'throw';
   slackAdmin?: boolean; // what the built-in users.info gate reports
+  clientToken?: string;
+  slackClientOptions?: any;
 } = {}) {
-  const { adminCheck, requireMembership = false, members = [ID.userId], slackAdmin = true } = opts;
+  const {
+    adminCheck, requireMembership = false, members = [ID.userId], slackAdmin = true,
+    clientToken, slackClientOptions,
+  } = opts;
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const client = {
+    ...(clientToken ? { token: clientToken } : {}),
     users: { info: async () => ({ user: { is_admin: slackAdmin } }) },
     conversations: {
       info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }),
@@ -45,7 +52,7 @@ async function ctx(t: TestContext, opts: {
   const c = new ConnectContext({
     identity: ID, channel: 'C_FIN', client, registry: new ProviderRegistry([provider]), vault, audit,
     consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
-    channelConfig: new ChannelConfig(db), adminCheck, requireMembership,
+    channelConfig: new ChannelConfig(db), adminCheck, requireMembership, slackClientOptions,
   });
   return { c, db, vault, audit };
 }
@@ -103,6 +110,38 @@ test('requireChannelMembership: membership check errors → refused', async (t) 
   await c.setChannelSecret('mcp', SECRET);
   await assert.rejects(() => c.connectChannel('mcp'), /member of this channel/);
   assert.ok((await auditRows(db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
+});
+
+test('requireChannelMembership: token-bearing clients use the bounded zero-retry transport', async (t) => {
+  const seen: any[] = [];
+  const prototype = WebClient.prototype as any;
+  const realApiCall = prototype.apiCall;
+  prototype.apiCall = async function (this: any, method: string) {
+    seen.push({
+      method,
+      retries: this.retryConfig?.retries,
+      rejectRateLimited: this.rejectRateLimitedCalls,
+      apiUrl: this.slackApiUrl,
+    });
+    return { ok: true, members: [ID.userId] };
+  };
+  try {
+    const { c } = await ctx(t, {
+      requireMembership: true,
+      clientToken: 'xoxb-membership-test',
+      slackClientOptions: { slackApiUrl: 'https://slack-proxy.internal/api/' },
+    });
+    await c.setChannelSecret('mcp', SECRET);
+    assert.ok(await c.connectChannel('mcp'));
+    assert.deepEqual(seen, [{
+      method: 'conversations.members',
+      retries: 0,
+      rejectRateLimited: true,
+      apiUrl: 'https://slack-proxy.internal/api/',
+    }]);
+  } finally {
+    prototype.apiCall = realApiCall;
+  }
 });
 
 test('/vouchr commands honor the custom isAdmin override', async (t) => {

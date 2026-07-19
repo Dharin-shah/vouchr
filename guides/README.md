@@ -4,7 +4,7 @@ The root README is the product overview and quick start. These guides hold the d
 material:
 
 - [Architecture](./ARCHITECTURE.md) - components, storage, credential modes, and core boundaries.
-- [Hybrid](./HYBRID.md) - Slack control plane plus a private headless broker, including current blockers.
+- [Hybrid](./HYBRID.md) - Slack control plane plus a private headless broker, including the broker-denial recovery bridge.
 - [Headless HTTP](./HEADLESS.md) - the broker API, wire contracts, and low-level integration surface.
 - [Deployment](./DEPLOYMENT.md) - PostgreSQL, KMS/envelope encryption, and production recommendations.
 - [Threat model](./THREAT-MODEL.md) - trust boundaries, attacker model, and enforced invariants.

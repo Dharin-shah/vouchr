@@ -311,9 +311,12 @@ async function main(): Promise<void> {
   }
   const built = await buildBrokerServer();
   built.server.listen(built.port, () => {
-    // One line, no secrets — startup provenance for ops.
+    // One line, no secrets — startup provenance for ops. Report the port the OS actually bound so
+    // VOUCHR_PORT=0 (ephemeral, e.g. the two-process integration test) logs a usable address.
+    const addr = built.server.address();
+    const port = typeof addr === 'object' && addr ? addr.port : built.port;
     console.log(
-      `[vouchr] broker listening port=${built.port} backend=${built.backend} ` +
+      `[vouchr] broker listening port=${port} backend=${built.backend} ` +
         `providers=[${built.providerIds.join(',')}] allowWrites=${built.allowWrites}` +
         (built.dryRun ? ' dryRun=true' : ''),
     );

@@ -9,6 +9,7 @@ import { Audit } from '../src/core/audit';
 import { Consent, withUserInteractionFence } from '../src/core/consent';
 import {
   Approvals,
+  approvalDeliveryAudienceKey,
   ApprovalPathTooLongError,
   ApprovalRequiredError,
   MAX_APPROVAL_PATH_BYTES,
@@ -1144,10 +1145,14 @@ test('PostgreSQL clock owns approval TTL/lease and expired delivered pending/gra
     `SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS now_ms`,
   );
   assert.ok(Math.abs(firstRow.created_at - dbNow!.now_ms) < 5_000, 'pod clock never stamps authority TTL');
-  const claim = await withClockOffset(60 * 60_000, () => a.claimDelivery(first));
+  const firstAudience = approvalDeliveryAudienceKey(first, 'self', ['U1']);
+  const claim = await withClockOffset(60 * 60_000, () => a.claimDelivery(first, firstAudience));
   assert.equal(claim.status, 'claimed');
-  assert.equal((await withClockOffset(-60 * 60_000, () => b.claimDelivery(first))).status, 'in-flight');
-  assert.equal(await a.confirmDelivery(first, (claim as any).token), true);
+  assert.equal(
+    (await withClockOffset(-60 * 60_000, () => b.claimDelivery(first, firstAudience))).status,
+    'in-flight',
+  );
+  assert.equal(await a.confirmDelivery(first, (claim as any).token, firstAudience), true);
 
   await dbA.run(`UPDATE approval_request SET expires_at=0 WHERE id=?`, [first]);
   const second = await withClockOffset(-60 * 60_000, () => b.request(key));
@@ -1157,9 +1162,10 @@ test('PostgreSQL clock owns approval TTL/lease and expired delivered pending/gra
   assert.equal(row.delivery_token, null);
   assert.equal(row.delivery_lease_expires_at, 0);
 
-  const secondClaim = await b.claimDelivery(second);
+  const secondAudience = approvalDeliveryAudienceKey(second, 'self', ['U1']);
+  const secondClaim = await b.claimDelivery(second, secondAudience);
   assert.equal(secondClaim.status, 'claimed');
-  await b.confirmDelivery(second, (secondClaim as any).token);
+  await b.confirmDelivery(second, (secondClaim as any).token, secondAudience);
   await b.approve(second, 'U1', 60_000);
   await dbA.run(`UPDATE approval_request SET expires_at=0 WHERE id=?`, [second]);
   const third = await a.request(key);
@@ -1170,7 +1176,73 @@ test('PostgreSQL clock owns approval TTL/lease and expired delivered pending/gra
   assert.equal(row.delivery_token, null);
 });
 
+test('approval delivery is reusable only by the same approver class and recipient set', async (t) => {
+  const db = await openTestDb(t);
+  const approvals = new Approvals(db);
+  const id = await approvals.request({
+    teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1',
+    credentialId: GENERATION, provider: 'acme', method: 'POST',
+    origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
+    channel: 'C1', thread: 'TH1',
+  });
+  const selfAudience = approvalDeliveryAudienceKey(id, 'self', ['U1']);
+  const selfClaim = await approvals.claimDelivery(id, selfAudience);
+  assert.equal(selfClaim.status, 'claimed');
+  assert.equal(
+    await approvals.confirmDelivery(id, (selfClaim as { token: string }).token, selfAudience),
+    true,
+  );
+  assert.deepEqual(await approvals.claimDelivery(id, selfAudience), { status: 'delivered' });
+
+  const adminAudience = approvalDeliveryAudienceKey(id, 'admin', ['UNEW']);
+  const adminClaim = await approvals.claimDelivery(id, adminAudience);
+  assert.equal(adminClaim.status, 'claimed', 'self delivery cannot suppress the new admin audience');
+  assert.equal(
+    await approvals.confirmDelivery(id, (adminClaim as { token: string }).token, adminAudience),
+    true,
+  );
+  assert.deepEqual(await approvals.claimDelivery(id, adminAudience), { status: 'delivered' });
+});
+
 // ── gate ordering: approval is an ADDITIONAL gate, never a bypass ─────────────────────────────────
+
+test('two replicas: a changing approval audience cannot replace an active delivery lease', async (t) => {
+  const url = await testDbUrl(t);
+  const dbA = await openDb({ databaseUrl: url });
+  const dbB = await openDb({ databaseUrl: url });
+  t.after(() => dbA.close());
+  t.after(() => dbB.close());
+  const firstReplica = new Approvals(dbA);
+  const secondReplica = new Approvals(dbB);
+  const id = await firstReplica.request({
+    teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1',
+    credentialId: GENERATION, provider: 'acme', method: 'POST',
+    origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
+    channel: 'C1', thread: 'TH1',
+  });
+  const oldAudience = approvalDeliveryAudienceKey(id, 'admin', ['UOLD']);
+  const newAudience = approvalDeliveryAudienceKey(id, 'admin', ['UNEW']);
+
+  const held = await firstReplica.claimDelivery(id, oldAudience);
+  assert.equal(held.status, 'claimed');
+  assert.deepEqual(
+    await secondReplica.claimDelivery(id, newAudience),
+    { status: 'in-flight' },
+    'roster churn must not invalidate a post already in progress on another replica',
+  );
+  assert.equal(
+    await firstReplica.confirmDelivery(id, (held as { token: string }).token, oldAudience),
+    true,
+    'the first replica retains authority to confirm its Slack delivery',
+  );
+
+  const replacement = await secondReplica.claimDelivery(id, newAudience);
+  assert.equal(replacement.status, 'claimed', 'the changed audience can post after the first lease settles');
+  assert.equal(
+    await secondReplica.confirmDelivery(id, (replacement as { token: string }).token, newAudience),
+    true,
+  );
+});
 
 test('ordering: an egress-denied target throws EgressBlockedError and never mints a prompt', async (t) => {
   const { ctx, ephemerals, auditRows, approvalRows } = await harness(t);
@@ -1339,7 +1411,10 @@ test('a later-wave first delivery commits before its tail finishes, blocking a s
       assert.ok(postsStarted > APPROVAL_FANOUT_CONCURRENCY, 'the first wave did not fail before delivery');
       assert.equal(promptSettled, false, 'the best-effort tail unexpectedly finished before confirmation');
       assert.deepEqual(
-        await new Approvals(dbB).claimDelivery(row.id),
+        await new Approvals(dbB).claimDelivery(
+          row.id,
+          approvalDeliveryAudienceKey(row.id, 'admin', admins),
+        ),
         { status: 'delivered' },
         'a second replica must observe delivery instead of reclaiming the lease',
       );

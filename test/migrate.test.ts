@@ -177,7 +177,8 @@ test('current migration invalidates prerelease-v9 consent and preserves current 
     'a PostgreSQL-clock v9 team tombstone remains a useful lifecycle fence',
   );
   await raw.run(
-    `INSERT INTO user_provisioning_request VALUES
+    `INSERT INTO user_provisioning_request
+       (id,team_id,user_id,provider,created_at,expires_at) VALUES
        ('00000000-0000-4000-8000-000000000001','T1','U1','acme',1,9999999999999)`,
   );
   await raw.run(
@@ -236,7 +237,7 @@ test('current migration invalidates prerelease-v9 consent and preserves current 
   );
 });
 
-test('v10 to v11 drains old consent authority and installs the single-generation lifecycle schema', async (t) => {
+test('v10 to v12 drains pre-v11 consent authority and installs the single-generation lifecycle schema', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url } = await emptySchema(t);
   const raw = rawDb(t, url);
@@ -337,6 +338,112 @@ test('v10 to v11 drains old consent authority and installs the single-generation
       delivered_at: 4,
     },
     'an idempotent v11 migration preserves v11-minted consent lifecycle state',
+  );
+});
+
+test('v11 to v12 installs key-prompt leases and invalidates global approval delivery', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+  await migrate({ databaseUrl: url });
+
+  // Reconstruct the complete v11 predecessor shape from the current schema. A v11 approval could
+  // say only "delivered somewhere", so preserve its pending action but clear that unsafe marker.
+  await raw.exec(`ALTER TABLE user_provisioning_request
+    DROP COLUMN delivery_token,
+    DROP COLUMN delivery_lease_expires_at,
+    DROP COLUMN delivered_at`);
+  await raw.exec(`ALTER TABLE approval_request DROP COLUMN delivery_audience`);
+  await raw.run(
+    `INSERT INTO user_provisioning_request
+       (id,team_id,user_id,provider,created_at,expires_at)
+     VALUES ('00000000-0000-4000-8000-000000000021','T1','U1','acme',1,9999999999999)`,
+  );
+  await raw.run(
+    `INSERT INTO approval_request
+       (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,
+        origin,host,path,query_hash,channel,thread,status,approved_by,created_at,expires_at,
+        delivery_token,delivery_lease_expires_at,delivered_at)
+     VALUES
+       ('00000000-0000-4000-8000-000000000022','action','T1','U1','user','U1',
+        '00000000-0000-4000-8000-000000000023','acme','POST','https://api.acme.test',
+        'api.acme.test','/repos','','C1','TH1','pending',NULL,1,9999999999999,
+        '00000000-0000-4000-8000-000000000024',9999999999999,2)`,
+  );
+  const v11ConsentState = 'D'.repeat(43);
+  await raw.run(
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',1)`,
+    [v11ConsentState],
+  );
+  await raw.run(`UPDATE meta SET value='11' WHERE key='schema_version'`);
+
+  await assert.rejects(
+    () => openDb({ databaseUrl: url }),
+    new RegExp(`schema version 11.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
+  );
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  assert.deepEqual(
+    await raw.get(
+      `SELECT delivery_token,delivery_lease_expires_at,delivered_at
+         FROM user_provisioning_request
+        WHERE id='00000000-0000-4000-8000-000000000021'`,
+    ),
+    { delivery_token: null, delivery_lease_expires_at: 0, delivered_at: null },
+  );
+  assert.deepEqual(
+    await raw.get(
+      `SELECT delivery_token,delivery_lease_expires_at,delivered_at,delivery_audience
+         FROM approval_request
+        WHERE id='00000000-0000-4000-8000-000000000022'`,
+    ),
+    {
+      delivery_token: null,
+      delivery_lease_expires_at: 0,
+      delivered_at: null,
+      delivery_audience: null,
+    },
+    'the exact pending action survives, but its unbound v11 delivery cannot suppress v12 recipients',
+  );
+  assert.equal(
+    (await raw.get<{ state: string }>(`SELECT state FROM consent_request WHERE state=$1`, [v11ConsentState]))?.state,
+    v11ConsentState,
+    'v11 consent already proves the single-generation delivery contract and survives v12',
+  );
+
+  await raw.run(
+    `UPDATE user_provisioning_request
+        SET delivery_token='00000000-0000-4000-8000-000000000025',
+            delivery_lease_expires_at=3, delivered_at=4`,
+  );
+  await raw.run(
+    `UPDATE approval_request
+        SET delivery_token='00000000-0000-4000-8000-000000000026',
+            delivery_lease_expires_at=5, delivered_at=6, delivery_audience=$1`,
+    ['a'.repeat(64)],
+  );
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  assert.deepEqual(
+    await raw.get(
+      `SELECT delivery_token,delivery_lease_expires_at,delivered_at
+         FROM user_provisioning_request
+        WHERE id='00000000-0000-4000-8000-000000000021'`,
+    ),
+    {
+      delivery_token: '00000000-0000-4000-8000-000000000025',
+      delivery_lease_expires_at: 3,
+      delivered_at: 4,
+    },
+    'an idempotent v12 migration preserves current key-prompt delivery state',
+  );
+  assert.equal(
+    (await raw.get<{ delivery_audience: string }>(
+      `SELECT delivery_audience FROM approval_request
+        WHERE id='00000000-0000-4000-8000-000000000022'`,
+    ))?.delivery_audience,
+    'a'.repeat(64),
+    'an idempotent v12 migration preserves audience-bound approval delivery',
   );
 });
 
@@ -672,7 +779,8 @@ test('privilege split: a DML-only role runs the runtime but is denied CREATE', a
   const lifecycleRows = [
     {
       table: 'user_provisioning_request',
-      insert: `INSERT INTO user_provisioning_request VALUES (?,?,?,?,?,?)`,
+      insert: `INSERT INTO user_provisioning_request
+        (id,team_id,user_id,provider,created_at,expires_at) VALUES (?,?,?,?,?,?)`,
       params: ['00000000-0000-4000-8000-000000000011', 'T1', 'U1', 'acme', 1, 2],
     },
     {

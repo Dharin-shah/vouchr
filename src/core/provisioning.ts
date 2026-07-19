@@ -13,8 +13,11 @@ import {
 import {
   isInteractionId,
   latestChannelInteractionTombstone,
+  newInteractionId,
   PENDING_INTERACTION_TTL_MS,
   POSTGRES_NOW_MS_SQL,
+  PROMPT_DELIVERY_LEASE_MS,
+  type PromptDeliveryClaim,
 } from './interaction';
 import { channelOwner, userOwner } from './owner';
 import { isValidProviderId } from './providers';
@@ -322,13 +325,115 @@ export async function issueUserProvisioningRequest(
            (id, team_id, user_id, provider, created_at, expires_at)
          VALUES (?,?,?,?,?,?)
          ON CONFLICT (team_id, user_id, provider) DO UPDATE SET
-           id=excluded.id, created_at=excluded.created_at, expires_at=excluded.expires_at
+           id=excluded.id, created_at=excluded.created_at, expires_at=excluded.expires_at,
+           delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL
          RETURNING id`,
         [id, identity.teamId, identity.userId, provider, issuedAt, issuedAt + PENDING_INTERACTION_TTL_MS],
       );
       if (!isInteractionId(row?.id)) throw new Error('could not issue user provisioning request');
       return row.id;
     }));
+}
+
+function validUserProvisioningDeliveryBinding(
+  identity: SlackIdentity,
+  provider: string,
+  id: string,
+): boolean {
+  return !!identity.teamId
+    && !!identity.userId
+    && isValidProviderId(provider)
+    && isInteractionId(id);
+}
+
+/** Claim the existing user-provisioning row's Slack delivery lease. The Vault supplies the one
+ * core-owned database/credential lock available to direct ConnectContext consumers, so Bolt never
+ * needs a raw Db handle or an adapter-local debounce. The row remains authority-free and is bound
+ * again to the verified actor/provider on every statement. */
+export async function claimUserProvisioningDelivery(
+  vault: Vault,
+  identity: SlackIdentity,
+  provider: string,
+  id: string,
+): Promise<PromptDeliveryClaim> {
+  if (!validUserProvisioningDeliveryBinding(identity, provider, id)) return { status: 'stale' };
+  return vault.withCredentialLock(userOwner(identity), provider, async (_locked, tx) => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const token = newInteractionId();
+      const claimed = await tx.get<{ id: string }>(
+        `UPDATE user_provisioning_request
+           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?
+         WHERE id=? AND team_id=? AND user_id=? AND provider=?
+           AND expires_at>${POSTGRES_NOW_MS_SQL} AND delivered_at IS NULL
+           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+         RETURNING id`,
+        [token, PROMPT_DELIVERY_LEASE_MS, id, identity.teamId, identity.userId, provider],
+      );
+      if (claimed) return { status: 'claimed', token };
+      const row = await tx.get<{
+        delivered_at: number | null;
+        delivery_lease_expires_at: number;
+        now_ms: number;
+      }>(
+        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
+           FROM user_provisioning_request
+          WHERE id=? AND team_id=? AND user_id=? AND provider=?
+            AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+        [id, identity.teamId, identity.userId, provider],
+      );
+      if (!row) return { status: 'stale' };
+      if (row.delivered_at != null) return { status: 'delivered' };
+      if (row.delivery_lease_expires_at > row.now_ms) return { status: 'in-flight' };
+    }
+    return { status: 'in-flight' };
+  });
+}
+
+/** Commit successful Slack delivery only for the caller's exact live lease. */
+export async function confirmUserProvisioningDelivery(
+  vault: Vault,
+  identity: SlackIdentity,
+  provider: string,
+  id: string,
+  token: string,
+): Promise<boolean> {
+  if (!validUserProvisioningDeliveryBinding(identity, provider, id) || !isInteractionId(token)) {
+    return false;
+  }
+  return vault.withCredentialLock(userOwner(identity), provider, async (_locked, tx) => (
+    await tx.run(
+      `UPDATE user_provisioning_request
+          SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL,
+              delivery_lease_expires_at=0
+        WHERE id=? AND team_id=? AND user_id=? AND provider=? AND delivery_token=?
+          AND delivered_at IS NULL AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+      [id, identity.teamId, identity.userId, provider, token],
+    )
+  ).changes === 1);
+}
+
+/** Release a definitely-undelivered key-setup prompt lease. The reusable setup row stays live so a
+ * later verified turn can retry the same safe opaque control; ambiguous delivery deliberately keeps
+ * its lease, matching consent/session/approval crash-safe semantics. */
+export async function abandonUserProvisioningDelivery(
+  vault: Vault,
+  identity: SlackIdentity,
+  provider: string,
+  id: string,
+  token: string,
+): Promise<boolean> {
+  if (!validUserProvisioningDeliveryBinding(identity, provider, id) || !isInteractionId(token)) {
+    return false;
+  }
+  return vault.withCredentialLock(userOwner(identity), provider, async (_locked, tx) => (
+    await tx.run(
+      `UPDATE user_provisioning_request
+          SET delivery_token=NULL, delivery_lease_expires_at=0
+        WHERE id=? AND team_id=? AND user_id=? AND provider=? AND delivery_token=?
+          AND delivered_at IS NULL`,
+      [id, identity.teamId, identity.userId, provider, token],
+    )
+  ).changes === 1);
 }
 
 type UserCredentialInput =

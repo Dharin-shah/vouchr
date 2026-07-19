@@ -169,28 +169,30 @@ class PgClientDb implements Db {
  * scoped break-glass provisioning tombstones, channel-interaction mutation tombstones, and one
  * PostgreSQL-clock credential-generation boundary for delayed destructive requests. Version 11
  * makes OAuth consent one durable owner/provider generation with cross-replica delivery leases.
- * `migrate()` accepts v6-v11 and applies every idempotent cleanup before stamping 11.
+ * Version 12 extends that delivery state to key setup and binds approval delivery to its current
+ * eligible audience. `migrate()` accepts v6-v12 and applies every idempotent cleanup before stamping 12.
  * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
  * controls differently.
  */
-export const SCHEMA_VERSION = 11;
-const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, 10, SCHEMA_VERSION]);
+export const SCHEMA_VERSION = 12;
+const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, 10, 11, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
- * Migration entry guard — runs BEFORE any DDL. `migrate()` implements exactly two lineages: create a
- * fresh baseline, and carry a v6-v10 database to v11. So the ONLY inputs it can correctly converge are:
+ * Migration entry guard — runs BEFORE any DDL. `migrate()` creates a fresh baseline, carries a
+ * v6-v11 database to v12, or idempotently verifies v12. The ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
  *  - a v6 database → the union cleanup plus preview removal;
  *  - a v7 database → preview removal;
  *  - a v8 database → persistent interaction state + approval dedup;
  *  - a v9 database → durable user/channel-provisioning requests + cross-team lifecycle tombstones;
  *  - a v10 database → single-generation OAuth consent + delivery state;
- *  - a v11 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v11 over an unknown shape (a v1–v5 marker,
- * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v11 downgrade —
+ *  - a v11 database → key-prompt delivery leases plus audience-bound approval delivery;
+ *  - a v12 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v12 over an unknown shape (a v1–v5 marker,
+ * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v12 downgrade —
  * which would let old code corrupt encrypted rows). Vouchr is greenfield: the fix for a rejected
  * database is to recreate it fresh, not to add historical migrations.
  */
@@ -234,7 +236,7 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
   if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 6, 7, 8, 9, 10, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
+        `version 6, 7, 8, 9, 10, 11, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
     );
   }
   return found;
@@ -300,7 +302,10 @@ function schema(): string {
       user_id TEXT NOT NULL,
       provider TEXT NOT NULL,
       created_at ${int} NOT NULL,
-      expires_at ${int} NOT NULL
+      expires_at ${int} NOT NULL,
+      delivery_token TEXT,
+      delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
+      delivered_at ${int}
     );
     CREATE UNIQUE INDEX IF NOT EXISTS uq_user_provisioning_owner_provider
       ON user_provisioning_request (team_id, user_id, provider);
@@ -419,7 +424,8 @@ function schema(): string {
       expires_at ${int} NOT NULL,
       delivery_token TEXT,
       delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
-      delivered_at ${int}
+      delivered_at ${int},
+      delivery_audience TEXT
     );
 
     CREATE TABLE IF NOT EXISTS notification_state (
@@ -588,7 +594,7 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       await tx.get('SELECT pg_advisory_xact_lock(hashtext(current_schema()))'); // released at COMMIT
       const previousVersion = await guardSchemaVersion(tx); // fail closed before any DDL
       await tx.exec(schema()); // idempotent baseline (CREATE TABLE IF NOT EXISTS)
-      // One-way carries from v6-v10: union borrowing and private previews are gone, v9 makes pending
+      // One-way carries from v6-v11: union borrowing and private previews are gone, v9 makes pending
       // interaction state durable and binds every authority row to one exact connection id, and v10
       // adds durable user/channel-provisioning requests, cross-team offboard tombstones, and
       // scoped break-glass provisioning tombstones.
@@ -603,10 +609,10 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       // pre-cutover request can target them; every later reconnect gets PostgreSQL time at INSERT.
       await tx.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS generation_at BIGINT NOT NULL DEFAULT ${POSTGRES_NOW_MS_SQL}`);
       // Pre-v11 consent lacks one owner/provider generation and durable delivery state. Spend every
-      // old state fail-closed at the drained cutover; an idempotent v11 rerun preserves v11 states.
+      // old state fail-closed at the drained cutover; v11→v12 and idempotent v12 runs preserve it.
       // v8 and older tombstones additionally used per-pod Date.now(), so clear those; a v9 team
       // tombstone already uses PostgreSQL time and remains useful.
-      if (previousVersion !== null && previousVersion < SCHEMA_VERSION) {
+      if (previousVersion !== null && previousVersion < 11) {
         await tx.exec(`DELETE FROM consent_request`);
       }
       if (previousVersion !== null && previousVersion < 9) {
@@ -633,6 +639,10 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_audience TEXT`);
+      await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
+      await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
+      await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS consumed_at BIGINT`);
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS superseded_at BIGINT`);
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
@@ -646,6 +656,16 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
            ON consent_request (team_id, user_id, provider)
            WHERE superseded_at IS NULL`,
       );
+      // Pre-v12 approval delivery was global to the row and cannot prove that a currently eligible
+      // approver received a surface. Clear only that delivery marker at the drained cutover; the
+      // pending exact action remains live and can be delivered to its current audience.
+      if (previousVersion !== null && previousVersion < 12) {
+        await tx.exec(
+          `UPDATE approval_request
+             SET delivery_token=NULL, delivery_lease_expires_at=0,
+                 delivered_at=NULL, delivery_audience=NULL`,
+        );
+      }
       await tx.exec(`ALTER TABLE approval_request ALTER COLUMN action_key SET NOT NULL`);
       await tx.exec(`DROP INDEX IF EXISTS uq_approval_request_action`);
       await tx.exec(`CREATE UNIQUE INDEX uq_approval_request_action ON approval_request (action_key)`);

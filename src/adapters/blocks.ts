@@ -413,20 +413,25 @@ export function approvalBlocks(o: {
   method: string;
   host: string;
   actionFingerprint: string;
-  /** How many query parameters the request carries (0 = none). Names/values are never shown. */
-  queryParamCount: number;
+  /** How many query parameters the request carries (0 = none). Names/values are never shown.
+   * `null` = the request HAS query parameters but the exact count is not retained (a pending row
+   * hydrated from storage keeps only the byte-exact digest) — rendered as "parameters present",
+   * never a fabricated number. */
+  queryParamCount: number | null;
   requester: string;
   id: string;
   approver: 'self' | 'admin';
 }): unknown[] {
   const p = escapeMrkdwn(o.provider);
   const n = o.queryParamCount;
-  const query = n ? `?… (${n} parameter${n === 1 ? '' : 's'})` : '';
+  const query = n == null
+    ? '?… (query parameters present)'
+    : n ? `?… (${n} parameter${n === 1 ? '' : 's'})` : '';
   // Raw paths are never rendered: they are caller-controlled and can embed tokens, signed webhook
   // material, or PII. The fixed-size fingerprint is the same value recorded in audit, while the
   // short-lived internal row retains the raw bytes solely for exact grant matching.
   const action = `${o.method} ${o.host}\nAction fingerprint: ${o.actionFingerprint}`;
-  const bound = n
+  const bound = n !== 0
     ? ' The exact query string is bound byte-for-byte (its parameters are not displayed); any change re-prompts.'
     : '';
   const intro = o.approver === 'admin'

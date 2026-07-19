@@ -50,12 +50,14 @@ export {
   UserFacingError,
   VOUCHR_ERROR_CODES,
   VOUCHR_RECOVERY_ACTIONS,
+  isVouchrErrorCode,
   mapSafeError,
   safeUserMessage,
 } from './core/errors';
 export type { ConsentPromptState, VouchrErrorCode, VouchrRecovery, VouchrSafeError } from './core/errors';
-// The broker maps this typed control-flow error to 403. Interaction stores are not exported: until
-// the later hybrid bridge lands, only packaged Bolt/broker paths own safe interaction mutations.
+// The broker maps this typed control-flow error to 403. Interaction stores are not exported: the
+// shipped hybrid bridge reaches their safe mutations only through the trusted Bolt
+// ConnectContext.recoverBrokerDenial surface; a pure-headless host gets no raw mutation API.
 export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval';
 export { sweepExpired } from './core/sweep';
 
