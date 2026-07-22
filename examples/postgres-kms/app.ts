@@ -41,7 +41,7 @@ import { loadKeyring } from '../../src/core/crypto';
     clientId: process.env.SLACK_CLIENT_ID!,
     clientSecret: process.env.SLACK_CLIENT_SECRET!,
     stateSecret: process.env.SLACK_STATE_SECRET!,
-    scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+    scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read', 'mpim:read'],
     installationStore,
   });
   const app = new App({ receiver });

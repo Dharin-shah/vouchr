@@ -5,7 +5,8 @@ import { openTestDb, testDbUrl } from './support/pg';
 import { createVouchr } from '../src/adapters/bolt';
 import { openDb, type Db } from '../src/core/db';
 import { defineProvider } from '../src/core/providers';
-import { userOwner } from '../src/core/owner';
+import { userOwner, channelOwner } from '../src/core/owner';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -61,6 +62,39 @@ async function failureHarness(providers = [mcp]) {
   vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
   return { vouchr, handler };
 }
+
+test('tools slash command resolves an MPIM after ack and exempts it from channel governance', async (t) => {
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db });
+  let handler: any;
+  vouchr.registerCommands({
+    command: (_name: string, registered: any) => { handler = registered; },
+    view: () => undefined,
+    action: () => undefined,
+  });
+  const run = async (isMpim: boolean) => {
+    const order: string[] = [];
+    const responses: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'GROUPDM01', text: 'tools' },
+      ack: async () => { order.push('ack'); },
+      respond: async (value: unknown) => { order.push('respond'); responses.push(String(value)); },
+      client: {
+        conversations: {
+          info: async () => { order.push('conversations.info'); return { channel: { is_mpim: isMpim } }; },
+        },
+      },
+    });
+    return { order, response: responses[0] ?? '' };
+  };
+
+  const mpim = await run(true);
+  assert.equal(mpim.order[0], 'ack', 'Slack classification must happen only after acknowledgement');
+  assert.match(mpim.response, /\*mcp\*: enabled/);
+
+  const privateChannel = await run(false);
+  assert.match(privateChannel.response, /\*mcp\*: disabled/);
+});
 
 test('read dependency failures ack first, respond once, and never disclose the raw error', async (t) => {
   const sentinel = 'ghp_READ_FAILURE_MUST_NOT_REACH_SLACK';
@@ -242,7 +276,7 @@ test('help lists the retained commands', async (t) => {
   const { run } = await harness(t);
   const msg = await run('help');
   assert.match(msg, /Vouchr commands/);
-  for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr mode', '/vouchr configure', '/vouchr stats']) {
+  for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr mode', '/vouchr connect-shared', '/vouchr disconnect-shared', '/vouchr stats']) {
     assert.ok(msg.includes(c), `help is missing ${c}`);
   }
   assert.ok(!msg.includes('/vouchr preview'), 'help must not promote the removed private-preview surface');
@@ -275,7 +309,7 @@ test('SEC-1: unknown command and provider values are never echoed', async (t) =>
     await run(`disable ${sentinel}`),
     await run(`mode ${sentinel} shared`),
     await run(`preview ${sentinel} public`),
-    await run(`configure ${sentinel}`),
+    await run(`connect-shared ${sentinel}`),
     await run(`disconnect ${sentinel}`),
   ];
   for (const msg of responses) {
@@ -295,6 +329,23 @@ test('SEC-4: disconnect of an unknown provider writes no audit revoke row', asyn
   assert.deepEqual(events, []);
 });
 
+// A non-admin denial must not make a syntactically-valid but unrecognized argument durable. The
+// submitted value can be a credential pasted into the provider slot; unlike `meta`, the audit
+// provider column has no redaction layer. A fixed trusted denial subject is safe, the input is not.
+test('SEC-4: disconnect-shared non-admin denial never audits an unrecognized submitted marker', async (t) => {
+  const { run, db } = await harness(t);
+  const marker = 'ghp_sensitive_disconnect_marker'; // valid provider-id syntax; not registered/stored
+
+  const msg = await run(`disconnect-shared ${marker}`);
+  assert.match(msg, /admin/i);
+  assert.ok(!msg.includes(marker));
+
+  const rows = await db.all(`SELECT * FROM audit`);
+  assert.equal(rows.length, 1, 'the denied attempt remains auditable under a trusted subject');
+  assert.equal((rows[0] as any).action, 'denied');
+  assert.ok(!JSON.stringify(rows).includes(marker), 'unrecognized input reached an audit column or meta');
+});
+
 test('malformed trailing arguments are rejected before disconnect mutates, audits, or emits', async (t) => {
   const { run, db, events, vouchr } = await harness(t);
   await vouchr.vault.upsert(userOwner(ID), 'mcp', cred);
@@ -310,7 +361,7 @@ test('every known command rejects unsupported arguments instead of silently wide
   for (const input of [
     'help extra', 'status extra', 'tools extra', 'stats extra', 'enable mcp extra',
     'disable mcp extra', 'mode mcp shared extra',
-    'configure mcp extra', 'audit channel extra', 'audit chanel',
+    'connect-shared mcp extra', 'audit channel extra', 'audit chanel',
   ]) {
     assert.match(await run(input), /Usage:/, input);
   }
@@ -506,6 +557,124 @@ test('disconnect preserves upstream-revoke guidance when the audit write also fa
     assert.doesNotMatch(msg, /ghp_/);
     assert.equal(await vouchr.vault.has(userOwner(ID), 'rev'), false);
     assert.deepEqual(events, [{ type: 'revoked', provider: 'rev', ok: false }]);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// #4: a provider removed from the registry can still leave a lingering shared credential in a channel.
+// `/vouchr disconnect-shared <retired>` must recognize the channel's exact stored credential (not only a
+// current registry entry) and clean it up, instead of rejecting the id as unknown before the core runs.
+test('disconnect-shared cleans up a RETIRED (unregistered) provider’s lingering shared credential (#4)', async (t) => {
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  let handler: any;
+  vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+  const run = async (text: string): Promise<string> => {
+    const out: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+    });
+    return out[0] ?? '';
+  };
+  const owner = channelOwner('T1', 'C_FIN');
+  // 'ghost' is a valid id but NOT in the registry; seed a shared credential + mode for it.
+  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'ghost', 'shared');
+  await vouchr.vault.upsert(owner, 'ghost', { ...cred, accessToken: 'sk-ghost' });
+
+  const msg = await run('disconnect-shared ghost');
+  assert.match(msg, /Removed the shared \*ghost\*/); // recognized + cleaned up, not "unknown provider"
+  assert.equal(await vouchr.vault.has(owner, 'ghost'), false); // the lingering credential is gone
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'ghost'), 'per-user'); // returned to per-user
+
+  // A retired provider can also be left in shared mode after its credential was already removed
+  // (for example by break-glass revocation). The persisted shared mode is sufficient recognition:
+  // recover it to per-user and report the truthful missing outcome, never "unknown provider".
+  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'orphaned', 'shared');
+  const missing = await run('disconnect-shared orphaned');
+  assert.match(missing, /There was no shared \*orphaned\* credential stored/i);
+  assert.doesNotMatch(missing, /Unknown provider/i);
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'orphaned'), 'per-user');
+
+  // A truly unknown id (no registry entry AND no stored credential) is still rejected before any mutation.
+  assert.match(await run('disconnect-shared neverheardof'), /Unknown provider|not a configured provider|isn't a provider/i);
+});
+
+test('disconnect-shared reports a committed removal when only its post-commit revoke audit fails', async (t) => {
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  let handler: any;
+  vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+  const run = async (text: string): Promise<string> => {
+    const out: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+    });
+    return out[0] ?? '';
+  };
+  const cfg = new ChannelConfig(db);
+  const owner = channelOwner('T1', 'C_FIN');
+  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'shared');
+  await vouchr.vault.upsert(owner, 'mcp', { ...cred, accessToken: 'shared-audit-failure' });
+
+  const originalRecord = vouchr.audit.record.bind(vouchr.audit);
+  let attemptedMeta: unknown;
+  (vouchr.audit as any).record = async (...args: Parameters<Audit['record']>) => {
+    if (args[0] === 'revoke') {
+      attemptedMeta = args[3];
+      throw new Error('ghp_POST_COMMIT_AUDIT_FAILURE_MUST_NOT_REACH_SLACK');
+    }
+    return originalRecord(...args);
+  };
+
+  const msg = await run('disconnect-shared mcp');
+  assert.match(msg, /Removed the shared \*mcp\* account/);
+  assert.match(msg, /could not confirm the audit record/i);
+  assert.match(msg, /admin.*logs/i);
+  assert.doesNotMatch(msg, /POST_COMMIT_AUDIT_FAILURE/);
+  assert.equal(await vouchr.vault.has(owner, 'mcp'), false);
+  assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), 'per-user');
+  assert.deepEqual(attemptedMeta, {
+    owner: 'channel', channel: 'C_FIN', ok: true, upstream: 'skipped',
+  });
+  assert.equal((await db.all(`SELECT 1 FROM audit WHERE action='revoke'`)).length, 0);
+});
+
+// #3: local removal succeeds but the post-commit UPSTREAM revoke FAILS → ok:false, rendered truthfully
+// ("upstream revocation could not be confirmed"), the credential still removed locally, no secret leaked.
+// Distinct from the post-commit-AUDIT-failure test: here the revoke call itself fails (attempted=true).
+test('disconnect-shared: local removal succeeds but a failed upstream revoke reports ok:false truthfully (#3)', async (t) => {
+  const db = await openTestDb(t);
+  const revocable = defineProvider({
+    id: 'rev', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['acme.example'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+    revokeUrl: 'https://acme.example/oauth/revoke',
+  });
+  const vouchr = await createVouchr({ providers: [revocable], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  let handler: any;
+  vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+  const run = async (text: string): Promise<string> => {
+    const out: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+    });
+    return out[0] ?? '';
+  };
+  const owner = channelOwner('T1', 'C_FIN');
+  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'rev', 'shared');
+  await vouchr.vault.upsert(owner, 'rev', { ...cred, accessToken: 'sk-live' });
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('ghp_REVOKE_FAILURE_MUST_NOT_REACH_SLACK'); }) as any;
+  try {
+    const msg = await run('disconnect-shared rev');
+    assert.match(msg, /Removed the shared \*rev\* account/);
+    assert.match(msg, /upstream revocation could not be confirmed/i);
+    assert.doesNotMatch(msg, /ghp_/);
+    assert.equal(await vouchr.vault.has(owner, 'rev'), false); // the local removal committed
   } finally {
     globalThis.fetch = realFetch;
   }

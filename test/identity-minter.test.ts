@@ -236,6 +236,29 @@ test('mintIdentity: produces a token verifyIdentity accepts, preserving the clai
   assert.equal(claims.threadTs, '123.45');
 });
 
+test('#2 channelType is a closed signed fact: supported values round-trip and malformed values fail closed', () => {
+  for (const channelType of ['channel', 'group', 'im', 'mpim', 'app_home'] as const) {
+    assert.equal(
+      verifyIdentity(mintIdentity({ ...who, channelType }, SECRET), SECRET).channelType,
+      channelType,
+    );
+  }
+
+  for (const channelType of ['', 'MPIM', 'unknown', 'mpim\n', 'x'.repeat(300)]) {
+    assert.throws(
+      () => mintIdentity({ ...who, channelType } as any, SECRET),
+      /supported Slack conversation type/,
+    );
+    const forged = signIdentity({
+      ...who,
+      channelType,
+      exp: Date.now() + 60_000,
+      jti: `bad-${channelType.length}`,
+    } as any, SECRET);
+    assert.throws(() => verifyIdentity(forged, SECRET), /incomplete claims/);
+  }
+});
+
 test('mintIdentity: each call gets a unique jti (so tokens are not accidental replays)', () => {
   const jtis = new Set(Array.from({ length: 100 }, () => verifyIdentity(mintIdentity(who, SECRET), SECRET).jti));
   assert.equal(jtis.size, 100);

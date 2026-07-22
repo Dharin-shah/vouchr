@@ -353,10 +353,10 @@ test('postgres backend: applyEnabled materializes atomically, then upserts on th
   const tools = new ChannelTools(db);
   await applyChannelToolsEnabled(tools, 'T_PG', 'C1', [['mcp', false]], ['mcp', 'other']);
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), false); // the targeted provider
-  assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // materialized, not silently disabled
+  assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), false); // deny-by-default: untouched provider materialized OFF
   await applyChannelToolsEnabled(tools, 'T_PG', 'C1', [['mcp', true]], ['mcp', 'other']);
   assert.equal(await tools.isEnabled('T_PG', 'C1', 'mcp'), true); // configured path: plain upsert
-  assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), true); // untouched
+  assert.equal(await tools.isEnabled('T_PG', 'C1', 'other'), false); // untouched → stays OFF from the first materialize
 });
 
 test('postgres backend: opposite provider orders cannot deadlock first or bulk tool writes', async (t) => {
@@ -381,7 +381,7 @@ test('postgres backend: opposite provider orders cannot deadlock first or bulk t
     ]);
     assert.equal(await toolsA.isEnabled('T_ORDER', channel, forward[0]), false);
     assert.equal(await toolsA.isEnabled('T_ORDER', channel, reverse[0]), false);
-    assert.equal(await toolsA.isEnabled('T_ORDER', channel, forward[250]), true);
+    assert.equal(await toolsA.isEnabled('T_ORDER', channel, forward[250]), false); // deny-by-default: untouched provider stays OFF
   }
 
   // The configured-channel upsert must use the same canonical row-lock order for bulk modal writes.

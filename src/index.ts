@@ -52,7 +52,13 @@ export { github, google, gitlab, notion, databricks, defineProvider, ProviderReg
 export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy, RevokeTarget } from './core/providers';
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
-export { PolicyDeniedError, ToolDisabledError } from './core/authz';
+export {
+  PolicyDeniedError,
+  ToolDisabledError,
+  SLACK_CONVERSATION_TYPES,
+  isSlackConversationType,
+} from './core/authz';
+export type { SlackConversationType } from './core/authz';
 export type { SlackIdentity } from './core/identity';
 export {
   ConnectionHandle,
@@ -99,6 +105,10 @@ export type { ToolManifestEntry } from './core/tools';
 // hand-copying the JSON (which then drifts from the Bolt path).
 export {
   connectBlocks,
+  // The OAuth "Connect" button's action_id. A custom Slack host that renders connectBlocks MUST
+  // register a no-op `ack()` for this id, or Slack shows "Operation timed out" — url buttons still
+  // deliver a block_actions interaction. Single source of truth so hosts never hard-code the string.
+  OAUTH_CONNECT_ACTION,
   configureModal,
   userKeyModal,
   CONFIGURE_CALLBACK,

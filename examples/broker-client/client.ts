@@ -21,12 +21,19 @@
  *
  * See guides/DEPLOYMENT.md for the two supported provisioning paths.
  */
-import { mintIdentity, loadIdentityConfig, type IdentityConfig } from '../../src'; // published package: from '@vouchr/core'
+import {
+  mintIdentity,
+  loadIdentityConfig,
+  type IdentityConfig,
+  type SlackConversationType,
+} from '../../src'; // published package: from '@vouchr/core'
 
 export interface Acting {
   teamId: string;
   userId: string;
   channel: string;
+  /** Slack conversation type from a verified event or authenticated API lookup; never from the model/worker. */
+  channelType: SlackConversationType;
   threadTs?: string;
 }
 
@@ -82,8 +89,10 @@ if (require.main === module) {
   // VOUCHR_DEPLOYMENT_ID from env, so the minted token's issuer/audience/kid match what the broker
   // expects. A mismatch (or a bare-secret token against a config-mode broker) is rejected.
   const identity = loadIdentityConfig(process.env);
-  // In a real agent these come from the event you already authenticated, not from user input.
-  const acting: Acting = { teamId: 'T1', userId: 'U1', channel: 'C1' };
+  // In a real agent these come from a signature-verified Slack event or authenticated Slack API
+  // lookup, never user input. Carry channel_type too: an MPIM uses a G… id, and the signed 'mpim'
+  // value tells the broker it is a personal group DM rather than a governed private channel.
+  const acting: Acting = { teamId: 'T1', userId: 'U1', channel: 'C1', channelType: 'channel' };
 
   fetchThroughBroker(brokerUrl, identity, acting, {
     provider: 'github',

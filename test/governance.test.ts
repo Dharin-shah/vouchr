@@ -160,7 +160,7 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
   let hydrated: any = null;
   const client = {
     users: { info: async () => ({ user: { is_admin: false } }) },
-    // enable/configure now assert channel eligibility at the mutation (like mode always did),
+    // enable/connect-shared now assert channel eligibility at the mutation (like mode always did),
     // so the fake must serve conversations.info for an ordinary eligible channel.
     conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }) },
     views: {
@@ -185,7 +185,7 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
   assert.equal(row.enabled, 1);
 
   await handler({
-    command: { ...base, text: 'configure mcp' },
+    command: { ...base, text: 'connect-shared mcp' },
     ack: async () => {},
     respond: async (m: string) => out.push(m),
     client,

@@ -1,4 +1,8 @@
 import { createHmac, timingSafeEqual, randomUUID, createHash } from 'node:crypto';
+import {
+  isSlackConversationType,
+  type SlackConversationType,
+} from '../../core/authz';
 
 /**
  * Verified claims about WHO is acting, minted by a trusted upstream (the receiver that already
@@ -57,6 +61,16 @@ export interface IdentityClaims {
    * request with this absent/false is refused.
    */
   channelEligible?: boolean;
+  /**
+   * The delivery channel's Slack conversation TYPE — the event `channel_type` ('im'/'mpim' for a
+   * DM/group-DM). Signed by the trusted caller (it verified the Slack event), so the broker can
+   * classify the mutable-GOVERNANCE scope (governanceChannelOf) exactly like Bolt does, instead of
+   * guessing from the id: an MPIM 'G…' id is indistinguishable from a private channel without it.
+   * Absent → the broker falls back to the id heuristic (a 1:1 DM 'D…' is still exempt; a group DM
+   * with no type stays governed). Static Policy always evaluates against the raw `channel`, so this
+   * only widens/narrows the admin-mutable allowlist scope, never the deployment policy.
+   */
+  channelType?: SlackConversationType;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -405,6 +419,7 @@ export type MintIdentityInput = Pick<
   | 'enterpriseId'
   | 'ownerKind'
   | 'channelEligible'
+  | 'channelType'
 >;
 
 /**
@@ -419,6 +434,9 @@ export type MintIdentityInput = Pick<
  * tool surface. Mint per request; do not cache or reuse a token across calls.
  */
 export function mintIdentity(input: MintIdentityInput, key: string | IdentityConfig, ttlMs = 60_000, now = Date.now()): string {
+  if (input.channelType !== undefined && !isSlackConversationType(input.channelType)) {
+    throw new Error('identity channelType must be a supported Slack conversation type');
+  }
   const config = typeof key === 'string' ? null : normalizeIdentityConfig(key);
   if (config && (!Number.isSafeInteger(now) || !Number.isSafeInteger(ttlMs))) {
     throw new Error('identity token now and ttlMs must be finite safe integers');
@@ -439,6 +457,7 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
     ...(input.enterpriseId !== undefined ? { enterpriseId: input.enterpriseId } : {}),
     ...(input.ownerKind !== undefined ? { ownerKind: input.ownerKind } : {}),
     ...(input.channelEligible !== undefined ? { channelEligible: input.channelEligible } : {}),
+    ...(input.channelType !== undefined ? { channelType: input.channelType } : {}),
     jti: randomUUID(),
     exp: now + lifetime,
   };
@@ -500,7 +519,9 @@ function isClaims(v: unknown): v is IdentityClaims {
     // Channel-fact claims (#51): reject a wrong-typed value rather than coercing it — a malformed
     // signed claim fails closed (an unknown ownerKind can't slip through as 'channel').
     (c.ownerKind === undefined || c.ownerKind === 'user' || c.ownerKind === 'channel') &&
-    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean')
+    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean') &&
+    // Signed conversation type is authorization-affecting: accept only Slack's closed event values.
+    (c.channelType === undefined || isSlackConversationType(c.channelType))
   );
 }
 

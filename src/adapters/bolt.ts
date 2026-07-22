@@ -17,6 +17,9 @@ import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listCha
 import { userOwner, channelOwner, type Owner } from '../core/owner';
 import {
   authorizeProvider,
+  governanceChannelOf,
+  isGovernanceChannelScope,
+  isSlackConversationType,
   PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
@@ -30,6 +33,7 @@ import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo
 import {
   configureChannelCredential,
   setChannelCredentialMode,
+  disconnectChannelShared,
   type ChannelProvisioningIssuance,
 } from '../core/channelCredential';
 import { ChannelTools, configureChannelTools, type ToolManifestEntry } from '../core/tools';
@@ -92,7 +96,7 @@ export {
 import { connectedHtml } from './landing';
 import {
   connectBlocks, configureModal, CONFIGURE_CALLBACK,
-  userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, RECONNECT_ACTION,
+  userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, OAUTH_CONNECT_ACTION, RECONNECT_ACTION,
   privateStatusModal,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,
   approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
@@ -184,6 +188,9 @@ function optionalBlockFallback(blocks: unknown[]): { text: string } | Record<str
 }
 
 export const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
+/** Leave most of Slack's short-lived trigger window for modal construction/open after classifying
+ * an ambiguous G… conversation. Timeout/error stays governed (fail closed). */
+export const SLACK_CONVERSATION_CLASSIFICATION_TIMEOUT_MS = 1_000;
 export const APPROVAL_FANOUT_CONCURRENCY = 16;
 /** One complete, current approval-recipient snapshot must resolve promptly before delivery is
  * claimed. This bounds pagination plus admin checks even for direct test/custom clients that do not
@@ -211,8 +218,12 @@ export const MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS = 32;
  * non-default Slack endpoint is not bypassed; Vouchr's finite timeout, zero retries, and rate-limit
  * rejection are applied ON TOP and always win (spread last), so a slow post can never outlive its
  * delivery lease. */
-function slackNotificationClient(token: string, base?: WebClientOptions): WebClient {
-  return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS });
+function slackNotificationClient(
+  token: string,
+  base?: WebClientOptions,
+  timeout = SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+): WebClient {
+  return new WebClient(token, { ...base, ...SLACK_NOTIFICATION_CLIENT_OPTIONS, timeout });
 }
 
 /** Skipped because the fan-out's start deadline elapsed before this item was started. */
@@ -327,7 +338,10 @@ export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_MS
   - DB_RUNTIME_QUERY_TIMEOUT_MS
   - APPROVAL_DELIVERY_SAFETY_MARGIN_MS;
 
-function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
+function boundedNotificationResolution<T>(
+  work: Promise<T>,
+  timeoutMs = SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
+): Promise<T | null> {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (value: T | null): void => {
@@ -336,7 +350,7 @@ function boundedNotificationResolution<T>(work: Promise<T>): Promise<T | null> {
       clearTimeout(timer);
       resolve(value);
     };
-    const timer = setTimeout(() => finish(null), SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS);
+    const timer = setTimeout(() => finish(null), timeoutMs);
     timer.unref();
     void work.then((value) => finish(value), () => finish(null));
   });
@@ -470,7 +484,9 @@ async function abandonKnownUndeliveredPrompt(
 }
 
 /** Channel/thread carried by a Slack-signed block_action. These are context facts only, never
- * authority on their own: core compares them with the persisted request before mutation. */
+ * authority on their own: core compares them with the persisted request before mutation. Do not
+ * fall back to the decision prompt's message_ts here: that timestamp is the prompt Slack rendered,
+ * not necessarily the originating thread stored on the approval/session row. */
 function interactionLocation(body: any): { channel: string; thread: string | null } | null {
   const channel = body?.channel?.id ?? body?.container?.channel_id;
   const thread = body?.container?.thread_ts ?? body?.message?.thread_ts ?? null;
@@ -495,6 +511,33 @@ async function assertChannelEligible(client: WebClient, channel: string): Promis
   }
   const reason = channelIneligibleReason(info);
   if (reason) throw new UserFacingError(reason);
+}
+
+/** Resolve the one ambiguous Slack id class (G… can be a private channel or MPIM) from Slack's
+ * authenticated API. This is the trusted mutable-governance classifier for command/action contexts;
+ * every error fails closed as governed. Shared mutations still run the stricter
+ * channelIneligibleReason check at their core mutation boundary. */
+async function governanceChannelForCommand(
+  client: WebClient,
+  channel: string,
+  clientOptions?: WebClientOptions,
+): Promise<string | null> {
+  const inferred = governanceChannelOf(channel);
+  if (inferred === null || !channel.startsWith('G')) return inferred;
+  try {
+    const token = (client as { token?: unknown }).token;
+    const lookupClient = typeof token === 'string' && token.length > 0
+      ? slackNotificationClient(token, clientOptions, SLACK_CONVERSATION_CLASSIFICATION_TIMEOUT_MS)
+      : client;
+    const result = await boundedNotificationResolution(
+      Promise.resolve(lookupClient.conversations.info({ channel })),
+      SLACK_CONVERSATION_CLASSIFICATION_TIMEOUT_MS,
+    );
+    const info = (result as any)?.channel;
+    return governanceChannelOf(channel, info?.is_mpim === true ? 'mpim' : undefined);
+  } catch {
+    return channel;
+  }
 }
 
 export interface VouchrOptions {
@@ -566,7 +609,7 @@ export interface VouchrOptions {
   isAdmin?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
   /**
    * Opt in to letting a channel's CREATOR (not only a workspace admin) run the channel-credential
-   * config commands (`mode`, `configure`, `enable`, `disable`). Default false: the gate is exactly
+   * config commands (`mode`, `connect-shared`, `disconnect-shared`, `enable`, `disable`). Default false: the gate is exactly
    * workspace-admin-only, unchanged from before this option existed. Off by default on purpose — in
    * Slack any member can create a public channel, so `creator` is not inherently a privileged role;
    * turn this on only where a channel owner should self-serve their own channel's config. Ignored
@@ -621,9 +664,12 @@ export interface VouchrOptions {
    * dry-run rows. The credential never appears in the echo. Request-side denials throw exactly as
    * in production. Safety rails: startup hard-fails if the database already holds non-dry-run
    * credential rows, a request refuses (and the dry-run callback never overwrites) a real row
-   * written later, and every audit row written in dry-run carries `meta.dry_run: true`. Complete a
-   * prompted consent programmatically in tests via `vouchr.dryRun.completeConsent(user, provider)`.
-   * Default false: zero behavior change.
+   * written later, and every audit row written in dry-run carries `meta.dry_run: true`. The
+   * returned `vouchr.dryRun` object exposes two test helpers: `enableTool(admin, channel,
+   * providerId)` opts a provider into a channel's allowlist (channels are DENY-BY-DEFAULT, so you
+   * MUST call this before `connect()` will resolve that provider in a channel — it reproduces an
+   * admin's `/vouchr enable`; DMs are ungoverned and need no enable), and `completeConsent(user,
+   * provider)` finishes a prompted consent programmatically. Default false: zero behavior change.
    */
   dryRun?: boolean;
 }
@@ -636,7 +682,15 @@ export interface VouchrOptions {
  */
 export interface ConnectContextDeps {
   identity: SlackIdentity;
+  /** The conversation this request is delivered in — where prompts/DMs are posted. */
   channel: string | null;
+  /** The channel scope that channel GOVERNANCE (tool allowlist + mode) applies to. Null for a
+   *  personal conversation (DM/group-DM) that has no admins to govern it, so credential use there is
+   *  never gated by the channel allowlist — exactly like a channel-less context. When OMITTED it is
+   *  derived from `channel` via `governanceChannelOf` (a 1:1 DM id `D…` maps to null); a caller that
+   *  can classify a group DM (it has the Slack `channel_type`) passes the exact value. Delivery still
+   *  uses `channel`, and static Policy still evaluates against `channel`. */
+  governableChannel?: string | null;
   client: WebClient;
   registry: ProviderRegistry;
   vault: Vault;
@@ -741,9 +795,11 @@ export type BrokerDenialRecovery =
 // construction falls back to the constructor's own monotonic instant.
 const INTERNAL_PROVISIONING_RECEIVED_AT = Symbol('vouchr.provisioning-received-at');
 const INTERNAL_CHANNEL_PROVISIONING_ISSUANCE = Symbol('vouchr.channel-provisioning-issuance');
+const INTERNAL_GOVERNANCE_CHANNEL_RESOLVER = Symbol('vouchr.governance-channel-resolver');
 type InternalConnectContextDeps = ConnectContextDeps & {
   [INTERNAL_PROVISIONING_RECEIVED_AT]?: bigint;
   [INTERNAL_CHANNEL_PROVISIONING_ISSUANCE]?: ChannelProvisioningIssuance;
+  [INTERNAL_GOVERNANCE_CHANNEL_RESOLVER]?: () => Promise<string | null>;
 };
 
 /** Map a verified handler's monotonic receipt instant into PostgreSQL's clock domain. Query latency
@@ -773,6 +829,8 @@ class ChannelProvisioningStaleError extends UserFacingError {
 export class ConnectContext {
   private identity: SlackIdentity;
   private channel: string | null;
+  /** Channel scope for governance (allowlist + mode); null in a DM/group-DM. See ConnectContextDeps. */
+  private governableChannel: string | null;
   private client: WebClient;
   private registry: ProviderRegistry;
   private vault: Vault;
@@ -800,10 +858,24 @@ export class ConnectContext {
   private slackClientOptions?: WebClientOptions;
   private provisioningReceivedAt: bigint;
   private channelProvisioningIssuance?: ChannelProvisioningIssuance;
+  /** Bolt commands/actions omit `channel_type`; classify an ambiguous G… id only when the host
+   * first uses Vouchr, so global middleware never delays the host's acknowledgement path. */
+  private governanceChannelResolver?: () => Promise<string | null>;
+  private governanceChannelResolution?: Promise<string | null>;
 
   constructor(deps: ConnectContextDeps) {
     this.identity = deps.identity;
     this.channel = deps.channel;
+    // Omitted → derive from the delivery channel (a 1:1 DM `D…` maps to null/ungoverned via the same
+    // id heuristic the middleware and broker use); explicit value (incl. null) is honored as given.
+    // Fixes a directly-constructed context for a DM channel being treated as governed (so `/vouchr
+    // tools` in a DM reported providers disabled). A group DM still needs an explicit null.
+    this.governableChannel = deps.governableChannel === undefined
+      ? governanceChannelOf(deps.channel)
+      : deps.governableChannel;
+    if (!isGovernanceChannelScope(deps.channel, this.governableChannel)) {
+      throw new Error('ConnectContext governance scope does not match its delivery channel');
+    }
     this.client = deps.client;
     this.registry = deps.registry;
     this.vault = deps.vault;
@@ -834,6 +906,27 @@ export class ConnectContext {
       ?? process.hrtime.bigint();
     this.channelProvisioningIssuance =
       (deps as InternalConnectContextDeps)[INTERNAL_CHANNEL_PROVISIONING_ISSUANCE];
+    this.governanceChannelResolver =
+      (deps as InternalConnectContextDeps)[INTERNAL_GOVERNANCE_CHANNEL_RESOLVER];
+  }
+
+  /** Resolve Slack's ambiguous G… id class once. A transport/API failure retains the initial
+   * governed scope (fail closed); an invalid resolver result can never widen authority. */
+  private currentGovernanceChannel(): Promise<string | null> {
+    if (!this.governanceChannelResolver) return Promise.resolve(this.governableChannel);
+    this.governanceChannelResolution ??= (async () => {
+      let resolved = this.governableChannel;
+      try {
+        const candidate = await this.governanceChannelResolver!();
+        if (isGovernanceChannelScope(this.channel, candidate)) resolved = candidate;
+      } catch {
+        // Keep the constructor's governed G… classification when Slack cannot classify it.
+      }
+      this.governableChannel = resolved;
+      this.governanceChannelResolver = undefined;
+      return resolved;
+    })();
+    return this.governanceChannelResolution;
   }
 
   /** Map this verified request's monotonic receipt instant into PostgreSQL's clock domain. Query
@@ -1062,6 +1155,9 @@ export class ConnectContext {
       actorIssuedAt,
       channelTools: this.channelTools ?? null,
       channelConfig: this.channelConfig ?? null,
+      // Classify the action's channel by the governance scope carried on the key (null in a DM/group
+      // DM), so a retained approval in a personal conversation is not re-denied by deny-by-default (#2).
+      governableChannel: key.governableChannel,
     });
   }
 
@@ -1076,6 +1172,7 @@ export class ConnectContext {
     channel: string | null,
     thread: string | null,
     actorIssuedAt: number,
+    governableChannel: string | null,
   ): () => Promise<boolean> {
     return async () => {
       if (owner.kind === 'channel') {
@@ -1118,6 +1215,10 @@ export class ConnectContext {
             actorIssuedAt,
             channelTools: this.channelTools ?? null,
             channelConfig: this.channelConfig ?? null,
+            // A channel-owned (shared) credential only lives in a governed channel, so its channel IS
+            // the governance scope; a user-owned credential uses the DM-aware governance channel, so a
+            // retained handle in a DM is not re-invalidated by deny-by-default (policy still applies).
+            governableChannel: owner.kind === 'channel' ? channel : governableChannel,
           });
           if (state !== 'current') throw new InteractionStateChangedError('connection', state);
           return true;
@@ -1328,8 +1429,24 @@ export class ConnectContext {
 
   /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own
    * variant because its audit metadata carries `owner: 'channel'`. */
-  private async requireProviderAuthorized(providerId: string): Promise<void> {
-    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+  private async requireProviderAuthorized(
+    providerId: string,
+    resolvedGovernanceChannel?: string | null,
+  ): Promise<void> {
+    // Static Policy evaluates against the real delivery channel (this.channel — a DM included), while
+    // the mutable tool allowlist is scoped to governableChannel (null in a DM, so deny-by-default
+    // never locks a DM out). Audit/delivery stay on the actual delivery channel.
+    const governanceChannel = resolvedGovernanceChannel === undefined
+      ? await this.currentGovernanceChannel()
+      : resolvedGovernanceChannel;
+    const denial = await authorizeProvider(
+      this.policy,
+      this.channelTools,
+      this.identity,
+      this.channel,
+      governanceChannel,
+      providerId,
+    );
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
@@ -1349,20 +1466,23 @@ export class ConnectContext {
     // credential, or session reads may pause behind offboarding; they must not let an older connect
     // mint a newer key request or OAuth state after the tombstone has committed.
     const connectIssuedAt = await this.provisioningIssuedAt();
+    const governableChannel = await this.currentGovernanceChannel();
 
     // The channel's configured auth mode for this provider decides the credential model:
     //   'shared'  → the channel's shared credential (delegate to connectChannel)
     //   'session' → the user's own credential, gated by a per-thread approval
     //   'per-user' / unset → the user's own credential, no gate
-    const mode = this.channel && this.channelConfig
-      ? await this.channelConfig.getMode(this.identity.teamId, this.channel, providerId)
+    // Mode is channel governance too, so it reads from governableChannel — a DM has no channel mode
+    // and resolves to per-user (its own credential), never a shared channel credential.
+    const mode = governableChannel && this.channelConfig
+      ? await this.channelConfig.getMode(this.identity.teamId, governableChannel, providerId)
       : null;
     if (mode === 'shared') return this.connectChannel(providerId);
 
     // Authorization (Policy + per-channel tool allowlist) — the CHECK is the shared core decision; the
     // Bolt path keeps its own audit/error mapping (and, unlike the broker, does NOT emit policy_denied on
     // a tool-disabled deny — preserved deliberately).
-    await this.requireProviderAuthorized(providerId);
+    await this.requireProviderAuthorized(providerId, governableChannel);
 
     // Resolve existence without decrypting. A first-time session user connects before approving a
     // thread; reconnect then purges old grants as a Vault satellite, so no approval can silently
@@ -1412,6 +1532,7 @@ export class ConnectContext {
               new ChannelTools(tx),
               this.identity,
               this.channel,
+              governableChannel,
               providerId,
             )) === null;
           },
@@ -1482,7 +1603,11 @@ export class ConnectContext {
           this.channel,
           this.thread,
           connectIssuedAt,
+          governableChannel,
         ),
+        // Persist the channel_type-aware governance scope on any approval so its DECISION
+        // revalidation can classify a group DM the id alone cannot (#2).
+        governableChannel,
       )));
     }
 
@@ -1730,10 +1855,22 @@ export class ConnectContext {
     this.assertCredentialAccessAvailable();
     const provider = this.brokerable(providerId);
     const connectIssuedAt = await this.provisioningIssuedAt();
+    const governableChannel = await this.currentGovernanceChannel();
+    if (governableChannel === null) {
+      throw new UserFacingError('Shared channel credentials are not available in a personal conversation.');
+    }
     const { cfg, owner, channel } = this.channelTarget();
     // Same authorization gate as connect() (the shared core CHECK): a deny applies to shared channel
-    // creds too. Audit meta carries owner:'channel' here; like connect(), no policy_denied on tool-disabled.
-    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+    // creds too. A shared credential only exists in a governed channel, so governableChannel == the
+    // real channel here. Audit meta carries owner:'channel'; like connect(), no policy_denied on tool-disabled.
+    const denial = await authorizeProvider(
+      this.policy,
+      this.channelTools,
+      this.identity,
+      this.channel,
+      governableChannel,
+      providerId,
+    );
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
       this.emit({ type: 'policy_denied', provider: providerId });
@@ -1782,25 +1919,38 @@ export class ConnectContext {
       null, this.rateLimits, this.health, this.approvals, this.thread, this.dryRun,
       undefined, undefined, credentialId,
       this.approvalRequestStillCurrent.bind(this, connectIssuedAt),
-      this.useValidator(r.owner, providerId, credentialId, owner.id, this.thread, connectIssuedAt),
+      this.useValidator(
+        r.owner,
+        providerId,
+        credentialId,
+        owner.id,
+        this.thread,
+        connectIssuedAt,
+        governableChannel,
+      ),
+      // A shared credential only lives in a governed channel, so its governance scope is that channel.
+      governableChannel,
     )));
   }
 
   /**
    * The channel-filtered tool manifest an agent / MCP gateway asks for before planning: every
    * registered provider with whether it's usable in THIS channel and the channel's credential mode.
-   * `enabled` intersects the channel tool allowlist (backward-compat rule applies) with Policy, so
-   * it matches what connect() would actually allow. With no channel (a DM-less context) there is no
+   * `enabled` intersects the channel's explicit deny-by-default allowlist with Policy, so it matches
+   * what connect() would actually allow. With no channel (a DM-less context) there is no
    * tool-allowlist restriction and mode is null, but Policy still applies: a default-deny or
    * allow-channel-only policy can still report a provider disabled.
    */
   async toolManifest(): Promise<ToolManifestEntry[]> {
+    const governanceChannel = await this.currentGovernanceChannel();
     // ONE shared core builder (with the broker's POST /v1/manifest), so `enabled` here is exactly
     // "authorizeProvider would allow it" and the two transports can't drift.
     return buildToolManifest({
       providerIds: this.providerIds, registry: this.registry, policy: this.policy,
       channelTools: this.channelTools, channelConfig: this.channelConfig,
-      principal: this.identity, channel: this.channel,
+      // Policy on the real delivery channel; tool-allowlist + mode on the governance scope (null in a
+      // DM, so personal providers report enabled there instead of deny-by-default disabled).
+      principal: this.identity, channel: this.channel, governanceChannel,
     });
   }
 
@@ -1974,7 +2124,7 @@ export class ConnectContext {
     );
     let text: string;
     if (actorIsAdmin) {
-      text = `No shared ${p} credential is configured in this channel. Run \`/vouchr configure ${p}\` here to set one up.`;
+      text = `No shared ${p} credential is configured in this channel. Run \`/vouchr connect-shared ${p}\` here to set one up.`;
     } else {
       let adminDirection: 'confirmed' | 'possible' | 'none' = 'none';
       const admin = await this.audit.lastChannelConfigActor(this.identity.teamId, channel, providerId);
@@ -1993,7 +2143,7 @@ export class ConnectContext {
           try {
             await client.chat.postMessage({
               channel: admin,
-              text: `The shared ${p} credential in <#${escapeMrkdwn(channel)}> is missing. Run \`/vouchr configure ${p}\` there to set it up.`,
+              text: `The shared ${p} credential in <#${escapeMrkdwn(channel)}> is missing. Run \`/vouchr connect-shared ${p}\` there to set it up.`,
             });
             adminDirection = 'confirmed';
           } catch (deliveryError) {
@@ -2017,7 +2167,7 @@ export class ConnectContext {
         ? `No shared ${p} credential is configured in this channel. A channel admin has been asked to configure it.`
         : adminDirection === 'possible'
           ? `No shared ${p} credential is configured in this channel. A channel admin may already have been notified; ask one directly if setup is still blocked.`
-          : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr configure ${p}\` here.`;
+          : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr connect-shared ${p}\` here.`;
     }
     try {
       await client.chat.postEphemeral({ channel, user: this.identity.userId, text });
@@ -2217,13 +2367,13 @@ export function healthNotifier(deps: {
           text: { type: 'mrkdwn', text: 'Ask the agent to reconnect; it will create a current private prompt.' },
         }];
       } else {
-        text = `The shared ${p} connection${where} stopped working and needs to be reconfigured. Use \`/vouchr configure ${p}\` there.`;
+        text = `The shared ${p} connection${where} stopped working and needs to be reconnected. Use \`/vouchr connect-shared ${p}\` there.`;
       }
     } else {
       const hours = Math.max(1, Math.round(((e.expiresAt ?? Date.now()) - Date.now()) / 3_600_000));
       text = e.owner.kind === 'user'
         ? `Your ${p} connection expires in ~${hours}h. Reconnect to keep using it.`
-        : `The shared ${p} connection${where} expires in ~${hours}h. Reconfigure it (\`/vouchr configure ${p}\`) to keep it working.`;
+        : `The shared ${p} connection${where} expires in ~${hours}h. Reconnect it (\`/vouchr connect-shared ${p}\`) to keep it working.`;
     }
     // Claim the 24h window LAST, right before the send (all skip-paths above claim nothing), so
     // exactly one claimer — across pods too — proceeds. On a failed send, release OUR claim so the
@@ -2368,7 +2518,7 @@ export async function createVouchr(opts: VouchrOptions) {
     provider: string,
     on: boolean,
     provisioningReceivedAt: bigint,
-  ): Promise<'ok' | 'denied'> => {
+  ): Promise<'ok' | 'unchanged' | 'denied'> => {
     const configured = await configureChannelTools({
       channelTools,
       vault,
@@ -2392,7 +2542,8 @@ export async function createVouchr(opts: VouchrOptions) {
     if (configured === 'stale') {
       throw new InteractionStateChangedError('connection', 'authorization');
     }
-    return configured === 'configured' ? 'ok' : 'denied';
+    if (configured === 'denied') return 'denied';
+    return configured === 'unchanged' ? 'unchanged' : 'ok';
   };
 
   const CHANNEL_CREDENTIAL_UNAVAILABLE =
@@ -2554,10 +2705,13 @@ export async function createVouchr(opts: VouchrOptions) {
       return 'unconfirmed';
     }
 
+    // Warn if the provider is disabled in this channel: a credential set here is inert until enabled
+    // (disable wins at use time). Read-only; a stale read is harmless — the write path is unchanged.
+    const providerDisabled = !(await channelTools.isEnabled(identity.teamId, channel, provider).catch(() => true));
     try {
       await client.views.update({
         view_id: viewId,
-        view: configureModal(provider, channel, referenceSources, requestId) as any,
+        view: configureModal(provider, channel, referenceSources, requestId, providerDisabled) as any,
       });
     } catch {
       // Acceptance of views.update is unknown. Leave the TTL-bound request alone and do not issue a
@@ -2649,11 +2803,21 @@ export async function createVouchr(opts: VouchrOptions) {
   ): Promise<void> {
     const client = await confirmClientFor(result.identity);
     if (!client) return;
-    await client.chat.postMessage({
-      channel: result.identity.userId,
-      // SEC-5: connectedDmText escapes the provider-reported account label.
-      text: connectedDmText(result.provider, result.account),
-    }).catch(() => undefined);
+    // SEC-5: connectedDmText escapes the provider-reported account label.
+    const text = connectedDmText(result.provider, result.account);
+    // Durable private receipt in the user's DM (survives; the record of what happened).
+    await client.chat.postMessage({ channel: result.identity.userId, text }).catch(() => undefined);
+    // Plus an in-context confirmation where the connect prompt was posted, so the user sees a green
+    // signal in the channel they were working in — not only a DM they may not be watching. Ephemeral
+    // (private to the connector, never broadcast) and best-effort. The disconnected browser callback
+    // can't update the original url-button prompt in place, so this is a fresh private confirmation.
+    if (result.channel && result.channel !== result.identity.userId) {
+      await client.chat.postEphemeral({
+        channel: result.channel,
+        user: result.identity.userId,
+        text,
+      }).catch(() => undefined);
+    }
   }
 
   // #117 credential-health wiring. Default: DM the owner (healthNotifier), via the same per-workspace
@@ -2675,13 +2839,36 @@ export async function createVouchr(opts: VouchrOptions) {
     const identity = resolveIdentity(args);
     if (identity) {
       const channel: string | null =
-        args.event?.channel ?? args.body?.channel_id ?? args.body?.channel?.id ?? null;
-      // The thread this request is in: thread_ts when in a thread, else the message's own ts (which
-      // is the thread root). Null when there's no event (slash command / action).
-      const thread: string | null = args.event?.thread_ts ?? args.event?.ts ?? null;
-      args.context.vouchr = new ConnectContext({
+        args.event?.channel
+        ?? args.body?.channel_id
+        ?? args.body?.channel?.id
+        ?? args.body?.container?.channel_id
+        ?? null;
+      // The thread this request is in: thread_ts for a reply, else the message's own ts (the root).
+      // Unlike interactionLocation() for Vouchr's decision buttons, a CUSTOM action listener uses
+      // the clicked message as its originating context, so standard message_ts/message.ts are valid
+      // root fallbacks here. Slash commands have none and remain null.
+      const thread: string | null =
+        args.event?.thread_ts
+        ?? args.event?.ts
+        ?? args.body?.container?.thread_ts
+        ?? args.body?.message?.thread_ts
+        ?? args.body?.container?.message_ts
+        ?? args.body?.message?.ts
+        ?? null;
+      // A DM / group-DM is a personal conversation with no admins, so channel governance (the tool
+      // allowlist + mode) does not apply — the request must NOT be denied by the deny-by-default
+      // allowlist there. The connect prompt is still delivered to `channel` (and static Policy still
+      // evaluates against it), but the governable scope is null (like a channel-less context). ONE
+      // source of truth for the mapping (governanceChannelOf, STR-2), shared with the headless broker.
+      const channelType = isSlackConversationType(args.event?.channel_type)
+        ? args.event.channel_type
+        : undefined;
+      const governableChannel: string | null = governanceChannelOf(channel, channelType);
+      const contextDeps: InternalConnectContextDeps = {
         identity,
         channel,
+        governableChannel,
         client: args.client,
         registry,
         vault,
@@ -2707,7 +2894,17 @@ export async function createVouchr(opts: VouchrOptions) {
         notifications: notifyState,
         dryRun,
         slackClientOptions: opts.slackClientOptions,
-      });
+      };
+      // Slash commands and block actions have no event.channel_type. A G… id can mean either a
+      // private channel (governed) or an MPIM (personal), so attach a LAZY authenticated lookup.
+      // It does not start in middleware: the host can acknowledge first, and the first Vouchr call
+      // resolves and memoizes the classification. Errors retain the governed scope (fail closed).
+      if (channel?.startsWith('G') && channelType === undefined) {
+        contextDeps[INTERNAL_GOVERNANCE_CHANNEL_RESOLVER] = () => (
+          governanceChannelForCommand(args.client, channel, opts.slackClientOptions)
+        );
+      }
+      args.context.vouchr = new ConnectContext(contextDeps);
     }
     await args.next();
   };
@@ -2732,6 +2929,33 @@ export async function createVouchr(opts: VouchrOptions) {
     const result = await handleOAuthCallback(callbackDeps, DRY_RUN_CODE, state);
     if (!result.ok) throw new Error(result.error);
     return result;
+  };
+
+  /**
+   * #116 dry-run test helper: opt a provider into a channel's tool allowlist, exactly as an admin
+   * running `/vouchr enable <provider>` (or toggling App Home) would. Channels are deny-by-default,
+   * so a first `connect()` for a provider that was never enabled here throws `ToolDisabledError`
+   * before any consent — call this once in setup to reproduce a governed channel offline.
+   */
+  const enableTool = async (
+    admin: SlackIdentity,
+    channel: string,
+    providerId: string,
+  ): Promise<void> => {
+    registry.get(providerId); // SEC-4: validate before any write; throws on an unknown id
+    const outcome = await configureChannelTools({
+      channelTools,
+      vault,
+      audit,
+      identity: admin,
+      channel,
+      changes: [[providerId, true]],
+      allProviders: providerIds,
+      issuance: await vault.userProvisioningIssuedAt(),
+      authorize: async () => true, // the caller vouches for admin authority in a test
+      assertEligible: async () => undefined,
+    });
+    if (outcome === 'stale') throw new Error('channel tool enable was superseded');
   };
 
   /** Mount the OAuth callback on the receiver's Express router. */
@@ -2781,6 +3005,7 @@ export async function createVouchr(opts: VouchrOptions) {
     client: WebClient,
     provisioningReceivedAt?: bigint,
     channelIssuance?: ChannelProvisioningIssuance,
+    governableChannel?: string | null,
   ): ConnectContext {
     const deps: InternalConnectContextDeps = {
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
@@ -2790,6 +3015,7 @@ export async function createVouchr(opts: VouchrOptions) {
       thread: null, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
       slackClientOptions: opts.slackClientOptions,
     };
+    if (governableChannel !== undefined) deps.governableChannel = governableChannel;
     if (provisioningReceivedAt != null) {
       deps[INTERNAL_PROVISIONING_RECEIVED_AT] = provisioningReceivedAt;
     }
@@ -2801,7 +3027,11 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /** The manifest plus its raw allowlist snapshot for admin renderers. Keeping the raw predicate lets
    *  them show policy-denied-but-allowlisted tools correctly without reading channel_tool twice. */
-  const manifestSnapshotFor = (identity: SlackIdentity, channel: string) => buildToolManifestSnapshot({
+  const manifestSnapshotFor = (
+    identity: SlackIdentity,
+    channel: string,
+    governanceChannel: string | null,
+  ) => buildToolManifestSnapshot({
     providerIds,
     registry,
     policy,
@@ -2809,13 +3039,14 @@ export async function createVouchr(opts: VouchrOptions) {
     channelConfig,
     principal: identity,
     channel,
+    governanceChannel,
   });
 
   /**
    * Register the `/vouchr` slash command (`status`, `disconnect <provider>`,
-   * `configure <provider>`), the channel-credential modal submit, and — when the app exposes
+   * `connect-shared <provider>`), the channel-credential modal submit, and — when the app exposes
    * `event` (Bolt does; older custom fakes may not) — the App Home console (#111) on
-   * `app_home_opened`. `configure` opens a private modal so the admin's secret is never typed
+   * `app_home_opened`. `connect-shared` opens a private modal so the admin's secret is never typed
    * into the channel (invariant 7 / T7).
    */
   function registerCommands(app: {
@@ -2840,7 +3071,8 @@ export async function createVouchr(opts: VouchrOptions) {
       '• `/vouchr enable <provider>` — allow a provider here',
       '• `/vouchr disable <provider>` — block a provider here',
       '• `/vouchr mode <provider> <shared|per-user|session>` — set the credential model',
-      '• `/vouchr configure <provider>` — set a channel-shared credential (opens a private modal)',
+      '• `/vouchr connect-shared <provider>` — connect one shared account for the whole channel (opens a private modal)',
+      '• `/vouchr disconnect-shared <provider>` — remove the channel-shared account (returns the channel to per-user)',
       '• `/vouchr stats` — 30-day usage for this channel',
       '• `/vouchr audit channel` — this channel’s shared-credential usage',
     ].join('\n');
@@ -2849,6 +3081,9 @@ export async function createVouchr(opts: VouchrOptions) {
     // escaping prevents injection, not disclosure. Keep one static, actionable response for every
     // provider-taking command.
     const UNKNOWN_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr tools` to see the registered providers.';
+    // A trusted audit subject for non-admin attempts against an unregistered provider-shaped value.
+    // The submitted value is not yet recognized and therefore must never reach any audit column.
+    const DISCONNECT_SHARED_DENIAL_SUBJECT = 'disconnect-shared';
     const UNKNOWN_DISCONNECT_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr status` to see your connected accounts.';
     const COMMAND_READ_FAILURE = {
       status: 'Could not load your connected accounts. Try `/vouchr status` again in a moment.',
@@ -2900,10 +3135,28 @@ export async function createVouchr(opts: VouchrOptions) {
         if (words.length !== 1) return respond('Usage: `/vouchr tools`');
         if (!command.channel_id) return respond('Run `/vouchr tools` from inside a channel.');
         const prepared = await prepareCommandResponse(async () => {
-          const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
+          const governance = await governanceChannelForCommand(
+            client,
+            command.channel_id,
+            opts.slackClientOptions,
+          );
+          const manifest = await contextFor(
+            identity,
+            command.channel_id,
+            client,
+            undefined,
+            undefined,
+            governance,
+          ).toolManifest();
           if (!manifest.length) return 'No providers are registered.';
           const lines = manifest
-            .map((m) => `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'}${m.mode ? ` (${escapeMrkdwn(m.mode)})` : ''}`)
+            // Always show the EFFECTIVE mode, not just an explicitly-set one: a null mode is per-user,
+            // so hiding it left members unable to tell "per-user" from "unset". Service tools have no
+            // human credential to broker, so they show that instead of a mode.
+            .map((m) => {
+              const model = isBrokeredProvider(m) ? escapeMrkdwn(m.mode ?? 'per-user') : 'service tool';
+              return `• *${escapeMrkdwn(m.provider)}*: ${m.enabled ? 'enabled' : 'disabled'} (${model})`;
+            })
             .join('\n');
           return `Tools for <#${escapeMrkdwn(command.channel_id)}>:\n${lines}\n\nAdmins: \`/vouchr enable|disable <provider>\`.`;
         });
@@ -2921,7 +3174,19 @@ export async function createVouchr(opts: VouchrOptions) {
             await audit.record('denied', identity, 'stats', { reason: 'not-admin', owner: 'channel', channel: command.channel_id });
             return adminOnly(allowChannelCreatorConfig, 'view channel usage stats');
           }
-          const manifest = await contextFor(identity, command.channel_id, client).toolManifest();
+          const governance = await governanceChannelForCommand(
+            client,
+            command.channel_id,
+            opts.slackClientOptions,
+          );
+          const manifest = await contextFor(
+            identity,
+            command.channel_id,
+            client,
+            undefined,
+            undefined,
+            governance,
+          ).toolManifest();
           const enabled = manifest.filter((m) => m.enabled && isBrokeredProvider(m)).map((m) => m.provider);
           const since = Date.now() - 30 * 24 * 60 * 60 * 1000;
           const stats = await audit.statsByChannel(identity.teamId, command.channel_id, since);
@@ -2940,19 +3205,22 @@ export async function createVouchr(opts: VouchrOptions) {
         if (!command.channel_id) return respond(`Run \`/vouchr ${sub}\` from inside the channel you want to configure.`);
         if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         const on = sub === 'enable';
+        let outcome: 'ok' | 'unchanged' | 'denied';
         try {
-          if ((await setChannelToolEnabled(
+          outcome = await setChannelToolEnabled(
             client,
             identity,
             command.channel_id,
             arg,
             on,
             provisioningReceivedAt,
-          )) === 'denied') {
-            return respond(adminOnly(allowChannelCreatorConfig, 'change channel tools'));
-          }
+          );
         } catch (e) {
           return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
+        }
+        if (outcome === 'denied') return respond(adminOnly(allowChannelCreatorConfig, 'change channel tools'));
+        if (outcome === 'unchanged') {
+          return respond(`*${escapeMrkdwn(arg)}* is already ${on ? 'enabled' : 'disabled'} in <#${escapeMrkdwn(command.channel_id)}> — nothing changed.`);
         }
         return respond(`${on ? 'Enabled' : 'Disabled'} *${escapeMrkdwn(arg)}* in <#${escapeMrkdwn(command.channel_id)}>.`);
       }
@@ -2978,9 +3246,9 @@ export async function createVouchr(opts: VouchrOptions) {
         return respond(`Set *${escapeMrkdwn(arg)}* to *${escapeMrkdwn(arg2)}* in <#${escapeMrkdwn(command.channel_id)}>.`);
       }
 
-      if (sub === 'configure') {
-        if (words.length !== 2) return respond('Usage: `/vouchr configure <provider>`');
-        if (!command.channel_id) return respond('Run `/vouchr configure` from inside the channel you want to configure.');
+      if (sub === 'connect-shared') {
+        if (words.length !== 2) return respond('Usage: `/vouchr connect-shared <provider>`');
+        if (!command.channel_id) return respond('Run `/vouchr connect-shared` from inside the channel you want to configure.');
         // Validate the provider BEFORE recording a denial or opening the modal (parity with enable/disable):
         // otherwise an unvalidated arg — potentially a credential-shaped typo — lands raw in the audit
         // `provider` column and could be reflected back into a `/vouchr audit` view. The gate + denial
@@ -3004,6 +3272,65 @@ export async function createVouchr(opts: VouchrOptions) {
           return respond(safeUserMessage(e)); // ineligible channel class → the core reason, nothing else
         }
         return;
+      }
+      // The counterpart to connect-shared. Admin-gated; the dedicated core op only acts from shared
+      // mode (a session/per-user channel is a truthful no-op — no thread-approval downgrade), deletes
+      // the shared credential AND attempts upstream revocation, and reports its real outcome.
+      if (sub === 'disconnect-shared') {
+        if (words.length !== 2) return respond('Usage: `/vouchr disconnect-shared <provider>`');
+        // Validate id syntax before any lookup or audit (SEC-4). Registry membership is safe to use
+        // in the denial audit; an unregistered submitted value is replaced by a fixed trusted subject.
+        if (!isValidProviderId(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
+        if (!command.channel_id) return respond('Run `/vouchr disconnect-shared` from inside the channel you want to configure.');
+        const chan = command.channel_id;
+        let outcome: Awaited<ReturnType<typeof disconnectChannelShared>>;
+        try {
+          if (!(await commandAdmin(client, identity, chan))) {
+            await audit.record(
+              'denied',
+              identity,
+              registry.has(arg) ? arg : DISCONNECT_SHARED_DENIAL_SUBJECT,
+              { reason: 'not-admin', owner: 'channel', channel: chan },
+            );
+            return respond(adminOnly(allowChannelCreatorConfig, 'change channel credentials'));
+          }
+          // Recognize a current registry entry, this channel's exact stored credential, OR its exact
+          // persisted shared-mode tuple. The last case is the documented `missing` recovery path: a
+          // break-glass delete may remove the credential while leaving shared mode behind, and provider
+          // retirement must not make that stuck governance row impossible to clear.
+          const recognized = registry.has(arg)
+            || await vault.has(channelOwner(identity.teamId, chan), arg)
+            || await channelConfig.getMode(identity.teamId, chan, arg) === 'shared';
+          if (!recognized) {
+            return respond(UNKNOWN_PROVIDER_TEXT);
+          }
+          outcome = await disconnectChannelShared({
+            vault, audit, channelConfig, registry, identity,
+            channel: chan, providerId: arg,
+            issuance: await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
+          });
+        } catch (e) {
+          return respond(safeUserMessage(e)); // raw message never reaches the user (may carry a secret)
+        }
+        const p = escapeMrkdwn(arg);
+        if (outcome.status === 'not-shared') {
+          return respond(`No shared *${p}* account is set in <#${escapeMrkdwn(chan)}> — nothing to disconnect. (This never changes a per-user or session channel.)`);
+        }
+        if (outcome.status === 'missing') {
+          return respond(`There was no shared *${p}* credential stored in <#${escapeMrkdwn(chan)}> (it may already have been revoked) — the channel now uses per-user credentials.`);
+        }
+        if (outcome.status === 'stale') {
+          return respond(`The *${p}* setup changed before the change completed — run \`/vouchr disconnect-shared ${p}\` again.`);
+        }
+        if (!outcome.ok) {
+          return respond(`Removed the shared *${p}* account in <#${escapeMrkdwn(chan)}> and returned the channel to per-user, but upstream revocation could not be confirmed — revoke or rotate Vouchr’s access in ${p} directly if needed.`);
+        }
+        if (!outcome.audited) {
+          // The delete + mode flip + revoke committed, but the durable revoke audit could not be
+          // written — surface it separately instead of discarding the committed outcome (mirrors disconnect).
+          return respond(`Removed the shared *${p}* account in <#${escapeMrkdwn(chan)}>, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
+        }
+        return respond(`Removed the shared *${p}* account in <#${escapeMrkdwn(chan)}> — the channel now uses per-user credentials.`);
       }
       if (sub === 'disconnect') {
         if (words.length !== 2) return respond('Usage: `/vouchr disconnect <provider>`');
@@ -3335,14 +3662,27 @@ export async function createVouchr(opts: VouchrOptions) {
     // disconnect. Service tools are shown read-only but excluded from the admin controls: Vouchr doesn't
     // broker them, so channel-credential mode is meaningless and setChannelMode would refuse them.
     async function buildConfigModal(identity: SlackIdentity, channelId: string | null, client: WebClient): Promise<unknown> {
+      // Connection rows do not depend on channel classification; start that database read now so an
+      // ambiguous G… Slack lookup and the independent vault read overlap inside the trigger window.
+      const connectionsPromise = listBrokeredConnections(identity);
+      // Slash commands and modal actions do not carry Slack's channel_type. Resolve the only
+      // ambiguous id class (G… private channel vs MPIM) after acknowledgement, then use that exact
+      // classification for both the read-only manifest and whether channel-admin controls exist.
+      // A DM/group-DM is a personal conversation: tools remain available without a mutable channel
+      // allowlist, and there are no channel-governance controls to render.
+      const governanceChannel = channelId
+        ? await governanceChannelForCommand(client, channelId, opts.slackClientOptions)
+        : null;
       // These are independent and all sit before Slack's short-lived trigger_id is consumed by
       // views.open. Dispatch them together rather than spending one DB/network window per fact.
       const [connections, manifest, isAdmin] = await Promise.all([
-        listBrokeredConnections(identity),
+        connectionsPromise,
         channelId
-          ? manifestSnapshotFor(identity, channelId)
+          ? manifestSnapshotFor(identity, channelId, governanceChannel)
           : Promise.resolve({ tools: [], toolAllowed: (_provider: string) => true }),
-        channelId ? commandAdmin(client, identity, channelId) : Promise.resolve(false),
+        channelId && governanceChannel
+          ? commandAdmin(client, identity, channelId)
+          : Promise.resolve(false),
       ]);
       // The modal keeps its pre-#111 contract: service tools are read-only there (its row shape is
       // mode+enabled controls, meaningless for them). The App Home instead renders every
@@ -3459,7 +3799,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // keeps untouched providers from vanishing, and the configured-ness decision itself — is ONE
       // atomic core mutation (ChannelTools.applyEnabled), so a concurrent admin or a mid-write
       // failure can never leave a partial allowlist. Audit only the providers that actually changed. ──
-      const enabledChanged = [...submittedEnabled].filter(([p]) => registry.has(p) && submittedEnabled.get(p) !== (openEnabled.get(p) ?? true));
+      const enabledChanged = [...submittedEnabled].filter(([p]) => registry.has(p) && submittedEnabled.get(p) !== (openEnabled.get(p) ?? false));
       if (enabledChanged.length) {
         try {
           const configured = await configureChannelTools({
@@ -3476,7 +3816,9 @@ export async function createVouchr(opts: VouchrOptions) {
             authorize: async () => true,
             assertEligible: () => assertChannelEligible(client, channel),
           });
-          if (configured === 'configured') confirmed += enabledChanged.length;
+          // 'unchanged' (the desired state already held, e.g. a concurrent write landed it) is still a
+          // confirmed outcome for the admin — the channel matches what they submitted.
+          if (configured === 'configured' || configured === 'unchanged') confirmed += enabledChanged.length;
           else unconfirmed += enabledChanged.length;
         } catch {
           unconfirmed += enabledChanged.length;
@@ -3576,7 +3918,7 @@ export async function createVouchr(opts: VouchrOptions) {
           } else if (!(workspaceAdmin || (await commandAdmin(client, identity, selected)))) {
             governance = { channel: selected, note: adminOnly(allowChannelCreatorConfig, 'configure this channel') };
           } else {
-            const manifest = await manifestSnapshotFor(identity, selected);
+            const manifest = await manifestSnapshotFor(identity, selected, selected);
             governance = { channel: selected, tools: adminToolRows(manifest.tools, manifest.toolAllowed) };
           }
         }
@@ -3698,7 +4040,7 @@ export async function createVouchr(opts: VouchrOptions) {
       await publishHome(identity, client, channel);
     });
 
-    // Configure → the SAME gate + modal as `/vouchr configure` (STR-3). The modal's submit is the
+    // Configure → the SAME gate + modal as `/vouchr connect-shared` (STR-3). The modal's submit is the
     // existing CONFIGURE_CALLBACK flow, so the credential write path is untouched.
     app.action(HOME_CONFIGURE_ACTION, async ({ ack, body, client }: any) => {
       const provisioningReceivedAt = process.hrtime.bigint();
@@ -3879,6 +4221,12 @@ export async function createVouchr(opts: VouchrOptions) {
       if (identity) await dmActor(client, identity, text);
     });
 
+    // The OAuth "Connect <provider>" button carries a `url`, so Slack opens the authorize page in the
+    // browser on click AND delivers a block_actions interaction that must be acknowledged. There is
+    // nothing else to do here (the OAuth `state` in the url drives the whole flow) — a bare ack is the
+    // entire handler, and without it Slack shows "Operation timed out. Apps need to respond within 3s."
+    app.action(OAUTH_CONNECT_ACTION, async ({ ack }: any) => { await ack(); });
+
     // Thread-scoped session approval. The control contains one opaque request id; provider and every
     // binding come from PostgreSQL, while identity/channel/thread come from the Slack-signed click.
     // The provider lock is shared with mode and tool writers, so revalidation + consume + grant +
@@ -3929,10 +4277,12 @@ export async function createVouchr(opts: VouchrOptions) {
                 decisionTx,
               );
               if (currentMode !== 'session') return false;
+              // Session mode only exists in a governed channel, so the governance scope IS row.channel.
               return (await authorizeProvider(
                 policy,
                 new ChannelTools(decisionTx),
                 identity,
+                row.channel,
                 row.channel,
                 row.provider,
               )) === null;
@@ -4253,7 +4603,7 @@ export async function createVouchr(opts: VouchrOptions) {
     audit,
     db,
     /** #116 dry-run helpers (see VouchrOptions.dryRun); undefined unless `dryRun: true`. */
-    dryRun: dryRun ? { completeConsent } : undefined,
+    dryRun: dryRun ? { completeConsent, enableTool } : undefined,
   };
 }
 

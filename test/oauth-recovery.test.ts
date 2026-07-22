@@ -30,6 +30,7 @@ import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { Policy } from '../src/core/policy';
 import { CredentialLockdownError, Vault } from '../src/core/vault';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { openTestDb, testDbUrl } from './support/pg';
 
 const KEY = randomBytes(32);
@@ -66,6 +67,9 @@ async function contextFor(vouchr: Awaited<ReturnType<typeof createVouchr>>, clie
     event: { channel: 'C1', user: ID.userId, team: ID.teamId },
     next: async () => {},
   });
+  // Deny-by-default: an unconfigured channel enables no provider. Opt 'acme' into C1 so these tests
+  // exercise the consent/prompt/recovery flow rather than tripping the tool gate before consent.
+  await setChannelToolEnabled(new ChannelTools(vouchr.db), ID.teamId, 'C1', provider.id, true);
   return context.vouchr;
 }
 
@@ -721,6 +725,82 @@ test('Bolt sends one private recovery DM for an attributable callback and none f
     assert.equal(apiCalls.length, 1, 'a replay must not duplicate the private recovery DM');
   } finally {
     prototype.apiCall = realApiCall;
+  }
+});
+
+// The post-OAuth SUCCESS notification is a production-path contract, so it is exercised through the
+// real WebClient (patched apiCall), not a stub that never fires: a durable private DM AND — when the
+// prompt was posted in a channel — a channel/user-bound ephemeral "green signal", with no duplicate on
+// a replayed (consumed) state and NO channel ephemeral for a channel-less connect.
+test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the DM when channel-less (#5)', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  const db = await openTestDb(t);
+  const apiCalls: Array<{ method: string; args: any }> = [];
+  const prototype = WebClient.prototype as any;
+  const realApiCall = prototype.apiCall;
+  prototype.apiCall = async (method: string, args: any) => {
+    apiCalls.push({ method, args });
+    return { ok: true, channel: args.channel, ts: '1.0' };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ access_token: 'AT-success', token_type: 'bearer', scope: 'read' }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )) as typeof fetch;
+  // Observable completion barrier: drain the event loop until the fire-and-forget notify has produced
+  // the expected calls (bounded, deterministic — no fixed wall-clock sleep and no Date.now).
+  const until = async (pred: () => boolean): Promise<void> => {
+    for (let i = 0; i < 500 && !pred(); i++) await new Promise<void>((r) => setImmediate(r));
+    if (!pred()) throw new Error('barrier: expected notification calls did not arrive');
+  };
+  const count = (method: string, match: (args: any) => boolean): number =>
+    apiCalls.filter((c) => c.method === method && match(c.args)).length;
+  try {
+    const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db, botToken: 'xoxb-test' });
+    let callback: any;
+    vouchr.mountRoutes({ get: (_p: string, h: any) => { callback = h; } });
+
+    // (A) in-channel connect (C1) → after OAuth, both a durable DM and a channel-bound ephemeral fire.
+    const prompts: any[] = [];
+    const context = await contextFor(vouchr, {
+      chat: { postEphemeral: async (a: any) => prompts.push(a), postMessage: async (a: any) => prompts.push(a) },
+    });
+    await assert.rejects(() => context.connect('acme'), ConsentRequiredError);
+    const state = new URL(prompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    const res = fakeResponse();
+    await callback({ query: { state, code: 'AUTHCODE' } }, res);
+    await until(() => apiCalls.length >= 2);
+    assert.equal(res.statusCode, 200);
+    assert.equal(count('chat.postMessage', (a) => a.channel === ID.userId), 1, 'a durable success DM is delivered to the user');
+    assert.equal(count('chat.postEphemeral', (a) => a.channel === 'C1' && a.user === ID.userId), 1, 'a channel/user-bound ephemeral green signal is delivered where the prompt was');
+
+    // (B) replay the now-consumed state (must NOT re-deliver) and (C) a channel-less success for a
+    // different user (only a DM). U2's DM is the observable barrier that proves the replay fully settled.
+    const replay = fakeResponse();
+    await callback({ query: { state, code: 'AUTHCODE' } }, replay);
+    const clPrompts: any[] = [];
+    const cl: any = {};
+    await vouchr.middleware({
+      context: cl,
+      client: { chat: { postEphemeral: async (a: any) => clPrompts.push(a), postMessage: async (a: any) => clPrompts.push(a) } },
+      event: { user: 'U2', team: ID.teamId }, // no channel → channel-less (ungoverned) context
+      next: async () => {},
+    });
+    await assert.rejects(() => cl.vouchr.connect('acme'), ConsentRequiredError);
+    const clState = new URL(clPrompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    const clRes = fakeResponse();
+    await callback({ query: { state: clState, code: 'AUTHCODE' } }, clRes);
+    await until(() => count('chat.postMessage', (a) => a.channel === 'U2') >= 1);
+
+    // BOTH counts: the replay duplicated neither the durable DM nor the channel confirmation, and the
+    // channel-less success DM'd its user with no channel ephemeral.
+    assert.equal(count('chat.postMessage', (a) => a.channel === ID.userId), 1, 'no duplicate durable DM on a replayed callback');
+    assert.equal(count('chat.postEphemeral', (a) => a.channel === 'C1'), 1, 'no duplicate channel confirmation on a replayed callback');
+    assert.equal(count('chat.postMessage', (a) => a.channel === 'U2'), 1, 'a channel-less success still DMs the user');
+    assert.equal(count('chat.postEphemeral', (a) => a.user === 'U2'), 0, 'a channel-less success posts no channel ephemeral');
+  } finally {
+    prototype.apiCall = realApiCall;
+    globalThis.fetch = realFetch;
   }
 });
 

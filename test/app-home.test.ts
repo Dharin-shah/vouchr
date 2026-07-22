@@ -240,11 +240,13 @@ test('forged invalid mode value never reaches state: shared cred survives, nothi
 });
 
 test('home Enable/Disable == /vouchr enable|disable: identical channel_tool row and audit rows', async (t) => {
+  // Use a real state change (enable on a deny-by-default channel) so both paths actually write a row
+  // and audit — a no-op disable now writes nothing, which would compare equal but prove nothing.
   const viaCommand = await harness(t, { slackAdmin: true });
-  await viaCommand.runCommand('disable mcp');
+  await viaCommand.runCommand('enable mcp');
   const viaHome = await harness(t, { slackAdmin: true });
-  await viaHome.toggleTool('disable:mcp');
-  assert.equal(await toolBit(viaHome.lan.db), 0);
+  await viaHome.toggleTool('enable:mcp');
+  assert.equal(await toolBit(viaHome.lan.db), 1);
   assert.equal(await toolBit(viaHome.lan.db), await toolBit(viaCommand.lan.db));
   assert.deepEqual(await auditRows(viaHome.lan.db), await auditRows(viaCommand.lan.db)); // STR-4 parity
 });
@@ -442,36 +444,35 @@ test('app_home_opened defers to a foreign (host-published) Home view; first open
   assert.equal(h.published().view.type, 'home');
 });
 
-test('first Disable on an unconfigured channel materializes the allowlist: others stay enabled, one audit row', async (t) => {
+test('deny-by-default: a Disable on an already-disabled provider is a no-op (no write, no audit)', async (t) => {
   const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
-  await h.toggleTool('disable:a');
   const tools = new ChannelTools(h.lan.db);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // the one the admin targeted
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // NOT silently disabled
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), true);
-  const rows = await auditRows(h.lan.db);
-  assert.deepEqual(rows.map((r) => [r.action, r.provider]), [['config', 'a']]); // only the real change audited
+  for (const p of ['a', 'b', 'c']) assert.equal(await tools.isEnabled('T1', 'C_FIN', p), false); // nothing usable until enabled
+  await h.toggleTool('disable:a'); // false -> false: the core filters the no-op, so nothing is written
+  for (const p of ['a', 'b', 'c']) assert.equal(await tools.isEnabled('T1', 'C_FIN', p), false);
+  assert.deepEqual(await auditRows(h.lan.db), []); // no fabricated config/tool:disabled row
+  assert.equal(await tools.isConfigured('T1', 'C_FIN'), false); // no rows materialized — still unconfigured
 });
 
-test('slash and home agree on the unconfigured-channel Disable: same rows, same audit', async (t) => {
+test('slash and home agree on an unconfigured-channel Enable: same rows, same audit', async (t) => {
   const slash = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
-  await slash.runCommand('disable a');
+  await slash.runCommand('enable a');
   const home = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
-  await home.toggleTool('disable:a');
+  await home.toggleTool('enable:a');
   for (const h of [slash, home]) {
     const tools = new ChannelTools(h.lan.db);
-    assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false);
-    assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true);
+    assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), true); // the one the admin opted in
+    assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), false); // deny-by-default: never implicitly on
   }
   assert.deepEqual(await auditRows(home.lan.db), await auditRows(slash.lan.db));
 });
 
-test('first Enable on an unconfigured channel does not disable the other providers', async (t) => {
+test('deny-by-default: enabling one provider turns ONLY it on; the rest stay disabled', async (t) => {
   const h = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
-  await h.runCommand('enable a'); // via slash — previously flipped the channel into a one-row allowlist
+  await h.runCommand('enable a'); // via slash
   const tools = new ChannelTools(h.lan.db);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), true);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // previously: silently disabled
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), false); // deny-by-default: not implicitly enabled
 });
 
 test('a stale/deleted metadata channel on a click DMs the actor and resets the view', async (t) => {
@@ -501,13 +502,13 @@ test('exported homeView is unstamped; a host Home tab built from it is deferred 
   assert.equal(h.published(), null); // and no view was clobbered
 });
 
-test('concurrent first Disables on an unconfigured channel both land; bystanders stay enabled', async (t) => {
+test('concurrent first Enables on an unconfigured channel both land; bystanders stay disabled', async (t) => {
   const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
-  await Promise.all([h.toggleTool('disable:a'), h.toggleTool('disable:b')]);
+  await Promise.all([h.toggleTool('enable:a'), h.toggleTool('enable:b')]);
   const tools = new ChannelTools(h.lan.db);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), false);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), true); // no interleaving re-enabled or dropped it
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), true);
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true);
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), false); // no interleaving implicitly enabled it
 });
 
 test('service tools: not advertised as connectable; governed via Enable/Disable only', async (t) => {
@@ -554,7 +555,7 @@ test('service tools cannot mint or render channel credential setup', async (t) =
 
   const viaSlash = await harness(t, { slackAdmin: true, providers });
   const responses: unknown[] = [];
-  await viaSlash.runCommand('configure svc', async (response) => { responses.push(response); });
+  await viaSlash.runCommand('connect-shared svc', async (response) => { responses.push(response); });
   assert.equal(viaSlash.opened(), null);
   assert.equal(viaSlash.hydrated(), null);
   assert.deepEqual(responses, [fixed]);
@@ -602,7 +603,7 @@ test('slash enable and configure refuse an ineligible channel class (parity with
   await h.runCommand('enable mcp', async (m: any) => { out.push(String(m)); });
   assert.match(out[0], /externally shared/);
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false);
-  await h.runCommand('configure mcp', async (m: any) => { out.push(String(m)); });
+  await h.runCommand('connect-shared mcp', async (m: any) => { out.push(String(m)); });
   assert.ok(h.opened()); // Slack trigger is consumed before the eligibility read
   assert.equal(h.hydrated(), null);
   assert.match(JSON.stringify(h.updates()), /externally shared/);

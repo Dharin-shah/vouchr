@@ -3,11 +3,18 @@ import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { createVouchr, defineProvider, github, ConsentRequiredError } from '../src';
+import {
+  ApprovalRequiredError,
+  createVouchr,
+  defineProvider,
+  github,
+  ConsentRequiredError,
+} from '../src';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 
 // A real local OAuth provider + API, so the flow is exercised over HTTP end to end.
 function startMockProvider(): Promise<{
@@ -82,6 +89,8 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
       },
     });
     const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
+    // Deny-by-default: opt the provider into the channel this test exercises.
+    await setChannelToolEnabled(new ChannelTools(lan.db), 'T1', 'C1', provider.id, true);
 
     // Capture the OAuth callback handler that mountRoutes registers on the router.
     let callback: any;
@@ -135,6 +144,212 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
   }
 });
 
+// The DM exemption must hold through the WHOLE lifecycle, not just the connect preflight: a personal
+// conversation (id 'D…' / channel_type 'im') is ungoverned, so with NO channel enable the manifest
+// reports the provider ENABLED, connect() reaches consent (not tool-disabled), and — the regression the
+// reviewer reproduced — the FIRST fetch on the retained handle succeeds instead of throwing
+// InteractionStateChangedError from a governance re-check against the DM channel. Static Policy still
+// evaluates against the real DM channel; that is exercised in the authz unit tests.
+test('integration: a per-user provider in a DM works end to end with no channel enable (#2 first-fetch)', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const mock = await startMockProvider();
+  try {
+    const provider = defineProvider({
+      id: 'mock', authorizeUrl: `${mock.base}/authorize`, tokenUrl: `${mock.base}/token`,
+      scopesDefault: ['read'], egressAllow: ['127.0.0.1'], refresh: 'none', pkce: true,
+      clientId: 'cid', clientSecret: 'csec',
+      accountProbe: async (tok) => {
+        const r = await fetch(`${mock.base}/api/me`, { headers: { Authorization: `Bearer ${tok}` } });
+        return r.ok ? (await r.json()).login : null;
+      },
+    });
+    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
+    // Deliberately NO setChannelToolEnabled for the DM — deny-by-default must not reach it.
+    let callback: any;
+    lan.mountRoutes({ get: (_p: string, h: any) => (callback = h) });
+    const posts: any[] = [];
+    const client = { chat: { postEphemeral: async (a: any) => posts.push(a), postMessage: async (a: any) => posts.push(a) } };
+
+    // Run the middleware exactly as Bolt would for a 1:1 DM (id 'D…' AND channel_type 'im').
+    const ctx: any = {};
+    await lan.middleware({
+      context: ctx, client,
+      event: { channel: 'D0PERSONAL', channel_type: 'im', user: 'U1', team: 'T1' },
+      next: async () => {},
+    });
+
+    // The manifest reports the provider ENABLED in the DM (mode null), not deny-by-default disabled.
+    const manifest = await ctx.vouchr.toolManifest();
+    assert.deepEqual(manifest.find((m: any) => m.provider === 'mock'), {
+      provider: 'mock', mode: null, enabled: true, identity: 'acting_human',
+    });
+
+    // connect() reaches consent (a Connect prompt), not a tool-disabled refusal.
+    await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
+    const state = new URL(posts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+
+    // Complete OAuth, then the FIRST fetch on the retained handle must succeed (the reproduced bug threw).
+    const res = fakeRes();
+    await callback({ query: { code: 'AUTHCODE', state }, headers: {} }, res);
+    assert.equal(res.statusCode, 200);
+    const handle = await ctx.vouchr.connect('mock');
+    const apiRes = await handle.fetch(`${mock.base}/api/me`);
+    assert.equal(apiRes.status, 200);
+    assert.equal(mock.reqs.find((r) => (r.url ?? '').startsWith('/api/me'))!.auth, 'Bearer AT123');
+  } finally {
+    await mock.close();
+  }
+});
+
+test('integration: command/action middleware lazily and once classifies G-prefixed conversations after ack', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const db = await openTestDb(t);
+  const provider = defineProvider({
+    id: 'lazy-governance',
+    authorizeUrl: 'https://provider.test/authorize',
+    tokenUrl: 'https://provider.test/token',
+    scopesDefault: [],
+    egressAllow: ['api.provider.test'],
+    egressMethods: ['GET', 'POST'],
+    refresh: 'none',
+    pkce: false,
+    clientId: 'cid',
+    clientSecret: 'secret',
+    approval: { approver: 'self' },
+  });
+  const lan = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db });
+  await lan.vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), provider.id, {
+    accessToken: 'stored-token',
+    refreshToken: null,
+    scopes: '',
+    expiresAt: null,
+    externalAccount: 'acct',
+  });
+
+  const run = async (input: {
+    body: Record<string, unknown>;
+    classify: () => Promise<unknown>;
+    enabled: boolean;
+    exerciseHandle?: boolean;
+  }) => {
+    let acknowledged = false;
+    let reads = 0;
+    let handle: ConnectionHandle | undefined;
+    const context: any = {};
+    const client = {
+      conversations: {
+        info: async () => {
+          reads++;
+          assert.equal(acknowledged, true, 'conversation classification started before the listener acknowledged');
+          return input.classify();
+        },
+      },
+      chat: {
+        postEphemeral: async () => undefined,
+        postMessage: async () => undefined,
+      },
+    };
+
+    await lan.middleware({
+      context,
+      client,
+      body: input.body,
+      next: async () => {
+        assert.equal(reads, 0, 'global middleware must not start Slack I/O before the listener runs');
+        acknowledged = true; // models `await ack()` in a custom command/action listener
+        const [first, second] = await Promise.all([
+          context.vouchr.toolManifest(),
+          context.vouchr.toolManifest(),
+        ]);
+        assert.equal(first[0].enabled, input.enabled);
+        assert.deepEqual(second, first);
+        if (input.exerciseHandle) {
+          handle = await context.vouchr.connect(provider.id);
+          assert.equal(await handle!.account(), 'acct', 'retained-use validation keeps the resolved MPIM scope');
+        }
+      },
+    });
+    assert.equal(reads, 1, 'classification is single-flight and memoized for the request context');
+    return handle;
+  };
+
+  await run({
+    body: { team_id: 'T1', user_id: 'U1', channel_id: 'GROUPDM_COMMAND' },
+    classify: async () => ({ channel: { id: 'GROUPDM_COMMAND', is_mpim: true } }),
+    enabled: true,
+    exerciseHandle: true,
+  });
+
+  const actionHandle = await run({
+    body: {
+      team: { id: 'T1' },
+      user: { id: 'U1' },
+      container: { channel_id: 'GROUPDM_ACTION', message_ts: 'ROOT_ACTION' },
+    },
+    classify: async () => ({ channel: { id: 'GROUPDM_ACTION', is_mpim: true } }),
+    enabled: true,
+    exerciseHandle: true,
+  });
+  await assert.rejects(
+    actionHandle!.fetch('https://api.provider.test/write', { method: 'POST' }),
+    ApprovalRequiredError,
+  );
+  assert.equal(
+    (await db.get<{ thread: string }>(
+      `SELECT thread FROM approval_request WHERE channel=?`,
+      ['GROUPDM_ACTION'],
+    ))?.thread,
+    'ROOT_ACTION',
+    'a root-message block action binds the standard container.message_ts as its thread root',
+  );
+
+  const replyHandle = await run({
+    body: {
+      team: { id: 'T1' },
+      user: { id: 'U1' },
+      container: { channel_id: 'GROUPDM_REPLY', message_ts: 'REPLY_ACTION' },
+      message: { ts: 'REPLY_ACTION', thread_ts: 'ROOT_THREAD' },
+    },
+    classify: async () => ({ channel: { id: 'GROUPDM_REPLY', is_mpim: true } }),
+    enabled: true,
+    exerciseHandle: true,
+  });
+  await assert.rejects(
+    replyHandle!.fetch('https://api.provider.test/reply', { method: 'POST' }),
+    ApprovalRequiredError,
+  );
+  assert.equal(
+    (await db.get<{ thread: string }>(
+      `SELECT thread FROM approval_request WHERE channel=?`,
+      ['GROUPDM_REPLY'],
+    ))?.thread,
+    'ROOT_THREAD',
+    'a reply action prefers message.thread_ts over the reply message timestamp',
+  );
+
+  await run({
+    body: { team_id: 'T1', user_id: 'U1', channel_id: 'G_PRIVATE' },
+    classify: async () => ({ channel: { id: 'G_PRIVATE', is_mpim: false } }),
+    enabled: false,
+  });
+
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      run({
+        body: { team_id: 'T1', user_id: 'U1', channel_id: 'G_UNRESPONSIVE' },
+        classify: () => new Promise(() => undefined),
+        enabled: false,
+      }),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('conversation classification was not bounded')), 5_000);
+      }),
+    ]);
+  } finally {
+    if (deadline) clearTimeout(deadline);
+  }
+});
+
 test('integration: maximum-valid OAuth scopes still produce one bounded connect prompt', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const scopes = Array.from({ length: 48 }, (_, i) => `scope-${i}`);
@@ -151,6 +366,8 @@ test('integration: maximum-valid OAuth scopes still produce one bounded connect 
     clientSecret: 'csec',
   });
   const lan = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db: await openTestDb(t) });
+  // Deny-by-default: opt the provider into the channel this test exercises.
+  await setChannelToolEnabled(new ChannelTools(lan.db), 'T1', 'C1', provider.id, true);
   const posts: any[] = [];
   const client = {
     chat: {
@@ -194,6 +411,8 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
       clientId: 'cid', clientSecret: 'csec',
     });
     const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
+    // Deny-by-default: opt the provider into the channel this test exercises.
+    await setChannelToolEnabled(new ChannelTools(lan.db), 'T1', 'C1', provider.id, true);
     let callback: any;
     lan.mountRoutes({ get: (_p: string, h: any) => (callback = h) });
 

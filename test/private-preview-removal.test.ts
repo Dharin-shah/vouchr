@@ -78,7 +78,7 @@ test('Bolt removes preview state/API but safely expires controls issued before t
   assert.equal('previews' in context, false, 'no process-memory provider-response store may be allocated');
 
   const manifest = await (context.toolManifest as () => Promise<Record<string, unknown>[]>).call(context);
-  assert.deepEqual(manifest, [{ provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' }]);
+  assert.deepEqual(manifest, [{ provider: 'mcp', mode: null, enabled: false, identity: 'acting_human' }]);
   assert.equal(Object.hasOwn(manifest[0], 'visibility'), false);
 
   const responses: string[] = [];

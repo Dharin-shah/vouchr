@@ -6,6 +6,7 @@ import {
   configModal,
   configureModal,
   connectBlocks,
+  OAUTH_CONNECT_ACTION,
   connectedBlocks,
   connectedDmText,
   connectionLine,
@@ -110,6 +111,15 @@ test('connectBlocks: no scopes renders exactly the intro + button (no scope bloc
   assert.doesNotMatch(j(b), /Connecting grants/);
 });
 
+test('connectBlocks: the OAuth button carries both the url and an action_id so Slack acks the click', () => {
+  // A url button still delivers a block_actions interaction; without an action_id the host cannot
+  // register an ack and Slack shows "Operation timed out. Apps need to respond within 3 seconds."
+  const b = connectBlocks('github', 'https://auth') as any[];
+  const button = b.find((x: any) => x.type === 'actions').elements[0];
+  assert.equal(button.url, 'https://auth'); // one-click OAuth preserved
+  assert.equal(button.action_id, OAUTH_CONNECT_ACTION); // so the host's no-op ack can match it
+});
+
 test('connectBlocks: escapes the provider id in mrkdwn (SEC-5, #178)', () => {
   // The provider id is registry-validated, but SEC-5 takes no exception — every mrkdwn renderer
   // escapes it, so a `<…|link>`-shaped id must render inert. Scope the assertion to the mrkdwn
@@ -207,6 +217,14 @@ test('credential and session renderers escape mrkdwn but preserve literal intera
   assert.equal(sessionButton.text.text, `Allow ${provider} here`);
   assert.equal(sessionButton.value, requestId);
   assert.ok(!sessionButton.value.includes(provider));
+});
+
+test('configureModal: the disabled flag warns the credential is inert until enabled (#7)', () => {
+  const enabled = mrkdwnTexts(configureModal('acme', 'C1', [], undefined, false)).join('\n');
+  const disabled = mrkdwnTexts(configureModal('acme', 'C1', [], undefined, true)).join('\n');
+  assert.doesNotMatch(enabled, /is currently \*disabled\*/i); // no warning when the provider is enabled
+  assert.match(disabled, /is currently \*disabled\* in this channel/i);
+  assert.match(disabled, /\/vouchr enable acme/); // tells the admin how to make the credential usable
 });
 
 test('credential modals advertise only reference sources available in their process', () => {

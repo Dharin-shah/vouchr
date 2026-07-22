@@ -35,12 +35,14 @@ export interface ToolManifestEntry {
  * Per-channel "tool manifest": the set of providers an agent is allowed to use in a channel.
  * Non-secret policy bits only: same kind of store as ChannelConfig, over the async `Db`.
  *
- * BACKWARD-COMPAT RULE (important): a channel with NO rows here treats EVERY provider as
- * enabled, so existing channels keep working untouched. The moment ANY provider is explicitly
- * set for the channel (enabled OR disabled), the channel flips to an allowlist: only providers
- * with an `enabled` row are usable; anything not listed is implicitly disabled. Re-enable all by
- * setting every provider back on, or there's no "clear all". That's intentional (an empty
- * allowlist = nothing usable, never silently reverts to all-on once configured).
+ * DENY-BY-DEFAULT (important): a channel with NO rows here enables NOTHING — an agent may use a
+ * provider in a channel only after an admin explicitly turns it on (`/vouchr enable <provider>`
+ * or the App Home toggle). The channel is always a strict allowlist: only a provider with an
+ * `enabled` row is usable; an explicit-off or unlisted provider is off. The first write
+ * MATERIALIZES the full manifest — every untouched provider is written as DISABLED — so the
+ * stored state is fully explicit rather than relying on the implicit deny. There's no "clear
+ * all"; re-enable providers individually. (DMs are personal and ungoverned, so this allowlist
+ * never applies there — see `governableChannel`.)
  */
 export class ChannelTools {
   constructor(private db: Db) {}
@@ -67,11 +69,13 @@ export class ChannelTools {
   }
 
   /**
-   * Atomically apply the desired enabled bits for `changes`, handling the first-write flip. Writing
-   * the FIRST row turns the channel from "all enabled" (backward-compat) into an allowlist where
-   * every row-less provider is implicitly disabled — so when the channel has no rows yet, the FULL
-   * allowlist is materialized (every provider in `allProviders` at its desired state where given,
-   * enabled otherwise) instead of a destructive partial one.
+   * Atomically apply the desired enabled bits for `changes`. Deny-by-default means a row-less channel
+   * already disables every provider, so the first write no longer flips a default — but we still
+   * materialize the full explicit allowlist on first write (every provider in `allProviders` at its
+   * desired state where given, DISABLED otherwise) so the stored state is fully explicit rather than
+   * relying on the implicit deny. ponytail: this materialization is now belt-and-suspenders (a bare
+   * upsert of `changes` would give the same verdicts); keep it for explicit auditable state, drop it
+   * if the allProviders plumbing ever becomes a burden.
    *
    * Concurrency safety comes from the configured-ness decision being evaluated INSIDE the
    * materialization statement and every writer acquiring row locks in canonical provider order.
@@ -98,7 +102,7 @@ export class ChannelTools {
     const orderedChanges = [...desired.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0);
     const full = [...new Set([...allProviders, ...desired.keys()])]
       .sort()
-      .map((p) => [p, desired.get(p) ?? true] as const);
+      .map((p) => [p, desired.get(p) ?? false] as const); // deny-by-default: untouched providers stay OFF
 
     if (!this.db.transaction) {
       throw new Error('channel tool allowlist updates require database transaction support');
@@ -127,9 +131,9 @@ export class ChannelTools {
 
   /**
    * The tool-allowlist verdict for EVERY provider in one channel-scoped read — the batched form of
-   * {@link isEnabled}, same backward-compat rule applied once, returning a predicate. A channel with no
-   * rows is unconfigured → every provider enabled; the moment any row exists the channel is an allowlist
-   * → only a provider with an explicit `enabled` row is on (an explicit-off or unlisted provider is off).
+   * {@link isEnabled}, same deny-by-default rule applied once, returning a predicate. A channel is a
+   * strict allowlist: only a provider with an explicit `enabled` row is on. No rows → nothing enabled;
+   * an explicit-off or unlisted provider is off. An admin opts each provider in per channel (SEC-3).
    * `buildToolManifest` and the App Home admin console fold through this so their query count is bounded
    * by the channel, not the configured-provider count (#209).
    */
@@ -138,14 +142,14 @@ export class ChannelTools {
       `SELECT provider, enabled FROM channel_tool WHERE team_id=? AND channel=?`,
       [teamId, channel],
     )) as { provider: string; enabled: number }[];
-    if (rows.length === 0) return () => true; // unconfigured → all enabled (backward compat), like isEnabled
+    if (rows.length === 0) return () => false; // deny-by-default: unconfigured channel → nothing enabled
     const on = new Set(rows.filter((r) => !!r.enabled).map((r) => r.provider));
-    return (provider) => on.has(provider); // configured = allowlist; explicit-off / unlisted → disabled
+    return (provider) => on.has(provider); // allowlist; explicit-off / unlisted → disabled
   }
 
-  /** Providers explicitly enabled in this channel. Empty array means either "unconfigured"
-   *  (→ all enabled, see the rule above) or "configured but everything off", callers that need
-   *  to tell them apart use `isEnabled`, which applies the backward-compat rule. */
+  /** Providers explicitly enabled in this channel. Empty array means nothing is enabled here —
+   *  under deny-by-default that is the same whether the channel is unconfigured or configured-all-off
+   *  (both → no provider usable). `isEnabled` gives the same verdict for any single provider. */
   async listEnabled(teamId: string, channel: string): Promise<string[]> {
     const rows = (await this.db.all(
       `SELECT provider FROM channel_tool WHERE team_id=? AND channel=? AND enabled=1`,
@@ -154,12 +158,9 @@ export class ChannelTools {
     return rows.map((r) => r.provider);
   }
 
-  /** Whether `provider` may be used in this channel, applying the backward-compat rule:
-   *  no rows at all → enabled; otherwise only an explicit enabled row counts. */
-  /** Whether this channel has ANY tool row — i.e. it is an explicit allowlist rather than the
-   *  backward-compat "all providers enabled" default. Callers about to write the FIRST row (which flips
-   *  the channel into allowlist mode, silently disabling every still-row-less provider) use this to
-   *  materialize the full desired allowlist instead of a single row. */
+  /** Whether this channel has ANY tool row. Under deny-by-default this no longer changes the
+   *  authorization verdict (row-less and all-off both deny) — it only tells a first-write caller that
+   *  no rows exist yet, so it can still materialize the full explicit-state allowlist in one write. */
   async isConfigured(teamId: string, channel: string, db: Db = this.db): Promise<boolean> {
     const row = (await db.get(
       `SELECT 1 AS x FROM channel_tool WHERE team_id=? AND channel=? LIMIT 1`,
@@ -168,9 +169,11 @@ export class ChannelTools {
     return !!row;
   }
 
+  /** Whether `provider` may be used in this channel. Deny-by-default: only an explicit `enabled` row
+   *  counts; no rows → disabled, an unlisted or explicit-off provider → disabled. */
   async isEnabled(teamId: string, channel: string, provider: string, db: Db = this.db): Promise<boolean> {
     const configured = await this.isConfigured(teamId, channel, db);
-    if (!configured) return true; // no rows for this channel → all providers enabled (backward compat)
+    if (!configured) return false; // deny-by-default: no rows for this channel → nothing enabled
     const row = (await db.get(
       `SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?`,
       [teamId, channel, provider],
@@ -219,50 +222,50 @@ export async function configureChannelTools(input: {
   authorize: () => Promise<boolean>;
   assertEligible: () => Promise<void>;
   issuance: number;
-}): Promise<'configured' | 'denied' | 'stale'> {
+}): Promise<'configured' | 'unchanged' | 'denied' | 'stale'> {
   if (!(await input.authorize())) return 'denied';
   await input.assertEligible();
   const owner = channelOwner(input.identity.teamId, input.channel);
+  let noRealChange = false;
   const result = await input.vault.withCredentialLocks(
     input.changes.map(([provider]) => ({ owner, provider })),
     async (_locked, tx) => {
       return withUserInteractionFence(tx, input.identity, input.issuance, async (fencedTx) => {
-        // Compare effective authorization before materializing/upserting. An unconfigured channel is
-        // already all-enabled, so its first explicit `enabled=true` write is not an authority change
-        // and must not revoke live grants. The credential locks serialize same-provider writers; the
-        // snapshot, write, selective purge, and audit all remain in this one transaction.
+        // Compare effective authorization before materializing/upserting, then apply ONLY the changes
+        // that actually flip a provider's state. A repeated/stale Disable (or Enable) whose desired
+        // state already matches the effective one writes nothing and is not audited — no fabricated
+        // `config/tool` row, no materialization. Every applied change is by definition an authority
+        // change, so it always purges + audits. Locks serialize same-provider writers; the snapshot,
+        // write, purge, and audit all commit in this one transaction.
         const txTools = new ChannelTools(fencedTx);
-        const desired = new Map(input.changes);
         const effectiveBefore = new Map<string, boolean>();
-        for (const providerId of desired.keys()) {
+        for (const [providerId] of input.changes) {
           effectiveBefore.set(
             providerId,
-            await txTools.isEnabled(
-              input.identity.teamId,
-              input.channel,
-              providerId,
-              fencedTx,
-            ),
+            await txTools.isEnabled(input.identity.teamId, input.channel, providerId, fencedTx),
           );
+        }
+        // Dedup to the last-write-wins desired state, then drop entries that don't change anything.
+        const desired = new Map(input.changes);
+        const realChanges = [...desired].filter(([p, enabled]) => effectiveBefore.get(p) !== enabled);
+        if (realChanges.length === 0) {
+          noRealChange = true;
+          return;
         }
         await applyChannelToolsEnabled(
           txTools,
           input.identity.teamId,
           input.channel,
-          input.changes,
+          realChanges,
           input.allProviders,
           async (writeTx) => {
-            // applyEnabled commits the final last-write-wins map, never the intermediate duplicate
-            // tuples. Purge and audit that same state exactly once per provider.
-            for (const [providerId, enabled] of desired) {
-              if (effectiveBefore.get(providerId) !== enabled) {
-                await purgeChannelInteractionState(
-                  writeTx,
-                  input.identity.teamId,
-                  input.channel,
-                  providerId,
-                );
-              }
+            for (const [providerId, enabled] of realChanges) {
+              await purgeChannelInteractionState(
+                writeTx,
+                input.identity.teamId,
+                input.channel,
+                providerId,
+              );
               await input.audit.record('config', input.identity, providerId, {
                 owner: 'channel',
                 channel: input.channel,
@@ -274,5 +277,6 @@ export async function configureChannelTools(input: {
       });
     },
   );
-  return result.status === 'current' ? 'configured' : 'stale';
+  if (result.status !== 'current') return 'stale';
+  return noRealChange ? 'unchanged' : 'configured';
 }

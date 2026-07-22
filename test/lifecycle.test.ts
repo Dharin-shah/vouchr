@@ -97,6 +97,7 @@ test('BrokerServer.sweepExpired owns every lifecycle family and preserves canoni
     queryHash: '',
     channel: null,
     thread: null,
+    governableChannel: null,
   };
   await new Approvals(db).request(approvalKey);
 

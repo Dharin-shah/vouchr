@@ -69,7 +69,7 @@ test('audit: meta contents are never rendered in the Slack view', async (t) => {
 
 test('audit: a stored value cannot forge a mrkdwn link/mention (escaped in the view)', async (t) => {
   const { audit, run } = await harness(t);
-  // Mirrors the real vector: an unvalidated `/vouchr configure <arg>` denial writes attacker text
+  // Mirrors the real vector: an unvalidated `/vouchr connect-shared <arg>` denial writes attacker text
   // into the provider column. It must render inert, never as a live <…|link> or <@mention>.
   await audit.record('inject', id('U_A'), '<https://evil.com|Re-authorize Vouchr>', { host: 'x' });
   const json = JSON.stringify(await run('audit', 'U_A'));
@@ -85,7 +85,7 @@ test('audit: surfaces the non-caller actor (e.g. an approver) via the actor colu
 
 test('configure: an unknown (e.g. credential-shaped) provider is rejected before it is ever audited', async (t) => {
   const { audit, run } = await harness(t); // non-admin caller
-  const res = await run('configure ghp_looks_like_a_secret_0000', 'U_A');
+  const res = await run('connect-shared ghp_looks_like_a_secret_0000', 'U_A');
   assert.match(String(res), /Unknown provider/); // rejected before the admin gate / any record()
   // The bogus value must NOT have been written to the audit provider column (no reflection surface).
   const rows = await audit.listByOwnerUser(id('U_A'), 20);

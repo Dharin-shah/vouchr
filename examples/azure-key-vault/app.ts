@@ -6,7 +6,7 @@ import { azureKeyVault } from './resolver';
 //
 // An admin then runs, from inside the channel they want to configure:
 //
-//   /vouchr configure github
+//   /vouchr connect-shared github
 //
 // and pastes a reference into the private modal, e.g.
 //

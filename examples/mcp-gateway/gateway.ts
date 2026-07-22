@@ -163,7 +163,7 @@ app.event('app_mention', async ({ context, event, client }) => {
   });
   app.use(vouchr.middleware);
   vouchr.mountRoutes(receiver.router);
-  vouchr.registerCommands(app); // /vouchr status | disconnect | configure
+  vouchr.registerCommands(app); // /vouchr, status, tools, disconnect, and connect-shared
 
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.start(port);

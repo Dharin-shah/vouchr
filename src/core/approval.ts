@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { Audit, AuditMeta } from './audit';
-import { authorizeProvider, resolveCredentialOwner } from './authz';
+import {
+  authorizeProvider,
+  governanceChannelOf,
+  isGovernanceChannelScope,
+  resolveCredentialOwner,
+} from './authz';
 import { ChannelConfig } from './channelConfig';
 import {
   userInteractionIsCurrent,
@@ -186,6 +191,16 @@ export interface ApprovalKey {
   queryHash: string;
   channel: string | null;
   thread: string | null;
+  /**
+   * The mutable-GOVERNANCE scope of `channel` at request time (null in a personal conversation),
+   * captured when the classification (Slack `channel_type`) is known so the DECISION revalidation can
+   * classify a group DM (MPIM) whose id alone cannot be distinguished from a private channel. Stored
+   * on the row and compared as part of every authoritative request/grant lookup. It deliberately
+   * stays out of the rendered fingerprint: the raw channel is already bound there, while this scope
+   * is an authorization classification for that channel. Required at every call site so an adapter
+   * cannot silently lose the Slack `channel_type` fact before persistence.
+   */
+  governableChannel: string | null;
 }
 
 /** One pending request / unspent grant, as the approve/deny surface and the sweep read it. */
@@ -227,6 +242,14 @@ export interface CredentialUseValidationInput {
   channelTools?: ChannelTools | null;
   /** `undefined` = core/Bolt default store; `null` = historical per-user/no-mode semantics. */
   channelConfig?: ChannelConfig | null;
+  /**
+   * The mutable-governance scope for the tool-allowlist + mode re-check; null in a personal
+   * conversation so a retained handle / approval in a DM is not invalidated by deny-by-default.
+   * Static Policy still evaluates against `binding.channel` (the real delivery channel). Omitted →
+   * derived from `binding.channel` (governanceChannelOf), so a 1:1 DM is exempt even for a caller
+   * that carries no channel_type; the channel_type-aware adapters pass the exact value.
+   */
+  governableChannel?: string | null;
 }
 
 async function credentialUseStateForCurrentActor(
@@ -238,26 +261,32 @@ async function credentialUseStateForCurrentActor(
     return 'authorization';
   }
 
+  // Governance (tool allowlist + mode + owner resolution) is scoped to the mutable-governance channel
+  // — null in a DM so a personal retained handle survives; static Policy keeps the real delivery
+  // channel (row.channel) so a policy-deny of a DM still denies. Where non-null it equals row.channel.
+  const governableChannel = input.governableChannel !== undefined
+    ? input.governableChannel
+    : governanceChannelOf(row.channel);
   const channelTools = input.channelTools === undefined ? new ChannelTools(db) : input.channelTools ?? undefined;
-  if ((await authorizeProvider(input.policy, channelTools, principal, row.channel, row.provider, db)) !== null) {
+  if ((await authorizeProvider(input.policy, channelTools, principal, row.channel, governableChannel, row.provider, db)) !== null) {
     return 'authorization';
   }
 
   const channelConfig = input.channelConfig === undefined ? new ChannelConfig(db) : input.channelConfig;
-  const mode = row.channel && channelConfig
-    ? await channelConfig.getMode(row.teamId, row.channel, row.provider, db)
+  const mode = governableChannel && channelConfig
+    ? await channelConfig.getMode(row.teamId, governableChannel, row.provider, db)
     : null;
   let resolved: ReturnType<typeof resolveCredentialOwner>;
   if (mode === 'shared') {
     resolved = resolveCredentialOwner({
-      path: 'channel', mode, principal, channel: row.channel, eligible: row.channel !== null,
+      path: 'channel', mode, principal, channel: governableChannel, eligible: governableChannel !== null,
     });
   } else {
-    const sessionCredentialId = mode === 'session' && row.channel && row.thread
-      ? await new SessionGrants(db).grantedCredentialId(principal, row.channel, row.thread, row.provider)
+    const sessionCredentialId = mode === 'session' && governableChannel && row.thread
+      ? await new SessionGrants(db).grantedCredentialId(principal, governableChannel, row.thread, row.provider)
       : null;
     resolved = resolveCredentialOwner({
-      path: 'user', mode, principal, channel: row.channel, thread: row.thread,
+      path: 'user', mode, principal, channel: governableChannel, thread: row.thread,
       hasSessionGrant: sessionCredentialId === row.credentialId,
     });
   }
@@ -342,6 +371,9 @@ export async function approvalOwnerStillCurrent(input: {
     actorIssuedAt: input.actorIssuedAt,
     channelTools: input.channelTools,
     channelConfig: input.channelConfig,
+    // Use the governance scope PERSISTED with the row, so the decision revalidation classifies a
+    // group DM (MPIM) that its id alone cannot — instead of re-deriving it (and wrongly governing it).
+    governableChannel: input.row.governableChannel,
   });
 }
 
@@ -363,6 +395,14 @@ export function approvalDecisionLockOwners(
 }
 
 function toRow(r: any): ApprovalRow {
+  const channel = r.channel || null;
+  if (typeof r.governable_channel !== 'string') {
+    throw new Error('approval row has no governance scope');
+  }
+  const governableChannel = r.governable_channel === '' ? null : r.governable_channel;
+  if (!isGovernanceChannelScope(channel, governableChannel)) {
+    throw new Error('approval row has an invalid governance scope');
+  }
   return {
     id: r.id,
     teamId: r.team_id,
@@ -376,8 +416,9 @@ function toRow(r: any): ApprovalRow {
     host: r.host,
     path: r.path,
     queryHash: r.query_hash ?? '',
-    channel: r.channel || null,
+    channel,
     thread: r.thread || null,
+    governableChannel,
     status: r.status,
     approvedBy: r.approved_by ?? null,
     createdAt: r.created_at,
@@ -394,6 +435,20 @@ function toRow(r: any): ApprovalRow {
  */
 export class Approvals {
   constructor(private db: Db) {}
+
+  /** Normalize and validate the authorization-affecting scope at the persistence boundary. Empty
+   * string is the explicit personal-conversation encoding; the schema is NOT NULL so it can never
+   * be confused with an older/unclassified row. A non-null scope must be the delivery channel. */
+  private governanceParam(k: ApprovalKey): string {
+    const scope = k.governableChannel;
+    if (scope === undefined) {
+      throw new Error('approval request has no governance scope');
+    }
+    if (!isGovernanceChannelScope(k.channel, scope)) {
+      throw new Error('approval request has an invalid governance scope');
+    }
+    return scope ?? '';
+  }
 
   /** Re-resolve the database-backed authority for a row through the canonical approval validator.
    * The recovery bridge has an Approvals instance but deliberately has no raw Db handle; keeping
@@ -422,6 +477,7 @@ export class Approvals {
       k.queryHash,
       k.channel ?? '',
       k.thread ?? '',
+      this.governanceParam(k),
     ];
   }
 
@@ -450,11 +506,12 @@ export class Approvals {
       const row = await db.get<{ id: string }>(
         `INSERT INTO approval_request
            (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, query_hash,
-            channel, thread, status, approved_by, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
+            channel, thread, governable_channel, status, approved_by, created_at, expires_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
+           governable_channel=excluded.governable_channel,
            delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL,
            delivery_audience=NULL
          WHERE approval_request.team_id=excluded.team_id
@@ -480,6 +537,7 @@ export class Approvals {
          WHERE action_key=?
            AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
            AND method=? AND origin=? AND host=? AND path=? AND query_hash=? AND channel=? AND thread=?
+           AND governable_channel=?
            AND expires_at>${POSTGRES_NOW_MS_SQL}`,
         [actionKey, ...params],
       );
@@ -699,7 +757,8 @@ export class Approvals {
       `SELECT id, created_at FROM approval_request
         WHERE action_key=?
           AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=? AND method=? AND origin=? AND host=? AND path=? AND query_hash=?
-          AND channel=? AND thread=? AND status='granted' AND expires_at>${POSTGRES_NOW_MS_SQL}
+          AND channel=? AND thread=? AND governable_channel=?
+          AND status='granted' AND expires_at>${POSTGRES_NOW_MS_SQL}
         LIMIT 1`,
       [approvalActionKey(k), ...this.keyParams(k)],
     );

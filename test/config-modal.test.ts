@@ -27,6 +27,7 @@ async function harness(t: TestContext, opts: {
   policy?: Policy;
   db?: Db;
   usersInfo?: () => Promise<unknown>;
+  conversationsInfo?: (args: { channel: string }) => Promise<unknown>;
   updateThrows?: boolean;
   dmThrows?: boolean;
 } = {}) {
@@ -46,7 +47,10 @@ async function harness(t: TestContext, opts: {
   const dms: string[] = [];
   const client = {
     users: { info: opts.usersInfo ?? (async () => ({ user: { is_admin: slackAdmin } })) },
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_OTHER' } }) },
+    conversations: {
+      info: opts.conversationsInfo
+        ?? (async ({ channel }: { channel: string }) => ({ channel: { id: channel, is_channel: true, creator: 'U_OTHER' } })),
+    },
     views: {
       open: async (a: any) => (opened = a),
       update: async (a: any) => {
@@ -64,7 +68,7 @@ async function harness(t: TestContext, opts: {
   return {
     lan, client, dms,
     /** Run no-arg `/vouchr`, return the opened modal view (with its real private_metadata). */
-    openModal: async () => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
+    openModal: async (channelId = 'C_FIN') => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: channelId, trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
     runCommand: (text: string, respond?: any) => command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text }, ack: async () => {}, respond: respond ?? (async () => {}), client }),
     submit: (state: any, ack: any, privateMetadata: string = defaultMeta, viewId?: string) => {
       const view = {
@@ -110,6 +114,86 @@ test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable cont
   assert.ok(view.blocks.some((b: any) => b.block_id === 'tool:mcp'));
   assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('preview:')));
   assert.equal(Object.hasOwn(JSON.parse(view.private_metadata).open[0], 'v'), false);
+});
+
+test('no-arg /vouchr in a DM shows personal tools without channel-admin controls', async (t) => {
+  let conversationReads = 0;
+  const h = await harness(t, {
+    slackAdmin: true,
+    conversationsInfo: async () => {
+      conversationReads++;
+      throw new Error('a D-prefixed DM must not need classification');
+    },
+  });
+
+  const view = await h.openModal('D_PERSONAL');
+  assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
+  assert.equal(view.submit, undefined);
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('tool:')));
+  assert.equal(conversationReads, 0);
+});
+
+test('no-arg /vouchr resolves a G-prefixed MPIM and suppresses channel governance', async (t) => {
+  let conversationReads = 0;
+  const h = await harness(t, {
+    slackAdmin: true,
+    conversationsInfo: async ({ channel }) => {
+      conversationReads++;
+      return { channel: { id: channel, is_mpim: true } };
+    },
+  });
+
+  const view = await h.openModal('G_MPIM');
+  assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
+  assert.equal(view.submit, undefined);
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('tool:')));
+  assert.equal(conversationReads, 1);
+});
+
+test('G-prefixed modal classification overlaps the independent connection read', async (t) => {
+  const base = await openTestDb(t);
+  let connectionReadStarted!: () => void;
+  const connectionRead = new Promise<void>((resolve) => { connectionReadStarted = resolve; });
+  const db: Db = {
+    get: (sql, params) => base.get(sql, params),
+    all: async (sql, params) => {
+      connectionReadStarted();
+      return base.all(sql, params);
+    },
+    run: (sql, params) => base.run(sql, params),
+    exec: (sql) => base.exec(sql),
+    close: () => base.close(),
+  };
+  const h = await harness(t, {
+    db,
+    conversationsInfo: async ({ channel }) => {
+      await connectionRead;
+      return { channel: { id: channel, is_mpim: true } };
+    },
+  });
+
+  const view = await h.openModal('G_CONCURRENT');
+  assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
+});
+
+test('a non-settling G-prefix classification is bounded and fails closed as governed', async (t) => {
+  const h = await harness(t, {
+    conversationsInfo: () => new Promise(() => undefined),
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const view = await Promise.race([
+      h.openModal('G_UNRESPONSIVE'),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('config-modal classification was not bounded')), 5_000);
+      }),
+    ]);
+    assert.match(JSON.stringify(view.blocks), /\*mcp\*: disabled/);
+  } finally {
+    if (deadline) clearTimeout(deadline);
+  }
 });
 
 test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', async (t) => {
@@ -224,7 +308,7 @@ test('an admin offboarded during modal verification cannot change mode or tools'
   assert.equal(await modeRow(h.lan.db), null);
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false);
   assert.deepEqual(await auditActions(h.lan.db), []);
-  assert.match(h.dms[0], /2 settings could not be confirmed/);
+  assert.match(h.dms[0], /1 setting could not be confirmed/); // the tool is already deny-by-default → the disable is a no-op; only the mode change is attempted (and blocked)
   assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
@@ -327,17 +411,18 @@ test('forged invalid mode value is ignored server-side, never persisted', async 
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
-// Finding 1: disabling ONE provider on an unconfigured channel must not silently disable the others.
-test('disabling one provider materializes the full allowlist; the others stay enabled', async (t) => {
+// Finding 1: enabling ONE provider on an unconfigured (deny-by-default) channel must not silently
+// enable the others when the first write materializes the full allowlist.
+test('enabling one provider materializes the full allowlist; the others stay disabled', async (t) => {
   const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
   const view = await h.openModal();
-  const pm = view.private_metadata; // real open-time state (all enabled, unconfigured)
-  await h.submit({ 'tool:a': unchecked(), 'tool:b': checked(), 'tool:c': checked() }, async () => {}, pm);
+  const pm = view.private_metadata; // real open-time state (all disabled, unconfigured)
+  await h.submit({ 'tool:a': unchecked(), 'tool:b': checked(), 'tool:c': unchecked() }, async () => {}, pm);
   const tools = new ChannelTools(h.lan.db);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // the one the admin unchecked
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // NOT silently disabled
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), true);
-  assert.deepEqual(await auditActions(h.lan.db), ['config']); // only the real change (a) audited
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // untouched → stays disabled
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // the one the admin enabled
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), false); // NOT silently enabled by materialization
+  assert.deepEqual(await auditActions(h.lan.db), ['config']); // only the real change (b) audited
 });
 
 // Finding 2: a stale save (untouched select re-submitting its open value) must not revert a change
@@ -357,14 +442,14 @@ test('untouched mode select does not revert a concurrent change or delete the sh
   assert.ok(await h.lan.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp')); // cred survived
 });
 
-// Finding 3: a policy-denied provider must not be spuriously disabled by an untouched save. The admin
-// checkbox reflects the ALLOWLIST bit (enabled), not the policy-intersected manifest, so an untouched
-// save is a true no-op.
+// Finding 3: a policy-denied provider must not be spuriously written by an untouched save. The admin
+// checkbox reflects the ALLOWLIST bit (deny-by-default here → unchecked), not the policy-intersected
+// manifest, so re-submitting the open value is a true no-op.
 test('untouched save with a policy-denied provider writes no channel_tool row', async (t) => {
   const h = await harness(t, { slackAdmin: true, policy: new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } }) }); // denies mcp in C_FIN
   const view = await h.openModal();
   const pm = view.private_metadata;
-  await h.submit({ 'tool:mcp': checked() }, async () => {}, pm); // checkbox untouched (allowlist-enabled)
+  await h.submit({ 'tool:mcp': unchecked() }, async () => {}, pm); // checkbox untouched (allowlist-disabled by default)
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false); // no allowlist row written
   assert.deepEqual(await auditActions(h.lan.db), []);
 });

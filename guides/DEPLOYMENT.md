@@ -105,11 +105,9 @@ user and shared-channel writes during confirmed break-glass revocation. Treat th
 cutover, not a mixed-version rolling upgrade. Schema v11 adds one active OAuth generation per
 workspace/user/provider, callback consumption/supersession state, cross-replica Slack delivery
 leases, and the partial unique active-generation index. Schema v12 extends cross-replica delivery
-leases to static-key setup and binds approval delivery to the current approver class and exact
-recipient set. Every pre-v11 consent row is deleted fail-closed because it cannot prove the v11
-generation and delivery invariants. A v11→v12 migration preserves v11 OAuth state and pending exact
-actions, but clears the old global approval-delivery marker so current eligible recipients get a
-truthful surface.
+leases to static-key setup, binds approval delivery to the current approver class and exact
+recipient set, and binds every approval to its exact mutable-governance scope. Every pre-v11 consent
+row is deleted fail-closed because it cannot prove the v11 generation and delivery invariants.
 
 1. Back up PostgreSQL and verify that the backup can be restored.
 2. Quiesce Slack and broker traffic **including identity-assertion minting**, drain in-flight
@@ -135,8 +133,6 @@ truthful surface.
    v8-v10 markers, v12 then drains old OAuth state and installs the consumption, supersession,
    delivery-lease, and active-generation constraints atomically with the version stamp. From every
    accepted pre-v12 marker, it adds key-prompt delivery leases and audience-bound approval delivery.
-   The v11→v12 carry preserves v11 OAuth generations and pending key/approval actions, while clearing
-   only approval delivery state that cannot identify its recipient audience.
 5. Start only v12 replicas, confirm readiness, and restore traffic and assertion minting. Users
    coming from v8 make fresh
    decisions; setup buttons rendered by v8 or prerelease v9 are rejected with fixed
@@ -238,7 +234,7 @@ const receiver = new ExpressReceiver({
   clientId: process.env.SLACK_CLIENT_ID!,
   clientSecret: process.env.SLACK_CLIENT_SECRET!,
   stateSecret: process.env.SLACK_STATE_SECRET!,
-  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read', 'mpim:read'],
   installationStore: store,
 });
 const app = new App({ receiver });
@@ -278,7 +274,7 @@ const vouchr = await createVouchr({
 });
 ```
 
-An admin then runs `/vouchr configure github` and pastes an ARN into the private modal. Full setup,
+An admin then runs `/vouchr connect-shared github` and pastes an ARN into the private modal. Full setup,
 auth (ambient IAM role, no static creds), and the least-privilege policy
 (`secretsmanager:GetSecretValue` scoped to the specific ARNs, `kms:Decrypt` if the secret uses a CMK)
 are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manager/README.md).
@@ -480,10 +476,10 @@ therefore write the same rows that `GET /v1/admin/config`, `POST /v1/manifest`, 
 `/v1/mcp` read and enforce. Team, channel, and admin authority come only from the signed identity
 assertion; same-named request-body fields have no authority.
 
-A channel with no `channel_tool` rows remains backward-compatible: every registered provider is
-enabled. The first admin mutation atomically materializes the full provider list before applying the
-requested changes, so toggling one provider cannot silently disable its bystanders, including under
-concurrent first writes. The materialization, final changes, and canonical config audit rows commit
+A channel with no `channel_tool` rows enables no provider (deny-by-default); an admin opts each one in
+per channel before its first use. The first admin mutation atomically materializes the full provider
+list before applying the requested changes, so toggling one provider cannot silently change its
+bystanders, including under concurrent first writes. The materialization, final changes, and canonical config audit rows commit
 as one transaction. A disabled brokered provider is refused before credential resolution or upstream
 I/O. Service tools carry the same stored and rendered Enable/Disable bit, but Vouchr never
 executes their service-authenticated egress; the trusted host must enforce a disabled service row.
@@ -796,7 +792,8 @@ distinguish an intentional lockdown from a mistaken rollout.
 
 Static `Policy` does not replace `ChannelTools`. Policy is operator-owned deployment configuration;
 `ChannelTools` is the PostgreSQL-backed, runtime-mutable allowlist changed through Slack or
-`POST /v1/admin/tools` (with the backward-compatible “no rows means enabled” default). The broker
+`POST /v1/admin/tools` (deny-by-default: with no rows no provider is enabled until an admin opts it
+in). The broker
 applies their intersection: the static policy **and** the mutable channel setting must both allow a
 provider. Use policy for reviewed deployment boundaries and `ChannelTools` for day-to-day admin
 enablement; neither can override a denial by the other.
@@ -1088,17 +1085,17 @@ must repeat representative load with the real configured KMS and exact container
 Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)
 (api.slack.com/apps → From a manifest), replacing `YOUR_PUBLIC_URL`. The manifest sets:
 
-- **Bot scopes:** `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`;
+- **Bot scopes:** `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`, `mpim:read`;
   additionally `app_mentions:read` when this app receives the agent's mentions.
 - **Events:** `app_home_opened`, `user_change` (the latter drives auto-revoke on deactivation);
   additionally `app_mention` when this app is also the agent.
-- **Interactivity:** enabled, and **required** for the Connect button and the key/configure modals.
+- **Interactivity:** enabled, and **required** for the Connect button and the key/connect-shared modals.
 - **Slash command:** bare `/vouchr` opens the settings modal (with a truthful status fallback if
   Slack cannot open it); `/vouchr help` is the canonical current command list. It includes personal
-  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and admin `configure <provider>`,
-  `mode <provider> <shared|per-user|session>`, `enable`/`disable <provider>`, `stats`, and
-  `audit channel`.
-- **Who may configure:** by default the `configure`/`mode`/`enable`/`disable` commands are
+  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and admin
+  `connect-shared`/`disconnect-shared <provider>`, `mode <provider> <shared|per-user|session>`,
+  `enable`/`disable <provider>`, `stats`, and `audit channel`.
+- **Who may configure:** by default the `connect-shared`/`disconnect-shared`/`mode`/`enable`/`disable` commands are
   **workspace-admin-only**. Set `allowChannelCreatorConfig: true` to also let a channel's **creator**
   self-serve their own channel's config (off by default — in Slack anyone can create a public channel,
   so `creator` isn't a privileged role). A custom `isAdmin` still fully overrides either default.
@@ -1108,7 +1105,7 @@ Wire the four hooks (see the README example):
 ```ts
 app.use(vouchr.middleware);
 vouchr.mountRoutes(receiver.router);  // OAuth callback at $baseUrl/vouchr/oauth/callback
-vouchr.registerCommands(app);         // /vouchr + the modals (mandatory for key/configure flows)
+vouchr.registerCommands(app);         // /vouchr + the modals (mandatory for key/connect-shared flows)
 vouchr.registerOffboarding(app);      // user_change → revoke a deactivated user's connections
 setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 ```

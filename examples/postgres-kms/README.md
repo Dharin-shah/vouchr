@@ -27,7 +27,7 @@ const receiver = new ExpressReceiver({
   clientId: process.env.SLACK_CLIENT_ID!,
   clientSecret: process.env.SLACK_CLIENT_SECRET!,
   stateSecret: process.env.SLACK_STATE_SECRET!,
-  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read', 'mpim:read'],
   installationStore, // Bolt persists every workspace installation through the envelope-backed store
 });
 const vouchr = await createVouchr({

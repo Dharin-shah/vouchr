@@ -9,7 +9,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
 import { ChannelConfig } from '../src/core/channelConfig';
-import { ChannelTools } from '../src/core/tools';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
@@ -67,6 +67,10 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
   await db.run(
     `UPDATE connection SET generation_at = generation_at - 3600000 WHERE team_id='T1' AND owner_id='U1' AND provider='acme'`,
   );
+  // Deny-by-default: opt the registered providers into channel C1 (the token's default channel),
+  // mirroring an admin having run `/vouchr enable`. Denial cases below drive their own state.
+  const channelTools = new ChannelTools(db);
+  for (const p of [acme, svc]) await setChannelToolEnabled(channelTools, 'T1', 'C1', p.id, true);
   const server = createBroker({
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),

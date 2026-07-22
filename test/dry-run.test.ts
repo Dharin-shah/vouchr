@@ -18,6 +18,7 @@ import { SessionGrants } from '../src/core/session';
 import { revokeConnection, selectRevocations } from '../src/core/offboard';
 import { EgressBlockedError } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { identityConfig, signIdentity } from './support/identity';
 import type { SlackIdentity } from '../src/core/identity';
 import type { Db } from '../src/core/db';
@@ -35,6 +36,12 @@ const seedDry = (v: Vault, id: SlackIdentity, provider: string, extra: Partial<S
 
 /** A no-op envelope provider: its mere PRESENCE (not any call) must make dry-run refuse at startup. */
 const fakeEnvelope = { wrapDataKey: async (d: Buffer) => d, unwrapDataKey: async (w: Buffer) => w };
+
+/** Deny-by-default: opt providers into channel C1 (team T1), exactly as an admin's `/vouchr enable`
+ *  would, so a governed test reaches consent instead of ToolDisabledError. Raw fixture write (no audit). */
+const enableC1 = async (db: Db, ...providerIds: string[]) => {
+  for (const id of providerIds) await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', id, true);
+};
 
 // Dummy client credentials: the whole point of dry-run is that no REAL OAuth app exists.
 const acme = () => defineProvider({
@@ -100,6 +107,7 @@ async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provide
     queryHash: '',
     channel: null,
     thread: null,
+    governableChannel: null,
   };
   await new Approvals(db).request(approvalKey);
 
@@ -205,6 +213,7 @@ test('dry-run: connect prompt → completeConsent → real gates → synthetic e
   const restore = banNetwork();
   try {
     const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'acme');
     const { ctx, posts } = await boltContext(vouchr);
 
     // The REAL consent machinery posts the prompt; only the authorize URL is replaced by the local
@@ -289,6 +298,7 @@ test('dry-run: the echo never contains the stored token, and honors a custom inj
       inject: (h, s) => h.set('x-api-key', s),
     });
     const vouchr = await createVouchr({ providers: [custom], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'custom');
     // Seed directly through the synthetic provenance column, to make the secret's value known.
     await seedDry(vouchr.vault, ID, 'custom', { accessToken: KNOWN });
 
@@ -313,10 +323,12 @@ test('dry-run: egress and policy denials are exactly the production error class 
     const policy = () => new Policy({ denied: { defaultAllow: false } });
 
     const prod = await createVouchr({ providers: [acme(), denied()], baseUrl: 'https://app.test', db: await openTestDb(t), policy: policy() });
+    await enableC1(prod.db, 'acme', 'denied');
     await prod.vault.upsert(userOwner(ID), 'acme', FRESH);
     const { ctx: prodCtx } = await boltContext(prod);
 
     const dry = await createVouchr({ providers: [acme(), denied()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true, policy: policy() });
+    await enableC1(dry.db, 'acme', 'denied');
     await seedDry(dry.vault, ID, 'acme');
     const { ctx: dryCtx } = await boltContext(dry);
 
@@ -390,6 +402,7 @@ test('dry-run: a non-boolean flag fails closed at construction (SEC-4)', async (
 
 test('dry-run: absent flag → zero behavior change (real authorize URL, real fetch, no markers)', async (t) => {
   const prod = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t) });
+  await enableC1(prod.db, 'acme');
   assert.equal(prod.dryRun, undefined); // no dry-run surface
 
   const { ctx, posts } = await boltContext(prod);
@@ -427,6 +440,7 @@ test('dry-run: a near-expiry credential with a refresh token never hits the toke
   }) as any;
   try {
     const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'acme');
     // A synthetic row INSIDE the 30s refresh window WITH a refresh token — production would POST /token
     // here before the outbound call (acme is refresh:'rotating', so it would also consume the token).
     await seedDry(vouchr.vault, ID, 'acme', { accessToken: 'synthetic-token', refreshToken: 'r1', expiresAt: Date.now() + 10_000 });
@@ -481,6 +495,7 @@ test('dry-run: a real row written AFTER boot is refused per-request, never injec
     // adversarial case): the per-request rail must key off the trusted dry_run COLUMN (dry_run=0 →
     // refuse), never the forgeable label — a label-based rail would inject this real token.
     const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'acme');
     await vouchr.vault.upsert(userOwner(ID), 'acme', { ...FRESH, accessToken: 'real', externalAccount: 'dry-run' });
     assert.equal((await vouchr.vault.get(userOwner(ID), 'acme'))?.dryRun, false); // real despite the label
     const { ctx } = await boltContext(vouchr);
@@ -559,6 +574,7 @@ test('dry-run: provider response constraints never false-deny the synthetic echo
       egressResponse: { allowContentTypes: ['text/csv'], maxBytes: 16 },
     });
     const vouchr = await createVouchr({ providers: [csv], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'csv');
     await seedDry(vouchr.vault, ID, 'csv');
     const { ctx } = await boltContext(vouchr);
     const res = await (await ctx.connect('csv')).fetch('https://api.acme.example/report');
@@ -676,6 +692,7 @@ test('P1-B: a concurrent real write is never clobbered by a synthetic consent (a
     // dry_run=1 row), so across EVERY interleaving the real row survives. Race the two writes on a
     // SHARED db handle (a sibling "production process") through a barrier, many times.
     const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'acme');
     const sibling = new Vault(vouchr.db, MASTER); // same db handle = same store, like another process
 
     for (let i = 0; i < 12; i++) {
@@ -713,6 +730,7 @@ test('P2-C: the provider inject hook runs exactly once, with a redacted placehol
       inject: (h, secret) => { seen.push(secret); h.set('x-api-key', secret); },
     });
     const vouchr = await createVouchr({ providers: [counting], baseUrl: 'https://app.test', db: await openTestDb(t), dryRun: true });
+    await enableC1(vouchr.db, 'ct');
     await seedDry(vouchr.vault, ID, 'ct', { accessToken: 'synthetic-secret' });
     const { ctx } = await boltContext(vouchr);
     const res = await (await ctx.connect('ct')).fetch('https://api.acme.example/x');

@@ -27,7 +27,7 @@ import {
 } from '../src/adapters/bolt';
 import { APPROVE_SESSION_ACTION } from '../src/adapters/blocks';
 import { openDb, type Db } from '../src/core/db';
-import { ChannelTools, configureChannelTools } from '../src/core/tools';
+import { ChannelTools, configureChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { setChannelCredentialMode } from '../src/core/channelCredential';
 import { Approvals } from '../src/core/approval';
 import {
@@ -217,6 +217,8 @@ async function setup(t: TestContext, ghMode: 'session' | 'per-user' | 'shared' =
   const sessions = new SessionGrants(db);
   const channelConfig = new ChannelConfig(db);
   await writeChannelMode(channelConfig, 'T1', 'C1', 'gh', ghMode);
+  // Deny-by-default: opt gh into the channel these tests exercise (as an admin `/vouchr enable` would).
+  await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'gh', true);
   const posted: any[] = [];
   const client = { chat: { postEphemeral: async (p: any) => { posted.push(p); return {}; } } } as any;
   const make = (thread: string | null, channel: string | null = 'C1') =>
@@ -268,6 +270,11 @@ async function sessionHarness(t: TestContext, o: {
       postMessage: async (payload: any) => { dms.push(payload); return {}; },
     },
   } as any;
+  // Deny-by-default: opt the registered providers into C1 (as an admin `/vouchr enable` would). Tests
+  // that assert a denial set their own session/shared state on top of this.
+  for (const p of providers) {
+    await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', p.id, true);
+  }
   if (providers.some((p) => p.id === 'gh')) {
     await writeChannelMode(new ChannelConfig(db), 'T1', 'C1', 'gh', 'session');
     if (o.credential !== false) {
@@ -1360,7 +1367,7 @@ test('delete-in-progress fences both session and approval request recreation acr
   const approvalRequest = new Approvals(requestDb).requestAudited({
     teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1', credentialId,
     provider: 'gh', method: 'POST', origin: 'https://api.test', host: 'api.test', path: '/x', queryHash: '',
-    channel: 'C1', thread: 'TH1',
+    channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   }, new Audit(requestDb), ID, requestVault, async () => true);
   void sessionRequest.catch(() => undefined);
   void approvalRequest.catch(() => undefined);

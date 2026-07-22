@@ -75,16 +75,17 @@ Provider OAuth callback: https://CONTROL_HOST/vouchr/oauth/callback
 
 Required for Vouchr's control surface:
 
-- bot scopes: `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`;
+- bot scopes: `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`, `mpim:read`;
 - events: `app_home_opened` and `user_change`;
 - App Home enabled;
 - interactivity enabled; and
 - the `/vouchr` slash command.
 
 Add `app_mentions:read` and the `app_mention` event only when the same Slack app is also the agent.
-`channels:read` and `groups:read` are security inputs: they let Vouchr verify channel type, creator,
-membership, and shared-credential eligibility. Invite the app to private channels it must govern;
-when Slack will not reveal a channel, shared access fails closed.
+`channels:read`, `groups:read`, and `mpim:read` are security inputs: they let Vouchr verify channel
+type, creator, membership, and shared-credential eligibility, and distinguish an MPIM from a
+governed `G…` private channel. Invite the app to private channels it must govern; when Slack will
+not reveal a conversation, access fails closed.
 
 Provider OAuth and Slack app installation OAuth are different flows. Provider redirect URIs use
 `/vouchr/oauth/callback`. A multi-workspace Slack app separately uses Bolt's installer routes and a
@@ -229,7 +230,7 @@ const receiver = new ExpressReceiver({
   clientId: process.env.SLACK_CLIENT_ID!,
   clientSecret: process.env.SLACK_CLIENT_SECRET!,
   stateSecret: process.env.SLACK_STATE_SECRET!,
-  scopes: ['chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+  scopes: ['chat:write', 'commands', 'users:read', 'channels:read', 'groups:read', 'mpim:read'],
   installationStore: store,
 });
 const app = new App({ receiver });
@@ -395,13 +396,15 @@ Use a schema-owner role only for `vouchr migrate`; both runtimes use DML-only cr
 The trusted Slack service or a narrow internal gateway mints a fresh, single-use assertion for each
 broker request. Never let a model, untrusted MCP client, or generic worker supply `teamId`, `userId`,
 `channel`, `threadTs`, `isAdmin`, `enterpriseId`, `offboardTargetUserId`, `ownerKind`, or
-`channelEligible`.
+`channelEligible` — or `channelType`.
 
 ```ts
 import {
   channelIneligibleReason,
+  isSlackConversationType,
   loadIdentityConfig,
   mintIdentity,
+  type SlackConversationType,
 } from '@vouchr/core/headless';
 
 const identity = loadIdentityConfig(process.env);
@@ -410,6 +413,7 @@ type VerifiedSlackFacts = {
   teamId: string;
   userId: string;
   channel: string;
+  channelType: SlackConversationType;
   threadTs: string;
   enterpriseId?: string;
 };
@@ -432,10 +436,14 @@ async function mintForBrokerCall(
   if ([facts.teamId, facts.userId, facts.channel, facts.threadTs].some((v) => !v.trim())) {
     throw new Error('Verified Slack identity is incomplete.');
   }
+  if (!isSlackConversationType(facts.channelType)) {
+    throw new Error('Verified Slack conversation type is invalid.');
+  }
   const common = {
     teamId: facts.teamId,
     userId: facts.userId,
     channel: facts.channel,
+    channelType: facts.channelType,
     threadTs: facts.threadTs,
     ...(facts.enterpriseId ? { enterpriseId: facts.enterpriseId } : {}),
   };
@@ -462,11 +470,17 @@ async function mintForBrokerCall(
 }
 ```
 
-Bolt payload shapes vary by event and action. Normalize them once, immediately after Slack signature
-verification, and fail closed when a required fact is missing. `serverMode` above must be read from
-Vouchr's current server-side manifest/config, never accepted from the worker. For a channel-owned
-assertion, the signed `ownerKind: 'channel'` and `channelEligible: true` must agree with the request
-handle. The broker rejects disagreement.
+Bolt payload shapes vary by event and action. Normalize them once after Slack signature verification;
+when a command/action omits `channel_type`, resolve it with an authenticated
+`conversations.info` lookup in the trusted Slack service. Fail closed when a required fact is
+missing. Accept only Slack's closed vocabulary (`channel`, `group`, `im`, `mpim`, or `app_home`) through the
+exported `isSlackConversationType` guard and carry that trusted value in `channelType`; never infer
+it from a worker-supplied channel id. This is load-bearing for group DMs: an MPIM has a `G…` id that
+otherwise resembles a governed private channel, so the signed `mpim` fact keeps personal DM use
+outside mutable channel governance. `serverMode` above must be read from Vouchr's current
+server-side manifest/config, never accepted from the worker. For a channel-owned assertion, the
+signed `ownerKind: 'channel'` and `channelEligible: true` must agree with the request handle. The
+broker rejects disagreement.
 
 `channelEligible` proves the **channel class** only; it is not a signed membership claim. When
 `requireChannelMembership: true`, the Bolt `connect()` preflight below must also run for shared mode,
@@ -643,7 +657,7 @@ operator must still satisfy the Slack/admin predicate to use the built-in contro
    `allowChannelCreatorConfig` is enabled, users may see the channel picker first; controls appear
    only after selecting a channel they created, and other selections fail closed.
 3. The admin picks an internal public/private channel.
-4. Each brokered provider row shows mode, Enable/Disable, and Configure credential controls.
+4. Each brokered provider row shows mode, Enable/Disable, and Connect shared account controls.
 5. Mode and enablement changes persist immediately and the Home view refreshes.
 6. Errors and denials are private.
 
@@ -654,10 +668,12 @@ Enable/Disable bit is manifest metadata that the trusted host—not Vouchr—mus
 admin route persists that bit in the same table as Bolt, and admin config plus the channel manifest
 report it consistently; Vouchr's fetch/MCP routes still refuse service credentials outright.
 
-Enable/Disable is backward-compatible runtime state, not deny-by-default policy. A channel with no
-`channel_tool` rows treats all registered providers as enabled. Bolt's first toggle materializes the
-full current provider list so changing one provider does not change the others. Static `Policy` is
-the outer “only these channels” boundary; mutable tool state is the inner admin switch.
+Enable/Disable is deny-by-default channel policy. A channel with no `channel_tool` rows enables **no**
+provider; an admin opts each one in per channel (`/vouchr enable <provider>` or the App Home toggle)
+before its first use there, and untouched providers stay off. Direct messages are personal, not
+governed, so they never require an enable. Bolt's first toggle still materializes the full provider
+list so changing one provider does not change the others. Static `Policy` is the outer “only these
+channels” boundary; mutable tool state is the inner admin switch.
 
 The equivalent slash-command flow is:
 
@@ -665,7 +681,7 @@ The equivalent slash-command flow is:
 /vouchr tools
 /vouchr mode internal-mcp shared
 /vouchr enable internal-mcp
-/vouchr configure internal-mcp
+/vouchr connect-shared internal-mcp
 /vouchr audit channel
 /vouchr stats
 ```
@@ -674,7 +690,7 @@ Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-on
 can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
 prevention belong to the trusted host; Vouchr does not retain provider responses or publish a
 preview-visibility policy. The modal does not contain the shared-credential input; use App Home's
-Configure credential action or `/vouchr configure <provider>`.
+Connect shared account action or `/vouchr connect-shared <provider>`.
 
 ### Channel-member experience
 

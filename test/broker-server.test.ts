@@ -11,7 +11,7 @@ import { beginBrokerDrain, buildBrokerServer } from '../bin/broker-server';
 import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ChannelTools, configureChannelTools } from '../src/core/tools';
+import { ChannelTools, configureChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { userOwner } from '../src/core/owner';
 import { mintIdentity, loadIdentityConfig } from '../src/adapters/http/identity';
 
@@ -366,6 +366,10 @@ test('#236 packaged policy trusts the signed channel and denies before credentia
     source: 'aws-sm',
     secretRef: 'arn:aws:secretsmanager:eu-west-1:123456789012:secret:policy-test',
   });
+  // Deny-by-default channel governance: opt `internal` into the policy-allowed channel so the tool
+  // allowlist passes and the Policy verdict is what this test exercises. C_DENIED needs no opt-in —
+  // Policy denies it before the tool-allowlist check runs.
+  await setChannelToolEnabled(new ChannelTools(built.db), 'T1', 'C_ALLOWED', 'internal', true);
 
   const realFetch = globalThis.fetch;
   let upstreamCalls = 0;
@@ -499,8 +503,10 @@ test('#240 packaged broker shares and enforces channel governance across every d
     await built.db.exec(
       `ALTER TABLE audit ADD CONSTRAINT issue240_reject_config_audit CHECK (action <> 'config')`,
     );
+    // Deny-by-default: fetcher is already off, so a real ENABLE is the change that materializes,
+    // upserts, and audits — forcing the config audit insert (and thus the rollback) to run.
     const auditRejected = await requestJson(port, 'POST', '/v1/admin/tools', {
-      provider: 'fetcher', enabled: false, identityToken: adminToken(),
+      provider: 'fetcher', enabled: true, identityToken: adminToken(),
     });
     assert.equal(auditRejected.status, 500);
     assert.deepEqual(auditRejected.json, {
@@ -521,30 +527,39 @@ test('#240 packaged broker shares and enforces channel governance across every d
     assert.equal(rolledBackTools?.n, 0);
     assert.equal(rolledBackAudits?.n, 0);
     assert.equal(await storedTools.isConfigured('T1', 'C1'), false);
-    assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), true);
+    // Rolled back to the implicit deny-by-default state: the enable never persisted.
+    assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), false);
     await built.db.exec(`ALTER TABLE audit DROP CONSTRAINT issue240_reject_config_audit`);
 
     // Once the audit sink recovers, the same route commits the full allowlist and audit together.
-    const disabled = await requestJson(port, 'POST', '/v1/admin/tools', {
-      provider: 'fetcher',
-      enabled: false,
+    // Deny-by-default: an admin opts providers IN, so an ENABLE is the real change that writes + audits.
+    // Opting mcp-governed in materializes the explicit allowlist (fetcher stays off) in one transaction.
+    const enabled = await requestJson(port, 'POST', '/v1/admin/tools', {
+      provider: 'mcp-governed',
+      enabled: true,
       identityToken: adminToken(),
       // Forgeable body scope has no authority; only the signed T1/C1 claims may be written.
       teamId: 'TEVIL',
       channel: 'CEVIL',
       isAdmin: false,
     });
-    assert.equal(disabled.status, 200);
-    assert.equal(await storedTools.isEnabled('T1', 'C1', 'fetcher'), false);
+    assert.equal(enabled.status, 200);
+    assert.equal(await storedTools.isEnabled('T1', 'C1', 'mcp-governed'), true);
     assert.equal(await storedTools.isConfigured('TEVIL', 'CEVIL'), false);
     const committedAudit = await built.db.get<{ meta: string }>(
       `SELECT meta FROM audit
        WHERE team_id=? AND channel=? AND provider=? AND action='config' ORDER BY at DESC LIMIT 1`,
-      ['T1', 'C1', 'fetcher'],
+      ['T1', 'C1', 'mcp-governed'],
     );
     assert.deepEqual(JSON.parse(committedAudit?.meta ?? 'null'), {
-      owner: 'channel', channel: 'C1', tool: 'disabled',
+      owner: 'channel', channel: 'C1', tool: 'enabled',
     });
+    // Opt service-tool in too so its shared governance bit is visible in the doors below. fetcher is
+    // deliberately left denied-by-default, which the disabled-provider config/manifest/fetch checks use.
+    const serviceEnabled = await requestJson(port, 'POST', '/v1/admin/tools', {
+      provider: 'service-tool', enabled: true, identityToken: adminToken(),
+    });
+    assert.equal(serviceEnabled.status, 200);
 
     const config = await requestJson(
       port,
@@ -648,6 +663,8 @@ test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp en
     await new Vault(built.db, Buffer.from(KEY_B64, 'base64')).upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'internal', {
       accessToken: 'tok_mcp_secret', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
+    // Deny-by-default: opt the env-declared provider into the channel so governance permits the fetch.
+    await setChannelToolEnabled(new ChannelTools(built.db), 'T1', 'C1', 'internal', true);
     const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, idConfig());
     const body = JSON.stringify({
       handle: { provider: 'internal', owner: 'user' }, identityToken, path: '/mcp',

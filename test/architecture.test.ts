@@ -83,3 +83,53 @@ test('#241 Postgres+KMS template wires one envelope-backed installation store in
   assert.doesNotMatch(source, /new App\(\{\s*token:/, 'multi-workspace template must not bypass the installation store');
   assert.doesNotMatch(source, /KMS envelope provider is not configured/, 'production template must not ship a placeholder provider');
 });
+
+// #2/#5 doc-drift guard: two governance facts changed and the docs must not regress to the inverse.
+// (1) The `/vouchr configure` slash command was REMOVED (renamed to `connect-shared`), so it must not
+//     appear in user-facing docs or the Slack manifest (CHANGELOG records the rename and is exempt).
+// (2) Channels are deny-by-default; the ChannelTools contract doc must say so, not the old open-by-default.
+test('#5 docs do not regress to the removed `configure` command or the open-by-default default', () => {
+  const root = process.cwd();
+  const docFiles = [
+    'README.md', 'QUICKSTART.md',
+    'guides/HYBRID.md', 'guides/DEPLOYMENT.md', 'guides/HEADLESS.md',
+    'examples/slack-manifest.yml', 'examples/dry-run/README.md',
+    'examples/google-user/app.ts', 'examples/mcp-gateway/gateway.ts',
+  ];
+  const offenders: string[] = [];
+  for (const rel of docFiles) {
+    const text = readFileSync(join(root, rel), 'utf8');
+    // The removed slash command as an invocation (`vouchr configure`). Not "configure the channel",
+    // `configureModal`, or `HOME_CONFIGURE_ACTION` — those are not the command surface.
+    text.split('\n').forEach((line, i) => {
+      if (/\bvouchr\s+configure\b/i.test(line)) offenders.push(`${rel}:${i + 1} references the removed \`vouchr configure\` command`);
+    });
+  }
+  assert.deepEqual(offenders, [], `docs still reference the removed configure command:\n${offenders.join('\n')}`);
+
+  // Positive guard: the ChannelTools contract documents deny-by-default (the inverse of the old text).
+  const tools = readFileSync(join(root, 'src', 'core', 'tools.ts'), 'utf8');
+  assert.match(tools, /deny-by-default/i, 'ChannelTools JSDoc must document deny-by-default');
+  assert.doesNotMatch(
+    tools,
+    /rowless[^.]*enable[sd]?\s+every\s+provider|treats\s+every\s+provider\s+as\s+enabled/i,
+    'ChannelTools JSDoc must not state the old open-by-default behavior',
+  );
+});
+
+test('shipped Slack installations can classify group DMs securely', () => {
+  for (const rel of [
+    'examples/slack-manifest.yml',
+    'examples/postgres-kms/app.ts',
+    'examples/postgres-kms/README.md',
+    'guides/HYBRID.md',
+    'guides/DEPLOYMENT.md',
+  ]) {
+    const source = readFileSync(join(process.cwd(), rel), 'utf8');
+    assert.match(
+      source,
+      /\bmpim:read\b/,
+      `${rel} must grant mpim:read for authenticated MPIM classification`,
+    );
+  }
+});

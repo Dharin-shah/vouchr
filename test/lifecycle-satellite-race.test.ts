@@ -140,6 +140,7 @@ test('lifecycle stale snapshot cannot purge a reconnect generation or its fresh 
       queryHash: '',
       channel: 'C_APPROVAL',
       thread: 'TH_APPROVAL',
+      governableChannel: 'C_APPROVAL',
     };
     await new Approvals(writerDb).request(approvalKey);
 

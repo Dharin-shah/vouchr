@@ -8,6 +8,7 @@ import { refreshToken, TokenEndpointError } from './tokens';
 import { DryRunVaultError, dryRunEcho } from './dryRun';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
 import { safeEmit } from './safe-emit';
+import { governanceChannelOf } from './authz';
 import type { CredentialHealthHook } from './health';
 import {
   approvalActionFingerprint,
@@ -308,6 +309,11 @@ export class ConnectionHandle {
     // credential/mode/owner/policy/tool/session state before any authority is spent and again at
     // each provider send. Headless requests construct a fresh handle after resolving those facts.
     private useStillValid?: () => Promise<boolean>,
+    // The mutable-governance scope of originChannel (null in a personal conversation), captured while
+    // the Slack channel_type is known so a persisted approval can classify a group DM (MPIM) that its
+    // id alone cannot. Undefined ⇒ derive from originChannel by the id heuristic (the direct/test
+    // default). Only stored on the approval row; it never gates injection here.
+    private approvalGovernableChannel?: string | null,
   ) {
     if (!Number.isSafeInteger(fetchDeadlineMs) || fetchDeadlineMs <= 0 || fetchDeadlineMs > MAX_TIMER_MS) {
       throw new Error(`ConnectionHandle: fetchDeadlineMs must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
@@ -657,6 +663,11 @@ export class ConnectionHandle {
         method, origin: url.origin, host: url.hostname, path: url.pathname,
         queryHash: queryDigest(url.search),
         channel: this.auditChannel(), thread: this.thread,
+        // The governance scope stored for the DECISION revalidation. Prefer the channel_type-aware
+        // value the adapter passed; fall back to the id heuristic for a directly-constructed handle.
+        governableChannel: this.approvalGovernableChannel !== undefined
+          ? this.approvalGovernableChannel
+          : governanceChannelOf(this.auditChannel()),
       };
       const grant = await this.approvals.consumeAudited(
         key,

@@ -37,7 +37,7 @@ app.event('app_mention', async ({ context, event, client }) => {
   });
   app.use(vouchr.middleware);
   vouchr.mountRoutes(receiver.router);
-  vouchr.registerCommands(app); // /vouchr status | disconnect | configure
+  vouchr.registerCommands(app); // /vouchr, status, tools, disconnect, and connect-shared
   vouchr.registerOffboarding(app);
   setInterval(() => vouchr.sweepExpired(), 60 * 60 * 1000);
 
