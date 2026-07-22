@@ -52,7 +52,13 @@ export { github, google, gitlab, notion, databricks, defineProvider, ProviderReg
 export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy, RevokeTarget } from './core/providers';
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
-export { PolicyDeniedError, ToolDisabledError } from './core/authz';
+export {
+  PolicyDeniedError,
+  ToolDisabledError,
+  SLACK_CONVERSATION_TYPES,
+  isSlackConversationType,
+} from './core/authz';
+export type { SlackConversationType } from './core/authz';
 export type { SlackIdentity } from './core/identity';
 export {
   ConnectionHandle,

@@ -151,6 +151,47 @@ test('disconnectChannelShared truth table (#3): revoke / non-revocable / unregis
   assert.equal(revokedTokens.length, before); // no real upstream call for a dry-run row
 });
 
+test('disconnectChannelShared preserves its committed outcome when the revoke audit store fails', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const cfg = new ChannelConfig(db);
+  const owner = channelOwner('T1', 'C_AUDIT_FAIL');
+  await writeChannelMode(cfg, 'T1', 'C_AUDIT_FAIL', 'mcp', 'shared');
+  await vault.upsert(owner, 'mcp', {
+    accessToken: 'shared-audit-failure', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  const originalRecord = audit.record.bind(audit);
+  let attemptedMeta: unknown;
+  (audit as any).record = async (...args: Parameters<Audit['record']>) => {
+    if (args[0] === 'revoke') {
+      attemptedMeta = args[3];
+      throw new Error('post-commit audit unavailable');
+    }
+    return originalRecord(...args);
+  };
+
+  const outcome = await disconnectChannelShared({
+    vault,
+    audit,
+    channelConfig: cfg,
+    registry: new ProviderRegistry([provider]),
+    identity: ID,
+    channel: 'C_AUDIT_FAIL',
+    providerId: 'mcp',
+    issuance: await vault.userProvisioningIssuedAt(),
+  });
+
+  assert.deepEqual(outcome, { status: 'removed', ok: true, attempted: false, audited: false });
+  assert.equal(await vault.has(owner, 'mcp'), false);
+  assert.equal(await cfg.getMode('T1', 'C_AUDIT_FAIL', 'mcp'), 'per-user');
+  assert.deepEqual(attemptedMeta, {
+    owner: 'channel', channel: 'C_AUDIT_FAIL', ok: true, upstream: 'skipped',
+  });
+  assert.equal((await db.all(`SELECT 1 FROM audit WHERE action='revoke'`)).length, 0);
+});
+
 // The atomic rewrite (#1) must report the truthful outcome AND mutate nothing on a stale snapshot: a
 // shared mode with no stored credential is `missing` (still recovered to per-user, no revoke); a newer
 // credential generation or an offboarded actor is `stale` and leaves the credential + mode untouched.

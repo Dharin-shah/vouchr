@@ -94,6 +94,7 @@ test('#5 docs do not regress to the removed `configure` command or the open-by-d
     'README.md', 'QUICKSTART.md',
     'guides/HYBRID.md', 'guides/DEPLOYMENT.md', 'guides/HEADLESS.md',
     'examples/slack-manifest.yml', 'examples/dry-run/README.md',
+    'examples/google-user/app.ts', 'examples/mcp-gateway/gateway.ts',
   ];
   const offenders: string[] = [];
   for (const rel of docFiles) {
@@ -114,4 +115,21 @@ test('#5 docs do not regress to the removed `configure` command or the open-by-d
     /rowless[^.]*enable[sd]?\s+every\s+provider|treats\s+every\s+provider\s+as\s+enabled/i,
     'ChannelTools JSDoc must not state the old open-by-default behavior',
   );
+});
+
+test('shipped Slack installations can classify group DMs securely', () => {
+  for (const rel of [
+    'examples/slack-manifest.yml',
+    'examples/postgres-kms/app.ts',
+    'examples/postgres-kms/README.md',
+    'guides/HYBRID.md',
+    'guides/DEPLOYMENT.md',
+  ]) {
+    const source = readFileSync(join(process.cwd(), rel), 'utf8');
+    assert.match(
+      source,
+      /\bmpim:read\b/,
+      `${rel} must grant mpim:read for authenticated MPIM classification`,
+    );
+  }
 });

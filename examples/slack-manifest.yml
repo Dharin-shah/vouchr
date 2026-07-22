@@ -28,6 +28,7 @@ oauth_config:
       - users:read          # admin gate for channel creds + offboarding (user_change)
       - channels:read       # conversations.info: channel eligibility/creator checks (App Home + shared creds)
       - groups:read         # same, for private channels
+      - mpim:read           # conversations.info: distinguish group DMs from governed private channels
 settings:
   event_subscriptions:
     request_url: https://YOUR_PUBLIC_URL/slack/events

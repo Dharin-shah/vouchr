@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 import type { Audit, AuditMeta } from './audit';
-import { authorizeProvider, governanceChannelOf, resolveCredentialOwner } from './authz';
+import {
+  authorizeProvider,
+  governanceChannelOf,
+  isGovernanceChannelScope,
+  resolveCredentialOwner,
+} from './authz';
 import { ChannelConfig } from './channelConfig';
 import {
   userInteractionIsCurrent,
@@ -190,11 +195,12 @@ export interface ApprovalKey {
    * The mutable-GOVERNANCE scope of `channel` at request time (null in a personal conversation),
    * captured when the classification (Slack `channel_type`) is known so the DECISION revalidation can
    * classify a group DM (MPIM) whose id alone cannot be distinguished from a private channel. Stored
-   * on the row but deliberately NOT part of the action match key / fingerprint (approvalActionKey,
-   * keyParams) — it is functionally derived from `channel`, so it never affects which action a grant
-   * covers. Absent (undefined) at revalidation ⇒ fall back to governanceChannelOf(channel).
+   * on the row and compared as part of every authoritative request/grant lookup. It deliberately
+   * stays out of the rendered fingerprint: the raw channel is already bound there, while this scope
+   * is an authorization classification for that channel. Required at every call site so an adapter
+   * cannot silently lose the Slack `channel_type` fact before persistence.
    */
-  governableChannel?: string | null;
+  governableChannel: string | null;
 }
 
 /** One pending request / unspent grant, as the approve/deny surface and the sweep read it. */
@@ -389,6 +395,14 @@ export function approvalDecisionLockOwners(
 }
 
 function toRow(r: any): ApprovalRow {
+  const channel = r.channel || null;
+  if (typeof r.governable_channel !== 'string') {
+    throw new Error('approval row has no governance scope');
+  }
+  const governableChannel = r.governable_channel === '' ? null : r.governable_channel;
+  if (!isGovernanceChannelScope(channel, governableChannel)) {
+    throw new Error('approval row has an invalid governance scope');
+  }
   return {
     id: r.id,
     teamId: r.team_id,
@@ -402,9 +416,9 @@ function toRow(r: any): ApprovalRow {
     host: r.host,
     path: r.path,
     queryHash: r.query_hash ?? '',
-    channel: r.channel || null,
+    channel,
     thread: r.thread || null,
-    governableChannel: r.governable_channel ?? null,
+    governableChannel,
     status: r.status,
     approvedBy: r.approved_by ?? null,
     createdAt: r.created_at,
@@ -421,6 +435,20 @@ function toRow(r: any): ApprovalRow {
  */
 export class Approvals {
   constructor(private db: Db) {}
+
+  /** Normalize and validate the authorization-affecting scope at the persistence boundary. Empty
+   * string is the explicit personal-conversation encoding; the schema is NOT NULL so it can never
+   * be confused with an older/unclassified row. A non-null scope must be the delivery channel. */
+  private governanceParam(k: ApprovalKey): string {
+    const scope = k.governableChannel;
+    if (scope === undefined) {
+      throw new Error('approval request has no governance scope');
+    }
+    if (!isGovernanceChannelScope(k.channel, scope)) {
+      throw new Error('approval request has an invalid governance scope');
+    }
+    return scope ?? '';
+  }
 
   /** Re-resolve the database-backed authority for a row through the canonical approval validator.
    * The recovery bridge has an Approvals instance but deliberately has no raw Db handle; keeping
@@ -449,6 +477,7 @@ export class Approvals {
       k.queryHash,
       k.channel ?? '',
       k.thread ?? '',
+      this.governanceParam(k),
     ];
   }
 
@@ -500,7 +529,7 @@ export class Approvals {
            AND approval_request.thread=excluded.thread
            AND approval_request.expires_at<=${POSTGRES_NOW_MS_SQL}
          RETURNING id`,
-        [id, actionKey, ...params, k.governableChannel ?? null, PENDING_INTERACTION_TTL_MS],
+        [id, actionKey, ...params, PENDING_INTERACTION_TTL_MS],
       );
       if (row) return { id: row.id, created: true };
       const live = await db.get<{ id: string }>(
@@ -508,6 +537,7 @@ export class Approvals {
          WHERE action_key=?
            AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
            AND method=? AND origin=? AND host=? AND path=? AND query_hash=? AND channel=? AND thread=?
+           AND governable_channel=?
            AND expires_at>${POSTGRES_NOW_MS_SQL}`,
         [actionKey, ...params],
       );
@@ -727,7 +757,8 @@ export class Approvals {
       `SELECT id, created_at FROM approval_request
         WHERE action_key=?
           AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=? AND method=? AND origin=? AND host=? AND path=? AND query_hash=?
-          AND channel=? AND thread=? AND status='granted' AND expires_at>${POSTGRES_NOW_MS_SQL}
+          AND channel=? AND thread=? AND governable_channel=?
+          AND status='granted' AND expires_at>${POSTGRES_NOW_MS_SQL}
         LIMIT 1`,
       [approvalActionKey(k), ...this.keyParams(k)],
     );

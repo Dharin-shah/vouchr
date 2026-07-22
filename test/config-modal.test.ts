@@ -27,6 +27,7 @@ async function harness(t: TestContext, opts: {
   policy?: Policy;
   db?: Db;
   usersInfo?: () => Promise<unknown>;
+  conversationsInfo?: (args: { channel: string }) => Promise<unknown>;
   updateThrows?: boolean;
   dmThrows?: boolean;
 } = {}) {
@@ -46,7 +47,10 @@ async function harness(t: TestContext, opts: {
   const dms: string[] = [];
   const client = {
     users: { info: opts.usersInfo ?? (async () => ({ user: { is_admin: slackAdmin } })) },
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_OTHER' } }) },
+    conversations: {
+      info: opts.conversationsInfo
+        ?? (async ({ channel }: { channel: string }) => ({ channel: { id: channel, is_channel: true, creator: 'U_OTHER' } })),
+    },
     views: {
       open: async (a: any) => (opened = a),
       update: async (a: any) => {
@@ -64,7 +68,7 @@ async function harness(t: TestContext, opts: {
   return {
     lan, client, dms,
     /** Run no-arg `/vouchr`, return the opened modal view (with its real private_metadata). */
-    openModal: async () => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
+    openModal: async (channelId = 'C_FIN') => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: channelId, trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
     runCommand: (text: string, respond?: any) => command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text }, ack: async () => {}, respond: respond ?? (async () => {}), client }),
     submit: (state: any, ack: any, privateMetadata: string = defaultMeta, viewId?: string) => {
       const view = {
@@ -110,6 +114,86 @@ test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable cont
   assert.ok(view.blocks.some((b: any) => b.block_id === 'tool:mcp'));
   assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('preview:')));
   assert.equal(Object.hasOwn(JSON.parse(view.private_metadata).open[0], 'v'), false);
+});
+
+test('no-arg /vouchr in a DM shows personal tools without channel-admin controls', async (t) => {
+  let conversationReads = 0;
+  const h = await harness(t, {
+    slackAdmin: true,
+    conversationsInfo: async () => {
+      conversationReads++;
+      throw new Error('a D-prefixed DM must not need classification');
+    },
+  });
+
+  const view = await h.openModal('D_PERSONAL');
+  assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
+  assert.equal(view.submit, undefined);
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('tool:')));
+  assert.equal(conversationReads, 0);
+});
+
+test('no-arg /vouchr resolves a G-prefixed MPIM and suppresses channel governance', async (t) => {
+  let conversationReads = 0;
+  const h = await harness(t, {
+    slackAdmin: true,
+    conversationsInfo: async ({ channel }) => {
+      conversationReads++;
+      return { channel: { id: channel, is_mpim: true } };
+    },
+  });
+
+  const view = await h.openModal('G_MPIM');
+  assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
+  assert.equal(view.submit, undefined);
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('tool:')));
+  assert.equal(conversationReads, 1);
+});
+
+test('G-prefixed modal classification overlaps the independent connection read', async (t) => {
+  const base = await openTestDb(t);
+  let connectionReadStarted!: () => void;
+  const connectionRead = new Promise<void>((resolve) => { connectionReadStarted = resolve; });
+  const db: Db = {
+    get: (sql, params) => base.get(sql, params),
+    all: async (sql, params) => {
+      connectionReadStarted();
+      return base.all(sql, params);
+    },
+    run: (sql, params) => base.run(sql, params),
+    exec: (sql) => base.exec(sql),
+    close: () => base.close(),
+  };
+  const h = await harness(t, {
+    db,
+    conversationsInfo: async ({ channel }) => {
+      await connectionRead;
+      return { channel: { id: channel, is_mpim: true } };
+    },
+  });
+
+  const view = await h.openModal('G_CONCURRENT');
+  assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
+});
+
+test('a non-settling G-prefix classification is bounded and fails closed as governed', async (t) => {
+  const h = await harness(t, {
+    conversationsInfo: () => new Promise(() => undefined),
+  });
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const view = await Promise.race([
+      h.openModal('G_UNRESPONSIVE'),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('config-modal classification was not bounded')), 5_000);
+      }),
+    ]);
+    assert.match(JSON.stringify(view.blocks), /\*mcp\*: disabled/);
+  } finally {
+    if (deadline) clearTimeout(deadline);
+  }
 });
 
 test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', async (t) => {

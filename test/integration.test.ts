@@ -3,7 +3,13 @@ import { openTestDb } from './support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
-import { createVouchr, defineProvider, github, ConsentRequiredError } from '../src';
+import {
+  ApprovalRequiredError,
+  createVouchr,
+  defineProvider,
+  github,
+  ConsentRequiredError,
+} from '../src';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -192,6 +198,155 @@ test('integration: a per-user provider in a DM works end to end with no channel 
     assert.equal(mock.reqs.find((r) => (r.url ?? '').startsWith('/api/me'))!.auth, 'Bearer AT123');
   } finally {
     await mock.close();
+  }
+});
+
+test('integration: command/action middleware lazily and once classifies G-prefixed conversations after ack', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const db = await openTestDb(t);
+  const provider = defineProvider({
+    id: 'lazy-governance',
+    authorizeUrl: 'https://provider.test/authorize',
+    tokenUrl: 'https://provider.test/token',
+    scopesDefault: [],
+    egressAllow: ['api.provider.test'],
+    egressMethods: ['GET', 'POST'],
+    refresh: 'none',
+    pkce: false,
+    clientId: 'cid',
+    clientSecret: 'secret',
+    approval: { approver: 'self' },
+  });
+  const lan = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db });
+  await lan.vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), provider.id, {
+    accessToken: 'stored-token',
+    refreshToken: null,
+    scopes: '',
+    expiresAt: null,
+    externalAccount: 'acct',
+  });
+
+  const run = async (input: {
+    body: Record<string, unknown>;
+    classify: () => Promise<unknown>;
+    enabled: boolean;
+    exerciseHandle?: boolean;
+  }) => {
+    let acknowledged = false;
+    let reads = 0;
+    let handle: ConnectionHandle | undefined;
+    const context: any = {};
+    const client = {
+      conversations: {
+        info: async () => {
+          reads++;
+          assert.equal(acknowledged, true, 'conversation classification started before the listener acknowledged');
+          return input.classify();
+        },
+      },
+      chat: {
+        postEphemeral: async () => undefined,
+        postMessage: async () => undefined,
+      },
+    };
+
+    await lan.middleware({
+      context,
+      client,
+      body: input.body,
+      next: async () => {
+        assert.equal(reads, 0, 'global middleware must not start Slack I/O before the listener runs');
+        acknowledged = true; // models `await ack()` in a custom command/action listener
+        const [first, second] = await Promise.all([
+          context.vouchr.toolManifest(),
+          context.vouchr.toolManifest(),
+        ]);
+        assert.equal(first[0].enabled, input.enabled);
+        assert.deepEqual(second, first);
+        if (input.exerciseHandle) {
+          handle = await context.vouchr.connect(provider.id);
+          assert.equal(await handle!.account(), 'acct', 'retained-use validation keeps the resolved MPIM scope');
+        }
+      },
+    });
+    assert.equal(reads, 1, 'classification is single-flight and memoized for the request context');
+    return handle;
+  };
+
+  await run({
+    body: { team_id: 'T1', user_id: 'U1', channel_id: 'GROUPDM_COMMAND' },
+    classify: async () => ({ channel: { id: 'GROUPDM_COMMAND', is_mpim: true } }),
+    enabled: true,
+    exerciseHandle: true,
+  });
+
+  const actionHandle = await run({
+    body: {
+      team: { id: 'T1' },
+      user: { id: 'U1' },
+      container: { channel_id: 'GROUPDM_ACTION', message_ts: 'ROOT_ACTION' },
+    },
+    classify: async () => ({ channel: { id: 'GROUPDM_ACTION', is_mpim: true } }),
+    enabled: true,
+    exerciseHandle: true,
+  });
+  await assert.rejects(
+    actionHandle!.fetch('https://api.provider.test/write', { method: 'POST' }),
+    ApprovalRequiredError,
+  );
+  assert.equal(
+    (await db.get<{ thread: string }>(
+      `SELECT thread FROM approval_request WHERE channel=?`,
+      ['GROUPDM_ACTION'],
+    ))?.thread,
+    'ROOT_ACTION',
+    'a root-message block action binds the standard container.message_ts as its thread root',
+  );
+
+  const replyHandle = await run({
+    body: {
+      team: { id: 'T1' },
+      user: { id: 'U1' },
+      container: { channel_id: 'GROUPDM_REPLY', message_ts: 'REPLY_ACTION' },
+      message: { ts: 'REPLY_ACTION', thread_ts: 'ROOT_THREAD' },
+    },
+    classify: async () => ({ channel: { id: 'GROUPDM_REPLY', is_mpim: true } }),
+    enabled: true,
+    exerciseHandle: true,
+  });
+  await assert.rejects(
+    replyHandle!.fetch('https://api.provider.test/reply', { method: 'POST' }),
+    ApprovalRequiredError,
+  );
+  assert.equal(
+    (await db.get<{ thread: string }>(
+      `SELECT thread FROM approval_request WHERE channel=?`,
+      ['GROUPDM_REPLY'],
+    ))?.thread,
+    'ROOT_THREAD',
+    'a reply action prefers message.thread_ts over the reply message timestamp',
+  );
+
+  await run({
+    body: { team_id: 'T1', user_id: 'U1', channel_id: 'G_PRIVATE' },
+    classify: async () => ({ channel: { id: 'G_PRIVATE', is_mpim: false } }),
+    enabled: false,
+  });
+
+  let deadline: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      run({
+        body: { team_id: 'T1', user_id: 'U1', channel_id: 'G_UNRESPONSIVE' },
+        classify: () => new Promise(() => undefined),
+        enabled: false,
+      }),
+      new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error('conversation classification was not bounded')), 5_000);
+      }),
+    ]);
+  } finally {
+    if (deadline) clearTimeout(deadline);
   }
 });
 

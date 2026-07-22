@@ -869,7 +869,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * secret) and returns 403 — the credential is never injected. Runs AFTER identity is verified, so a
    * denied request still spends its single-use jti (no free retries) but the vault is never read.
    */
-  async function authorize(provider: string, claims: IdentityClaims): Promise<void> {
+  async function authorize(
+    provider: string,
+    claims: IdentityClaims,
+    governableChannel: string | null,
+  ): Promise<void> {
     const channel = claims.channel;
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // The Policy + channel-tool CHECK is the shared core decision; the broker keeps its own audit/emit/
@@ -878,7 +882,14 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // signed delivery channel; the tool allowlist sees the governance scope (null for a signed DM/group-DM
     // claim, so the broker no longer denies personal conversations by deny-by-default) — same split as
     // Bolt. The signed `channelType` classifies a group DM whose id is not 'D…' (an MPIM 'G…' id).
-    const denial = await authorizeProvider(opts.policy, opts.channelTools, acting, channel, governanceChannelOf(channel, claims.channelType), provider);
+    const denial = await authorizeProvider(
+      opts.policy,
+      opts.channelTools,
+      acting,
+      channel,
+      governableChannel,
+      provider,
+    );
     if (denial === 'policy') {
       await opts.audit.record('denied', acting, provider, { channel });
       emit({ type: 'policy_denied', provider });
@@ -909,6 +920,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   async function resolveOwner(
     ref: ConnectionHandleRef,
     claims: IdentityClaims,
+    governableChannel: string | null,
   ): Promise<{ owner: Owner; acting: SlackIdentity; credentialId: string }> {
     const ownerKind = claims.ownerKind ?? 'user';
     // The body handle's owner must MATCH the signed ownerKind — a forged body owner:'channel' on a plain
@@ -934,15 +946,17 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       let mode: ChannelMode | null = null;
       let hasSessionGrant = false;
       const thread = claims.threadTs ?? null;
-      if (opts.channelConfig) {
-        mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
+      if (opts.channelConfig && governableChannel) {
+        mode = await opts.channelConfig.getMode(claims.teamId, governableChannel, ref.provider);
         if (mode === 'session' && thread) {
           hasSessionGrant = (await sessions.grantedCredentialId(
-            acting, claims.channel, thread, ref.provider,
+            acting, governableChannel, thread, ref.provider,
           )) === credentialId;
         }
       }
-      const r = resolveCredentialOwner({ path: 'user', mode, principal: acting, channel: claims.channel, thread, hasSessionGrant });
+      const r = resolveCredentialOwner({
+        path: 'user', mode, principal: acting, channel: governableChannel, thread, hasSessionGrant,
+      });
       if (r.status === 'needs_session') {
         await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, reason: r.reason });
         throw new HttpError(403, {
@@ -963,13 +977,18 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     }
 
     // ── channel-owned (opt-in, fail-closed) ──
-    if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
+    if (!opts.channelConfig) {
+      throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
+    }
+    if (!governableChannel) {
+      throw new HttpError(403, { error: 'channel-owned credentials are not enabled in personal conversations' });
+    }
     // Eligibility from the SIGNED verdict (the broker has no Slack client). Fail-closed: only an explicit
     // true is eligible. When eligibility is enforced entirely upstream, requireChannelEligibility:false
     // treats every channel-owned request as eligible (unchanged).
     const eligible = (opts.requireChannelEligibility ?? true) ? claims.channelEligible === true : true;
-    const mode = await opts.channelConfig.getMode(claims.teamId, claims.channel, ref.provider);
-    const r = resolveCredentialOwner({ path: 'channel', mode, principal: acting, channel: claims.channel, eligible });
+    const mode = await opts.channelConfig.getMode(claims.teamId, governableChannel, ref.provider);
+    const r = resolveCredentialOwner({ path: 'channel', mode, principal: acting, channel: governableChannel, eligible });
     if (r.status === 'refused') {
       if (r.code === 'ineligible') {
         await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
@@ -1007,15 +1026,16 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // perimeter can't enumerate registered providers via distinct 404/403 responses (#enumeration).
     const claims = await verify(body.identityToken);
     const { issuedAt: actorIssuedAt } = await requireCurrentActor(claims);
+    const governableChannel = governanceChannelOf(claims.channel, claims.channelType);
     if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
     // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
     // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
     if (!isBrokeredProvider(registry.get(ref.provider))) {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
-    await authorize(ref.provider, claims);
+    await authorize(ref.provider, claims, governableChannel);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.allowWrites);
-    const { owner, acting, credentialId } = await resolveOwner(ref, claims);
+    const { owner, acting, credentialId } = await resolveOwner(ref, claims, governableChannel);
     // A verified token makes the channel facts trustworthy, not immutable. Governance, session
     // authority, and the selected connection generation can all change after resolveOwner's reads.
     // Re-resolve the complete use binding under the same canonical lifecycle locks both before any
@@ -1057,7 +1077,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
             channelConfig: opts.channelConfig ?? null,
             // Governance scope for the retained-use re-check, classified by the signed channelType so an
             // MPIM 'G…' claim is not re-denied by deny-by-default (Policy still uses the raw channel).
-            governableChannel: governanceChannelOf(claims.channel, claims.channelType),
+            governableChannel,
           });
           if (state !== 'current') throw new InteractionStateChangedError('connection', state);
           return true;
@@ -1093,9 +1113,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           actorIssuedAt,
           channelTools: opts.channelTools ?? null,
           channelConfig: opts.channelConfig ?? null,
+          governableChannel: key.governableChannel,
         });
       },
       useStillValid,
+      governableChannel,
     );
     return { handle, provider, acting };
   }

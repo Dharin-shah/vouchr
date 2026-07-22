@@ -135,6 +135,17 @@ echo "==> require() every published entrypoint (CJS exports map)"
   if (typeof root.OAUTH_CONNECT_ACTION !== 'string' || root.OAUTH_CONNECT_ACTION.length === 0) {
     throw new Error('packed root is missing the OAUTH_CONNECT_ACTION action id export');
   }
+  for (const surface of [root, headless]) {
+    if (!surface.isSlackConversationType('mpim') || surface.isSlackConversationType('MPIM')) {
+      throw new Error('packed conversation-type guard is missing or does not fail closed');
+    }
+    if (!surface.isSlackConversationType('app_home')) {
+      throw new Error('packed conversation-type guard rejects Slack App Home events');
+    }
+    if (JSON.stringify(surface.SLACK_CONVERSATION_TYPES) !== JSON.stringify(['channel', 'group', 'im', 'mpim', 'app_home'])) {
+      throw new Error('packed conversation-type values drifted');
+    }
+  }
   if ('ConnectContext' in headless) {
     throw new Error('Bolt ConnectContext leaked into the headless runtime entrypoint');
   }
@@ -149,9 +160,13 @@ echo "==> require() every published entrypoint (CJS exports map)"
     VOUCHR_IDENTITY_SECRET: 'packed-consumer-identity-secret-32-bytes!!',
     VOUCHR_DEPLOYMENT_ID: 'packed-consumer',
   });
-  const token = headless.mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
+  const token = headless.mintIdentity({
+    teamId: 'T1', userId: 'U1', channel: 'GROUPDM01', channelType: 'mpim',
+  }, identity);
   const claims = headless.verifyIdentity(token, identity);
-  if (claims.aud !== 'packed-consumer' || !claims.kid) throw new Error('packed bound identity round-trip failed');
+  if (claims.aud !== 'packed-consumer' || !claims.kid || claims.channelType !== 'mpim') {
+    throw new Error('packed bound identity/channel-type round-trip failed');
+  }
   const inertDb = {};
   const directBroker = headless.createBroker({
     providers: [headless.github({ clientId: 'packed-client', clientSecret: 'packed-provider-secret' })],
@@ -196,6 +211,7 @@ import {
   isVouchrErrorCode, mapSafeError, safeUserMessage,
   TOKEN_ENDPOINT_FAILURE_KINDS, VOUCHR_ERROR_CODES, VOUCHR_RECOVERY_ACTIONS,
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type BrokerServer, type IdentityConfig,
+  type SlackConversationType,
   type ConsentPromptState,
   type SecretReferenceErrorCode, type TokenEndpointFailureKind, type VouchrErrorCode,
   type VouchrRecovery, type VouchrSafeError, type RevokeAllReport,
@@ -213,8 +229,15 @@ void installationMigration;
 // A typed host imports the OAuth Connect action_id from the package root (not an internal path).
 const oauthConnectActionId: string = OAUTH_CONNECT_ACTION;
 void oauthConnectActionId;
-const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
-void verifyIdentity(identityToken, identity);
+const identityToken = mintIdentity(
+  { teamId: 'T1', userId: 'U1', channel: 'GROUPDM01', channelType: 'mpim' },
+  identity,
+);
+const verifiedIdentity = verifyIdentity(identityToken, identity);
+const verifiedChannelType: SlackConversationType | undefined = verifiedIdentity.channelType;
+void verifiedChannelType;
+const appHomeChannelType: SlackConversationType = 'app_home';
+void appHomeChannelType;
 type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : false;
 type HasSkewKnob = 'skewMs' extends keyof IdentityConfig ? true : false;
 const noReplayOverride: false = null as unknown as HasReplayOverride;

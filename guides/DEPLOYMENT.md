@@ -105,11 +105,9 @@ user and shared-channel writes during confirmed break-glass revocation. Treat th
 cutover, not a mixed-version rolling upgrade. Schema v11 adds one active OAuth generation per
 workspace/user/provider, callback consumption/supersession state, cross-replica Slack delivery
 leases, and the partial unique active-generation index. Schema v12 extends cross-replica delivery
-leases to static-key setup and binds approval delivery to the current approver class and exact
-recipient set. Every pre-v11 consent row is deleted fail-closed because it cannot prove the v11
-generation and delivery invariants. A v11→v12 migration preserves v11 OAuth state and pending exact
-actions, but clears the old global approval-delivery marker so current eligible recipients get a
-truthful surface.
+leases to static-key setup, binds approval delivery to the current approver class and exact
+recipient set, and binds every approval to its exact mutable-governance scope. Every pre-v11 consent
+row is deleted fail-closed because it cannot prove the v11 generation and delivery invariants.
 
 1. Back up PostgreSQL and verify that the backup can be restored.
 2. Quiesce Slack and broker traffic **including identity-assertion minting**, drain in-flight
@@ -135,8 +133,6 @@ truthful surface.
    v8-v10 markers, v12 then drains old OAuth state and installs the consumption, supersession,
    delivery-lease, and active-generation constraints atomically with the version stamp. From every
    accepted pre-v12 marker, it adds key-prompt delivery leases and audience-bound approval delivery.
-   The v11→v12 carry preserves v11 OAuth generations and pending key/approval actions, while clearing
-   only approval delivery state that cannot identify its recipient audience.
 5. Start only v12 replicas, confirm readiness, and restore traffic and assertion minting. Users
    coming from v8 make fresh
    decisions; setup buttons rendered by v8 or prerelease v9 are rejected with fixed
@@ -238,7 +234,7 @@ const receiver = new ExpressReceiver({
   clientId: process.env.SLACK_CLIENT_ID!,
   clientSecret: process.env.SLACK_CLIENT_SECRET!,
   stateSecret: process.env.SLACK_STATE_SECRET!,
-  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read'],
+  scopes: ['app_mentions:read', 'chat:write', 'commands', 'users:read', 'channels:read', 'groups:read', 'mpim:read'],
   installationStore: store,
 });
 const app = new App({ receiver });
@@ -1089,7 +1085,7 @@ must repeat representative load with the real configured KMS and exact container
 Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)
 (api.slack.com/apps → From a manifest), replacing `YOUR_PUBLIC_URL`. The manifest sets:
 
-- **Bot scopes:** `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`;
+- **Bot scopes:** `chat:write`, `commands`, `users:read`, `channels:read`, `groups:read`, `mpim:read`;
   additionally `app_mentions:read` when this app receives the agent's mentions.
 - **Events:** `app_home_opened`, `user_change` (the latter drives auto-revoke on deactivation);
   additionally `app_mention` when this app is also the agent.

@@ -112,7 +112,13 @@ export type { ChannelMode } from './core/channelConfig';
 // BrokerOptions. All core/adapters-http — no @slack in the graph. ──
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
-export { PolicyDeniedError, ToolDisabledError } from './core/authz';
+export {
+  PolicyDeniedError,
+  ToolDisabledError,
+  SLACK_CONVERSATION_TYPES,
+  isSlackConversationType,
+} from './core/authz';
+export type { SlackConversationType } from './core/authz';
 export { ChannelTools } from './core/tools';
 export { InteractionStateChangedError } from './core/interaction';
 export type { ToolManifestEntry } from './core/tools';

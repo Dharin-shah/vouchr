@@ -423,6 +423,37 @@ test('the public five-argument disconnectProvider wrapper captures trusted serve
   assert.equal(await vault.has(O1, 'norevoke'), false);
 });
 
+test('provider-addressed disconnect fails closed on an equal-millisecond credential generation', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  await vault.upsert(O1, 'norevoke', {
+    accessToken: 'SAME_MS_CREDENTIAL', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+  const issuedAt = await vault.userProvisioningIssuedAt();
+  await db.run(
+    "UPDATE connection SET generation_at=? WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?",
+    [issuedAt, ID.teamId, ID.userId, 'norevoke'],
+  );
+
+  await assert.rejects(
+    disconnectProviderAtReceipt(
+      vault,
+      audit,
+      new ProviderRegistry([norevoke]),
+      ID,
+      'norevoke',
+      issuedAt,
+    ),
+    (error: any) => error?.code === 'interaction_state_changed' && error?.reason === 'credential',
+  );
+  assert.equal((await vault.get(O1, 'norevoke'))?.accessToken, 'SAME_MS_CREDENTIAL');
+  assert.equal(
+    (await db.all(`SELECT 1 FROM audit WHERE action='revoke' AND provider='norevoke'`)).length,
+    0,
+  );
+});
+
 // GHSA-25m2: a row past its LOCAL TTL may still be live upstream — disconnect must still revoke
 // it there, and `removed` reflects the actual delete (the row existed), not the TTL-gated read.
 test('disconnectProvider revokes an expired-here token upstream and reports removed:true', async (t) => {

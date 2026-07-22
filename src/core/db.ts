@@ -169,8 +169,9 @@ class PgClientDb implements Db {
  * scoped break-glass provisioning tombstones, channel-interaction mutation tombstones, and one
  * PostgreSQL-clock credential-generation boundary for delayed destructive requests. Version 11
  * makes OAuth consent one durable owner/provider generation with cross-replica delivery leases.
- * Version 12 extends that delivery state to key setup and binds approval delivery to its current
- * eligible audience. `migrate()` accepts v6-v12 and applies every idempotent cleanup before stamping 12.
+ * Version 12 extends that delivery state to key setup, binds approval delivery to its current
+ * eligible audience, and requires an explicit mutable-governance scope on pending approvals.
+ * `migrate()` accepts v6-v12 and applies every idempotent cleanup before stamping 12.
  * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
  * controls differently.
  */
@@ -418,10 +419,10 @@ function schema(): string {
       query_hash TEXT NOT NULL DEFAULT '',
       channel TEXT NOT NULL,
       thread TEXT NOT NULL,
-      -- The mutable-GOVERNANCE scope for this action's channel at request time (null in a personal
-      -- conversation). Persisted so the decision revalidation classifies a group DM (MPIM) that its
-      -- id alone cannot; NOT part of the action-match key (it is functionally derived from channel).
-      governable_channel TEXT,
+      -- The mutable-GOVERNANCE scope for this action's channel at request time. Empty string is an
+      -- explicitly personal conversation; otherwise it equals channel. NOT NULL prevents an old or
+      -- unclassified row from being interpreted as ungoverned.
+      governable_channel TEXT NOT NULL,
       status TEXT NOT NULL,
       approved_by TEXT,
       created_at ${int} NOT NULL,
@@ -644,7 +645,6 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_audience TEXT`);
-      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS governable_channel TEXT`);
       await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
       await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
       await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);

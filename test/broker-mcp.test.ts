@@ -183,6 +183,41 @@ test('#2 broker manifest: a signed group-DM (MPIM) is ungoverned; the same id wi
   }
 });
 
+test('#2 broker approval: a signed MPIM preserves its personal scope through request validation and storage', async (t) => {
+  const approvalProvider = { ...mcpAcme, approval: { approver: 'self' as const } } as Provider;
+  const { server, port, db } = await makeMcpBroker(t, (store) => ({
+    providers: [approvalProvider],
+    channelTools: new ChannelTools(store),
+    channelConfig: new ChannelConfig(store),
+  }));
+  const upstream = mockUpstream(() => new Response('{}', { status: 200 }));
+  const request = (channelType?: IdentityClaims['channelType']) => fetchEnvelope({
+    identityToken: signIdentity(claims({
+      channel: 'GROUPDM01',
+      ...(channelType === undefined ? {} : { channelType }),
+    }), SECRET),
+  });
+  try {
+    const unclassified = await postRaw(port, '/v1/fetch', request());
+    assert.equal(unclassified.status, 403);
+    assert.equal(JSON.parse(unclassified.raw).code, 'tool_disabled');
+    assert.equal((await db.all(`SELECT 1 FROM approval_request`)).length, 0);
+
+    const personal = await postRaw(port, '/v1/fetch', request('mpim'));
+    assert.equal(personal.status, 403, personal.raw);
+    assert.equal(JSON.parse(personal.raw).code, 'approval_required');
+    assert.deepEqual(
+      await db.get(`SELECT channel, governable_channel FROM approval_request`),
+      { channel: 'GROUPDM01', governable_channel: '' },
+      'the approval decision must retain the signed personal-conversation classification',
+    );
+    assert.equal(upstream.seen.length, 0);
+  } finally {
+    upstream.restore();
+    server.close();
+  }
+});
+
 // ── the acceptance flow: initialize → tools/list → tools/call, credential injected, never revealed ──
 
 test('#65 mcp: initialize/listTools/callTool round trip — token injected, session + protocol headers pass both ways, secret never revealed', async (t) => {

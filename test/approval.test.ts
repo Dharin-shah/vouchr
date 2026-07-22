@@ -458,15 +458,32 @@ test('#2: a persisted governance scope drives approval revalidation (group DM st
   const revalidate = (k: ApprovalKey): Promise<boolean> => approvalOwnerStillCurrent({
     row: k, db, registry, policy: new Policy(), vault, actorIssuedAt: Date.now(), channelTools, channelConfig,
   });
-  const stored = async (id: string): Promise<string | null> =>
-    (await db.get(`SELECT governable_channel FROM approval_request WHERE id=?`, [id]) as any).governable_channel ?? null;
+  const stored = async (id: string): Promise<string> =>
+    (await db.get(`SELECT governable_channel FROM approval_request WHERE id=?`, [id]) as any).governable_channel;
 
-  // A group DM: governance scope persisted as null (personal). Even with NO channel enable, the
+  // A group DM: governance scope persists as the explicit empty-string personal encoding. Even with NO channel enable, the
   // decision revalidation stays valid — deny-by-default never reaches a personal conversation.
   const mpim = key('GROUPDM01', 'TH1', null);
   const mpimId = await approvals.request(mpim);
-  assert.equal(await stored(mpimId), null, 'the personal (null) governance scope round-trips through storage');
-  assert.equal(await revalidate(mpim), true, 'a group-DM approval is not invalidated by deny-by-default');
+  assert.equal(await stored(mpimId), '', 'the personal governance scope has a non-ambiguous storage encoding');
+  const persistedMpim = await approvals.get(mpimId);
+  assert.equal(persistedMpim?.governableChannel, null, 'the public row decodes personal scope to null');
+  assert.ok(persistedMpim);
+  assert.equal(await revalidate(persistedMpim), true, 'the persisted group-DM approval is not invalidated by deny-by-default');
+
+  // The same action cannot silently reuse a row under a different signed channel classification.
+  await assert.rejects(
+    approvals.request({ ...mpim, governableChannel: 'GROUPDM01' }),
+    /could not be recorded/,
+  );
+  await assert.rejects(
+    approvals.request({ ...mpim, governableChannel: 'C_OTHER' }),
+    /invalid governance scope/,
+  );
+  await db.run(`UPDATE approval_request SET expires_at=0 WHERE id=?`, [mpimId]);
+  const reclassifiedId = await approvals.request({ ...mpim, governableChannel: 'GROUPDM01' });
+  assert.notEqual(reclassifiedId, mpimId);
+  assert.equal(await stored(reclassifiedId), 'GROUPDM01', 'an expired row can be safely replaced under current classification');
 
   // A governed channel with no enable: scope persisted as the channel → deny-by-default invalidates it.
   const gov = key('C_GOV', 'TH2', 'C_GOV');
@@ -737,7 +754,7 @@ test('P1-A(a): a grant minted for one credential owner cannot be consumed for an
   const approvals = new Approvals(db);
   const forOwner = (ownerId: string) => ({
     teamId: 'T1', userId: 'U_CALLER', ownerKind: 'user' as const, ownerId,
-    credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
+    credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   });
   const id = await approvals.request(forOwner('U_OWNER_A'));
   assert.ok(await approvals.approve(id, 'U_CALLER', 60_000));
@@ -790,7 +807,7 @@ test('post-purge stale approval request insert is fenced by the credential-gener
   const key = {
     teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: oldId,
     provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
-    channel: 'C1', thread: 'TH1',
+    channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   };
   let purged!: () => void;
   let release!: () => void;
@@ -834,6 +851,7 @@ test('two replicas: a paused DM approval request cannot cross actor offboarding'
     teamId: ID.teamId, userId: ID.userId, ownerKind: 'user' as const, ownerId: ID.userId,
     credentialId, provider: 'acme', method: 'POST', origin: 'https://api.acme.test',
     host: 'api.acme.test', path: '/repos', queryHash: '', channel: null, thread: null,
+    governableChannel: null,
   };
   let reached!: () => void;
   let release!: () => void;
@@ -1040,7 +1058,7 @@ test('race: two concurrent identical fetches cannot both spend one grant (DELETE
 test('race: two concurrent store-level consumes yield exactly one winner (consent-consume pattern)', async (t) => {
   const db = await openTestDb(t);
   const approvals = new Approvals(db);
-  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: null };
+  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: null, governableChannel: 'C1' };
   const id = await approvals.request(key);
   assert.ok(await approvals.approve(id, 'U9', 60_000));
   const [a, b] = await Promise.all([approvals.consume(key), approvals.consume(key)]);
@@ -1057,7 +1075,7 @@ test('a pre-offboard shared-credential grant cannot revive after actor re-onboar
     teamId: 'T1', userId: 'U1', ownerKind: 'channel' as const, ownerId: 'C1',
     credentialId: GENERATION, provider: 'acme', method: 'POST',
     origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
-    channel: 'C1', thread: 'TH1',
+    channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   };
   const id = await approvals.request(key);
   assert.ok(await approvals.approve(id, 'U_ADMIN', 60_000));
@@ -1116,6 +1134,7 @@ test('two replicas: a stale actor receipt cannot consume a fresh post-offboard g
     teamId: ID.teamId, userId: ID.userId, ownerKind: 'channel' as const, ownerId: 'C1',
     credentialId, provider: 'acme', method: 'POST', origin: 'https://api.acme.test',
     host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
+    governableChannel: 'C1',
   };
   const validateAt = (issuedAt: number) => async (_approval: ApprovalKey, tx: Db) => {
     const fenced = await withUserInteractionFence(tx, ID, issuedAt, async () => true);
@@ -1166,7 +1185,7 @@ test('Approvals rejects missing, malformed, and oversized credential generations
   const base = {
     teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1',
     credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test',
-    path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
+    path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   };
   for (const credentialId of [undefined, '', ' ', 'not-a-uuid', 'x'.repeat(10_000)]) {
     const invalid = { ...base, credentialId: credentialId as any };
@@ -1179,7 +1198,7 @@ test('Approvals rejects missing, malformed, and oversized credential generations
 test('concurrent decisions: approve and deny on one pending request — exactly one wins', async (t) => {
   const db = await openTestDb(t);
   const approvals = new Approvals(db);
-  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: null, thread: null };
+  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: null, thread: null, governableChannel: null };
   const id = await approvals.request(key);
   const [approved, denied] = await Promise.all([approvals.approve(id, 'U9', 60_000), approvals.deny(id)]);
   assert.equal([approved !== false && approved !== null, denied !== null].filter(Boolean).length, 1);
@@ -1193,7 +1212,7 @@ test('decideAudited rejects malformed decisions and validator results before row
   const id = await approvals.request({
     teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1',
     credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test',
-    path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
+    path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   });
   const base = {
     id,
@@ -1229,7 +1248,7 @@ test('PostgreSQL clock owns approval TTL/lease and expired delivered pending/gra
   const key = {
     teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1',
     credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test',
-    path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1',
+    path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   };
 
   const first = await withClockOffset(60 * 60_000, () => a.request(key));
@@ -1276,7 +1295,7 @@ test('approval delivery is reusable only by the same approver class and recipien
     teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1',
     credentialId: GENERATION, provider: 'acme', method: 'POST',
     origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
-    channel: 'C1', thread: 'TH1',
+    channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   });
   const selfAudience = approvalDeliveryAudienceKey(id, 'self', ['U1']);
   const selfClaim = await approvals.claimDelivery(id, selfAudience);
@@ -1311,7 +1330,7 @@ test('two replicas: a changing approval audience cannot replace an active delive
     teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1',
     credentialId: GENERATION, provider: 'acme', method: 'POST',
     origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
-    channel: 'C1', thread: 'TH1',
+    channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   });
   const oldAudience = approvalDeliveryAudienceKey(id, 'admin', ['UOLD']);
   const newAudience = approvalDeliveryAudienceKey(id, 'admin', ['UNEW']);
@@ -2064,7 +2083,7 @@ test('action digest is never authority: selector collisions cannot reuse another
   const approvals = new Approvals(db);
   const base = {
     teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', provider: 'acme',
-    credentialId: GENERATION, method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', queryHash: '', channel: 'C1', thread: 'TH1',
+    credentialId: GENERATION, method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', queryHash: '', channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   };
   const first = { ...base, path: '/first' };
   const providerMismatch = { ...first, provider: 'other' };
@@ -2796,7 +2815,7 @@ test('sweep: expired prompts and unspent grants are deleted and audited (actor: 
   const audit = new Audit(db);
   const consent = new Consent(db);
   const approvals = new Approvals(db);
-  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1' };
+  const key = { teamId: 'T1', userId: 'U1', ownerKind: 'user' as const, ownerId: 'U1', credentialId: GENERATION, provider: 'acme', method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '', channel: 'C1', thread: 'TH1', governableChannel: 'C1' };
   await approvals.request(key); // pending, 10-minute prompt lifetime
   const granted = await approvals.request({ ...key, path: '/other' });
   await approvals.approve(granted, 'U_ADM', 1_000); // grant, 1s TTL

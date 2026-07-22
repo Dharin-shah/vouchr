@@ -172,6 +172,11 @@ language. When the broker denies (`not_connected`, `session_approval_required`,
 recovery prompt from verified state. See the [hybrid architecture](./guides/HYBRID.md) and the
 [headless guide](./guides/HEADLESS.md).
 
+Signed broker assertions carry Slack's canonical conversation type so a `G…` group DM is not
+mistaken for a governed private channel. Trusted minters should validate verified event/API values
+with the exported `isSlackConversationType` guard; never accept this authorization fact from the
+model or worker.
+
 ## Learn more
 
 | | |

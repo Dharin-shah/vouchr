@@ -122,8 +122,8 @@ async function seed(t: TestContext): Promise<{ db: Db; vault: Vault }> {
   await db.run(`INSERT INTO session_request (id, team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at) VALUES (?, 'T1', 'C1', 'th', 'U1', 'revok_ok', ?, ?, ?)`, [randomUUID(), randomUUID(), now, later]);
   await db.run(`INSERT INTO session_grant (team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at) VALUES ('T1', 'C1', 'th', 'U1', 'revok_ok', ?, ?, ?)`, [randomUUID(), now, later]);
   await db.run(
-    `INSERT INTO approval_request (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, channel, thread, status, created_at, expires_at)
-     VALUES (?, 'k', 'T1', 'U1', 'user', 'U1', ?, 'revok_ok', 'POST', 'https://api.ok.example', 'api.ok.example', '/x', 'C1', 'th', 'pending', ?, ?)`,
+    `INSERT INTO approval_request (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, channel, thread, governable_channel, status, created_at, expires_at)
+     VALUES (?, 'k', 'T1', 'U1', 'user', 'U1', ?, 'revok_ok', 'POST', 'https://api.ok.example', 'api.ok.example', '/x', 'C1', 'th', 'C1', 'pending', ?, ?)`,
     [randomUUID(), randomUUID(), now, later],
   );
   await db.run(`INSERT INTO user_provisioning_request (id, team_id, user_id, provider, created_at, expires_at) VALUES (?, 'T1', 'U1', 'revok_ok', ?, ?)`, [randomUUID(), now, later]);

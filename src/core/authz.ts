@@ -118,16 +118,50 @@ export async function snapshotChannelModes(
  * axis (deployment config, not admin-mutable) and keeps evaluating against the real delivery channel,
  * so a deployment can still deny a provider in DMs / allow it only in named channels.
  *
- * `channelType` is Slack's event `channel_type` ('im'/'mpim'); it identifies a group DM whose id is
+ * `channelType` is Slack's event `channel_type`; it identifies a group DM whose id is
  * not `D…`. The id-prefix check alone catches a 1:1 DM when only the channel string is available (a
  * signed broker claim, or a retained-use re-check that carries no channel_type).
  * ponytail: a group-DM whose id is neither `D…` nor accompanied by channel_type stays governed —
  * reachable only on a re-check that lost the original channel_type, never on the connect path.
  */
-export function governanceChannelOf(channel: string | null, channelType?: string): string | null {
+export const SLACK_CONVERSATION_TYPES = Object.freeze([
+  'channel',
+  'group',
+  'im',
+  'mpim',
+  'app_home',
+] as const);
+export type SlackConversationType = (typeof SLACK_CONVERSATION_TYPES)[number];
+
+/** Runtime guard shared by every transport that accepts Slack's conversation type. Keep the closed
+ * set beside the governance decision it controls: an unknown or malformed value must never become
+ * a signed authorization fact or silently exempt a channel from deny-by-default. */
+export function isSlackConversationType(value: unknown): value is SlackConversationType {
+  return typeof value === 'string'
+    && (SLACK_CONVERSATION_TYPES as readonly string[]).includes(value);
+}
+
+export function governanceChannelOf(
+  channel: string | null,
+  channelType?: SlackConversationType,
+): string | null {
   if (channel === null) return null;
-  if (channel.startsWith('D') || channelType === 'im' || channelType === 'mpim') return null;
+  if (channel.startsWith('D')) return null;
+  // Slack's MPIM ids share the G… prefix with private channels. Require both facts before widening
+  // the governance scope; a contradictory signed type/id pair fails closed as governed.
+  if (channelType === 'mpim' && channel.startsWith('G')) return null;
   return channel;
+}
+
+/** Validate a persisted/forwarded governance classification for one delivery channel. A governed
+ * scope is always the exact channel. Personal scope is valid only for Slack's DM id classes: D… is
+ * unambiguous, while G… needs the separately verified MPIM fact at the adapter boundary. */
+export function isGovernanceChannelScope(
+  channel: string | null,
+  scope: string | null,
+): boolean {
+  if (scope !== null) return scope === channel;
+  return channel === null || channel.startsWith('D') || channel.startsWith('G');
 }
 
 /**

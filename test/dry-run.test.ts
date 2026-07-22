@@ -107,6 +107,7 @@ async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provide
     queryHash: '',
     channel: null,
     thread: null,
+    governableChannel: null,
   };
   await new Approvals(db).request(approvalKey);
 

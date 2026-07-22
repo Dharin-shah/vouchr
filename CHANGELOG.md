@@ -23,6 +23,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- **Dry-run channel-governance bootstrap.** Bolt dry-run hosts can call
+  `vouchr.dryRun.enableTool(admin, channel, providerId)` to exercise the real deny-by-default
+  enablement path before `completeConsent`, without bypassing the admin, mutation, or audit checks.
 - **`/vouchr disconnect-shared <provider>`** — removes a channel's shared credential through a
   dedicated core operation: it only acts when the channel is in `shared` mode (never downgrading a
   `session`/`per-user` channel), attempts the provider's declared upstream revocation, returns the
@@ -32,6 +35,9 @@ All notable changes to this project are documented here. This project adheres to
   durable DM.
 - **`OAUTH_CONNECT_ACTION` is exported** so custom Block Kit hosts can register the required no-op
   `ack()` for the OAuth "Connect" button.
+- **Canonical Slack conversation-type exports.** `SlackConversationType`,
+  `SLACK_CONVERSATION_TYPES`, and `isSlackConversationType` are available from both package
+  entrypoints so trusted identity minters validate the same closed vocabulary as Vouchr.
 - **Disabled-provider warning** when configuring a channel credential for a provider that is disabled
   in the channel.
 
@@ -102,10 +108,9 @@ All notable changes to this project are documented here. This project adheres to
   self/admin or obsolete-admin delivery cannot suppress the current approvers. The Approve/Deny
   surface uses the same delivery helper for broker and in-process requests. Every channel-membership
   proof shares the same deadline, size cap, and cursor-cycle rejection, so malformed Slack/proxy
-  pagination fails closed before a prompt, lease, or channel-context DM. Schema v12 adds the
-  key-prompt delivery lease and approval-audience columns; its drained migration clears pre-v12
-  global approval delivery markers while preserving the pending exact action for truthful
-  redelivery. `connectChannel`'s missing-credential
+  pagination fails closed before a prompt, lease, or channel-context DM. Schema v12 stores the
+  key-prompt delivery lease, approval audience, and each approval's explicit mutable-governance
+  scope, so a group-DM decision cannot be reinterpreted as governed later. `connectChannel`'s missing-credential
   failure is now the typed `NoConnectionError` (owner `channel`; message unchanged). The packaged
   broker's readiness line reports the OS-bound port so `VOUCHR_PORT=0` is usable. Proven by a
   two-process integration test (`test/broker-bridge.test.ts`): a spawned `vouchr-broker` process and

@@ -1367,7 +1367,7 @@ test('delete-in-progress fences both session and approval request recreation acr
   const approvalRequest = new Approvals(requestDb).requestAudited({
     teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1', credentialId,
     provider: 'gh', method: 'POST', origin: 'https://api.test', host: 'api.test', path: '/x', queryHash: '',
-    channel: 'C1', thread: 'TH1',
+    channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   }, new Audit(requestDb), ID, requestVault, async () => true);
   void sessionRequest.catch(() => undefined);
   void approvalRequest.catch(() => undefined);

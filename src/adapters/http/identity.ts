@@ -1,4 +1,8 @@
 import { createHmac, timingSafeEqual, randomUUID, createHash } from 'node:crypto';
+import {
+  isSlackConversationType,
+  type SlackConversationType,
+} from '../../core/authz';
 
 /**
  * Verified claims about WHO is acting, minted by a trusted upstream (the receiver that already
@@ -66,7 +70,7 @@ export interface IdentityClaims {
    * with no type stays governed). Static Policy always evaluates against the raw `channel`, so this
    * only widens/narrows the admin-mutable allowlist scope, never the deployment policy.
    */
-  channelType?: string;
+  channelType?: SlackConversationType;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -430,6 +434,9 @@ export type MintIdentityInput = Pick<
  * tool surface. Mint per request; do not cache or reuse a token across calls.
  */
 export function mintIdentity(input: MintIdentityInput, key: string | IdentityConfig, ttlMs = 60_000, now = Date.now()): string {
+  if (input.channelType !== undefined && !isSlackConversationType(input.channelType)) {
+    throw new Error('identity channelType must be a supported Slack conversation type');
+  }
   const config = typeof key === 'string' ? null : normalizeIdentityConfig(key);
   if (config && (!Number.isSafeInteger(now) || !Number.isSafeInteger(ttlMs))) {
     throw new Error('identity token now and ttlMs must be finite safe integers');
@@ -513,9 +520,8 @@ function isClaims(v: unknown): v is IdentityClaims {
     // signed claim fails closed (an unknown ownerKind can't slip through as 'channel').
     (c.ownerKind === undefined || c.ownerKind === 'user' || c.ownerKind === 'channel') &&
     (c.channelEligible === undefined || typeof c.channelEligible === 'boolean') &&
-    // Signed conversation type: reject a wrong-typed value rather than coercing it. Only 'im'/'mpim'
-    // affect governance (governanceChannelOf); any other bounded string is treated as a governed channel.
-    (c.channelType === undefined || typeof c.channelType === 'string')
+    // Signed conversation type is authorization-affecting: accept only Slack's closed event values.
+    (c.channelType === undefined || isSlackConversationType(c.channelType))
   );
 }
 

@@ -51,8 +51,8 @@ Configured `onEvent` and `onCredentialHealth` hooks receive the sweep's `expired
 the cleanup commits.
 The lower-level core `sweepExpired(vault, audit, consent, …)` export remains for non-broker lifecycle
 integrations, but it does not own a broker's private interaction stores and is not a substitute for
-this method. For compatibility, the returned number counts expired credential deletions only; all
-interaction families are still swept on every call.
+this method. The returned number counts expired credential deletions; all interaction families are
+still swept on every call.
 
 Headless is primarily the credential **use path**, not a replacement for Slack consent. Users still
 connect or approve access through the Slack app first (or through the headless OAuth flow when it is
@@ -65,8 +65,20 @@ a fresh short-lived `identityToken` for each call:
 
 ```ts
 const identity = loadIdentityConfig(process.env);
-const identityToken = mintIdentity({ teamId, userId, channel, threadTs }, identity);
+const identityToken = mintIdentity(
+  { teamId, userId, channel, threadTs, channelType: verifiedSlackEvent.channel_type },
+  identity,
+);
 ```
+
+`channelType` must come from a signature-verified Slack event or an authenticated
+`conversations.info` lookup by the trusted Slack service—not the model, worker, unverified request
+body, or a guess from the channel id. Normalize with the exported `isSlackConversationType` guard
+to Slack's closed `channel`, `group`, `im`, `mpim`, or `app_home` vocabulary and fail closed on
+anything else.
+The signed value is required for correct group-DM handling: an MPIM has a `G…` id, so
+`channelType: 'mpim'` is what keeps that personal conversation exempt from mutable channel
+governance. Static `Policy` still receives the real channel id and may deny it.
 
 The worker then calls `POST /v1/fetch`:
 
