@@ -17,7 +17,7 @@ features:
     - command: /vouchr
       url: https://YOUR_PUBLIC_URL/slack/events
       description: Manage your connected accounts
-      usage_hint: status | disconnect <provider> | configure <provider>
+      usage_hint: status | disconnect <provider> | connect-shared <provider>
       should_escape: false
 oauth_config:
   scopes:
@@ -36,7 +36,7 @@ settings:
       - app_home_opened     # render the App Home console
       - user_change         # auto-revoke a deactivated user's connections
   interactivity:
-    is_enabled: true        # REQUIRED for the Connect button + key/configure modals
+    is_enabled: true        # REQUIRED for the Connect button + key/connect-shared modals
     request_url: https://YOUR_PUBLIC_URL/slack/events
   org_deploy_enabled: false
   socket_mode_enabled: false

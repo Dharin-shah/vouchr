@@ -169,12 +169,15 @@ export async function setChannelCredentialMode(
   });
 }
 
-/** The truthful outcome of {@link disconnectChannelShared}. `removed` deleted a shared credential;
- *  `not-shared` did nothing because the channel had no shared account (never downgrading a
- *  session/per-user channel); `stale` lost the mode flip to a concurrent lifecycle change.
- *  `ok=false` means upstream revocation debt may remain (the provider token could still be live). */
+/** The truthful outcome of {@link disconnectChannelShared}. `removed` deleted a shared credential and
+ *  returned the channel to per-user; `missing` found `shared` mode but no stored credential (e.g. a
+ *  prior break-glass revoke deleted the row but left the mode) and still returned it to per-user;
+ *  `not-shared` did nothing because the channel was not in `shared` mode (never downgrading a
+ *  session/per-user channel); `stale` lost to a concurrent lifecycle change (a newer credential
+ *  generation, or the acting admin being offboarded) and mutated nothing. `ok=false` on `removed`
+ *  means upstream revocation debt may remain (the provider token could still be live). */
 export type DisconnectSharedOutcome = {
-  status: 'removed' | 'not-shared' | 'stale';
+  status: 'removed' | 'missing' | 'not-shared' | 'stale';
   ok: boolean;
   attempted: boolean;
 };
@@ -184,12 +187,20 @@ export type DisconnectSharedOutcome = {
  * Unlike a generic mode reset it:
  *  - only acts when the channel is actually in `shared` mode, so a `per-user`/`session` channel is
  *    never mutated (a session channel keeps its thread-approval requirement — no access widening);
- *  - deletes the shared credential through the SAME atomic delete→decode→revoke primitive the
- *    personal disconnect uses, so revocable provider authority is actually revoked upstream, not just
- *    dropped locally; and
- *  - reports a truthful outcome (`not-shared` no-op, `removed` with `ok`/`attempted`, or `stale`).
- * Ordering — claim-delete + revoke BEFORE flipping the mode — so a mid-operation failure converges on
- * retry: a retry still sees `shared`, re-claims (finding nothing) and re-flips the mode.
+ *  - deletes the shared credential through the SAME claim→decode→revoke primitive the personal
+ *    disconnect uses, so revocable provider authority is actually revoked upstream, not just dropped
+ *    locally; and
+ *  - reports a truthful outcome (`not-shared`/`missing`/`stale`/`removed` with `ok`/`attempted`).
+ *
+ * Every decision and mutation — the actor/receipt fence, the shared-mode check, the current-generation
+ * validation, the exact-row claim-delete, the mode flip, the satellite purge, and the local audit —
+ * happens in ONE locked, fenced transaction, mirroring configureChannelCredential's lock stack
+ * (credential → provisioning-revocation → actor-offboard). Only the best-effort upstream revoke (a
+ * network call that must not run inside the DB transaction) happens after commit, against the token
+ * material claimed by the delete. Doing the claim-delete inside the same locked transaction as the
+ * mode read is what prevents a concurrent shared→session change from being clobbered, a newer shared
+ * credential from being deleted by a delayed command, and an offboarded actor from deleting before
+ * its stale issuance is rejected.
  */
 export async function disconnectChannelShared(input: {
   vault: Vault;
@@ -205,32 +216,83 @@ export async function disconnectChannelShared(input: {
   const provider = input.registry?.has(input.providerId) ? input.registry.get(input.providerId) : null;
   const registered = provider != null;
 
-  // No-op unless the channel is in shared mode — the key safety property (never touch a session or
-  // per-user channel).
-  const mode = await input.channelConfig.getMode(owner.teamId, input.channel, input.providerId);
-  if (mode !== 'shared') return { status: 'not-shared', ok: true, attempted: false };
+  type Claimed = Awaited<ReturnType<Vault['claimGenerationForRevoke']>>;
+  const decided = await input.vault.withCredentialLock(owner, input.providerId, async (_locked, tx) =>
+    withProvisioningRevocationLock(tx, owner, input.providerId, (revocationTx) =>
+      withUserOffboardLock(revocationTx, input.identity, async (fencedTx): Promise<
+        { status: 'not-shared' | 'stale' | 'missing' } | { status: 'removed'; claimed: Claimed }
+      > => {
+        // Actor/receipt fence: an actor offboarded at or after this request's issuance is rejected
+        // BEFORE any mutation — a stale authorization must never delete a credential (finding #1).
+        // A provisioning-revocation tombstone deliberately does NOT block here: unlike setup, a
+        // durable break-glass marker must not permanently wedge the recovery path into `stale`.
+        const offboardedAt = await latestUserOffboardTombstone(fencedTx, input.identity);
+        if (tombstoneBlocks(offboardedAt, input.issuance)) return { status: 'stale' };
 
-  // Atomic claim-delete of the channel-owned credential + best-effort upstream revoke — the same
-  // primitive/semantics as the personal disconnect (deleteForRevoke serializes on the credential lock).
-  const claimed = await input.vault.deleteForRevoke(owner, input.providerId, registered);
-  let ok = !claimed.removed || !registered || claimed.dryRun;
+        // Shared-mode check INSIDE the lock: a session/per-user channel is never touched, and a
+        // concurrent shared→session change is either already visible here (⇒ not-shared) or blocked
+        // on the credential lock until we commit (⇒ it applies on top, never silently clobbered).
+        const mode = await input.channelConfig.getMode(owner.teamId, input.channel, input.providerId, fencedTx);
+        if (mode !== 'shared') return { status: 'not-shared' };
+
+        // Current-generation validation: only the credential generation that already existed at this
+        // request's issuance is deletable. A strictly-newer shared credential (re-configured after the
+        // command was authorized) is left intact — the delayed command must not delete it (finding #1).
+        const existing = await fencedTx.get<{ id: string; generation_at: number }>(
+          `SELECT id, generation_at FROM connection
+             WHERE team_id=? AND owner_kind='channel' AND owner_id=? AND provider=?`,
+          [owner.teamId, owner.id, input.providerId],
+        );
+        if (existing && existing.generation_at > input.issuance) return { status: 'stale' };
+
+        // Return the channel to per-user + purge satellites + audit the mode change — always, once we
+        // are committed to acting on a shared channel. The purge advances the channel-interaction
+        // tombstone, which fences any stalled setup request from recreating the credential.
+        const flipAndAudit = async () => {
+          await writeChannelMode(input.channelConfig, owner.teamId, input.channel, input.providerId, 'per-user', fencedTx);
+          await purgeChannelInteractionState(fencedTx, owner.teamId, input.channel, input.providerId);
+          await input.audit.record('config', input.identity, input.providerId, {
+            owner: 'channel', channel: input.channel, mode: 'per-user',
+          }, undefined, fencedTx);
+        };
+
+        // `missing`: shared mode with no stored credential (a prior break-glass revoke left the mode).
+        // Still recover the channel to per-user, but there is nothing to delete or revoke.
+        if (!existing) {
+          await flipAndAudit();
+          return { status: 'missing' };
+        }
+
+        // Exact-row claim-delete (+ satellite purge) in this same transaction, decoded for the
+        // post-commit upstream revoke. Unregistered providers pass decrypt=false (ciphertext untouched).
+        const claimed = await input.vault.claimGenerationForRevoke(fencedTx, owner, input.providerId, existing.id, registered);
+        await flipAndAudit();
+        return { status: 'removed', claimed };
+      })));
+
+  if (decided.status !== 'removed') {
+    if (decided.status === 'not-shared') return { status: 'not-shared', ok: true, attempted: false };
+    if (decided.status === 'stale') return { status: 'stale', ok: false, attempted: false };
+    return { status: 'missing', ok: true, attempted: false };
+  }
+
+  // Post-commit best-effort upstream revoke, mirroring the personal disconnect's truth table exactly
+  // (removeUserConnection): `ok` starts true when there is no revocation debt to leave behind (nothing
+  // removed, a registered provider whose revoke will run, or a synthetic dry-run row) and only goes
+  // false if a DUE revoke fails or could not run. `!registered` (unknown revoke contract) is debt.
+  const claimed = decided.claimed;
+  let ok = !claimed.removed || registered || claimed.dryRun;
   let attempted = false;
   if (provider && claimed.removed && !claimed.dryRun && (provider.revoke || provider.revokeUrl)) {
     const upstream = await revokeProviderCredential(provider, claimed);
     attempted = upstream.attempted;
     if (!upstream.ok) ok = false;
   }
-
-  // Flip governance back to per-user (fenced + audited). If the fence is stale the credential is
-  // already removed/revoked; a retry re-flips the mode (it will read `not-shared` only once flipped).
-  const fenced = await input.vault.withCredentialLock(owner, input.providerId, async (_locked, tx) =>
-    withUserInteractionFence(tx, input.identity, input.issuance, async (fencedTx) => {
-      await writeChannelMode(input.channelConfig, owner.teamId, input.channel, input.providerId, 'per-user', fencedTx);
-      await purgeChannelInteractionState(fencedTx, owner.teamId, input.channel, input.providerId);
-      await input.audit.record('config', input.identity, input.providerId, {
-        owner: 'channel', channel: input.channel, mode: 'per-user',
-      }, undefined, fencedTx);
-    }));
-  if (fenced.status !== 'current') return { status: 'removed', ok: false, attempted };
+  // Durable revoke-outcome audit (STR-4: same 'revoke' action + attempted/skipped meta shape as the
+  // break-glass channel revoke). Only a committed delete is a revoke event; `missing`/no-op are not.
+  await input.audit.record('revoke', input.identity, input.providerId, {
+    owner: 'channel', channel: input.channel,
+    ...(attempted ? { ok } : { upstream: 'skipped' }),
+  });
   return { status: 'removed', ok, attempted };
 }

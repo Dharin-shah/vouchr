@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { Audit, AuditMeta } from './audit';
-import { authorizeProvider, resolveCredentialOwner } from './authz';
+import { authorizeProvider, governanceChannelOf, resolveCredentialOwner } from './authz';
 import { ChannelConfig } from './channelConfig';
 import {
   userInteractionIsCurrent,
@@ -227,6 +227,14 @@ export interface CredentialUseValidationInput {
   channelTools?: ChannelTools | null;
   /** `undefined` = core/Bolt default store; `null` = historical per-user/no-mode semantics. */
   channelConfig?: ChannelConfig | null;
+  /**
+   * The mutable-governance scope for the tool-allowlist + mode re-check; null in a personal
+   * conversation so a retained handle / approval in a DM is not invalidated by deny-by-default.
+   * Static Policy still evaluates against `binding.channel` (the real delivery channel). Omitted →
+   * derived from `binding.channel` (governanceChannelOf), so a 1:1 DM is exempt even for a caller
+   * that carries no channel_type; the channel_type-aware adapters pass the exact value.
+   */
+  governableChannel?: string | null;
 }
 
 async function credentialUseStateForCurrentActor(
@@ -238,26 +246,32 @@ async function credentialUseStateForCurrentActor(
     return 'authorization';
   }
 
+  // Governance (tool allowlist + mode + owner resolution) is scoped to the mutable-governance channel
+  // — null in a DM so a personal retained handle survives; static Policy keeps the real delivery
+  // channel (row.channel) so a policy-deny of a DM still denies. Where non-null it equals row.channel.
+  const governableChannel = input.governableChannel !== undefined
+    ? input.governableChannel
+    : governanceChannelOf(row.channel);
   const channelTools = input.channelTools === undefined ? new ChannelTools(db) : input.channelTools ?? undefined;
-  if ((await authorizeProvider(input.policy, channelTools, principal, row.channel, row.provider, db)) !== null) {
+  if ((await authorizeProvider(input.policy, channelTools, principal, row.channel, governableChannel, row.provider, db)) !== null) {
     return 'authorization';
   }
 
   const channelConfig = input.channelConfig === undefined ? new ChannelConfig(db) : input.channelConfig;
-  const mode = row.channel && channelConfig
-    ? await channelConfig.getMode(row.teamId, row.channel, row.provider, db)
+  const mode = governableChannel && channelConfig
+    ? await channelConfig.getMode(row.teamId, governableChannel, row.provider, db)
     : null;
   let resolved: ReturnType<typeof resolveCredentialOwner>;
   if (mode === 'shared') {
     resolved = resolveCredentialOwner({
-      path: 'channel', mode, principal, channel: row.channel, eligible: row.channel !== null,
+      path: 'channel', mode, principal, channel: governableChannel, eligible: governableChannel !== null,
     });
   } else {
-    const sessionCredentialId = mode === 'session' && row.channel && row.thread
-      ? await new SessionGrants(db).grantedCredentialId(principal, row.channel, row.thread, row.provider)
+    const sessionCredentialId = mode === 'session' && governableChannel && row.thread
+      ? await new SessionGrants(db).grantedCredentialId(principal, governableChannel, row.thread, row.provider)
       : null;
     resolved = resolveCredentialOwner({
-      path: 'user', mode, principal, channel: row.channel, thread: row.thread,
+      path: 'user', mode, principal, channel: governableChannel, thread: row.thread,
       hasSessionGrant: sessionCredentialId === row.credentialId,
     });
   }

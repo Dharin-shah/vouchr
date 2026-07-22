@@ -480,10 +480,10 @@ therefore write the same rows that `GET /v1/admin/config`, `POST /v1/manifest`, 
 `/v1/mcp` read and enforce. Team, channel, and admin authority come only from the signed identity
 assertion; same-named request-body fields have no authority.
 
-A channel with no `channel_tool` rows remains backward-compatible: every registered provider is
-enabled. The first admin mutation atomically materializes the full provider list before applying the
-requested changes, so toggling one provider cannot silently disable its bystanders, including under
-concurrent first writes. The materialization, final changes, and canonical config audit rows commit
+A channel with no `channel_tool` rows enables no provider (deny-by-default); an admin opts each one in
+per channel before its first use. The first admin mutation atomically materializes the full provider
+list before applying the requested changes, so toggling one provider cannot silently change its
+bystanders, including under concurrent first writes. The materialization, final changes, and canonical config audit rows commit
 as one transaction. A disabled brokered provider is refused before credential resolution or upstream
 I/O. Service tools carry the same stored and rendered Enable/Disable bit, but Vouchr never
 executes their service-authenticated egress; the trusted host must enforce a disabled service row.
@@ -796,7 +796,8 @@ distinguish an intentional lockdown from a mistaken rollout.
 
 Static `Policy` does not replace `ChannelTools`. Policy is operator-owned deployment configuration;
 `ChannelTools` is the PostgreSQL-backed, runtime-mutable allowlist changed through Slack or
-`POST /v1/admin/tools` (with the backward-compatible “no rows means enabled” default). The broker
+`POST /v1/admin/tools` (deny-by-default: with no rows no provider is enabled until an admin opts it
+in). The broker
 applies their intersection: the static policy **and** the mutable channel setting must both allow a
 provider. Use policy for reviewed deployment boundaries and `ChannelTools` for day-to-day admin
 enablement; neither can override a denial by the other.
@@ -1092,13 +1093,13 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
   additionally `app_mentions:read` when this app receives the agent's mentions.
 - **Events:** `app_home_opened`, `user_change` (the latter drives auto-revoke on deactivation);
   additionally `app_mention` when this app is also the agent.
-- **Interactivity:** enabled, and **required** for the Connect button and the key/configure modals.
+- **Interactivity:** enabled, and **required** for the Connect button and the key/connect-shared modals.
 - **Slash command:** bare `/vouchr` opens the settings modal (with a truthful status fallback if
   Slack cannot open it); `/vouchr help` is the canonical current command list. It includes personal
-  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and admin `configure <provider>`,
-  `mode <provider> <shared|per-user|session>`, `enable`/`disable <provider>`, `stats`, and
-  `audit channel`.
-- **Who may configure:** by default the `configure`/`mode`/`enable`/`disable` commands are
+  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and admin
+  `connect-shared`/`disconnect-shared <provider>`, `mode <provider> <shared|per-user|session>`,
+  `enable`/`disable <provider>`, `stats`, and `audit channel`.
+- **Who may configure:** by default the `connect-shared`/`disconnect-shared`/`mode`/`enable`/`disable` commands are
   **workspace-admin-only**. Set `allowChannelCreatorConfig: true` to also let a channel's **creator**
   self-serve their own channel's config (off by default — in Slack anyone can create a public channel,
   so `creator` isn't a privileged role). A custom `isAdmin` still fully overrides either default.
@@ -1108,7 +1109,7 @@ Wire the four hooks (see the README example):
 ```ts
 app.use(vouchr.middleware);
 vouchr.mountRoutes(receiver.router);  // OAuth callback at $baseUrl/vouchr/oauth/callback
-vouchr.registerCommands(app);         // /vouchr + the modals (mandatory for key/configure flows)
+vouchr.registerCommands(app);         // /vouchr + the modals (mandatory for key/connect-shared flows)
 vouchr.registerOffboarding(app);      // user_change → revoke a deactivated user's connections
 setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 ```

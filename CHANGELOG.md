@@ -605,16 +605,10 @@ All notable changes to this project are documented here. This project adheres to
   of clobbering it; residual caveat: on a user's very first open there is no current view, so a
   host with its own Home tab races Vouchr once — from the next open the `callback_id` decides.
 
-  **Behavior change:** the first `/vouchr enable|disable` (or Home Enable/Disable click) on a
-  channel with no explicit tool rows now materializes the full allowlist, so flipping one provider
-  no longer silently disables every other. Previously a first `/vouchr disable X` flipped the
-  channel into allowlist mode and knocked out all unlisted providers channel-wide while auditing
-  only X; the config modal already materialized — the shared helper now applies the same rule to
-  all surfaces. Only the provider the admin actually targeted is audited. Additionally,
-  `/vouchr enable|disable` and `/vouchr configure` (and their App Home buttons) now refuse
-  ineligible channel classes — archived, externally shared / Slack Connect, DMs — with the same
-  fail-closed rule `mode` already enforced; previously the tool-allowlist bit could be flipped and
-  the credential modal opened in an externally shared channel.
+  **Behavior change:** `/vouchr enable|disable` and `/vouchr connect-shared` (and their App Home
+  buttons) now refuse ineligible channel classes — archived, externally shared / Slack Connect,
+  DMs — with the same fail-closed rule `mode` already enforced; previously the tool-allowlist bit
+  could be flipped and the credential modal opened in an externally shared channel.
 
 - **Credential health notifications** (#117). When a token refresh fails DEFINITIVELY
   (`invalid_grant`, or a bare 400/401 from the token endpoint — classified by the new exported

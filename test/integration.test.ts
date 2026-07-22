@@ -138,6 +138,63 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
   }
 });
 
+// The DM exemption must hold through the WHOLE lifecycle, not just the connect preflight: a personal
+// conversation (id 'D…' / channel_type 'im') is ungoverned, so with NO channel enable the manifest
+// reports the provider ENABLED, connect() reaches consent (not tool-disabled), and — the regression the
+// reviewer reproduced — the FIRST fetch on the retained handle succeeds instead of throwing
+// InteractionStateChangedError from a governance re-check against the DM channel. Static Policy still
+// evaluates against the real DM channel; that is exercised in the authz unit tests.
+test('integration: a per-user provider in a DM works end to end with no channel enable (#2 first-fetch)', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const mock = await startMockProvider();
+  try {
+    const provider = defineProvider({
+      id: 'mock', authorizeUrl: `${mock.base}/authorize`, tokenUrl: `${mock.base}/token`,
+      scopesDefault: ['read'], egressAllow: ['127.0.0.1'], refresh: 'none', pkce: true,
+      clientId: 'cid', clientSecret: 'csec',
+      accountProbe: async (tok) => {
+        const r = await fetch(`${mock.base}/api/me`, { headers: { Authorization: `Bearer ${tok}` } });
+        return r.ok ? (await r.json()).login : null;
+      },
+    });
+    const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
+    // Deliberately NO setChannelToolEnabled for the DM — deny-by-default must not reach it.
+    let callback: any;
+    lan.mountRoutes({ get: (_p: string, h: any) => (callback = h) });
+    const posts: any[] = [];
+    const client = { chat: { postEphemeral: async (a: any) => posts.push(a), postMessage: async (a: any) => posts.push(a) } };
+
+    // Run the middleware exactly as Bolt would for a 1:1 DM (id 'D…' AND channel_type 'im').
+    const ctx: any = {};
+    await lan.middleware({
+      context: ctx, client,
+      event: { channel: 'D0PERSONAL', channel_type: 'im', user: 'U1', team: 'T1' },
+      next: async () => {},
+    });
+
+    // The manifest reports the provider ENABLED in the DM (mode null), not deny-by-default disabled.
+    const manifest = await ctx.vouchr.toolManifest();
+    assert.deepEqual(manifest.find((m: any) => m.provider === 'mock'), {
+      provider: 'mock', mode: null, enabled: true, identity: 'acting_human',
+    });
+
+    // connect() reaches consent (a Connect prompt), not a tool-disabled refusal.
+    await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
+    const state = new URL(posts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+
+    // Complete OAuth, then the FIRST fetch on the retained handle must succeed (the reproduced bug threw).
+    const res = fakeRes();
+    await callback({ query: { code: 'AUTHCODE', state }, headers: {} }, res);
+    assert.equal(res.statusCode, 200);
+    const handle = await ctx.vouchr.connect('mock');
+    const apiRes = await handle.fetch(`${mock.base}/api/me`);
+    assert.equal(apiRes.status, 200);
+    assert.equal(mock.reqs.find((r) => (r.url ?? '').startsWith('/api/me'))!.auth, 'Bearer AT123');
+  } finally {
+    await mock.close();
+  }
+});
+
 test('integration: maximum-valid OAuth scopes still produce one bounded connect prompt', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const scopes = Array.from({ length: 48 }, (_, i) => `scope-${i}`);

@@ -182,14 +182,17 @@ Keep this terminal visible in the recording — it proves the token never appear
 In your Slack workspace, `#demo` channel:
 
 1. **Invite the bot to the channel** once: `/invite @vouchr`.
-2. **Mention it:** `@vouchr who am I on github?` (any text works — the mention is the trigger).
+2. **Enable GitHub in the channel** once — channels are deny-by-default: a channel admin runs
+   `/vouchr enable github` in `#demo`. Without it the first mention is refused with *"This provider is
+   disabled in the channel."* A direct message needs no enable — DMs are personal, not governed.
+3. **Mention it:** `@vouchr who am I on github?` (any text works — the mention is the trigger).
    → Vouchr posts a **private** *"Connect your GitHub account"* message with a **Connect** button.
    *Narrate: only you can see this — it's an ephemeral, not a channel post.*
-3. **Click Connect** → your browser opens GitHub's authorize screen → **Authorize** → you land on a
+4. **Click Connect** → your browser opens GitHub's authorize screen → **Authorize** → you land on a
    plain *"You're connected"* page.
-4. **Mention it again:** `@vouchr who am I on github?`
+5. **Mention it again:** `@vouchr who am I on github?`
    → In-thread reply: **`You are *yourlogin* on GitHub, N public repos.`**
-5. **Land the point** (this is the whole pitch): the bot code just ran
+6. **Land the point** (this is the whole pitch): the bot code just ran
    `gh.fetch('https://api.github.com/user')` — it **never saw the token**. Cut to the terminal to
    show there's no token in the logs. Optionally run `/vouchr status` to show the managed connection,
    and `/vouchr disconnect github` to show one-click revocation.

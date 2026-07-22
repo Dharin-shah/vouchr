@@ -17,6 +17,7 @@ import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listCha
 import { userOwner, channelOwner, type Owner } from '../core/owner';
 import {
   authorizeProvider,
+  governanceChannelOf,
   PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
@@ -1130,6 +1131,10 @@ export class ConnectContext {
             actorIssuedAt,
             channelTools: this.channelTools ?? null,
             channelConfig: this.channelConfig ?? null,
+            // A channel-owned (shared) credential only lives in a governed channel, so its channel IS
+            // the governance scope; a user-owned credential uses the DM-aware governance channel, so a
+            // retained handle in a DM is not re-invalidated by deny-by-default (policy still applies).
+            governableChannel: owner.kind === 'channel' ? channel : this.governableChannel,
           });
           if (state !== 'current') throw new InteractionStateChangedError('connection', state);
           return true;
@@ -1341,9 +1346,10 @@ export class ConnectContext {
   /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own
    * variant because its audit metadata carries `owner: 'channel'`. */
   private async requireProviderAuthorized(providerId: string): Promise<void> {
-    // Governance (tool allowlist) is scoped to governableChannel — null in a DM, so the allowlist is
-    // skipped there. Audit/delivery stay on the actual delivery channel.
-    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.governableChannel, providerId);
+    // Static Policy evaluates against the real delivery channel (this.channel — a DM included), while
+    // the mutable tool allowlist is scoped to governableChannel (null in a DM, so deny-by-default
+    // never locks a DM out). Audit/delivery stay on the actual delivery channel.
+    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, this.governableChannel, providerId);
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
       this.emit({ type: 'policy_denied', provider: providerId });
@@ -1428,6 +1434,7 @@ export class ConnectContext {
               new ChannelTools(tx),
               this.identity,
               this.channel,
+              this.governableChannel,
               providerId,
             )) === null;
           },
@@ -1748,8 +1755,9 @@ export class ConnectContext {
     const connectIssuedAt = await this.provisioningIssuedAt();
     const { cfg, owner, channel } = this.channelTarget();
     // Same authorization gate as connect() (the shared core CHECK): a deny applies to shared channel
-    // creds too. Audit meta carries owner:'channel' here; like connect(), no policy_denied on tool-disabled.
-    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, providerId);
+    // creds too. A shared credential only exists in a governed channel, so governableChannel == the
+    // real channel here. Audit meta carries owner:'channel'; like connect(), no policy_denied on tool-disabled.
+    const denial = await authorizeProvider(this.policy, this.channelTools, this.identity, this.channel, this.governableChannel, providerId);
     if (denial === 'policy') {
       await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
       this.emit({ type: 'policy_denied', provider: providerId });
@@ -1816,7 +1824,9 @@ export class ConnectContext {
     return buildToolManifest({
       providerIds: this.providerIds, registry: this.registry, policy: this.policy,
       channelTools: this.channelTools, channelConfig: this.channelConfig,
-      principal: this.identity, channel: this.channel,
+      // Policy on the real delivery channel; tool-allowlist + mode on the governance scope (null in a
+      // DM, so personal providers report enabled there instead of deny-by-default disabled).
+      principal: this.identity, channel: this.channel, governanceChannel: this.governableChannel,
     });
   }
 
@@ -2711,14 +2721,11 @@ export async function createVouchr(opts: VouchrOptions) {
       const thread: string | null = args.event?.thread_ts ?? args.event?.ts ?? null;
       // A DM / group-DM is a personal conversation with no admins, so channel governance (the tool
       // allowlist + mode) does not apply — the request must NOT be denied by the deny-by-default
-      // allowlist there. The connect prompt is still delivered to `channel`, but the governable scope
-      // is null (like a channel-less context). Detection is API-call-free: Slack IM ids always start
-      // with 'D', and message/app_mention events also carry channel_type ('im'/'mpim').
-      const channelType: unknown = args.event?.channel_type;
-      const isPersonalConversation =
-        (typeof channel === 'string' && channel.startsWith('D')) ||
-        channelType === 'im' || channelType === 'mpim';
-      const governableChannel: string | null = isPersonalConversation ? null : channel;
+      // allowlist there. The connect prompt is still delivered to `channel` (and static Policy still
+      // evaluates against it), but the governable scope is null (like a channel-less context). ONE
+      // source of truth for the mapping (governanceChannelOf, STR-2), shared with the headless broker.
+      const channelType = typeof args.event?.channel_type === 'string' ? args.event.channel_type : undefined;
+      const governableChannel: string | null = governanceChannelOf(channel, channelType);
       args.context.vouchr = new ConnectContext({
         identity,
         channel,
@@ -2881,9 +2888,9 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /**
    * Register the `/vouchr` slash command (`status`, `disconnect <provider>`,
-   * `configure <provider>`), the channel-credential modal submit, and — when the app exposes
+   * `connect-shared <provider>`), the channel-credential modal submit, and — when the app exposes
    * `event` (Bolt does; older custom fakes may not) — the App Home console (#111) on
-   * `app_home_opened`. `configure` opens a private modal so the admin's secret is never typed
+   * `app_home_opened`. `connect-shared` opens a private modal so the admin's secret is never typed
    * into the channel (invariant 7 / T7).
    */
   function registerCommands(app: {
@@ -3108,6 +3115,9 @@ export async function createVouchr(opts: VouchrOptions) {
         const p = escapeMrkdwn(arg);
         if (outcome.status === 'not-shared') {
           return respond(`No shared *${p}* account is set in <#${escapeMrkdwn(chan)}> — nothing to disconnect. (This never changes a per-user or session channel.)`);
+        }
+        if (outcome.status === 'missing') {
+          return respond(`There was no shared *${p}* credential stored in <#${escapeMrkdwn(chan)}> (it may already have been revoked) — the channel now uses per-user credentials.`);
         }
         if (outcome.status === 'stale') {
           return respond(`The *${p}* setup changed before the change completed — run \`/vouchr disconnect-shared ${p}\` again.`);
@@ -3812,7 +3822,7 @@ export async function createVouchr(opts: VouchrOptions) {
       await publishHome(identity, client, channel);
     });
 
-    // Configure → the SAME gate + modal as `/vouchr configure` (STR-3). The modal's submit is the
+    // Configure → the SAME gate + modal as `/vouchr connect-shared` (STR-3). The modal's submit is the
     // existing CONFIGURE_CALLBACK flow, so the credential write path is untouched.
     app.action(HOME_CONFIGURE_ACTION, async ({ ack, body, client }: any) => {
       const provisioningReceivedAt = process.hrtime.bigint();
@@ -4049,10 +4059,12 @@ export async function createVouchr(opts: VouchrOptions) {
                 decisionTx,
               );
               if (currentMode !== 'session') return false;
+              // Session mode only exists in a governed channel, so the governance scope IS row.channel.
               return (await authorizeProvider(
                 policy,
                 new ChannelTools(decisionTx),
                 identity,
+                row.channel,
                 row.channel,
                 row.provider,
               )) === null;

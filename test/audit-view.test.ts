@@ -69,7 +69,7 @@ test('audit: meta contents are never rendered in the Slack view', async (t) => {
 
 test('audit: a stored value cannot forge a mrkdwn link/mention (escaped in the view)', async (t) => {
   const { audit, run } = await harness(t);
-  // Mirrors the real vector: an unvalidated `/vouchr configure <arg>` denial writes attacker text
+  // Mirrors the real vector: an unvalidated `/vouchr connect-shared <arg>` denial writes attacker text
   // into the provider column. It must render inert, never as a live <…|link> or <@mention>.
   await audit.record('inject', id('U_A'), '<https://evil.com|Re-authorize Vouchr>', { host: 'x' });
   const json = JSON.stringify(await run('audit', 'U_A'));

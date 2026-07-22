@@ -354,7 +354,7 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
     providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: tools,
     channelConfig: config, principal: ID, channel: 'C_FIN',
   });
-  assert.equal(await authorizeProvider(undefined, tools, ID, 'C_FIN', 'mcp'), 'tool-disabled');
+  assert.equal(await authorizeProvider(undefined, tools, ID, 'C_FIN', 'C_FIN', 'mcp'), 'tool-disabled');
   assert.deepEqual(manifest[0], {
     provider: 'mcp', mode: 'session', enabled: false, identity: 'acting_human',
   });
@@ -373,7 +373,7 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
     providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: configuredTools,
     principal: ID, channel: 'C_FIN',
   });
-  assert.equal(await authorizeProvider(undefined, configuredTools, ID, 'C_FIN', 'mcp'), 'tool-disabled');
+  assert.equal(await authorizeProvider(undefined, configuredTools, ID, 'C_FIN', 'C_FIN', 'mcp'), 'tool-disabled');
   assert.equal(configuredManifest[0].enabled, false);
 
   // Existing JavaScript wrappers may implement only the pre-batch public methods. They remain valid.

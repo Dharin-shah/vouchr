@@ -643,7 +643,7 @@ operator must still satisfy the Slack/admin predicate to use the built-in contro
    `allowChannelCreatorConfig` is enabled, users may see the channel picker first; controls appear
    only after selecting a channel they created, and other selections fail closed.
 3. The admin picks an internal public/private channel.
-4. Each brokered provider row shows mode, Enable/Disable, and Configure credential controls.
+4. Each brokered provider row shows mode, Enable/Disable, and Connect shared account controls.
 5. Mode and enablement changes persist immediately and the Home view refreshes.
 6. Errors and denials are private.
 
@@ -654,10 +654,12 @@ Enable/Disable bit is manifest metadata that the trusted host—not Vouchr—mus
 admin route persists that bit in the same table as Bolt, and admin config plus the channel manifest
 report it consistently; Vouchr's fetch/MCP routes still refuse service credentials outright.
 
-Enable/Disable is backward-compatible runtime state, not deny-by-default policy. A channel with no
-`channel_tool` rows treats all registered providers as enabled. Bolt's first toggle materializes the
-full current provider list so changing one provider does not change the others. Static `Policy` is
-the outer “only these channels” boundary; mutable tool state is the inner admin switch.
+Enable/Disable is deny-by-default channel policy. A channel with no `channel_tool` rows enables **no**
+provider; an admin opts each one in per channel (`/vouchr enable <provider>` or the App Home toggle)
+before its first use there, and untouched providers stay off. Direct messages are personal, not
+governed, so they never require an enable. Bolt's first toggle still materializes the full provider
+list so changing one provider does not change the others. Static `Policy` is the outer “only these
+channels” boundary; mutable tool state is the inner admin switch.
 
 The equivalent slash-command flow is:
 

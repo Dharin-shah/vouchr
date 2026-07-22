@@ -129,6 +129,12 @@ echo "==> require() every published entrypoint (CJS exports map)"
   if (typeof root.ConnectContext?.prototype?.recoverBrokerDenial !== 'function') {
     throw new Error('packed root ConnectContext is missing recoverBrokerDenial');
   }
+  // The OAuth Connect button action_id must be a public runtime export: a custom host that renders
+  // connectBlocks registers its no-op ack against this exact string, or Slack shows an
+  // Operation-timed-out error. A hard-coded copy would drift; the package is the single source (#5).
+  if (typeof root.OAUTH_CONNECT_ACTION !== 'string' || root.OAUTH_CONNECT_ACTION.length === 0) {
+    throw new Error('packed root is missing the OAUTH_CONNECT_ACTION action id export');
+  }
   if ('ConnectContext' in headless) {
     throw new Error('Bolt ConnectContext leaked into the headless runtime entrypoint');
   }
@@ -172,7 +178,8 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import {
-  createVouchr, disconnectProvider, type ConnectContext, type DbInstallationStoreOptions,
+  createVouchr, disconnectProvider, OAUTH_CONNECT_ACTION,
+  type ConnectContext, type DbInstallationStoreOptions,
 } from '@vouchr/core';
 import {
   isVouchrErrorCode as isRootVouchrErrorCode, type BrokerDenialRecovery,
@@ -203,6 +210,9 @@ const installationMigration: DbInstallationStoreOptions = {
   lockdown: true,
 };
 void installationMigration;
+// A typed host imports the OAuth Connect action_id from the package root (not an internal path).
+const oauthConnectActionId: string = OAUTH_CONNECT_ACTION;
+void oauthConnectActionId;
 const identityToken = mintIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1' }, identity);
 void verifyIdentity(identityToken, identity);
 type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : false;

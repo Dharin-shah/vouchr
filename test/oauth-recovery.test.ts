@@ -728,6 +728,76 @@ test('Bolt sends one private recovery DM for an attributable callback and none f
   }
 });
 
+// The post-OAuth SUCCESS notification is a production-path contract, so it is exercised through the
+// real WebClient (patched apiCall), not a stub that never fires: a durable private DM AND — when the
+// prompt was posted in a channel — a channel/user-bound ephemeral "green signal", with no duplicate on
+// a replayed (consumed) state and NO channel ephemeral for a channel-less connect.
+test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the DM when channel-less (#5)', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
+  const db = await openTestDb(t);
+  const apiCalls: Array<{ method: string; args: any }> = [];
+  const prototype = WebClient.prototype as any;
+  const realApiCall = prototype.apiCall;
+  prototype.apiCall = async (method: string, args: any) => {
+    apiCalls.push({ method, args });
+    return { ok: true, channel: args.channel, ts: '1.0' };
+  };
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => new Response(
+    JSON.stringify({ access_token: 'AT-success', token_type: 'bearer', scope: 'read' }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )) as typeof fetch;
+  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 50)); // let the fire-and-forget notify settle
+  try {
+    const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db, botToken: 'xoxb-test' });
+    let callback: any;
+    vouchr.mountRoutes({ get: (_p: string, h: any) => { callback = h; } });
+
+    // (A) in-channel connect (C1) → after OAuth, both a durable DM and a channel-bound ephemeral fire.
+    const prompts: any[] = [];
+    const context = await contextFor(vouchr, {
+      chat: { postEphemeral: async (a: any) => prompts.push(a), postMessage: async (a: any) => prompts.push(a) },
+    });
+    await assert.rejects(() => context.connect('acme'), ConsentRequiredError);
+    const state = new URL(prompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    const res = fakeResponse();
+    await callback({ query: { state, code: 'AUTHCODE' } }, res);
+    await flush();
+    assert.equal(res.statusCode, 200);
+    assert.equal(apiCalls.filter((c) => c.method === 'chat.postMessage' && c.args.channel === ID.userId).length, 1, 'a durable success DM is delivered to the user');
+    const eph = apiCalls.filter((c) => c.method === 'chat.postEphemeral' && c.args.channel === 'C1' && c.args.user === ID.userId);
+    assert.equal(eph.length, 1, 'a channel/user-bound ephemeral green signal is delivered where the prompt was');
+
+    // (B) replaying the now-consumed state must NOT re-deliver the channel confirmation.
+    const replay = fakeResponse();
+    await callback({ query: { state, code: 'AUTHCODE' } }, replay);
+    await flush();
+    assert.equal(apiCalls.filter((c) => c.method === 'chat.postEphemeral' && c.args.channel === 'C1').length, 1, 'no duplicate channel confirmation on a replayed callback');
+
+    // (C) channel-less connect (a different user, no event channel) → only the durable DM, no ephemeral.
+    const clPrompts: any[] = [];
+    const cl: any = {};
+    await vouchr.middleware({
+      context: cl,
+      client: { chat: { postEphemeral: async (a: any) => clPrompts.push(a), postMessage: async (a: any) => clPrompts.push(a) } },
+      event: { user: 'U2', team: ID.teamId }, // no channel → channel-less (ungoverned) context
+      next: async () => {},
+    });
+    await assert.rejects(() => cl.vouchr.connect('acme'), ConsentRequiredError);
+    const clState = new URL(clPrompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    const clBefore = apiCalls.length;
+    const clRes = fakeResponse();
+    await callback({ query: { state: clState, code: 'AUTHCODE' } }, clRes);
+    await flush();
+    const clNew = apiCalls.slice(clBefore);
+    assert.ok(clNew.some((c) => c.method === 'chat.postMessage' && c.args.channel === 'U2'), 'a channel-less success still DMs the user');
+    assert.ok(!clNew.some((c) => c.method === 'chat.postEphemeral'), 'a channel-less success posts no channel ephemeral');
+  } finally {
+    prototype.apiCall = realApiCall;
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('a provider-side callback error is not messaged as a user denial and is never echoed', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   const db = await openTestDb(t);

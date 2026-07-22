@@ -111,25 +111,51 @@ export async function snapshotChannelModes(
 }
 
 /**
+ * A DM or group-DM is a PERSONAL conversation that per-channel admin governance (the mutable tool
+ * allowlist + credential mode) does not reach: there are no channel admins to enable a provider, so
+ * deny-by-default must NOT lock it out. Map a VERIFIED delivery channel to its mutable-governance
+ * scope — null for a personal conversation, else the channel itself. Static Policy is a DIFFERENT
+ * axis (deployment config, not admin-mutable) and keeps evaluating against the real delivery channel,
+ * so a deployment can still deny a provider in DMs / allow it only in named channels.
+ *
+ * `channelType` is Slack's event `channel_type` ('im'/'mpim'); it identifies a group DM whose id is
+ * not `D…`. The id-prefix check alone catches a 1:1 DM when only the channel string is available (a
+ * signed broker claim, or a retained-use re-check that carries no channel_type).
+ * ponytail: a group-DM whose id is neither `D…` nor accompanied by channel_type stays governed —
+ * reachable only on a re-check that lost the original channel_type, never on the connect path.
+ */
+export function governanceChannelOf(channel: string | null, channelType?: string): string | null {
+  if (channel === null) return null;
+  if (channel.startsWith('D') || channelType === 'im' || channelType === 'mpim') return null;
+  return channel;
+}
+
+/**
  * The credential-use authorization gate, identical for both adapters: Policy first, then the per-channel
- * tool allowlist (deny-by-default: an unconfigured channel allows nothing — see ChannelTools.isEnabled). The
- * channel/team are the VERIFIED ones (Slack event or signed claim), never a request body. Returns the
- * denial reason (or null); the caller decides audit/emit/error — deliberately, because the two adapters
- * differ there (e.g. the broker emits policy_denied on a tool-disabled deny and Bolt does not).
+ * tool allowlist (deny-by-default: an unconfigured channel allows nothing — see ChannelTools.isEnabled).
+ * The channel/team are the VERIFIED ones (Slack event or signed claim), never a request body. Returns
+ * the denial reason (or null); the caller decides audit/emit/error — deliberately, because the two
+ * adapters differ there (e.g. the broker emits policy_denied on a tool-disabled deny and Bolt does not).
+ *
+ * TWO channel scopes, deliberately distinct (see governanceChannelOf): `channel` is the real delivery
+ * channel that static Policy evaluates against (a DM included); `governanceChannel` is the mutable
+ * tool-allowlist scope, null in a personal conversation so deny-by-default never locks a DM out.
  */
 export async function authorizeProvider(
   policy: Policy | undefined,
   channelTools: ChannelTools | undefined,
   principal: SlackIdentity,
   channel: string | null,
+  governanceChannel: string | null,
   provider: string,
   db?: Db,
 ): Promise<AuthzDenial | null> {
   const policyAllows = !policy || policy.check(provider, channel);
-  // Resolve the tool-allowlist bit only when policy would allow AND there's a channel + store to
-  // restrict against — so a policy-deny still never runs the allowlist query (unchanged short-circuit).
-  const toolAllowed = policyAllows && channel && channelTools
-    ? await channelTools.isEnabled(principal.teamId, channel, provider, db)
+  // Resolve the tool-allowlist bit only when policy would allow AND there's a GOVERNANCE channel +
+  // store to restrict against — so a policy-deny still never runs the allowlist query (unchanged
+  // short-circuit), and a personal conversation (governanceChannel null) is never allowlist-gated.
+  const toolAllowed = policyAllows && governanceChannel && channelTools
+    ? await channelTools.isEnabled(principal.teamId, governanceChannel, provider, db)
     : true;
   return authorizeVerdict(policyAllows, toolAllowed);
 }
@@ -150,7 +176,11 @@ export interface ToolManifestBuildOptions {
   channelTools?: ChannelTools;
   channelConfig?: ChannelConfig;
   principal: SlackIdentity;
+  /** The real delivery channel static Policy evaluates against (a DM included). */
   channel: string | null;
+  /** The mutable-governance scope (tool allowlist + mode); null in a personal conversation so a DM
+   *  reports personal providers enabled. Defaults to `channel` when omitted (a governed channel). */
+  governanceChannel?: string | null;
 }
 
 /** Build the public manifest and retain the raw allowlist predicate used to produce it. Admin
@@ -161,17 +191,21 @@ export async function buildToolManifestSnapshot(o: ToolManifestBuildOptions): Pr
   toolAllowed: (provider: string) => boolean;
 }> {
   if (o.providerIds.length === 0) return { tools: [], toolAllowed: () => true };
+  // Governance (tool allowlist + mode) is scoped to the mutable-governance channel — null in a DM, so
+  // the manifest reports personal providers enabled there; static Policy still evaluates against the
+  // real delivery channel below, so a policy-denied provider is still reported disabled in a DM.
+  const governanceChannel = o.governanceChannel === undefined ? o.channel : o.governanceChannel;
   // Two channel-scoped batch reads (tool allowlist and mode) — a fixed query count regardless of
-  // provider count, replacing the per-provider isEnabled/getMode fan-out (#209). With no channel
-  // (or no store) there is nothing channel-scoped to read: tools unrestricted and mode null.
+  // provider count, replacing the per-provider isEnabled/getMode fan-out (#209). With no governance
+  // channel (or no store) there is nothing channel-scoped to read: tools unrestricted and mode null.
   // These facts are independent. Dispatch their reads together so a slow database costs one
   // round-trip window, not two serial windows (important before Slack trigger_id expiry).
   const [toolAllowed, modeOf] = await Promise.all([
-    o.channel && o.channelTools
-      ? snapshotToolAllowlist(o.channelTools, o.principal.teamId, o.channel, o.providerIds)
+    governanceChannel && o.channelTools
+      ? snapshotToolAllowlist(o.channelTools, o.principal.teamId, governanceChannel, o.providerIds)
       : Promise.resolve((_provider: string) => true),
-    o.channel && o.channelConfig
-      ? snapshotChannelModes(o.channelConfig, o.principal.teamId, o.channel, o.providerIds)
+    governanceChannel && o.channelConfig
+      ? snapshotChannelModes(o.channelConfig, o.principal.teamId, governanceChannel, o.providerIds)
       : Promise.resolve((_provider: string): ChannelMode | null => null),
   ]);
   const tools = o.providerIds.map((provider) => {

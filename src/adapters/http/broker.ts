@@ -23,6 +23,7 @@ import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/
 import { setChannelCredentialMode } from '../../core/channelCredential';
 import {
   authorizeProvider,
+  governanceChannelOf,
   PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
@@ -873,8 +874,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
     // The Policy + channel-tool CHECK is the shared core decision; the broker keeps its own audit/emit/
     // status mapping (it emits policy_denied on BOTH a policy and a tool-disabled deny — the Bolt path does
-    // not emit on tool-disabled, so the mapping deliberately stays per-adapter).
-    const denial = await authorizeProvider(opts.policy, opts.channelTools, acting, channel, provider);
+    // not emit on tool-disabled, so the mapping deliberately stays per-adapter). Static Policy sees the
+    // signed delivery channel; the tool allowlist sees the governance scope (null for a signed DM claim,
+    // so the broker no longer denies personal DM conversations by deny-by-default) — same split as Bolt.
+    const denial = await authorizeProvider(opts.policy, opts.channelTools, acting, channel, governanceChannelOf(channel), provider);
     if (denial === 'policy') {
       await opts.audit.record('denied', acting, provider, { channel });
       emit({ type: 'policy_denied', provider });
@@ -1799,7 +1802,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const tools = await buildToolManifest({
       providerIds, registry,
       policy: opts.policy, channelTools: opts.channelTools, channelConfig: opts.channelConfig,
-      principal, channel: claims.channel || null, // '' (a channel-less token) behaves like Bolt's DM context
+      // Policy on the signed delivery channel; tool-allowlist + mode on the governance scope (null for
+      // a signed DM claim), so the broker manifest reports a DM's personal providers enabled — matching
+      // Bolt. '' (a channel-less token) already behaves like a DM context in both.
+      principal, channel: claims.channel || null, governanceChannel: governanceChannelOf(claims.channel || null),
     });
     return { tools };
   }

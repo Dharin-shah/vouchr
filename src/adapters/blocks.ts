@@ -7,7 +7,7 @@ import type { AttributedOAuthCallbackOutcome } from '../core/oauthCallback';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
- *  unvalidated `/vouchr configure <arg>` denial writes `arg` there), so an admin's `audit channel`
+ *  unvalidated `/vouchr connect-shared <arg>` denial writes `arg` there), so an admin's `audit channel`
  *  view must not turn a stored string into a forged `<…|link>` or `<@user>` mention. */
 export const escapeMrkdwn = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 

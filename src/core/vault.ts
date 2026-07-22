@@ -636,28 +636,31 @@ export class Vault {
     } else {
       ({ row, fenced } = await this.claimDeleteFenced(owner, provider));
     }
+    return { ...(await this.decodeClaimedForRevoke(row, decrypt)), fenced };
+  }
+
+  /** Shape and best-effort decode a just-claimed connection row for upstream REVOCATION only: a null
+   *  row is `removed:false`; a dry-run or `decrypt=false` row skips ciphertext (its trusted dry_run
+   *  bit is enough); otherwise both token columns are bounded-decoded independently so a row with two
+   *  hung KMS unwraps costs one deadline, not two, and one unreadable column still reports the other.
+   *  TTL-independent by design (a past-TTL row may still be live upstream) — never used for injection. */
+  private async decodeClaimedForRevoke(
+    row: { access_token_enc: unknown; refresh_token_enc: unknown; dry_run: unknown } | null,
+    decrypt: boolean,
+  ): Promise<{
+    removed: boolean;
+    accessToken: string | null;
+    refreshToken: string | null;
+    accessUnreadable: boolean;
+    refreshUnreadable: boolean;
+    dryRun: boolean;
+  }> {
     if (!row) {
-      return {
-        removed: false,
-        accessToken: null,
-        refreshToken: null,
-        accessUnreadable: false,
-        refreshUnreadable: false,
-        dryRun: false,
-        fenced,
-      };
+      return { removed: false, accessToken: null, refreshToken: null, accessUnreadable: false, refreshUnreadable: false, dryRun: false };
     }
     const dryRun = row.dry_run === 1;
     if (!decrypt || dryRun) {
-      return {
-        removed: true,
-        accessToken: null,
-        refreshToken: null,
-        accessUnreadable: false,
-        refreshUnreadable: false,
-        dryRun,
-        fenced,
-      };
+      return { removed: true, accessToken: null, refreshToken: null, accessUnreadable: false, refreshUnreadable: false, dryRun };
     }
     const decode = async (value: unknown): Promise<{ token: string | null; unreadable: boolean }> => {
       if (!value) return { token: null, unreadable: false };
@@ -667,8 +670,6 @@ export class Vault {
         return { token: null, unreadable: true };
       }
     };
-    // Access and refresh ciphertext are independent. Bound and decode them in parallel so a row with
-    // two hung KMS unwraps still costs one deadline, not two, while preserving per-token reporting.
     const [access, refresh] = await Promise.all([
       decode(row.access_token_enc),
       decode(row.refresh_token_enc),
@@ -680,8 +681,36 @@ export class Vault {
       accessUnreadable: access.unreadable,
       refreshUnreadable: refresh.unreadable,
       dryRun,
-      fenced,
     };
+  }
+
+  /**
+   * Claim-delete the EXACT credential generation inside a transaction the caller already holds (its
+   * credential lock + governance fence), returning decoded token material for a post-commit upstream
+   * revoke. The exact-id match plus the held credential lock make the delete atomic with the caller's
+   * own mode flip and satellite purge — a concurrent reconnect cannot slip a newer credential between
+   * the caller's generation snapshot and this delete. No provisioning-revocation marker is written:
+   * the caller's channel-interaction tombstone already fences a stalled setup request, and a durable
+   * marker would wedge a later legitimate re-configure. `decrypt=false` (unregistered provider) keeps
+   * ciphertext untouched. This is the channel-shared counterpart to the personal disconnect's
+   * prepare→claim→decode→revoke split; both route their local delete through claimPreparedDisconnect.
+   */
+  async claimGenerationForRevoke(
+    tx: Db,
+    owner: Owner,
+    provider: string,
+    expectedId: string,
+    decrypt: boolean,
+  ): Promise<{
+    removed: boolean;
+    accessToken: string | null;
+    refreshToken: string | null;
+    accessUnreadable: boolean;
+    refreshUnreadable: boolean;
+    dryRun: boolean;
+  }> {
+    const row = await this.claimPreparedDisconnect(tx, owner, provider, expectedId);
+    return this.decodeClaimedForRevoke(row, decrypt);
   }
 
   /** PostgreSQL-clock timestamp for a direct trusted user-provisioning call. Capture this before
