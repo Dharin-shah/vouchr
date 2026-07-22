@@ -747,7 +747,14 @@ test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the 
     JSON.stringify({ access_token: 'AT-success', token_type: 'bearer', scope: 'read' }),
     { status: 200, headers: { 'content-type': 'application/json' } },
   )) as typeof fetch;
-  const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 50)); // let the fire-and-forget notify settle
+  // Observable completion barrier: drain the event loop until the fire-and-forget notify has produced
+  // the expected calls (bounded, deterministic — no fixed wall-clock sleep and no Date.now).
+  const until = async (pred: () => boolean): Promise<void> => {
+    for (let i = 0; i < 500 && !pred(); i++) await new Promise<void>((r) => setImmediate(r));
+    if (!pred()) throw new Error('barrier: expected notification calls did not arrive');
+  };
+  const count = (method: string, match: (args: any) => boolean): number =>
+    apiCalls.filter((c) => c.method === method && match(c.args)).length;
   try {
     const vouchr = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db, botToken: 'xoxb-test' });
     let callback: any;
@@ -762,19 +769,15 @@ test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the 
     const state = new URL(prompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
     const res = fakeResponse();
     await callback({ query: { state, code: 'AUTHCODE' } }, res);
-    await flush();
+    await until(() => apiCalls.length >= 2);
     assert.equal(res.statusCode, 200);
-    assert.equal(apiCalls.filter((c) => c.method === 'chat.postMessage' && c.args.channel === ID.userId).length, 1, 'a durable success DM is delivered to the user');
-    const eph = apiCalls.filter((c) => c.method === 'chat.postEphemeral' && c.args.channel === 'C1' && c.args.user === ID.userId);
-    assert.equal(eph.length, 1, 'a channel/user-bound ephemeral green signal is delivered where the prompt was');
+    assert.equal(count('chat.postMessage', (a) => a.channel === ID.userId), 1, 'a durable success DM is delivered to the user');
+    assert.equal(count('chat.postEphemeral', (a) => a.channel === 'C1' && a.user === ID.userId), 1, 'a channel/user-bound ephemeral green signal is delivered where the prompt was');
 
-    // (B) replaying the now-consumed state must NOT re-deliver the channel confirmation.
+    // (B) replay the now-consumed state (must NOT re-deliver) and (C) a channel-less success for a
+    // different user (only a DM). U2's DM is the observable barrier that proves the replay fully settled.
     const replay = fakeResponse();
     await callback({ query: { state, code: 'AUTHCODE' } }, replay);
-    await flush();
-    assert.equal(apiCalls.filter((c) => c.method === 'chat.postEphemeral' && c.args.channel === 'C1').length, 1, 'no duplicate channel confirmation on a replayed callback');
-
-    // (C) channel-less connect (a different user, no event channel) → only the durable DM, no ephemeral.
     const clPrompts: any[] = [];
     const cl: any = {};
     await vouchr.middleware({
@@ -785,13 +788,16 @@ test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the 
     });
     await assert.rejects(() => cl.vouchr.connect('acme'), ConsentRequiredError);
     const clState = new URL(clPrompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
-    const clBefore = apiCalls.length;
     const clRes = fakeResponse();
     await callback({ query: { state: clState, code: 'AUTHCODE' } }, clRes);
-    await flush();
-    const clNew = apiCalls.slice(clBefore);
-    assert.ok(clNew.some((c) => c.method === 'chat.postMessage' && c.args.channel === 'U2'), 'a channel-less success still DMs the user');
-    assert.ok(!clNew.some((c) => c.method === 'chat.postEphemeral'), 'a channel-less success posts no channel ephemeral');
+    await until(() => count('chat.postMessage', (a) => a.channel === 'U2') >= 1);
+
+    // BOTH counts: the replay duplicated neither the durable DM nor the channel confirmation, and the
+    // channel-less success DM'd its user with no channel ephemeral.
+    assert.equal(count('chat.postMessage', (a) => a.channel === ID.userId), 1, 'no duplicate durable DM on a replayed callback');
+    assert.equal(count('chat.postEphemeral', (a) => a.channel === 'C1'), 1, 'no duplicate channel confirmation on a replayed callback');
+    assert.equal(count('chat.postMessage', (a) => a.channel === 'U2'), 1, 'a channel-less success still DMs the user');
+    assert.equal(count('chat.postEphemeral', (a) => a.user === 'U2'), 0, 'a channel-less success posts no channel ephemeral');
   } finally {
     prototype.apiCall = realApiCall;
     globalThis.fetch = realFetch;

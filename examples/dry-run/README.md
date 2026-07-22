@@ -16,6 +16,11 @@ in your own repo, point `databaseUrl` at a fresh, dedicated PostgreSQL schema in
 
 ## What is real, what is synthetic
 
+- **Deny-by-default:** a channel enables nothing until an admin opts a provider in, so a test first
+  calls `vouchr.dryRun.enableTool(admin, channel, providerId)` — the programmatic form of an admin
+  running `/vouchr enable <provider>` (or the App Home toggle). Without it the first `connect()` in a
+  channel is refused with `ToolDisabledError` before any consent. (DMs are personal/ungoverned and
+  need no enable.)
 - `connect()` posts the real Connect prompt, but the authorize URL is a local,
   instantly-succeeding redirect into the real OAuth callback. Complete it by "clicking" it, or from
   a test with `vouchr.dryRun.completeConsent(user, provider)` — either way the real callback writes

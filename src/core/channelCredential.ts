@@ -175,11 +175,14 @@ export async function setChannelCredentialMode(
  *  `not-shared` did nothing because the channel was not in `shared` mode (never downgrading a
  *  session/per-user channel); `stale` lost to a concurrent lifecycle change (a newer credential
  *  generation, or the acting admin being offboarded) and mutated nothing. `ok=false` on `removed`
- *  means upstream revocation debt may remain (the provider token could still be live). */
+ *  means upstream revocation debt may remain (the provider token could still be live). `audited=false`
+ *  means the destructive work committed but its durable `revoke` audit row could not be written — the
+ *  caller renders that separately and never discards the committed outcome (matches personal disconnect). */
 export type DisconnectSharedOutcome = {
   status: 'removed' | 'missing' | 'not-shared' | 'stale';
   ok: boolean;
   attempted: boolean;
+  audited: boolean;
 };
 
 /**
@@ -235,15 +238,18 @@ export async function disconnectChannelShared(input: {
         const mode = await input.channelConfig.getMode(owner.teamId, input.channel, input.providerId, fencedTx);
         if (mode !== 'shared') return { status: 'not-shared' };
 
-        // Current-generation validation: only the credential generation that already existed at this
-        // request's issuance is deletable. A strictly-newer shared credential (re-configured after the
-        // command was authorized) is left intact — the delayed command must not delete it (finding #1).
+        // Current-generation validation: only a credential generation strictly OLDER than this
+        // request's issuance is deletable. Timestamp equality FAILS CLOSED (`>=`): both are integer
+        // PostgreSQL milliseconds, so a replacement credential re-configured in the SAME millisecond as
+        // the command's issuance must be treated as newer and left intact — never deleted by the
+        // delayed command (finding #1). This matches the write-side newest-generation fence
+        // (withUserProvisioningFence): a legitimate replacement always arrives on a strictly-later receipt.
         const existing = await fencedTx.get<{ id: string; generation_at: number }>(
           `SELECT id, generation_at FROM connection
              WHERE team_id=? AND owner_kind='channel' AND owner_id=? AND provider=?`,
           [owner.teamId, owner.id, input.providerId],
         );
-        if (existing && existing.generation_at > input.issuance) return { status: 'stale' };
+        if (existing && existing.generation_at >= input.issuance) return { status: 'stale' };
 
         // Return the channel to per-user + purge satellites + audit the mode change — always, once we
         // are committed to acting on a shared channel. The purge advances the channel-interaction
@@ -271,9 +277,11 @@ export async function disconnectChannelShared(input: {
       })));
 
   if (decided.status !== 'removed') {
-    if (decided.status === 'not-shared') return { status: 'not-shared', ok: true, attempted: false };
-    if (decided.status === 'stale') return { status: 'stale', ok: false, attempted: false };
-    return { status: 'missing', ok: true, attempted: false };
+    // Nothing was deleted, so no `revoke` audit is due; any mode-flip audit already committed inside
+    // the transaction above (it cannot fail post-commit), so these are audited by construction.
+    if (decided.status === 'not-shared') return { status: 'not-shared', ok: true, attempted: false, audited: true };
+    if (decided.status === 'stale') return { status: 'stale', ok: false, attempted: false, audited: true };
+    return { status: 'missing', ok: true, attempted: false, audited: true };
   }
 
   // Post-commit best-effort upstream revoke, mirroring the personal disconnect's truth table exactly
@@ -288,11 +296,19 @@ export async function disconnectChannelShared(input: {
     attempted = upstream.attempted;
     if (!upstream.ok) ok = false;
   }
-  // Durable revoke-outcome audit (STR-4: same 'revoke' action + attempted/skipped meta shape as the
-  // break-glass channel revoke). Only a committed delete is a revoke event; `missing`/no-op are not.
-  await input.audit.record('revoke', input.identity, input.providerId, {
-    owner: 'channel', channel: input.channel,
-    ...(attempted ? { ok } : { upstream: 'skipped' }),
-  });
-  return { status: 'removed', ok, attempted };
+  // Durable revoke-outcome audit (STR-4: same 'revoke' action as the personal disconnect). This runs
+  // AFTER the destructive transaction and the upstream attempt committed, so an audit-store failure
+  // must NOT reject the whole operation and hide the committed result: catch it and report
+  // audited:false (the caller renders it separately). ALWAYS record `ok` (adding upstream:'skipped'
+  // when no call was made) so a successful non-revocable removal is distinguishable from unresolved
+  // upstream debt — matching disconnectProviderAtGeneration's revoke meta.
+  let audited = true;
+  try {
+    await input.audit.record('revoke', input.identity, input.providerId, {
+      owner: 'channel', channel: input.channel, ok, ...(attempted ? {} : { upstream: 'skipped' }),
+    });
+  } catch {
+    audited = false;
+  }
+  return { status: 'removed', ok, attempted, audited };
 }

@@ -158,6 +158,31 @@ function postRaw(
 
 const sse = (data: string) => `data: ${data}\n\n`;
 
+// #2: the headless broker must classify a group DM the same way Bolt does. A 1:1 DM ('D…') is caught
+// by the id heuristic, but an MPIM 'G…' id is indistinguishable from a private channel — only the
+// SIGNED channelType tells the broker it is personal/ungoverned. Without it, deny-by-default wrongly
+// locks the group DM out. Static Policy is a separate axis (tested elsewhere) and always sees the raw channel.
+test('#2 broker manifest: a signed group-DM (MPIM) is ungoverned; the same id with no type stays governed', async (t) => {
+  const { server, port } = await makeMcpBroker(t, (db) => ({ channelTools: new ChannelTools(db) }));
+  const acmeEnabled = async (over: Partial<IdentityClaims>): Promise<boolean> => {
+    const r = await postRaw(port, '/v1/manifest', { identityToken: signIdentity(claims(over), SECRET) });
+    assert.equal(r.status, 200, r.raw);
+    return JSON.parse(r.raw).tools.find((x: any) => x.provider === 'acme').enabled;
+  };
+  try {
+    // A governed channel with no `enable` → deny-by-default reports it disabled.
+    assert.equal(await acmeEnabled({ channel: 'C_GOVERNED' }), false);
+    // A 1:1 DM (id 'D…', no type needed) → the id heuristic exempts it → enabled with no enable.
+    assert.equal(await acmeEnabled({ channel: 'D_PERSONAL' }), true);
+    // A group DM: the signed channelType='mpim' classifies the 'G…' id as personal → enabled, no enable.
+    assert.equal(await acmeEnabled({ channel: 'GROUPDM01', channelType: 'mpim' }), true);
+    // The SAME 'G…' id with no signed type stays governed (deny-by-default) — proving the type is load-bearing.
+    assert.equal(await acmeEnabled({ channel: 'GROUPDM01' }), false);
+  } finally {
+    server.close();
+  }
+});
+
 // ── the acceptance flow: initialize → tools/list → tools/call, credential injected, never revealed ──
 
 test('#65 mcp: initialize/listTools/callTool round trip — token injected, session + protocol headers pass both ways, secret never revealed', async (t) => {

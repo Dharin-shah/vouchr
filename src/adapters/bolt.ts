@@ -568,7 +568,7 @@ export interface VouchrOptions {
   isAdmin?: (client: WebClient, userId: string, teamId: string) => Promise<boolean>;
   /**
    * Opt in to letting a channel's CREATOR (not only a workspace admin) run the channel-credential
-   * config commands (`mode`, `configure`, `enable`, `disable`). Default false: the gate is exactly
+   * config commands (`mode`, `connect-shared`, `disconnect-shared`, `enable`, `disable`). Default false: the gate is exactly
    * workspace-admin-only, unchanged from before this option existed. Off by default on purpose — in
    * Slack any member can create a public channel, so `creator` is not inherently a privileged role;
    * turn this on only where a channel owner should self-serve their own channel's config. Ignored
@@ -623,9 +623,12 @@ export interface VouchrOptions {
    * dry-run rows. The credential never appears in the echo. Request-side denials throw exactly as
    * in production. Safety rails: startup hard-fails if the database already holds non-dry-run
    * credential rows, a request refuses (and the dry-run callback never overwrites) a real row
-   * written later, and every audit row written in dry-run carries `meta.dry_run: true`. Complete a
-   * prompted consent programmatically in tests via `vouchr.dryRun.completeConsent(user, provider)`.
-   * Default false: zero behavior change.
+   * written later, and every audit row written in dry-run carries `meta.dry_run: true`. The
+   * returned `vouchr.dryRun` object exposes two test helpers: `enableTool(admin, channel,
+   * providerId)` opts a provider into a channel's allowlist (channels are DENY-BY-DEFAULT, so you
+   * MUST call this before `connect()` will resolve that provider in a channel — it reproduces an
+   * admin's `/vouchr enable`; DMs are ungoverned and need no enable), and `completeConsent(user,
+   * provider)` finishes a prompted consent programmatically. Default false: zero behavior change.
    */
   dryRun?: boolean;
 }
@@ -642,9 +645,10 @@ export interface ConnectContextDeps {
   channel: string | null;
   /** The channel scope that channel GOVERNANCE (tool allowlist + mode) applies to. Null for a
    *  personal conversation (DM/group-DM) that has no admins to govern it, so credential use there is
-   *  never gated by the channel allowlist — exactly like a channel-less context. Defaults to
-   *  `channel` when omitted (a caller that hasn't distinguished the two keeps the pre-existing
-   *  behavior). Delivery still uses `channel`. */
+   *  never gated by the channel allowlist — exactly like a channel-less context. When OMITTED it is
+   *  derived from `channel` via `governanceChannelOf` (a 1:1 DM id `D…` maps to null); a caller that
+   *  can classify a group DM (it has the Slack `channel_type`) passes the exact value. Delivery still
+   *  uses `channel`, and static Policy still evaluates against `channel`. */
   governableChannel?: string | null;
   client: WebClient;
   registry: ProviderRegistry;
@@ -815,8 +819,13 @@ export class ConnectContext {
   constructor(deps: ConnectContextDeps) {
     this.identity = deps.identity;
     this.channel = deps.channel;
-    // Omitted → govern the delivery channel (legacy behavior); explicit null → ungoverned (DM).
-    this.governableChannel = deps.governableChannel === undefined ? deps.channel : deps.governableChannel;
+    // Omitted → derive from the delivery channel (a 1:1 DM `D…` maps to null/ungoverned via the same
+    // id heuristic the middleware and broker use); explicit value (incl. null) is honored as given.
+    // Fixes a directly-constructed context for a DM channel being treated as governed (so `/vouchr
+    // tools` in a DM reported providers disabled). A group DM still needs an explicit null.
+    this.governableChannel = deps.governableChannel === undefined
+      ? governanceChannelOf(deps.channel)
+      : deps.governableChannel;
     this.client = deps.client;
     this.registry = deps.registry;
     this.vault = deps.vault;
@@ -1075,6 +1084,9 @@ export class ConnectContext {
       actorIssuedAt,
       channelTools: this.channelTools ?? null,
       channelConfig: this.channelConfig ?? null,
+      // Classify the action's channel by the governance scope carried on the key (null in a DM/group
+      // DM), so a retained approval in a personal conversation is not re-denied by deny-by-default (#2).
+      governableChannel: key.governableChannel,
     });
   }
 
@@ -1506,6 +1518,9 @@ export class ConnectContext {
           this.thread,
           connectIssuedAt,
         ),
+        // Persist the channel_type-aware governance scope on any approval so its DECISION
+        // revalidation can classify a group DM the id alone cannot (#2).
+        this.governableChannel,
       )));
     }
 
@@ -1807,6 +1822,8 @@ export class ConnectContext {
       undefined, undefined, credentialId,
       this.approvalRequestStillCurrent.bind(this, connectIssuedAt),
       this.useValidator(r.owner, providerId, credentialId, owner.id, this.thread, connectIssuedAt),
+      // A shared credential only lives in a governed channel, so its governance scope is that channel.
+      this.governableChannel,
     )));
   }
 
@@ -3095,7 +3112,9 @@ export async function createVouchr(opts: VouchrOptions) {
       // the shared credential AND attempts upstream revocation, and reports its real outcome.
       if (sub === 'disconnect-shared') {
         if (words.length !== 2) return respond('Usage: `/vouchr disconnect-shared <provider>`');
-        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
+        // Validate the id SYNTAX before any lookup or audit (SEC-4); provider RECOGNITION happens after
+        // the admin gate below so a non-admin never probes stored channel state.
+        if (!isValidProviderId(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         if (!command.channel_id) return respond('Run `/vouchr disconnect-shared` from inside the channel you want to configure.');
         const chan = command.channel_id;
         let outcome: Awaited<ReturnType<typeof disconnectChannelShared>>;
@@ -3103,6 +3122,12 @@ export async function createVouchr(opts: VouchrOptions) {
           if (!(await commandAdmin(client, identity, chan))) {
             await audit.record('denied', identity, arg, { reason: 'not-admin', owner: 'channel', channel: chan });
             return respond(adminOnly(allowChannelCreatorConfig, 'change channel credentials'));
+          }
+          // Recognize a CURRENT registry entry OR this channel's exact persisted shared credential, so a
+          // provider removed from the registry can still have its lingering shared credential cleaned up
+          // (mirrors the personal disconnect). Arbitrary valid-looking ids reach no mutation/audit (SEC-4).
+          if (!registry.has(arg) && !(await vault.has(channelOwner(identity.teamId, chan), arg))) {
+            return respond(UNKNOWN_PROVIDER_TEXT);
           }
           outcome = await disconnectChannelShared({
             vault, audit, channelConfig, registry, identity,
@@ -3124,6 +3149,11 @@ export async function createVouchr(opts: VouchrOptions) {
         }
         if (!outcome.ok) {
           return respond(`Removed the shared *${p}* account in <#${escapeMrkdwn(chan)}> and returned the channel to per-user, but upstream revocation could not be confirmed — revoke or rotate Vouchr’s access in ${p} directly if needed.`);
+        }
+        if (!outcome.audited) {
+          // The delete + mode flip + revoke committed, but the durable revoke audit could not be
+          // written — surface it separately instead of discarding the committed outcome (mirrors disconnect).
+          return respond(`Removed the shared *${p}* account in <#${escapeMrkdwn(chan)}>, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
         }
         return respond(`Removed the shared *${p}* account in <#${escapeMrkdwn(chan)}> — the channel now uses per-user credentials.`);
       }

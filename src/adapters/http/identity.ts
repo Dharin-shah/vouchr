@@ -57,6 +57,16 @@ export interface IdentityClaims {
    * request with this absent/false is refused.
    */
   channelEligible?: boolean;
+  /**
+   * The delivery channel's Slack conversation TYPE — the event `channel_type` ('im'/'mpim' for a
+   * DM/group-DM). Signed by the trusted caller (it verified the Slack event), so the broker can
+   * classify the mutable-GOVERNANCE scope (governanceChannelOf) exactly like Bolt does, instead of
+   * guessing from the id: an MPIM 'G…' id is indistinguishable from a private channel without it.
+   * Absent → the broker falls back to the id heuristic (a 1:1 DM 'D…' is still exempt; a group DM
+   * with no type stays governed). Static Policy always evaluates against the raw `channel`, so this
+   * only widens/narrows the admin-mutable allowlist scope, never the deployment policy.
+   */
+  channelType?: string;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -405,6 +415,7 @@ export type MintIdentityInput = Pick<
   | 'enterpriseId'
   | 'ownerKind'
   | 'channelEligible'
+  | 'channelType'
 >;
 
 /**
@@ -439,6 +450,7 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
     ...(input.enterpriseId !== undefined ? { enterpriseId: input.enterpriseId } : {}),
     ...(input.ownerKind !== undefined ? { ownerKind: input.ownerKind } : {}),
     ...(input.channelEligible !== undefined ? { channelEligible: input.channelEligible } : {}),
+    ...(input.channelType !== undefined ? { channelType: input.channelType } : {}),
     jti: randomUUID(),
     exp: now + lifetime,
   };
@@ -500,7 +512,10 @@ function isClaims(v: unknown): v is IdentityClaims {
     // Channel-fact claims (#51): reject a wrong-typed value rather than coercing it — a malformed
     // signed claim fails closed (an unknown ownerKind can't slip through as 'channel').
     (c.ownerKind === undefined || c.ownerKind === 'user' || c.ownerKind === 'channel') &&
-    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean')
+    (c.channelEligible === undefined || typeof c.channelEligible === 'boolean') &&
+    // Signed conversation type: reject a wrong-typed value rather than coercing it. Only 'im'/'mpim'
+    // affect governance (governanceChannelOf); any other bounded string is treated as a governed channel.
+    (c.channelType === undefined || typeof c.channelType === 'string')
   );
 }
 

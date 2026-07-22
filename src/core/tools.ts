@@ -35,12 +35,14 @@ export interface ToolManifestEntry {
  * Per-channel "tool manifest": the set of providers an agent is allowed to use in a channel.
  * Non-secret policy bits only: same kind of store as ChannelConfig, over the async `Db`.
  *
- * BACKWARD-COMPAT RULE (important): a channel with NO rows here treats EVERY provider as
- * enabled, so existing channels keep working untouched. The moment ANY provider is explicitly
- * set for the channel (enabled OR disabled), the channel flips to an allowlist: only providers
- * with an `enabled` row are usable; anything not listed is implicitly disabled. Re-enable all by
- * setting every provider back on, or there's no "clear all". That's intentional (an empty
- * allowlist = nothing usable, never silently reverts to all-on once configured).
+ * DENY-BY-DEFAULT (important): a channel with NO rows here enables NOTHING — an agent may use a
+ * provider in a channel only after an admin explicitly turns it on (`/vouchr enable <provider>`
+ * or the App Home toggle). The channel is always a strict allowlist: only a provider with an
+ * `enabled` row is usable; an explicit-off or unlisted provider is off. The first write
+ * MATERIALIZES the full manifest — every untouched provider is written as DISABLED — so the
+ * stored state is fully explicit rather than relying on the implicit deny. There's no "clear
+ * all"; re-enable providers individually. (DMs are personal and ungoverned, so this allowlist
+ * never applies there — see `governableChannel`.)
  */
 export class ChannelTools {
   constructor(private db: Db) {}

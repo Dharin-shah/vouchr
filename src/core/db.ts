@@ -418,6 +418,10 @@ function schema(): string {
       query_hash TEXT NOT NULL DEFAULT '',
       channel TEXT NOT NULL,
       thread TEXT NOT NULL,
+      -- The mutable-GOVERNANCE scope for this action's channel at request time (null in a personal
+      -- conversation). Persisted so the decision revalidation classifies a group DM (MPIM) that its
+      -- id alone cannot; NOT part of the action-match key (it is functionally derived from channel).
+      governable_channel TEXT,
       status TEXT NOT NULL,
       approved_by TEXT,
       created_at ${int} NOT NULL,
@@ -640,6 +644,7 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);
       await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS delivery_audience TEXT`);
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS governable_channel TEXT`);
       await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
       await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
       await tx.exec(`ALTER TABLE user_provisioning_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);

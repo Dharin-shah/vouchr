@@ -157,6 +157,9 @@ Runnable examples: [Google user credentials](./examples/google-user) ·
 
 `dryRun: true` runs your real Vouchr wiring — consent, channel modes, policy, egress
 checks, audit — with zero outbound network calls and no Slack or provider OAuth apps.
+Channels are deny-by-default, so a test first enables the provider in the channel with
+`vouchr.dryRun.enableTool(admin, channel, providerId)` (the programmatic form of an admin's
+`/vouchr enable`), then drives consent and fetch.
 Validate your allowlists and consent handling in CI: [`examples/dry-run/`](./examples/dry-run).
 
 ## Headless and hybrid

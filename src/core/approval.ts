@@ -186,6 +186,15 @@ export interface ApprovalKey {
   queryHash: string;
   channel: string | null;
   thread: string | null;
+  /**
+   * The mutable-GOVERNANCE scope of `channel` at request time (null in a personal conversation),
+   * captured when the classification (Slack `channel_type`) is known so the DECISION revalidation can
+   * classify a group DM (MPIM) whose id alone cannot be distinguished from a private channel. Stored
+   * on the row but deliberately NOT part of the action match key / fingerprint (approvalActionKey,
+   * keyParams) — it is functionally derived from `channel`, so it never affects which action a grant
+   * covers. Absent (undefined) at revalidation ⇒ fall back to governanceChannelOf(channel).
+   */
+  governableChannel?: string | null;
 }
 
 /** One pending request / unspent grant, as the approve/deny surface and the sweep read it. */
@@ -356,6 +365,9 @@ export async function approvalOwnerStillCurrent(input: {
     actorIssuedAt: input.actorIssuedAt,
     channelTools: input.channelTools,
     channelConfig: input.channelConfig,
+    // Use the governance scope PERSISTED with the row, so the decision revalidation classifies a
+    // group DM (MPIM) that its id alone cannot — instead of re-deriving it (and wrongly governing it).
+    governableChannel: input.row.governableChannel,
   });
 }
 
@@ -392,6 +404,7 @@ function toRow(r: any): ApprovalRow {
     queryHash: r.query_hash ?? '',
     channel: r.channel || null,
     thread: r.thread || null,
+    governableChannel: r.governable_channel ?? null,
     status: r.status,
     approvedBy: r.approved_by ?? null,
     createdAt: r.created_at,
@@ -464,11 +477,12 @@ export class Approvals {
       const row = await db.get<{ id: string }>(
         `INSERT INTO approval_request
            (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, query_hash,
-            channel, thread, status, approved_by, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
+            channel, thread, governable_channel, status, approved_by, created_at, expires_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
+           governable_channel=excluded.governable_channel,
            delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL,
            delivery_audience=NULL
          WHERE approval_request.team_id=excluded.team_id
@@ -486,7 +500,7 @@ export class Approvals {
            AND approval_request.thread=excluded.thread
            AND approval_request.expires_at<=${POSTGRES_NOW_MS_SQL}
          RETURNING id`,
-        [id, actionKey, ...params, PENDING_INTERACTION_TTL_MS],
+        [id, actionKey, ...params, k.governableChannel ?? null, PENDING_INTERACTION_TTL_MS],
       );
       if (row) return { id: row.id, created: true };
       const live = await db.get<{ id: string }>(

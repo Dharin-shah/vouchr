@@ -12,6 +12,7 @@ import { ConnectContext, createVouchr } from '../src/adapters/bolt';
 import { CONFIGURE_CALLBACK } from '../src/adapters/blocks';
 import { disconnectChannelShared } from '../src/core/channelCredential';
 import { offboardUser } from '../src/core/offboard';
+import { ChannelTools } from '../src/core/tools';
 import { channelOwner } from '../src/core/owner';
 
 // The channel-creator config gate is OPT-IN (`allowChannelCreatorConfig`, default off). When off the
@@ -123,7 +124,9 @@ test('disconnectChannelShared truth table (#3): revoke / non-revocable / unregis
   const r2 = await disconnectChannelShared({ vault, audit, channelConfig: cfg, registry, identity: ID, channel: 'C2', providerId: 'mcp', issuance: await issuance() });
   assert.deepEqual({ status: r2.status, ok: r2.ok, attempted: r2.attempted }, { status: 'removed', ok: true, attempted: false });
   const a2 = (await revokeAudits()).filter((r) => r.provider === 'mcp' && r.meta.channel === 'C2');
-  assert.deepEqual(a2[0].meta, { owner: 'channel', channel: 'C2', upstream: 'skipped' });
+  // `ok` is ALWAYS recorded (even when the revoke was skipped) so a successful non-revocable removal is
+  // distinguishable from unresolved upstream debt — matching the personal disconnect revoke meta.
+  assert.deepEqual(a2[0].meta, { owner: 'channel', channel: 'C2', ok: true, upstream: 'skipped' });
 
   // (3) UNREGISTERED id with a stored shared credential → removed, but ok:FALSE: the revoke contract is
   //     unknown, so upstream debt may remain. The old inverted table wrongly reported ok:true here.
@@ -180,6 +183,21 @@ test('disconnectChannelShared truthful missing + stale (#1): no-credential, newe
   assert.equal(await cfg.getMode('T1', 'C_NEW', 'mcp'), 'shared'); // unchanged
   assert.ok(await vault.get(channelOwner('T1', 'C_NEW'), 'mcp')); // the newer credential survives
 
+  // stale (SAME-millisecond replacement, no sleeps): a credential whose generation equals the command
+  // issuance to the millisecond must fail closed (`>=`) — it is a replacement racing the command and
+  // must not be deleted. Deterministic: set generation_at EXACTLY to the issuance.
+  await writeChannelMode(cfg, 'T1', 'C_EQ', 'mcp', 'shared');
+  await vault.upsert(channelOwner('T1', 'C_EQ'), 'mcp', { accessToken: 'eq-sk', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const eqIssuance = await vault.userProvisioningIssuedAt();
+  await db.run(
+    "UPDATE connection SET generation_at=? WHERE team_id=? AND owner_kind='channel' AND owner_id=? AND provider=?",
+    [eqIssuance, 'T1', 'C_EQ', 'mcp'],
+  );
+  const staleEq = await disconnectChannelShared({ vault, audit, channelConfig: cfg, registry, identity: ID, channel: 'C_EQ', providerId: 'mcp', issuance: eqIssuance });
+  assert.equal(staleEq.status, 'stale');
+  assert.equal(await cfg.getMode('T1', 'C_EQ', 'mcp'), 'shared'); // unchanged
+  assert.ok(await vault.get(channelOwner('T1', 'C_EQ'), 'mcp')); // the same-ms replacement survives
+
   // stale (offboarded actor): a command authorized before the acting admin was offboarded must not
   // delete first and reject later — the actor fence rejects it before any mutation.
   await writeChannelMode(cfg, 'T1', 'C_OFF', 'mcp', 'shared');
@@ -190,6 +208,25 @@ test('disconnectChannelShared truthful missing + stale (#1): no-credential, newe
   assert.equal(staleOff.status, 'stale');
   assert.equal(await cfg.getMode('T1', 'C_OFF', 'mcp'), 'shared'); // unchanged — no destructive mutation
   assert.ok(await vault.get(channelOwner('T1', 'C_OFF'), 'mcp')); // the channel credential is intact
+});
+
+// #2(a): a ConnectContext constructed directly for a DM channel (no explicit governableChannel) must
+// derive the ungoverned scope from the id — otherwise `/vouchr tools` in a DM reports every provider
+// disabled by deny-by-default. The middleware passes an explicit scope; direct callers rely on the default.
+test('#2: a directly-constructed ConnectContext for a DM is ungoverned — toolManifest reports providers enabled', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const make = (channel: string) => new ConnectContext({
+    identity: ID, channel, // no governableChannel: exercise the constructor default
+    client: {} as any, registry: new ProviderRegistry([provider]), vault, audit,
+    consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
+    channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db), providerIds: ['mcp'],
+  });
+  // A 1:1 DM ('D…') → personal/ungoverned → the provider reports ENABLED with no channel enable.
+  assert.equal((await make('D0PERSONAL').toolManifest()).find((m) => m.provider === 'mcp')?.enabled, true);
+  // A governed channel with no enable → deny-by-default reports it disabled (the contrast).
+  assert.equal((await make('C_GOVERNED').toolManifest()).find((m) => m.provider === 'mcp')?.enabled, false);
 });
 
 const auditActions = async (db: any) =>

@@ -567,8 +567,11 @@ export class Vault {
           }
           // Provider-addressed slash/headless requests carry no opaque row id. This PostgreSQL-clock
           // boundary proves the current row already existed when the trusted request/assertion was
-          // issued; a delayed request can never retarget a later reconnect.
-          if (expectedId === undefined && row && row.generation_at > issuedAt) {
+          // issued; a delayed request can never retarget a later reconnect. Timestamp equality FAILS
+          // CLOSED (`>=`): a reconnect committed in the SAME millisecond as this request's issuance is
+          // treated as newer and left intact, matching the write-side generation fence and the
+          // channel-shared disconnect — a legitimate disconnect arrives on a strictly-later receipt.
+          if (expectedId === undefined && row && row.generation_at >= issuedAt) {
             return { status: 'stale' } as const;
           }
           const savepoint = 'vouchr_disconnect_provisioning_fence';

@@ -10,6 +10,7 @@ import { Consent, withUserInteractionFence } from '../src/core/consent';
 import {
   Approvals,
   approvalDeliveryAudienceKey,
+  approvalOwnerStillCurrent,
   ApprovalPathTooLongError,
   ApprovalRequiredError,
   MAX_APPROVAL_PATH_BYTES,
@@ -434,6 +435,44 @@ test('Bolt omitted governance stores ignore ambient rows in retained and approva
   });
   assert.equal((await db.all(`SELECT 1 FROM approval_request`)).length, 1);
   assert.equal(ephemerals.length, 1);
+});
+
+// #2: an approval PERSISTS the mutable-governance scope of its channel at request time, so the DECISION
+// revalidation (which has no Slack channel_type) classifies a group DM correctly. A personal-conversation
+// scope (null) stays valid even with no channel enable; a governed channel with no enable is invalidated.
+test('#2: a persisted governance scope drives approval revalidation (group DM stays valid; governed-no-enable invalidated)', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, randomBytes(32));
+  const provider = approvalProvider();
+  const registry = new ProviderRegistry([provider]);
+  const channelTools = new ChannelTools(db); // deny-by-default active
+  const channelConfig = new ChannelConfig(db);
+  await vault.upsert(userOwner(ID), provider.id, { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const credentialId = (await vault.liveId(userOwner(ID), provider.id))!;
+  const approvals = new Approvals(db);
+  const key = (channel: string, thread: string, governableChannel: string | null): ApprovalKey => ({
+    teamId: ID.teamId, userId: ID.userId, ownerKind: 'user', ownerId: ID.userId, credentialId,
+    provider: provider.id, method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test',
+    path: '/repos', queryHash: '', channel, thread, governableChannel,
+  });
+  const revalidate = (k: ApprovalKey): Promise<boolean> => approvalOwnerStillCurrent({
+    row: k, db, registry, policy: new Policy(), vault, actorIssuedAt: Date.now(), channelTools, channelConfig,
+  });
+  const stored = async (id: string): Promise<string | null> =>
+    (await db.get(`SELECT governable_channel FROM approval_request WHERE id=?`, [id]) as any).governable_channel ?? null;
+
+  // A group DM: governance scope persisted as null (personal). Even with NO channel enable, the
+  // decision revalidation stays valid — deny-by-default never reaches a personal conversation.
+  const mpim = key('GROUPDM01', 'TH1', null);
+  const mpimId = await approvals.request(mpim);
+  assert.equal(await stored(mpimId), null, 'the personal (null) governance scope round-trips through storage');
+  assert.equal(await revalidate(mpim), true, 'a group-DM approval is not invalidated by deny-by-default');
+
+  // A governed channel with no enable: scope persisted as the channel → deny-by-default invalidates it.
+  const gov = key('C_GOV', 'TH2', 'C_GOV');
+  const govId = await approvals.request(gov);
+  assert.equal(await stored(govId), 'C_GOV', 'the governed-channel scope round-trips through storage');
+  assert.equal(await revalidate(gov), false, 'a governed, un-enabled channel invalidates the approval');
 });
 
 // ── the full state machine, through the public Bolt API ──────────────────────────────────────────

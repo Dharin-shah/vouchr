@@ -237,10 +237,10 @@ One core, two front doors — both reach the same credential boundary.
 | Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` · channel-scoped `POST /v1/manifest` |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
-| Ingest a **raw** key/secret | ✅ private modal (`configure` / key setup) | ❌ rejected; reference routes never accept raw values |
+| Ingest a **raw** key/secret | ✅ private modal (`connect-shared` / key setup) | ❌ rejected; reference routes never accept raw values |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `POST /v1/admin/reference` (channel) · `POST /v1/user/reference` (self) |
 | Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons for in-process use | ✅ broker enforces 403 `approval_required`; the trusted control plane delivers the decision surface via `recoverBrokerDenial` |
-| Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
+| Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.enableTool` (deny-by-default: enable the provider in the channel first) + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
 ## Writes are opt-in
 

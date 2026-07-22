@@ -5,7 +5,8 @@ import { openTestDb, testDbUrl } from './support/pg';
 import { createVouchr } from '../src/adapters/bolt';
 import { openDb, type Db } from '../src/core/db';
 import { defineProvider } from '../src/core/providers';
-import { userOwner } from '../src/core/owner';
+import { userOwner, channelOwner } from '../src/core/owner';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -509,4 +510,34 @@ test('disconnect preserves upstream-revoke guidance when the audit write also fa
   } finally {
     globalThis.fetch = realFetch;
   }
+});
+
+// #4: a provider removed from the registry can still leave a lingering shared credential in a channel.
+// `/vouchr disconnect-shared <retired>` must recognize the channel's exact stored credential (not only a
+// current registry entry) and clean it up, instead of rejecting the id as unknown before the core runs.
+test('disconnect-shared cleans up a RETIRED (unregistered) provider’s lingering shared credential (#4)', async (t) => {
+  const db = await openTestDb(t);
+  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  let handler: any;
+  vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+  const run = async (text: string): Promise<string> => {
+    const out: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+    });
+    return out[0] ?? '';
+  };
+  const owner = channelOwner('T1', 'C_FIN');
+  // 'ghost' is a valid id but NOT in the registry; seed a shared credential + mode for it.
+  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'ghost', 'shared');
+  await vouchr.vault.upsert(owner, 'ghost', { ...cred, accessToken: 'sk-ghost' });
+
+  const msg = await run('disconnect-shared ghost');
+  assert.match(msg, /Removed the shared \*ghost\*/); // recognized + cleaned up, not "unknown provider"
+  assert.equal(await vouchr.vault.has(owner, 'ghost'), false); // the lingering credential is gone
+  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'ghost'), 'per-user'); // returned to per-user
+
+  // A truly unknown id (no registry entry AND no stored credential) is still rejected before any mutation.
+  assert.match(await run('disconnect-shared neverheardof'), /Unknown provider|not a configured provider|isn't a provider/i);
 });

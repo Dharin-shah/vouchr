@@ -875,9 +875,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // The Policy + channel-tool CHECK is the shared core decision; the broker keeps its own audit/emit/
     // status mapping (it emits policy_denied on BOTH a policy and a tool-disabled deny — the Bolt path does
     // not emit on tool-disabled, so the mapping deliberately stays per-adapter). Static Policy sees the
-    // signed delivery channel; the tool allowlist sees the governance scope (null for a signed DM claim,
-    // so the broker no longer denies personal DM conversations by deny-by-default) — same split as Bolt.
-    const denial = await authorizeProvider(opts.policy, opts.channelTools, acting, channel, governanceChannelOf(channel), provider);
+    // signed delivery channel; the tool allowlist sees the governance scope (null for a signed DM/group-DM
+    // claim, so the broker no longer denies personal conversations by deny-by-default) — same split as
+    // Bolt. The signed `channelType` classifies a group DM whose id is not 'D…' (an MPIM 'G…' id).
+    const denial = await authorizeProvider(opts.policy, opts.channelTools, acting, channel, governanceChannelOf(channel, claims.channelType), provider);
     if (denial === 'policy') {
       await opts.audit.record('denied', acting, provider, { channel });
       emit({ type: 'policy_denied', provider });
@@ -1054,6 +1055,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
             actorIssuedAt,
             channelTools: opts.channelTools ?? null,
             channelConfig: opts.channelConfig ?? null,
+            // Governance scope for the retained-use re-check, classified by the signed channelType so an
+            // MPIM 'G…' claim is not re-denied by deny-by-default (Policy still uses the raw channel).
+            governableChannel: governanceChannelOf(claims.channel, claims.channelType),
           });
           if (state !== 'current') throw new InteractionStateChangedError('connection', state);
           return true;
@@ -1803,9 +1807,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       providerIds, registry,
       policy: opts.policy, channelTools: opts.channelTools, channelConfig: opts.channelConfig,
       // Policy on the signed delivery channel; tool-allowlist + mode on the governance scope (null for
-      // a signed DM claim), so the broker manifest reports a DM's personal providers enabled — matching
-      // Bolt. '' (a channel-less token) already behaves like a DM context in both.
-      principal, channel: claims.channel || null, governanceChannel: governanceChannelOf(claims.channel || null),
+      // a signed DM/group-DM claim, classified by the signed channelType), so the broker manifest reports
+      // a personal conversation's providers enabled — matching Bolt. '' (a channel-less token) is a DM context.
+      principal, channel: claims.channel || null, governanceChannel: governanceChannelOf(claims.channel || null, claims.channelType),
     });
     return { tools };
   }
