@@ -185,7 +185,7 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
   assert.equal(row.enabled, 1);
 
   await handler({
-    command: { ...base, text: 'configure mcp' },
+    command: { ...base, text: 'connect-shared mcp' },
     ack: async () => {},
     respond: async (m: string) => out.push(m),
     client,

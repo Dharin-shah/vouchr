@@ -10,6 +10,8 @@ import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
 import { CONFIGURE_CALLBACK } from '../src/adapters/blocks';
+import { disconnectChannelShared } from '../src/core/channelCredential';
+import { channelOwner } from '../src/core/owner';
 
 // The channel-creator config gate is OPT-IN (`allowChannelCreatorConfig`, default off). When off the
 // gate is exactly workspace-admin-only; when on, a channel's CREATOR may also run the config
@@ -49,6 +51,34 @@ async function ctx(t: TestContext, opts: {
   });
   return { c, db };
 }
+
+test('disconnectChannelShared: removes the shared credential (per-user after); a session channel is a no-op (#2)', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const cfg = new ChannelConfig(db);
+
+  // A shared channel with a stored shared credential → removed, and the channel returns to per-user.
+  const shared = channelOwner('T1', 'C_SHARED');
+  await writeChannelMode(cfg, 'T1', 'C_SHARED', 'mcp', 'shared');
+  await vault.upsert(shared, 'mcp', { accessToken: 'shared-sk', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const removed = await disconnectChannelShared({
+    vault, audit, channelConfig: cfg, registry: new ProviderRegistry([provider]),
+    identity: ID, channel: 'C_SHARED', providerId: 'mcp', issuance: await vault.userProvisioningIssuedAt(),
+  });
+  assert.equal(removed.status, 'removed');
+  assert.equal(await cfg.getMode('T1', 'C_SHARED', 'mcp'), 'per-user'); // returned to per-user
+  assert.ok(!(await vault.get(shared, 'mcp'))); // the shared credential is gone
+
+  // A SESSION channel is never downgraded — disconnect-shared is a truthful no-op there (the #2 fix).
+  await writeChannelMode(cfg, 'T1', 'C_SESSION', 'mcp', 'session');
+  const noop = await disconnectChannelShared({
+    vault, audit, channelConfig: cfg, registry: new ProviderRegistry([provider]),
+    identity: ID, channel: 'C_SESSION', providerId: 'mcp', issuance: await vault.userProvisioningIssuedAt(),
+  });
+  assert.equal(noop.status, 'not-shared');
+  assert.equal(await cfg.getMode('T1', 'C_SESSION', 'mcp'), 'session'); // thread-approval requirement preserved
+});
 
 const auditActions = async (db: any) =>
   ((await db.all('SELECT action FROM audit')) as any[]).map((r) => r.action);
@@ -157,7 +187,7 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
   await h.run('disable mcp');
   assert.match(h.out[1], /Disabled/);
 
-  await h.run('configure mcp');
+  await h.run('connect-shared mcp');
   assert.equal(h.opened()?.trigger_id, 'trig'); // loading modal consumed the trigger immediately
   assert.equal(h.hydrated()?.callback_id, CONFIGURE_CALLBACK);
 });
@@ -167,7 +197,7 @@ test('flag off (default): channel creator is denied on enable/configure', async 
   const h = await commandHarness(t, { creator: ID.userId, allowCreator: false });
   await h.run('enable mcp');
   assert.match(h.out[0], /Only a workspace admin can/);
-  await h.run('configure mcp');
+  await h.run('connect-shared mcp');
   assert.ok(h.opened());
   assert.equal(h.hydrated(), null);
 });
@@ -177,7 +207,7 @@ test('flag on: non-creator non-admin is denied on enable/configure', async (t) =
   const h = await commandHarness(t, { creator: 'U_SOMEONE_ELSE', allowCreator: true });
   await h.run('enable mcp');
   assert.match(h.out[0], /admin or the channel creator/);
-  await h.run('configure mcp');
+  await h.run('connect-shared mcp');
   assert.match(h.out[1], /admin or the channel creator/);
   assert.ok(h.opened());
   assert.equal(h.hydrated(), null);

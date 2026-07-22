@@ -50,11 +50,11 @@ async function ctx(t: TestContext, isAdmin = true, channel: string | null = 'C_F
 const auditRows = async (db: any) => (await db.all('SELECT action, meta FROM audit')) as any[];
 const chOwner = { teamId: 'T1', kind: 'channel', id: 'C_FIN' } as const;
 
-// Backward compat: a channel with no tool rows treats every provider as enabled.
-test('no rows => all providers enabled (backward compat)', async (t) => {
+// Deny-by-default: a channel with no tool rows enables nothing until an admin opts a provider in.
+test('no rows => deny-by-default: every provider disabled', async (t) => {
   const { tools } = await ctx(t);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'mcp'), true);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'other'), true);
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'mcp'), false);
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'other'), false);
   assert.deepEqual(await tools.listEnabled('T1', 'C_FIN'), []);
 });
 
@@ -66,8 +66,8 @@ test('enabling A disables B in that channel; isEnabled/listEnabled correctness',
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'other'), false); // unlisted → disabled
   assert.deepEqual(await tools.listEnabled('T1', 'C_FIN'), ['mcp']);
 
-  // Other channels are unaffected (still all-enabled).
-  assert.equal(await tools.isEnabled('T1', 'C_OTHER', 'other'), true);
+  // Other channels are independent — still deny-by-default (unconfigured → nothing enabled).
+  assert.equal(await tools.isEnabled('T1', 'C_OTHER', 'other'), false);
 
   // Disabling flips it back off and drops it from listEnabled.
   await setChannelToolEnabled(tools, 'T1', 'C_FIN', 'mcp', false);
@@ -114,11 +114,11 @@ test('connectChannel() refuses a disabled provider and allows an enabled one', a
 test('toolManifest returns the expected shape', async (t) => {
   const { c, tools } = await ctx(t);
 
-  // Unconfigured channel → every provider enabled, mode null.
+  // Unconfigured channel → deny-by-default: every provider disabled, mode null.
   let m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' },
-    { provider: 'other', mode: null, enabled: true, identity: 'acting_human' },
+    { provider: 'mcp', mode: null, enabled: false, identity: 'acting_human' },
+    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' },
   ]);
 
   // After configuring: mcp enabled + shared, other implicitly disabled.
@@ -173,12 +173,12 @@ async function freshTools(t: TestContext) {
   return { db, tools: new ChannelTools(db) };
 }
 
-test('applyEnabled on an unconfigured channel materializes the full allowlist', async (t) => {
+test('applyEnabled on an unconfigured channel: only the target lands, fillers materialize disabled', async (t) => {
   const { tools } = await freshTools(t);
-  await applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', false]], ALL3);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false); // the targeted provider
-  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true); // bystanders materialized enabled
-  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+  await applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', true]], ALL3);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true); // the targeted provider
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), false); // deny-by-default: fillers stay OFF
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false);
 });
 
 test('applyEnabled on a configured channel touches only the given rows', async (t) => {
@@ -190,15 +190,15 @@ test('applyEnabled on a configured channel touches only the given rows', async (
   assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false); // unlisted on an allowlist stays off
 });
 
-test('applyEnabled: concurrent first writes converge — both targets land, bystanders stay enabled', async (t) => {
+test('applyEnabled: concurrent first writes converge — both targets land, bystanders stay disabled', async (t) => {
   const { tools } = await freshTools(t);
   await Promise.all([
-    applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', false]], ALL3),
-    applyChannelToolsEnabled(tools, 'T1', 'C1', [['other', false]], ALL3),
+    applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', true]], ALL3),
+    applyChannelToolsEnabled(tools, 'T1', 'C1', [['other', true]], ALL3),
   ]);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), false);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true); // neither writer's fillers clobbered
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false); // neither writer's fillers enabled it
 });
 
 // Failure injection at the Db seam, between/at the two statements. A mid-STATEMENT partial write
@@ -224,27 +224,27 @@ function flakyDb(db: any, failOn: () => RegExp | null) {
   return wrapped;
 }
 
-test('applyEnabled: failing materialization writes NOTHING (channel stays all-enabled)', async (t) => {
+test('applyEnabled: failing materialization writes NOTHING (channel stays deny-by-default)', async (t) => {
   const { db } = await freshTools(t);
   let re: RegExp | null = /DO NOTHING/;
   const tools = new ChannelTools(flakyDb(db, () => re) as any);
-  await assert.rejects(() => applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', false]], ALL3), /injected/);
+  await assert.rejects(() => applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', true]], ALL3), /injected/);
   assert.equal(await tools.isConfigured('T1', 'C1'), false); // no partial allowlist
-  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true); // everything still effectively enabled
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), false); // deny-by-default: nothing enabled
   re = null; // db recovers → the retry lands the full change
-  await applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', false]], ALL3);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+  await applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', true]], ALL3);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false);
 });
 
 test('applyEnabled: failure after materialization rolls the complete allowlist back', async (t) => {
   const { db } = await freshTools(t);
   const tools = new ChannelTools(flakyDb(db, () => /DO UPDATE/) as any);
-  await assert.rejects(() => applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', false]], ALL3), /injected/);
+  await assert.rejects(() => applyChannelToolsEnabled(tools, 'T1', 'C1', [['mcp', true]], ALL3), /injected/);
   assert.equal(await tools.isConfigured('T1', 'C1'), false);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), true);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), true);
-  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), true);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'mcp'), false); // rolled back → deny-by-default
+  assert.equal(await tools.isEnabled('T1', 'C1', 'other'), false);
+  assert.equal(await tools.isEnabled('T1', 'C1', 'third'), false);
 });
 
 // ── #209 batched manifest reads: query count is bounded by the CHANNEL, not the provider count ────
@@ -360,20 +360,21 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
   });
 
   // isEnabled also delegates to the older public isConfigured hook. Overriding only that hook must
-  // likewise force the compatibility path; the inherited batch would read this disabled row and lie.
-  const disabledRowDb = {
-    all: async () => [{ provider: 'mcp', enabled: 0 }],
+  // force the compatibility path; the inherited batch would read this ENABLED row and lie — deny-by-
+  // default says an unconfigured channel (isConfigured=false) enables nothing, regardless of a stray row.
+  const enabledRowDb = {
+    all: async () => [{ provider: 'mcp', enabled: 1 }],
   } as unknown as Db;
   class CustomConfiguredTools extends ChannelTools {
     override async isConfigured(): Promise<boolean> { return false; }
   }
-  const configuredTools = new CustomConfiguredTools(disabledRowDb);
+  const configuredTools = new CustomConfiguredTools(enabledRowDb);
   const configuredManifest = await buildToolManifest({
     providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: configuredTools,
     principal: ID, channel: 'C_FIN',
   });
-  assert.equal(await authorizeProvider(undefined, configuredTools, ID, 'C_FIN', 'mcp'), null);
-  assert.equal(configuredManifest[0].enabled, true);
+  assert.equal(await authorizeProvider(undefined, configuredTools, ID, 'C_FIN', 'mcp'), 'tool-disabled');
+  assert.equal(configuredManifest[0].enabled, false);
 
   // Existing JavaScript wrappers may implement only the pre-batch public methods. They remain valid.
   const legacyTools = { isEnabled: async () => true } as unknown as ChannelTools;
@@ -403,9 +404,9 @@ test('enabledSnapshot is one read and matches isEnabled per provider (App Home a
     assert.equal(snap(p), await plain.isEnabled('T1', 'C_FIN', p), `snapshot disagrees with isEnabled for ${p}`);
   }
 
-  // And an unconfigured channel snapshots to all-enabled (backward compat), still one read.
+  // And an unconfigured channel snapshots to deny-by-default (nothing enabled), still one read.
   const fresh = countingDb(base);
   const snap2 = await new ChannelTools(fresh.db).enabledSnapshot('T1', 'C_EMPTY');
   assert.deepEqual(fresh.counts, { get: 0, all: 1 });
-  assert.equal(snap2('anything'), true);
+  assert.equal(snap2('anything'), false);
 });

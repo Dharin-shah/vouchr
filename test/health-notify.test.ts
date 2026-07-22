@@ -487,7 +487,7 @@ test('channel-owned credential: the expiring-soon DM goes to the configuring adm
   assert.equal(dms.length, 1);
   assert.equal(dms[0].channel, 'UADMIN');
   assert.match(dms[0].text, /shared acme connection in <#C9>.*expires in ~70h/);
-  assert.match(dms[0].text, /\/vouchr configure acme/);
+  assert.match(dms[0].text, /\/vouchr connect-shared acme/);
   const rows = (await db.all(`SELECT owner_id FROM notification_state`)) as any[];
   assert.deepEqual(rows.map((r) => r.owner_id), ['C9']); // only the delivered DM was marked
 });

@@ -112,7 +112,7 @@ export async function snapshotChannelModes(
 
 /**
  * The credential-use authorization gate, identical for both adapters: Policy first, then the per-channel
- * tool allowlist (backward-compat: an unconfigured channel allows all — see ChannelTools.isEnabled). The
+ * tool allowlist (deny-by-default: an unconfigured channel allows nothing — see ChannelTools.isEnabled). The
  * channel/team are the VERIFIED ones (Slack event or signed claim), never a request body. Returns the
  * denial reason (or null); the caller decides audit/emit/error — deliberately, because the two adapters
  * differ there (e.g. the broker emits policy_denied on a tool-disabled deny and Bolt does not).

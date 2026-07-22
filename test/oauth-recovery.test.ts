@@ -30,6 +30,7 @@ import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { Policy } from '../src/core/policy';
 import { CredentialLockdownError, Vault } from '../src/core/vault';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { openTestDb, testDbUrl } from './support/pg';
 
 const KEY = randomBytes(32);
@@ -66,6 +67,9 @@ async function contextFor(vouchr: Awaited<ReturnType<typeof createVouchr>>, clie
     event: { channel: 'C1', user: ID.userId, team: ID.teamId },
     next: async () => {},
   });
+  // Deny-by-default: an unconfigured channel enables no provider. Opt 'acme' into C1 so these tests
+  // exercise the consent/prompt/recovery flow rather than tripping the tool gate before consent.
+  await setChannelToolEnabled(new ChannelTools(vouchr.db), ID.teamId, 'C1', provider.id, true);
   return context.vouchr;
 }
 

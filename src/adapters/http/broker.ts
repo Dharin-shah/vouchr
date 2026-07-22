@@ -183,8 +183,8 @@ export interface BrokerOptions {
   policy?: Policy;
   /**
    * Per-channel tool allowlist, identical to the Bolt path. When set, /v1/fetch enforces
-   * `channelTools.isEnabled(teamId, channel, provider)` (backward-compat: an unconfigured channel
-   * allows all). Unset = no tool gate.
+   * `channelTools.isEnabled(teamId, channel, provider)` (deny-by-default: an unconfigured channel
+   * allows nothing). Unset = no tool gate.
    */
   channelTools?: ChannelTools;
   /**

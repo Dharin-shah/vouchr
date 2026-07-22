@@ -665,7 +665,7 @@ The equivalent slash-command flow is:
 /vouchr tools
 /vouchr mode internal-mcp shared
 /vouchr enable internal-mcp
-/vouchr configure internal-mcp
+/vouchr connect-shared internal-mcp
 /vouchr audit channel
 /vouchr stats
 ```
@@ -674,7 +674,7 @@ Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-on
 can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
 prevention belong to the trusted host; Vouchr does not retain provider responses or publish a
 preview-visibility policy. The modal does not contain the shared-credential input; use App Home's
-Configure credential action or `/vouchr configure <provider>`.
+Connect shared account action or `/vouchr connect-shared <provider>`.
 
 ### Channel-member experience
 

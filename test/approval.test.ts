@@ -40,7 +40,7 @@ import {
   SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS,
   UserFacingError,
 } from '../src/adapters/bolt';
-import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION } from '../src/adapters/blocks';
+import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION, OAUTH_CONNECT_ACTION } from '../src/adapters/blocks';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity } from './support/identity';
 import {
@@ -206,6 +206,9 @@ async function harness(t: TestContext, o: {
   };
   await vouchr.middleware(args);
   const ctx = args.context.vouchr;
+  // Deny-by-default: a channel enables no provider until an admin opts it in. Mirror that setup so
+  // these tests exercise the approval/egress flow rather than tripping the tool gate first.
+  if (channel) await setChannelToolEnabled(new ChannelTools(vouchr.db), 'T1', channel, provider.id, true);
   if (o.sharedChannel) {
     // shared: the CHANNEL owns the credential (owner_kind=channel/owner_id=C1); the caller borrows it.
     await writeChannelMode(new ChannelConfig(vouchr.db), 'T1', 'C1', provider.id, 'shared');
@@ -242,6 +245,16 @@ async function harness(t: TestContext, o: {
     (await vouchr.db.all(`SELECT * FROM approval_request`)) as any[];
   return { vouchr, ctx, ephemerals, dms, click, auditRows, approvalRows, provider, admins, client };
 }
+
+// The OAuth "Connect" button is a url button, but Slack still delivers a block_actions interaction for
+// it — the host MUST register a no-op ack() or the client shows "Operation timed out. Apps need to
+// respond within 3 seconds." Prove the registered handler acknowledges the click.
+test('the OAuth Connect url-button action is acknowledged (no 3s timeout) (#6/#7)', async (t) => {
+  const { click } = await harness(t);
+  let acked = false;
+  await click(OAUTH_CONNECT_ACTION, 'U1', '', [], async () => { acked = true; });
+  assert.equal(acked, true, 'the registered OAUTH_CONNECT_ACTION handler must call ack()');
+});
 
 // ── predicate ─────────────────────────────────────────────────────────────────────────────────────
 
@@ -2441,16 +2454,17 @@ test('same-value tool retries preserve live approval and session grants', async 
     assert.ok(credentialId);
     await sessions.grant(ID, 'C1', 'TH_KEEP', 'acme', 60_000, credentialId);
 
-    // Unconfigured means effectively enabled already. Materializing a final enabled bit (even when
-    // duplicate tuples conflict), then retrying it, must not revoke authority: both net to a no-op.
+    // acme is already enabled (the harness opted it in). Re-asserting the enabled bit — even via
+    // conflicting duplicate tuples, then a plain retry — nets to the SAME state, so the no-op filter
+    // writes nothing: it must neither revoke the live approval/session grants (no purge) nor fabricate
+    // a config audit row.
     await configureEnabled([['acme', false], ['acme', true]]);
     await configureEnabled();
 
     assert.equal((await approvalRows()).find((row) => row.id === granted.approvalId)?.status, 'granted');
     assert.equal(await sessions.isGranted(ID, 'C1', 'TH_KEEP', 'acme', credentialId), true);
     const configRows = (await auditRows()).filter((row) => row.action === 'config');
-    assert.equal(configRows.length, 2, 'one final desired audit per provider and request');
-    assert.ok(configRows.every((row) => JSON.parse(row.meta).tool === 'enabled'));
+    assert.equal(configRows.length, 0, 'same-value retries are no-ops — no config audit, no purge');
   });
 });
 
@@ -2611,11 +2625,18 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
   const toolsPort = (withTools.address() as any).port;
   try {
     await withFetch(async (calls) => {
+      // Deny-by-default: seed an explicit ENABLED row so the fetch clears the tool gate and reaches
+      // the governance lock. Without it the rowless channel denies the fetch before onValidatorLock,
+      // and the paused disable transaction below never gets its release() — the deadlock that hung CI.
+      // The race then flips enabled -> disabled under the paused governance transaction.
+      await setChannelToolEnabled(new ChannelTools(dbB), 'T1', 'C1', 'acme', true);
       const originalRecord = auditB.record.bind(auditB);
       let atAudit!: () => void;
       let release!: () => void;
+      let entered!: () => void;
       const atAuditP = new Promise<void>((resolve) => { atAudit = resolve; });
       const releaseP = new Promise<void>((resolve) => { release = resolve; });
+      const enteredP = new Promise<void>((resolve) => { entered = resolve; });
       (auditB as any).record = async (...args: any[]) => {
         atAudit();
         await releaseP;
@@ -2634,32 +2655,44 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
         assertEligible: async () => {},
         issuance: disablingIssuance,
       });
-      await atAuditP;
-
-      let entered!: () => void;
-      const enteredP = new Promise<void>((resolve) => { entered = resolve; });
       onValidatorLock = entered;
       let settled = false;
-      const pending = post(toolsPort, '/v1/fetch', body()).then((response) => {
-        settled = true;
-        return response;
-      });
-      await enteredP;
-      assert.equal(settled, false, 'route waits for the governance lifecycle transaction');
-      release();
-      await disabling;
-      const denied = await pending;
-      assert.deepEqual(denied, {
-        status: 403,
-        json: {
-          error: 'authorization changed; resolve and retry',
-          code: 'interaction_state_changed',
-          retryable: false,
-          recovery: 'resolve_again',
-        },
-      });
-      assert.equal(resolverCalls, 0);
-      assert.equal(calls.length, 0);
+      try {
+        await atAuditP;
+        const pending = post(toolsPort, '/v1/fetch', body()).then((response) => {
+          settled = true;
+          return response;
+        });
+        // Bounded: a fetch that never reaches the lock (a regressed gate) must FAIL here, not hang CI.
+        await Promise.race([
+          enteredP,
+          new Promise<void>((_, reject) => {
+            const timer = setTimeout(() => reject(new Error('fetch never reached the governance lock within 5s')), 5000);
+            (timer as { unref?: () => void }).unref?.();
+          }),
+        ]);
+        assert.equal(settled, false, 'route waits for the governance lifecycle transaction');
+        release();
+        await disabling;
+        const denied = await pending;
+        assert.deepEqual(denied, {
+          status: 403,
+          json: {
+            error: 'authorization changed; resolve and retry',
+            code: 'interaction_state_changed',
+            retryable: false,
+            recovery: 'resolve_again',
+          },
+        });
+        assert.equal(resolverCalls, 0);
+        assert.equal(calls.length, 0);
+      } finally {
+        // Release every barrier unconditionally so a failed assertion or the timeout can never
+        // deadlock the paused governance transaction (and the rest of the suite).
+        entered();
+        release();
+        await (disabling as Promise<unknown>).catch(() => {});
+      }
     });
   } finally {
     await new Promise<void>((resolve) => withTools.close(() => resolve()));

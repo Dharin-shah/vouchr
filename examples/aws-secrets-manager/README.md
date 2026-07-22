@@ -21,7 +21,7 @@ const vouchr = await createVouchr({
 Then an admin, from inside the channel to configure, runs:
 
 ```
-/vouchr configure github
+/vouchr connect-shared github
 ```
 
 and pastes an ARN into the private modal:

@@ -5,7 +5,45 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Channel tools are deny-by-default.** An unconfigured channel now enables **no** provider; an
+  admin explicitly opts each one in per channel (`/vouchr enable <provider>` or the App Home toggle)
+  before it can be used. Previously an unconfigured channel implicitly allowed every provider
+  (opt-out). Direct messages / group DMs are personal, not governed, so they are exempt (a DM never
+  requires an enable). **Breaking** for deployments that relied on the implicit-allow default; Vouchr
+  is pre-1.0 and greenfield, so there is no data migration — newly governed channels simply start
+  closed. `enabled` and `mode` remain independent gates.
+- **`/vouchr configure <provider>` is renamed to `/vouchr connect-shared <provider>`** — no
+  backwards-compatible alias, `configure` is gone (greenfield/pre-1.0). Pairs with the new
+  `/vouchr disconnect-shared`. The App Home "Configure credential" button is now "Connect shared
+  account".
+- **`/vouchr tools` always shows a provider's effective mode** (`per-user`/`shared`/`session`, or
+  `service tool`) instead of hiding the `per-user` default.
+
+### Added
+
+- **`/vouchr disconnect-shared <provider>`** — removes a channel's shared credential through a
+  dedicated core operation: it only acts when the channel is in `shared` mode (never downgrading a
+  `session`/`per-user` channel), attempts the provider's declared upstream revocation, returns the
+  channel to `per-user`, and reports a truthful `removed`/`not-shared`/partial-failure outcome.
+- **In-channel connect confirmation.** After a successful OAuth connect, Vouchr posts a private
+  ephemeral confirmation in the channel where the connect prompt was shown, in addition to the
+  durable DM.
+- **`OAUTH_CONNECT_ACTION` is exported** so custom Block Kit hosts can register the required no-op
+  `ack()` for the OAuth "Connect" button.
+- **Disabled-provider warning** when configuring a channel credential for a provider that is disabled
+  in the channel.
+
 ### Fixed
+
+- **The OAuth "Connect" button no longer triggers "Operation timed out. Apps need to respond within
+  3 seconds."** Slack delivers a `block_actions` interaction for url buttons too; the button now
+  carries an `action_id` and the Bolt host registers a no-op ack. The `url` (one-click OAuth) is
+  unchanged.
+- **A no-op channel-tool change writes nothing and is not audited.** Repeating or re-submitting a
+  Disable/Enable that already matches the effective state returns an `unchanged` outcome instead of
+  materializing rows and fabricating a `config/tool` audit entry.
 
 - **Vanished ephemeral prompts can be recovered on a genuine re-ask** (#194). Connect, key-setup,
   session, and approval prompts posted with Slack `postEphemeral` may be re-delivered after a 30s

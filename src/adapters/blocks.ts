@@ -196,6 +196,9 @@ export function connectBlocks(
           type: 'button',
           text: { type: 'plain_text', text: `Connect ${provider}`, emoji: true },
           url: authorizeUrl,
+          // Slack sends a block_actions payload for url buttons too; without an action_id + registered
+          // ack the client shows "Operation timed out". The action carries no authority (SEC-3).
+          action_id: OAUTH_CONNECT_ACTION,
           style: 'primary',
         },
       ],
@@ -206,6 +209,12 @@ export function connectBlocks(
 export const CONFIGURE_CALLBACK = 'vouchr_configure';
 export const USER_KEY_CALLBACK = 'vouchr_user_key';
 export const SETUP_KEY_ACTION = 'vouchr_setup_key';
+/** The OAuth "Connect <provider>" button. It carries a `url` (opens the provider's authorize page
+ *  directly), but Slack STILL delivers a block_actions interaction for a url button — so the button
+ *  needs an action_id and the host must register a no-op ack, or Slack shows "Operation timed out.
+ *  Apps need to respond within 3 seconds." No id/authority rides in the button; the OAuth `state` in
+ *  the url is the only carrier. */
+export const OAUTH_CONNECT_ACTION = 'vouchr_oauth_connect';
 export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
 /** Legacy #117 action id. New health DMs render no long-lived reconnect control; the registered
  * handler only acknowledges already-delivered buttons with fixed stale guidance. */
@@ -300,8 +309,15 @@ export function configureModal(
   channel: string,
   referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
   requestId?: string,
+  /** When the provider is DISABLED in this channel, warn that the credential is inert until enabled
+   *  (an admin may still pre-configure). Prevents a "configured but unusable" surprise. */
+  disabled = false,
 ): unknown {
   const p = escapeMrkdwn(provider);
+  const warning = disabled
+    ? `:warning: *${p}* is currently *disabled* in this channel — a credential set here will NOT be ` +
+      `used by the agent until you enable it (\`/vouchr enable ${p}\`).\n\n`
+    : '';
   return secretModal({
     callbackId: CONFIGURE_CALLBACK,
     // Built-in Slack flows carry only the opaque request id. Preserve the legacy metadata shape
@@ -310,6 +326,7 @@ export function configureModal(
     title: 'Channel credential',
     referenceSources,
     intro:
+      warning +
       `Set the *${p}* credential for this channel. Only you can see what you ` +
       `type here. It is never posted to the channel.`,
   });
@@ -960,7 +977,7 @@ export function homeView(o: {
             ...(brokered
               ? [{
                   type: 'button',
-                  text: { type: 'plain_text', text: 'Configure credential', emoji: true },
+                  text: { type: 'plain_text', text: 'Connect shared account', emoji: true },
                   action_id: HOME_CONFIGURE_ACTION,
                   value: t.provider,
                 }]

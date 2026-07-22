@@ -1363,7 +1363,7 @@ test('effective channel governance changes fence setup receipts while no-op retr
     audit,
     identity: ID,
     channel: toolChannel,
-    changes: [[toolProvider, false]],
+    changes: [[toolProvider, true]],
     allProviders: [toolProvider],
     authorize: async () => true,
     assertEligible: async () => undefined,
@@ -1379,7 +1379,7 @@ test('effective channel governance changes fence setup receipts while no-op retr
     liveToolIssuance,
   );
   assert.ok(liveToolRequest);
-  assert.equal(await configureTool(liveToolIssuance), 'configured');
+  assert.equal(await configureTool(liveToolIssuance), 'unchanged');
   assert.deepEqual(
     await requests.resolveForModal(liveToolRequest, ID),
     { channel: toolChannel, provider: toolProvider },

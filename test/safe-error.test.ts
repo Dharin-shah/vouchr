@@ -59,7 +59,7 @@ function channelSetupSurface(vouchr: Awaited<ReturnType<typeof createVouchr>>) {
         user_id: 'U1',
         channel_id: 'C1',
         trigger_id: 'TRIGGER',
-        text: 'configure acme',
+        text: 'connect-shared acme',
       },
       ack: async () => undefined,
       respond,

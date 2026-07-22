@@ -8,6 +8,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 
 // A real local OAuth provider + API, so the flow is exercised over HTTP end to end.
 function startMockProvider(): Promise<{
@@ -82,6 +83,8 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
       },
     });
     const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
+    // Deny-by-default: opt the provider into the channel this test exercises.
+    await setChannelToolEnabled(new ChannelTools(lan.db), 'T1', 'C1', provider.id, true);
 
     // Capture the OAuth callback handler that mountRoutes registers on the router.
     let callback: any;
@@ -151,6 +154,8 @@ test('integration: maximum-valid OAuth scopes still produce one bounded connect 
     clientSecret: 'csec',
   });
   const lan = await createVouchr({ providers: [provider], baseUrl: 'https://vouchr.test', db: await openTestDb(t) });
+  // Deny-by-default: opt the provider into the channel this test exercises.
+  await setChannelToolEnabled(new ChannelTools(lan.db), 'T1', 'C1', provider.id, true);
   const posts: any[] = [];
   const client = {
     chat: {
@@ -194,6 +199,8 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
       clientId: 'cid', clientSecret: 'csec',
     });
     const lan = await createVouchr({ providers: [provider], baseUrl: mock.base, db: await openTestDb(t) });
+    // Deny-by-default: opt the provider into the channel this test exercises.
+    await setChannelToolEnabled(new ChannelTools(lan.db), 'T1', 'C1', provider.id, true);
     let callback: any;
     lan.mountRoutes({ get: (_p: string, h: any) => (callback = h) });
 

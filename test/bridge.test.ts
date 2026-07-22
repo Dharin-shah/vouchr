@@ -24,9 +24,11 @@ import { createBroker } from '../src/adapters/http/broker';
 import {
   APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS,
   ConnectContext,
+  ConsentRequiredError,
   createVouchr,
   type BrokerDenialRecovery,
 } from '../src/adapters/bolt';
+import { ToolDisabledError } from '../src/core/authz';
 import {
   APPROVAL_APPROVE_ACTION,
   APPROVE_SESSION_ACTION,
@@ -34,6 +36,7 @@ import {
 } from '../src/adapters/blocks';
 import type { Db } from '../src/core/db';
 import { openDb } from '../src/core/db';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import {
   POSTGRES_NOW_MS_SQL,
   PROMPT_REDELIVERY_DEBOUNCE_MS,
@@ -92,6 +95,13 @@ async function harness(t: TestContext, o: {
     policy: o.policy,
     slackClientOptions: o.slackClientOptions,
   });
+  // Deny-by-default: opt the registered providers into the channels these tests exercise, mirroring an
+  // admin having run `/vouchr enable`. Tests that assert a denial set their own session/shared state.
+  for (const chan of ['C1', 'C9']) {
+    for (const p of (o.providers ?? [oauthGh])) {
+      await setChannelToolEnabled(new ChannelTools(db), 'T1', chan, p.id, true);
+    }
+  }
   const actions: Record<string, any> = {};
   vouchr.registerCommands({
     command: () => undefined,
@@ -273,6 +283,18 @@ test('bridge: non-bridgeable and malformed denials change nothing', async (t) =>
   assert.equal(h.dms.length, 0);
   assert.equal((await h.db.all('SELECT 1 AS x FROM consent_request')).length, 0);
   assert.equal((await h.db.all('SELECT 1 AS x FROM audit')).length, 0);
+});
+
+test('deny-by-default: a real Slack DM is ungoverned — a provider works there without a channel enable (#1)', async (t) => {
+  const h = await harness(t);
+  // A DM channel id starts with 'D'. The middleware treats it as ungoverned (no admins to govern it),
+  // so the tool allowlist is skipped and connect() reaches the CONSENT flow — NOT tool-disabled —
+  // even though no channel_tool row exists for it. This is the recovery path deny-by-default must keep.
+  const dm = await h.context({ channel: 'D0PERSONAL' });
+  await assert.rejects(() => dm.connect('gh'), (e: unknown) => e instanceof ConsentRequiredError);
+  // Contrast: an ordinary channel that was never enabled IS denied by deny-by-default.
+  const strict = await h.context({ channel: 'C_NEVER_ENABLED' });
+  await assert.rejects(() => strict.connect('gh'), (e: unknown) => e instanceof ToolDisabledError);
 });
 
 test('bridge: the provider is registry-validated before anything (SEC-4)', async (t) => {
@@ -572,7 +594,7 @@ test('bridge: shared-owner miss directs an admin-eligible actor in place (never 
   const r = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected', recovery: 'fix_configuration' });
   assert.deepEqual(r, { status: 'configuration_required', provider: 'gh' });
   assert.equal(h.ephemerals.length, 1);
-  assert.match(h.ephemerals[0].text, /\/vouchr configure gh/);
+  assert.match(h.ephemerals[0].text, /\/vouchr connect-shared gh/);
   assert.equal(h.dms.length, 0, 'the actor IS the eligible admin — no extra DM');
   assert.equal((await h.db.all('SELECT 1 AS x FROM consent_request')).length, 0, 'no personal connect flow');
 });
@@ -585,7 +607,7 @@ test('bridge: shared-owner miss DMs the responsible admin once per window for a 
   assert.deepEqual(r, { status: 'configuration_required', provider: 'gh' });
   assert.equal(h.dms.length, 1, 'the last configuring admin is asked');
   assert.equal(h.dms[0].channel, 'UADM');
-  assert.match(h.dms[0].text, /\/vouchr configure gh/);
+  assert.match(h.dms[0].text, /\/vouchr connect-shared gh/);
   assert.match(h.ephemerals[0].text, /has been asked/);
   assert.ok(!h.ephemerals[0].text.includes(TOKEN));
 

@@ -21,6 +21,7 @@ import { openDb } from '../src/core/db';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { loadIdentityConfig, mintIdentity, type MintIdentityInput } from '../src/adapters/http/identity';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { APPROVAL_APPROVE_ACTION, APPROVE_SESSION_ACTION, SETUP_KEY_ACTION } from '../src/adapters/blocks';
 
 const IDENTITY_SECRET = 'bridge-e2e-identity-secret-at-least-32-bytes!!';
@@ -128,6 +129,14 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
   // ── The trusted Slack control plane: a real createVouchr on the SAME schema, Slack faked. ──────
   const db = await openDb({ databaseUrl });
   t.after(() => db.close());
+  // Deny-by-default: opt the registered providers into the channels this test exercises (C1, C2),
+  // mirroring an admin having run `/vouchr enable`. The session/approval denials below come from
+  // channel MODE and missing grants, not from the tool being disabled.
+  for (const chan of ['C1', 'C2']) {
+    for (const p of PROVIDERS) {
+      await setChannelToolEnabled(new ChannelTools(db), 'T1', chan, p.id, true);
+    }
+  }
   const vouchr = await createVouchr({
     providers: PROVIDERS.map((p) => ({
       ...p, authorizeUrl: '', tokenUrl: '', scopesDefault: [], refresh: 'none' as const, pkce: false,

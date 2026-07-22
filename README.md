@@ -32,8 +32,10 @@ permissions, their consent.
   Injection happens inside Vouchr, at the outbound HTTP request.
 - **Guardrails on every call.** Allowlisted hosts and paths, per-user rate limits, response
   caps, and human Approve/Deny for sensitive writes.
-- **Governed in Slack.** Admins choose per channel: personal accounts, thread-scoped
-  approvals, or one shared team credential — via `/vouchr` or the App Home tab.
+- **Governed in Slack, deny-by-default.** Every provider is off in a channel until an admin enables
+  it there; then they choose the model per channel — personal accounts, thread-scoped approvals, or
+  one shared team credential — via `/vouchr` or the App Home tab. (Direct messages are personal, not
+  governed, so they need no enable.)
 - **Accountable and revocable.** Every action is tied to the Slack identity that authorized
   it; deactivating someone in Slack revokes their credentials. For a full compromise, one tested
   break-glass — `vouchr revoke --all --confirm ALL-CREDENTIALS` plus `VOUCHR_LOCKDOWN` containment —
@@ -68,8 +70,10 @@ app.event('app_mention', async ({ context, say }) => {
 });
 ```
 
-On first use, `connect()` privately prompts the user. One click and a browser OAuth later,
-the agent just works:
+Channels are **deny-by-default**: before the first use in a channel, an admin enables the provider
+there — `/vouchr enable github` (or the App Home toggle). In a direct message no enable is needed.
+Then on first use `connect()` privately prompts the user; one click and a browser OAuth later, the
+agent just works:
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 

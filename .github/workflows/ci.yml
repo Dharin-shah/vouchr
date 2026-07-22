@@ -54,6 +54,10 @@ jobs:
         if: matrix.node != 22
       - run: npm run test:coverage
         if: matrix.node == 22
+      # The advertised runnable dry-run example is a blocking regression: it exercises the real
+      # first-use flow (admin enable → consent → egress gates) end to end, so a change like
+      # deny-by-default that breaks first use fails here instead of only in a user's repo.
+      - run: npm run example:dry-run
 
   # Exercises the PUBLISHED artifact (pack → install into a fresh project → resolve every
   # entrypoint/bin/type). Separate job: a packaging break is distinct from a test failure, and it

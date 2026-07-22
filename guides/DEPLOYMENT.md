@@ -278,7 +278,7 @@ const vouchr = await createVouchr({
 });
 ```
 
-An admin then runs `/vouchr configure github` and pastes an ARN into the private modal. Full setup,
+An admin then runs `/vouchr connect-shared github` and pastes an ARN into the private modal. Full setup,
 auth (ambient IAM role, no static creds), and the least-privilege policy
 (`secretsmanager:GetSecretValue` scoped to the specific ARNs, `kms:Decrypt` if the secret uses a CMK)
 are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manager/README.md).

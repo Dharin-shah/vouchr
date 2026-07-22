@@ -242,7 +242,7 @@ test('help lists the retained commands', async (t) => {
   const { run } = await harness(t);
   const msg = await run('help');
   assert.match(msg, /Vouchr commands/);
-  for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr mode', '/vouchr configure', '/vouchr stats']) {
+  for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr mode', '/vouchr connect-shared', '/vouchr disconnect-shared', '/vouchr stats']) {
     assert.ok(msg.includes(c), `help is missing ${c}`);
   }
   assert.ok(!msg.includes('/vouchr preview'), 'help must not promote the removed private-preview surface');
@@ -275,7 +275,7 @@ test('SEC-1: unknown command and provider values are never echoed', async (t) =>
     await run(`disable ${sentinel}`),
     await run(`mode ${sentinel} shared`),
     await run(`preview ${sentinel} public`),
-    await run(`configure ${sentinel}`),
+    await run(`connect-shared ${sentinel}`),
     await run(`disconnect ${sentinel}`),
   ];
   for (const msg of responses) {
@@ -310,7 +310,7 @@ test('every known command rejects unsupported arguments instead of silently wide
   for (const input of [
     'help extra', 'status extra', 'tools extra', 'stats extra', 'enable mcp extra',
     'disable mcp extra', 'mode mcp shared extra',
-    'configure mcp extra', 'audit channel extra', 'audit chanel',
+    'connect-shared mcp extra', 'audit channel extra', 'audit chanel',
   ]) {
     assert.match(await run(input), /Usage:/, input);
   }

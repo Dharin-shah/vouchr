@@ -224,7 +224,7 @@ test('an admin offboarded during modal verification cannot change mode or tools'
   assert.equal(await modeRow(h.lan.db), null);
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false);
   assert.deepEqual(await auditActions(h.lan.db), []);
-  assert.match(h.dms[0], /2 settings could not be confirmed/);
+  assert.match(h.dms[0], /1 setting could not be confirmed/); // the tool is already deny-by-default → the disable is a no-op; only the mode change is attempted (and blocked)
   assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
@@ -327,17 +327,18 @@ test('forged invalid mode value is ignored server-side, never persisted', async 
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
-// Finding 1: disabling ONE provider on an unconfigured channel must not silently disable the others.
-test('disabling one provider materializes the full allowlist; the others stay enabled', async (t) => {
+// Finding 1: enabling ONE provider on an unconfigured (deny-by-default) channel must not silently
+// enable the others when the first write materializes the full allowlist.
+test('enabling one provider materializes the full allowlist; the others stay disabled', async (t) => {
   const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
   const view = await h.openModal();
-  const pm = view.private_metadata; // real open-time state (all enabled, unconfigured)
-  await h.submit({ 'tool:a': unchecked(), 'tool:b': checked(), 'tool:c': checked() }, async () => {}, pm);
+  const pm = view.private_metadata; // real open-time state (all disabled, unconfigured)
+  await h.submit({ 'tool:a': unchecked(), 'tool:b': checked(), 'tool:c': unchecked() }, async () => {}, pm);
   const tools = new ChannelTools(h.lan.db);
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // the one the admin unchecked
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // NOT silently disabled
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), true);
-  assert.deepEqual(await auditActions(h.lan.db), ['config']); // only the real change (a) audited
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // untouched → stays disabled
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // the one the admin enabled
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), false); // NOT silently enabled by materialization
+  assert.deepEqual(await auditActions(h.lan.db), ['config']); // only the real change (b) audited
 });
 
 // Finding 2: a stale save (untouched select re-submitting its open value) must not revert a change
@@ -357,14 +358,14 @@ test('untouched mode select does not revert a concurrent change or delete the sh
   assert.ok(await h.lan.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp')); // cred survived
 });
 
-// Finding 3: a policy-denied provider must not be spuriously disabled by an untouched save. The admin
-// checkbox reflects the ALLOWLIST bit (enabled), not the policy-intersected manifest, so an untouched
-// save is a true no-op.
+// Finding 3: a policy-denied provider must not be spuriously written by an untouched save. The admin
+// checkbox reflects the ALLOWLIST bit (deny-by-default here → unchecked), not the policy-intersected
+// manifest, so re-submitting the open value is a true no-op.
 test('untouched save with a policy-denied provider writes no channel_tool row', async (t) => {
   const h = await harness(t, { slackAdmin: true, policy: new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } }) }); // denies mcp in C_FIN
   const view = await h.openModal();
   const pm = view.private_metadata;
-  await h.submit({ 'tool:mcp': checked() }, async () => {}, pm); // checkbox untouched (allowlist-enabled)
+  await h.submit({ 'tool:mcp': unchecked() }, async () => {}, pm); // checkbox untouched (allowlist-disabled by default)
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false); // no allowlist row written
   assert.deepEqual(await auditActions(h.lan.db), []);
 });

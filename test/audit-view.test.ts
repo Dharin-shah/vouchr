@@ -85,7 +85,7 @@ test('audit: surfaces the non-caller actor (e.g. an approver) via the actor colu
 
 test('configure: an unknown (e.g. credential-shaped) provider is rejected before it is ever audited', async (t) => {
   const { audit, run } = await harness(t); // non-admin caller
-  const res = await run('configure ghp_looks_like_a_secret_0000', 'U_A');
+  const res = await run('connect-shared ghp_looks_like_a_secret_0000', 'U_A');
   assert.match(String(res), /Unknown provider/); // rejected before the admin gate / any record()
   // The bogus value must NOT have been written to the audit provider column (no reflection surface).
   const rows = await audit.listByOwnerUser(id('U_A'), 20);

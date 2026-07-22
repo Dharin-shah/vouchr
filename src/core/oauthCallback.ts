@@ -82,6 +82,9 @@ export type CallbackResult =
       account: string | null;
       scopes: string;
       identity: SlackIdentity;
+      /** The channel the connect prompt was posted in (null for a channel-less prompt). Lets the
+       *  adapter confirm the connection in-context, not only in the private DM. */
+      channel: string | null;
     }
   | {
       ok: false;
@@ -425,6 +428,7 @@ export async function handleOAuthCallback(
       account,
       scopes,
       identity: row.identity,
+      channel: row.channel,
     };
   } catch (error) {
     // Post-consent connection FAILURE (token exchange / account probe / vault write threw) — not a

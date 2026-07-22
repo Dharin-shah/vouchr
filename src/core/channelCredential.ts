@@ -12,7 +12,9 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import { latestChannelInteractionTombstone, purgeChannelInteractionState } from './interaction';
 import { channelOwner } from './owner';
+import type { ProviderRegistry } from './providers';
 import type { SecretReference } from './reference';
+import { revokeProviderCredential } from './tokens';
 import {
   prepareVaultCredentialWrite,
   type PreparedVaultCredentialWrite,
@@ -165,4 +167,70 @@ export async function setChannelCredentialMode(
     );
     return fenced.status === 'current';
   });
+}
+
+/** The truthful outcome of {@link disconnectChannelShared}. `removed` deleted a shared credential;
+ *  `not-shared` did nothing because the channel had no shared account (never downgrading a
+ *  session/per-user channel); `stale` lost the mode flip to a concurrent lifecycle change.
+ *  `ok=false` means upstream revocation debt may remain (the provider token could still be live). */
+export type DisconnectSharedOutcome = {
+  status: 'removed' | 'not-shared' | 'stale';
+  ok: boolean;
+  attempted: boolean;
+};
+
+/**
+ * Remove a channel's SHARED credential: the dedicated counterpart to configureChannelCredential.
+ * Unlike a generic mode reset it:
+ *  - only acts when the channel is actually in `shared` mode, so a `per-user`/`session` channel is
+ *    never mutated (a session channel keeps its thread-approval requirement — no access widening);
+ *  - deletes the shared credential through the SAME atomic delete→decode→revoke primitive the
+ *    personal disconnect uses, so revocable provider authority is actually revoked upstream, not just
+ *    dropped locally; and
+ *  - reports a truthful outcome (`not-shared` no-op, `removed` with `ok`/`attempted`, or `stale`).
+ * Ordering — claim-delete + revoke BEFORE flipping the mode — so a mid-operation failure converges on
+ * retry: a retry still sees `shared`, re-claims (finding nothing) and re-flips the mode.
+ */
+export async function disconnectChannelShared(input: {
+  vault: Vault;
+  audit: Audit;
+  channelConfig: ChannelConfig;
+  registry?: ProviderRegistry;
+  identity: SlackIdentity;
+  channel: string;
+  providerId: string;
+  issuance: number;
+}): Promise<DisconnectSharedOutcome> {
+  const owner = channelOwner(input.identity.teamId, input.channel);
+  const provider = input.registry?.has(input.providerId) ? input.registry.get(input.providerId) : null;
+  const registered = provider != null;
+
+  // No-op unless the channel is in shared mode — the key safety property (never touch a session or
+  // per-user channel).
+  const mode = await input.channelConfig.getMode(owner.teamId, input.channel, input.providerId);
+  if (mode !== 'shared') return { status: 'not-shared', ok: true, attempted: false };
+
+  // Atomic claim-delete of the channel-owned credential + best-effort upstream revoke — the same
+  // primitive/semantics as the personal disconnect (deleteForRevoke serializes on the credential lock).
+  const claimed = await input.vault.deleteForRevoke(owner, input.providerId, registered);
+  let ok = !claimed.removed || !registered || claimed.dryRun;
+  let attempted = false;
+  if (provider && claimed.removed && !claimed.dryRun && (provider.revoke || provider.revokeUrl)) {
+    const upstream = await revokeProviderCredential(provider, claimed);
+    attempted = upstream.attempted;
+    if (!upstream.ok) ok = false;
+  }
+
+  // Flip governance back to per-user (fenced + audited). If the fence is stale the credential is
+  // already removed/revoked; a retry re-flips the mode (it will read `not-shared` only once flipped).
+  const fenced = await input.vault.withCredentialLock(owner, input.providerId, async (_locked, tx) =>
+    withUserInteractionFence(tx, input.identity, input.issuance, async (fencedTx) => {
+      await writeChannelMode(input.channelConfig, owner.teamId, input.channel, input.providerId, 'per-user', fencedTx);
+      await purgeChannelInteractionState(fencedTx, owner.teamId, input.channel, input.providerId);
+      await input.audit.record('config', input.identity, input.providerId, {
+        owner: 'channel', channel: input.channel, mode: 'per-user',
+      }, undefined, fencedTx);
+    }));
+  if (fenced.status !== 'current') return { status: 'removed', ok: false, attempted };
+  return { status: 'removed', ok, attempted };
 }

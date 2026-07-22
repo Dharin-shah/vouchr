@@ -99,6 +99,10 @@ export type { ToolManifestEntry } from './core/tools';
 // hand-copying the JSON (which then drifts from the Bolt path).
 export {
   connectBlocks,
+  // The OAuth "Connect" button's action_id. A custom Slack host that renders connectBlocks MUST
+  // register a no-op `ack()` for this id, or Slack shows "Operation timed out" — url buttons still
+  // deliver a block_actions interaction. Single source of truth so hosts never hard-code the string.
+  OAUTH_CONNECT_ACTION,
   configureModal,
   userKeyModal,
   CONFIGURE_CALLBACK,
