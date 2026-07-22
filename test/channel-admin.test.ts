@@ -439,3 +439,41 @@ test('union mode is rejected at the config boundary, writing nothing (SEC-4)', a
   );
   assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), null);
 });
+
+// #2 atomicity: the 'config' (mode-flip) audit runs INSIDE the locked transaction, so an audit-store
+// failure THERE must roll the WHOLE operation back — no credential delete, no mode change, no purge —
+// and the post-commit upstream revoke must never run. (Contrast: a POST-COMMIT revoke-audit failure
+// preserves the committed outcome and only reports audited:false — covered by a separate test.)
+test('disconnectChannelShared: an in-transaction config-audit failure rolls back the delete/mode/purge and skips revoke', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const cfg = new ChannelConfig(db);
+  const revoked: string[] = [];
+  const rev = defineProvider({
+    id: 'rev', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+    revoke: async (_p, tokenStr) => { revoked.push(tokenStr); },
+  });
+  await writeChannelMode(cfg, 'T1', 'C_RB', 'rev', 'shared');
+  await vault.upsert(channelOwner('T1', 'C_RB'), 'rev', { accessToken: 'rev-sk', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const issuance = await vault.userProvisioningIssuedAt(); // after the write ⇒ not stale
+
+  const realAudit = new Audit(db);
+  const audit = {
+    record: async (action: any, ...rest: any[]) => {
+      if (action === 'config') throw new Error('audit-store down'); // the in-transaction mode-flip audit
+      return (realAudit.record as any)(action, ...rest);
+    },
+  } as any;
+
+  await assert.rejects(() => disconnectChannelShared({
+    vault, audit, channelConfig: cfg, registry: new ProviderRegistry([rev]),
+    identity: ID, channel: 'C_RB', providerId: 'rev', issuance,
+  }));
+
+  // FULL rollback: credential, mode, and satellites intact; no upstream revoke attempted or audited.
+  assert.ok(await vault.get(channelOwner('T1', 'C_RB'), 'rev'), 'the credential is not deleted');
+  assert.equal(await cfg.getMode('T1', 'C_RB', 'rev'), 'shared', 'the mode is unchanged');
+  assert.deepEqual(revoked, [], 'the upstream revoke was never attempted');
+  assert.equal(((await db.all("SELECT 1 FROM audit WHERE action='revoke'")) as any[]).length, 0, 'no revoke audit row');
+});

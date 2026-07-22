@@ -2834,3 +2834,52 @@ test('sweep: expired prompts and unspent grants are deleted and audited (actor: 
     assert.match(r.meta, /approval-expired/);
   }
 });
+
+// #2/#4: the ENTIRE approval flow in a group DM (MPIM), through the production Bolt adapter — middleware
+// (classifies the 'mpim' + 'G…' delivery channel as ungoverned), storage (persists the personal scope),
+// and revalidation (the Approve decision + the consume re-check both honor it). With NO channel enable, a
+// self-approval in a group DM must prompt → approve → retry → execute, not be invalidated by deny-by-default.
+test('#4 MPIM approval flow through Bolt: prompt → approve → retry executes with no channel enable', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = randomBytes(32).toString('base64');
+  const provider = approvalProvider();
+  const vouchr = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
+  const actions: Record<string, any> = {};
+  vouchr.registerCommands({ command: () => undefined, view: () => undefined, action: (id: string, h: any) => (actions[id] = h) });
+  const ephemerals: any[] = [];
+  const client = { chat: { postEphemeral: async (p: any) => { ephemerals.push(p); return {}; }, postMessage: async () => ({}) } } as any;
+  // A verified group-DM event: id 'G…' + channel_type 'mpim' ⇒ governanceChannelOf returns null (ungoverned).
+  const args: any = {
+    context: {}, client,
+    event: { user: 'U1', team: 'T1', channel: 'GROUPDM01', channel_type: 'mpim', thread_ts: 'TH1' },
+    next: async () => {},
+  };
+  await vouchr.middleware(args);
+  const ctx = args.context.vouchr;
+  // Deliberately NO setChannelToolEnabled: deny-by-default must not reach the group DM.
+  await vouchr.vault.upsert(userOwner(ID), provider.id, { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect(provider.id);
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    assert.equal(e.approver, 'self');
+    assert.equal(calls.length, 0, 'the unapproved write never hit the network');
+    assert.equal(ephemerals.length, 1);
+    assert.equal(ephemerals[0].channel, 'GROUPDM01', 'the prompt is delivered in the group DM');
+    assert.equal(ephemerals[0].user, 'U1');
+
+    // Approve (self = requester), clicking in the SAME group DM. The decision revalidation reads the
+    // persisted personal scope, so deny-by-default does NOT invalidate the grant.
+    await actions[APPROVAL_APPROVE_ACTION]({
+      ack: async () => {},
+      body: {
+        team: { id: 'T1' }, user: { id: 'U1' }, channel: { id: 'GROUPDM01' },
+        container: { channel_id: 'GROUPDM01', thread_ts: 'TH1' }, actions: [{ value: e.approvalId }],
+      },
+      client, respond: async () => {},
+    });
+
+    const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL });
+    assert.equal(res.status, 200, 'the approved retry executed instead of being invalidated');
+    assert.equal(calls.length, 1, 'exactly one upstream call — the approved retry');
+  });
+});

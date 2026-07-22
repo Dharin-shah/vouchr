@@ -641,3 +641,41 @@ test('disconnect-shared reports a committed removal when only its post-commit re
   });
   assert.equal((await db.all(`SELECT 1 FROM audit WHERE action='revoke'`)).length, 0);
 });
+
+// #3: local removal succeeds but the post-commit UPSTREAM revoke FAILS → ok:false, rendered truthfully
+// ("upstream revocation could not be confirmed"), the credential still removed locally, no secret leaked.
+// Distinct from the post-commit-AUDIT-failure test: here the revoke call itself fails (attempted=true).
+test('disconnect-shared: local removal succeeds but a failed upstream revoke reports ok:false truthfully (#3)', async (t) => {
+  const db = await openTestDb(t);
+  const revocable = defineProvider({
+    id: 'rev', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
+    egressAllow: ['acme.example'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
+    revokeUrl: 'https://acme.example/oauth/revoke',
+  });
+  const vouchr = await createVouchr({ providers: [revocable], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  let handler: any;
+  vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
+  const run = async (text: string): Promise<string> => {
+    const out: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+    });
+    return out[0] ?? '';
+  };
+  const owner = channelOwner('T1', 'C_FIN');
+  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'rev', 'shared');
+  await vouchr.vault.upsert(owner, 'rev', { ...cred, accessToken: 'sk-live' });
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => { throw new Error('ghp_REVOKE_FAILURE_MUST_NOT_REACH_SLACK'); }) as any;
+  try {
+    const msg = await run('disconnect-shared rev');
+    assert.match(msg, /Removed the shared \*rev\* account/);
+    assert.match(msg, /upstream revocation could not be confirmed/i);
+    assert.doesNotMatch(msg, /ghp_/);
+    assert.equal(await vouchr.vault.has(owner, 'rev'), false); // the local removal committed
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

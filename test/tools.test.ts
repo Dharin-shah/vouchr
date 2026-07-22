@@ -10,7 +10,7 @@ import { applyChannelToolsEnabled, ChannelTools, setChannelToolEnabled } from '.
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
-import { authorizeProvider, buildToolManifest } from '../src/core/authz';
+import { authorizeProvider, buildToolManifest, governanceChannelOf } from '../src/core/authz';
 import { ConnectContext } from '../src/adapters/bolt';
 import { countingDb } from './support/counting-db';
 import type { Db } from '../src/core/db';
@@ -409,4 +409,29 @@ test('enabledSnapshot is one read and matches isEnabled per provider (App Home a
   const snap2 = await new ChannelTools(fresh.db).enabledSnapshot('T1', 'C_EMPTY');
   assert.deepEqual(fresh.counts, { get: 0, all: 1 });
   assert.equal(snap2('anything'), false);
+});
+
+// #2 two-scope authorization: governanceChannelOf maps a verified delivery channel to its MUTABLE
+// governance scope (null = ungoverned/personal). A 1:1 DM 'D…' is always personal; a public channel
+// 'C…' is always governed; an ambiguous 'G…' id is a group DM only when the SIGNED type says 'mpim'
+// (a contradictory public-id + mpim pair fails closed as governed). Static Policy is a separate axis.
+test('governanceChannelOf: two-scope classification, contradictory public-id + mpim stays governed', () => {
+  // Public channel: always governed, regardless of a (contradictory) signed personal type.
+  assert.equal(governanceChannelOf('C123'), 'C123');
+  assert.equal(governanceChannelOf('C123', 'channel'), 'C123');
+  assert.equal(governanceChannelOf('C123', 'mpim'), 'C123'); // contradictory → fails closed as governed
+  assert.equal(governanceChannelOf('C123', 'im'), 'C123');
+  // 1:1 DM: always personal (the 'D' prefix is unambiguous), with or without a type.
+  assert.equal(governanceChannelOf('D999'), null);
+  assert.equal(governanceChannelOf('D999', 'im'), null);
+  assert.equal(governanceChannelOf('D999', 'mpim'), null);
+  // Ambiguous 'G…' id: a group DM ONLY when the signed type says mpim; otherwise a governed private channel.
+  assert.equal(governanceChannelOf('G777', 'mpim'), null);
+  assert.equal(governanceChannelOf('G777', 'im'), 'G777'); // im on a G-id is contradictory → governed
+  assert.equal(governanceChannelOf('G777'), 'G777');
+  assert.equal(governanceChannelOf('G777', 'channel'), 'G777');
+  assert.equal(governanceChannelOf('G777', 'group'), 'G777');
+  // No channel: nothing to govern.
+  assert.equal(governanceChannelOf(null), null);
+  assert.equal(governanceChannelOf(null, 'mpim'), null);
 });
