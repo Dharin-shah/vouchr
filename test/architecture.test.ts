@@ -8,6 +8,35 @@ import {
   CONFIGURE_CALLBACK, USER_KEY_CALLBACK, SETUP_KEY_ACTION,
 } from '../src';
 
+function userFacingFiles(root: string, relativeDir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(join(root, relativeDir), { withFileTypes: true })) {
+    const relative = join(relativeDir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...userFacingFiles(root, relative));
+    } else if (/\.(?:md|ya?ml|ts)$/.test(entry.name)) {
+      files.push(relative);
+    }
+  }
+  return files;
+}
+
+function expressReceiverBlocks(source: string): string[] {
+  const lines = source.split('\n');
+  const blocks: string[] = [];
+  for (let start = 0; start < lines.length; start++) {
+    if (!lines[start].includes('new ExpressReceiver({')) continue;
+    const end = lines.findIndex(
+      (line, index) => index >= start && /^\s*\}\);\s*(?:\/\/.*)?$/.test(line),
+    );
+    if (end >= start) {
+      blocks.push(lines.slice(start, end + 1).join('\n'));
+      start = end;
+    }
+  }
+  return blocks;
+}
+
 // The broker core must stay transport-agnostic: no Slack/Bolt or adapter imports. That boundary is
 // what lets the packaged broker + thin clients reuse the SAME core (and its security logic) instead of
 // re-implementing it per language. Slack-specific pieces (e.g. the InstallationStore) live in
@@ -91,10 +120,10 @@ test('#241 Postgres+KMS template wires one envelope-backed installation store in
 test('#5 docs do not regress to the removed `configure` command or the open-by-default default', () => {
   const root = process.cwd();
   const docFiles = [
-    'README.md', 'QUICKSTART.md',
-    'guides/HYBRID.md', 'guides/DEPLOYMENT.md', 'guides/HEADLESS.md',
-    'examples/slack-manifest.yml', 'examples/dry-run/README.md',
-    'examples/google-user/app.ts', 'examples/mcp-gateway/gateway.ts',
+    'README.md',
+    'QUICKSTART.md',
+    ...userFacingFiles(root, 'guides'),
+    ...userFacingFiles(root, 'examples'),
   ];
   const offenders: string[] = [];
   for (const rel of docFiles) {
@@ -107,6 +136,23 @@ test('#5 docs do not regress to the removed `configure` command or the open-by-d
   }
   assert.deepEqual(offenders, [], `docs still reference the removed configure command:\n${offenders.join('\n')}`);
 
+  assert.match(
+    readFileSync(join(root, 'QUICKSTART.md'), 'utf8'),
+    /\/vouchr enable github/,
+    'the first-use walkthrough must include the deny-by-default channel bootstrap',
+  );
+  const dryRunReadme = readFileSync(join(root, 'examples', 'dry-run', 'README.md'), 'utf8');
+  assert.match(
+    dryRunReadme,
+    /dryRun\.enableTool/,
+    'the dry-run walkthrough must configure the same deny-by-default bootstrap as production',
+  );
+  assert.match(
+    dryRunReadme,
+    /\/vouchr enable <provider>/,
+    'the dry-run bootstrap must identify its production Slack equivalent',
+  );
+
   // Positive guard: the ChannelTools contract documents deny-by-default (the inverse of the old text).
   const tools = readFileSync(join(root, 'src', 'core', 'tools.ts'), 'utf8');
   assert.match(tools, /deny-by-default/i, 'ChannelTools JSDoc must document deny-by-default');
@@ -118,18 +164,38 @@ test('#5 docs do not regress to the removed `configure` command or the open-by-d
 });
 
 test('shipped Slack installations can classify group DMs securely', () => {
+  const manifest = readFileSync(join(process.cwd(), 'examples', 'slack-manifest.yml'), 'utf8');
+  const lines = manifest.split('\n');
+  const oauthStart = lines.findIndex((line) => /^oauth_config:\s*$/.test(line));
+  const oauthEnd = lines.findIndex((line, index) => index > oauthStart && /^\S/.test(line));
+  const oauthLines = lines.slice(oauthStart, oauthEnd === -1 ? undefined : oauthEnd);
+  const botStart = oauthLines.findIndex((line) => /^\s{4}bot:\s*$/.test(line));
+  const botEnd = oauthLines.findIndex(
+    (line, index) => index > botStart && /^\s{0,4}\S/.test(line),
+  );
+  const botLines = oauthLines.slice(botStart + 1, botEnd === -1 ? undefined : botEnd);
+  const manifestBotScopes = botLines
+    .map((line) => line.match(/^\s{6}-\s*([^#\s]+)/)?.[1])
+    .filter((scope): scope is string => scope !== undefined);
+  assert.ok(oauthStart >= 0 && botStart >= 0, 'Slack manifest must contain oauth_config.scopes.bot');
+  assert.ok(
+    manifestBotScopes.includes('mpim:read'),
+    'examples/slack-manifest.yml oauth_config.scopes.bot must grant mpim:read',
+  );
+
   for (const rel of [
-    'examples/slack-manifest.yml',
     'examples/postgres-kms/app.ts',
     'examples/postgres-kms/README.md',
     'guides/HYBRID.md',
     'guides/DEPLOYMENT.md',
   ]) {
     const source = readFileSync(join(process.cwd(), rel), 'utf8');
-    assert.match(
-      source,
-      /\bmpim:read\b/,
-      `${rel} must grant mpim:read for authenticated MPIM classification`,
+    const receivers = expressReceiverBlocks(source);
+    assert.ok(
+      receivers.some((receiver) => (
+        /\bscopes\s*:\s*\[[^\]]*['"]mpim:read['"][^\]]*\]/.test(receiver)
+      )),
+      `${rel} must grant mpim:read in its configured ExpressReceiver scopes`,
     );
   }
 });

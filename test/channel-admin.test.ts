@@ -54,7 +54,7 @@ async function ctx(t: TestContext, opts: {
   return { c, db };
 }
 
-test('disconnectChannelShared: removes the shared credential (per-user after); a session channel is a no-op (#2)', async (t) => {
+test('disconnectChannelShared removes shared and leaves every non-shared mode untouched', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
@@ -72,14 +72,20 @@ test('disconnectChannelShared: removes the shared credential (per-user after); a
   assert.equal(await cfg.getMode('T1', 'C_SHARED', 'mcp'), 'per-user'); // returned to per-user
   assert.ok(!(await vault.get(shared, 'mcp'))); // the shared credential is gone
 
-  // A SESSION channel is never downgraded — disconnect-shared is a truthful no-op there (the #2 fix).
-  await writeChannelMode(cfg, 'T1', 'C_SESSION', 'mcp', 'session');
-  const noop = await disconnectChannelShared({
-    vault, audit, channelConfig: cfg, registry: new ProviderRegistry([provider]),
-    identity: ID, channel: 'C_SESSION', providerId: 'mcp', issuance: await vault.userProvisioningIssuedAt(),
-  });
-  assert.equal(noop.status, 'not-shared');
-  assert.equal(await cfg.getMode('T1', 'C_SESSION', 'mcp'), 'session'); // thread-approval requirement preserved
+  // Every non-shared state is a no-op: session cannot be downgraded, an explicit per-user row stays
+  // put, and an unconfigured provider must not gain a row. None invents an audit event.
+  for (const current of ['session', 'per-user', null] as const) {
+    const channel = `C_${current ?? 'NULL'}`;
+    if (current) await writeChannelMode(cfg, 'T1', channel, 'mcp', current);
+    const beforeAudits = (await db.all(`SELECT 1 FROM audit`)).length;
+    const noop = await disconnectChannelShared({
+      vault, audit, channelConfig: cfg, registry: new ProviderRegistry([provider]),
+      identity: ID, channel, providerId: 'mcp', issuance: await vault.userProvisioningIssuedAt(),
+    });
+    assert.equal(noop.status, 'not-shared');
+    assert.equal(await cfg.getMode('T1', channel, 'mcp'), current);
+    assert.equal((await db.all(`SELECT 1 FROM audit`)).length, beforeAudits);
+  }
 });
 
 // The channel-shared revoke truth table must MATCH the personal disconnect (removeUserConnection):
@@ -134,6 +140,10 @@ test('disconnectChannelShared truth table (#3): revoke / non-revocable / unregis
   await setShared('C3', 'ghost', 'ghost-sk');
   const r3 = await disconnectChannelShared({ vault, audit, channelConfig: cfg, registry: bare, identity: ID, channel: 'C3', providerId: 'ghost', issuance: await issuance() });
   assert.deepEqual({ status: r3.status, ok: r3.ok, attempted: r3.attempted }, { status: 'removed', ok: false, attempted: false });
+  const a3 = (await revokeAudits()).filter((r) => r.provider === 'ghost' && r.meta.channel === 'C3');
+  assert.deepEqual(a3[0].meta, {
+    owner: 'channel', channel: 'C3', ok: false, upstream: 'skipped',
+  });
 
   // (4) reference credential (secret_ref, no token Vouchr holds) on a REVOCABLE provider → removed, but
   //     ok:FALSE: a due upstream revoke could not run because Vouchr never held the token (missing).
@@ -141,6 +151,10 @@ test('disconnectChannelShared truth table (#3): revoke / non-revocable / unregis
   await vault.reference(channelOwner('T1', 'C4'), 'rev', { source: 'test', secretRef: 'ref://chan/rev' });
   const r4 = await disconnectChannelShared({ vault, audit, channelConfig: cfg, registry, identity: ID, channel: 'C4', providerId: 'rev', issuance: await issuance() });
   assert.deepEqual({ status: r4.status, ok: r4.ok, attempted: r4.attempted }, { status: 'removed', ok: false, attempted: false });
+  const a4 = (await revokeAudits()).filter((r) => r.provider === 'rev' && r.meta.channel === 'C4');
+  assert.deepEqual(a4[0].meta, {
+    owner: 'channel', channel: 'C4', ok: false, upstream: 'skipped',
+  });
 
   // (5) dry-run credential → removed, ok:true, NOT attempted: a synthetic row is never POSTed upstream.
   await writeChannelMode(cfg, 'T1', 'C5', 'rev', 'shared');
@@ -149,6 +163,15 @@ test('disconnectChannelShared truth table (#3): revoke / non-revocable / unregis
   const r5 = await disconnectChannelShared({ vault, audit, channelConfig: cfg, registry, identity: ID, channel: 'C5', providerId: 'rev', issuance: await issuance() });
   assert.deepEqual({ status: r5.status, ok: r5.ok, attempted: r5.attempted }, { status: 'removed', ok: true, attempted: false });
   assert.equal(revokedTokens.length, before); // no real upstream call for a dry-run row
+  const a5 = (await revokeAudits()).filter((r) => r.provider === 'rev' && r.meta.channel === 'C5');
+  assert.deepEqual(a5[0].meta, {
+    owner: 'channel', channel: 'C5', ok: true, upstream: 'skipped',
+  });
+
+  const durableAudit = JSON.stringify(await db.all(`SELECT * FROM audit`));
+  for (const secret of ['rev-sk', 'mcp-sk', 'ghost-sk', 'ref://chan/rev', 'dry-sk']) {
+    assert.ok(!durableAudit.includes(secret), `audit must not contain ${secret}`);
+  }
 });
 
 test('disconnectChannelShared preserves its committed outcome when the revoke audit store fails', async (t) => {
@@ -456,6 +479,23 @@ test('disconnectChannelShared: an in-transaction config-audit failure rolls back
   });
   await writeChannelMode(cfg, 'T1', 'C_RB', 'rev', 'shared');
   await vault.upsert(channelOwner('T1', 'C_RB'), 'rev', { accessToken: 'rev-sk', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
+  const now = Date.now();
+  await db.run(
+    `INSERT INTO channel_provisioning_request
+       (id, team_id, channel, user_id, provider, created_at, expires_at)
+     VALUES (?,?,?,?,?,?,?)`,
+    [`rollback-${randomBytes(6).toString('hex')}`, 'T1', 'C_RB', ID.userId, 'rev', now, now + 60_000],
+  );
+  await db.run(
+    `UPDATE channel_interaction_tombstone
+        SET created_at=1
+      WHERE team_id='T1' AND channel='C_RB' AND provider='rev'`,
+  );
+  const tombstoneBefore = await db.get<{ created_at: number }>(
+    `SELECT created_at FROM channel_interaction_tombstone
+      WHERE team_id='T1' AND channel='C_RB' AND provider='rev'`,
+  );
+  assert.ok(tombstoneBefore);
   const issuance = await vault.userProvisioningIssuedAt(); // after the write ⇒ not stale
 
   const realAudit = new Audit(db);
@@ -475,5 +515,21 @@ test('disconnectChannelShared: an in-transaction config-audit failure rolls back
   assert.ok(await vault.get(channelOwner('T1', 'C_RB'), 'rev'), 'the credential is not deleted');
   assert.equal(await cfg.getMode('T1', 'C_RB', 'rev'), 'shared', 'the mode is unchanged');
   assert.deepEqual(revoked, [], 'the upstream revoke was never attempted');
-  assert.equal(((await db.all("SELECT 1 FROM audit WHERE action='revoke'")) as any[]).length, 0, 'no revoke audit row');
+  assert.equal(
+    (await db.all(
+      `SELECT 1 FROM channel_provisioning_request
+        WHERE team_id='T1' AND channel='C_RB' AND provider='rev'`,
+    )).length,
+    1,
+    'the pending channel setup satellite is restored',
+  );
+  assert.deepEqual(
+    await db.get<{ created_at: number }>(
+      `SELECT created_at FROM channel_interaction_tombstone
+        WHERE team_id='T1' AND channel='C_RB' AND provider='rev'`,
+    ),
+    tombstoneBefore,
+    'the interaction fence is not advanced by a rolled-back purge',
+  );
+  assert.equal((await db.all(`SELECT 1 FROM audit`)).length, 0, 'no config or revoke audit row');
 });
