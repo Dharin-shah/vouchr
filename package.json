@@ -1,6 +1,6 @@
 {
   "name": "@vouchr/core",
-  "version": "0.2.0",
+  "version": "1.0.0-beta",
   "description": "Self-hostable, Slack-native credential broker for AI agents.",
   "license": "Apache-2.0",
   "author": "Dharin Shah",

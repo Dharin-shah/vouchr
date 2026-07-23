@@ -5,6 +5,13 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+## [1.0.0-beta] — 2026-07-23
+
+Beta. The first release cut from the PostgreSQL-only, deny-by-default line — it supersedes the
+far-behind `0.2.0` and is the recommended build. Breaking vs `0.2.0` (greenfield — no data migration):
+SQLite and the cross-user `union` mode are removed (PostgreSQL-only), channels are deny-by-default, and
+`/vouchr configure` is now `/vouchr connect-shared`. See the migration/reset notes below.
+
 ### Changed
 
 - **Channel tools are deny-by-default.** An unconfigured channel now enables **no** provider; an

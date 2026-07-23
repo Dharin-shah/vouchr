@@ -3,14 +3,13 @@
 
 **Your Slack agent acts as the person asking — and never holds their tokens.**
 
-![Status: Alpha](https://img.shields.io/badge/status-alpha-orange?style=for-the-badge) [![CI](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml) [![Security](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/security.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Security)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge)](./LICENSE)
+![Status: Beta](https://img.shields.io/badge/status-beta-yellow?style=for-the-badge) [![CI](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml) [![Security](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/security.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Security)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge)](./LICENSE)
 
 </div>
 
 > [!IMPORTANT]
-> **Alpha — not yet proven in a live deployment**, and the last published package (`v0.2.0`)
-> is far behind `main`: **build from source** until the next release is cut. Feedback and
-> issues are very welcome.
+> **Beta.** `1.0.0-beta` is the current release (PostgreSQL-only, deny-by-default) and the recommended
+> build. Feedback and issues are very welcome.
 
 When a Slack agent needs to touch GitHub, Google, or Jira, teams pick between two bad options:
 one broad bot token (every action is "the bot", wielding everyone's power at once), or user
@@ -190,7 +189,7 @@ model or worker.
 
 ## Status
 
-Alpha. Every push runs the full test suite against real PostgreSQL, plus CodeQL and
+Beta. Every push runs the full test suite against real PostgreSQL, plus CodeQL and
 dependency checks. Want to help? See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 License: [Apache-2.0](./LICENSE).
