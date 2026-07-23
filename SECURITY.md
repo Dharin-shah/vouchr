@@ -16,6 +16,15 @@ Please include: affected version/commit, a description, reproduction steps or a 
 concept, and the impact you foresee. We aim to acknowledge within a few business days and to
 coordinate a fix and disclosure timeline with you.
 
+## Supported versions
+
+Only the current release line is supported with fixes.
+
+| Version | Supported |
+| --- | --- |
+| `1.0.0-beta` | ✅ current release (PostgreSQL-only, deny-by-default) |
+| `< 1.0` | ❌ superseded — upgrade to `1.0.0-beta` (breaking; greenfield, no data migration) |
+
 ## Scope
 
 Of particular interest:

@@ -82,12 +82,17 @@ jobs:
           registry-url: https://registry.npmjs.org
       - run: npm ci
       - run: npm run build
-      # Prerelease tags (a semver `-` suffix, e.g. v0.2.0-rc.1) publish under the `rc` dist-tag so they
-      # never become the default `npm install` target; stable tags publish as `latest`. This overrides
-      # publishConfig.tag per-release. Provenance signs the release.
+      # Dist-tag policy (overrides publishConfig.tag per-release; provenance signs the release):
+      #  - an in-progress prerelease (`-rc`/`-alpha`) publishes under `rc` so it never becomes the
+      #    default `npm install` target;
+      #  - a `-beta` release IS the recommended install for the beta line, so it publishes as `latest`;
+      #  - a stable tag publishes as `latest`.
       - name: npm publish
         run: |
-          if [[ "${GITHUB_REF_NAME}" == *-* ]]; then TAG=rc; else TAG=latest; fi
+          case "${GITHUB_REF_NAME}" in
+            *-rc*|*-alpha*) TAG=rc ;;
+            *)              TAG=latest ;;
+          esac
           echo "publishing ${GITHUB_REF_NAME} under dist-tag ${TAG}"
           npm publish --provenance --tag "${TAG}"
         env:
