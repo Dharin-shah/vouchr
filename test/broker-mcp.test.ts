@@ -172,6 +172,8 @@ test('#2 broker manifest: a signed group-DM (MPIM) is ungoverned; the same id wi
   try {
     // A governed channel with no `enable` → deny-by-default reports it disabled.
     assert.equal(await acmeEnabled({ channel: 'C_GOVERNED' }), false);
+    // A contradictory signed type cannot widen a non-G channel into an MPIM.
+    assert.equal(await acmeEnabled({ channel: 'C_GOVERNED', channelType: 'mpim' }), false);
     // A 1:1 DM (id 'D…', no type needed) → the id heuristic exempts it → enabled with no enable.
     assert.equal(await acmeEnabled({ channel: 'D_PERSONAL' }), true);
     // A group DM: the signed channelType='mpim' classifies the 'G…' id as personal → enabled, no enable.
@@ -179,6 +181,74 @@ test('#2 broker manifest: a signed group-DM (MPIM) is ungoverned; the same id wi
     // The SAME 'G…' id with no signed type stays governed (deny-by-default) — proving the type is load-bearing.
     assert.equal(await acmeEnabled({ channel: 'GROUPDM01' }), false);
   } finally {
+    server.close();
+  }
+});
+
+test('#2 broker authz: static Policy still governs DMs and MPIMs while mutable channel tools do not', async (t) => {
+  const deniedChannels = ['D_POLICY_DENIED', 'G_POLICY_DENIED'];
+  const { server, port, db } = await makeMcpBroker(t, (store) => ({
+    policy: new Policy({ acme: { defaultAllow: true, denyChannels: deniedChannels } }),
+    channelTools: new ChannelTools(store),
+  }));
+  const upstream = mockUpstream(() => new Response('{}', {
+    status: 200,
+    headers: { 'content-type': 'application/json' },
+  }));
+  const signedClaims = (
+    channel: string,
+    channelType: IdentityClaims['channelType'],
+  ) => signIdentity(claims({ channel, channelType }), SECRET);
+  const enabled = async (
+    channel: string,
+    channelType: IdentityClaims['channelType'],
+  ): Promise<boolean> => {
+    const response = await postRaw(port, '/v1/manifest', {
+      identityToken: signedClaims(channel, channelType),
+    });
+    assert.equal(response.status, 200, response.raw);
+    return JSON.parse(response.raw).tools.find((tool: any) => tool.provider === 'acme').enabled;
+  };
+  const use = (
+    channel: string,
+    channelType: IdentityClaims['channelType'],
+  ) => postRaw(port, '/v1/fetch', fetchEnvelope({
+    identityToken: signedClaims(channel, channelType),
+  }));
+
+  try {
+    for (const personal of [
+      { channel: 'D_POLICY_DENIED', channelType: 'im' as const, allowed: false },
+      { channel: 'G_POLICY_DENIED', channelType: 'mpim' as const, allowed: false },
+      { channel: 'D_POLICY_ALLOWED', channelType: 'im' as const, allowed: true },
+      { channel: 'G_POLICY_ALLOWED', channelType: 'mpim' as const, allowed: true },
+    ]) {
+      assert.equal(
+        await enabled(personal.channel, personal.channelType),
+        personal.allowed,
+        `manifest and enforcement must share the two-scope verdict for ${personal.channel}`,
+      );
+      const response = await use(personal.channel, personal.channelType);
+      if (personal.allowed) {
+        assert.equal(response.status, 200, response.raw);
+      } else {
+        assert.equal(response.status, 403, response.raw);
+        assert.equal(JSON.parse(response.raw).code, 'policy_denied');
+      }
+    }
+
+    assert.equal(
+      (await db.all(`SELECT 1 FROM channel_tool`)).length,
+      0,
+      'personal conversations remain usable without mutable channel-tool rows',
+    );
+    assert.equal(
+      upstream.seen.length,
+      2,
+      'only the two statically allowed personal-conversation requests reach the provider',
+    );
+  } finally {
+    upstream.restore();
     server.close();
   }
 });
