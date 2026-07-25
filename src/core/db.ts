@@ -1,4 +1,5 @@
 import { Pool, types, type PoolClient } from 'pg';
+import { hideInternals } from './redact';
 import { isPostgresUrl, optionalPositiveEnv } from './options';
 import { POSTGRES_NOW_MS_SQL } from './interaction';
 
@@ -60,7 +61,12 @@ class PgDb implements Db {
   // Dedicated small pool for token refresh, separate from the read pool, so a hung provider
   // /token endpoint inside a held lock can't starve the connections serving normal requests.
   private refreshPool?: Pool;
-  constructor(private pool: Pool, private connectionString: string) {}
+  constructor(private pool: Pool, private connectionString: string) {
+    // SEC-1: `connectionString` carries the database password and `createVouchr` returns this object
+    // to the host, so JSON.stringify/spread/a structured logger would print it. Same TS-erasure
+    // problem as ConnectionHandle; see core/redact.
+    hideInternals(this);
+  }
   async get(sql: string, params: any[] = []) { return (await this.pool.query(toPositional(sql), params)).rows[0]; }
   async all(sql: string, params: any[] = []) { return (await this.pool.query(toPositional(sql), params)).rows; }
   async run(sql: string, params: any[] = []) { return { changes: (await this.pool.query(toPositional(sql), params)).rowCount ?? 0 }; }

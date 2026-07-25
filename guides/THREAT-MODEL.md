@@ -22,14 +22,20 @@ flowchart TB
         slackapi["Slack Web API\n(users.info, conversations.info,\nchat.postMessage)"]
     end
 
+    subgraph minter["Identity minter (trust anchor, headless only)"]
+        mint["Slack-facing verifier\nholds identitySecret,\nmints signed assertions"]
+    end
+
     subgraph agent["Agent application (untrusted w.r.t. secrets)"]
         llm["LLM / model"]
         tools["MCP / tool runtime"]
         handler["Bolt event handler\n(your code)"]
+        worker["Agent worker (headless)\nholds assertions, never the key"]
     end
 
     subgraph vouchr["Vouchr process (trust anchor)"]
         adapter["Bolt adapter\n(src/adapters)"]
+        httpbroker["HTTP broker /v1/*\n(src/adapters/http)"]
         core["Core broker\n(src/core: vault, injector,\nconsent, tokens, crypto)"]
     end
 
@@ -44,7 +50,10 @@ flowchart TB
 
     user -->|verified events,\nOAuth authorize in browser| adapter
     handler -->|context.vouchr.connect / handle.fetch| adapter
+    mint -->|short-lived, single-use,\ndeployment-bound assertion| worker
+    worker -->|POST /v1/fetch with assertion,\nnever an owner id| httpbroker
     adapter --> core
+    httpbroker --> core
     core -->|handle only,\nNEVER the secret| handler
     handler -.->|may pass response data| llm
     handler -.-> tools
@@ -65,6 +74,15 @@ Boundaries, and what crosses each:
 - **Agent app ↔ Vouchr.** The hard boundary. The agent (and therefore the LLM and
   any tool runtime) receives a `ConnectionHandle`, never the secret
   (`src/core/injector.ts`). The handle exposes `fetch()` and `account()` only.
+- **Identity minter ↔ headless broker (`/v1/*`).** The second front door. The broker has no Slack
+  client, so *who is acting*, *whether they are a workspace admin*, and *whether the channel is
+  eligible for a shared credential* arrive only as claims signed by the minter — the trusted
+  Slack-facing service that already verified the Slack event signature and holds `identitySecret`.
+  That service is a trust anchor of the same rank as the master key; the worker on the other side of
+  the boundary receives only minted assertions. The optional `brokerToken`/`authorize` perimeter
+  (`broker.ts:perimeter`) runs *before* identity but is coarse, and is absent when the operator sets
+  neither — network access control to `/v1/*` is the operator's job. See "Headless broker: leaked
+  identity signing key" below.
 - **Vouchr ↔ database.** Token material is stored encrypted with AES-256-GCM. The runtime supports
   direct master-key encryption; with a KMS `EnvelopeProvider` configured, both Vault connection
   tokens and multi-workspace Slack installation `bot_token`/`data` use per-secret DEKs wrapped by an
@@ -156,6 +174,58 @@ or buggy.
   depth: the audit layer redacts credential-shaped values anyway (`src/core/audit.ts`,
   `looksSecret`). Treat custom providers as trusted code.
 
+### Headless broker: leaked identity signing key (`/v1/*`)
+
+The agent runtime holds `identitySecret` — it mints its own assertions in-process, or the key was
+mounted into a worker's environment — and is prompt-injected or otherwise hostile.
+
+- **Not mitigated. This is total compromise of the headless door, by design of the boundary.** The
+  broker cannot verify anything about the acting human itself (no Slack client), so identity, admin
+  authority, and channel eligibility have no second source: whoever can sign, decides. The attacker
+  mints `{ teamId, userId: <any human>, isAdmin: true, ownerKind: 'channel', channelEligible: true }`
+  and every gate downstream honours it. Impact: use of **every credential the deployment serves** via
+  `/v1/fetch` and `/v1/mcp` — the token bytes still never leave the broker, but the attacker receives
+  the provider's response to any allowlisted call made with that credential, which for most providers
+  is equivalent to holding it — plus every `/v1/admin/*` route (mode, tools, reference, config, audit,
+  offboard). Audit rows attribute the impersonated human, not the attacker. Short lifetimes, the
+  replay guard, and deployment binding do **not** reduce this: the attacker mints fresh, valid,
+  unspent assertions at will. The only control is where the key lives — in the minter, never in a
+  worker or any process running model or tool code (`guides/HEADLESS.md` → Operations;
+  `examples/broker-client/client.ts`).
+- **Blast radius is bounded to one deployment and one rotation window.** Verification requires the
+  configured `iss`/`aud`, so a key stolen from deployment A mints nothing that deployment B accepts,
+  and rotation retires a compromised `kid` (`identity.ts:verifyIdentity`, `normalizeIdentityConfig`;
+  rotation order in [DEPLOYMENT.md](./DEPLOYMENT.md)). Purpose separation is enforced, so this key is
+  never also the master key, broker bearer, Slack signing secret, or a provider client secret
+  (`assertIdentityPurposeDistinct`, checked in `loadIdentityConfig` *and* again in `createBroker`).
+
+Against the supported attacker — a caller that holds **assertions but not the key** — the broker does
+enforce all of the following:
+
+- **Deployment-bound, no legacy mode.** `createBroker` normalizes an `IdentityConfig`
+  (`broker.ts:createBroker`), so a bare-secret token is not a production broker mode. Verification
+  requires the exact `iss` and `aud`, a known `kid`, and a safe-integer `iat` that is not in the
+  future beyond the single documented ±30s skew.
+- **Short-lived.** `MAX_LIFETIME_MS` is 5 minutes and is enforced at *verify* time over `exp - iat`,
+  not merely trusted from the minter; `mintIdentity` clamps to the same ceiling (default TTL 60s).
+- **Single-use across replicas.** Every `jti` is spent in the shared PostgreSQL `broker_jti` table
+  (`DbReplayStore.use`, `INSERT … ON CONFLICT DO NOTHING`), so an assertion spent on one pod is
+  rejected on all the others. The store is not swappable — `createBroker` throws if a caller passes
+  `replayStore`, and the in-memory `ReplayGuard` is test-only — a spent `jti` is retained past `exp`
+  by three skew windows so pruning cannot open a replay gap, and `/readyz` EXPLAINs the exact
+  statements so a missing table or grant fails readiness instead of every request.
+- **Entropy floor on the trust root.** `MIN_IDENTITY_SECRET_BYTES` (32) plus a placeholder deny-list
+  and a repeated-pattern check, enforced per key at every construction boundary
+  (`assertStrongIdentitySecret`, `normalizeIdentityConfig`), with at most one active and one previous
+  key whose `kid` must be the canonical fingerprint of its secret.
+- **Owner ids are never read from the request body.** The vault owner key is built from verified
+  claims only (`broker.ts:ownerFromClaims`); a forged `handle` cannot cross tenants.
+- **Admin fails closed and is audited.** `claims.isAdmin !== true` refuses the admin routes and
+  records a `denied` row; the Enterprise/Grid offboard path additionally requires the subject in the
+  signed `offboardTargetUserId`, so admin status alone cannot nominate a foreign user from the body.
+- **Offboarding fences a retained assertion** — see "Deactivated user" above: a pre-tombstone
+  assertion gets `409 interaction_state_changed`, and its replay gets `401`.
+
 ### Database reader
 
 An attacker with read access to the Postgres database.
@@ -179,6 +249,69 @@ An attacker with read access to the Postgres database.
   key in memory/env is also out of scope here. Operator must encrypt the database at rest
   and access-control it (SECURITY.md, "The Postgres database is not wholly encrypted at
   rest"; "Operator responsibilities").
+
+### Database writer
+
+An attacker with `UPDATE`/`INSERT` on the `connection` table but **not** the master key or KMS grant:
+one over-privileged DML role, an SQL injection in a colocated application sharing the database, or a
+restored backup written back into a live schema.
+
+- **Encryption protects the bytes; it does not bind them to a row.** A sealed credential is
+  self-contained — `iv | tag | ciphertext` (scheme-0), `0x02 | keyId | …` (keyed), or
+  `0x01 | wrappedDek | …` (KMS envelope) — and nothing in it names the owner it was stored under
+  (`crypto.ts:seal`/`open`). Every gate above the vault reasons about the *row*: owner resolution,
+  full-key tenant isolation, policy, channel tools, approvals, and the offboard fence all decide
+  against `(team_id, owner_kind, owner_id, provider)` and then hand whatever ciphertext that row
+  holds to the injector.
+- **The attack is relocation, not decryption.** Copying Alice's `access_token_enc` /
+  `refresh_token_enc` into Bob's row passes every one of those checks unchanged: the vault decrypts
+  the blob successfully — the envelope path is no different, since the wrapped DEK travels inside the
+  blob and Vouchr passes the KMS no encryption context — the injector sends **Alice's** credential
+  upstream on Bob's turn, and the audit row attributes Alice's credential use to Bob. Confidentiality
+  holds throughout; provenance is what breaks.
+- **Invariant.** A credential ciphertext must be cryptographically bound to the owner row that stores
+  it, so that decrypting it under a different `(team_id, owner_kind, owner_id, provider)` **fails**
+  rather than silently succeeds.
+
+- **Status: NOT mitigated today.** `crypto.ts` calls `createCipheriv`/`createDecipheriv` with no
+  `setAAD`, and the envelope path passes the KMS no encryption context, so no stored blob is bound to
+  its row. Closing it requires a new ciphertext scheme — existing rows must stay readable forever, and
+  rows written by a binding build cannot be read by an earlier one — so it is deliberately not being
+  retrofitted alongside unrelated changes. Until it ships, treat write access to the `connection`
+  table as equivalent to *use* of every credential in it, and size the database role accordingly.
+
+- **Out of scope for row binding, and still not mitigated:** a writer can delete rows (denial of
+  service), rewrite non-secret columns (scopes, `secret_ref`, timestamps), or remove the tombstones
+  and provisioning markers the lifecycle fences depend on. Binding limits credential *relocation*; it
+  is not a substitute for a least-privilege database role and keeping DML away from every other
+  workload (SECURITY.md, "Operator responsibilities").
+
+### Write blast radius differs by transport
+
+A prompt-injected agent reaches further through the embedded Bolt path than through the headless
+broker, for the same provider and the same credential. This is a deliberate default, not an
+oversight, and it is the difference most likely to surprise an operator who reads only one guide.
+
+- **Broker (`/v1/fetch`).** `allowWrites` defaults to **false**, and the route rejects any
+  non-GET/HEAD with a 405 *before* identity verification or vault access. Turning it on is only the
+  first of two opt-ins: `withEgressDefaults` then pins any provider that declares no `egressMethods`
+  to GET/HEAD, so enabling writes globally never grants DELETE to every registered provider.
+- **Bolt (`handle.fetch`).** `allowWrites` defaults to **true**. Acting as the asking human — opening
+  the PR, filing the ticket — is the purpose of this surface, and the intended gate for a sensitive
+  write is `provider.approval` (human-in-the-loop) plus the OAuth scopes the user actually granted.
+  A provider that declares no `egressMethods` therefore accepts any method the host's handler passes.
+- **Consequence.** With a built-in such as `github()`, which declares no `egressMethods`, a handler
+  that forwards a model-chosen method allows `DELETE /repos/{owner}/{repo}` on the Bolt path with the
+  user's full `repo` scope, while the identical call through the broker is refused. The credential is
+  the user's and the action is attributed to them, but nothing in the egress layer narrows it.
+- **What to do about it.** For a read-only agent set `allowWrites: false` on `createVouchr`; it
+  intersects every provider's methods with GET/HEAD, so a provider that declares its own writes is
+  narrowed too. For a
+  writing agent, declare `egressMethods` (and ideally `egressPaths`) on the provider so the gate is
+  the provider's declaration rather than the handler's discipline — `databricks()` ships this way,
+  locked to `/api/2.0/sql/statements` with GET+POST. Use `provider.approval` for writes that warrant a
+  human decision. Both transports run the same core rule, so a declared provider behaves identically
+  on either.
 
 ### Network redirect / egress bypass
 
@@ -403,7 +536,16 @@ These mirror what the code (and the test suite) enforce:
    never derived from the channel id (`owner.ts:channelOwner`).
 9. **Channel-credential config is admin-gated, default-closed.** `isSlackAdmin`
    fails closed on any API error; non-admin attempts are audited as `denied`
-   (`adapters/slack-identity.ts`, `bolt.ts:requireAdmin`).
+   (`adapters/slack-identity.ts`, `bolt.ts:requireAdmin`). On the headless door the same gate is the
+   signed `isAdmin` claim, refused and audited when absent (`broker.ts:requireAdmin`,
+   `handleOffboard`).
+10. **Headless identity assertions are deployment-bound, ≤5-minute, and single-use cluster-wide.**
+    Issuer, audience, `kid`, and `iat` are verified against the deployment's own
+    `IdentityConfig`; the lifetime ceiling is enforced at verify, not trusted from the minter; each
+    `jti` is spent once in the shared `broker_jti` table and the store is not swappable. The signing
+    key has a 32-byte floor and must be byte-distinct from every other configured secret
+    (`http/identity.ts`, `http/replayStore.ts`, `http/broker.ts:createBroker`). Whoever holds that key
+    can assert any identity, including `isAdmin` — see the headless attacker entry above.
 
 ## Non-goals (cross-reference)
 

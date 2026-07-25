@@ -1,13 +1,10 @@
-# Slack app manifest for the Vouchr demo — the shape of the FINISHED app.
+# BOOTSTRAP manifest — use this one to CREATE the app. It is `slack-manifest.yml` with the three
+# request URLs removed, because Slack challenges those URLs the moment you submit the manifest and
+# your app cannot answer yet: it needs the SLACK_SIGNING_SECRET that only exists once the app is
+# created. Create → copy the secrets → start the tunnel + app → then paste the URLs in the UI, where
+# Slack verifies them against a live server. QUICKSTART.md § 3 is the full order.
 #
-# Do not create an app from this file: Slack challenges the three request URLs below at submit time,
-# and your app can't answer until it exists (it needs the signing secret this creation would produce).
-# Create from `slack-manifest.bootstrap.yml` instead, then add the URLs once the app is running —
-# QUICKSTART.md § 3. Use this file to review or re-apply the finished configuration.
-#
-# Replace YOUR_PUBLIC_URL with your tunnel HOST ONLY — no scheme, no trailing slash
-# (`your-name.ngrok-free.app`); the `https://` is already in each URL below. With an
-# ExpressReceiver, events, interactivity, and the slash command all post to /slack/events.
+# Keep this file in sync with slack-manifest.yml (which stays the reference for the finished app).
 display_information:
   name: Vouchr
   description: Connect your accounts so agents can act on your behalf, without seeing your tokens.
@@ -20,8 +17,7 @@ features:
     display_name: vouchr
     always_online: true
   slash_commands:
-    - command: /vouchr
-      url: https://YOUR_PUBLIC_URL/slack/events
+    - command: /vouchr        # add its Request URL in Features → Slash Commands after the app runs
       description: Manage your connected accounts
       usage_hint: status | disconnect <provider> | connect-shared <provider>
       should_escape: false
@@ -36,15 +32,16 @@ oauth_config:
       - groups:read         # same, for private channels
       - mpim:read           # conversations.info: distinguish group DMs from governed private channels
 settings:
+  # The bot events are declared here so you don't hand-pick them later; Slack keeps Events disabled
+  # until you save a verified Request URL in Features → Event Subscriptions.
   event_subscriptions:
-    request_url: https://YOUR_PUBLIC_URL/slack/events
     bot_events:
       - app_mention
       - app_home_opened     # render the App Home console
       - user_change         # auto-revoke a deactivated user's connections
   interactivity:
-    is_enabled: true        # REQUIRED for the Connect button + key/connect-shared modals
-    request_url: https://YOUR_PUBLIC_URL/slack/events
+    is_enabled: false       # turn ON in Features → Interactivity & Shortcuts when you add its URL —
+                            # REQUIRED for the Connect button + key/connect-shared modals
   org_deploy_enabled: false
   socket_mode_enabled: false
   token_rotation_enabled: false

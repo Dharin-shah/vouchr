@@ -834,19 +834,23 @@ test('CLI dry-run writes no provisioning fence', async (t) => {
 test('CLI revoke does not echo a token-shaped positional or unknown-flag secret (SEC-1)', async (t) => {
   const dbPath = await testDbUrl(t);
   const keyB64 = randomBytes(32).toString('base64');
-  const secret = 'ghp_TOPSECRETtokenBBBBBBBBBBBBBBBBBBBB';
+  const SENTINEL = 'SYNTHETIC-DO-NOT-ECHO';
+  // Token-SHAPED (the `ghp_` prefix the audit redactor keys on) but not a real GitHub
+  // grammar, so secret scanners stay quiet. Assertions match SENTINEL, not the whole
+  // string, so a TRUNCATED echo is caught too.
+  const secret = `ghp_${SENTINEL}-B`;
   const env = { ...process.env, VOUCHR_DATABASE_URL: dbPath, VOUCHR_MASTER_KEY: keyB64 };
   for (const args of [['revoke', secret, '--yes'], ['revoke', `--${secret}`, '--yes']]) {
     const res = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', ...args], { env, encoding: 'utf8' });
     assert.notEqual(res.status, 0);
-    assert.doesNotMatch(res.stderr + res.stdout, /ghp_TOPSECRET/, `must not echo the secret in ${args.join(' ')}`);
+    assert.ok(!(res.stderr + res.stdout).includes(SENTINEL), `must not echo the secret in ${args.join(' ')}`);
   }
 
   // Recognized flag values are untrusted too; a token pasted as --provider must not be reflected in
   // the scope summary even though parsing succeeds and the dry-run safely matches zero rows.
   const recognized = spawnSync(process.execPath, ['--import', 'tsx', 'bin/vouchr.ts', 'revoke', '--provider', secret, '--dry-run'], { env, encoding: 'utf8' });
   assert.equal(recognized.status, 0);
-  assert.doesNotMatch(recognized.stderr + recognized.stdout, /ghp_TOPSECRET/);
+  assert.ok(!(recognized.stderr + recognized.stdout).includes(SENTINEL), 'must not echo the secret');
 
   // The command itself is untrusted argv too. A credential pasted in that position must get a
   // useful but static usage error, never be reflected back into terminal logs.
@@ -855,7 +859,7 @@ test('CLI revoke does not echo a token-shaped positional or unknown-flag secret 
   });
   assert.equal(unknownCommand.status, 2);
   assert.match(unknownCommand.stderr, /Unknown command/);
-  assert.doesNotMatch(unknownCommand.stderr + unknownCommand.stdout, /ghp_TOPSECRET/);
+  assert.ok(!(unknownCommand.stderr + unknownCommand.stdout).includes(SENTINEL), 'must not echo the secret');
 });
 
 // -------------------------------------------------------------------------------------------------

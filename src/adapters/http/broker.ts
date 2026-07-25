@@ -8,7 +8,7 @@ import type { Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import { configureChannelTools, type ChannelTools } from '../../core/tools';
-import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, canonicalMethod, hasAmbiguousPathEncoding, type Provider } from '../../core/providers';
+import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, canonicalMethod, hasAmbiguousPathEncoding, withEgressDefaults, type Provider } from '../../core/providers';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, approvalNeeded, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
@@ -421,11 +421,9 @@ class HttpError extends Error {
   }
 }
 
-/** #25: default-deny realized in the adapter (core stays unchanged): set GET/HEAD when unset. */
-export function withEgressDefaults(p: Provider, defaultDenyNonGet?: boolean): Provider {
-  if (defaultDenyNonGet && !p.egressMethods) return { ...p, egressMethods: ['GET', 'HEAD'] };
-  return p;
-}
+/** #25 default-deny. The rule now lives in core so the Bolt path cannot drift from it (STR-1/STR-2);
+ *  re-exported here because it is published API and referenced by existing tests. */
+export { withEgressDefaults };
 
 function requestMethod(method: unknown): string {
   if (typeof method !== 'string') throw new HttpError(400, { error: 'invalid method' });

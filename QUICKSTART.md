@@ -4,7 +4,7 @@ This takes you from **nothing** to a working Slack bot that acts as *you* on Git
 your account once through a private OAuth prompt, then answering `You are *yourlogin*, N public
 repos` — with the GitHub token **never** touching the bot code, the Slack transcript, or the logs.
 
-It doubles as a **video script**: the [Record the demo](#7-record-the-demo-the-money-shot) section
+It doubles as a **video script**: the [Record the demo](#8-record-the-demo-the-money-shot) section
 is the exact on-screen sequence.
 
 > New to the project? Do the [30-second sanity check](#0-30-second-sanity-check-no-accounts-needed)
@@ -30,11 +30,13 @@ is the exact on-screen sequence.
 ## 0. 30-second sanity check (no accounts needed)
 
 Confirms the real consent → policy → egress → vault → audit machinery works, with every network edge
-stubbed. Only needs local PostgreSQL.
+stubbed. It needs local PostgreSQL, so start one first — `npm run pg:up` runs a throwaway
+`postgres:16-alpine` on `localhost:5432` with database, user, and password all `vouchr`:
 
 ```bash
 npm install
-VOUCHR_TEST_PG_URL=postgres://vouchr:vouchr@localhost:5432/vouchr npm run example:dry-run
+npm run pg:up            # Docker; skip if you already have Postgres on :5432 (see step 1)
+npm run example:dry-run
 ```
 
 Green ⇒ the core is sound; now wire up the real Slack demo below.
@@ -43,14 +45,10 @@ Green ⇒ the core is sound; now wire up the real Slack demo below.
 
 ## 1. PostgreSQL
 
-**Option A — Docker (portable):**
+Step 0's `npm run pg:up` is the whole story if you have Docker: it is the container the rest of this
+guide assumes, and `npm run pg:down` removes it (along with everything in it).
 
-```bash
-docker run --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr \
-  -e POSTGRES_DB=vouchr -p 5432:5432 -d postgres:16
-```
-
-**Option B — Homebrew (macOS):**
+**Prefer Homebrew (macOS)?**
 
 ```bash
 brew install postgresql@16 && brew services start postgresql@16
@@ -91,24 +89,26 @@ Copy the `https://…` URL it prints. Call it **`PUBLIC_URL`** from here on.
 
 ---
 
-## 3. Create a Slack workspace + app
+## 3. Create a Slack workspace + app (from the **bootstrap** manifest)
 
 1. **New workspace:** go to <https://slack.com/get-started> → *Create a workspace*. Name it (e.g.
    "Vouchr Demo"), skip inviting people, and create a channel like `#demo`.
 2. **New app from the manifest:** <https://api.slack.com/apps> → **Create New App** → **From a
    manifest** → pick your new workspace.
-3. Paste the contents of [`examples/slack-manifest.yml`](./examples/slack-manifest.yml), then
-   **replace every `YOUR_PUBLIC_URL`** with your tunnel host (the part after `https://`). There are
-   three: the slash command URL, the event `request_url`, and the interactivity `request_url` — all
-   `https://YOUR_PUBLIC_URL/slack/events`.
+3. Paste the contents of
+   [`examples/slack-manifest.bootstrap.yml`](./examples/slack-manifest.bootstrap.yml) — **not**
+   `slack-manifest.yml`. Nothing to replace: the bootstrap file deliberately carries **no** request
+   URLs. Slack challenges a request URL the instant you submit the manifest, and your app cannot
+   answer one until it is running with the signing secret this very step is about to hand you. You
+   paste the URLs in [step 7](#7-finish-the-slack-app-the-three-urls), against a live server.
 4. **Create** → on the app's **Install App** page, **Install to Workspace** → **Allow**.
 5. Grab two secrets:
    - **Install App** page → **Bot User OAuth Token** (`xoxb-…`) → this is `SLACK_BOT_TOKEN`.
    - **Basic Information** → **Signing Secret** → this is `SLACK_SIGNING_SECRET`.
 
 The manifest already wires the `/vouchr` command, the `app_mention` / `app_home_opened` /
-`user_change` events, interactivity (the Connect button + modals), and the minimal bot scopes —
-you don't configure any of that by hand.
+`user_change` event list, the App Home tab, and the minimal bot scopes — the only things left to do
+by hand are the three URLs in step 7.
 
 ---
 
@@ -177,7 +177,28 @@ Keep this terminal visible in the recording — it proves the token never appear
 
 ---
 
-## 7. Record the demo (the money shot)
+## 7. Finish the Slack app (the three URLs)
+
+Now that the tunnel **and** the app are running, Slack can verify a URL the moment you save it. All
+three are the same one — an `ExpressReceiver` serves events, interactivity, and commands on a single
+path: **`PUBLIC_URL/slack/events`** (your tunnel URL from step 2, e.g.
+`https://your-name.ngrok-free.app/slack/events`).
+
+Back on <https://api.slack.com/apps> → your app:
+
+1. **Event Subscriptions** → turn **Enable Events** on → paste the URL into **Request URL** → wait
+   for the green **Verified** → **Save Changes**. The three bot events are already listed from the
+   manifest.
+2. **Interactivity & Shortcuts** → toggle **on** → same URL → **Save Changes**. Required: the
+   Connect button and every modal ride on this.
+3. **Slash Commands** → `/vouchr` → **Edit** → same URL → **Save**.
+
+If Slack asks you to reinstall the app afterwards, do it — the bot token doesn't change.
+[`examples/slack-manifest.yml`](./examples/slack-manifest.yml) is what the finished app looks like.
+
+---
+
+## 8. Record the demo (the money shot)
 
 In your Slack workspace, `#demo` channel:
 
@@ -209,11 +230,11 @@ In your Slack workspace, `#demo` channel:
 
 | Symptom | Fix |
 | --- | --- |
-| Slack "Your URL didn't respond" when saving the manifest | The app must be **running on :3000 through the tunnel** before Slack verifies. Start `npm run example:github` and the tunnel first, then create/verify the app. Avoid ngrok's interstitial (static domain / cloudflared). |
+| Slack "Your URL didn't respond" when saving a Request URL | Slack calls the URL as you save it, so the app must already be up: check `npm run example:github` is running and that the tunnel forwards to `:3000`. If you hit this while *creating* the app, you pasted `slack-manifest.yml` — create from `slack-manifest.bootstrap.yml` (step 3) and add the URLs in step 7 instead. Avoid ngrok's interstitial (static domain / cloudflared). |
 | GitHub `redirect_uri mismatch` | The callback must be **exactly** `PUBLIC_URL/vouchr/oauth/callback`, same scheme/host, no trailing slash. |
 | Bot ignores your `@mention` | `/invite @vouchr` into the channel; confirm the `app_mention` event is in the manifest and the process is running. |
 | Boot fails on the database | Run `npm run cli -- migrate` first; check `VOUCHR_DATABASE_URL` points at a reachable Postgres (Vouchr fails closed if it's unset or non-`postgres://`). |
-| `role "vouchr" does not exist` | Create the role/db (step 1 Option B) or point the URL at an existing one. |
+| `role "vouchr" does not exist` | Create the role/db (step 1, Homebrew) or point the URL at an existing one. |
 | Connect prompt never returns / callback 404 | `PUBLIC_URL` in `.env` must match the tunnel and the GitHub callback exactly, and the tunnel must forward to `:3000`. |
 
 ---

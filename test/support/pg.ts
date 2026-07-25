@@ -13,7 +13,7 @@ process.env.VOUCHR_PG_POOL_MAX ??= '2';
 // production shape. Ownership is explicit: every fixture registers a `t.after` that closes its pool
 // and drops its schema, so nothing leaks connections across the parallel suite (the old harness
 // leaked a pool per unclosed handle → `53300 too many clients`).
-export const TEST_PG_URL = process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5433/vouchr';
+export const TEST_PG_URL = process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5432/vouchr';
 
 /** True if the test Postgres is reachable. Retries a few times: under the parallel suite a momentary
  *  connection-pressure blip (a burst of pools near the server ceiling) must NOT be misread as "no PG".

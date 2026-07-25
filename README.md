@@ -43,6 +43,10 @@ permissions, their consent.
 **[QUICKSTART.md](./QUICKSTART.md)** is the full zero-to-running walkthrough: a Slack workspace and
 app, a GitHub OAuth app, and the bot acting as you in ~5 minutes.
 
+```bash
+npm install @vouchr/core   # `latest` currently resolves to 1.0.0-beta
+```
+
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
 import { createVouchr, github, ConsentRequiredError } from '@vouchr/core';

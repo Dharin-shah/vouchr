@@ -8,6 +8,7 @@ import { refreshToken, TokenEndpointError } from './tokens';
 import { DryRunVaultError, dryRunEcho } from './dryRun';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from './rateLimit';
 import { safeEmit } from './safe-emit';
+import { hideInternals } from './redact';
 import { governanceChannelOf } from './authz';
 import type { CredentialHealthHook } from './health';
 import {
@@ -322,6 +323,11 @@ export class ConnectionHandle {
       && (!Number.isSafeInteger(transportResponseMaxBytes) || transportResponseMaxBytes <= 0)) {
       throw new Error('ConnectionHandle: transportResponseMaxBytes must be a positive safe integer');
     }
+    // SEC-1: the handle is what the host holds INSTEAD of a token, so it must never serialize into
+    // one. The `private` modifiers above are erased at runtime; without this, JSON.stringify, an
+    // object spread, or any structured logger walks vault → master key, provider → OAuth client
+    // secret, and db → connection password. Regression: test/no-secret-serialization.test.ts.
+    hideInternals(this);
   }
 
   /** The identity key for this handle's (owner, provider) pair — the single-flight refresh map and

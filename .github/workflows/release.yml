@@ -22,8 +22,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     # Vouchr is PostgreSQL-only, so `npm test` (the real-PG suite) needs a live Postgres — mirror the
-    # service + VOUCHR_TEST_PG_URL that ci.yml uses. Without it the suite has no DB and the release
-    # can't pass. Container-only; there is no offline/PGlite tier.
+    # service ci.yml uses, on the localhost:5432 the suite defaults to. Without it the suite has no DB
+    # and the release can't pass. Container-only; there is no offline/PGlite tier.
     services:
       postgres:
         image: postgres:16-alpine
@@ -38,8 +38,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    env:
-      VOUCHR_TEST_PG_URL: postgres://vouchr:vouchr@localhost:5432/vouchr
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Gate BEFORE any publish (verify precedes every publish job): npm/GHCR are irreversible. Hard-

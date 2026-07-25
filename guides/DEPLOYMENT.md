@@ -58,11 +58,11 @@ request and `replicas > 1` is safe (the cluster-wide replay table is part of the
 **not** fully encrypted at rest (only token columns are), so run it on encrypted, access-controlled
 storage.
 
-Local Postgres for development (throwaway Docker container on port 5433):
+Local Postgres for development (throwaway Docker container on `localhost:5432`, the port the suite
+and every example default to):
 
 ```bash
 npm run pg:up   # postgres:16-alpine, db/user/pass all "vouchr"
-export VOUCHR_TEST_PG_URL=postgres://vouchr:vouchr@localhost:5433/vouchr
 npm test        # the suite migrates a throwaway schema and exercises the Postgres backend
 npm run pg:down # tear it down
 ```
@@ -936,6 +936,35 @@ Vouchr ships two ways; pick by how your platform builds:
   without a build. Best for non-GYG/self-host quick starts; the perimeter must then be enforced at
   the mesh (there's no code hook in a prebuilt image).
 
+  **`:latest` is stale — do not use it.** The release workflow tags images with the exact version
+  (`type=semver`), and `latest` only moves on a *stable* release, so it still points at the
+  pre-PostgreSQL `0.2.0` image. Use the explicit version tag (`1.0.0-beta`) or, better, the digest
+  you verified below.
+
+### Running the image
+
+Migrate first, then start the broker. Both use the same image; the migrate step needs the
+schema-owner URL and the runtime the DML-only one (see [Migrations](#migrations)):
+
+```bash
+IMAGE=ghcr.io/dharin-shah/vouchr-broker:1.0.0-beta
+docker run --rm -e VOUCHR_DATABASE_URL="postgres://vouchr_owner:...@host:5432/vouchr" \
+  "$IMAGE" node dist/bin/vouchr.js migrate
+docker run -d --name vouchr-broker -p 3000:3000 \
+  -e VOUCHR_DATABASE_URL="postgres://vouchr_app:...@host:5432/vouchr" \
+  -e VOUCHR_MASTER_KEY="$(openssl rand -base64 32)" \
+  -e VOUCHR_IDENTITY_SECRET="$(openssl rand -base64 32)" \
+  -e VOUCHR_DEPLOYMENT_ID=my-deployment \
+  -e VOUCHR_PROVIDERS='[{"id":"internal","credential":"key","egressAllow":["api.internal.example"]}]' \
+  "$IMAGE"
+```
+
+Those five variables are the full required set (`vouchr-broker --help`); everything else in the
+[environment contract](#environment-contract) is optional. Generate the two secrets **once** and keep
+them — a fresh `VOUCHR_MASTER_KEY` cannot decrypt existing credentials, and they must be distinct
+values. `curl localhost:3000/readyz` returns `{"ok":true}` when the broker is up against a migrated
+database. `test/docker-smoke.sh` runs exactly this sequence in CI.
+
 ### Verifying the GHCR image (cosign, SBOM, provenance)
 
 Every released image is keyless-signed with [cosign](https://docs.sigstore.dev/) by the release
@@ -1023,6 +1052,15 @@ recommend:
   tokens, not just storage-level encryption. Add `@aws-sdk/client-kms` to the image and bind an IRSA
   ServiceAccount. In a multi-workspace control plane, pass the same envelope to
   `DbInstallationStore` so Slack installation `bot_token`/`data` use that boundary too.
+
+  > [!IMPORTANT]
+  > **Changing `VOUCHR_KMS_KEY_ID` does not re-wrap existing rows.** Vouchr pins `KeyId` on the KMS
+  > `Decrypt` call, so a stored data key can only be unwrapped by the KEK that wrapped it. Repointing
+  > the variable at a different key — or moving an alias onto a new key — makes every previously
+  > stored credential fail to decrypt. `vouchr rekey` re-encrypts under the **master** key, not the
+  > KEK, so it does not migrate these; rotate via KMS key rotation (which preserves the key id), or
+  > plan an explicit re-wrap. Asymmetric KEKs are unsupported: `Decrypt` would additionally require
+  > `EncryptionAlgorithm`, which Vouchr does not send.
 - **Static channel policy** (`VOUCHR_POLICY_FILE`) for sensitive providers — keep the reviewed JSON
   beside the deployment manifest and use `defaultDeny: true` when every provider must be explicitly
   scoped. Runtime `ChannelTools` remains a second, independently enforced admin control.

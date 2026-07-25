@@ -74,7 +74,7 @@
     "test:coverage": "VOUCHR_REQUIRE_POSTGRES=1 node --import tsx --test --experimental-test-coverage --test-coverage-include='src/**' test/*.test.ts",
     "pack-smoke": "bash test/pack-smoke.sh",
     "docker-smoke": "bash test/docker-smoke.sh",
-    "pg:up": "docker run --rm -d --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr -p 5433:5432 postgres:16-alpine",
+    "pg:up": "docker run --rm -d --name vouchr-pg -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr -p 5432:5432 postgres:16-alpine",
     "pg:down": "docker rm -f vouchr-pg",
     "bench:audit": "node --import tsx test/bench/audit-bench.ts",
     "bench:perf": "node --import tsx test/bench/perf-bench.ts",

@@ -1,8 +1,20 @@
 /**
- * Caller-side integration for the headless broker: mint a per-request identity token and call
- * /v1/fetch. This is the code that runs in YOUR agent/runtime — the thing that already knows which
- * human is acting. The broker verifies the token and injects the real credential; your agent never
- * sees it.
+ * Reference integration for the headless broker, split across the TWO roles a production deployment
+ * keeps in SEPARATE processes:
+ *
+ *   1. the TRUSTED MINTER — your Slack-facing service. It verified the Slack event signature, holds
+ *      VOUCHR_IDENTITY_SECRET, and mints one short-lived assertion per request (`mintIdentity`).
+ *   2. the AGENT WORKER — the process running model/tool code. It receives only that assertion and
+ *      calls the broker (`fetchThroughBroker` below). It never sees the signing key, and never sees
+ *      the credential: the broker injects it.
+ *
+ * !! The `main` block at the bottom runs BOTH roles in one process. That is LOCAL DEVELOPMENT ONLY.
+ * The identity signing key is the broker's trust root: anything holding it can mint
+ * `{ userId: <any human>, isAdmin: true }` and use every credential the deployment serves. Minting
+ * inside the agent runtime therefore collapses the trust boundary — one prompt injection that can
+ * read the process environment owns the workspace. In production, keep the key in the minter and
+ * pass only `identityToken` over the wire. See guides/THREAT-MODEL.md, "Headless broker: leaked
+ * identity signing key".
  *
  * Run against a local broker. First provision T1/U1 through a Bolt control plane sharing this
  * database, or through the broker's validated `/v1/user/reference` route with a configured external
@@ -24,10 +36,10 @@
 import {
   mintIdentity,
   loadIdentityConfig,
-  type IdentityConfig,
   type SlackConversationType,
 } from '../../src'; // published package: from '@vouchr/core'
 
+/** Minter-side input: the acting human, from a signature-verified Slack event. Never worker input. */
 export interface Acting {
   teamId: string;
   userId: string;
@@ -48,21 +60,17 @@ export interface BrokerCall {
 }
 
 /**
- * Mint a fresh token for `acting` and POST one request through the broker. `identity` is the
- * deployment-bound `IdentityConfig` built from `loadIdentityConfig(process.env)`, so the assertion is
- * bound to one issuer/audience and signed with the active key. Your trusted minter and every broker
- * replica must share the same verification key set. `brokerToken` is the optional coarse perimeter
- * bearer if your broker sets one. Returns the broker's JSON response.
+ * WORKER SIDE — no signing key here. POST one request through the broker with an `identityToken` the
+ * trusted minter produced for exactly this call: assertions are single-use and short-lived, so ask
+ * the minter again for every request and every retry rather than caching one. `brokerToken` is the
+ * optional coarse perimeter bearer if your broker sets one. Returns the broker's JSON response.
  */
 export async function fetchThroughBroker(
   brokerUrl: string,
-  identity: IdentityConfig,
-  acting: Acting,
+  identityToken: string,
   call: BrokerCall,
   brokerToken?: string,
 ): Promise<{ status: number; body: unknown }> {
-  const identityToken = mintIdentity(acting, identity); // fresh jti + short exp, per call
-
   const res = await fetch(`${brokerUrl}/v1/fetch`, {
     method: 'POST',
     headers: {
@@ -85,16 +93,20 @@ export async function fetchThroughBroker(
 
 if (require.main === module) {
   const brokerUrl = process.env.BROKER_URL ?? 'http://localhost:3000';
+
+  // ---- TRUSTED MINTER SIDE — a SEPARATE service in production; in-process here is local dev only.
   // Build the SAME deployment-bound config the broker uses (#212): reads VOUCHR_IDENTITY_SECRET +
   // VOUCHR_DEPLOYMENT_ID from env, so the minted token's issuer/audience/kid match what the broker
   // expects. A mismatch (or a bare-secret token against a config-mode broker) is rejected.
   const identity = loadIdentityConfig(process.env);
-  // In a real agent these come from a signature-verified Slack event or authenticated Slack API
+  // In the real minter these come from a signature-verified Slack event or authenticated Slack API
   // lookup, never user input. Carry channel_type too: an MPIM uses a G… id, and the signed 'mpim'
   // value tells the broker it is a personal group DM rather than a governed private channel.
   const acting: Acting = { teamId: 'T1', userId: 'U1', channel: 'C1', channelType: 'channel' };
+  const identityToken = mintIdentity(acting, identity); // fresh jti + short exp, one per call
 
-  fetchThroughBroker(brokerUrl, identity, acting, {
+  // ---- WORKER SIDE — receives the assertion over the wire; the signing key never crosses here.
+  fetchThroughBroker(brokerUrl, identityToken, {
     provider: 'github',
     method: 'GET',
     path: '/user',
