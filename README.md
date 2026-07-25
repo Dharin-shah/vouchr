@@ -105,16 +105,19 @@ secret-manager-backed credentials (AWS, GCP, Azure, Vault) work too.
 Request only the scopes you use — `github({ scopes: ['read:user'] })` shows the user "Read your
 profile", not the broad `repo` default. See
 [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative) for declarative
-providers and for running one provider at different scopes in different channels.
+providers, and the [provider model](./guides/ARCHITECTURE.md#different-scopes-in-different-channels)
+for running one provider at different scopes in different channels.
 
-Twelve runnable examples — Google, Databricks, internal API keys, every major secret manager, the
-headless broker client, MCP gateway, Prometheus, SCIM — live in [`examples/`](./examples).
+Runnable examples — Google, Databricks, internal API keys, every major secret manager, the headless
+broker client, MCP gateway, Prometheus, SCIM — live in [`examples/`](./examples), each with its own
+README.
 
 ## Test without any external service
 
 `dryRun: true` runs your real Vouchr wiring — consent, channel modes, policy, egress checks, audit —
-with zero outbound network calls and no Slack or provider OAuth apps. Validate your allowlists and
-consent handling in CI: [`examples/dry-run/`](./examples/dry-run).
+with zero outbound network calls and no Slack or provider OAuth apps. Channels are deny-by-default,
+so enable the provider first with `vouchr.dryRun.enableTool(admin, channel, providerId)`. Validate
+your allowlists and consent handling in CI: [`examples/dry-run/`](./examples/dry-run).
 
 ## Headless and hybrid
 

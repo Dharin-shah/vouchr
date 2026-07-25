@@ -207,6 +207,24 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
   from a bounded supported reference form and require a configured resolver before persistence or
   audit; they do not invoke the resolver until injection. Rotation stays where the secret lives.
 
+### Different scopes in different channels
+
+Scopes come from the provider definition, so request exactly what you use:
+`github({ scopes: ['read:user'] })` shows the user only "Read your profile" rather than the broad
+`repo` default.
+
+Scopes are per-provider, not per-channel (yet —
+[#272](https://github.com/Dharin-shah/vouchr/issues/272)). Until then, define the provider twice
+under distinct ids and gate them with channel tools or policy:
+
+```ts
+providers: [
+  github({ scopes: ['read:user'] }),                                       // id: 'github' — read-only
+  defineProvider({ ...github({ scopes: ['read:user', 'repo'] }), id: 'github-write' }),
+]
+// then enable `github-write` only in the channels that need writes, `github` elsewhere.
+```
+
 ## Lifecycle
 
 ```
