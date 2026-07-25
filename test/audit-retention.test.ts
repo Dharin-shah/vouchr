@@ -196,13 +196,13 @@ test('prune CLI: only a bare --yes deletes; malformed forms are rejected without
   assert.equal(await count(), 5, 'an out-of-range days must delete nothing');
 
   // SEC-1: a token-shaped positional and an unknown flag carrying a secret must NOT be echoed.
-  const secret = 'ghp_TOPSECRETtokenAAAAAAAAAAAAAAAAAAAA';
+  const secret = 'SYNTHETIC-CREDENTIAL-A-DO-NOT-ECHO';
   let s = run(secret, '--yes');
   assert.notEqual(s.status, 0);
-  assert.doesNotMatch(s.stderr + s.stdout, /ghp_TOPSECRET/, 'a positional secret must not be echoed');
+  assert.ok(!(s.stderr + s.stdout).includes(secret), 'a positional secret must not be echoed');
   s = run(`--${secret}`, '--yes');
   assert.notEqual(s.status, 0);
-  assert.doesNotMatch(s.stderr + s.stdout, /ghp_TOPSECRET/, 'an unknown-flag secret must not be echoed');
+  assert.ok(!(s.stderr + s.stdout).includes(secret), 'an unknown-flag secret must not be echoed');
 
   await seed5();
   let r = run(); // no --yes → dry-run

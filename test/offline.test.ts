@@ -191,7 +191,7 @@ test('tokens: client auth + body format honor the provider (Basic+JSON vs body+f
 
 test('tokens: provider-supplied OAuth error text is not propagated', async () => {
   const realFetch = globalThis.fetch;
-  const leaked = 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const leaked = 'SYNTHETIC-CREDENTIAL-C-MUST-NOT-PROPAGATE';
   globalThis.fetch = (async () => new Response(JSON.stringify({
     error: 'invalid_grant',
     error_description: `provider echoed ${leaked}`,
