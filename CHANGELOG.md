@@ -5,6 +5,81 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **`ConnectionHandle` / `ConnectContext` no longer serialize their dependencies.** TypeScript's
+  `private` is erased at compile time, so every dependency was an own **enumerable** property at
+  runtime: `JSON.stringify(handle)`, `{...handle}`, `Object.entries`, `console.log`, and any
+  structured logger that walks own keys reached the vault's AES-256 master key, the provider's OAuth
+  client secret, the Slack bot token, and the database password. A handler dumping `context` on error
+  — or an agent runtime returning its context in a tool result — put the key to the whole credential
+  store into the log aggregator and the transcript. Own properties on `ConnectionHandle`,
+  `ConnectContext`, `Vault` and the PostgreSQL `Db` handle (which carries the connection password and
+  is returned to the host by `createVouchr`) are now non-enumerable
+  (`core/redact.hideInternals`), which also covers spread and `Object.keys`, not just
+  `JSON.stringify`. The Bolt adapter's two `handle.fetch` wrappers use `defineHidden` so re-assigning
+  the method does not put an enumerable own key back on the handle. Regression:
+  `test/no-secret-serialization.test.ts` asserts through every enumeration path.
+
+  Not covered, deliberately: `util.inspect(x, { showHidden: true })` and
+  `Object.getOwnPropertyNames`. This stops accidental serialization; it is not a confidentiality
+  boundary against the host process, which by design holds these objects.
+- **AWS KMS `Decrypt` is pinned to the configured KEK.** `DecryptCommand` omitted `KeyId`, so KMS
+  unwrapped under whatever key the ciphertext blob named; if the deployment's IAM role could decrypt
+  under any other key, a swapped wrapped-DEK was accepted. **Breaking** for custom `KmsClientLike`
+  implementations: `decrypt` now takes `keyId` as its first argument, the same one passed to
+  `encrypt`. `kmsEnvelope(keyId, client)` callers are unaffected. TypeScript implementers get a
+  compile error; **plain-JavaScript implementers get a silent runtime break** and must add the
+  parameter. Operational consequence, now documented in `guides/DEPLOYMENT.md`: repointing
+  `VOUCHR_KMS_KEY_ID` at a different KEK no longer decrypts existing rows, and `vouchr rekey` does
+  not migrate them (it re-encrypts under the master key, not the KEK).
+- The threat model now covers the **headless broker** (identity minter as trust anchor, the "agent
+  worker holds `identitySecret`" entry) and the **database writer** — the credential-relocation
+  attacker, which is documented as *not yet mitigated*: stored ciphertext carries no AAD, so it is not
+  bound to its owner row.
+
+### Added
+
+- **`allowWrites` on `createVouchr`**, so a read-only agent can be locked down on the Bolt path.
+  Previously that path applied no HTTP-method restriction at all and offered no way to add one: a
+  prompt-injected `handle.fetch(url, { method: 'DELETE' })` ran with the user's full scopes, while the
+  identical call through the broker was a 405. Setting `allowWrites: false` pins every provider that
+  declares no `egressMethods` to GET/HEAD, refusing the write before the credential is read.
+
+  **The default is `true`** — unchanged behaviour, because acting as the asking user is the purpose of
+  this surface and `provider.approval` is the intended gate for a sensitive write. The two transports
+  therefore still differ by default (the broker defaults writes off); that asymmetry is now written
+  down in `guides/THREAT-MODEL.md` § "Write blast radius differs by transport" rather than being an
+  undocumented surprise. The default-deny rule itself moved into `core/providers.withEgressDefaults`
+  so both adapters share one implementation.
+
+### Removed
+
+- **`vouchr health`.** It probed provider host reachability, sent no credentials, and touched no
+  state, while forcing a third hand-maintained copy of the provider list — which had already drifted
+  (it omitted `databricks`). Use ordinary reachability tooling; `vouchr doctor` still covers keys,
+  database, and row counts.
+
+### Fixed
+
+- `escapeMrkdwn` is exported from the package root **and from `@vouchr/core/headless`**. SEC-5
+  requires every user-influenced string interpolated into Slack mrkdwn to go through it, but hosts
+  rendering their own surfaces could not import it.
+- The "no accounts needed" quickstart no longer fails on its first command — PostgreSQL starts in
+  step 0, before the sanity check that needs it, and the dry-run example now fails with the message
+  that names the fix instead of a raw authentication error.
+- Slack app creation is no longer circular: `examples/slack-manifest.bootstrap.yml` omits the three
+  request URLs Slack verifies at creation time, so the app can be created before the server it would
+  have to answer from exists.
+- One PostgreSQL port everywhere (5432). `npm run pg:up` mapped 5433 while every user-facing doc said
+  5432, and both used the container name `vouchr-pg`, so `npm run pg:down` destroyed the database a
+  quickstart reader's `.env` pointed at. CI now fails if `localhost:5433` reappears in the docs.
+- `deploy/k8s.yaml` pins `:1.0.0-beta`. GHCR `:latest` still resolves to the pre-PostgreSQL `0.2.0`
+  image, so the reference manifest pulled software whose storage layer differs from the docs.
+- `CONTRIBUTING.md` no longer claims `npm test` is "fully offline" — it requires PostgreSQL.
+- `test/property.test.ts` no longer uses a copy of the implementation as its own oracle for the path
+  allowlist, so a wrong shared-prefix rule (`/user` matching `/userish`) can no longer pass.
+
 ## [1.0.0-beta] — 2026-07-23
 
 Beta. The first release cut from the PostgreSQL-only, deny-by-default line — it supersedes the

@@ -8,8 +8,12 @@ Slack app, no provider OAuth app; only the required local PostgreSQL.
 Run the suite:
 
 ```bash
+npm run pg:up             # throwaway postgres:16-alpine on localhost:5432, if you don't have one
 npm run example:dry-run   # or: node --import tsx --test examples/dry-run/app.test.ts
 ```
+
+It fails closed with `run npm run pg:up or set VOUCHR_TEST_PG_URL` when that database is missing,
+rather than a raw driver error.
 
 Note: [`app.test.ts`](./app.test.ts) imports `testDbUrl` from this repo's internal test support —
 in your own repo, point `databaseUrl` at a fresh, dedicated PostgreSQL schema instead.

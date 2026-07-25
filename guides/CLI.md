@@ -168,15 +168,5 @@ vouchr prune --older-than-days 90 --yes      # delete, in bounded batches
 #   --batch <N>   rows per DELETE (1..10000; default 10000)
 ```
 
-### `health [provider|host ...]`
-Best-effort HTTPS reachability of each provider's authorize/token **hosts** (no
-credentials are ever sent). Defaults to the built-ins `github google gitlab notion`;
-extra args are treated as provider ids or bare hostnames.
-
-```bash
-vouchr health
-vouchr health github example.com
-```
-
 ### `help`
 Usage.

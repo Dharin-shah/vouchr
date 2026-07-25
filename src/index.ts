@@ -104,6 +104,9 @@ export type { ToolManifestEntry } from './core/tools';
 // submission to the headless endpoints (/v1/connect, /v1/{admin,user}/reference), instead of
 // hand-copying the JSON (which then drifts from the Bolt path).
 export {
+  // SEC-5 requires every stored/user-influenced string interpolated into Slack mrkdwn to go through
+  // this escaper; a host rendering its own surfaces needs the SAME one, not a re-implementation.
+  escapeMrkdwn,
   connectBlocks,
   // The OAuth "Connect" button's action_id. A custom Slack host that renders connectBlocks MUST
   // register a no-op `ack()` for this id, or Slack shows "Operation timed out" — url buttons still

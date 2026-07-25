@@ -4,7 +4,7 @@
  *
  * Connects to the SAME credential store the app uses (PostgreSQL via
  * VOUCHR_DATABASE_URL or --db) through `openDb`. The read commands
- * (inventory/channels/doctor/health) are metadata-only and NEVER decrypt or print
+ * (inventory/channels/doctor) are metadata-only and NEVER decrypt or print
  * token/secret material. Four commands mutate: `migrate` creates/alters the schema;
  * `revoke` DELETES credential rows and may best-effort decrypt an access token to hand
  * to the upstream revoke — never to stdout; `rekey` re-encrypts ciphertext columns under
@@ -16,19 +16,12 @@
  *
  * Run: `node --import tsx bin/vouchr.ts <cmd>` (or `npm run cli -- <cmd>`).
  */
+import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
 import { openDb, migrate, type Db } from '../src/core/db';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { rekey } from '../src/core/rekey';
 import { isPostgresUrl } from '../src/core/options';
-import {
-  github,
-  google,
-  gitlab,
-  isValidProviderId,
-  notion,
-  ProviderRegistry,
-  type Provider,
-} from '../src/core/providers';
+import { isValidProviderId, ProviderRegistry } from '../src/core/providers';
 import { Vault } from '../src/core/vault';
 import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -46,36 +39,37 @@ import {
 } from '../src/core/offboard';
 import { loadProviders } from './providerConfig';
 
-type Flags = { values: Record<string, string>; positional: string[] };
+/** The flags the NON-destructive commands accept, parsed per command by {@link READ_SPECS}. */
+type Flags = { db?: string; team?: string; provider?: string; 'dry-run'?: boolean };
 
-/** Tiny flag parser: `--key value` / `--key=value` → values; everything else positional. */
-function parseFlags(argv: string[]): Flags {
-  const values: Record<string, string> = {};
-  const positional: string[] = [];
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a.startsWith('--')) {
-      const eq = a.indexOf('=');
-      if (eq !== -1) { values[a.slice(2, eq)] = a.slice(eq + 1); continue; }
-      // Boolean flag: a `--flag` with no value (end of argv or another `--flag` next) must not swallow
-      // the following flag as its value. Ids never start with `--`, so this is unambiguous.
-      const next = argv[i + 1];
-      values[a.slice(2)] = next === undefined || next.startsWith('--') ? '' : argv[++i];
-    } else positional.push(a);
-  }
-  return { values, positional };
-}
+/**
+ * Per-command flag sets for the non-destructive commands, parsed by `node:util.parseArgs` in STRICT
+ * mode: an unknown flag, a positional, a valued boolean (`--dry-run=x`), and a missing or
+ * flag-shaped value (the `vouchr rekey --db --dry-run` typo, which must never silently become a
+ * live rekey) are usage errors instead of being absorbed. The DESTRUCTIVE commands keep
+ * {@link strictParse}, which additionally rejects duplicate flags and empty values — neither is
+ * expressible with parseArgs.
+ */
+const READ_SPECS: Record<string, ParseArgsOptionsConfig> = {
+  migrate: { db: { type: 'string' } },
+  inventory: { db: { type: 'string' }, team: { type: 'string' }, provider: { type: 'string' } },
+  channels: { db: { type: 'string' }, team: { type: 'string' } },
+  rekey: { db: { type: 'string' }, 'dry-run': { type: 'boolean' } },
+  doctor: { db: { type: 'string' } },
+};
 
 type FlagSpec = Record<string, 'string' | 'boolean'>;
 type StrictValues = Record<string, string | true>;
 
 /**
- * Strict CLI parse for the DESTRUCTIVE commands (`revoke`, `prune`) — the loose {@link parseFlags}
- * fails open (collapses `--yes`/`--yes=`, silently drops unknown flags/typos, last-writer-wins on
- * duplicates), so a misspelled scope or a `--yes=` could delete data. This one rejects: an unknown
+ * Strict CLI parse for the DESTRUCTIVE commands (`revoke`, `prune`). It rejects: an unknown
  * flag, a positional argument, a duplicate flag, a boolean flag given a value (`--yes=…`), and a
  * value flag missing its value or given a flag-shaped one (the `--team --yes` typo). Consequently a
  * confirmed delete requires an EXACT bare `--yes`. Runs BEFORE the database is opened.
+ *
+ * Not `node:util.parseArgs` (which the read commands use, see {@link READ_SPECS}): parseArgs is
+ * last-writer-wins on a duplicate flag and accepts an empty value, so `--team=` would silently mean
+ * "no filter" and widen a delete. Those two rules are the reason this parser exists.
  */
 function strictParse(argv: string[], spec: FlagSpec): { values: StrictValues } | { error: string } {
   // SEC-1: error messages NEVER echo an argument value or an unknown flag name — a positional or an
@@ -196,8 +190,8 @@ function describeBackend(dbUrl?: string): string {
 async function cmdInventory(db: Db, f: Flags): Promise<void> {
   const where: string[] = [];
   const params: any[] = [];
-  if (f.values.team) { where.push('team_id=?'); params.push(f.values.team); }
-  if (f.values.provider) { where.push('provider=?'); params.push(f.values.provider); }
+  if (f.team) { where.push('team_id=?'); params.push(f.team); }
+  if (f.provider) { where.push('provider=?'); params.push(f.provider); }
   const sourcePlaceholders = SECRET_REFERENCE_SOURCES.map(() => '?').join(', ');
   // Metadata columns only. Neither token ciphertext nor raw reference/source values are selected:
   // legacy rows can predate validation, so even fields intended as metadata are untrusted output.
@@ -220,8 +214,8 @@ async function cmdInventory(db: Db, f: Flags): Promise<void> {
 
 async function cmdChannels(db: Db, f: Flags): Promise<void> {
   // FULL OUTER JOIN: a channel may have a config row, a tool row, or both.
-  const where = f.values.team ? 'WHERE COALESCE(c.team_id, t.team_id)=?' : '';
-  const params = f.values.team ? [f.values.team] : [];
+  const where = f.team ? 'WHERE COALESCE(c.team_id, t.team_id)=?' : '';
+  const params = f.team ? [f.team] : [];
   const rows = await db.all<any>(
     `SELECT COALESCE(c.team_id, t.team_id)   AS team_id,
             COALESCE(c.channel, t.channel)   AS channel,
@@ -524,7 +518,7 @@ async function cmdRekey(db: Db, f: Flags): Promise<number> {
     console.error('rekey: master key configuration is invalid');
     return 2;
   }
-  const dryRun = 'dry-run' in f.values;
+  const dryRun = f['dry-run'] === true;
   const primary = ring.primary.id === null ? 'id-less VOUCHR_MASTER_KEY' : `key '${ring.primary.id}'`;
   console.log(`${dryRun ? 'REKEY DRY-RUN' : 'REKEY'}: re-encrypt under ${primary} (${ring.legacy.length} key(s) configured)`);
   const r = await rekey(db, ring, {
@@ -566,12 +560,12 @@ async function cmdDoctor(f: Flags): Promise<number> {
   }
 
   // 2. Backend in use (informational).
-  console.log(`INFO backend: ${describeBackend(f.values.db)}`);
+  console.log(`INFO backend: ${describeBackend(f.db)}`);
 
   // 3. DB reachable + counts.
   let db: Db | undefined;
   try {
-    db = await openDb({ databaseUrl: f.values.db });
+    db = await openDb({ databaseUrl: f.db });
     await db.get('SELECT 1 AS x');
     pass('db reachable');
     const conns = await db.get<{ n: number }>('SELECT COUNT(*) AS n FROM connection');
@@ -631,49 +625,6 @@ async function runPrune(db: Db, plan: PrunePlan): Promise<number> {
   return 0;
 }
 
-/** Best-effort: any HTTP response (even 4xx/5xx) means the host is reachable. */
-async function reachable(host: string, timeoutMs = 5000): Promise<boolean> {
-  try {
-    await fetch(`https://${host}/`, { method: 'HEAD', redirect: 'manual', signal: AbortSignal.timeout(timeoutMs) });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Built-in providers. Dummy creds satisfy defineProvider's clientId/clientSecret check;
-// health only reads authorizeUrl/tokenUrl hosts and never sends credentials.
-const BUILTINS: Record<string, () => Provider> = {
-  github: () => github({ clientId: 'x', clientSecret: 'x' }),
-  google: () => google({ clientId: 'x', clientSecret: 'x' }),
-  gitlab: () => gitlab({ clientId: 'x', clientSecret: 'x' }),
-  notion: () => notion({ clientId: 'x', clientSecret: 'x' }),
-};
-
-async function cmdHealth(f: Flags): Promise<void> {
-  // Each target → a label and the set of hosts to probe.
-  const targets: { label: string; hosts: string[] }[] = [];
-  const names = f.positional.length ? f.positional : Object.keys(BUILTINS);
-  for (const name of names) {
-    if (BUILTINS[name]) {
-      const p = BUILTINS[name]();
-      const hosts = [...new Set([new URL(p.authorizeUrl).host, new URL(p.tokenUrl).host])];
-      targets.push({ label: name, hosts });
-    } else {
-      // Treat an unrecognised arg as a bare hostname to probe directly.
-      targets.push({ label: name, hosts: [name] });
-    }
-  }
-  const rows: string[][] = [];
-  for (const t of targets) {
-    for (const host of t.hosts) {
-      const ok = await reachable(host);
-      rows.push([t.label, host, ok ? 'reachable' : 'unreachable']);
-    }
-  }
-  printTable(['target', 'host', 'status'], rows);
-}
-
 function usage(): void {
   console.log(`vouchr: operator CLI (reads are metadata-only; \`migrate\`, \`revoke\`, \`rekey\`, \`prune\` mutate)
 
@@ -723,9 +674,6 @@ Commands:
                 --older-than-days <N>  REQUIRED (positive; nothing pruned without it)
                 --batch <N>            rows per delete (default 10000)
                 --yes                  actually delete (default is a dry-run count)
-  health [provider|host ...]
-              Reachability of provider authorize/token hosts (no credentials sent).
-              Defaults to built-ins: ${Object.keys(BUILTINS).join(', ')}.
   help        This message.
 
 Store selection (shared with the app):
@@ -739,7 +687,19 @@ Store selection (shared with the app):
 
 async function main(): Promise<number> {
   const [cmd, ...rest] = process.argv.slice(2);
-  const f = parseFlags(rest);
+  // Non-destructive commands parse strictly here, BEFORE any DB opens; the destructive ones parse
+  // with strictParse inside their case. SEC-1: parseArgs' message quotes the offending flag, which
+  // is raw argv and could be credential-shaped, so the error is fixed text and never echoes it.
+  let f: Flags = {};
+  const spec = cmd === undefined ? undefined : READ_SPECS[cmd];
+  if (spec) {
+    try {
+      f = parseArgs({ args: rest, options: spec, strict: true, allowPositionals: false }).values as Flags;
+    } catch {
+      console.error(`${cmd}: invalid usage; run \`vouchr help\` (allowed: ${Object.keys(spec).map((k) => `--${k}`).join(', ')})`);
+      return 2;
+    }
+  }
 
   switch (cmd) {
     case 'migrate': {
@@ -747,13 +707,13 @@ async function main(): Promise<number> {
       // schema-owner role; the runtime then connects with a DML-only role. Idempotent and safe to
       // run concurrently (advisory-locked). Prefer VOUCHR_DATABASE_URL over --db so a credential URL
       // stays out of shell history / process args.
-      const { version } = await migrate({ databaseUrl: f.values.db });
+      const { version } = await migrate({ databaseUrl: f.db });
       console.log(`OK schema migrated to version ${version}`);
       return 0;
     }
     case 'inventory':
     case 'channels': {
-      const db = await openDb({ databaseUrl: f.values.db });
+      const db = await openDb({ databaseUrl: f.db });
       try {
         if (cmd === 'inventory') await cmdInventory(db, f);
         else await cmdChannels(db, f);
@@ -777,7 +737,7 @@ async function main(): Promise<number> {
       }
     }
     case 'rekey': {
-      const db = await openDb({ databaseUrl: f.values.db });
+      const db = await openDb({ databaseUrl: f.db });
       try {
         return await cmdRekey(db, f);
       } finally {
@@ -798,9 +758,6 @@ async function main(): Promise<number> {
     }
     case 'doctor':
       return cmdDoctor(f);
-    case 'health':
-      await cmdHealth(f);
-      return 0;
     case undefined:
     case 'help':
     case '--help':

@@ -71,6 +71,17 @@ const identityToken = mintIdentity(
 );
 ```
 
+> [!WARNING]
+> **The signing key stays in that Slack-facing service — never in the worker.** It is the broker's
+> trust root: the broker has no Slack client, so identity, the `isAdmin` claim, and channel
+> eligibility have no second source. Anything that can sign mints `{ userId: <any human>, isAdmin:
+> true }` and can use every credential the deployment serves. Minting inside the agent runtime
+> collapses the trust boundary — one prompt injection that reads the process environment owns the
+> workspace. Give the worker the minted `identityToken` only. The reference example
+> ([`examples/broker-client/client.ts`](../examples/broker-client/client.ts)) marks its single-process
+> `main` block as local development only for exactly this reason; see the threat model's
+> [headless entry](./THREAT-MODEL.md#headless-broker-leaked-identity-signing-key-v1).
+
 `channelType` must come from a signature-verified Slack event or an authenticated
 `conversations.info` lookup by the trusted Slack service—not the model, worker, unverified request
 body, or a guess from the channel id. Normalize with the exported `isSlackConversationType` guard
@@ -475,10 +486,13 @@ Legacy assertions without a verified `iat` fail closed at the production broker 
 
 ## Operations
 
-- **Deployment identity.** Build `identitySecret` with `loadIdentityConfig(process.env)` in both the
-  trusted Slack verifier/minter and every broker replica. Keep the signing keys out of arbitrary
-  workers, and keep them distinct from the Slack signing secret, encryption keys, broker bearer, and
-  provider OAuth client secrets. See the deployment guide for the required upgrade and rotation order.
+- **Deployment identity.** Build `identitySecret` with `loadIdentityConfig(process.env)` in exactly
+  two places: the trusted Slack verifier/minter and every broker replica. It must not be readable by
+  an agent worker, a model/tool runtime, or any other process — a holder can assert any user and
+  `isAdmin: true` (see the warning above and the threat model). Keep it distinct from the Slack
+  signing secret, encryption keys, broker bearer, and provider OAuth client secrets; the equality
+  check is enforced, not advisory. See the deployment guide for the required upgrade and rotation
+  order.
 - **Replay protection.** Automatic when you use a shared database — every db-configured broker
   uses the durable PostgreSQL `DbReplayStore`, so a `jti` spent on one pod is rejected on the others.
   The replay store is not configurable; the exported in-memory `ReplayGuard` is only for direct
@@ -542,4 +556,5 @@ MCP runtime; do not build a second sidecar that trusts caller-supplied owner ids
 Slack-facing service mints a fresh deployment-bound `identityToken` for each broker call, while the
 worker receives only that short-lived assertion and never the signing key. The TypeScript flow in
 [`examples/broker-client`](../examples/broker-client) is the reference request shape to reproduce in
-another language.
+another language — reproduce its minter/worker split; its `main` block collapses the two into one
+process for local development only.

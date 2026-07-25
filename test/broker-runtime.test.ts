@@ -83,13 +83,33 @@ test('#212 DbReplayStore: after cutover, new pruning preserves an existing raw-e
 
 // ── T5: kmsEnvelope (at-rest DEK wrapping, injectable client) ─────────────────
 
-// A fake, reversible KMS client — proves the envelope wiring without any AWS SDK.
+// A fake, reversible KMS client — proves the envelope wiring without any AWS SDK. The unwrap
+// REFUSES a blob that was not wrapped under the same keyId, mirroring exactly what passing `KeyId`
+// to the real DecryptCommand buys: KMS will not satisfy the unwrap using some other key that the
+// ciphertext blob names. Before that fix, the keyId never reached decrypt at all.
 function fakeKms(): KmsClientLike {
   return {
     encrypt: async (keyId, plaintext) => Buffer.concat([Buffer.from(`wrap:${keyId}:`), plaintext]),
-    decrypt: async (ciphertext) => ciphertext.subarray(ciphertext.indexOf(0x3a, 5) + 1),
+    decrypt: async (keyId, ciphertext) => {
+      const prefix = Buffer.from(`wrap:${keyId}:`);
+      if (!ciphertext.subarray(0, prefix.length).equals(prefix)) {
+        throw new Error('KMS: ciphertext was not wrapped under the requested key');
+      }
+      return ciphertext.subarray(prefix.length);
+    },
   };
 }
+
+test('kmsEnvelope: an unwrap is pinned to the configured KEK, not the key the blob names', async () => {
+  // A blob wrapped under key-2 must not unwrap through an envelope configured for key-1. This is the
+  // property `KeyId` on DecryptCommand enforces in real KMS; without it a swapped wrapped-DEK is
+  // accepted whenever the deployment's IAM role can decrypt under the attacker's key too.
+  const foreign = await kmsEnvelope('key-2', fakeKms()).wrapDataKey(randomBytes(32));
+  await assert.rejects(
+    () => kmsEnvelope('key-1', fakeKms()).unwrapDataKey(foreign),
+    /not wrapped under the requested key/,
+  );
+});
 
 test('kmsEnvelope: wraps and unwraps a data key', async () => {
   const env = kmsEnvelope('key-1', fakeKms());
@@ -107,7 +127,7 @@ test('kmsEnvelope: propagates cancellation to the KMS client in both directions'
       observed.push(signal);
       return Buffer.from(plaintext);
     },
-    async decrypt(ciphertext, signal) {
+    async decrypt(_keyId, ciphertext, signal) {
       observed.push(signal);
       return Buffer.from(ciphertext);
     },

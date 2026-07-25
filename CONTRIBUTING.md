@@ -12,11 +12,18 @@ dev setup, testing expectations, and the exact PR sign-off template. The PROC ru
 ## Quick start
 
 ```bash
-nvm use            # Node ≥ 22 (CI runs 22 and 24)
+nvm use
 npm install
-npm run typecheck  # must be clean
-npm test           # unit + integration, fully offline
+npm run pg:up       # start the local PostgreSQL container (Docker) — required for tests
+                    # binds host :5432; skip it if you already run PostgreSQL there, and instead
+                    # point VOUCHR_TEST_PG_URL at your own instance
+npm run typecheck   # must be clean
+npm run lint        # biome, warnings are errors
+npm test            # unit + integration, against the local Postgres (no network)
 ```
+
+Node ≥ 22 (see `.nvmrc`; CI runs 22 and 24). Vouchr is PostgreSQL-only (#204): `npm test`
+needs the container from `npm run pg:up` and fails if it is unreachable.
 
 ## Ground rules
 
