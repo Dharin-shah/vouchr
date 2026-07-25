@@ -7,7 +7,7 @@ import {
   type Db,
 } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, readOnlyEgress, type Provider } from '../core/providers';
 import { CredentialLockdownError, Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -29,6 +29,7 @@ import {
 import { ConnectionHandle, NoConnectionError, approvalNeeded, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
+import { defineHidden, hideInternals } from '../core/redact';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import {
   configureChannelCredential,
@@ -672,6 +673,23 @@ export interface VouchrOptions {
    * provider)` finishes a prompted consent programmatically. Default false: zero behavior change.
    */
   dryRun?: boolean;
+  /**
+   * Allow non-GET/HEAD provider requests through `handle.fetch()`. Default **true**, which is this
+   * path's long-standing behaviour: acting as the asking user — opening the PR, filing the ticket —
+   * is the point of the Bolt surface, and `provider.approval` is how a sensitive write is gated.
+   *
+   * Set it to **false** to force every provider read-only: each one's methods are INTERSECTED with
+   * GET/HEAD, so even a provider that declares writes of its own — `databricks()` declares
+   * `['GET','POST']` — loses them, and a prompt-injected `handle.fetch(url, { method: 'DELETE' })`
+   * is refused before the credential is read. Recommended for read-only agents.
+   *
+   * NOTE the asymmetry with `createBroker`, which defaults writes OFF: the broker serves remote
+   * workers over HTTP and rejects non-GET/HEAD at the route before identity or vault access, whereas
+   * this path runs the host's own in-process handler. The same prompt injection therefore reaches
+   * further here than through the broker unless you set this false or declare `egressMethods` on the
+   * provider. See guides/THREAT-MODEL.md, "Write blast radius differs by transport".
+   */
+  allowWrites?: boolean;
 }
 
 /**
@@ -735,6 +753,9 @@ export interface ConnectContextDeps {
   /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
    *  VouchrOptions.dryRun). Default false: unchanged behavior. */
   dryRun?: boolean;
+  /** Permit non-GET/HEAD provider requests (see VouchrOptions.allowWrites). Default TRUE: this
+   *  path's existing behaviour. False pins providers that declare no egressMethods to GET/HEAD. */
+  allowWrites?: boolean;
   /** Transport options for bounded prompt/DM clients (see VouchrOptions.slackClientOptions). */
   slackClientOptions?: WebClientOptions;
 }
@@ -797,6 +818,12 @@ const INTERNAL_PROVISIONING_RECEIVED_AT = Symbol('vouchr.provisioning-received-a
 const INTERNAL_CHANNEL_PROVISIONING_ISSUANCE = Symbol('vouchr.channel-provisioning-issuance');
 const INTERNAL_GOVERNANCE_CHANNEL_RESOLVER = Symbol('vouchr.governance-channel-resolver');
 type InternalConnectContextDeps = ConnectContextDeps & {
+  /** REQUIRED here, though optional on the public `ConnectContextDeps`. `allowWrites` is a security
+   *  gate whose default is permissive, so a construction site that omits it fails OPEN silently —
+   *  which is exactly what happened once: it was wired into `contextFor()` but not into the
+   *  middleware's `contextDeps`, making `createVouchr({ allowWrites: false })` a no-op on the only
+   *  path that calls `handle.fetch`. Requiring it here makes a missed site a compile error (REV-2). */
+  allowWrites: boolean;
   [INTERNAL_PROVISIONING_RECEIVED_AT]?: bigint;
   [INTERNAL_CHANNEL_PROVISIONING_ISSUANCE]?: ChannelProvisioningIssuance;
   [INTERNAL_GOVERNANCE_CHANNEL_RESOLVER]?: () => Promise<string | null>;
@@ -855,6 +882,7 @@ export class ConnectContext {
   private health: CredentialHealthHook;
   private notifications: NotificationState | null;
   private dryRun: boolean;
+  private allowWrites: boolean;
   private slackClientOptions?: WebClientOptions;
   private provisioningReceivedAt: bigint;
   private channelProvisioningIssuance?: ChannelProvisioningIssuance;
@@ -900,6 +928,7 @@ export class ConnectContext {
     this.health = deps.health ?? (() => {});
     this.notifications = deps.notifications ?? null;
     this.dryRun = deps.dryRun ?? false;
+    this.allowWrites = deps.allowWrites ?? true;
     this.slackClientOptions = deps.slackClientOptions;
     this.provisioningReceivedAt =
       (deps as InternalConnectContextDeps)[INTERNAL_PROVISIONING_RECEIVED_AT]
@@ -908,6 +937,14 @@ export class ConnectContext {
       (deps as InternalConnectContextDeps)[INTERNAL_CHANNEL_PROVISIONING_ISSUANCE];
     this.governanceChannelResolver =
       (deps as InternalConnectContextDeps)[INTERNAL_GOVERNANCE_CHANNEL_RESOLVER];
+    // Declared-but-unassigned would be created enumerable on first write, escaping hideInternals.
+    this.governanceChannelResolution = undefined;
+    // SEC-1: this object is attached to Bolt's per-request `context.vouchr` — the thing a handler
+    // is most likely to dump on error. The `private` modifiers above are erased at runtime; without
+    // this, JSON.stringify/spread/a structured logger walks client → Slack bot token, vault →
+    // master key, registry → OAuth client secrets, and db → connection password.
+    // Regression: test/no-secret-serialization.test.ts.
+    hideInternals(this);
   }
 
   /** Resolve Slack's ambiguous G… id class once. A transport/API failure retains the initial
@@ -957,7 +994,9 @@ export class ConnectContext {
    */
   private notifyRateLimited(handle: ConnectionHandle): ConnectionHandle {
     const fetch = handle.fetch.bind(handle);
-    handle.fetch = async (input: string, init: RequestInit = {}) => {
+    // defineHidden, not assignment: a plain `handle.fetch = …` shadows the prototype method with an
+    // own ENUMERABLE property, undoing hideInternals for this key (SEC-1).
+    defineHidden(handle, 'fetch', async (input: string, init: RequestInit = {}) => {
       try {
         return await fetch(input, init);
       } catch (e) {
@@ -970,7 +1009,7 @@ export class ConnectContext {
         }
         throw e;
       }
-    };
+    });
     return handle;
   }
 
@@ -986,7 +1025,8 @@ export class ConnectContext {
    */
   private notifyApprovalRequired(handle: ConnectionHandle): ConnectionHandle {
     const fetch = handle.fetch.bind(handle);
-    handle.fetch = async (input: string, init: RequestInit = {}) => {
+    // See notifyRateLimited: assignment would re-expose this key to enumeration.
+    defineHidden(handle, 'fetch', async (input: string, init: RequestInit = {}) => {
       try {
         return await fetch(input, init);
       } catch (e) {
@@ -1005,7 +1045,7 @@ export class ConnectContext {
         }
         throw e;
       }
-    };
+    });
     return handle;
   }
 
@@ -1424,7 +1464,13 @@ export class ConnectContext {
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
     }
-    return provider;
+    // Apply the write gate at the one chokepoint every Bolt credential entry point already routes
+    // through, so both ConnectionHandle construction sites inherit it and a future third cannot miss
+    // it. `allowWrites: false` must INTERSECT (readOnlyEgress), not merely default: a provider that
+    // declares its own methods — databricks() declares ['GET','POST'] — would otherwise keep POST on
+    // a deployment that explicitly asked to be read-only. The broker gets the same guarantee from its
+    // route-level 405, which runs before the provider is consulted.
+    return this.allowWrites ? provider : readOnlyEgress(provider);
   }
 
   /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own
@@ -2893,6 +2939,7 @@ export async function createVouchr(opts: VouchrOptions) {
         health,
         notifications: notifyState,
         dryRun,
+        allowWrites: opts.allowWrites ?? true,
         slackClientOptions: opts.slackClientOptions,
       };
       // Slash commands and block actions have no event.channel_type. A G… id can mean either a
@@ -3013,6 +3060,7 @@ export async function createVouchr(opts: VouchrOptions) {
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
+      allowWrites: opts.allowWrites ?? true,
       slackClientOptions: opts.slackClientOptions,
     };
     if (governableChannel !== undefined) deps.governableChannel = governableChannel;

@@ -25,7 +25,7 @@ import { decrypt, encrypt, type EnvelopeProvider } from '../../src/core/crypto';
 import { MAX_TIMER_MS, nonNegativeIntegerEnv, optionalPositiveEnv } from '../../src/core/options';
 import { identityConfig, signIdentity } from '../support/identity';
 
-const PG = process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5433/vouchr';
+const PG = process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5432/vouchr';
 const SECRET = 'bench-identity';
 const U1 = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const MASTER_KEY = Buffer.alloc(32, 7);

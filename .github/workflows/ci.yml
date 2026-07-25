@@ -32,9 +32,9 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    env:
-      # Exercises the required real Postgres backend; the suite's sentinel fails if unreachable.
-      VOUCHR_TEST_PG_URL: postgres://vouchr:vouchr@localhost:5432/vouchr
+    # The service publishes the same localhost:5432 the suite defaults to (test/support/pg.ts) and
+    # `npm run pg:up` maps, so no VOUCHR_TEST_PG_URL override is needed; the suite's sentinel fails
+    # if it is unreachable.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -44,6 +44,17 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run lint
+      # Guardrail (AGENTS.md REV-2): ONE local-Postgres port. `pg:up`, the test default, the CI
+      # services above and every doc must all say 5432 — when a doc drifted to a second port, readers
+      # pointed .env at one container while `npm run pg:down` destroyed the other (same `vouchr-pg`
+      # name). Runs once; git grep only sees tracked files.
+      - name: "Docs and pg:up use one Postgres port (5432)"
+        if: matrix.node == 22
+        run: |
+          if git grep -n 5433 -- '*.md' package.json test/support/pg.ts test/bench .github .env.example ':!.github/workflows/ci.yml' ':!CHANGELOG.md'; then
+            echo "::error::local PostgreSQL is 5432 everywhere (docs, npm run pg:up, test default); drop the 5433 shown above"
+            exit 1
+          fi
       # Build BEFORE test: the compiled dist/ must exist for tests that inspect the shipped artifact
       # (e.g. the headless @slack-free module-graph check), and an emit/declaration break fails fast here.
       - run: npm run build

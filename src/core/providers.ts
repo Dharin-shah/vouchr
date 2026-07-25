@@ -273,6 +273,52 @@ export function canonicalMethod(m: string): string | null {
 }
 
 /**
+ * #25 default-deny: a provider that declares NO `egressMethods` is pinned to GET/HEAD. Lives in core
+ * so both transports share one rule (STR-1/STR-2) instead of each adapter inventing its own.
+ *
+ * The two transports reach this from opposite directions, which is why the parameter is the
+ * denial and not the permission:
+ *  - the broker has a route gate that 405s every non-GET/HEAD when `allowWrites` is off, so it only
+ *    needs this once writes ARE enabled — a second, per-provider opt-in, so flipping `allowWrites`
+ *    cannot silently grant DELETE to every registered provider;
+ *  - the Bolt path has no route to reject at, so it passes `!allowWrites` to get the same floor.
+ *
+ * A provider that DOES declare `egressMethods` always keeps its own declaration.
+ */
+/** The read-only floor: the only methods an explicitly read-only deployment may emit. */
+const READ_ONLY_METHODS = ['GET', 'HEAD'] as const;
+
+/**
+ * Force `p` read-only: INTERSECT whatever it declares with GET/HEAD.
+ *
+ * This is what an explicit `allowWrites: false` must mean, and why it cannot be expressed by
+ * `withEgressDefaults`. That helper only supplies a DEFAULT for a provider that declares nothing, so
+ * a provider that declares its own methods keeps them — `databricks()` declares `['GET','POST']`, so
+ * defaulting alone would leave a statement-submission POST open on a deployment that explicitly
+ * asked to be read-only. The broker never had this hole because its route rejects non-GET/HEAD
+ * before the provider is consulted at all; the Bolt path has no route, so the narrowing happens here.
+ *
+ * Intersection, not replacement: a provider declaring `['GET']` must not be WIDENED to include HEAD.
+ * A write-only provider intersects to `[]`, which the injector reads as "no method permitted" — the
+ * correct answer for "run this provider read-only", not an error.
+ */
+export function readOnlyEgress(p: Provider): Provider {
+  const allowed = (p.egressMethods ?? [...READ_ONLY_METHODS])
+    .filter((m) => (READ_ONLY_METHODS as readonly string[]).includes(m.toUpperCase()));
+  return Object.freeze({ ...p, egressMethods: Object.freeze(allowed) as unknown as string[] });
+}
+
+export function withEgressDefaults(p: Provider, defaultDenyNonGet?: boolean): Provider {
+  // Frozen like everything out of defineProvider/ProviderRegistry: the freeze is a stated control
+  // ("mutating the original object or a nested allowlist after registration cannot widen live
+  // egress"), and an unfrozen clone would quietly drop it on the path that uses this.
+  if (defaultDenyNonGet && !p.egressMethods) {
+    return Object.freeze({ ...p, egressMethods: Object.freeze(['GET', 'HEAD']) as unknown as string[] });
+  }
+  return p;
+}
+
+/**
  * Loopback hosts exempt from the https / explicit-port rules — the "test-only local path" carve-out
  * (#211): a mock OAuth server and a local dev broker bind `http://127.0.0.1:<port>`. The injector's
  * egress guard uses the SAME set (STR-2), so a provider's OAuth-endpoint carve-out and its API-egress

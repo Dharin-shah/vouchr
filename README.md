@@ -47,6 +47,10 @@ permissions, their consent.
 > Slack workspace + app, a GitHub OAuth app, and see the bot act as you in ~5 minutes (with a script
 > for recording a demo).
 
+```bash
+npm install @vouchr/core   # `latest` currently resolves to 1.0.0-beta
+```
+
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
 import { createVouchr, github, ConsentRequiredError } from '@vouchr/core';
@@ -87,7 +91,8 @@ layers a finite timeout, zero retries, rate-limit rejection, and lease-safe queu
 on top.
 
 Run the in-repo demo (Node ≥ 22 and PostgreSQL required; Slack app config starts from
-[`examples/slack-manifest.yml`](./examples/slack-manifest.yml)):
+[`examples/slack-manifest.bootstrap.yml`](./examples/slack-manifest.bootstrap.yml) — see
+[QUICKSTART](./QUICKSTART.md) for why the URLs go in afterwards):
 
 ```bash
 npm install && cp .env.example .env   # VOUCHR_MASTER_KEY, Slack secrets, provider OAuth creds
@@ -127,6 +132,26 @@ covers a whole account — a single `google()` consent can span Calendar, Gmail,
 scoped as narrowly as you choose. Any other OAuth2 API takes ~10 lines with
 `defineProvider`; API-key tools and secret-manager-backed credentials (AWS, GCP, Azure,
 Vault) work too — see [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
+
+**Bound what a write can reach.** A provider that declares no `egressMethods` accepts any method your
+handler passes, so if a model chooses the method, prompt injection chooses it too. Two ways to narrow
+it — prefer the first, because then the gate is the provider's declaration rather than your handler's
+discipline:
+
+```ts
+// 1. Declare what the provider may do. databricks() ships this way, locked to
+//    /api/2.0/sql/statements with GET+POST.
+defineProvider({ ...github(), egressMethods: ['GET', 'POST'], egressPaths: ['/repos'] })
+
+// 2. Or lock the whole agent read-only: intersects EVERY provider's methods with
+//    GET/HEAD — including ones that declare writes — before the credential is read.
+const vouchr = await createVouchr({ providers: [github()], allowWrites: false, baseUrl });
+```
+
+`createBroker` defaults `allowWrites` to **false** (it serves remote workers and rejects non-GET at
+the route); `createVouchr` defaults it to **true**, since writing as the asking user is the point of
+the Slack surface and `provider.approval` gates sensitive writes. That difference is deliberate and
+documented in the [threat model](./guides/THREAT-MODEL.md).
 
 **Least privilege — request only the scopes you use.** Scopes come from the provider
 definition, so pass exactly what you need: `github({ scopes: ['read:user'] })` shows the
