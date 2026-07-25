@@ -17,8 +17,8 @@ test('audit: redacts credential-shaped values, keeps legitimate metadata intact'
   const blob = 'A'.repeat(60); // 60-char high-entropy base64 blob
 
   const meta = {
-    token: 'xoxb-123456789012-abcdefghijklmnop',
-    gh: 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    token: 'xoxb-NOT-A-REAL-SLACK-TOKEN',
+    gh: 'ghp_NOT_A_REAL_GITHUB_TOKEN',
     auth: 'Bearer abcdef0123456789',
     secret: blob,
     // legitimate fields that must survive untouched
@@ -44,7 +44,7 @@ test('audit: redacts credential-shaped values, keeps legitimate metadata intact'
   assert.equal(stored.ok, true);
 
   // The caller's original object must not be mutated.
-  assert.equal(meta.token, 'xoxb-123456789012-abcdefghijklmnop');
+  assert.equal(meta.token, 'xoxb-NOT-A-REAL-SLACK-TOKEN');
   assert.equal(meta.secret, blob);
 });
 
@@ -53,8 +53,8 @@ test('audit: redaction walks nested objects and arrays', async (t) => {
   const audit = new Audit(db);
 
   const meta = {
-    nested: { leaked: 'ghp_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', safe: 'ok' },
-    list: ['C0123ABC', 'AKIAIOSFODNN7EXAMPLE', 200],
+    nested: { leaked: 'ghp_NOT_A_REAL_NESTED_TOKEN', safe: 'ok' },
+    list: ['C0123ABC', 'AKIA_NOT_A_REAL_AWS_KEY', 200],
   };
 
   await audit.record('config', ID, 'github', meta);
