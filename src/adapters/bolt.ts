@@ -7,7 +7,7 @@ import {
   type Db,
 } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, withEgressDefaults, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, readOnlyEgress, type Provider } from '../core/providers';
 import { CredentialLockdownError, Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -678,9 +678,10 @@ export interface VouchrOptions {
    * path's long-standing behaviour: acting as the asking user — opening the PR, filing the ticket —
    * is the point of the Bolt surface, and `provider.approval` is how a sensitive write is gated.
    *
-   * Set it to **false** to pin every provider that does not declare its own `egressMethods` to
-   * GET/HEAD, so a prompt-injected `handle.fetch(url, { method: 'DELETE' })` is refused before the
-   * credential is read. Recommended for read-only agents.
+   * Set it to **false** to force every provider read-only: each one's methods are INTERSECTED with
+   * GET/HEAD, so even a provider that declares writes of its own — `databricks()` declares
+   * `['GET','POST']` — loses them, and a prompt-injected `handle.fetch(url, { method: 'DELETE' })`
+   * is refused before the credential is read. Recommended for read-only agents.
    *
    * NOTE the asymmetry with `createBroker`, which defaults writes OFF: the broker serves remote
    * workers over HTTP and rejects non-GET/HEAD at the route before identity or vault access, whereas
@@ -1463,11 +1464,13 @@ export class ConnectContext {
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
     }
-    // Apply the read-only lockdown at the one chokepoint every Bolt credential entry point already
-    // routes through, so both ConnectionHandle construction sites inherit it and a future third
-    // cannot miss it. Same core rule the broker uses (STR-2); the argument is inverted because the
-    // broker denies non-GET at its route first and this path has no route to deny at.
-    return withEgressDefaults(provider, !this.allowWrites);
+    // Apply the write gate at the one chokepoint every Bolt credential entry point already routes
+    // through, so both ConnectionHandle construction sites inherit it and a future third cannot miss
+    // it. `allowWrites: false` must INTERSECT (readOnlyEgress), not merely default: a provider that
+    // declares its own methods — databricks() declares ['GET','POST'] — would otherwise keep POST on
+    // a deployment that explicitly asked to be read-only. The broker gets the same guarantee from its
+    // route-level 405, which runs before the provider is consulted.
+    return this.allowWrites ? provider : readOnlyEgress(provider);
   }
 
   /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own

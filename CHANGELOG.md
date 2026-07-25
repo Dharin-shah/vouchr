@@ -43,8 +43,10 @@ All notable changes to this project are documented here. This project adheres to
 - **`allowWrites` on `createVouchr`**, so a read-only agent can be locked down on the Bolt path.
   Previously that path applied no HTTP-method restriction at all and offered no way to add one: a
   prompt-injected `handle.fetch(url, { method: 'DELETE' })` ran with the user's full scopes, while the
-  identical call through the broker was a 405. Setting `allowWrites: false` pins every provider that
-  declares no `egressMethods` to GET/HEAD, refusing the write before the credential is read.
+  identical call through the broker was a 405. Setting `allowWrites: false` forces every provider
+  read-only by INTERSECTING its methods with GET/HEAD — so a provider that declares writes of its own
+  (`databricks()` declares `['GET','POST']`) loses them too, rather than merely supplying a default
+  for providers that declare nothing. The write is refused before the credential is read.
 
   **The default is `true`** — unchanged behaviour, because acting as the asking user is the purpose of
   this surface and `provider.approval` is the intended gate for a sensitive write. The two transports

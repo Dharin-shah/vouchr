@@ -187,6 +187,27 @@ test('the real database handle does not serialize its connection string', async 
   assert.deepEqual(Object.keys(db), [], 'the Db exposes no enumerable own properties');
 });
 
+test('a field declared but assigned only later stays hidden', () => {
+  // hideInternals can only hide what exists when the constructor ends. This holds ONLY under
+  // `useDefineForClassFields: true` (now pinned in tsconfig.json): with define semantics a declared
+  // field is materialised as undefined at construction, so it is hidden then and STAYS hidden when
+  // written later. Flip that flag and lazily-assigned fields such as PgDb.refreshPool would reappear
+  // in JSON.stringify with the rest of the suite still green — this test is what goes red.
+  class Lazy {
+    private eager = 'e';
+    private lazy?: string; // declared, NOT assigned in the constructor
+    constructor() { hideInternals(this); }
+    fill(v: string) { this.lazy = v; }
+    read() { return `${this.eager}${this.lazy ?? ''}`; }
+  }
+  const o = new Lazy();
+  assert.deepEqual(Object.keys(o), [], 'nothing enumerable after construction');
+  o.fill(DB_PASSWORD);
+  assert.deepEqual(Object.keys(o), [], 'a lazily-assigned field must not become enumerable');
+  assert.ok(!(JSON.stringify(o) ?? '').includes(DB_PASSWORD), 'and must not serialize');
+  assert.ok(o.read().includes(DB_PASSWORD), 'while staying readable internally');
+});
+
 test('the canaries are actually reachable when NOT hidden (the test can fail)', () => {
   // Guards against the suite passing because the secrets were never wired in. This mirrors the
   // pre-fix structure: a plain holder with enumerable references to the same dependency graph.

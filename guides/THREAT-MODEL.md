@@ -304,7 +304,9 @@ oversight, and it is the difference most likely to surprise an operator who read
   that forwards a model-chosen method allows `DELETE /repos/{owner}/{repo}` on the Bolt path with the
   user's full `repo` scope, while the identical call through the broker is refused. The credential is
   the user's and the action is attributed to them, but nothing in the egress layer narrows it.
-- **What to do about it.** For a read-only agent set `allowWrites: false` on `createVouchr`. For a
+- **What to do about it.** For a read-only agent set `allowWrites: false` on `createVouchr`; it
+  intersects every provider's methods with GET/HEAD, so a provider that declares its own writes is
+  narrowed too. For a
   writing agent, declare `egressMethods` (and ideally `egressPaths`) on the provider so the gate is
   the provider's declaration rather than the handler's discipline — `databricks()` ships this way,
   locked to `/api/2.0/sql/statements` with GET+POST. Use `provider.approval` for writes that warrant a

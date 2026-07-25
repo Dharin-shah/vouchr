@@ -143,8 +143,8 @@ discipline:
 //    /api/2.0/sql/statements with GET+POST.
 defineProvider({ ...github(), egressMethods: ['GET', 'POST'], egressPaths: ['/repos'] })
 
-// 2. Or lock the whole agent read-only: pins every provider that declares no
-//    egressMethods to GET/HEAD, refusing the write before the credential is read.
+// 2. Or lock the whole agent read-only: intersects EVERY provider's methods with
+//    GET/HEAD — including ones that declare writes — before the credential is read.
 const vouchr = await createVouchr({ providers: [github()], allowWrites: false, baseUrl });
 ```
 

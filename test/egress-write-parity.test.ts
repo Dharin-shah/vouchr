@@ -22,7 +22,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { Policy } from '../src/core/policy';
-import { defineProvider, ProviderRegistry, withEgressDefaults, type Provider } from '../src/core/providers';
+import { defineProvider, ProviderRegistry, readOnlyEgress, withEgressDefaults, type Provider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
@@ -182,6 +182,40 @@ test('createVouchr({ allowWrites: false }) reaches the handle the middleware han
   } finally {
     up.restore();
   }
+});
+
+test('allowWrites:false narrows a provider that DECLARES writes — not just an undeclared one', async (t) => {
+  // The hole this closes: `withEgressDefaults` only supplies a DEFAULT, so a provider declaring its
+  // own methods kept them. `databricks()` declares ['GET','POST'], so `allowWrites: false` would
+  // have left statement-submission POST open on a deployment that explicitly asked to be read-only —
+  // exactly the injected-write the flag exists to stop. readOnlyEgress INTERSECTS instead.
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const provider = defineProvider({ ...methodless(), egressMethods: ['GET', 'POST'] } as Provider);
+  await vault.upsert(userOwner(U1), 'acme', {
+    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
+  });
+
+  const up = stubUpstream();
+  try {
+    assert.equal(await boltVerdict(db, vault, provider, 'POST', false), 'denied', 'a DECLARED write must be refused under lockdown');
+    assert.equal(await boltVerdict(db, vault, provider, 'GET', false), 'allowed', 'reads still work');
+    assert.equal(await boltVerdict(db, vault, provider, 'POST', true), 'allowed', 'and the declaration still stands when writes are on');
+  } finally {
+    up.restore();
+  }
+});
+
+test('readOnlyEgress intersects rather than replacing, so it can never widen a provider', () => {
+  const base = methodless();
+  // Undeclared → the read-only floor.
+  assert.deepEqual(readOnlyEgress(base).egressMethods, ['GET', 'HEAD']);
+  // Declares a write → the write is dropped, the read kept.
+  assert.deepEqual(readOnlyEgress({ ...base, egressMethods: ['GET', 'POST'] } as Provider).egressMethods, ['GET']);
+  // Declares GET only → must NOT be widened to include HEAD.
+  assert.deepEqual(readOnlyEgress({ ...base, egressMethods: ['GET'] } as Provider).egressMethods, ['GET']);
+  // Write-only provider → nothing is permitted, which is the right answer for "run this read-only".
+  assert.deepEqual(readOnlyEgress({ ...base, egressMethods: ['POST'] } as Provider).egressMethods, []);
 });
 
 test('both transports share one rule, so a declared provider is never silently widened', () => {

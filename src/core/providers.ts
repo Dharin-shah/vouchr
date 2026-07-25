@@ -285,6 +285,29 @@ export function canonicalMethod(m: string): string | null {
  *
  * A provider that DOES declare `egressMethods` always keeps its own declaration.
  */
+/** The read-only floor: the only methods an explicitly read-only deployment may emit. */
+const READ_ONLY_METHODS = ['GET', 'HEAD'] as const;
+
+/**
+ * Force `p` read-only: INTERSECT whatever it declares with GET/HEAD.
+ *
+ * This is what an explicit `allowWrites: false` must mean, and why it cannot be expressed by
+ * `withEgressDefaults`. That helper only supplies a DEFAULT for a provider that declares nothing, so
+ * a provider that declares its own methods keeps them — `databricks()` declares `['GET','POST']`, so
+ * defaulting alone would leave a statement-submission POST open on a deployment that explicitly
+ * asked to be read-only. The broker never had this hole because its route rejects non-GET/HEAD
+ * before the provider is consulted at all; the Bolt path has no route, so the narrowing happens here.
+ *
+ * Intersection, not replacement: a provider declaring `['GET']` must not be WIDENED to include HEAD.
+ * A write-only provider intersects to `[]`, which the injector reads as "no method permitted" — the
+ * correct answer for "run this provider read-only", not an error.
+ */
+export function readOnlyEgress(p: Provider): Provider {
+  const allowed = (p.egressMethods ?? [...READ_ONLY_METHODS])
+    .filter((m) => (READ_ONLY_METHODS as readonly string[]).includes(m.toUpperCase()));
+  return Object.freeze({ ...p, egressMethods: Object.freeze(allowed) as unknown as string[] });
+}
+
 export function withEgressDefaults(p: Provider, defaultDenyNonGet?: boolean): Provider {
   // Frozen like everything out of defineProvider/ProviderRegistry: the freeze is a stated control
   // ("mutating the original object or a nested allowlist after registration cannot widen live

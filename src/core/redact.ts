@@ -17,6 +17,12 @@
  *
  * Call it as the LAST statement of the constructor, once every field has been assigned.
  *
+ * This depends on `useDefineForClassFields: true` (pinned in tsconfig.json, and implied by
+ * target ES2022): with define semantics a DECLARED-but-unassigned field such as `PgDb.refreshPool`
+ * already exists as `undefined` at construction time, so it is hidden here and stays hidden when it
+ * is assigned later. Flip that flag off and every such field would spring into existence enumerable
+ * on first write, silently reopening it to `JSON.stringify`.
+ *
  * ## What this deliberately does NOT stop
  *
  * - Properties created AFTER construction. The constructor cannot hide what does not exist yet, and
