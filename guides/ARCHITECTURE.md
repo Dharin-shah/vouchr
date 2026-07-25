@@ -97,6 +97,28 @@ wrapper, and the internal callback row (including PKCE material) is not a root-p
 export. Prefer the packaged Bolt or broker callback path unless implementing another
 trusted adapter.
 
+### Handling `ConsentRequiredError`
+
+`connect()` throws `ConsentRequiredError` when the user has no usable credential yet. Vouchr has
+already posted the private Connect prompt, so the handler's only job is to stop the turn.
+
+The error carries a `promptState`:
+
+| `promptState` | Meaning |
+| --- | --- |
+| `'posted'` | A fresh prompt was just posted. |
+| `'reused'` | A still-live prompt from moments ago was reused rather than re-posted. An in-channel prompt is an ephemeral, so it may no longer be visible. |
+
+Branch on the error class or its `code`, **never on message text** — `mapSafeError` copy differs by
+state and is not a stable contract.
+
+### Custom Slack transports
+
+If your Bolt `App` uses a non-default Slack transport (a proxy, a custom `slackApiUrl`, or a TLS
+agent), pass the same options as `slackClientOptions` to `createVouchr`, so Vouchr's own prompt and
+DM posts use your transport too. Vouchr always layers a finite timeout, zero retries, rate-limit
+rejection, and lease-safe queue concurrency on top of whatever you supply.
+
 ### Wiring without `install()`
 
 `vouchr.install(app, receiver)` is a convenience that registers every Bolt-facing piece.

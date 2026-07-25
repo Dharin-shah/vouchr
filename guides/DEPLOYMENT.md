@@ -618,6 +618,24 @@ Two credential-store incidents demand different responses:
   external references need manual rotation; invalidated installations require each workspace to
   reinstall the Slack app. The tabletop/drill that exercises this end to end is tracked under #216.
 
+### Different scopes in different channels
+
+Scopes come from the provider definition, so request exactly what you use:
+`github({ scopes: ['read:user'] })` shows the user only "Read your profile" rather than the broad
+`repo` default.
+
+Scopes are per-provider, not per-channel (yet —
+[#272](https://github.com/Dharin-shah/vouchr/issues/272)). Until then, define the provider twice
+under distinct ids and gate them with channel tools or policy:
+
+```ts
+providers: [
+  github({ scopes: ['read:user'] }),                                       // id: 'github' — read-only
+  defineProvider({ ...github({ scopes: ['read:user', 'repo'] }), id: 'github-write' }),
+]
+// then enable `github-write` only in the channels that need writes, `github` elsewhere.
+```
+
 ### Provider config (declarative)
 
 Declare providers without editing source. Declarative fields only — a provider needing function
