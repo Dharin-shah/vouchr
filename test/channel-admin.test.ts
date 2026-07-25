@@ -376,11 +376,15 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
   // that it fails closed. `tombstoneBlocks` counts a tie as blocked, so a connect-shared issued in
   // the SAME millisecond as a preceding config mutation is correctly refused: the loading modal is
   // replaced by "Review current status" instead of the configure modal, and h.hydrated() is
-  // undefined. That is the right product behaviour — it only bites here because a test can fire three
-  // slash commands with sub-millisecond spacing, which real Slack (two separately signed HTTPS POSTs,
-  // a network RTT apart) never does. Asserting the independent gates in this order leaves the fence
-  // nothing to tie against. Do NOT paper over it with a sleep; if the post-disable ordering is ever
-  // wanted deliberately, use a second commandHarness — each gets a fresh schema and no tombstone.
+  // null. The refusal itself is right — the fence backdates by >=1ms so that it fails closed — but a
+  // test can fire three slash commands sub-millisecond apart, which two separately signed HTTPS POSTs
+  // never do. Asserting the independent gates in this order leaves the fence nothing to tie against.
+  // Do NOT paper over it with a sleep; if the post-disable ordering is ever wanted deliberately, use
+  // a second commandHarness — each gets a fresh schema and no tombstone.
+  //
+  // This is NOT unique to this test: the same millisecond-tie family also flakes
+  // test/dry-run.test.ts's "P1-B ... atomic" and the late shared-handle validation case. The
+  // systemic fix (microsecond fence resolution) is issue #290; this reorder is the local one.
   await h.run('connect-shared mcp');
   assert.equal(h.opened()?.trigger_id, 'trig'); // loading modal consumed the trigger immediately
   assert.equal(h.hydrated()?.callback_id, CONFIGURE_CALLBACK);
