@@ -54,7 +54,7 @@ test('audit: redaction walks nested objects and arrays', async (t) => {
 
   const meta = {
     nested: { leaked: 'ghp_NOT_A_REAL_NESTED_TOKEN', safe: 'ok' },
-    list: ['C0123ABC', 'AKIAIOSFODNN7EXAMPLE', 200],
+    list: ['C0123ABC', 'AKIA_NOT_A_REAL_AWS_KEY', 200],
   };
 
   await audit.record('config', ID, 'github', meta);

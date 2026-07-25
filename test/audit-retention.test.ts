@@ -196,13 +196,17 @@ test('prune CLI: only a bare --yes deletes; malformed forms are rejected without
   assert.equal(await count(), 5, 'an out-of-range days must delete nothing');
 
   // SEC-1: a token-shaped positional and an unknown flag carrying a secret must NOT be echoed.
-  const secret = 'SYNTHETIC-CREDENTIAL-A-DO-NOT-ECHO';
+  const SENTINEL = 'SYNTHETIC-DO-NOT-ECHO';
+  // Token-SHAPED (the `ghp_` prefix the audit redactor keys on) but not a real GitHub
+  // grammar, so secret scanners stay quiet. Assertions match SENTINEL, not the whole
+  // string, so a TRUNCATED echo is caught too.
+  const secret = `ghp_${SENTINEL}-A`;
   let s = run(secret, '--yes');
   assert.notEqual(s.status, 0);
-  assert.ok(!(s.stderr + s.stdout).includes(secret), 'a positional secret must not be echoed');
+  assert.ok(!(s.stderr + s.stdout).includes(SENTINEL), 'a positional secret must not be echoed');
   s = run(`--${secret}`, '--yes');
   assert.notEqual(s.status, 0);
-  assert.ok(!(s.stderr + s.stdout).includes(secret), 'an unknown-flag secret must not be echoed');
+  assert.ok(!(s.stderr + s.stdout).includes(SENTINEL), 'an unknown-flag secret must not be echoed');
 
   await seed5();
   let r = run(); // no --yes → dry-run
