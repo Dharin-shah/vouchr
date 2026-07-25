@@ -208,6 +208,27 @@ test('a field declared but assigned only later stays hidden', () => {
   assert.ok(o.read().includes(DB_PASSWORD), 'while staying readable internally');
 });
 
+test('PgDb.refreshPool stays hidden when withRefreshLock assigns it lazily', async (t) => {
+  // The REAL lazy-assignment path, not a synthetic stand-in: `private refreshPool?: Pool` is declared
+  // but only assigned inside withRefreshLocks. Raised in review as a suspected hole — if that first
+  // write created a fresh own property it would be ENUMERABLE, and util.inspect/spread/structured
+  // logging could then walk into the Pool's options and out through its password-bearing
+  // connectionString. It does not, because a declared class field is materialised at construction
+  // (define semantics, pinned via useDefineForClassFields) and hideInternals covers it there; the
+  // later write reuses that non-enumerable slot. This test is what fails if that pin is ever removed.
+  const db = await openTestDb(t) as unknown as {
+    refreshPool?: unknown;
+    withRefreshLock: (k: string, fn: () => Promise<void>) => Promise<void>;
+  };
+  assert.ok(Object.getOwnPropertyNames(db).includes('refreshPool'), 'the field exists at construction');
+  assert.deepEqual(Object.keys(db), [], 'nothing enumerable after construction');
+  await db.withRefreshLock('no-secret-serialization-probe', async () => {});
+  assert.ok(db.refreshPool, 'withRefreshLock really did assign it (otherwise this proves nothing)');
+  assert.deepEqual(Object.keys(db), [], 'the lazily-assigned pool must not become enumerable');
+  const text = `${JSON.stringify(db) ?? ''}${inspect(db, { depth: null })}${JSON.stringify({ ...db }) ?? ''}`;
+  assert.ok(!/:\/\/[^@\s"]*:[^@\s"]+@/.test(text), 'no password-bearing URL may escape via the pool');
+});
+
 test('the canaries are actually reachable when NOT hidden (the test can fail)', () => {
   // Guards against the suite passing because the secrets were never wired in. This mirrors the
   // pre-fix structure: a plain holder with enumerable references to the same dependency graph.
