@@ -87,6 +87,7 @@ import {
   isVouchrErrorCode,
   safeUserMessage,
   type ConsentPromptState,
+  type VouchrErrorCode,
 } from '../core/errors';
 export {
   ConsentRequiredError,
@@ -809,7 +810,23 @@ export type BrokerDenialRecovery =
   | { status: 'approval_prompted'; provider: string; approver: 'self' | 'admin' }
   | { status: 'configuration_required'; provider: string }
   | { status: 'stale'; provider: string }
+  /** A denial with no button: the user was told privately that a human must act. */
+  | { status: 'notified'; provider: string; code: VouchrErrorCode }
   | { status: 'not_bridgeable' };
+
+/**
+ * Relayed denial codes that carry user-actionable copy but no decision surface. Mapping to the TYPED
+ * error (rather than reusing the relayed message) means the hybrid path and the Bolt path render the
+ * identical sentence from `mapSafeError`, and no broker-supplied text is ever echoed into Slack.
+ *
+ * Deliberately excluded: egress/response blocks and resolver/token failures (operator configuration,
+ * not something the asking human can act on) and rate limiting (already surfaced by the Bolt path's
+ * own ephemeral, and its retry hint would have to come from the wire).
+ */
+const BRIDGEABLE_NOTICES: Partial<Record<VouchrErrorCode, () => Error>> = {
+  tool_disabled: () => new ToolDisabledError(),
+  policy_denied: () => new PolicyDeniedError(),
+};
 
 // Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
 // caller nor any forgeable Slack field can choose a newer provisioning issuance. Normal direct
@@ -2142,7 +2159,38 @@ export class ConnectContext {
       return { status: 'approval_prompted', provider: providerId, approver: approval.approver };
     }
 
+    // Denials that need a HUMAN, not a consent surface. On the Bolt path these already reach the
+    // user (connect() throws them and the host renders safeUserMessage); relayed from the broker
+    // they reached nobody — so a hybrid deployment's most common first-run failure, a channel that
+    // is deny-by-default with the provider never enabled, was silence. Same failure, same words,
+    // whichever transport produced it.
+    //
+    // SEC-3/SEC-1: the copy is derived LOCALLY from the typed code, never from the relayed payload.
+    // A broker response is transport input; its `message` is neither trusted nor echoed — exactly as
+    // the consent branches above rebuild their surfaces from verified state rather than sent text.
+    if (code) {
+      const notice = BRIDGEABLE_NOTICES[code];
+      if (notice) {
+        await this.postDenialNotice(safeUserMessage(notice()));
+        return { status: 'notified', provider: providerId, code };
+      }
+    }
+
     return { status: 'not_bridgeable' };
+  }
+
+  /** Private, ephemeral delivery for a relayed denial that carries no button: the user needs to know
+   *  an admin has to act, and that nothing was sent on their behalf. Best-effort — a Slack hiccup
+   *  must not turn an already-correct denial into an unrelated thrown error on the recovery path. */
+  private async postDenialNotice(text: string): Promise<void> {
+    const channel = this.channel;
+    if (!channel) return; // nothing to post into (a relayed call outside any conversation)
+    try {
+      await this.promptClient().chat.postEphemeral({ channel, user: this.identity.userId, text });
+    } catch {
+      // Swallowed deliberately: the denial stands and is already audited. Surfacing a delivery
+      // failure would replace "an admin must enable this" with an unrelated error.
+    }
   }
 
   /** Shared-owner recovery for a missing channel credential: direct an eligible admin to channel

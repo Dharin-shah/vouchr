@@ -5,6 +5,22 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The broker-to-Slack recovery bridge now covers denials that need a human rather than a button.**
+  `recoverBrokerDenial` handled only the three consent-shaped codes (`not_connected`,
+  `session_approval_required`, `approval_required`); everything else returned `not_bridgeable`, so a
+  relayed `tool_disabled` reached nobody. Because channels are deny-by-default, "an admin never
+  enabled this provider here" is the single most likely first run of a hybrid deployment — and it was
+  silent. `tool_disabled` and `policy_denied` now post the same private notice the embedded Bolt path
+  shows for the same typed error, and return the new `{ status: 'notified', provider, code }`.
+
+  The copy is derived locally from the typed code: a relayed `message` is never echoed into Slack, so
+  a confused or compromised data plane cannot choose what the user reads. Delivery is best-effort —
+  a Slack hiccup cannot turn an already-correct denial into an unrelated error. Egress/response
+  blocks, resolver and token-endpoint failures, and rate limiting remain `not_bridgeable`: they are
+  operator-configuration or transient problems, not something the asking human can act on.
+
 ### Security
 
 - **`ConnectionHandle` / `ConnectContext` no longer serialize their dependencies.** TypeScript's

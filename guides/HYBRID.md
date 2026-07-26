@@ -567,9 +567,16 @@ app.event('app_mention', async ({ context, event, client, say }) => {
       });
       return;
     }
+    if (recovery.status === 'notified') {
+      // A denial that needs a human, not a button (a provider not enabled in this channel, or a
+      // policy denial). Vouchr already posted the private notice — in the same words the embedded
+      // Bolt path uses for the same typed error — so the host adds nothing here.
+      return;
+    }
     if (recovery.status === 'not_bridgeable') {
-      // The bridge owns only connect/session/approval denials. Keep every other safe broker
-      // failure private; never fall through and publish it to the channel with say().
+      // Everything the bridge does not own: operator-configuration failures (egress/response
+      // blocks, resolver and token-endpoint errors) and transient upstream problems. Keep them
+      // private; never fall through and publish one to the channel with say().
       await client.chat.postEphemeral({
         channel: event.channel,
         user: event.user,
@@ -590,7 +597,10 @@ body to `recoverBrokerDenial` from the same verified context. Prompt/configurati
 turn. `resolved` and `stale` mean only that a new attempt may re-resolve current state; they are not
 replay authority. The example asks the user to start a new turn so the host repeats preflight and
 mints a fresh assertion instead of automatically replaying a possibly non-idempotent operation.
-`not_bridgeable` stays private and follows the broker's safe typed guidance. If the model chooses a
+`notified` means Vouchr posted the private notice itself: the denial needed a human rather than a
+decision surface, and the copy is derived locally from the typed code — a relayed `message` is
+never echoed into Slack, so a confused or compromised data plane cannot choose what the user
+reads. `not_bridgeable` stays private and follows the broker's safe typed guidance. If the model chooses a
 tool only after planning, intercept the proposed tool in the trusted host, run the same preflight,
 and add the identity assertion out of band. It must never be a model-visible tool argument. A mode
 change between preflight and egress fails closed; rerun preflight instead of guessing.
@@ -784,6 +794,8 @@ state; recovery metadata is routing guidance, not authority.
 | Signal | Meaning | Safe response |
 | --- | --- | --- |
 | `409`, code `not_connected` | No usable owner credential | Relay to `recoverBrokerDenial`: user ownership gets the private connect/key flow; shared ownership directs an eligible admin to channel configuration. Do not loop broker retries |
+| `403`, code `tool_disabled` | The provider was never enabled in this channel (channels are deny-by-default) | Relay to `recoverBrokerDenial`: it privately tells the asking user an admin must enable it, in the same words the embedded path uses. Returns `notified`; the host adds nothing |
+| `403`, code `policy_denied` | Provider policy denies this channel | Relay to `recoverBrokerDenial`: same private-notice path, returns `notified` |
 | `403`, code `session_approval_required` | No live thread grant | Relay to `recoverBrokerDenial` from the verified thread context: it creates/reuses the one thread-scoped approval prompt, and the click re-validates everything at the mutation. Retry only after the grant, with a fresh assertion |
 | `403`, code `approval_required` | A write needs a human grant | Relay to `recoverBrokerDenial`: the opaque `approvalId` is a lookup handle, never authority — the bridge re-reads the pending row, re-derives the self/admin rule from the registry, and delivers the decision surface. Retry only after one live grant, with a fresh assertion |
 | `policy_denied` or `tool_disabled` | Provider is not authorized here | Follow non-retryable `contact_admin`; never silently widen scope or loop retries |
