@@ -245,6 +245,32 @@ const refreshFlights = new WeakMap<Promise<string | null>, RefreshFlight>();
  * side-effect-free or idempotent per RFC 9110. A non-idempotent write (POST/PATCH, or any unknown
  * method) is NEVER auto-replayed — a provider may have applied it before returning 401 (#209). */
 const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'PUT', 'DELETE']);
+
+/**
+ * Build the outbound `fetch` init from an ALLOWLIST of caller fields.
+ *
+ * The egress gates decide which URL a credential may be sent to, but `fetch` options can decide
+ * where the socket actually goes: undici honours `dispatcher`, which replaces the transport
+ * entirely. Spreading the caller's init forwarded that (and every other unknown key) past every
+ * gate, so a request whose URL was perfectly allowlisted could still deliver the injected
+ * credential to an arbitrary origin. Only these fields cross the boundary; everything else —
+ * `dispatcher`, `cache`, `credentials`, `mode`, `referrer`, and anything a future runtime adds —
+ * is dropped rather than trusted. Vouchr owns method, headers, redirect and signal outright.
+ *
+ * A deployment that genuinely needs a custom dispatcher (a corporate egress proxy) must supply it
+ * as construction config, where it is operator-controlled, not per-request where it is caller-
+ * controlled. Dropping it here is deliberate.
+ */
+function outboundInit(init: RequestInit, method: string, headers: Headers, signal: AbortSignal): RequestInit {
+  const out: RequestInit & { duplex?: 'half' } = { method, headers, redirect: 'manual', signal };
+  if (init.body != null) {
+    out.body = init.body;
+    // Node requires duplex:'half' to send a streaming body; a string/Buffer body neither needs nor
+    // is harmed by it, so only set it for the stream case.
+    if (typeof (init.body as ReadableStream<Uint8Array>).getReader === 'function') out.duplex = 'half';
+  }
+  return out;
+}
 function isIdempotentMethod(method: string): boolean {
   return IDEMPOTENT_METHODS.has(method);
 }
@@ -766,7 +792,16 @@ export class ConnectionHandle {
         // redirect:'manual', never auto-follow a 3xx off the allowlisted host with the bearer attached.
         // The composed signal covers headers + the still-streaming body, proactive/401 refresh, and
         // client cancellation. It is disposed when the returned body finishes/cancels (below).
-        return await fetch(input, { ...init, method, headers, redirect: 'manual', signal: deadline.signal });
+        //
+        // SEC: the outbound init is built EXPLICITLY — never `{ ...init }`. A spread forwarded every
+        // unknown caller key straight to fetch, including undici's `dispatcher`, which replaces the
+        // TRANSPORT. The egress gates validate the URL; a dispatcher decides where the socket
+        // actually connects, so a caller (or a host tool that forwards model-influenced fetch
+        // options) could send the injected credential to any origin while the URL still passed every
+        // gate. Reproduced: the bearer arrived at a non-allowlisted 127.0.0.1 listener with all eight
+        // gates green. Only the fields Vouchr supports cross this boundary; anything else is dropped.
+        // A deployment-wide proxy/dispatcher belongs in construction config, not in per-request input.
+        return await fetch(input, outboundInit(init, method, headers, deadline.signal));
       } catch (e) {
         if (deadline.timedOut() || isVouchrDeadlineReason(deadline.signal.reason)) {
           throw new UpstreamTimeoutError();
