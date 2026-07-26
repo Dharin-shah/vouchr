@@ -28,7 +28,8 @@ import {
  *     enabled here, and that becomes the model's tool enum. Channels are deny-by-default, so an
  *     agent in a channel where nothing is enabled can reach nothing.
  *  3. The model chooses the URL. That is the generic-HTTP-tool shape prompt injection loves, and
- *     it is safe only because the egress gates run before the credential is read. When the model
+ *     it is safe only because the egress gates run before the credential is attached — a refused
+ *     request reads no credential and opens no connection. When the model
  *     picks a host or method the provider never declared, the request is refused and the user is
  *     told — see the `EgressBlockedError` path below, which is a demo beat, not an edge case.
  */
@@ -71,6 +72,9 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 app.event('app_mention', async ({ context, event, client, say }) => {
   const thread = (event as { thread_ts?: string }).thread_ts ?? event.ts;
   const vouchr = context.vouchr;
+  // No acting human on the event means there is no identity to broker a credential for.
+  const actor = event.user;
+  if (!actor) return;
 
   // The channel's tool manifest IS the model's tool surface. `acting_human` entries are the ones
   // Vouchr brokers; a `service` tool is the host's own to wire up, so it is not offered here.
@@ -128,7 +132,7 @@ app.event('app_mention', async ({ context, event, client, say }) => {
       output_config: { effort: 'low' },
       tools: [callProvider],
       system:
-        `You act on behalf of <@${event.user}> in a Slack thread. Available providers: ${usable.join(', ')}.\n`
+        `You act on behalf of <@${actor}> in a Slack thread. Available providers: ${usable.join(', ')}.\n`
         + 'Pick the provider that owns what they asked for and make the smallest request that does it. '
         + 'Then reply in one or two sentences saying what you did and, where the provider tells you, '
         + 'under which account. If a request is refused, say plainly what was refused and stop — do not '
@@ -144,8 +148,15 @@ app.event('app_mention', async ({ context, event, client, say }) => {
     // Vouchr already posted this person a private Connect prompt; nobody else in the thread is
     // affected, and the next person to ask gets their own.
     if (e instanceof ConsentRequiredError) return;
-    // Everything else — including an egress refusal — becomes fixed, leak-safe copy.
-    await say({ thread_ts: thread, text: safeUserMessage(e) });
+    // Everything else — including an egress refusal — becomes fixed, leak-safe copy, and it goes
+    // back to the asker only. The copy is safe to publish, but a refusal names what this channel
+    // does not allow; that is governance state, and guides/HYBRID.md says keep it private.
+    await client.chat.postEphemeral({
+      channel: event.channel,
+      user: actor,
+      thread_ts: thread,
+      text: safeUserMessage(e),
+    });
   }
 });
 

@@ -26,9 +26,9 @@ Channels are deny-by-default, so an agent in a channel where nothing is enabled 
 Turning a provider on is `/vouchr enable <provider>` — no redeploy, no code change.
 
 **3. The model chooses the URL — and that's safe.** This is deliberately the generic-HTTP-tool shape
-prompt injection loves. It's safe because the egress gates run **before the credential is read**:
-a host, path, or method the provider never declared is refused and nothing is sent. Each provider
-declares its own bounds:
+prompt injection loves. It's safe because the egress gates run **before the credential is attached**:
+a host, path, or method the provider never declared is refused, the refused request reads no
+credential and opens no connection, and nothing is sent. Each provider declares its own bounds:
 
 ```ts
 defineProvider({ ...github(...), egressMethods: ['GET', 'POST'], egressPaths: ['/repos', '/user'] })
@@ -47,7 +47,7 @@ createVouchr({ providers, allowWrites: true, … })                      // 2. d
 ```
 
 Try it: delete `allowWrites: true` and ask again. Every provider is intersected down to GET/HEAD
-regardless of what it declares, and the write is refused before the credential is read.
+regardless of what it declares, and the write is refused before the credential is attached.
 
 ## Setup
 
@@ -97,9 +97,15 @@ The multi-user shot is the story. Film with **two real Slack accounts** — not 
 Beat 3 is the one no competitor screenshot reproduces. Beat 5 only reads as *proof* because of beat 3
 — without a second user it's just OAuth with extra steps.
 
-**Optional beat 6, if you want the guardrail on camera:** ask for something outside the allowlist
-(*"delete the repo"*). The egress gate refuses it before the credential is read, and the agent says
-so. That's the difference between a policy and a control.
+**Optional beat 6, if you want the guardrail on camera:** ask the agent to **edit an existing
+comment**. That's a `PATCH`, which this GitHub config doesn't declare, so the method gate refuses it
+without reading the credential or opening a connection.
+
+Pick that ask deliberately. *"Delete the repo"* films worse: the tool's `method` enum is
+`GET | POST | PATCH`, so the model can't emit `DELETE` at all and simply declines — on camera that's
+indistinguishable from a model being agreeable, which is the thing this beat exists to contrast
+against. `PATCH` is a request the model *will* make and the gate *will* stop. (A URL on a host
+outside `egressAllow` works equally well, via the host gate.)
 
 Split-screen Slack and the terminal throughout so beat 5 needs no cut. Captions, not voiceover — it
 gets watched muted.
@@ -110,6 +116,14 @@ Vouchr binds **who** the request acts as and **where** it may go. It does not ve
 the model composed is a faithful reading of what the human wanted — the model picked the endpoint and
 wrote the body. For writes where that matters, show the user what's about to happen before it does;
 see [#294](https://github.com/Dharin-shah/vouchr/issues/294) for that discussion.
+
+**This example specifically feeds the model the whole thread, and that crosses participants.** The
+prompt is every message from everyone in it, while the credential is the *mentioning* user's — so
+Bob can write something in the thread that steers what the model does with Alice's token when Alice
+mentions the bot. The egress gates still bound it to what Alice's own provider config allows (here:
+comment or open an issue in a public repo, not delete one), but the blast radius is Alice's account,
+not Bob's. Narrow the transcript, or scope writes tighter, before pointing this at a channel where
+that matters.
 
 Provider responses also come back to your process. What reaches the model or the transcript after
 that is the host's call, not Vouchr's.
