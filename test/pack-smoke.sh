@@ -193,8 +193,10 @@ done
 echo "==> a minimal typed consumer compiles against the published types"
 cat > "$CONSUMER/consumer.ts" <<'TS'
 import {
-  createVouchr, disconnectProvider, OAUTH_CONNECT_ACTION,
+  createVouchr, disconnectProvider, isSlackConversationType as isRootSlackConversationType,
+  OAUTH_CONNECT_ACTION,
   type ConnectContext, type DbInstallationStoreOptions,
+  type SlackConversationType as RootSlackConversationType,
 } from '@vouchr/core';
 import {
   isVouchrErrorCode as isRootVouchrErrorCode, type BrokerDenialRecovery,
@@ -208,7 +210,7 @@ import {
   ResolverConfigurationError, ResolverFailedError,
   ResponseBlockedError, RateLimitedError, SecretReferenceError, TokenEndpointError,
   UpstreamTimeoutError, UserFacingError,
-  isVouchrErrorCode, mapSafeError, safeUserMessage,
+  isSlackConversationType, isVouchrErrorCode, mapSafeError, safeUserMessage,
   TOKEN_ENDPOINT_FAILURE_KINDS, VOUCHR_ERROR_CODES, VOUCHR_RECOVERY_ACTIONS,
   type BrokerError, type BrokerFetchResponse, type BrokerOptions, type BrokerServer, type IdentityConfig,
   type SlackConversationType,
@@ -238,6 +240,29 @@ const verifiedChannelType: SlackConversationType | undefined = verifiedIdentity.
 void verifiedChannelType;
 const appHomeChannelType: SlackConversationType = 'app_home';
 void appHomeChannelType;
+const untrustedChannelType: unknown = 'mpim';
+if (isSlackConversationType(untrustedChannelType)) {
+  const narrowedHeadlessType: SlackConversationType = untrustedChannelType;
+  void narrowedHeadlessType;
+}
+if (isRootSlackConversationType(untrustedChannelType)) {
+  const narrowedRootType: RootSlackConversationType = untrustedChannelType;
+  void narrowedRootType;
+}
+type ExpectedSlackConversationType = 'channel' | 'group' | 'im' | 'mpim' | 'app_home';
+type IsAny<T> = 0 extends (1 & T) ? true : false;
+type ExactConversationType<T> =
+  IsAny<T> extends true
+    ? false
+    : [T] extends [ExpectedSlackConversationType]
+      ? [ExpectedSlackConversationType] extends [T] ? true : false
+      : false;
+const exactHeadlessConversationType: true =
+  null as unknown as ExactConversationType<SlackConversationType>;
+const exactRootConversationType: true =
+  null as unknown as ExactConversationType<RootSlackConversationType>;
+void exactHeadlessConversationType;
+void exactRootConversationType;
 type HasReplayOverride = 'replayStore' extends keyof BrokerOptions ? true : false;
 type HasSkewKnob = 'skewMs' extends keyof IdentityConfig ? true : false;
 const noReplayOverride: false = null as unknown as HasReplayOverride;

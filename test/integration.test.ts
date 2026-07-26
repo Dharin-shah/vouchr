@@ -9,6 +9,8 @@ import {
   defineProvider,
   github,
   ConsentRequiredError,
+  Policy,
+  PolicyDeniedError,
 } from '../src';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
@@ -199,6 +201,40 @@ test('integration: a per-user provider in a DM works end to end with no channel 
   } finally {
     await mock.close();
   }
+});
+
+test('integration: static Policy still denies a DM that mutable channel governance exempts', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const db = await openTestDb(t);
+  const provider = defineProvider({
+    id: 'dm-policy', authorizeUrl: 'https://provider.test/authorize',
+    tokenUrl: 'https://provider.test/token', scopesDefault: [],
+    egressAllow: ['api.provider.test'], refresh: 'none', pkce: false,
+    clientId: 'cid', clientSecret: 'secret',
+  });
+  const lan = await createVouchr({
+    providers: [provider], baseUrl: 'https://vouchr.test', db,
+    policy: new Policy({ [provider.id]: { defaultAllow: true, denyChannels: ['D_POLICY_DENIED'] } }),
+  });
+  await lan.vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), provider.id, {
+    accessToken: randomBytes(24).toString('base64url'),
+    refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'acct',
+  });
+  const context: any = {};
+  await lan.middleware({
+    context,
+    client: { chat: { postEphemeral: async () => undefined, postMessage: async () => undefined } },
+    event: { channel: 'D_POLICY_DENIED', channel_type: 'im', user: 'U1', team: 'T1' },
+    next: async () => {},
+  });
+
+  assert.equal((await context.vouchr.toolManifest())[0].enabled, false);
+  await assert.rejects(context.vouchr.connect(provider.id), PolicyDeniedError);
+  assert.equal(
+    (await db.all(`SELECT 1 FROM channel_tool`)).length,
+    0,
+    'the policy verdict uses the real DM channel without materializing mutable governance',
+  );
 });
 
 test('integration: command/action middleware lazily and once classifies G-prefixed conversations after ack', async (t) => {

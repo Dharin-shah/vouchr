@@ -184,6 +184,20 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
   const row = await lan.db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
   assert.equal(row.enabled, 1);
 
+  const enableAuditCount = Number((await lan.db.get(
+    "SELECT COUNT(*) AS n FROM audit WHERE action='config' AND provider='mcp'",
+  ) as any).n);
+  await handler({
+    command: { ...base, text: 'enable mcp' },
+    ack: async () => {},
+    respond: async (m: string) => out.push(m),
+    client,
+  });
+  assert.match(out[1], /\*mcp\* is already enabled .*— nothing changed\./);
+  assert.equal(Number((await lan.db.get(
+    "SELECT COUNT(*) AS n FROM audit WHERE action='config' AND provider='mcp'",
+  ) as any).n), enableAuditCount, 'truthful no-op feedback must not mask an audit write');
+
   await handler({
     command: { ...base, text: 'connect-shared mcp' },
     ack: async () => {},
@@ -193,4 +207,75 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
   assert.equal(opened?.trigger_id, 'trig');
   assert.equal(opened?.view?.callback_id, undefined);
   assert.equal(hydrated?.callback_id, CONFIGURE_CALLBACK);
+
+  await handler({
+    command: { ...base, text: 'disable mcp' },
+    ack: async () => {},
+    respond: async (m: string) => out.push(m),
+    client,
+  });
+  assert.match(out.at(-1) ?? '', /Disabled/);
+  const disableAuditCount = Number((await lan.db.get(
+    "SELECT COUNT(*) AS n FROM audit WHERE action='config' AND provider='mcp'",
+  ) as any).n);
+  await handler({
+    command: { ...base, text: 'disable mcp' },
+    ack: async () => {},
+    respond: async (m: string) => out.push(m),
+    client,
+  });
+  assert.match(out.at(-1) ?? '', /\*mcp\* is already disabled .*— nothing changed\./);
+  assert.equal(Number((await lan.db.get(
+    "SELECT COUNT(*) AS n FROM audit WHERE action='config' AND provider='mcp'",
+  ) as any).n), disableAuditCount, 'a repeated disable must remain mutation- and audit-free');
+});
+
+test('/vouchr G-conversation classification preserves transport options and disables SDK retries', async (t) => {
+  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
+  const prototype = WebClient.prototype as any;
+  const realApiCall = prototype.apiCall;
+  const seen: any[] = [];
+  const order: string[] = [];
+  prototype.apiCall = async function (this: any, method: string) {
+    order.push(method);
+    seen.push({
+      method,
+      retries: this.retryConfig?.retries,
+      rejectRateLimited: this.rejectRateLimitedCalls,
+      apiUrl: this.slackApiUrl,
+    });
+    return { ok: true, channel: { is_mpim: true } };
+  };
+  try {
+    const lan = await createVouchr({
+      providers: [provider],
+      baseUrl: 'http://127.0.0.1:1',
+      db: await openTestDb(t),
+      slackClientOptions: { slackApiUrl: 'https://slack-proxy.internal/api/' },
+    });
+    let handler: any;
+    lan.registerCommands({
+      command: (_n: string, h: any) => (handler = h),
+      view: () => undefined,
+      action: () => undefined,
+    });
+    const responses: string[] = [];
+    await handler({
+      command: { team_id: 'T1', user_id: 'U1', channel_id: 'G_MPIM', text: 'tools' },
+      ack: async () => { order.push('ack'); },
+      respond: async (m: string) => responses.push(m),
+      client: { token: 'xoxb-classifier-test' },
+    });
+
+    assert.equal(order[0], 'ack', 'classification must begin only after the command is acknowledged');
+    assert.deepEqual(seen, [{
+      method: 'conversations.info',
+      retries: 0,
+      rejectRateLimited: true,
+      apiUrl: 'https://slack-proxy.internal/api/',
+    }]);
+    assert.match(responses[0], /\*mcp\*: enabled/);
+  } finally {
+    prototype.apiCall = realApiCall;
+  }
 });
