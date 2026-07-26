@@ -5,24 +5,20 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
-### Added
+## [1.0.0-beta.1] — 2026-07-26
 
-- **The broker-to-Slack recovery bridge now covers denials that need a human rather than a button.**
-  `recoverBrokerDenial` handled only the three consent-shaped codes (`not_connected`,
-  `session_approval_required`, `approval_required`); everything else returned `not_bridgeable`, so a
-  relayed `tool_disabled` reached nobody. Because channels are deny-by-default, "an admin never
-  enabled this provider here" is the single most likely first run of a hybrid deployment — and it was
-  silent. `tool_disabled` and `policy_denied` now post the same private notice the embedded Bolt path
-  shows for the same typed error, and return the new `{ status: 'notified', provider, code }`.
+Security release with **two** credential-exposure fixes. **Anyone running `1.0.0-beta` should
+upgrade.**
 
-  The copy is derived locally from the typed code: a relayed `message` is never echoed into Slack, so
-  a confused or compromised data plane cannot choose what the user reads. `notified` is returned only
-  when the notice plausibly landed — a platform rejection (channel removed, bot evicted) proves the
-  user did not see it, so it falls through to `not_bridgeable` and the host's existing safe-text path
-  still says something. Egress/response blocks, resolver and token-endpoint failures, and rate
-  limiting also remain `not_bridgeable`: operator-configuration or transient problems, not something
-  the asking human can act on. `BRIDGEABLE_NOTICES` and `DELIBERATELY_UNBRIDGED` are exported and a
-  test asserts they partition every `VouchrErrorCode`, so a new code cannot be silently unbridged.
+1. That published build leaks the AES-256 master key, the provider OAuth client secret, the Slack bot
+   token and the database password into logs and transcripts whenever the host serializes the Vouchr
+   context or handle — which structured loggers and error dumps routinely do.
+2. It also forwards unrecognized caller `fetch` options, so a `dispatcher` could redirect an injected
+   credential to a non-allowlisted origin while every egress gate passed.
+
+No schema change and no data migration. One breaking API change for custom `KmsClientLike`
+implementations (`decrypt` now takes `keyId` first); `kmsEnvelope` callers are unaffected. One
+behaviour change: a per-request `dispatcher` is now ignored rather than honoured.
 
 ### Security
 
@@ -44,7 +40,6 @@ All notable changes to this project are documented here. This project adheres to
   now ignored instead of honoured. A deployment-wide egress proxy belongs in construction config,
   where it is operator-controlled; Vouchr does not expose that option yet.
 
-### Security
 
 - **`ConnectionHandle` / `ConnectContext` no longer serialize their dependencies.** TypeScript's
   `private` is erased at compile time, so every dependency was an own **enumerable** property at
@@ -78,6 +73,24 @@ All notable changes to this project are documented here. This project adheres to
   bound to its owner row.
 
 ### Added
+
+- **The broker-to-Slack recovery bridge now covers denials that need a human rather than a button.**
+  `recoverBrokerDenial` handled only the three consent-shaped codes (`not_connected`,
+  `session_approval_required`, `approval_required`); everything else returned `not_bridgeable`, so a
+  relayed `tool_disabled` reached nobody. Because channels are deny-by-default, "an admin never
+  enabled this provider here" is the single most likely first run of a hybrid deployment — and it was
+  silent. `tool_disabled` and `policy_denied` now post the same private notice the embedded Bolt path
+  shows for the same typed error, and return the new `{ status: 'notified', provider, code }`.
+
+  The copy is derived locally from the typed code: a relayed `message` is never echoed into Slack, so
+  a confused or compromised data plane cannot choose what the user reads. `notified` is returned only
+  when the notice plausibly landed — a platform rejection (channel removed, bot evicted) proves the
+  user did not see it, so it falls through to `not_bridgeable` and the host's existing safe-text path
+  still says something. Egress/response blocks, resolver and token-endpoint failures, and rate
+  limiting also remain `not_bridgeable`: operator-configuration or transient problems, not something
+  the asking human can act on. `BRIDGEABLE_NOTICES` and `DELIBERATELY_UNBRIDGED` are exported and a
+  test asserts they partition every `VouchrErrorCode`, so a new code cannot be silently unbridged.
+
 
 - **`allowWrites` on `createVouchr`**, so a read-only agent can be locked down on the Bolt path.
   Previously that path applied no HTTP-method restriction at all and offered no way to add one: a
