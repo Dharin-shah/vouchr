@@ -823,10 +823,35 @@ export type BrokerDenialRecovery =
  * not something the asking human can act on) and rate limiting (already surfaced by the Bolt path's
  * own ephemeral, and its retry hint would have to come from the wire).
  */
-const BRIDGEABLE_NOTICES: Partial<Record<VouchrErrorCode, () => Error>> = {
-  tool_disabled: () => new ToolDisabledError(),
-  policy_denied: () => new PolicyDeniedError(),
-};
+export const BRIDGEABLE_NOTICES: Partial<Record<VouchrErrorCode, () => Error>> = Object.assign(
+  Object.create(null) as Partial<Record<VouchrErrorCode, () => Error>>,
+  {
+    tool_disabled: () => new ToolDisabledError(),
+    policy_denied: () => new PolicyDeniedError(),
+  },
+);
+
+/**
+ * Every remaining code, and why it is NOT bridged. Exported so a test can assert the two sets
+ * partition VOUCHR_ERROR_CODES exactly (REV-2): adding a code to core then fails the suite until
+ * someone decides which side it belongs on, instead of silently not being bridged — which is the
+ * very silence this bridge exists to remove.
+ */
+export const DELIBERATELY_UNBRIDGED: readonly VouchrErrorCode[] = Object.freeze([
+  // Consent-shaped: handled earlier in recoverBrokerDenial with a real decision surface.
+  'consent_required', 'not_connected', 'session_approval_required', 'approval_required',
+  // Operator configuration, not something the asking human can act on.
+  'egress_blocked', 'response_blocked', 'invalid_reference', 'invalid_scopes',
+  'resolver_configuration_error', 'resolver_failed', 'approval_path_too_large',
+  'resolver_unavailable',
+  // Transient/infrastructural: the host's safeText path already reports these.
+  'token_endpoint_failed', 'upstream_timeout', 'overloaded', 'rate_limited',
+  'internal_error', 'interaction_state_changed',
+  // Identity/assertion problems on the broker door: the worker's, not the human's, to fix.
+  'source_mismatch',
+  // Host-authored copy; Vouchr has no fixed sentence to show.
+  'user_facing',
+] as VouchrErrorCode[]);
 
 // Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
 // caller nor any forgeable Slack field can choose a newer provisioning issuance. Normal direct
@@ -2171,25 +2196,46 @@ export class ConnectContext {
     if (code) {
       const notice = BRIDGEABLE_NOTICES[code];
       if (notice) {
-        await this.postDenialNotice(safeUserMessage(notice()));
-        return { status: 'notified', provider: providerId, code };
+        const delivery = await this.postPrivateNotice(safeUserMessage(notice()));
+        // Never claim a delivery that did not happen — the same rule the rest of this file applies
+        // to prompts, and the whole point of this PR. `no-channel` (nothing was posted) and
+        // `platform-rejected` (Slack proved it was refused) fall through to `not_bridgeable`, so the
+        // host's existing safeText path still tells the user something. `ambiguous`/`rate-limited`
+        // may well have landed; reporting them as failure would produce a duplicate notice.
+        if (delivery !== 'no-channel' && delivery !== 'platform-rejected') {
+          return { status: 'notified', provider: providerId, code };
+        }
       }
     }
 
     return { status: 'not_bridgeable' };
   }
 
-  /** Private, ephemeral delivery for a relayed denial that carries no button: the user needs to know
-   *  an admin has to act, and that nothing was sent on their behalf. Best-effort — a Slack hiccup
-   *  must not turn an already-correct denial into an unrelated thrown error on the recovery path. */
-  private async postDenialNotice(text: string): Promise<void> {
+  /**
+   * Send one private, ephemeral, text-only notice to the acting user and REPORT what happened.
+   *
+   * The single place that owns channel presence, thread placement, and delivery classification for
+   * a buttonless notice (STR-3) — `recoverBrokerDenial` and `directChannelConfiguration` both use
+   * it, and previously disagreed about all three. It never throws: each caller decides what a
+   * failure means, which is the only difference between them.
+   *
+   * `platform-rejected` is the one outcome that PROVES the user did not see it (channel_not_found,
+   * bot removed). `ambiguous` and `rate-limited` may still have landed, so they are reported as
+   * such rather than as failure — the same fail-safe reading the approval prompts use.
+   */
+  private async postPrivateNotice(text: string): Promise<'delivered' | 'no-channel' | SlackPromptDeliveryFailure> {
     const channel = this.channel;
-    if (!channel) return; // nothing to post into (a relayed call outside any conversation)
+    if (!channel) return 'no-channel'; // a relayed call outside any conversation
+    // Thread placement matches every other private surface in this file: a question asked in a
+    // thread is answered in that thread, not in the channel view where the user is not looking.
+    const threadArg = this.thread ? { thread_ts: this.thread } : {};
     try {
-      await this.promptClient().chat.postEphemeral({ channel, user: this.identity.userId, text });
-    } catch {
-      // Swallowed deliberately: the denial stands and is already audited. Surfacing a delivery
-      // failure would replace "an admin must enable this" with an unrelated error.
+      await this.promptClient().chat.postEphemeral({
+        channel, user: this.identity.userId, ...threadArg, text,
+      });
+      return 'delivered';
+    } catch (deliveryError) {
+      return classifySlackPromptDeliveryFailure(deliveryError);
     }
   }
 
@@ -2263,10 +2309,11 @@ export class ConnectContext {
           ? `No shared ${p} credential is configured in this channel. A channel admin may already have been notified; ask one directly if setup is still blocked.`
           : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr connect-shared ${p}\` here.`;
     }
-    try {
-      await client.chat.postEphemeral({ channel, user: this.identity.userId, text });
-    } catch (deliveryError) {
-      throw slackPromptDeliveryRecovery(classifySlackPromptDeliveryFailure(deliveryError), 'configuration');
+    const delivery = await this.postPrivateNotice(text);
+    // Same sender, different contract: this path is a configuration DIRECTION the caller must know
+    // failed, so a non-delivery still throws exactly as before.
+    if (delivery !== 'delivered') {
+      throw slackPromptDeliveryRecovery(delivery === 'no-channel' ? 'ambiguous' : delivery, 'configuration');
     }
   }
 

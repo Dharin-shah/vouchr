@@ -16,10 +16,13 @@ All notable changes to this project are documented here. This project adheres to
   shows for the same typed error, and return the new `{ status: 'notified', provider, code }`.
 
   The copy is derived locally from the typed code: a relayed `message` is never echoed into Slack, so
-  a confused or compromised data plane cannot choose what the user reads. Delivery is best-effort —
-  a Slack hiccup cannot turn an already-correct denial into an unrelated error. Egress/response
-  blocks, resolver and token-endpoint failures, and rate limiting remain `not_bridgeable`: they are
-  operator-configuration or transient problems, not something the asking human can act on.
+  a confused or compromised data plane cannot choose what the user reads. `notified` is returned only
+  when the notice plausibly landed — a platform rejection (channel removed, bot evicted) proves the
+  user did not see it, so it falls through to `not_bridgeable` and the host's existing safe-text path
+  still says something. Egress/response blocks, resolver and token-endpoint failures, and rate
+  limiting also remain `not_bridgeable`: operator-configuration or transient problems, not something
+  the asking human can act on. `BRIDGEABLE_NOTICES` and `DELIBERATELY_UNBRIDGED` are exported and a
+  test asserts they partition every `VouchrErrorCode`, so a new code cannot be silently unbridged.
 
 ### Security
 

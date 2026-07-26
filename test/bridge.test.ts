@@ -26,10 +26,12 @@ import {
   ConnectContext,
   ConsentRequiredError,
   createVouchr,
+  BRIDGEABLE_NOTICES,
+  DELIBERATELY_UNBRIDGED,
   type BrokerDenialRecovery,
 } from '../src/adapters/bolt';
 import { ToolDisabledError } from '../src/core/authz';
-import { safeUserMessage } from '../src/core/errors';
+import { mapSafeError, safeUserMessage, VOUCHR_ERROR_CODES, type VouchrErrorCode } from '../src/core/errors';
 import {
   APPROVAL_APPROVE_ACTION,
   APPROVE_SESSION_ACTION,
@@ -333,11 +335,68 @@ test('bridge: a relayed denial message is NEVER echoed into Slack (SEC-1/SEC-3)'
   assert.equal(h.ephemerals[0].text, safeUserMessage(new ToolDisabledError()), 'copy is derived locally');
 });
 
-test('bridge: a failed notice delivery does not convert a correct denial into an error', async (t) => {
-  // The denial already stands and is audited. A Slack hiccup must not surface as an unrelated throw.
-  const h = await harness(t, { postEphemeral: () => { throw new Error('slack exploded'); } });
+test('bridge: a PROVEN non-delivery is never reported as notified', async (t) => {
+  // The regression this whole PR exists to remove, in its own failure path: a platform rejection
+  // (channel_not_found, bot removed from the channel) proves the user did NOT see the notice. If the
+  // bridge still returned `notified`, the host would stop the turn believing they were told, and the
+  // user would see nothing at all. Falling through to `not_bridgeable` runs the host's safeText path.
+  const rejected = Object.assign(new Error('channel_not_found'), { code: SlackErrorCode.PlatformError });
+  const h = await harness(t, { postEphemeral: () => { throw rejected; } });
+  const r = await (await h.context()).recoverBrokerDenial('gh', { code: 'tool_disabled' });
+  assert.deepEqual(r, { status: 'not_bridgeable' } satisfies BrokerDenialRecovery);
+});
+
+test('bridge: an AMBIGUOUS delivery failure still counts as notified (no duplicate notice)', async (t) => {
+  // An HTTP/transport error does not prove the post was refused — it may well have landed. Treating
+  // it as failure would make the host post a second copy of the same sentence. Fail safe, like the
+  // approval prompts do.
+  const h = await harness(t, { postEphemeral: () => { throw new Error('socket hang up'); } });
   const r = await (await h.context()).recoverBrokerDenial('gh', { code: 'tool_disabled' });
   assert.deepEqual(r, { status: 'notified', provider: 'gh', code: 'tool_disabled' } satisfies BrokerDenialRecovery);
+});
+
+test('bridge: with no channel to post into, nothing is claimed', async (t) => {
+  const h = await harness(t);
+  const ctx = await h.context({ channel: null });
+  const r = await ctx.recoverBrokerDenial('gh', { code: 'tool_disabled' });
+  assert.deepEqual(r, { status: 'not_bridgeable' } satisfies BrokerDenialRecovery);
+  assert.equal(h.ephemerals.length, 0, 'nothing was posted, so nothing may be claimed');
+});
+
+test('bridge: the notice lands in the thread the user asked in', async (t) => {
+  const h = await harness(t);
+  const ctx = await h.context({ thread: 'TH1' });
+  await ctx.recoverBrokerDenial('gh', { code: 'tool_disabled' });
+  assert.equal(h.ephemerals.length, 1);
+  assert.equal(h.ephemerals[0].thread_ts, 'TH1', 'a threaded question gets a threaded answer');
+});
+
+test('bridge: every VouchrErrorCode is explicitly bridged or explicitly not (REV-2)', () => {
+  // core/errors.ts already knows which denials need a human (recovery: contact_admin). This bridge
+  // restates a subset by hand, so without this test a NEW contact_admin code would silently not be
+  // bridged — the same silence this bridge removes, with nothing failing. The two sets must
+  // partition VOUCHR_ERROR_CODES exactly, which forces a decision when a code is added.
+  const bridged = Object.keys(BRIDGEABLE_NOTICES) as VouchrErrorCode[];
+  const covered = new Set<string>([...bridged, ...DELIBERATELY_UNBRIDGED]);
+  assert.deepEqual(
+    VOUCHR_ERROR_CODES.filter((c) => !covered.has(c)), [],
+    'a code is neither bridged nor listed as deliberately unbridged — decide which it is',
+  );
+  assert.deepEqual(
+    [...covered].filter((c) => !(VOUCHR_ERROR_CODES as readonly string[]).includes(c)), [],
+    'a listed code no longer exists in VOUCHR_ERROR_CODES',
+  );
+  assert.deepEqual(
+    bridged.filter((c) => (DELIBERATELY_UNBRIDGED as readonly string[]).includes(c)), [],
+    'a code cannot be both bridged and deliberately unbridged',
+  );
+  // Every bridged code must be one core itself classifies as needing a human.
+  for (const code of bridged) {
+    assert.equal(
+      mapSafeError(BRIDGEABLE_NOTICES[code]!()).recovery, 'contact_admin',
+      `${code} is bridged but core does not classify it as contact_admin`,
+    );
+  }
 });
 
 test('deny-by-default: a real Slack DM is ungoverned — a provider works there without a channel enable (#1)', async (t) => {
