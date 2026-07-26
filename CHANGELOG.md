@@ -7,6 +7,26 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Security
 
+- **`handle.fetch` no longer forwards unrecognized caller `fetch` options, which could redirect the
+  injected credential off the egress allowlist.** The outbound request was built as
+  `{ ...init, method, headers, redirect, signal }`, so every unknown key the caller supplied reached
+  `fetch` — including undici's `dispatcher`, which replaces the transport outright. The egress gates
+  validate the URL; a dispatcher decides where the socket actually connects. A request whose URL
+  passed all eight gates could therefore deliver the credential to an arbitrary origin. Reproduced:
+  the bearer arrived at a non-allowlisted `127.0.0.1` listener with every gate green.
+
+  Reachable wherever a host forwards model-influenced fetch options into `handle.fetch` (the generic
+  HTTP-tool shape); not reachable through the broker, which builds its init from parsed fields.
+  The outbound init is now built from an allowlist — `method`, `headers`, `body` from the caller,
+  with `redirect`, `signal` and the transport owned by Vouchr. Regression:
+  `test/egress-init-passthrough.test.ts`, which fails against the old spread.
+
+  **Behaviour change:** a per-request `dispatcher` (or `cache`/`credentials`/`mode`/`referrer`) is
+  now ignored instead of honoured. A deployment-wide egress proxy belongs in construction config,
+  where it is operator-controlled; Vouchr does not expose that option yet.
+
+### Security
+
 - **`ConnectionHandle` / `ConnectContext` no longer serialize their dependencies.** TypeScript's
   `private` is erased at compile time, so every dependency was an own **enumerable** property at
   runtime: `JSON.stringify(handle)`, `{...handle}`, `Object.entries`, `console.log`, and any

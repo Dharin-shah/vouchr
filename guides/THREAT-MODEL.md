@@ -315,13 +315,25 @@ oversight, and it is the difference most likely to surprise an operator who read
 
 ### Network redirect / egress bypass
 
-An attacker manipulates the request URL or DNS to send the bearer somewhere
-unintended.
+An attacker manipulates the request URL, the DNS, **or the transport** to send the bearer
+somewhere unintended.
 
 - **Mitigated before secret access.** Egress allowlist (`provider.egressAllow`) + HTTPS
   enforcement + `redirect: 'manual'` (`injector.ts`). Optional path/method/validator
   controls are checked in the same pre-secret block. URLs with embedded userinfo are
   refused before vault access.
+- **The transport is Vouchr's, not the caller's.** Gating the URL is not sufficient by itself:
+  `fetch` options can override where the socket actually connects — undici honours `dispatcher` —
+  so a request whose URL passes every gate could still be delivered elsewhere. The outbound request
+  is therefore built from an ALLOWLIST of caller fields (`method`, `headers`, `body`), with
+  `redirect`, `signal` and the transport owned by Vouchr; `dispatcher` and every other unrecognized
+  option are dropped rather than forwarded (`outboundInit` in `injector.ts`). This matters wherever
+  a host forwards model-influenced fetch options into `handle.fetch` — the generic-HTTP-tool shape.
+  Regression: `test/egress-init-passthrough.test.ts`.
+- **Consequence for operators:** a deployment-wide egress proxy cannot be supplied per request. It
+  belongs in construction config, where it is operator-controlled rather than caller-controlled.
+  Vouchr does not expose that option yet; passing `dispatcher` to `handle.fetch` is now ignored
+  rather than honoured.
 - **Not fully mitigated:** provider-side scope/action restriction. Even with path/method
   narrowing, Vouchr is not the provider's authorization engine; constrain the token's
   own scopes and permissions at the provider. DNS rebinding against an allowlisted host
