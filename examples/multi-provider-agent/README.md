@@ -51,8 +51,16 @@ regardless of what it declares, and the write is refused before the credential i
 
 ## Setup
 
-Start from the [QUICKSTART](../../QUICKSTART.md) Slack app. Then configure **at least one** provider —
-the agent registers whichever ones it finds credentials for:
+Start from the [QUICKSTART](../../QUICKSTART.md) Slack app.
+
+**One extra bot scope.** This example reads the thread it was mentioned in
+(`conversations.replies`), which `examples/slack-manifest.yml` does not grant — add
+`channels:history` (and `groups:history` for private channels) to the manifest's bot scopes and
+reinstall the app, or the first mention fails with `missing_scope`. It's deliberately not in the
+shared manifest: reading channel history is a broad grant, and only this example needs it.
+
+Then configure **at least one** provider — the agent registers whichever ones it finds credentials
+for:
 
 | Provider | Env | Enables |
 | --- | --- | --- |
