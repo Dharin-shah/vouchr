@@ -7,7 +7,7 @@ import {
   type Db,
 } from '../core/db';
 import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
-import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, type Provider } from '../core/providers';
+import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, readOnlyEgress, type Provider } from '../core/providers';
 import { CredentialLockdownError, Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
 import { Consent } from '../core/consent';
@@ -29,6 +29,7 @@ import {
 import { ConnectionHandle, NoConnectionError, approvalNeeded, type Resolvers, type EventSink, type VouchrEvent } from '../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../core/rateLimit';
 import { safeEmit } from '../core/safe-emit';
+import { defineHidden, hideInternals } from '../core/redact';
 import { ChannelConfig, channelIneligibleReason, isChannelMode, type ChannelInfo, type ChannelMode } from '../core/channelConfig';
 import {
   configureChannelCredential,
@@ -86,6 +87,7 @@ import {
   isVouchrErrorCode,
   safeUserMessage,
   type ConsentPromptState,
+  type VouchrErrorCode,
 } from '../core/errors';
 export {
   ConsentRequiredError,
@@ -672,6 +674,23 @@ export interface VouchrOptions {
    * provider)` finishes a prompted consent programmatically. Default false: zero behavior change.
    */
   dryRun?: boolean;
+  /**
+   * Allow non-GET/HEAD provider requests through `handle.fetch()`. Default **true**, which is this
+   * path's long-standing behaviour: acting as the asking user — opening the PR, filing the ticket —
+   * is the point of the Bolt surface, and `provider.approval` is how a sensitive write is gated.
+   *
+   * Set it to **false** to force every provider read-only: each one's methods are INTERSECTED with
+   * GET/HEAD, so even a provider that declares writes of its own — `databricks()` declares
+   * `['GET','POST']` — loses them, and a prompt-injected `handle.fetch(url, { method: 'DELETE' })`
+   * is refused before the credential is read. Recommended for read-only agents.
+   *
+   * NOTE the asymmetry with `createBroker`, which defaults writes OFF: the broker serves remote
+   * workers over HTTP and rejects non-GET/HEAD at the route before identity or vault access, whereas
+   * this path runs the host's own in-process handler. The same prompt injection therefore reaches
+   * further here than through the broker unless you set this false or declare `egressMethods` on the
+   * provider. See guides/THREAT-MODEL.md, "Write blast radius differs by transport".
+   */
+  allowWrites?: boolean;
 }
 
 /**
@@ -735,6 +754,9 @@ export interface ConnectContextDeps {
   /** #116 dry-run: threaded to every ConnectionHandle so the final outbound call is stubbed (see
    *  VouchrOptions.dryRun). Default false: unchanged behavior. */
   dryRun?: boolean;
+  /** Permit non-GET/HEAD provider requests (see VouchrOptions.allowWrites). Default TRUE: this
+   *  path's existing behaviour. False pins providers that declare no egressMethods to GET/HEAD. */
+  allowWrites?: boolean;
   /** Transport options for bounded prompt/DM clients (see VouchrOptions.slackClientOptions). */
   slackClientOptions?: WebClientOptions;
 }
@@ -788,7 +810,48 @@ export type BrokerDenialRecovery =
   | { status: 'approval_prompted'; provider: string; approver: 'self' | 'admin' }
   | { status: 'configuration_required'; provider: string }
   | { status: 'stale'; provider: string }
+  /** A denial with no button: the user was told privately that a human must act. */
+  | { status: 'notified'; provider: string; code: VouchrErrorCode }
   | { status: 'not_bridgeable' };
+
+/**
+ * Relayed denial codes that carry user-actionable copy but no decision surface. Mapping to the TYPED
+ * error (rather than reusing the relayed message) means the hybrid path and the Bolt path render the
+ * identical sentence from `mapSafeError`, and no broker-supplied text is ever echoed into Slack.
+ *
+ * Deliberately excluded: egress/response blocks and resolver/token failures (operator configuration,
+ * not something the asking human can act on) and rate limiting (already surfaced by the Bolt path's
+ * own ephemeral, and its retry hint would have to come from the wire).
+ */
+export const BRIDGEABLE_NOTICES: Partial<Record<VouchrErrorCode, () => Error>> = Object.assign(
+  Object.create(null) as Partial<Record<VouchrErrorCode, () => Error>>,
+  {
+    tool_disabled: () => new ToolDisabledError(),
+    policy_denied: () => new PolicyDeniedError(),
+  },
+);
+
+/**
+ * Every remaining code, and why it is NOT bridged. Exported so a test can assert the two sets
+ * partition VOUCHR_ERROR_CODES exactly (REV-2): adding a code to core then fails the suite until
+ * someone decides which side it belongs on, instead of silently not being bridged — which is the
+ * very silence this bridge exists to remove.
+ */
+export const DELIBERATELY_UNBRIDGED: readonly VouchrErrorCode[] = Object.freeze([
+  // Consent-shaped: handled earlier in recoverBrokerDenial with a real decision surface.
+  'consent_required', 'not_connected', 'session_approval_required', 'approval_required',
+  // Operator configuration, not something the asking human can act on.
+  'egress_blocked', 'response_blocked', 'invalid_reference', 'invalid_scopes',
+  'resolver_configuration_error', 'resolver_failed', 'approval_path_too_large',
+  'resolver_unavailable',
+  // Transient/infrastructural: the host's safeText path already reports these.
+  'token_endpoint_failed', 'upstream_timeout', 'overloaded', 'rate_limited',
+  'internal_error', 'interaction_state_changed',
+  // Identity/assertion problems on the broker door: the worker's, not the human's, to fix.
+  'source_mismatch',
+  // Host-authored copy; Vouchr has no fixed sentence to show.
+  'user_facing',
+] as VouchrErrorCode[]);
 
 // Bolt owns the trusted event-receipt instant. Keep the override module-private so neither a
 // caller nor any forgeable Slack field can choose a newer provisioning issuance. Normal direct
@@ -797,6 +860,12 @@ const INTERNAL_PROVISIONING_RECEIVED_AT = Symbol('vouchr.provisioning-received-a
 const INTERNAL_CHANNEL_PROVISIONING_ISSUANCE = Symbol('vouchr.channel-provisioning-issuance');
 const INTERNAL_GOVERNANCE_CHANNEL_RESOLVER = Symbol('vouchr.governance-channel-resolver');
 type InternalConnectContextDeps = ConnectContextDeps & {
+  /** REQUIRED here, though optional on the public `ConnectContextDeps`. `allowWrites` is a security
+   *  gate whose default is permissive, so a construction site that omits it fails OPEN silently —
+   *  which is exactly what happened once: it was wired into `contextFor()` but not into the
+   *  middleware's `contextDeps`, making `createVouchr({ allowWrites: false })` a no-op on the only
+   *  path that calls `handle.fetch`. Requiring it here makes a missed site a compile error (REV-2). */
+  allowWrites: boolean;
   [INTERNAL_PROVISIONING_RECEIVED_AT]?: bigint;
   [INTERNAL_CHANNEL_PROVISIONING_ISSUANCE]?: ChannelProvisioningIssuance;
   [INTERNAL_GOVERNANCE_CHANNEL_RESOLVER]?: () => Promise<string | null>;
@@ -855,6 +924,7 @@ export class ConnectContext {
   private health: CredentialHealthHook;
   private notifications: NotificationState | null;
   private dryRun: boolean;
+  private allowWrites: boolean;
   private slackClientOptions?: WebClientOptions;
   private provisioningReceivedAt: bigint;
   private channelProvisioningIssuance?: ChannelProvisioningIssuance;
@@ -900,6 +970,7 @@ export class ConnectContext {
     this.health = deps.health ?? (() => {});
     this.notifications = deps.notifications ?? null;
     this.dryRun = deps.dryRun ?? false;
+    this.allowWrites = deps.allowWrites ?? true;
     this.slackClientOptions = deps.slackClientOptions;
     this.provisioningReceivedAt =
       (deps as InternalConnectContextDeps)[INTERNAL_PROVISIONING_RECEIVED_AT]
@@ -908,6 +979,14 @@ export class ConnectContext {
       (deps as InternalConnectContextDeps)[INTERNAL_CHANNEL_PROVISIONING_ISSUANCE];
     this.governanceChannelResolver =
       (deps as InternalConnectContextDeps)[INTERNAL_GOVERNANCE_CHANNEL_RESOLVER];
+    // Declared-but-unassigned would be created enumerable on first write, escaping hideInternals.
+    this.governanceChannelResolution = undefined;
+    // SEC-1: this object is attached to Bolt's per-request `context.vouchr` — the thing a handler
+    // is most likely to dump on error. The `private` modifiers above are erased at runtime; without
+    // this, JSON.stringify/spread/a structured logger walks client → Slack bot token, vault →
+    // master key, registry → OAuth client secrets, and db → connection password.
+    // Regression: test/no-secret-serialization.test.ts.
+    hideInternals(this);
   }
 
   /** Resolve Slack's ambiguous G… id class once. A transport/API failure retains the initial
@@ -957,7 +1036,9 @@ export class ConnectContext {
    */
   private notifyRateLimited(handle: ConnectionHandle): ConnectionHandle {
     const fetch = handle.fetch.bind(handle);
-    handle.fetch = async (input: string, init: RequestInit = {}) => {
+    // defineHidden, not assignment: a plain `handle.fetch = …` shadows the prototype method with an
+    // own ENUMERABLE property, undoing hideInternals for this key (SEC-1).
+    defineHidden(handle, 'fetch', async (input: string, init: RequestInit = {}) => {
       try {
         return await fetch(input, init);
       } catch (e) {
@@ -970,7 +1051,7 @@ export class ConnectContext {
         }
         throw e;
       }
-    };
+    });
     return handle;
   }
 
@@ -986,7 +1067,8 @@ export class ConnectContext {
    */
   private notifyApprovalRequired(handle: ConnectionHandle): ConnectionHandle {
     const fetch = handle.fetch.bind(handle);
-    handle.fetch = async (input: string, init: RequestInit = {}) => {
+    // See notifyRateLimited: assignment would re-expose this key to enumeration.
+    defineHidden(handle, 'fetch', async (input: string, init: RequestInit = {}) => {
       try {
         return await fetch(input, init);
       } catch (e) {
@@ -1005,7 +1087,7 @@ export class ConnectContext {
         }
         throw e;
       }
-    };
+    });
     return handle;
   }
 
@@ -1424,7 +1506,13 @@ export class ConnectContext {
         `"${providerId}" is a service-to-service tool; Vouchr does not broker it. Call it with your host's service auth.`,
       );
     }
-    return provider;
+    // Apply the write gate at the one chokepoint every Bolt credential entry point already routes
+    // through, so both ConnectionHandle construction sites inherit it and a future third cannot miss
+    // it. `allowWrites: false` must INTERSECT (readOnlyEgress), not merely default: a provider that
+    // declares its own methods — databricks() declares ['GET','POST'] — would otherwise keep POST on
+    // a deployment that explicitly asked to be read-only. The broker gets the same guarantee from its
+    // route-level 405, which runs before the provider is consulted.
+    return this.allowWrites ? provider : readOnlyEgress(provider);
   }
 
   /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own
@@ -2096,7 +2184,59 @@ export class ConnectContext {
       return { status: 'approval_prompted', provider: providerId, approver: approval.approver };
     }
 
+    // Denials that need a HUMAN, not a consent surface. On the Bolt path these already reach the
+    // user (connect() throws them and the host renders safeUserMessage); relayed from the broker
+    // they reached nobody — so a hybrid deployment's most common first-run failure, a channel that
+    // is deny-by-default with the provider never enabled, was silence. Same failure, same words,
+    // whichever transport produced it.
+    //
+    // SEC-3/SEC-1: the copy is derived LOCALLY from the typed code, never from the relayed payload.
+    // A broker response is transport input; its `message` is neither trusted nor echoed — exactly as
+    // the consent branches above rebuild their surfaces from verified state rather than sent text.
+    if (code) {
+      const notice = BRIDGEABLE_NOTICES[code];
+      if (notice) {
+        const delivery = await this.postPrivateNotice(safeUserMessage(notice()));
+        // Never claim a delivery that did not happen — the same rule the rest of this file applies
+        // to prompts, and the whole point of this PR. `no-channel` (nothing was posted) and
+        // `platform-rejected` (Slack proved it was refused) fall through to `not_bridgeable`, so the
+        // host's existing safeText path still tells the user something. `ambiguous`/`rate-limited`
+        // may well have landed; reporting them as failure would produce a duplicate notice.
+        if (delivery !== 'no-channel' && delivery !== 'platform-rejected') {
+          return { status: 'notified', provider: providerId, code };
+        }
+      }
+    }
+
     return { status: 'not_bridgeable' };
+  }
+
+  /**
+   * Send one private, ephemeral, text-only notice to the acting user and REPORT what happened.
+   *
+   * The single place that owns channel presence, thread placement, and delivery classification for
+   * a buttonless notice (STR-3) — `recoverBrokerDenial` and `directChannelConfiguration` both use
+   * it, and previously disagreed about all three. It never throws: each caller decides what a
+   * failure means, which is the only difference between them.
+   *
+   * `platform-rejected` is the one outcome that PROVES the user did not see it (channel_not_found,
+   * bot removed). `ambiguous` and `rate-limited` may still have landed, so they are reported as
+   * such rather than as failure — the same fail-safe reading the approval prompts use.
+   */
+  private async postPrivateNotice(text: string): Promise<'delivered' | 'no-channel' | SlackPromptDeliveryFailure> {
+    const channel = this.channel;
+    if (!channel) return 'no-channel'; // a relayed call outside any conversation
+    // Thread placement matches every other private surface in this file: a question asked in a
+    // thread is answered in that thread, not in the channel view where the user is not looking.
+    const threadArg = this.thread ? { thread_ts: this.thread } : {};
+    try {
+      await this.promptClient().chat.postEphemeral({
+        channel, user: this.identity.userId, ...threadArg, text,
+      });
+      return 'delivered';
+    } catch (deliveryError) {
+      return classifySlackPromptDeliveryFailure(deliveryError);
+    }
   }
 
   /** Shared-owner recovery for a missing channel credential: direct an eligible admin to channel
@@ -2169,10 +2309,11 @@ export class ConnectContext {
           ? `No shared ${p} credential is configured in this channel. A channel admin may already have been notified; ask one directly if setup is still blocked.`
           : `No shared ${p} credential is configured in this channel. Ask a channel admin to run \`/vouchr connect-shared ${p}\` here.`;
     }
-    try {
-      await client.chat.postEphemeral({ channel, user: this.identity.userId, text });
-    } catch (deliveryError) {
-      throw slackPromptDeliveryRecovery(classifySlackPromptDeliveryFailure(deliveryError), 'configuration');
+    const delivery = await this.postPrivateNotice(text);
+    // Same sender, different contract: this path is a configuration DIRECTION the caller must know
+    // failed, so a non-delivery still throws exactly as before.
+    if (delivery !== 'delivered') {
+      throw slackPromptDeliveryRecovery(delivery === 'no-channel' ? 'ambiguous' : delivery, 'configuration');
     }
   }
 
@@ -2893,6 +3034,7 @@ export async function createVouchr(opts: VouchrOptions) {
         health,
         notifications: notifyState,
         dryRun,
+        allowWrites: opts.allowWrites ?? true,
         slackClientOptions: opts.slackClientOptions,
       };
       // Slash commands and block actions have no event.channel_type. A G… id can mean either a
@@ -3013,6 +3155,7 @@ export async function createVouchr(opts: VouchrOptions) {
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
       thread: null, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
+      allowWrites: opts.allowWrites ?? true,
       slackClientOptions: opts.slackClientOptions,
     };
     if (governableChannel !== undefined) deps.governableChannel = governableChannel;

@@ -392,6 +392,27 @@ async function commandHarness(t: TestContext, opts: {
 // Flag on: channel creator can enable/disable tools and open the configure modal.
 test('flag on: channel creator can run enable/disable and pass the configure gate', async (t) => {
   const h = await commandHarness(t, { creator: ID.userId, allowCreator: true });
+
+  // The configure gate is asserted FIRST, on purpose. `enable`/`disable` write a channel-interaction
+  // tombstone (core/tools.ts → purgeChannelInteractionState), and the provisioning fence
+  // (bolt.ts → provisioningIssuedAtFromReceipt) deliberately backdates its receipt by up to 1ms so
+  // that it fails closed. `tombstoneBlocks` counts a tie as blocked, so a connect-shared issued in
+  // the SAME millisecond as a preceding config mutation is correctly refused: the loading modal is
+  // replaced by "Review current status" instead of the configure modal, and h.hydrated() is
+  // null. The refusal itself is right — the fence backdates by >=1ms so that it fails closed — but a
+  // test can fire three slash commands sub-millisecond apart, which two separately signed HTTPS POSTs
+  // never do. Asserting the independent gates in this order leaves the fence nothing to tie against.
+  // Do NOT paper over it with a sleep; if the post-disable ordering is ever wanted deliberately, use
+  // a second commandHarness — each gets a fresh schema and no tombstone.
+  //
+  // This is NOT unique to this test: the same millisecond-tie family also flakes
+  // test/dry-run.test.ts's "P1-B ... atomic" and the late shared-handle validation case. The
+  // systemic fix (microsecond fence resolution) is issue #290; this reorder is the local one.
+  await h.run('connect-shared mcp');
+  assert.equal(h.opened()?.trigger_id, 'trig'); // loading modal consumed the trigger immediately
+  assert.equal(h.hydrated()?.callback_id, CONFIGURE_CALLBACK);
+
+  // connect-shared's success path returns without respond()ing, so h.out still starts at index 0.
   await h.run('enable mcp');
   assert.match(h.out[0], /Enabled/);
   const row = await h.lan.db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
@@ -399,10 +420,6 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
 
   await h.run('disable mcp');
   assert.match(h.out[1], /Disabled/);
-
-  await h.run('connect-shared mcp');
-  assert.equal(h.opened()?.trigger_id, 'trig'); // loading modal consumed the trigger immediately
-  assert.equal(h.hydrated()?.callback_id, CONFIGURE_CALLBACK);
 });
 
 // Flag off (default): the creator is denied on the same command paths — workspace-admin-only.

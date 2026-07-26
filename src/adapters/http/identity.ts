@@ -428,9 +428,13 @@ export type MintIdentityInput = Pick<
  *   - a fresh random `jti` (reuse it and the broker rejects the second call as a replay), and
  *   - `exp = now + ttlMs`, clamped to the 5-minute ceiling the broker enforces.
  *
- * Call it on the CALLER side — the agent/runtime that already authenticated the acting human — then
- * send the returned string as `identityToken` in the /v1/fetch body. The signing secret is the
- * broker's trust root: keep it only in the minter and the broker, never in the model or the agent's
+ * Call it in the TRUSTED MINTER — the Slack-facing service that verified the Slack event signature
+ * and holds the signing key — NOT in the agent worker that makes the broker call. Send the returned
+ * string to the worker, which puts it in the /v1/fetch body as `identityToken`. The signing secret
+ * is the broker's trust root and its ONLY source of identity, `isAdmin`, and channel eligibility:
+ * any process that can sign can assert any user, including `isAdmin: true`, and can therefore USE
+ * every credential the deployment serves (no route returns token bytes, but the provider's response
+ * does come back). Keep it in the minter and the broker only — never in a worker, a model, or a
  * tool surface. Mint per request; do not cache or reuse a token across calls.
  */
 export function mintIdentity(input: MintIdentityInput, key: string | IdentityConfig, ttlMs = 60_000, now = Date.now()): string {

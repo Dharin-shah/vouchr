@@ -3,6 +3,7 @@ import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
+import { hideInternals } from './redact';
 import { purgeSessionsForOwner } from './session';
 import {
   InteractionStateChangedError,
@@ -171,6 +172,11 @@ export class Vault {
     // deployment's one EnvelopeProvider. Direct seal/open helpers intentionally remain unwrapped for
     // low-level crypto use and focused format tests.
     this.envelope = envelope === undefined ? undefined : boundedEnvelopeProvider(envelope);
+    // SEC-1 defence in depth: `Vault` is a public export and `private key: MasterKeys` above is
+    // erased at runtime, so JSON.stringify(vault) emits the raw AES-256 master key bytes and the
+    // database connection password. Nothing reads these fields by enumeration — the transaction
+    // facade in withCredentialLocks reads `this.key` directly — so hiding them is behaviour-neutral.
+    hideInternals(this);
   }
 
   /** #239: fail closed on any credential serve/mint/refresh while the deployment is locked down.

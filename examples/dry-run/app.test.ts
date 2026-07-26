@@ -12,13 +12,18 @@
 import { test } from 'node:test';
 // Repo-internal helper (not shipped in the npm package): in YOUR repo, replace this with a
 // database URL pointing at a fresh, dedicated PostgreSQL schema for the dry run.
-import { testDbUrl } from '../../test/support/pg';
+import { pgReachable, testDbUrl } from '../../test/support/pg';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { createVouchr, github, ConsentRequiredError } from '../../src';
 
 // Vouchr's at-rest encryption key — any random 32 bytes will do in a test.
 process.env.VOUCHR_MASTER_KEY ??= randomBytes(32).toString('base64');
+
+// This example is a first-run sanity check, so an absent database must SAY what to run. Opting into
+// the suite's require-Postgres mode makes pgReachable() below throw its actionable "run npm run
+// pg:up" message instead of letting freshSchema() surface a raw driver auth/connect error.
+process.env.VOUCHR_REQUIRE_POSTGRES ??= '1';
 
 // ── The handler under test: the same shape as examples/bolt-github/app.ts ──────────────────────
 async function handleMention({ context, event, client }: any): Promise<void> {
@@ -34,6 +39,7 @@ async function handleMention({ context, event, client }: any): Promise<void> {
 }
 
 test('dry-run example: consent prompt, programmatic connect, real egress gates, echo response', async (t) => {
+  await pgReachable(); // fail closed here, with the fix in the message, before any schema work
   const vouchr = await createVouchr({
     dryRun: true, // ← the only change vs production wiring
     providers: [github({ clientId: 'dry-run', clientSecret: 'dry-run' })], // dummies — no OAuth app

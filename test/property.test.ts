@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ConnectionHandle } from '../src/core/injector';
+import { ConnectionHandle, pathAllowed } from '../src/core/injector';
 import { Policy, type PolicyRule } from '../src/core/policy';
 import { Consent, STATE_TTL_MS } from '../src/core/consent';
 import { defineProvider, github, google, gitlab, notion, type Provider } from '../src/core/providers';
@@ -66,11 +66,65 @@ const egProvider = defineProvider({
   clientSecret: 'sec',
 });
 
-function pathAllowed(pathname: string, allowed: string): boolean {
-  if (allowed === '/') return true;
-  if (allowed.endsWith('/')) return pathname.startsWith(allowed);
-  return pathname === allowed || pathname.startsWith(`${allowed}/`);
-}
+// Same provider WITHOUT a path lock: `egressPaths` unset means every path is in scope, which is how
+// GitLab-style ids (`group%2Fproject`) stay usable. Used to pin BOTH halves of the encoded-separator
+// rule below (refused under a path lock, allowed without one).
+const egOpenPathProvider = defineProvider({
+  id: 'eg-open',
+  authorizeUrl: 'https://acme.example/auth',
+  tokenUrl: 'https://acme.example/token',
+  scopesDefault: ['x'],
+  egressAllow: [EG_HOST],
+  egressMethods: ['GET', 'POST'],
+  refresh: 'none',
+  pkce: false,
+  clientId: 'id',
+  clientSecret: 'sec',
+});
+
+// Hand-written truth table for the path matcher, asserted against the REAL implementation
+// (`pathAllowed`, src/core/injector). A local re-implementation as the oracle can only ever prove
+// that two copies agree: a wrong shared-prefix rule (`/user` matching `/userish`) or a flipped
+// trailing-slash rule would pass both sides and stay green. These expectations are written out by
+// hand instead, so the matcher's semantics are pinned rather than mirrored.
+const PATH_ALLOW_CASES: [path: string, prefix: string, expected: boolean][] = [
+  // Bare prefix (no trailing slash): the exact path or a SUBPATH of it — never a longer word.
+  ['/user', '/user', true],
+  ['/user/', '/user', true],
+  ['/user/abc', '/user', true],
+  ['/userish', '/user', false],
+  ['/user-agent', '/user', false],
+  ['/users', '/user', false],
+  ['/User', '/user', false], // case-sensitive
+  ['/x/user', '/user', false], // must match from the start
+  ['', '/user', false],
+  // Trailing-slash prefix: pure startsWith, so the bare parent does NOT match.
+  ['/repos/x', '/repos/', true],
+  ['/repos/', '/repos/', true],
+  ['/repos', '/repos/', false],
+  ['/reposx', '/repos/', false],
+  ['/repos', '/repos', true],
+  ['/repos/x/y', '/repos', true],
+  // '/' is the "no path lock" spelling: everything matches.
+  ['/anything/at/all', '/', true],
+  ['/', '/', true],
+  // The databricks lock (egressPaths: ['/api/2.0/sql/statements']) — the whole point of that provider.
+  ['/api/2.0/sql/statements', '/api/2.0/sql/statements', true],
+  ['/api/2.0/sql/statements/', '/api/2.0/sql/statements', true],
+  ['/api/2.0/sql/statements/01ef', '/api/2.0/sql/statements', true],
+  ['/api/2.0/sql/statementsX', '/api/2.0/sql/statements', false],
+  ['/api/2.0/secrets/acls/list', '/api/2.0/sql/statements', false],
+];
+
+test('path-lock matcher matches the hand-written truth table', () => {
+  for (const [path, prefix, expected] of PATH_ALLOW_CASES) {
+    assert.equal(
+      pathAllowed(path, prefix),
+      expected,
+      `pathAllowed(${JSON.stringify(path)}, ${JSON.stringify(prefix)}) should be ${expected}`,
+    );
+  }
+});
 
 // One handle, reused across iterations; the resolver counter is reset per case. A referenced cred
 // means the ONLY way to read the secret is the resolver, and count 0 proves the secret was never read.
@@ -158,6 +212,49 @@ test('property: only matching path+method pass; mismatches denied with secret un
         );
         assert.equal(getCalls(), 0, `secret read for denied ${method} ${path}`);
       }
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test('encoded path separators are refused ONLY when a path lock is in force', async (t) => {
+  const realFetch = globalThis.fetch;
+  let requested: string | null = null;
+  globalThis.fetch = (async (input: string) => { requested = input; return new Response('{}', { status: 200 }); }) as any;
+  try {
+    // WITH egressPaths the path lock IS the boundary, so a path a later decode pass could re-route is
+    // denied before the vault is touched — even when its literal form matches the allowlist.
+    const locked = await makeEgressHandle(t, egProvider);
+    for (const path of [
+      '/user/a%2fb',
+      '/user/a%2Fb',
+      '/user/a%5cb',
+      '/user/a%5Cb',
+      '/repos/a%2fb',
+      '/user/..%252f..%252fsecrets', // double-encoded: one decode pass exposes %2f
+    ]) {
+      locked.reset();
+      requested = null;
+      await assert.rejects(
+        () => locked.handle.fetch(`https://${EG_HOST}${path}`, { method: 'GET' }),
+        /Egress blocked/,
+        `encoded separator must be denied under a path lock: ${path}`,
+      );
+      assert.equal(locked.getCalls(), 0, `secret read for denied ${path}`);
+      assert.equal(requested, null, `request went out for denied ${path}`);
+    }
+
+    // WITHOUT a path lock there is no boundary to smuggle past, and `group%2Fproject` is exactly how
+    // GitLab addresses a project — refusing it here would break a legitimate provider.
+    const open = await makeEgressHandle(t, egOpenPathProvider);
+    for (const path of ['/api/v4/projects/group%2Fproject', '/api/v4/projects/g%2Fs%2Fp/issues', '/a%5cb']) {
+      open.reset();
+      const url = `https://${EG_HOST}${path}`;
+      const res = await open.handle.fetch(url, { method: 'GET' });
+      assert.equal(res.status, 200, `encoded separator must pass without a path lock: ${path}`);
+      assert.equal(open.getCalls(), 1, `secret should be read once for ${path}`);
+      assert.equal(requested, url, 'the original (un-decoded) bytes go upstream');
     }
   } finally {
     globalThis.fetch = realFetch;

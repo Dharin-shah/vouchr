@@ -38,6 +38,10 @@ export type { TtlPolicy } from './core/vault';
 export { loadKeyring } from './core/crypto';
 export type { Keyring, MasterKeys, EnvelopeProvider } from './core/crypto';
 export { Audit } from './core/audit';
+// SEC-5 escaper for hosts that render their own Slack surfaces from a Bolt-free process. blocks.ts
+// is pure string→JSON, so this pulls no @slack/* into the headless module graph
+// (test/headless-boltfree.test.ts enforces that).
+export { escapeMrkdwn } from './adapters/blocks';
 export type { AuditSink, VouchrAuditEvent } from './core/audit';
 export { Consent } from './core/consent';
 export type { ConsentRequest } from './core/consent';

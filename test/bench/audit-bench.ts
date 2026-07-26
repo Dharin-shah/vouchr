@@ -13,7 +13,7 @@ import { Client } from 'pg';
 import { migrate, openDb } from '../../src/core/db';
 import { Audit, PRUNE_BATCH_SQL } from '../../src/core/audit';
 
-const BASE = process.env.VOUCHR_BENCH_PG_URL ?? process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5433/vouchr';
+const BASE = process.env.VOUCHR_BENCH_PG_URL ?? process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5432/vouchr';
 const ROWS = Number(process.env.BENCH_ROWS ?? 1_000_000);
 const SCHEMA = 'audit_bench';
 

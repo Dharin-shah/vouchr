@@ -8,8 +8,8 @@
 </div>
 
 > [!IMPORTANT]
-> **Beta.** `1.0.0-beta` is the current release (PostgreSQL-only, deny-by-default) and the recommended
-> build. Feedback and issues are very welcome.
+> **Beta.** `1.0.0-beta` is the current release (PostgreSQL-only, deny-by-default) and the
+> recommended build. Feedback and issues are very welcome.
 
 When a Slack agent needs to touch GitHub, Google, or Jira, teams pick between two bad options:
 one broad bot token (every action is "the bot", wielding everyone's power at once), or user
@@ -25,27 +25,27 @@ permissions, their consent.
 
 ## What you get
 
-- **The agent acts as real people.** Every request runs with the asking user's own account
-  and permissions — no shared god-token.
-- **Tokens never reach the model.** Not the prompt, not the transcript, not your logs.
-  Injection happens inside Vouchr, at the outbound HTTP request.
-- **Guardrails on every call.** Allowlisted hosts and paths, per-user rate limits, response
-  caps, and human Approve/Deny for sensitive writes.
-- **Governed in Slack, deny-by-default.** Every provider is off in a channel until an admin enables
-  it there; then they choose the model per channel — personal accounts, thread-scoped approvals, or
-  one shared team credential — via `/vouchr` or the App Home tab. (Direct messages are personal, not
-  governed, so they need no enable.)
-- **Accountable and revocable.** Every action is tied to the Slack identity that authorized
-  it; deactivating someone in Slack revokes their credentials. For a full compromise, one tested
-  break-glass — `vouchr revoke --all --confirm ALL-CREDENTIALS` plus `VOUCHR_LOCKDOWN` containment —
-  wipes every stored credential and denies all serving before secret access (see [SECURITY.md](./SECURITY.md)).
+- **The agent acts as real people.** Every request runs with the asking user's own account and
+  permissions — no shared god-token.
+- **Tokens never reach the model.** Not the prompt, not the transcript, not your logs. Injection
+  happens inside Vouchr, at the outbound HTTP request.
+- **Guardrails on every call.** Allowlisted hosts and paths, per-user rate limits, response caps,
+  and human Approve/Deny for sensitive writes.
+- **Governed in Slack, deny-by-default.** A provider is off in a channel until an admin enables it
+  there; then they pick the model per channel. Direct messages are personal, not governed.
+- **Accountable and revocable.** Every action ties to the Slack identity that authorized it, and
+  deactivating someone in Slack revokes their credentials. For a full compromise there is a tested
+  break-glass — see [SECURITY.md](./SECURITY.md).
 - **Self-hosted.** Your infrastructure, your PostgreSQL, your keys (or your KMS).
 
 ## Quickstart
 
-> In a hurry? **[QUICKSTART.md](./QUICKSTART.md)** is the full zero-to-running walkthrough — create a
-> Slack workspace + app, a GitHub OAuth app, and see the bot act as you in ~5 minutes (with a script
-> for recording a demo).
+**[QUICKSTART.md](./QUICKSTART.md)** is the full zero-to-running walkthrough: a Slack workspace and
+app, a GitHub OAuth app, and the bot acting as you in ~5 minutes.
+
+```bash
+npm install @vouchr/core   # `latest` currently resolves to 1.0.0-beta
+```
 
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
@@ -69,25 +69,13 @@ app.event('app_mention', async ({ context, say }) => {
 });
 ```
 
-Channels are **deny-by-default**: before the first use in a channel, an admin enables the provider
-there — `/vouchr enable github` (or the App Home toggle). In a direct message no enable is needed.
-Then on first use `connect()` privately prompts the user; one click and a browser OAuth later, the
-agent just works:
+Channels are **deny-by-default**: before first use in a channel an admin runs
+`/vouchr enable github` (or flips the App Home toggle). A direct message needs no enable. Then
+`connect()` privately prompts the user; one click and a browser OAuth later, the agent just works.
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
-`ConsentRequiredError` carries a `promptState`: `'posted'` means a fresh prompt was just
-posted; `'reused'` means a still-live prompt from a moment ago was reused rather than
-re-posted — and an in-channel prompt is an ephemeral, so it may no longer be visible.
-Branch on the class or `code`, never on message text (the `mapSafeError` copy differs by
-state). If your Bolt `App` uses a non-default Slack transport (a proxy, a custom
-`slackApiUrl`, or a TLS agent), pass the same options as `slackClientOptions` to
-`createVouchr` so Vouchr's prompt and DM posts use your transport too — Vouchr always
-layers a finite timeout, zero retries, rate-limit rejection, and lease-safe queue concurrency
-on top.
-
-Run the in-repo demo (Node ≥ 22 and PostgreSQL required; Slack app config starts from
-[`examples/slack-manifest.yml`](./examples/slack-manifest.yml)):
+Run the in-repo demo (Node ≥ 22 and PostgreSQL required):
 
 ```bash
 npm install && cp .env.example .env   # VOUCHR_MASTER_KEY, Slack secrets, provider OAuth creds
@@ -96,18 +84,9 @@ npm run cli -- migrate                # package consumers: npx vouchr migrate
 npm run example:github                # then @-mention the bot in a channel
 ```
 
-Full setup — Slack scopes, provider OAuth apps, migrations, KMS, Kubernetes:
-[deployment guide](./guides/DEPLOYMENT.md).
-
-For a multi-workspace Slack app, construct `DbInstallationStore(db, keyring, envelope)` and pass
-that same store to Bolt's OAuth receiver and `createVouchr`. The third argument is the same
-`EnvelopeProvider` used by `createVouchr`; production installation `bot_token`/`data` then receive
-the same per-secret KMS envelope as provider credentials.
-Envelope-enabled installation reads reject direct rows by default; the fourth-argument
-`{ allowDirectRowsDuringMigration: true }` option exists only for an explicit, temporary cutover.
-The built-in store automatically honors `VOUCHR_LOCKDOWN`; direct hosts may also pass
-`{ lockdown: true }`, and `false` never overrides the deployment flag. Custom installation stores
-must enforce the same external containment gate.
+Handling `ConsentRequiredError`, custom Slack transports, and wiring without `install()`:
+[architecture guide](./guides/ARCHITECTURE.md). Slack scopes, provider OAuth apps, migrations,
+multi-workspace installs, KMS, and Kubernetes: [deployment guide](./guides/DEPLOYMENT.md).
 
 ## Credential modes
 
@@ -122,59 +101,36 @@ Each channel chooses how a provider is authorized; your handler code never chang
 
 ## Providers
 
-Built-ins: `github()`, `google()`, `gitlab()`, `notion()`, `databricks()`. One connection
-covers a whole account — a single `google()` consent can span Calendar, Gmail, and more,
-scoped as narrowly as you choose. Any other OAuth2 API takes ~10 lines with
-`defineProvider`; API-key tools and secret-manager-backed credentials (AWS, GCP, Azure,
-Vault) work too — see [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
+Built-ins: `github()`, `google()`, `gitlab()`, `notion()`, `databricks()`. One connection covers a
+whole account — a single `google()` consent can span Calendar, Gmail, and more, scoped as narrowly
+as you choose. Any other OAuth2 API takes ~10 lines with `defineProvider`; API-key tools and
+secret-manager-backed credentials (AWS, GCP, Azure, Vault) work too.
 
-**Least privilege — request only the scopes you use.** Scopes come from the provider
-definition, so pass exactly what you need: `github({ scopes: ['read:user'] })` shows the
-user only "Read your profile", not the broad `repo` default. Need *different* scopes for the
-same provider in different channels? Scopes are per-provider, not per-channel (yet —
-[#272](https://github.com/Dharin-shah/vouchr/issues/272)), so define the provider twice under
-distinct ids and gate them with channel tools/policy — explicit and easy:
+Request only the scopes you use — `github({ scopes: ['read:user'] })` shows the user "Read your
+profile", not the broad `repo` default. See
+[provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative) for declarative
+providers, and the [provider model](./guides/ARCHITECTURE.md#different-scopes-in-different-channels)
+for running one provider at different scopes in different channels.
 
-```ts
-providers: [
-  github({ scopes: ['read:user'] }),                                       // id: 'github' — read-only
-  defineProvider({ ...github({ scopes: ['read:user', 'repo'] }), id: 'github-write' }),
-]
-// then: enable `github-write` only where writes are needed, `github` elsewhere.
-```
-
-Runnable examples: [Google user credentials](./examples/google-user) ·
-[internal API keys](./examples/internal-api-key) · [Databricks](./examples/databricks) ·
-[AWS Secrets Manager](./examples/aws-secrets-manager) ·
-[GCP Secret Manager](./examples/gcp-secret-manager) ·
-[Azure Key Vault](./examples/azure-key-vault) ·
-[HashiCorp Vault](./examples/hashicorp-vault) · [Postgres + KMS](./examples/postgres-kms) ·
-[headless broker client](./examples/broker-client) · [MCP gateway](./examples/mcp-gateway) ·
-[Prometheus metrics](./examples/prometheus) · [SCIM offboarding](./examples/scim)
+Runnable examples — Google, Databricks, internal API keys, every major secret manager, the headless
+broker client, MCP gateway, Prometheus, SCIM — live in [`examples/`](./examples), each with its own
+README.
 
 ## Test without any external service
 
-`dryRun: true` runs your real Vouchr wiring — consent, channel modes, policy, egress
-checks, audit — with zero outbound network calls and no Slack or provider OAuth apps.
-Channels are deny-by-default, so a test first enables the provider in the channel with
-`vouchr.dryRun.enableTool(admin, channel, providerId)` (the programmatic form of an admin's
-`/vouchr enable`), then drives consent and fetch.
-Validate your allowlists and consent handling in CI: [`examples/dry-run/`](./examples/dry-run).
+`dryRun: true` runs your real Vouchr wiring — consent, channel modes, policy, egress checks, audit —
+with zero outbound network calls and no Slack or provider OAuth apps. Channels are deny-by-default,
+so enable the provider first with `vouchr.dryRun.enableTool(admin, channel, providerId)`. Validate
+your allowlists and consent handling in CI: [`examples/dry-run/`](./examples/dry-run).
 
 ## Headless and hybrid
 
-Slack-facing service and agent workers in separate processes? A private HTTP broker
-performs credential use under the same rules — the token still never leaves Vouchr, in any
-language. When the broker denies (`not_connected`, `session_approval_required`,
-`approval_required`), the trusted Slack side relays the typed denial to
-`context.vouchr.recoverBrokerDenial(provider, denial)` and Vouchr posts the correct private
-recovery prompt from verified state. See the [hybrid architecture](./guides/HYBRID.md) and the
+Slack-facing service and agent workers in separate processes? A private HTTP broker performs
+credential use under the same rules — the token still never leaves Vouchr, in any language. When the
+broker denies, the trusted Slack side relays the typed denial to
+`context.vouchr.recoverBrokerDenial(provider, denial)` and Vouchr posts the correct private recovery
+prompt from verified state. See the [hybrid architecture](./guides/HYBRID.md) and the
 [headless guide](./guides/HEADLESS.md).
-
-Signed broker assertions carry Slack's canonical conversation type so a `G…` group DM is not
-mistaken for a governed private channel. Trusted minters should validate verified event/API values
-with the exported `isSlackConversationType` guard; never accept this authorization fact from the
-model or worker.
 
 ## Learn more
 
@@ -189,7 +145,7 @@ model or worker.
 
 ## Status
 
-Beta. Every push runs the full test suite against real PostgreSQL, plus CodeQL and
-dependency checks. Want to help? See [CONTRIBUTING.md](./CONTRIBUTING.md).
+Beta. Every push runs the full test suite against real PostgreSQL, plus CodeQL and dependency
+checks. Want to help? See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 License: [Apache-2.0](./LICENSE).

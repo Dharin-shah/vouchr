@@ -6,7 +6,9 @@ import type { EnvelopeProvider } from '../core/crypto';
  */
 export interface KmsClientLike {
   encrypt(keyId: string, plaintext: Buffer, signal?: AbortSignal): Promise<Buffer>;
-  decrypt(ciphertext: Buffer, signal?: AbortSignal): Promise<Buffer>;
+  /** Takes the SAME `keyId` as `encrypt` so the unwrap can be pinned to the configured KEK rather
+   *  than trusting the key the ciphertext blob names — see `awsKmsClient`. */
+  decrypt(keyId: string, ciphertext: Buffer, signal?: AbortSignal): Promise<Buffer>;
 }
 
 /**
@@ -17,7 +19,9 @@ export interface KmsClientLike {
 export function kmsEnvelope(keyId: string, client: KmsClientLike): EnvelopeProvider {
   return {
     wrapDataKey: (dek, signal) => client.encrypt(keyId, dek, signal),
-    unwrapDataKey: (wrapped, signal) => client.decrypt(wrapped, signal),
+    // The same `keyId` on both sides (STR-2): one configured KEK, so an unwrap cannot be satisfied
+    // by a different key the blob happens to name.
+    unwrapDataKey: (wrapped, signal) => client.decrypt(keyId, wrapped, signal),
   };
 }
 
@@ -40,9 +44,14 @@ export async function awsKmsClient(opts: { region?: string } = {}): Promise<KmsC
       );
       return Buffer.from(out.CiphertextBlob);
     },
-    decrypt: async (ciphertext, signal) => {
+    // `KeyId` is REQUIRED on Decrypt, not optional politeness. Without it KMS decrypts under
+    // whatever key the ciphertext blob names, so if this deployment's IAM role can decrypt under any
+    // other key, an attacker who can swap the stored wrapped-DEK for one they created gets it
+    // unwrapped and the credential decrypts under a key they control. Pinning it makes KMS reject
+    // any blob not wrapped by the configured KEK.
+    decrypt: async (keyId, ciphertext, signal) => {
       const out = await client.send(
-        new mod.DecryptCommand({ CiphertextBlob: ciphertext }),
+        new mod.DecryptCommand({ KeyId: keyId, CiphertextBlob: ciphertext }),
         signal ? { abortSignal: signal } : undefined,
       );
       return Buffer.from(out.Plaintext);

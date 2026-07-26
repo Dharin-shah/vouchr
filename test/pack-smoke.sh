@@ -278,6 +278,7 @@ type ExpectedBrokerRecoveryStatus =
   | 'approval_prompted'
   | 'configuration_required'
   | 'stale'
+  | 'notified'
   | 'not_bridgeable';
 type RootSurface = typeof import('@vouchr/core');
 type HeadlessSurface = typeof import('@vouchr/core/headless');

@@ -150,8 +150,18 @@ Vouchr is self-hosted; some of the security posture is yours to own:
 - Scope the IAM/role used by any external-secret resolver to least privilege (read-only on the
   specific secrets it resolves).
 - Keep the PostgreSQL credential store encrypted at rest and access-controlled
-  at the infrastructure layer.
+  at the infrastructure layer. Give Vouchr a least-privilege role and keep write access to the
+  credential tables away from every other workload: encryption keeps the token bytes confidential,
+  but deciding which owner row a stored blob belongs to is a separate property (threat model →
+  ["Database writer"](./guides/THREAT-MODEL.md#database-writer)).
 - Understand the admin gate's trust boundary: channel-credential configuration is gated on
   Slack **workspace** admin/owner status (`users.info` `is_admin`/`is_owner`), which is
   workspace-wide, not channel-membership-scoped. By design, a workspace admin can configure a
-  shared credential for a channel they are not a member of.
+  shared credential for a channel they are not a member of. On the headless broker there is no Slack
+  client: admin authority is the **signed `isAdmin` claim**, so your minter makes that determination
+  and Vouchr enforces it fail-closed.
+- Treat the headless `identitySecret` as a trust root of the same rank as the master key. It belongs
+  only in the trusted Slack-facing minter and the broker replicas — never in an agent worker or any
+  process running model or tool code, which is the deployment mistake that turns one prompt injection
+  into full workspace impersonation (threat model →
+  ["Headless broker: leaked identity signing key"](./guides/THREAT-MODEL.md#headless-broker-leaked-identity-signing-key-v1)).
