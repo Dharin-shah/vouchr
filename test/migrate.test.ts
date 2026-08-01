@@ -420,6 +420,12 @@ test('v12 to v13 converts every lifecycle-fence timestamp to microseconds exactl
      VALUES ('00000000-0000-4000-8000-0000000000ae','k1','T1','U1','user','U1','cred','acme','POST',
         'https://api.acme.test','api.acme.test','/x','C1','TH1','C1','pending',13,14,17,18)`,
   );
+  // A real v12 catalog also carries the millisecond column DEFAULT (CREATE TABLE IF NOT EXISTS and
+  // ADD COLUMN IF NOT EXISTS never touch it), and vault writers omit generation_at and rely on it.
+  await raw.exec(
+    `ALTER TABLE connection ALTER COLUMN generation_at
+       SET DEFAULT (extract(epoch from clock_timestamp())*1000)::bigint`,
+  );
   await raw.run(`UPDATE meta SET value='12' WHERE key='schema_version'`);
 
   // The exact-version runtime assertion is what keeps a v12 (millisecond) binary off v13 data.
@@ -475,6 +481,22 @@ test('v12 to v13 converts every lifecycle-fence timestamp to microseconds exactl
   assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
   const after = await converted();
   assert.equal(after.generation, 777_000);
+  // The migration must also reset the stale v12 millisecond DEFAULT: a post-cutover credential
+  // write that omits generation_at (as every vault writer does) must stamp microseconds, or the
+  // newest-generation fences never block (fail-open).
+  await raw.run(
+    `INSERT INTO connection
+       (id,enterprise_id,team_id,owner_kind,owner_id,provider,source,scopes,dry_run,
+        created_at,updated_at)
+     VALUES ('00000000-0000-4000-8000-0000000000af',NULL,'T1','user','U2','acme','vault','',0,1,1)`,
+  );
+  const defaulted = (await raw.get<{ generation_at: number }>(
+    `SELECT generation_at FROM connection WHERE id='00000000-0000-4000-8000-0000000000af'`,
+  ))!.generation_at;
+  assert.ok(
+    defaulted > 1.5e15,
+    `post-migration generation_at DEFAULT must stamp microseconds, got ${defaulted}`,
+  );
   assert.deepEqual(
     after.appClock,
     { created_at: 1, updated_at: 1 },

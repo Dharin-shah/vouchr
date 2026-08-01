@@ -623,6 +623,11 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       // receipt. Existing rows are conservatively stamped at the drained migration boundary, so no
       // pre-cutover request can target them; every later reconnect gets PostgreSQL time at INSERT.
       await tx.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS generation_at BIGINT NOT NULL DEFAULT ${POSTGRES_NOW_US_SQL}`);
+      // On a pre-v13 database the baseline CREATE TABLE and the ADD COLUMN above are both no-ops,
+      // so the column keeps its stored v10-v12 MILLISECOND default — and every vault writer relies
+      // on that default. Reset it explicitly (idempotent) or every post-cutover write would stamp a
+      // ms-scale generation that no µs-scale issuance fence ever exceeds (fail-open).
+      await tx.exec(`ALTER TABLE connection ALTER COLUMN generation_at SET DEFAULT ${POSTGRES_NOW_US_SQL}`);
       // Pre-v11 consent lacks one owner/provider generation and durable delivery state. Spend every
       // old state fail-closed at the drained cutover; v11→v12 and idempotent v12 runs preserve it.
       // v8 and older tombstones additionally used per-pod Date.now(), so clear those; a v9 team
