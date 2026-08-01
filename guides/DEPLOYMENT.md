@@ -193,12 +193,30 @@ condition this drained sequence exists to prevent.
 ### v13 → v14 (browser Slack-identity verification, #302)
 
 Schema v14 adds two nullable/defaulted columns to `consent_request` (`slack_verified_at`,
-`slack_verify_required`) — purely additive, no data conversion and no drain beyond the ordinary
-rule: run `vouchr migrate` to completion before new replicas start (the exact-version boot check
-enforces it). Pre-v14 consent rows carry `slack_verify_required = 0`, which is exact: their prompt
-URL never offered the verify hop. A pre-v13 database reaches v14 through the drained v13 sequence
-above in the same `vouchr migrate` run — the ms→µs conversion still applies exactly once on the
-way through.
+`slack_verify_required`); no data conversion. Pre-v14 consent rows carry
+`slack_verify_required = 0`, which is exact: their prompt URL never offered the verify hop. A
+pre-v13 database reaches v14 through the drained v13 sequence above in the same `vouchr migrate`
+run — the ms→µs conversion still applies exactly once on the way through.
+
+The DDL is additive, but the **rollout order is load-bearing**: a v13 process that was already
+running when migrate stamps v14 keeps serving (the exact-version check runs only at boot) and
+predates `slack_verify_required` — its callback would complete an *enforced* consent unstamped,
+which is precisely the bypass the flag exists to prevent. An enforced (`slack_verify_required=1`)
+state must therefore never coexist with a live v13 process. Two safe sequences:
+
+- **Drained cutover (simplest):** stop every v13 replica, run `vouchr migrate`, start only v14
+  replicas (flag on or off). Same shape as the v13 sequence above.
+- **Staged, no drain — flag off until v13 is gone:**
+  1. Run `vouchr migrate` (stamps v14). Already-running v13 replicas keep serving; any v13
+     restart/scale-up is refused at boot by the exact-version check.
+  2. Roll every replica to v14 with `requireBrowserSlackIdentity` **off**. Both binaries treat the
+     resulting `slack_verify_required=0` states identically, so this phase is safe to overlap.
+  3. Only when **zero** v13 processes remain, enable the flag everywhere. Enforced states now only
+     ever meet v14 callbacks, which honor the row unconditionally (regression:
+     `test/browser-identity.test.ts`, two-instance shared-database tests). A still-pending
+     unenforced prompt is superseded on the user's next connect — the persisted mode is part of the
+     consent generation's identity, so a mode flip mints a fresh generation instead of reusing the
+     old row (off→on and on→off regressions in the same file).
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
@@ -453,8 +471,13 @@ With the flag on, the flow gains one redirect hop and two routes mounted beside 
 The requirement is **persisted with the consent at mint time** (`slack_verify_required`, schema
 v14) and every callback enforces the row's value — never the completing replica's own flag. In a
 multi-replica fleet, a state minted by an enforcing replica therefore fails closed even when the
-provider redirect lands on a replica whose flag is off (rollout, config drift); flip the flag on
-all replicas together to avoid minting mixed generations. Slack's OIDC endpoints are fixed and not
+provider redirect lands on a v14 replica whose flag is off (rollout, config drift). The persisted
+mode is also part of the consent generation's identity: a connect handled under the other mode
+supersedes a still-pending prompt and mints a fresh generation, so a flag flip never leaves a
+verify-hop URL over an unenforced row or an un-completable direct URL over an enforced one. Do not
+enable the flag while any pre-v14 (v13) process is still live — see
+[v13 → v14](#v13--v14-browser-slack-identity-verification-302) for the required order. Slack's
+OIDC endpoints are fixed and not
 configurable: the id_token is accepted from Slack's token endpoint over TLS without signature
 verification, so a configurable endpoint would be an identity-forging seam.
 

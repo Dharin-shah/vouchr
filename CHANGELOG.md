@@ -21,7 +21,12 @@ All notable changes to this project are documented here. This project adheres to
   non-reflecting error. Enforcement authority is **persisted with the consent** at mint time
   (`slack_verify_required`), and every callback enforces the row's value unconditionally — so in a
   multi-replica fleet a state minted by an enforcing replica fails closed even when the completing
-  replica has the flag off. Schema v14 adds both columns (run `vouchr migrate`). Off by default in
+  replica has the flag off. The persisted mode is part of the consent generation's identity: a
+  connect under the other mode supersedes a still-pending prompt instead of reusing it, so a flag
+  flip can neither leave a bypassable unenforced row behind a verify-hop URL nor a dead-end
+  enforced row behind a direct URL. Schema v14 adds both columns (run `vouchr migrate`; **do not
+  enable the flag while any v13 process is still live** — see DEPLOYMENT § v13 → v14 for the
+  required rollout order). Off by default in
   the beta (no behaviour change unless enabled); slated ON-by-default for GA. Regression:
   `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
   guides/DEPLOYMENT.md § "Browser Slack-identity verification".

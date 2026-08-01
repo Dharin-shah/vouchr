@@ -592,8 +592,15 @@ export class Consent {
       [i.teamId, i.userId, provider.id],
     );
     if (existing) {
+      // #302: the persisted verification mode is part of the generation's identity. Reusing across
+      // a mode flip would either hand out a verify-hop URL for a row the callback never enforces
+      // (off→on: the old direct provider URL could still bypass the hop) or a direct provider URL
+      // for a row the callback refuses unstamped (on→off: a dead-end prompt). A mismatch
+      // supersedes the old generation and mints one that matches the minting replica's mode.
+      const sameMode = Number(existing.slack_verify_required) === (this.browserVerifyUri ? 1 : 0);
       const sameContext = existing.enterprise_id === i.enterpriseId
-        && existing.channel === channel;
+        && existing.channel === channel
+        && sameMode;
       const live = existing.consumed_at == null
         && existing.observed_at - existing.created_at <= STATE_TTL_US;
       const lifecycleCurrent = !tombstoneBlocks(offboardedAt, existing.created_at)

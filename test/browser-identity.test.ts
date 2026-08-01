@@ -306,6 +306,88 @@ test('#302 guardrail: the requirement is the ROW\'s, not the replica\'s — a fl
   }
 });
 
+test('#302 mode flip off→on: the unenforced prompt is superseded, the replacement row requires verification', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
+  const serverOff = createBroker({ ...base });
+  const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
+  await new Promise<void>((r) => serverOff.listen(0, r));
+  await new Promise<void>((r) => serverOn.listen(0, r));
+  const portOff = (serverOff.address() as any).port;
+  const portOn = (serverOn.address() as any).port;
+  const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
+  try {
+    // Minted unenforced: the prompt carries the DIRECT provider URL.
+    const first = await beginFlow(portOff);
+    assert.equal(`${first.authorize.origin}${first.authorize.pathname}`, 'https://acme.example/auth');
+
+    // The same user/provider/channel connects again through an ENFORCING replica: the persisted
+    // mode differs, so the old generation is superseded and a fresh enforced one is minted.
+    const second = await beginFlow(portOn);
+    assert.notEqual(second.state, first.state);
+    assert.equal(second.authorize.pathname, '/oauth/verify');
+    const newRow = (await db.get(
+      `SELECT slack_verify_required FROM consent_request WHERE state=?`, [second.state],
+    )) as any;
+    assert.equal(Number(newRow.slack_verify_required), 1);
+
+    // The old direct provider URL can no longer complete — the unenforced state went stale…
+    const stale = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(first.state)}`);
+    assert.equal(stale.status, 409, stale.raw);
+    // …and the replacement enforces the hop: a direct callback fails closed and writes nothing.
+    const bypass = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(second.state)}`);
+    assert.equal(bypass.status, 403, bypass.raw);
+    assert.equal(stub.log.providerTokenCalls, 0);
+    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
+  } finally {
+    stub.restore();
+    serverOff.close();
+    serverOn.close();
+  }
+});
+
+test('#302 mode flip on→off: the enforced prompt is superseded instead of becoming a dead end', async (t) => {
+  const db = await openTestDb(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
+  const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
+  const serverOff = createBroker({ ...base });
+  await new Promise<void>((r) => serverOn.listen(0, r));
+  await new Promise<void>((r) => serverOff.listen(0, r));
+  const portOn = (serverOn.address() as any).port;
+  const portOff = (serverOff.address() as any).port;
+  const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
+  try {
+    const first = await beginFlow(portOn);
+    assert.equal(first.authorize.pathname, '/oauth/verify');
+
+    // A connect under the off mode must NOT reuse the enforced row (its direct URL could never
+    // complete): it supersedes and mints an unenforced generation with a direct provider URL.
+    const second = await beginFlow(portOff);
+    assert.notEqual(second.state, first.state);
+    assert.equal(`${second.authorize.origin}${second.authorize.pathname}`, 'https://acme.example/auth');
+    const newRow = (await db.get(
+      `SELECT slack_verify_required FROM consent_request WHERE state=?`, [second.state],
+    )) as any;
+    assert.equal(Number(newRow.slack_verify_required), 0);
+
+    // The old enforced state is stale, and the new unenforced one completes directly.
+    const stale = await getRaw(portOn, `/oauth/callback?code=abc123&state=${encodeURIComponent(first.state)}`);
+    assert.equal(stale.status, 409, stale.raw);
+    const done = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(second.state)}`);
+    assert.equal(done.status, 200, done.raw);
+    const cred = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
+    assert.equal(cred?.accessToken, 'PROVIDER_TOKEN');
+  } finally {
+    stub.restore();
+    serverOn.close();
+    serverOff.close();
+  }
+});
+
 test('#302 mismatch with a failing audit store: state stays spent, but the response is 500 contact-admin, never a recorded-looking 403', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
