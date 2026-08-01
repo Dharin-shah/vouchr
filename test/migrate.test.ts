@@ -361,6 +361,173 @@ test('v10 to v12 drains pre-v11 consent authority and installs the single-genera
   );
 });
 
+test('v12 to v13 converts every lifecycle-fence timestamp to microseconds exactly once', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+
+  // Materialize the current schema, seed one MILLISECOND-stamped row per fence table, and restore
+  // the v12 marker — the exact predecessor state of the #290 cutover. Every stored PostgreSQL-clock
+  // value must be multiplied by exactly 1000 exactly once: a second migrate() (previousVersion=13)
+  // must NOT multiply again, or every fence would leap ~50 years into the future.
+  await migrate({ databaseUrl: url });
+  await raw.run(
+    `INSERT INTO connection
+       (id,enterprise_id,team_id,owner_kind,owner_id,provider,source,scopes,dry_run,
+        generation_at,created_at,updated_at)
+     VALUES ('00000000-0000-4000-8000-0000000000aa',NULL,'T1','user','U1','acme','vault','',0,777,1,1)`,
+  );
+  await raw.run(`INSERT INTO channel_interaction_tombstone VALUES ('T1','C1','acme',111)`);
+  await raw.run(`INSERT INTO offboard_tombstone (team_id,user_id,created_at) VALUES ('T1','U1',222)`);
+  await raw.run(`INSERT INTO user_offboard_scope_tombstone VALUES ('enterprise','E1','U1',333)`);
+  await raw.run(
+    `INSERT INTO provisioning_revocation_tombstone VALUES ('acme','global',$1,444)`,
+    ['A'.repeat(43)],
+  );
+  const state = 'D'.repeat(43);
+  await raw.run(
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at,
+        consumed_at,superseded_at,delivery_lease_expires_at,delivered_at)
+     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',1000,NULL,2000,4000,3000)`,
+    [state],
+  );
+  await raw.run(
+    `INSERT INTO user_provisioning_request
+       (id,team_id,user_id,provider,created_at,expires_at,delivery_lease_expires_at,delivered_at)
+     VALUES ('00000000-0000-4000-8000-0000000000ab','T1','U1','acme',1,99,6,5)`,
+  );
+  await raw.run(
+    `INSERT INTO channel_provisioning_request VALUES
+       ('00000000-0000-4000-8000-0000000000ac','T1','C1','U1','acme',7,88)`,
+  );
+  await raw.run(
+    `INSERT INTO session_request
+       (id,team_id,channel,thread,user_id,provider,credential_id,created_at,expires_at,
+        delivery_lease_expires_at,delivered_at)
+     VALUES ('00000000-0000-4000-8000-0000000000ad','T1','C1','TH1','U1','acme','cred',9,10,15,16)`,
+  );
+  await raw.run(
+    `INSERT INTO session_grant
+       (team_id,channel,thread,user_id,provider,credential_id,created_at,expires_at)
+     VALUES ('T1','C1','TH1','U1','acme','cred',11,12)`,
+  );
+  await raw.run(
+    `INSERT INTO approval_request
+       (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,origin,
+        host,path,channel,thread,governable_channel,status,created_at,expires_at,
+        delivery_lease_expires_at,delivered_at)
+     VALUES ('00000000-0000-4000-8000-0000000000ae','k1','T1','U1','user','U1','cred','acme','POST',
+        'https://api.acme.test','api.acme.test','/x','C1','TH1','C1','pending',13,14,17,18)`,
+  );
+  // A real v12 catalog also carries the millisecond column DEFAULT (CREATE TABLE IF NOT EXISTS and
+  // ADD COLUMN IF NOT EXISTS never touch it), and vault writers omit generation_at and rely on it.
+  await raw.exec(
+    `ALTER TABLE connection ALTER COLUMN generation_at
+       SET DEFAULT (extract(epoch from clock_timestamp())*1000)::bigint`,
+  );
+  await raw.run(`UPDATE meta SET value='12' WHERE key='schema_version'`);
+
+  // The exact-version runtime assertion is what keeps a v12 (millisecond) binary off v13 data.
+  await assert.rejects(
+    () => openDb({ databaseUrl: url }),
+    new RegExp(`schema version 12.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
+  );
+
+  const converted = async () => ({
+    generation: (await raw.get<{ generation_at: number }>(
+      `SELECT generation_at FROM connection WHERE id='00000000-0000-4000-8000-0000000000aa'`,
+    ))!.generation_at,
+    appClock: await raw.get<{ created_at: number; updated_at: number }>(
+      `SELECT created_at, updated_at FROM connection WHERE id='00000000-0000-4000-8000-0000000000aa'`,
+    ),
+    channelTomb: (await raw.get<{ created_at: number }>(
+      `SELECT created_at FROM channel_interaction_tombstone WHERE team_id='T1'`,
+    ))!.created_at,
+    offboard: (await raw.get<{ created_at: number }>(
+      `SELECT created_at FROM offboard_tombstone WHERE team_id='T1'`,
+    ))!.created_at,
+    scopeTomb: (await raw.get<{ created_at: number }>(
+      `SELECT created_at FROM user_offboard_scope_tombstone WHERE user_id='U1'`,
+    ))!.created_at,
+    revocation: (await raw.get<{ created_at: number }>(
+      `SELECT created_at FROM provisioning_revocation_tombstone WHERE provider='acme'`,
+    ))!.created_at,
+    consent: await raw.get<Record<string, number>>(
+      `SELECT created_at, consumed_at, superseded_at, delivered_at, delivery_lease_expires_at
+         FROM consent_request WHERE state=$1`,
+      [state],
+    ),
+    userProv: await raw.get<Record<string, number>>(
+      `SELECT created_at, expires_at, delivered_at, delivery_lease_expires_at
+         FROM user_provisioning_request WHERE team_id='T1'`,
+    ),
+    channelProv: await raw.get<Record<string, number>>(
+      `SELECT created_at, expires_at FROM channel_provisioning_request WHERE team_id='T1'`,
+    ),
+    sessionReq: await raw.get<Record<string, number>>(
+      `SELECT created_at, expires_at, delivered_at, delivery_lease_expires_at
+         FROM session_request WHERE team_id='T1'`,
+    ),
+    sessionGrant: await raw.get<Record<string, number>>(
+      `SELECT created_at, expires_at FROM session_grant WHERE team_id='T1'`,
+    ),
+    approval: await raw.get<Record<string, number>>(
+      `SELECT created_at, expires_at, delivered_at, delivery_lease_expires_at
+         FROM approval_request WHERE team_id='T1'`,
+    ),
+  });
+
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  const after = await converted();
+  assert.equal(after.generation, 777_000);
+  // The migration must also reset the stale v12 millisecond DEFAULT: a post-cutover credential
+  // write that omits generation_at (as every vault writer does) must stamp microseconds, or the
+  // newest-generation fences never block (fail-open).
+  await raw.run(
+    `INSERT INTO connection
+       (id,enterprise_id,team_id,owner_kind,owner_id,provider,source,scopes,dry_run,
+        created_at,updated_at)
+     VALUES ('00000000-0000-4000-8000-0000000000af',NULL,'T1','user','U2','acme','vault','',0,1,1)`,
+  );
+  const defaulted = (await raw.get<{ generation_at: number }>(
+    `SELECT generation_at FROM connection WHERE id='00000000-0000-4000-8000-0000000000af'`,
+  ))!.generation_at;
+  assert.ok(
+    defaulted > 1.5e15,
+    `post-migration generation_at DEFAULT must stamp microseconds, got ${defaulted}`,
+  );
+  assert.deepEqual(
+    after.appClock,
+    { created_at: 1, updated_at: 1 },
+    'application-clock connection columns stay epoch-ms — only the PostgreSQL-clock fence converts',
+  );
+  assert.equal(after.channelTomb, 111_000);
+  assert.equal(after.offboard, 222_000);
+  assert.equal(after.scopeTomb, 333_000);
+  assert.equal(after.revocation, 444_000);
+  assert.deepEqual(after.consent, {
+    created_at: 1_000_000, consumed_at: null, superseded_at: 2_000_000,
+    delivered_at: 3_000_000, delivery_lease_expires_at: 4_000_000,
+  });
+  assert.deepEqual(after.userProv, {
+    created_at: 1_000, expires_at: 99_000, delivered_at: 5_000, delivery_lease_expires_at: 6_000,
+  });
+  assert.deepEqual(after.channelProv, { created_at: 7_000, expires_at: 88_000 });
+  assert.deepEqual(after.sessionReq, {
+    created_at: 9_000, expires_at: 10_000, delivered_at: 16_000, delivery_lease_expires_at: 15_000,
+  });
+  assert.deepEqual(after.sessionGrant, { created_at: 11_000, expires_at: 12_000 });
+  assert.deepEqual(after.approval, {
+    created_at: 13_000, expires_at: 14_000, delivered_at: 18_000, delivery_lease_expires_at: 17_000,
+  });
+
+  // The conversion is gated on the recorded predecessor version: re-running the migration at v13
+  // must not multiply anything again.
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  assert.deepEqual(await converted(), after, 'a second migrate() must not convert again');
+});
+
 test('v10 stamps legacy connections with a PostgreSQL credential-generation boundary', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url } = await emptySchema(t);

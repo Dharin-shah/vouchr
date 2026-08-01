@@ -49,7 +49,7 @@ import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit,
 import { booleanEnv } from '../core/options';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
-import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
+import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_US } from '../core/interaction';
 import {
   abandonUserProvisioningDelivery,
   ChannelProvisioningRequests,
@@ -334,7 +334,7 @@ export async function settledWithLimit<T>(
  * before the 30s lease. The timer begins BEFORE claimDelivery, conservatively including its round
  * trip, so even a late-wave first success starts confirmation with the supported database budget. */
 export const APPROVAL_DELIVERY_SAFETY_MARGIN_MS = 1_000;
-export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_MS
+export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_US / 1_000
   - SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS
   - DB_CONNECTION_TIMEOUT_MS
   - DB_RUNTIME_QUERY_TIMEOUT_MS
@@ -872,14 +872,15 @@ type InternalConnectContextDeps = ConnectContextDeps & {
 };
 
 /** Map a verified handler's monotonic receipt instant into PostgreSQL's clock domain. Query latency
- * is included in the subtraction and fractional milliseconds round up, so uncertainty can only
- * make the issuance older (fail closed), never newer than the received interaction. */
+ * is included in the subtraction and fractional microseconds round up (the nanosecond monotonic
+ * receipt keeps sub-millisecond precision), so uncertainty can only make the issuance older (fail
+ * closed) — by at least 1µs — never newer than the received interaction. */
 async function provisioningIssuedAtFromReceipt(vault: Vault, receivedAt: bigint): Promise<number> {
   const pgNow = await vault.userProvisioningIssuedAt();
   const elapsedNs = process.hrtime.bigint() - receivedAt;
   if (elapsedNs < 0n) throw new Error('invalid provisioning receipt clock');
-  const elapsedMs = Number((elapsedNs + 999_999n) / 1_000_000n);
-  const issuedAt = pgNow - elapsedMs;
+  const elapsedUs = Number((elapsedNs + 999n) / 1_000n);
+  const issuedAt = pgNow - elapsedUs;
   if (!Number.isSafeInteger(issuedAt)) throw new Error('could not issue provisioning fence');
   return issuedAt;
 }
@@ -1009,7 +1010,7 @@ export class ConnectContext {
   }
 
   /** Map this verified request's monotonic receipt instant into PostgreSQL's clock domain. Query
-   * latency is included in the elapsed subtraction and fractional milliseconds round up, so clock
+   * latency is included in the elapsed subtraction and fractional microseconds round up, so clock
    * uncertainty can only make the issuance older (fail closed), never newer than the request. */
   private async provisioningIssuedAt(): Promise<number> {
     return provisioningIssuedAtFromReceipt(this.vault, this.provisioningReceivedAt);
@@ -1310,7 +1311,7 @@ export class ConnectContext {
   }
 
   /** Client for lease-guarded prompt posts. A leased post must terminate well inside its
-   * PROMPT_DELIVERY_LEASE_MS: the default WebClient has no request timeout and silently queues
+   * PROMPT_DELIVERY_LEASE_US: the default WebClient has no request timeout and silently queues
    * rate-limited retries for up to ~30 minutes, so a slow post outlives its lease and a takeover
    * replica double-delivers the prompt (the caller then also mis-reports its own landed post).
    * Real Bolt clients carry their resolved token — post through a bounded twin (no retries, short

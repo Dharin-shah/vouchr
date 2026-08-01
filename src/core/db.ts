@@ -1,7 +1,7 @@
 import { Pool, types, type PoolClient } from 'pg';
 import { hideInternals } from './redact';
 import { isPostgresUrl, optionalPositiveEnv } from './options';
-import { POSTGRES_NOW_MS_SQL } from './interaction';
+import { POSTGRES_NOW_US_SQL } from './interaction';
 
 /** Runtime pool bounds used by lease-sensitive callers when reserving enough time for one final
  * database mutation. Keep the pool configuration and those callers on these single sources of truth. */
@@ -177,19 +177,22 @@ class PgClientDb implements Db {
  * makes OAuth consent one durable owner/provider generation with cross-replica delivery leases.
  * Version 12 extends that delivery state to key setup, binds approval delivery to its current
  * eligible audience, and requires an explicit mutable-governance scope on pending approvals.
- * `migrate()` accepts v6-v12 and applies every idempotent cleanup before stamping 12.
+ * Version 13 moves every PostgreSQL-clock lifecycle-fence timestamp from millisecond to
+ * microsecond resolution (#290) so unrelated operations no longer tie inside the clock's
+ * truncation window.
+ * `migrate()` accepts v6-v13 and applies every idempotent cleanup before stamping 13.
  * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
  * controls differently.
  */
-export const SCHEMA_VERSION = 12;
-const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, 10, 11, SCHEMA_VERSION]);
+export const SCHEMA_VERSION = 13;
+const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, 10, 11, 12, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
  * Migration entry guard — runs BEFORE any DDL. `migrate()` creates a fresh baseline, carries a
- * v6-v11 database to v12, or idempotently verifies v12. The ONLY inputs it can correctly converge are:
+ * v6-v12 database to v13, or idempotently verifies v13. The ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
  *  - a v6 database → the union cleanup plus preview removal;
  *  - a v7 database → preview removal;
@@ -197,9 +200,10 @@ const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value T
  *  - a v9 database → durable user/channel-provisioning requests + cross-team lifecycle tombstones;
  *  - a v10 database → single-generation OAuth consent + delivery state;
  *  - a v11 database → key-prompt delivery leases plus audience-bound approval delivery;
- *  - a v12 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v12 over an unknown shape (a v1–v5 marker,
- * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v12 downgrade —
+ *  - a v12 database → the ms→µs lifecycle-fence timestamp conversion (#290);
+ *  - a v13 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v13 over an unknown shape (a v1–v5 marker,
+ * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v13 downgrade —
  * which would let old code corrupt encrypted rows). Vouchr is greenfield: the fix for a rejected
  * database is to recreate it fresh, not to add historical migrations.
  */
@@ -243,7 +247,7 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
   if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 6, 7, 8, 9, 10, 11, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
+        `version 6, 7, 8, 9, 10, 11, 12, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
     );
   }
   return found;
@@ -280,7 +284,7 @@ function schema(): string {
       expires_at ${int},
       external_account TEXT,
       dry_run ${int} NOT NULL DEFAULT 0,
-      generation_at ${int} NOT NULL DEFAULT ${POSTGRES_NOW_MS_SQL},
+      generation_at ${int} NOT NULL DEFAULT ${POSTGRES_NOW_US_SQL},
       created_at ${int} NOT NULL,
       updated_at ${int} NOT NULL,
       last_used_at ${int},
@@ -533,7 +537,7 @@ function connectDb(
         'DATABASE_URL fallback. The URL must include a host (e.g. postgres://user:pass@host:5432/db).',
     );
   }
-  types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (ms timestamps are < 2^53)
+  types.setTypeParser(20, (v) => parseInt(v, 10)); // int8 → JS number (µs/ms timestamps are < 2^53)
   const pool = new Pool({
     connectionString: boundedMainPoolUrl(url, statementTimeoutMs),
     application_name: appName, // names the backend in pg_stat_activity for operators
@@ -618,7 +622,12 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       // A delayed provider-addressed disconnect must prove the row existed at its trusted request
       // receipt. Existing rows are conservatively stamped at the drained migration boundary, so no
       // pre-cutover request can target them; every later reconnect gets PostgreSQL time at INSERT.
-      await tx.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS generation_at BIGINT NOT NULL DEFAULT ${POSTGRES_NOW_MS_SQL}`);
+      await tx.exec(`ALTER TABLE connection ADD COLUMN IF NOT EXISTS generation_at BIGINT NOT NULL DEFAULT ${POSTGRES_NOW_US_SQL}`);
+      // On a pre-v13 database the baseline CREATE TABLE and the ADD COLUMN above are both no-ops,
+      // so the column keeps its stored v10-v12 MILLISECOND default — and every vault writer relies
+      // on that default. Reset it explicitly (idempotent) or every post-cutover write would stamp a
+      // ms-scale generation that no µs-scale issuance fence ever exceeds (fail-open).
+      await tx.exec(`ALTER TABLE connection ALTER COLUMN generation_at SET DEFAULT ${POSTGRES_NOW_US_SQL}`);
       // Pre-v11 consent lacks one owner/provider generation and durable delivery state. Spend every
       // old state fail-closed at the drained cutover; v11→v12 and idempotent v12 runs preserve it.
       // v8 and older tombstones additionally used per-pod Date.now(), so clear those; a v9 team
@@ -675,6 +684,54 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
           `UPDATE approval_request
              SET delivery_token=NULL, delivery_lease_expires_at=0,
                  delivered_at=NULL, delivery_audience=NULL`,
+        );
+      }
+      // v13 (#290): every PostgreSQL-clock lifecycle-fence timestamp moves from millisecond to
+      // microsecond resolution. A ×1000 DATA conversion — NOT idempotent, so it is gated on the
+      // recorded predecessor version, and it runs AFTER the drains above so no deleted-generation
+      // row is converted. There are no dual-unit reads afterward: every reader/writer of these
+      // columns is microseconds-only, and openDb's exact-version assertion (assertSchemaCurrent)
+      // is what keeps a v12 (millisecond) binary off v13 data at the drained cutover.
+      // Application-clock columns (connection created_at/updated_at/last_used_at/expires_at,
+      // audit.at, installation.updated_at, notification_state, broker_jti.exp) never meet the
+      // PostgreSQL clock in a comparison and deliberately stay epoch-ms.
+      if (previousVersion !== null && previousVersion < 13) {
+        // generation_at carries ms values only for v10-v12 predecessors; for older databases the
+        // retro-add above just stamped it directly in µs at this drained boundary.
+        if (previousVersion >= 10) {
+          await tx.exec(`UPDATE connection SET generation_at=generation_at*1000`);
+        }
+        await tx.exec(`UPDATE channel_interaction_tombstone SET created_at=created_at*1000`);
+        await tx.exec(`UPDATE offboard_tombstone SET created_at=created_at*1000`);
+        await tx.exec(`UPDATE user_offboard_scope_tombstone SET created_at=created_at*1000`);
+        await tx.exec(`UPDATE provisioning_revocation_tombstone SET created_at=created_at*1000`);
+        await tx.exec(
+          `UPDATE consent_request
+             SET created_at=created_at*1000, consumed_at=consumed_at*1000,
+                 superseded_at=superseded_at*1000, delivered_at=delivered_at*1000,
+                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
+        );
+        await tx.exec(
+          `UPDATE user_provisioning_request
+             SET created_at=created_at*1000, expires_at=expires_at*1000,
+                 delivered_at=delivered_at*1000,
+                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
+        );
+        await tx.exec(
+          `UPDATE channel_provisioning_request SET created_at=created_at*1000, expires_at=expires_at*1000`,
+        );
+        await tx.exec(
+          `UPDATE session_request
+             SET created_at=created_at*1000, expires_at=expires_at*1000,
+                 delivered_at=delivered_at*1000,
+                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
+        );
+        await tx.exec(`UPDATE session_grant SET created_at=created_at*1000, expires_at=expires_at*1000`);
+        await tx.exec(
+          `UPDATE approval_request
+             SET created_at=created_at*1000, expires_at=expires_at*1000,
+                 delivered_at=delivered_at*1000,
+                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
         );
       }
       await tx.exec(`ALTER TABLE approval_request ALTER COLUMN action_key SET NOT NULL`);

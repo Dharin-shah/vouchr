@@ -155,9 +155,40 @@ from those display/routing fields.
 Do not leave any pre-v12 process live during or after migration. Older processes do not re-check the
 marker after startup; v8 cannot supply the required approval action key, v9 can still accept an
 unfenced static/reference write, and v10 does not enforce the single-generation OAuth contract.
-Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11/v12 service is unsupported.
-Rollback requires stopping v12, restoring the matching pre-migration backup, and only then starting
-the binary that created it; running an older binary against schema v12 is refused and unsafe.
+Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11/v12/v13 service is unsupported.
+Rollback from this cutover requires stopping v12, restoring the matching pre-migration backup, and
+only then starting the binary that created it; running an older binary against schema v12 is refused
+and unsafe. (v13 rollback has its own sequence below.)
+
+### Required v12 (or any earlier supported marker) → v13 drained cutover
+
+Schema v13 (#290) moves every PostgreSQL-clock lifecycle-fence timestamp — the offboard,
+break-glass, and channel-interaction tombstones, `connection.generation_at`, and all pending
+consent/provisioning/session/approval state — from millisecond to microsecond resolution, so
+unrelated sequential operations no longer tie inside the clock's truncation window while every
+`>=` fence still fails a genuine tie closed. It is a pure data conversion (each stored value
+×1000), not a table-shape change; application-clock columns (`audit.at`, connection
+created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-milliseconds.
+
+1. Back up PostgreSQL and verify that the backup can be restored.
+2. Quiesce Slack and broker traffic, drain in-flight interactions, and stop **every** pre-v13
+   replica. A v12 binary reads and writes millisecond fences and must never share the database
+   with v13 data; the exact-version runtime check refuses it at boot, and this drain is what keeps
+   one from staying live across the conversion.
+3. Run this build's `vouchr migrate` with the schema-owner role. From v12 it multiplies every
+   stored fence timestamp by exactly 1000, atomically with the version stamp; from an earlier
+   supported marker it first applies the carries above and converts whatever survives them. The
+   conversion is gated on the recorded predecessor version, so re-running migrate (or racing a
+   concurrent run — the advisory lock serializes them) never multiplies twice.
+4. Start only v13 replicas, confirm readiness, and restore traffic. This step drains no
+   user-visible state: pending prompts, grants, and durable tombstones carry over at the new
+   resolution.
+
+Rollback from v13 requires stopping **every** v13 replica, restoring the matching pre-v13 backup,
+and only then starting the older binary that created that backup. The order matters: the
+exact-version startup check refuses a mismatched binary only at boot, so a v13 process left live
+across the restore would read the restored millisecond fences as microseconds — the mixed-unit
+condition this drained sequence exists to prevent.
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
@@ -174,7 +205,7 @@ the binary that created it; running an older binary against schema v12 is refuse
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
   if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
   Job / initContainer) to completion before new runtime replicas start. For v7 → v8 and any
-  supported pre-v12 marker → v12, use the applicable drained maintenance sequence above instead.
+  supported pre-v13 marker → v13, use the applicable drained maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 

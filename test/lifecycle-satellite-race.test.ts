@@ -5,6 +5,7 @@ import { Approvals, type ApprovalKey } from '../src/core/approval';
 import { Audit } from '../src/core/audit';
 import { openDb, type Db } from '../src/core/db';
 import { NotificationState } from '../src/core/health';
+import { POSTGRES_NOW_US_SQL } from '../src/core/interaction';
 import type { SlackIdentity } from '../src/core/identity';
 import { userOwner } from '../src/core/owner';
 import { SessionGrants } from '../src/core/session';
@@ -161,14 +162,14 @@ test('lifecycle stale snapshot cannot purge a reconnect generation or its fresh 
       freshCredentialId,
     );
 
-    const now = Date.now();
     await writerDb.run(
       `INSERT INTO user_provisioning_request
-        (id, team_id, user_id, provider, created_at, expires_at) VALUES (?,?,?,?,?,?)`,
-      [randomUUID(), IDENTITY.teamId, IDENTITY.userId, PROVIDER, now, now + 60_000],
+        (id, team_id, user_id, provider, created_at, expires_at)
+       VALUES (?,?,?,?,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+60000000)`,
+      [randomUUID(), IDENTITY.teamId, IDENTITY.userId, PROVIDER],
     );
     assert.equal(
-      await new NotificationState(writerDb).claim(owner, PROVIDER, 'expiring_soon', now),
+      await new NotificationState(writerDb).claim(owner, PROVIDER, 'expiring_soon', Date.now()),
       true,
     );
 

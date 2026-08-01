@@ -699,9 +699,9 @@ test('P1-B: a concurrent real write is never clobbered by a synthetic consent (a
       await vouchr.vault.delete(userOwner(ID), 'acme'); // reset to empty
       // Each attempt is a new Slack delivery received after the reset's lifecycle marker. Reusing
       // one old context would correctly exercise the stale-interaction fence instead of this race.
-      // The marker and the receipt are millisecond clocks: on a fast machine both can land in the
-      // SAME ms and tombstoneBlocks' >= fence then (correctly, fail-closed) refuses the connect.
-      // Step strictly past the marker so this test exercises the write race, not the tie fence.
+      // The marker and the receipt share the microsecond fence clock (#290), so a genuine tie is
+      // vanishingly rare; the short step keeps this test strictly past the marker on any machine so
+      // it exercises the write race, not tombstoneBlocks' fail-closed tie fence.
       await new Promise((resolve) => setTimeout(resolve, 2));
       const { ctx } = await boltContext(vouchr);
       await assert.rejects(() => ctx.connect('acme'), ConsentRequiredError); // records a fresh consent state

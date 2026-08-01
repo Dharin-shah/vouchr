@@ -65,7 +65,7 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
   // issuance is then still newer than the stored credential, so the newest-generation fence lets a
   // legitimate re-reference proceed instead of treating the just-seeded row as concurrent.
   await db.run(
-    `UPDATE connection SET generation_at = generation_at - 3600000 WHERE team_id='T1' AND owner_id='U1' AND provider='acme'`,
+    `UPDATE connection SET generation_at = generation_at - 3600000000 WHERE team_id='T1' AND owner_id='U1' AND provider='acme'`,
   );
   // Deny-by-default: opt the registered providers into channel C1 (the token's default channel),
   // mirroring an admin having run `/vouchr enable`. Denial cases below drive their own state.

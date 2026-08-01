@@ -14,10 +14,10 @@ import {
   isInteractionId,
   latestChannelInteractionTombstone,
   newInteractionId,
-  PENDING_INTERACTION_TTL_MS,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_DELIVERY_LEASE_MS,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  PENDING_INTERACTION_TTL_US,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_DELIVERY_LEASE_US,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
   type PromptDeliveryClaim,
   type PromptDeliveryOptions,
 } from './interaction';
@@ -55,7 +55,7 @@ export class UserProvisioningRequests {
     const row = await this.db.get<{ provider: string; created_at: number }>(
       `SELECT provider, created_at FROM user_provisioning_request
        WHERE id=? AND team_id=? AND user_id=?
-         AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id, identity.teamId, identity.userId],
     );
     if (typeof row?.provider !== 'string') return null;
@@ -87,7 +87,7 @@ export class UserProvisioningRequests {
       const row = await tx.get<{ created_at: number }>(
         `DELETE FROM user_provisioning_request
          WHERE id=? AND team_id=? AND user_id=? AND provider=?
-           AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND expires_at>${POSTGRES_NOW_US_SQL}
          RETURNING created_at`,
         [id, identity.teamId, identity.userId, provider],
       );
@@ -104,7 +104,7 @@ export class UserProvisioningRequests {
 
   async sweepExpired(): Promise<number> {
     return (await this.db.run(
-      `DELETE FROM user_provisioning_request WHERE expires_at<${POSTGRES_NOW_MS_SQL}`,
+      `DELETE FROM user_provisioning_request WHERE expires_at<${POSTGRES_NOW_US_SQL}`,
     )).changes;
   }
 }
@@ -159,11 +159,11 @@ export class ChannelProvisioningRequests {
             tombstoneBlocks(changedAt, issuedAt)
           ) return null;
           const clock = await fencedTx.get<{ now: number }>(
-            `SELECT ${POSTGRES_NOW_MS_SQL} AS now`,
+            `SELECT ${POSTGRES_NOW_US_SQL} AS now`,
           );
           if (
             !Number.isSafeInteger(clock?.now) ||
-            issuedAt + PENDING_INTERACTION_TTL_MS <= clock!.now
+            issuedAt + PENDING_INTERACTION_TTL_US <= clock!.now
           ) return null;
           const existing = await fencedTx.get<{
             id: string;
@@ -195,7 +195,7 @@ export class ChannelProvisioningRequests {
               identity.userId,
               provider,
               issuedAt,
-              issuedAt + PENDING_INTERACTION_TTL_MS,
+              issuedAt + PENDING_INTERACTION_TTL_US,
             ],
           );
           if (!isInteractionId(row?.id)) {
@@ -219,7 +219,7 @@ export class ChannelProvisioningRequests {
     }>(
       `SELECT channel, provider, created_at FROM channel_provisioning_request
        WHERE id=? AND team_id=? AND user_id=?
-         AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id, identity.teamId, identity.userId],
     );
     if (
@@ -255,7 +255,7 @@ export class ChannelProvisioningRequests {
       const row = await tx.get<{ created_at: number }>(
         `DELETE FROM channel_provisioning_request
          WHERE id=? AND team_id=? AND channel=? AND user_id=? AND provider=?
-           AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND expires_at>${POSTGRES_NOW_US_SQL}
          RETURNING created_at`,
         [id, identity.teamId, channel, identity.userId, provider],
       );
@@ -272,7 +272,7 @@ export class ChannelProvisioningRequests {
 
   async sweepExpired(): Promise<number> {
     return (await this.db.run(
-      `DELETE FROM channel_provisioning_request WHERE expires_at<${POSTGRES_NOW_MS_SQL}`,
+      `DELETE FROM channel_provisioning_request WHERE expires_at<${POSTGRES_NOW_US_SQL}`,
     )).changes;
   }
 }
@@ -309,8 +309,8 @@ export async function issueUserProvisioningRequest(
       // connect() observed absence before entering this helper; reassert it under the exact
       // credential lock so a sibling write cannot land between that read and ticket issuance.
       if (await locked.hasLive(owner, provider)) return null;
-      const now = await fencedTx.get<{ now: number }>(`SELECT ${POSTGRES_NOW_MS_SQL} AS now`);
-      if (!Number.isSafeInteger(now?.now) || issuedAt + PENDING_INTERACTION_TTL_MS <= now!.now) return null;
+      const now = await fencedTx.get<{ now: number }>(`SELECT ${POSTGRES_NOW_US_SQL} AS now`);
+      if (!Number.isSafeInteger(now?.now) || issuedAt + PENDING_INTERACTION_TTL_US <= now!.now) return null;
       const existing = await fencedTx.get<{ id: string; created_at: number; expires_at: number }>(
         `SELECT id, created_at, expires_at FROM user_provisioning_request
          WHERE team_id=? AND user_id=? AND provider=?`,
@@ -330,7 +330,7 @@ export async function issueUserProvisioningRequest(
            id=excluded.id, created_at=excluded.created_at, expires_at=excluded.expires_at,
            delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL
          RETURNING id`,
-        [id, identity.teamId, identity.userId, provider, issuedAt, issuedAt + PENDING_INTERACTION_TTL_MS],
+        [id, identity.teamId, identity.userId, provider, issuedAt, issuedAt + PENDING_INTERACTION_TTL_US],
       );
       if (!isInteractionId(row?.id)) throw new Error('could not issue user provisioning request');
       return row.id;
@@ -365,41 +365,41 @@ export async function claimUserProvisioningDelivery(
       const token = newInteractionId();
       const claimed = await tx.get<{ id: string }>(
         `UPDATE user_provisioning_request
-           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
+           SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_US_SQL}+?, delivered_at=NULL
          WHERE id=? AND team_id=? AND user_id=? AND provider=?
-           AND expires_at>${POSTGRES_NOW_MS_SQL}
+           AND expires_at>${POSTGRES_NOW_US_SQL}
            AND (
              delivered_at IS NULL
-             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_US_SQL}-?)
            )
-           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
          RETURNING id`,
         [
           token,
-          PROMPT_DELIVERY_LEASE_MS,
+          PROMPT_DELIVERY_LEASE_US,
           id,
           identity.teamId,
           identity.userId,
           provider,
           options.redeliverDelivered === true,
-          PROMPT_REDELIVERY_DEBOUNCE_MS,
+          PROMPT_REDELIVERY_DEBOUNCE_US,
         ],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await tx.get<{
         delivered_at: number | null;
         delivery_lease_expires_at: number;
-        now_ms: number;
+        now_us: number;
       }>(
-        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
+        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_US_SQL} AS now_us
            FROM user_provisioning_request
           WHERE id=? AND team_id=? AND user_id=? AND provider=?
-            AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+            AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [id, identity.teamId, identity.userId, provider],
       );
       if (!row) return { status: 'stale' };
       if (row.delivered_at != null) return { status: 'delivered' };
-      if (row.delivery_lease_expires_at > row.now_ms) return { status: 'in-flight' };
+      if (row.delivery_lease_expires_at > row.now_us) return { status: 'in-flight' };
     }
     return { status: 'in-flight' };
   });
@@ -419,10 +419,10 @@ export async function confirmUserProvisioningDelivery(
   return vault.withCredentialLock(userOwner(identity), provider, async (_locked, tx) => (
     await tx.run(
       `UPDATE user_provisioning_request
-          SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL,
+          SET delivered_at=${POSTGRES_NOW_US_SQL}, delivery_token=NULL,
               delivery_lease_expires_at=0
         WHERE id=? AND team_id=? AND user_id=? AND provider=? AND delivery_token=?
-          AND delivered_at IS NULL AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+          AND delivered_at IS NULL AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id, identity.teamId, identity.userId, provider, token],
     )
   ).changes === 1);
