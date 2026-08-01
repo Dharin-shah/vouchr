@@ -457,7 +457,7 @@ export async function markUserOffboardedEverywhere(
   await withOffboardLocks(db, keys, (tx) => writeScopeOffboardMarkers(tx, user.userId, scopes));
 }
 
-interface ConsentRow {
+export interface ConsentRow {
   state: string;
   identity: SlackIdentity;
   provider: string;
@@ -465,6 +465,13 @@ interface ConsentRow {
   pkceVerifier: string;
   /** When the consent state was minted — the callback write-gate compares it to the tombstone. */
   createdAt: number;
+  /** When the browser completing this consent proved the bound Slack identity via the Slack OIDC
+   * hop (#302). NULL until then. */
+  slackVerifiedAt: number | null;
+  /** Whether this consent was MINTED under `requireBrowserSlackIdentity` (#302). Enforcement
+   * authority travels with the row: every callback on every replica honors this value, so a
+   * replica whose own flag is off can never complete an enforced consent unverified. */
+  slackVerifyRequired: boolean;
 }
 
 export interface ConsentRequest {
@@ -490,6 +497,8 @@ function consentRow(row: any): ConsentRow {
     channel: row.channel,
     pkceVerifier: row.pkce_verifier,
     createdAt: row.created_at,
+    slackVerifiedAt: row.slack_verified_at ?? null,
+    slackVerifyRequired: Number(row.slack_verify_required) === 1,
   };
 }
 
@@ -497,10 +506,14 @@ function consentRow(row: any): ConsentRow {
 export class Consent {
   /** `dryRun` (#116): begin() then returns a LOCAL authorize URL — the redirect target itself with
    *  a synthetic code — instead of the provider's, so clicking Connect completes instantly and
-   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery. */
+   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery.
+   *  `browserVerifyUri` (#302): when set, every minted authorize URL is the Vouchr browser-verify
+   *  hop (`<verifyUri>?state=S`) instead of the provider's, so the ONE URL swap covers every
+   *  prompt surface; {@link providerAuthorizeUrl} rebuilds the real URL after Slack verification. */
   constructor(
     private db: Db,
     private dryRun = false,
+    private browserVerifyUri?: string,
   ) {}
 
   /** Create a single-use consent request and return the provider authorize URL. */
@@ -619,9 +632,13 @@ export class Consent {
 
     await db.run(
       `INSERT INTO consent_request
-         (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt],
+         (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at,
+          slack_verify_required)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      // #302: the requirement is PERSISTED at mint time — the callback enforces the row's value,
+      // never a completing replica's process-local flag, so a mixed-config fleet stays fail-closed.
+      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt,
+        this.browserVerifyUri ? 1 : 0],
     );
 
     return this.requestFor(provider, redirectUri, state, pkceVerifier);
@@ -643,6 +660,26 @@ export class Consent {
       return { authorizeUrl: u.toString(), state };
     }
 
+    // #302: with browser verification on, the ONLY URL a prompt ever carries is the Vouchr verify
+    // hop. The provider authorize URL is rebuilt by providerAuthorizeUrl() strictly after the Slack
+    // OIDC hop proves the bound identity, so no surface can hand out a direct provider URL.
+    if (this.browserVerifyUri) {
+      const u = new URL(this.browserVerifyUri);
+      u.searchParams.set('state', state);
+      return { authorizeUrl: u.toString(), state };
+    }
+
+    return { authorizeUrl: this.providerAuthorizeUrl(provider, redirectUri, state, pkceVerifier), state };
+  }
+
+  /** The real provider authorize URL for an already-minted state. Called by requestFor when browser
+   *  verification is off, and by the verify hop's post-verification redirect when it is on. */
+  providerAuthorizeUrl(
+    provider: Provider,
+    redirectUri: string,
+    state: string,
+    pkceVerifier: string,
+  ): string {
     const url = new URL(provider.authorizeUrl);
     // Provider extras FIRST, so the Vouchr-owned params below always win even if one slipped past the
     // definition-time reserved-key guard (RESERVED_AUTHORIZE_PARAMS in defineProvider). Belt and
@@ -661,7 +698,33 @@ export class Consent {
       url.searchParams.set('code_challenge', sha256base64url(pkceVerifier));
       url.searchParams.set('code_challenge_method', 'S256');
     }
-    return { authorizeUrl: url.toString(), state };
+    return url.toString();
+  }
+
+  /** Read — never spend — one still-active consent row, for the browser-verify hop (#302). The same
+   * live predicate as claimDelivery/latestStateFor: unconsumed, unsuperseded, within the state TTL. */
+  async activeRow(state: string): Promise<ConsentRow | null> {
+    if (!isConsentState(state)) return null;
+    const raw = await this.db.get<any>(
+      `SELECT * FROM consent_request
+       WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?`,
+      [state, STATE_TTL_US],
+    );
+    return raw ? consentRow(raw) : null;
+  }
+
+  /** Stamp a still-active consent as browser-verified (#302). Atomic against consume/supersede/TTL:
+   * false means the state was spent, replaced, or expired since the hop began — the caller fails
+   * closed rather than resurrecting authority. */
+  async markSlackVerified(state: string): Promise<boolean> {
+    if (!isConsentState(state)) return false;
+    return (await this.db.run(
+      `UPDATE consent_request SET slack_verified_at=${POSTGRES_NOW_US_SQL}
+       WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?`,
+      [state, STATE_TTL_US],
+    )).changes === 1;
   }
 
   /** Delete any in-flight consent for a user, preventing a pending OAuth from

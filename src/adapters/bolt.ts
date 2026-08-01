@@ -14,6 +14,7 @@ import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
+import { BrowserIdentityVerifier, assertSlackOidcOptions, type SlackOidcOptions } from './slackVerify';
 import { userOwner, channelOwner, type Owner } from '../core/owner';
 import {
   authorizeProvider,
@@ -691,6 +692,21 @@ export interface VouchrOptions {
    * provider. See guides/THREAT-MODEL.md, "Write blast radius differs by transport".
    */
   allowWrites?: boolean;
+  /**
+   * #302: require the browser completing provider OAuth to prove, via Slack OpenID Connect, that it
+   * is signed in as the Slack user the consent `state` was bound to. Connect prompts then point at
+   * a Vouchr verify route (mounted beside `callbackPath`) that routes through Slack sign-in before
+   * revealing the provider authorize URL, and the callback refuses any consent the hop never
+   * stamped. Closes the "Forwarded consent link" hand-off (guides/THREAT-MODEL.md). Requires
+   * `slackOidc` credentials and is incompatible with `dryRun`. Default false.
+   */
+  requireBrowserSlackIdentity?: boolean;
+  /**
+   * Slack app OIDC credentials for `requireBrowserSlackIdentity` (the same Slack app that owns the
+   * bot). Falls back to `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`. The Slack app must list the
+   * `…/slack` route beside `callbackPath` as an OAuth redirect URL (see guides/DEPLOYMENT.md).
+   */
+  slackOidc?: SlackOidcOptions;
 }
 
 /**
@@ -2550,6 +2566,31 @@ export async function createVouchr(opts: VouchrOptions) {
   // and the OAuth redirect URI from interpreting relative/URL/query/fragment forms differently.
   const callbackPath = opts.callbackPath === undefined ? '/vouchr/oauth/callback' : opts.callbackPath;
   const redirectUri = buildCallbackUrl(opts.baseUrl, callbackPath);
+  // #302: validate the browser Slack-identity hop config BEFORE the pool opens, like every other
+  // no-db check above. The verify/slack routes mount beside callbackPath (same directory).
+  if (opts.requireBrowserSlackIdentity !== undefined && typeof opts.requireBrowserSlackIdentity !== 'boolean') {
+    throw new Error('createVouchr: requireBrowserSlackIdentity must be a boolean'); // SEC-4: fail closed, never coerce
+  }
+  const requireBrowserSlackIdentity = opts.requireBrowserSlackIdentity === true;
+  if (requireBrowserSlackIdentity && dryRun) {
+    throw new Error('createVouchr: requireBrowserSlackIdentity is incompatible with dryRun (the synthetic authorize URL never passes the Slack hop)');
+  }
+  const slackOidc = requireBrowserSlackIdentity
+    ? assertSlackOidcOptions(
+        opts.slackOidc ?? {
+          clientId: process.env.SLACK_CLIENT_ID ?? '',
+          clientSecret: process.env.SLACK_CLIENT_SECRET ?? '',
+        },
+        'createVouchr',
+      )
+    : undefined;
+  const browserVerifyPath = callbackPath.replace(/[^/]+$/, 'verify');
+  const slackRedirectPath = callbackPath.replace(/[^/]+$/, 'slack');
+  if (slackOidc && (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath)) {
+    throw new Error('createVouchr: callbackPath must not end in /verify or /slack when requireBrowserSlackIdentity is on');
+  }
+  const browserVerifyUri = slackOidc ? buildCallbackUrl(opts.baseUrl, browserVerifyPath) : undefined;
+  const oidcRedirectUri = slackOidc ? buildCallbackUrl(opts.baseUrl, slackRedirectPath) : undefined;
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
@@ -2567,7 +2608,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope, lockdown);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
-  const consent = new Consent(db, dryRun);
+  const consent = new Consent(db, dryRun, browserVerifyUri);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
@@ -3052,7 +3093,13 @@ export async function createVouchr(opts: VouchrOptions) {
     await args.next();
   };
 
+  // #302: no flag here — the callback enforces the ROW's minted-time slack_verify_required.
   const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, dryRun };
+
+  // #302: one shared verifier owns the OIDC exchange + compare + stamp/spend sequence.
+  const browserVerifier = slackOidc
+    ? new BrowserIdentityVerifier({ consent, registry, redirectUri, oidcRedirectUri: oidcRedirectUri!, audit, auditSink, oidc: slackOidc })
+    : null;
 
   /**
    * #116 dry-run test helper: complete the NEWEST pending consent for (user, provider) through the
@@ -3101,8 +3148,42 @@ export async function createVouchr(opts: VouchrOptions) {
     if (outcome === 'stale') throw new Error('channel tool enable was superseded');
   };
 
-  /** Mount the OAuth callback on the receiver's Express router. */
+  /** One fixed text/plain error response for the browser routes (SEC-1/SEC-5: static text only). */
+  function sendPlain(res: any, status: number, text: string): any {
+    return res
+      .status(status)
+      .set({ 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' })
+      .send(text);
+  }
+
+  /** Mount the OAuth callback (and, with #302 on, the Slack verify hop) on the receiver's router. */
   function mountRoutes(router: any): void {
+    if (browserVerifier) {
+      // #302 hop 1: the Connect prompt's URL. Redirects the browser to Slack's OIDC authorize.
+      router.get(browserVerifyPath, async (req: any, res: any) => {
+        try {
+          const r = await browserVerifier.begin(req.query?.state);
+          if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
+          return sendPlain(res, r.status, r.error);
+        } catch {
+          sendPlain(res, 500, 'Connection failed. Please try again.');
+        }
+      });
+      // #302 hop 2: Slack's redirect back. A verified match continues to the provider authorize URL.
+      router.get(slackRedirectPath, async (req: any, res: any) => {
+        try {
+          const r = await browserVerifier.complete({
+            code: req.query?.code,
+            state: req.query?.state,
+            error: req.query?.error,
+          });
+          if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
+          return sendPlain(res, r.status, r.error);
+        } catch {
+          sendPlain(res, 500, 'Connection failed. Please try again.');
+        }
+      });
+    }
     router.get(callbackPath, async (req: any, res: any) => {
       try {
         const { code, state, error } = req.query;

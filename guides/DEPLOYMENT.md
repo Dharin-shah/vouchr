@@ -190,6 +190,16 @@ exact-version startup check refuses a mismatched binary only at boot, so a v13 p
 across the restore would read the restored millisecond fences as microseconds — the mixed-unit
 condition this drained sequence exists to prevent.
 
+### v13 → v14 (browser Slack-identity verification, #302)
+
+Schema v14 adds two nullable/defaulted columns to `consent_request` (`slack_verified_at`,
+`slack_verify_required`) — purely additive, no data conversion and no drain beyond the ordinary
+rule: run `vouchr migrate` to completion before new replicas start (the exact-version boot check
+enforces it). Pre-v14 consent rows carry `slack_verify_required = 0`, which is exact: their prompt
+URL never offered the verify hop. A pre-v13 database reaches v14 through the drained v13 sequence
+above in the same `vouchr migrate` run — the ms→µs conversion still applies exactly once on the
+way through.
+
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
   and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
@@ -414,6 +424,47 @@ When a `/v1/resolve` returns `needs_consent`, drive the user through `POST /v1/c
 `/v1/fetch` for that user then succeeds. The broker never handles a raw token itself — it is only ever
 written to the vault inside the callback.
 
+#### Browser Slack-identity verification (`requireBrowserSlackIdentity`, #302)
+
+Opt-in hardening for the "Forwarded consent link" hand-off (see `guides/THREAT-MODEL.md`): require
+the browser completing provider OAuth to prove, via Slack OpenID Connect, that it is signed in as
+the Slack user the consent `state` was bound to. Set `VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY=1`
+plus `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` (the Slack app's OIDC credentials —
+the same app that owns your bot). On `createVouchr`/`createBroker` directly, the options are
+`requireBrowserSlackIdentity: true` and `slackOidc: { clientId, clientSecret }`.
+
+With the flag on, the flow gains one redirect hop and two routes mounted beside `callbackPath`
+(broker defaults shown; on Bolt they sit beside `/vouchr/oauth/callback`):
+
+1. `authorizeUrl` from `POST /v1/connect` (or the Bolt Connect button) now points at
+   `GET <baseUrl>/oauth/verify?state=…`, which 302s to Slack's OIDC authorize (`scope=openid`).
+2. Slack authenticates the browser's real Slack session and redirects to
+   `GET <baseUrl>/oauth/slack`. Vouchr exchanges the code at `openid.connect.token` server-side
+   (a Vouchr-internal Slack call — outside the provider egress gate, bounded by the same OAuth
+   deadline and response cap as token exchange, redirects refused) and compares the id_token's
+   `sub`/team claim to the identity bound in the state. Match → the consent row is stamped
+   `slack_verified_at` and the browser is redirected to the real provider authorize URL. Mismatch →
+   the single-use state is spent, the outcome is audited against the **bound** user (reason
+   `browser_identity_mismatch`; the completer's identity is compared and discarded), and a fixed
+   non-reflecting error page is shown.
+3. The provider callback additionally refuses any consent the hop never stamped, so `GET
+   <callbackPath>` can never be used to bypass the hop — a direct hit only burns the state.
+
+The requirement is **persisted with the consent at mint time** (`slack_verify_required`, schema
+v14) and every callback enforces the row's value — never the completing replica's own flag. In a
+multi-replica fleet, a state minted by an enforcing replica therefore fails closed even when the
+provider redirect lands on a replica whose flag is off (rollout, config drift); flip the flag on
+all replicas together to avoid minting mixed generations. Slack's OIDC endpoints are fixed and not
+configurable: the id_token is accepted from Slack's token endpoint over TLS without signature
+verification, so a configurable endpoint would be an identity-forging seam.
+
+Slack app configuration: add `"$VOUCHR_BASE_URL/oauth/slack"` (Bolt:
+`"$baseUrl/vouchr/oauth/slack"`) to the app's **OAuth redirect URLs**; no extra bot scope is
+needed (`openid` is a user-consented sign-in scope requested at the hop). Startup fails closed
+when the flag is set without both OIDC credentials or without `VOUCHR_BASE_URL`, and the flag is
+incompatible with `VOUCHR_DRY_RUN` (the synthetic authorize URL never passes the hop). The flag is
+opt-in during the beta and slated ON-by-default for GA (#302).
+
 ### Convenience: batch status + manifest (#55)
 
 Two non-secret helpers so a host needn't loop `/v1/resolve` or re-derive the provider list:
@@ -598,6 +649,8 @@ POST /v1/admin/reference
 | `VOUCHR_SWEEP_INTERVAL_MS` | no | TTL sweep interval (#54). Default hourly; `0` defers to an external scheduler. |
 | `VOUCHR_BASE_URL` | for OAuth | public HTTPS origin of this broker; setting it mounts `POST /v1/connect` + the OAuth callback (#52). |
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
+| `VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY` | no | `1`/`true` requires the browser completing provider OAuth to prove the bound Slack identity via Slack OIDC before the provider authorize URL is revealed (#302); `0`/`false` disables it, and any other value refuses boot. Needs `VOUCHR_BASE_URL` plus both Slack OIDC credentials below; incompatible with `VOUCHR_DRY_RUN`. See [Browser Slack-identity verification](#browser-slack-identity-verification-requirebrowserslackidentity-302). |
+| `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` | with #302 | the Slack app's OIDC client credentials for the verify hop. The secret must be distinct from every other configured secret (purpose separation). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
@@ -1181,6 +1234,12 @@ setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 
 Single-workspace: set `botToken` (or `SLACK_BOT_TOKEN`). Multi-workspace: use a `DbInstallationStore`
 in both Bolt's OAuth config and `createVouchr` (see *Multi-workspace install* above).
+
+With `requireBrowserSlackIdentity: true` (#302), also add `"$baseUrl/vouchr/oauth/slack"` to the
+app's **OAuth redirect URLs** (App settings → OAuth & Permissions) and pass the app's client
+credentials as `slackOidc: { clientId, clientSecret }` (or `SLACK_CLIENT_ID` /
+`SLACK_CLIENT_SECRET`). The Connect button then routes through Slack sign-in before provider OAuth
+— see [Browser Slack-identity verification](#browser-slack-identity-verification-requirebrowserslackidentity-302).
 
 ## Production readiness checklist
 
