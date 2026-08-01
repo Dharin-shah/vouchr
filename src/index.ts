@@ -1,6 +1,8 @@
 export { createVouchr, ConnectContext } from './adapters/bolt';
 export type { VouchrOptions } from './adapters/bolt';
 export type { ConnectContextDeps, BrokerDenialRecovery } from './adapters/bolt';
+// #302 browser Slack-identity verification (requireBrowserSlackIdentity on either surface).
+export type { SlackOidcOptions } from './adapters/slackVerify';
 // One Bolt-free typed-error contract feeds direct handles, Slack rendering, and the headless broker.
 // Unknown/foreign messages never cross this boundary.
 export {

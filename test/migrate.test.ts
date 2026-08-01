@@ -528,6 +528,58 @@ test('v12 to v13 converts every lifecycle-fence timestamp to microseconds exactl
   assert.deepEqual(await converted(), after, 'a second migrate() must not convert again');
 });
 
+test('v13 to v14 adds the browser-verification columns and leaves converted µs fences untouched (#302)', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+
+  // Materialize head, then recreate the exact v13 predecessor: the #290 µs conversion already ran
+  // (values are microseconds), but the #302 columns do not exist yet.
+  await migrate({ databaseUrl: url });
+  await raw.exec(`ALTER TABLE consent_request DROP COLUMN slack_verified_at`);
+  await raw.exec(`ALTER TABLE consent_request DROP COLUMN slack_verify_required`);
+  const microsCreated = 1_722_000_000_000_000; // an already-converted µs fence stamp
+  const state = 'E'.repeat(43);
+  await raw.run(
+    `INSERT INTO consent_request
+       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
+     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',$2)`,
+    [state, microsCreated],
+  );
+  await raw.run(`INSERT INTO offboard_tombstone (team_id,user_id,created_at) VALUES ('T1','U1',$1)`, [microsCreated]);
+  await raw.run(`UPDATE meta SET value='13' WHERE key='schema_version'`);
+
+  // A v14 binary refuses to run on v13 data until migrate converges it.
+  await assert.rejects(
+    () => openDb({ databaseUrl: url }),
+    new RegExp(`schema version 13.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
+  );
+
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  const row = await raw.get<Record<string, unknown>>(
+    `SELECT created_at, slack_verified_at, slack_verify_required FROM consent_request WHERE state=$1`,
+    [state],
+  );
+  // The columns arrived; the pre-existing row is unverified and NOT required (its prompt URL never
+  // offered the hop), and — critically — the v13 ×1000 conversion did NOT run again on µs data.
+  assert.deepEqual(row, {
+    created_at: microsCreated,
+    slack_verified_at: null,
+    slack_verify_required: 0,
+  });
+  const tomb = await raw.get<{ created_at: number }>(
+    `SELECT created_at FROM offboard_tombstone WHERE team_id='T1'`,
+  );
+  assert.equal(tomb!.created_at, microsCreated, 'a converted µs fence must survive v13→v14 unchanged');
+
+  // Idempotent at head: a second migrate() changes nothing.
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  assert.deepEqual(
+    await raw.get(`SELECT created_at, slack_verified_at, slack_verify_required FROM consent_request WHERE state=$1`, [state]),
+    row,
+  );
+});
+
 test('v10 stamps legacy connections with a PostgreSQL credential-generation boundary', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url } = await emptySchema(t);

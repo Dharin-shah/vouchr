@@ -179,20 +179,22 @@ class PgClientDb implements Db {
  * eligible audience, and requires an explicit mutable-governance scope on pending approvals.
  * Version 13 moves every PostgreSQL-clock lifecycle-fence timestamp from millisecond to
  * microsecond resolution (#290) so unrelated operations no longer tie inside the clock's
- * truncation window.
- * `migrate()` accepts v6-v13 and applies every idempotent cleanup before stamping 13.
+ * truncation window. Version 14 adds `consent_request.slack_verified_at` +
+ * `slack_verify_required` — the browser Slack-identity verification stamp and the minted-time
+ * requirement the OAuth callback enforces (#302).
+ * `migrate()` accepts v6-v14 and applies every idempotent cleanup before stamping 14.
  * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
  * controls differently.
  */
-export const SCHEMA_VERSION = 13;
-const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, 10, 11, 12, SCHEMA_VERSION]);
+export const SCHEMA_VERSION = 14;
+const MIGRATABLE_SCHEMA_VERSIONS = new Set([6, 7, 8, 9, 10, 11, 12, 13, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
  * Migration entry guard — runs BEFORE any DDL. `migrate()` creates a fresh baseline, carries a
- * v6-v12 database to v13, or idempotently verifies v13. The ONLY inputs it can correctly converge are:
+ * v6-v13 database to v14, or idempotently verifies v14. The ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
  *  - a v6 database → the union cleanup plus preview removal;
  *  - a v7 database → preview removal;
@@ -201,9 +203,10 @@ const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value T
  *  - a v10 database → single-generation OAuth consent + delivery state;
  *  - a v11 database → key-prompt delivery leases plus audience-bound approval delivery;
  *  - a v12 database → the ms→µs lifecycle-fence timestamp conversion (#290);
- *  - a v13 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v13 over an unknown shape (a v1–v5 marker,
- * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v13 downgrade —
+ *  - a v13 database → the browser Slack-identity verification columns on consent (#302);
+ *  - a v14 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v14 over an unknown shape (a v1–v5 marker,
+ * a pre-marker legacy schema whose columns this build never created, or a NEWER-than-v14 downgrade —
  * which would let old code corrupt encrypted rows). Vouchr is greenfield: the fix for a rejected
  * database is to recreate it fresh, not to add historical migrations.
  */
@@ -304,7 +307,9 @@ function schema(): string {
       superseded_at ${int},
       delivery_token TEXT,
       delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
-      delivered_at ${int}
+      delivered_at ${int},
+      slack_verified_at ${int},
+      slack_verify_required ${int} NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS user_provisioning_request (
@@ -668,6 +673,13 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS delivery_token TEXT`);
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS delivery_lease_expires_at BIGINT NOT NULL DEFAULT 0`);
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS delivered_at BIGINT`);
+      // v14 (#302): the browser Slack-identity verification columns. `slack_verify_required` is the
+      // MINTED-TIME requirement — enforcement authority travels with the state, never a replica's
+      // process-local flag, so a mixed-config fleet cannot complete an enforced consent unverified.
+      // Both are new and never carry pre-v13 ms values, so the v13 ×1000 conversion below rightly
+      // ignores them; a pre-v14 row gets required=0 (its prompt URL never offered the hop).
+      await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS slack_verified_at BIGINT`);
+      await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS slack_verify_required BIGINT NOT NULL DEFAULT 0`);
       // Created only after the pre-v11 drain above, so a cutover never maintains an index while
       // deleting every old consent row. Runtime recovery sweeps use it as an exact range condition.
       await tx.exec(`CREATE INDEX IF NOT EXISTS idx_consent_request_created_at ON consent_request (created_at)`);

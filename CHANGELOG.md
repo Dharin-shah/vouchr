@@ -5,6 +5,32 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Security
+
+- **`requireBrowserSlackIdentity` (#302): opt-in Slack OpenID Connect verification of the browser
+  completing provider OAuth — the prevention for the "Forwarded consent link" hand-off.** With the
+  flag on (both surfaces: `createVouchr` and `createBroker`/`vouchr-broker` via
+  `VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY` + `VOUCHR_SLACK_CLIENT_ID`/`VOUCHR_SLACK_CLIENT_SECRET`),
+  the Connect prompt's URL becomes a Vouchr verify route that sends the browser through Slack
+  sign-in (`scope=openid`) first; Vouchr exchanges the OIDC code server-side (bounded fetch,
+  redirects refused, Slack's published endpoints only), compares the id_token identity byte-exact
+  to the one bound in the single-use `state`, and only on a match stamps
+  `consent_request.slack_verified_at` and reveals the provider authorize URL. A mismatch spends the
+  state, audits `denied` / `browser_identity_mismatch` against the **bound** user (the completer's
+  identity is compared and discarded, never persisted or rendered), and shows a fixed
+  non-reflecting error. Enforcement authority is **persisted with the consent** at mint time
+  (`slack_verify_required`), and every callback enforces the row's value unconditionally — so in a
+  multi-replica fleet a state minted by an enforcing replica fails closed even when the completing
+  replica has the flag off. The persisted mode is part of the consent generation's identity: a
+  connect under the other mode supersedes a still-pending prompt instead of reusing it, so a flag
+  flip can neither leave a bypassable unenforced row behind a verify-hop URL nor a dead-end
+  enforced row behind a direct URL. Schema v14 adds both columns (run `vouchr migrate`; **do not
+  enable the flag while any v13 process is still live** — see DEPLOYMENT § v13 → v14 for the
+  required rollout order). Off by default in
+  the beta (no behaviour change unless enabled); slated ON-by-default for GA. Regression:
+  `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
+  guides/DEPLOYMENT.md § "Browser Slack-identity verification".
+
 ### Changed
 
 - **Lifecycle fences now compare PostgreSQL time at microsecond resolution (#290).** Every
@@ -20,7 +46,8 @@ All notable changes to this project are documented here. This project adheres to
   so re-running migrate never multiplies twice), and the exact-version boot check keeps a v12
   (millisecond) binary off v13 data. Application-clock columns (`audit.at`, connection
   created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-ms. See
-  guides/DEPLOYMENT.md § Migrations.
+  guides/DEPLOYMENT.md § Migrations. (Superseded as the current version by v14 above; the v13
+  conversion still runs unchanged on the way through.)
 
 ## [1.0.0-beta.1] — 2026-07-26
 
