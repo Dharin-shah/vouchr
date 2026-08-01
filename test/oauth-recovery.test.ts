@@ -15,13 +15,13 @@ import {
   CONSENT_SWEEP_BATCH_SQL,
   Consent,
   MAX_CONSENT_SWEEP_BATCH,
-  STATE_RECOVERY_RETENTION_MS,
-  STATE_TTL_MS,
+  STATE_RECOVERY_RETENTION_US,
+  STATE_TTL_US,
 } from '../src/core/consent';
 import { userOwner } from '../src/core/owner';
 import {
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
 } from '../src/core/interaction';
 import { openDb, type Db } from '../src/core/db';
 import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core/errors';
@@ -285,9 +285,9 @@ test('a delivered connect prompt is reclaimed only for a transient delivery surf
   // owns a transient surface can opt in to reclaiming the same generation.
   await db.run(
     `UPDATE consent_request
-       SET delivered_at = ${POSTGRES_NOW_MS_SQL} - ?
+       SET delivered_at = ${POSTGRES_NOW_US_SQL} - ?
      WHERE state=?`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, pending.state],
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000, pending.state],
   );
   assert.deepEqual(
     await consent.claimDelivery(pending.state),
@@ -450,7 +450,7 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   assert.deepEqual(JSON.parse(incompleteAudit?.meta ?? '{}'), { reason: 'consent_incomplete' });
 
   const expiredState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
-  await db.run(`UPDATE consent_request SET created_at=? WHERE state=?`, [Date.now() - STATE_TTL_MS - 1_000, expiredState.state]);
+  await db.run(`UPDATE consent_request SET created_at=${POSTGRES_NOW_US_SQL}-? WHERE state=?`, [STATE_TTL_US + 1_000_000, expiredState.state]);
   assert.equal(await consent.sweepStale(), 0, 'authority expiry must retain bounded recovery context');
   const expired = await handleOAuthCallback(deps, 'code', expiredState.state);
   assert.equal(!expired.ok && expired.outcome, 'state_expired');
@@ -458,9 +458,9 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
 
   const abandoned = await consent.begin(ID, provider, deps.redirectUri, 'C1');
   await db.run(
-    `UPDATE consent_request SET created_at=? WHERE state IN (?,?)`,
+    `UPDATE consent_request SET created_at=${POSTGRES_NOW_US_SQL}-? WHERE state IN (?,?)`,
     [
-      Date.now() - STATE_RECOVERY_RETENTION_MS - 1_000,
+      STATE_RECOVERY_RETENTION_US + 1_000_000,
       expiredState.state,
       abandoned.state,
     ],
@@ -497,7 +497,9 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
 
 test('OAuth recovery retention prunes in indexed bounded batches', async (t) => {
   const real = await openTestDb(t);
-  const staleAt = Date.now() - STATE_RECOVERY_RETENTION_MS - 60_000;
+  const staleAt = (await real.get<{ n: number }>(
+    `SELECT ${POSTGRES_NOW_US_SQL} - ${STATE_RECOVERY_RETENTION_US + 60_000_000} AS n`,
+  ))!.n;
   await real.exec(
     `INSERT INTO consent_request
        (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at,superseded_at)
@@ -1304,12 +1306,12 @@ test('every user-owned issuance shape is generation-fenced: an older key/referen
 test("an offboarded user's surviving expired link is account-inactive, not \"ask again\"", async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
-  // Offboarding tolerates a failed consent-row purge, so the row can outlive STATE_TTL_MS with no
+  // Offboarding tolerates a failed consent-row purge, so the row can outlive STATE_TTL_US with no
   // re-onboarding. Expiry must NOT mask the lifecycle invalidation the user must act on.
   const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
   await consent.markOffboarded(ID);
   await new Promise((resolve) => setTimeout(resolve, 2));
-  await db.run(`UPDATE consent_request SET created_at=? WHERE state=?`, [Date.now() - STATE_TTL_MS - 1_000, pending.state]);
+  await db.run(`UPDATE consent_request SET created_at=${POSTGRES_NOW_US_SQL}-? WHERE state=?`, [STATE_TTL_US + 1_000_000, pending.state]);
   const claim = await consent.consume(pending.state);
   assert.equal(claim.status, 'invalidated', 'a blocking tombstone wins over expiry');
   assert.equal(claim.status === 'invalidated' && claim.reason, 'offboarded');

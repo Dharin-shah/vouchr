@@ -240,7 +240,7 @@ export async function disconnectChannelShared(input: {
 
         // Current-generation validation: only a credential generation strictly OLDER than this
         // request's issuance is deletable. Timestamp equality FAILS CLOSED (`>=`): both are integer
-        // PostgreSQL milliseconds, so a replacement credential re-configured in the SAME millisecond as
+        // PostgreSQL microseconds, so a replacement credential re-configured in the SAME microsecond as
         // the command's issuance must be treated as newer and left intact — never deleted by the
         // delayed command (finding #1). This matches the write-side newest-generation fence
         // (withUserProvisioningFence): a legitimate replacement always arrives on a strictly-later receipt.

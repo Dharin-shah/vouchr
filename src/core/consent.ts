@@ -8,17 +8,18 @@ import { DRY_RUN_CODE } from './dryRun';
 import {
   isInteractionId,
   newInteractionId,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_DELIVERY_LEASE_MS,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_DELIVERY_LEASE_US,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
   type PromptDeliveryClaim,
   type PromptDeliveryOptions,
 } from './interaction';
 
-export const STATE_TTL_MS = 10 * 60 * 1000;
+/** Microseconds, like every duration compared against the PostgreSQL fence clock. */
+export const STATE_TTL_US = 10 * 60 * 1_000_000;
 /** Expired state has no authority, but its owner-bound row remains briefly so the callback can give
  * precise private recovery instead of becoming indistinguishable from hostile random input. */
-export const STATE_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
+export const STATE_RECOVERY_RETENTION_US = 24 * 60 * 60 * 1_000_000;
 export const MAX_CONSENT_SWEEP_BATCH = 1_000;
 /** One bounded retention statement. The created_at subquery rides
  * idx_consent_request_created_at; the state array lets PostgreSQL use the primary key when that is
@@ -104,7 +105,7 @@ function userOffboardLockKeys(identity: SlackIdentity): string[] {
 
 async function writeTeamOffboardMarker(tx: Db, identity: SlackIdentity): Promise<void> {
   await tx.run(
-    `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,${POSTGRES_NOW_MS_SQL})
+    `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,${POSTGRES_NOW_US_SQL})
      ON CONFLICT(team_id, user_id) DO UPDATE SET created_at=GREATEST(
        offboard_tombstone.created_at,
        excluded.created_at
@@ -119,7 +120,7 @@ async function writeScopeOffboardMarkers(
   scopes: readonly OffboardScope[],
 ): Promise<void> {
   const clock = await tx.get<{ created_at: number }>(
-    `SELECT ${POSTGRES_NOW_MS_SQL} AS created_at`,
+    `SELECT ${POSTGRES_NOW_US_SQL} AS created_at`,
   );
   if (!Number.isSafeInteger(clock?.created_at)) {
     throw new Error('could not establish cross-team offboard fence');
@@ -269,7 +270,7 @@ export async function markProvisioningRevoked(
   const key = provisioningRevocationLockKey(filter.provider, scope.key);
   const mark = async (tx: Db): Promise<number> => {
     const clock = await tx.get<{ created_at: number }>(
-      `SELECT ${POSTGRES_NOW_MS_SQL} AS created_at`,
+      `SELECT ${POSTGRES_NOW_US_SQL} AS created_at`,
     );
     if (!Number.isSafeInteger(clock?.created_at)) {
       throw new Error('could not establish provisioning revocation fence');
@@ -510,7 +511,7 @@ export class Consent {
     channel: string | null,
   ): Promise<ConsentRequest> {
     const clock = await this.db.get<{ issued_at: number }>(
-      `SELECT ${POSTGRES_NOW_MS_SQL} AS issued_at`,
+      `SELECT ${POSTGRES_NOW_US_SQL} AS issued_at`,
     );
     if (!Number.isSafeInteger(clock?.issued_at)) throw new Error('could not issue consent fence');
     const pending = await this.beginFenced(
@@ -571,7 +572,7 @@ export class Consent {
     revokedAt: number | null,
   ): Promise<ConsentRequest | null> {
     const existing = await db.get<any>(
-      `SELECT *, ${POSTGRES_NOW_MS_SQL} AS observed_at
+      `SELECT *, ${POSTGRES_NOW_US_SQL} AS observed_at
        FROM consent_request
        WHERE team_id=? AND user_id=? AND provider=? AND superseded_at IS NULL
        FOR UPDATE`,
@@ -581,7 +582,7 @@ export class Consent {
       const sameContext = existing.enterprise_id === i.enterpriseId
         && existing.channel === channel;
       const live = existing.consumed_at == null
-        && existing.observed_at - existing.created_at <= STATE_TTL_MS;
+        && existing.observed_at - existing.created_at <= STATE_TTL_US;
       const lifecycleCurrent = !tombstoneBlocks(offboardedAt, existing.created_at)
         && !tombstoneBlocks(revokedAt, existing.created_at);
       if (sameContext && live && lifecycleCurrent) {
@@ -594,23 +595,23 @@ export class Consent {
       }
       // A delayed older request may reuse an already-visible prompt in the same context, but it may
       // not replace a newer generation or move that prompt to another channel.
-      if (existing.created_at > issuedAt || existing.observed_at - issuedAt > STATE_TTL_MS) {
+      if (existing.created_at > issuedAt || existing.observed_at - issuedAt > STATE_TTL_US) {
         return null;
       }
       await db.run(
         `UPDATE consent_request
-         SET superseded_at=${POSTGRES_NOW_MS_SQL}
+         SET superseded_at=${POSTGRES_NOW_US_SQL}
          WHERE state=? AND superseded_at IS NULL`,
         [existing.state],
       );
     } else {
       const clock = await db.get<{ observed_at: number }>(
-        `SELECT ${POSTGRES_NOW_MS_SQL} AS observed_at`,
+        `SELECT ${POSTGRES_NOW_US_SQL} AS observed_at`,
       );
       if (!Number.isSafeInteger(clock?.observed_at)) {
         throw new Error('could not establish consent generation');
       }
-      if (clock!.observed_at - issuedAt > STATE_TTL_MS) return null;
+      if (clock!.observed_at - issuedAt > STATE_TTL_US) return null;
     }
 
     const state = randomBytes(32).toString('base64url');
@@ -694,8 +695,8 @@ export class Consent {
     // Sample PostgreSQL time once. A volatile clock_timestamp() inside the row predicate becomes a
     // per-row filter instead of an index condition and can make an empty sweep scan the whole table.
     const rawCutoff = await this.db.get<{ cutoff: unknown }>(
-      `SELECT ${POSTGRES_NOW_MS_SQL} - ? AS cutoff`,
-      [STATE_RECOVERY_RETENTION_MS],
+      `SELECT ${POSTGRES_NOW_US_SQL} - ? AS cutoff`,
+      [STATE_RECOVERY_RETENTION_US],
     );
     const cutoff = Number(rawCutoff?.cutoff);
     if (!Number.isSafeInteger(cutoff)) throw new Error('consent retention cutoff is unavailable');
@@ -716,9 +717,9 @@ export class Consent {
     const row = (await this.db.get(
       `SELECT state FROM consent_request WHERE user_id=? AND provider=?${teamId ? ' AND team_id=?' : ''}
          AND superseded_at IS NULL AND consumed_at IS NULL
-         AND created_at >= ${POSTGRES_NOW_MS_SQL} - ?
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?
        ORDER BY created_at DESC LIMIT 1`,
-      teamId ? [userId, provider, teamId, STATE_TTL_MS] : [userId, provider, STATE_TTL_MS],
+      teamId ? [userId, provider, teamId, STATE_TTL_US] : [userId, provider, STATE_TTL_US],
     )) as any;
     return row?.state ?? null;
   }
@@ -729,9 +730,9 @@ export class Consent {
     if (!isConsentState(state)) return { status: 'unavailable' };
     const raw = await this.db.get<any>(
       `UPDATE consent_request
-       SET consumed_at=${POSTGRES_NOW_MS_SQL}
+       SET consumed_at=${POSTGRES_NOW_US_SQL}
        WHERE state=? AND consumed_at IS NULL
-       RETURNING *, ${POSTGRES_NOW_MS_SQL} AS observed_at`,
+       RETURNING *, ${POSTGRES_NOW_US_SQL} AS observed_at`,
       [state],
     );
     if (!raw) return { status: 'unavailable' };
@@ -768,7 +769,7 @@ export class Consent {
     // finalizeProvisioning() re-checks the tombstones inside the credential transaction, so an
     // offboard/revoke that wins during token exchange still blocks the write.
     if (raw.superseded_at != null) return { status: 'superseded', row };
-    if (raw.observed_at - raw.created_at > STATE_TTL_MS) return { status: 'expired', row };
+    if (raw.observed_at - raw.created_at > STATE_TTL_US) return { status: 'expired', row };
     return { status: 'active', row };
   }
 
@@ -818,39 +819,39 @@ export class Consent {
       const token = newInteractionId();
       const claimed = await this.db.get<{ state: string }>(
         `UPDATE consent_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_US_SQL}+?, delivered_at=NULL
          WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
-           AND created_at >= ${POSTGRES_NOW_MS_SQL}-?
+           AND created_at >= ${POSTGRES_NOW_US_SQL}-?
            AND (
              delivered_at IS NULL
-             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_US_SQL}-?)
            )
-           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
          RETURNING state`,
         [
           token,
-          PROMPT_DELIVERY_LEASE_MS,
+          PROMPT_DELIVERY_LEASE_US,
           state,
-          STATE_TTL_MS,
+          STATE_TTL_US,
           options.redeliverDelivered === true,
-          PROMPT_REDELIVERY_DEBOUNCE_MS,
+          PROMPT_REDELIVERY_DEBOUNCE_US,
         ],
       );
       if (claimed) return { status: 'claimed', token };
       const current = await this.db.get<{
         delivered_at: number | null;
         delivery_lease_expires_at: number;
-        now_ms: number;
+        now_us: number;
       }>(
-        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
+        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_US_SQL} AS now_us
          FROM consent_request
          WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
-           AND created_at >= ${POSTGRES_NOW_MS_SQL}-?`,
-        [state, STATE_TTL_MS],
+           AND created_at >= ${POSTGRES_NOW_US_SQL}-?`,
+        [state, STATE_TTL_US],
       );
       if (!current) return { status: 'stale' };
       if (current.delivered_at != null) return { status: 'delivered' };
-      if (current.delivery_lease_expires_at > current.now_ms) return { status: 'in-flight' };
+      if (current.delivery_lease_expires_at > current.now_us) return { status: 'in-flight' };
     }
     return { status: 'in-flight' };
   }
@@ -859,10 +860,10 @@ export class Consent {
     if (!isConsentState(state) || !isInteractionId(token)) return false;
     return (await this.db.run(
       `UPDATE consent_request
-       SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
+       SET delivered_at=${POSTGRES_NOW_US_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
        WHERE state=? AND delivery_token=? AND superseded_at IS NULL AND consumed_at IS NULL
-         AND delivered_at IS NULL AND created_at >= ${POSTGRES_NOW_MS_SQL}-?`,
-      [state, token, STATE_TTL_MS],
+         AND delivered_at IS NULL AND created_at >= ${POSTGRES_NOW_US_SQL}-?`,
+      [state, token, STATE_TTL_US],
     )).changes === 1;
   }
 

@@ -40,7 +40,7 @@ import {
   userInteractionIsCurrent,
 } from '../../core/consent';
 import { SessionGrants } from '../../core/session';
-import { InteractionStateChangedError, isInteractionId } from '../../core/interaction';
+import { InteractionStateChangedError, isInteractionId, usFromMs } from '../../core/interaction';
 import { ChannelProvisioningRequests, UserProvisioningRequests } from '../../core/provisioning';
 import {
   Approvals,
@@ -821,9 +821,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     return claims;
   }
 
-  /** Map one verified deployment-bound assertion into PostgreSQL's clock domain. Preserving its
-   * observed age makes process/DB clock offset irrelevant; query latency and the accepted identity
-   * skew both move the result earlier, so uncertainty fails closed. */
+  /** Map one verified deployment-bound assertion into PostgreSQL's microsecond clock domain.
+   * Preserving its observed age makes process/DB clock offset irrelevant; query latency and the
+   * accepted identity skew both move the result earlier, so uncertainty fails closed. JWT `iat`
+   * and the skew are milliseconds — convert once at this boundary. */
   async function userInteractionIssuedAt(claims: IdentityClaims): Promise<number> {
     if (!Number.isSafeInteger(claims.iat)) {
       throw new HttpError(401, { error: 'invalid identity token' });
@@ -831,7 +832,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const pgNow = await opts.vault.userProvisioningIssuedAt();
     const observedAt = Date.now();
     const tokenAge = Math.max(0, observedAt - claims.iat!);
-    const issuedAt = pgNow - tokenAge - IDENTITY_SKEW_MS;
+    const issuedAt = pgNow - usFromMs(tokenAge + IDENTITY_SKEW_MS);
     if (!Number.isSafeInteger(issuedAt)) {
       throw new HttpError(401, { error: 'invalid identity token' });
     }

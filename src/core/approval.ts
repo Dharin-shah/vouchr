@@ -19,10 +19,11 @@ import {
   InteractionStateChangedError,
   isInteractionId,
   newInteractionId,
-  PENDING_INTERACTION_TTL_MS,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_DELIVERY_LEASE_MS,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  PENDING_INTERACTION_TTL_US,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_DELIVERY_LEASE_US,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
+  usFromMs,
   type PromptDeliveryClaim,
   type PromptDeliveryOptions,
 } from './interaction';
@@ -507,7 +508,7 @@ export class Approvals {
         `INSERT INTO approval_request
            (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, query_hash,
             channel, thread, governable_channel, status, approved_by, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?)
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
@@ -527,9 +528,9 @@ export class Approvals {
            AND approval_request.query_hash=excluded.query_hash
            AND approval_request.channel=excluded.channel
            AND approval_request.thread=excluded.thread
-           AND approval_request.expires_at<=${POSTGRES_NOW_MS_SQL}
+           AND approval_request.expires_at<=${POSTGRES_NOW_US_SQL}
          RETURNING id`,
-        [id, actionKey, ...params, PENDING_INTERACTION_TTL_MS],
+        [id, actionKey, ...params, PENDING_INTERACTION_TTL_US],
       );
       if (row) return { id: row.id, created: true };
       const live = await db.get<{ id: string }>(
@@ -538,7 +539,7 @@ export class Approvals {
            AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
            AND method=? AND origin=? AND host=? AND path=? AND query_hash=? AND channel=? AND thread=?
            AND governable_channel=?
-           AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+           AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [actionKey, ...params],
       );
       if (live) return { id: live.id, created: false };
@@ -603,25 +604,25 @@ export class Approvals {
       // remains an explicit adapter decision because some private surfaces are durable messages.
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE approval_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?,
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_US_SQL}+?,
              delivered_at=NULL, delivery_audience=?
-         WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_MS_SQL}
+         WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_US_SQL}
            AND (
-             delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL}
+             delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL}
            )
            AND (
              delivery_audience IS DISTINCT FROM ? OR delivered_at IS NULL
-             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_US_SQL}-?)
            )
          RETURNING id`,
         [
           token,
-          PROMPT_DELIVERY_LEASE_MS,
+          PROMPT_DELIVERY_LEASE_US,
           audience,
           id,
           audience,
           options.redeliverDelivered === true,
-          PROMPT_REDELIVERY_DEBOUNCE_MS,
+          PROMPT_REDELIVERY_DEBOUNCE_US,
         ],
       );
       if (claimed) return { status: 'claimed', token };
@@ -630,23 +631,23 @@ export class Approvals {
         delivery_token: string | null;
         delivery_lease_expires_at: number;
         delivery_audience: string | null;
-        now_ms: number;
+        now_us: number;
       }>(
         `SELECT delivered_at, delivery_token, delivery_lease_expires_at, delivery_audience,
-                ${POSTGRES_NOW_MS_SQL} AS now_ms
+                ${POSTGRES_NOW_US_SQL} AS now_us
          FROM approval_request
-         WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [id],
       );
       if (!row) return { status: 'stale' };
       if (row.delivery_audience !== audience) {
-        if (row.delivery_token !== null && row.delivery_lease_expires_at > row.now_ms) {
+        if (row.delivery_token !== null && row.delivery_lease_expires_at > row.now_us) {
           return { status: 'in-flight' };
         }
         continue;
       }
       if (row.delivered_at != null) return { status: 'delivered' };
-      if (row.delivery_lease_expires_at > row.now_ms) return { status: 'in-flight' };
+      if (row.delivery_lease_expires_at > row.now_us) return { status: 'in-flight' };
     }
     return { status: 'in-flight' };
   }
@@ -656,10 +657,10 @@ export class Approvals {
       return false;
     }
     return (await this.db.run(
-      `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
+      `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_US_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
        WHERE id=? AND delivery_token=? AND delivery_audience=?
          AND status='pending' AND delivered_at IS NULL
-         AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id, token, audience],
     )).changes === 1;
   }
@@ -694,7 +695,7 @@ export class Approvals {
     if (!isInteractionId(id)) return null;
     const row = await this.db.get<any>(
       `SELECT * FROM approval_request WHERE id=? AND status='pending'
-       AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+       AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id],
     );
     return row ? toRow(row) : null;
@@ -717,9 +718,9 @@ export class Approvals {
   async approve(id: string, approvedBy: string, ttlMs: number): Promise<boolean> {
     if (!isInteractionId(id)) return false;
     const { changes } = await this.db.run(
-      `UPDATE approval_request SET status='granted', approved_by=?, expires_at=${POSTGRES_NOW_MS_SQL}+?
-       WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_MS_SQL}`,
-      [approvedBy, ttlMs, id],
+      `UPDATE approval_request SET status='granted', approved_by=?, expires_at=${POSTGRES_NOW_US_SQL}+?
+       WHERE id=? AND status='pending' AND expires_at>${POSTGRES_NOW_US_SQL}`,
+      [approvedBy, usFromMs(ttlMs), id],
     );
     return changes === 1;
   }
@@ -758,7 +759,7 @@ export class Approvals {
         WHERE action_key=?
           AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=? AND method=? AND origin=? AND host=? AND path=? AND query_hash=?
           AND channel=? AND thread=? AND governable_channel=?
-          AND status='granted' AND expires_at>${POSTGRES_NOW_MS_SQL}
+          AND status='granted' AND expires_at>${POSTGRES_NOW_US_SQL}
         LIMIT 1`,
       [approvalActionKey(k), ...this.keyParams(k)],
     );
@@ -771,7 +772,7 @@ export class Approvals {
   ): Promise<{ approvedBy: string | null } | null> {
     const row = await db.get<{ approved_by: string | null }>(
       `DELETE FROM approval_request
-        WHERE id=? AND status='granted' AND expires_at>${POSTGRES_NOW_MS_SQL}
+        WHERE id=? AND status='granted' AND expires_at>${POSTGRES_NOW_US_SQL}
         RETURNING approved_by`,
       [id],
     );
@@ -893,7 +894,7 @@ export class Approvals {
         async (tx) => {
           const raw = await tx.get<any>(
             `SELECT * FROM approval_request WHERE id=? AND status='pending'
-             AND expires_at>${POSTGRES_NOW_MS_SQL} FOR UPDATE`,
+             AND expires_at>${POSTGRES_NOW_US_SQL} FOR UPDATE`,
             [input.id],
           );
           if (!raw) return { status: 'stale' } as const;
@@ -915,8 +916,8 @@ export class Approvals {
           if (input.decision === 'approve') {
             const updated = await tx.get<{ expires_at: number }>(
               `UPDATE approval_request SET status='granted', approved_by=?,
-                 expires_at=${POSTGRES_NOW_MS_SQL}+? WHERE id=? RETURNING expires_at`,
-              [input.approvedBy, input.ttlMs, row.id],
+                 expires_at=${POSTGRES_NOW_US_SQL}+? WHERE id=? RETURNING expires_at`,
+              [input.approvedBy, usFromMs(input.ttlMs), row.id],
             );
             if (!updated) return { status: 'stale' } as const;
             const expiresAt = updated.expires_at;
@@ -969,7 +970,7 @@ export class Approvals {
    *  audit each expiry. Run on the same timer as the connection TTL sweep. */
   async sweepExpired(): Promise<ApprovalRow[]> {
     const rows = await this.db.all<any>(
-      `DELETE FROM approval_request WHERE expires_at<${POSTGRES_NOW_MS_SQL} RETURNING *`,
+      `DELETE FROM approval_request WHERE expires_at<${POSTGRES_NOW_US_SQL} RETURNING *`,
     );
     return rows.map(toRow);
   }

@@ -5,6 +5,23 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Lifecycle fences now compare PostgreSQL time at microsecond resolution (#290).** Every
+  PostgreSQL-clock fence timestamp — the offboard, break-glass, and channel-interaction tombstones,
+  `connection.generation_at`, and pending consent/provisioning/session/approval state — is stored
+  and compared in epoch microseconds. Every `>=` comparison keeps its fail-closed direction, so a
+  genuine tie still blocks; what changes is that unrelated back-to-back operations no longer tie
+  inside a one-millisecond truncation window, making spurious "Review current status" /
+  "setup changed while Vouchr was preparing it" refusals right after an unrelated config mutation
+  vanishingly rare.
+- **Schema version 13** with a required drained cutover: `vouchr migrate` converts every stored
+  fence timestamp ms→µs exactly once (the conversion is gated on the recorded predecessor version,
+  so re-running migrate never multiplies twice), and the exact-version boot check keeps a v12
+  (millisecond) binary off v13 data. Application-clock columns (`audit.at`, connection
+  created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-ms. See
+  guides/DEPLOYMENT.md § Migrations.
+
 ## [1.0.0-beta.1] — 2026-07-26
 
 Security release with **two** credential-exposure fixes. **Anyone running `1.0.0-beta` should

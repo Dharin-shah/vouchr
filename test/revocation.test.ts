@@ -20,6 +20,7 @@ import { channelOwner, userOwner } from '../src/core/owner';
 import type { EnvelopeProvider } from '../src/core/crypto';
 import type { SlackIdentity } from '../src/core/identity';
 import { openDb } from '../src/core/db';
+import { POSTGRES_NOW_US_SQL } from '../src/core/interaction';
 import {
   ChannelProvisioningRequests,
   configureUserCredential,
@@ -1766,7 +1767,7 @@ test('offboardUser succeeds when only the consent-row purge fails but the tombst
 
 test('repeated team and global offboarding never move an existing tombstone backward', async (t) => {
   const db = await openTestDb(t);
-  const future = Date.now() + 60_000;
+  const future = (await db.get<{ n: number }>(`SELECT ${POSTGRES_NOW_US_SQL} + 60000000 AS n`))!.n;
   const identity = { enterpriseId: null, teamId: 'T_MONOTONIC', userId: 'U_MONOTONIC' };
   await db.run(
     `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,?)`,

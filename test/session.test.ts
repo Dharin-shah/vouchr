@@ -32,8 +32,8 @@ import { setChannelCredentialMode } from '../src/core/channelCredential';
 import { Approvals } from '../src/core/approval';
 import {
   InteractionStateChangedError,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
 } from '../src/core/interaction';
 import { mapSafeError, type VouchrRecovery } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
@@ -156,10 +156,10 @@ test('PostgreSQL clock owns session TTL/lease and expired delivered requests res
 
   const first = await withClockOffset(60 * 60_000, () => a.request(ID, 'C1', 'TH1', 'gh', GENERATION));
   const firstRow = await dbA.get<any>(`SELECT * FROM session_request WHERE id=?`, [first.id]);
-  const dbNow = await dbA.get<{ now_ms: number }>(
-    `SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS now_ms`,
+  const dbNow = await dbA.get<{ now_us: number }>(
+    `SELECT ${POSTGRES_NOW_US_SQL} AS now_us`,
   );
-  assert.ok(Math.abs(firstRow.created_at - dbNow!.now_ms) < 5_000);
+  assert.ok(Math.abs(firstRow.created_at - dbNow!.now_us) < 5_000_000);
   const claim = await withClockOffset(60 * 60_000, () => a.claimDelivery(first.id));
   assert.equal(claim.status, 'claimed');
   assert.equal((await withClockOffset(-60 * 60_000, () => b.claimDelivery(first.id))).status, 'in-flight');
@@ -515,8 +515,8 @@ test('connect(): covered provider deduplicates one opaque in-thread request and 
   assert.ok(!sessionRows[0].meta.includes(button.value), 'opaque control ids never enter audit metadata');
 
   await db.run(
-    `UPDATE session_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-? WHERE id=?`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, button.value],
+    `UPDATE session_request SET delivered_at=${POSTGRES_NOW_US_SQL}-? WHERE id=?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000, button.value],
   );
   await assert.rejects(() => make('TH_A').connect('gh'), SessionApprovalRequiredError);
   assert.equal(posted.length, 2, 'the vanished session ephemeral is re-posted after the debounce');
@@ -1062,7 +1062,7 @@ test('offboard tombstone and session grant linearize across pools; tombstone-fir
   const releaseP = new Promise<void>((resolve) => { release = resolve; });
   const tombstone = withOffboardLock(dbB, 'T1', 'U1', async (tx) => {
     await tx.run(
-      `INSERT INTO offboard_tombstone (team_id,user_id,created_at) VALUES (?,?,${POSTGRES_NOW_MS_SQL})
+      `INSERT INTO offboard_tombstone (team_id,user_id,created_at) VALUES (?,?,${POSTGRES_NOW_US_SQL})
        ON CONFLICT(team_id,user_id) DO UPDATE SET created_at=excluded.created_at`,
       ['T1', 'U1'],
     );

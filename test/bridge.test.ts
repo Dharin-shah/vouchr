@@ -41,8 +41,8 @@ import type { Db } from '../src/core/db';
 import { openDb } from '../src/core/db';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import {
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
 } from '../src/core/interaction';
 
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -436,9 +436,9 @@ test('bridge: connect prompts deduplicate rapid retries and recover after an eph
   assert.equal((await h.db.all("SELECT 1 AS x FROM consent_request WHERE superseded_at IS NULL")).length, 1);
 
   await h.db.run(
-    `UPDATE consent_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?
+    `UPDATE consent_request SET delivered_at=${POSTGRES_NOW_US_SQL}-?
       WHERE superseded_at IS NULL`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000],
   );
   const recovered = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
   assert.deepEqual(recovered, {
@@ -458,9 +458,9 @@ test('bridge: an aged durable connect DM remains deduplicated', async (t) => {
   assert.equal(h.dms.length, 1);
 
   await h.db.run(
-    `UPDATE consent_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?
+    `UPDATE consent_request SET delivered_at=${POSTGRES_NOW_US_SQL}-?
       WHERE superseded_at IS NULL`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000],
   );
   const again = await (await h.context({ channel: null, thread: null }))
     .recoverBrokerDenial('gh', { code: 'not_connected' });
@@ -486,8 +486,8 @@ test('bridge: user not_connected for a key provider posts the key-setup prompt',
   assert.equal(h.ephemerals.length, 1, 'the delivered key-setup prompt is not reposted');
 
   await h.db.run(
-    `UPDATE user_provisioning_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+    `UPDATE user_provisioning_request SET delivered_at=${POSTGRES_NOW_US_SQL}-?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000],
   );
   const recovered = await (await h.context()).recoverBrokerDenial('vaulted', {
     code: 'not_connected',
@@ -508,8 +508,8 @@ test('bridge: an aged durable key-setup DM remains deduplicated', async (t) => {
   assert.equal(h.dms.length, 1);
 
   await h.db.run(
-    `UPDATE user_provisioning_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-?`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000],
+    `UPDATE user_provisioning_request SET delivered_at=${POSTGRES_NOW_US_SQL}-?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000],
   );
   const again = await (await h.context({ channel: null, thread: null }))
     .recoverBrokerDenial('vaulted', { code: 'not_connected' });
@@ -870,8 +870,8 @@ test('bridge: broker approval denial delivers ONE self decision surface; approve
   assert.equal(h.ephemerals.length, 1, 'no duplicate prompt');
 
   await h.db.run(
-    `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-? WHERE id=?`,
-    [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, denial.approvalId],
+    `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_US_SQL}-? WHERE id=?`,
+    [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000, denial.approvalId],
   );
   const recovered = await (await h.context()).recoverBrokerDenial('acme', denial);
   assert.deepEqual(recovered, {
