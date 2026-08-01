@@ -156,8 +156,9 @@ Do not leave any pre-v12 process live during or after migration. Older processes
 marker after startup; v8 cannot supply the required approval action key, v9 can still accept an
 unfenced static/reference write, and v10 does not enforce the single-generation OAuth contract.
 Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11/v12/v13 service is unsupported.
-Rollback requires stopping v12, restoring the matching pre-migration backup, and only then starting
-the binary that created it; running an older binary against schema v12 is refused and unsafe.
+Rollback from this cutover requires stopping v12, restoring the matching pre-migration backup, and
+only then starting the binary that created it; running an older binary against schema v12 is refused
+and unsafe. (v13 rollback has its own sequence below.)
 
 ### Required v12 (or any earlier supported marker) → v13 drained cutover
 
@@ -182,6 +183,12 @@ created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-milliseconds.
 4. Start only v13 replicas, confirm readiness, and restore traffic. This step drains no
    user-visible state: pending prompts, grants, and durable tombstones carry over at the new
    resolution.
+
+Rollback from v13 requires stopping **every** v13 replica, restoring the matching pre-v13 backup,
+and only then starting the older binary that created that backup. The order matters: the
+exact-version startup check refuses a mismatched binary only at boot, so a v13 process left live
+across the restore would read the restored millisecond fences as microseconds — the mixed-unit
+condition this drained sequence exists to prevent.
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
