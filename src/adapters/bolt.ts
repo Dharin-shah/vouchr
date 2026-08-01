@@ -2584,8 +2584,11 @@ export async function createVouchr(opts: VouchrOptions) {
         'createVouchr',
       )
     : undefined;
-  const browserVerifyPath = callbackPath.replace(/[^/]+$/, 'verify');
-  const slackRedirectPath = callbackPath.replace(/[^/]+$/, 'slack');
+  // Plain string slicing (not a regex): callbackPath was proven canonical above, and CodeQL flags
+  // an end-anchored [^/]+ replace as polynomial-time on adversarial input.
+  const callbackDir = callbackPath.slice(0, callbackPath.lastIndexOf('/') + 1);
+  const browserVerifyPath = `${callbackDir}verify`;
+  const slackRedirectPath = `${callbackDir}slack`;
   if (slackOidc && (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath)) {
     throw new Error('createVouchr: callbackPath must not end in /verify or /slack when requireBrowserSlackIdentity is on');
   }

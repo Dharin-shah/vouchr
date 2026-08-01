@@ -788,8 +788,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   let browserVerifyUri: string | undefined;
   let oidcRedirectUri: string | undefined;
   if (slackOidc) {
-    browserVerifyPath = callbackPath.replace(/[^/]+$/, 'verify');
-    slackRedirectPath = callbackPath.replace(/[^/]+$/, 'slack');
+    // Plain string slicing (not a regex): callbackPath was proven canonical above, and CodeQL flags
+    // an end-anchored [^/]+ replace as polynomial-time on adversarial input.
+    const callbackDir = callbackPath.slice(0, callbackPath.lastIndexOf('/') + 1);
+    browserVerifyPath = `${callbackDir}verify`;
+    slackRedirectPath = `${callbackDir}slack`;
     if (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath) {
       throw new Error('createBroker: callbackPath must not end in /verify or /slack when requireBrowserSlackIdentity is on');
     }
