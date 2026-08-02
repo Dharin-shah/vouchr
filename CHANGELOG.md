@@ -25,8 +25,8 @@ All notable changes to this project are documented here. This project adheres to
   connect under the other mode supersedes a still-pending prompt instead of reusing it, so a flag
   flip can neither leave a bypassable unenforced row behind a verify-hop URL nor a dead-end
   enforced row behind a direct URL. Schema v14 adds both columns (run `vouchr migrate`; **do not
-  enable the flag while any v13 process is still live** — see DEPLOYMENT § v13 → v14 for the
-  required rollout order). Off by default in
+  enable the flag while any v13 process is still live** — see guides/DEPLOYMENT.md
+  § "Upgrading from 1.0.0-beta.1" for the required rollout order). Off by default in
   the beta (no behaviour change unless enabled); slated ON-by-default for GA. Regression:
   `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
   guides/DEPLOYMENT.md § "Browser Slack-identity verification".
@@ -48,6 +48,13 @@ All notable changes to this project are documented here. This project adheres to
   created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-ms. See
   guides/DEPLOYMENT.md § Migrations. (Superseded as the current version by v14 above; the v13
   conversion still runs unchanged on the way through.)
+
+### Docs
+
+- Removed pre-1.0 migration archaeology from the guides: DEPLOYMENT now carries a single
+  "Upgrading from 1.0.0-beta.1" runbook (drained cutover → backup → `vouchr migrate` → new
+  replicas → only then enable `requireBrowserSlackIdentity`), and README/SECURITY are aligned
+  with the shipped `1.0.0-beta.1` release.
 
 ## [1.0.0-beta.1] — 2026-07-26
 

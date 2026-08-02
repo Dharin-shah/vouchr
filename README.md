@@ -8,8 +8,8 @@
 </div>
 
 > [!IMPORTANT]
-> **Beta.** `1.0.0-beta` is the current release (PostgreSQL-only, deny-by-default) and the
-> recommended build. Feedback and issues are very welcome.
+> **Beta.** PostgreSQL-only, deny-by-default, not yet independently assessed. Feedback and
+> issues are very welcome.
 
 When a Slack agent needs to touch GitHub, Google, or Jira, teams pick between two bad options:
 one broad bot token (every action is "the bot", wielding everyone's power at once), or user
@@ -30,14 +30,14 @@ permissions, their consent.
 - **Tokens never reach the model.** Not the prompt, not the transcript, not your logs. Injection
   happens inside Vouchr, at the outbound HTTP request.
 - **Guardrails on every call.** Allowlisted hosts and paths, per-user rate limits, response caps,
-  and human Approve/Deny for sensitive writes.
+  human Approve/Deny for sensitive writes — or pin the whole deployment read-only.
 - **Governed in Slack, deny-by-default.** A provider is off in a channel until an admin enables it
-  there; then they pick the model per channel. Direct messages are personal, not governed.
+  there; then they pick the credential mode per channel. Direct messages are personal, not governed.
 - **Accountable and revocable.** Every action ties to the Slack identity that authorized it, and
   deactivating someone in Slack revokes their credentials. For a full compromise there is a tested
   break-glass — see [SECURITY.md](./SECURITY.md).
-- **Consent bound to the person, not just the link.** Opt-in `requireBrowserSlackIdentity` makes the
-  browser completing OAuth sign in with Slack first, so a forwarded Connect link cannot bind someone
+- **Consent bound to the person, not just the link.** Opt-in verification makes the browser
+  completing OAuth sign in with Slack first, so a forwarded Connect link cannot bind someone
   else's account — see [guides/DEPLOYMENT.md](./guides/DEPLOYMENT.md).
 - **Self-hosted.** Your infrastructure, your PostgreSQL, your keys (or your KMS).
 
@@ -47,7 +47,7 @@ permissions, their consent.
 app, a GitHub OAuth app, and the bot acting as you in ~5 minutes.
 
 ```bash
-npm install @vouchr/core   # `latest` currently resolves to 1.0.0-beta
+npm install @vouchr/core
 ```
 
 ```ts
@@ -116,8 +116,7 @@ providers, and the [provider model](./guides/ARCHITECTURE.md#different-scopes-in
 for running one provider at different scopes in different channels.
 
 Runnable examples — Google, Databricks, internal API keys, every major secret manager, the headless
-broker client, MCP gateway, Prometheus, SCIM — live in [`examples/`](./examples), each with its own
-README.
+broker client, MCP gateway, Prometheus, SCIM — live in [`examples/`](./examples).
 
 ## Test without any external service
 
@@ -143,6 +142,8 @@ prompt from verified state. See the [hybrid architecture](./guides/HYBRID.md) an
 | [Threat model](./guides/THREAT-MODEL.md) | What Vouchr defends against — and its honest limits |
 | [Deployment](./guides/DEPLOYMENT.md) | PostgreSQL, KMS, Kubernetes, runbooks, production checklist |
 | [Headless](./guides/HEADLESS.md) | Broker API, error contract, replay protection |
+| [Hybrid](./guides/HYBRID.md) | Public Slack control plane + private broker, in separate processes |
+| [Operator CLI](./guides/CLI.md) | migrate, inventory, channels, revoke, rekey, prune, doctor |
 | [Vision](./vision.md) | Product scope and roadmap |
 | [SECURITY.md](./SECURITY.md) | Security model and how to report issues |
 
