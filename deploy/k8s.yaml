@@ -35,7 +35,7 @@ spec:
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: migrate
-          image: REPLACE_ME/vouchr-broker:1.0.0-beta # SAME image/tag as the Deployment below
+          image: REPLACE_ME/vouchr-broker:1.0.0-beta.1 # SAME image/tag as the Deployment below
           command: ["node", "dist/bin/vouchr.js", "migrate"]
           # This env carries the SCHEMA-OWNER VOUCHR_DATABASE_URL (a role that can CREATE tables) —
           # a DIFFERENT Secret from the runtime's DML-only credential below.
@@ -79,7 +79,7 @@ spec:
           # Pin to your registry + an immutable tag (ideally the digest you verified — see
           # guides/DEPLOYMENT.md). Do NOT use `:latest`: it still points at the pre-Postgres 0.2.0
           # image because the release workflow only moves `latest` on a stable (non-prerelease) tag.
-          image: REPLACE_ME/vouchr-broker:1.0.0-beta
+          image: REPLACE_ME/vouchr-broker:1.0.0-beta.1
           ports:
             - { name: http, containerPort: 3000 }
           # Secrets (VOUCHR_IDENTITY_SECRET, optional VOUCHR_IDENTITY_SECRET_PREVIOUS,

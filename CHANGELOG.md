@@ -49,6 +49,13 @@ All notable changes to this project are documented here. This project adheres to
   guides/DEPLOYMENT.md § Migrations. (Superseded as the current version by v14 above; the v13
   conversion still runs unchanged on the way through.)
 
+### Docs
+
+- Removed pre-1.0 migration archaeology from the guides: DEPLOYMENT now carries a single
+  "Upgrading from 1.0.0-beta.1" runbook (drained cutover → backup → `vouchr migrate` → new
+  replicas → only then enable `requireBrowserSlackIdentity`), and README/SECURITY are aligned
+  with the shipped `1.0.0-beta.1` release.
+
 ## [1.0.0-beta.1] — 2026-07-26
 
 Security release with **two** credential-exposure fixes. **Anyone running `1.0.0-beta` should

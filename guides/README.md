@@ -8,4 +8,4 @@ material:
 - [Headless HTTP](./HEADLESS.md) - the broker API, wire contracts, and low-level integration surface.
 - [Deployment](./DEPLOYMENT.md) - PostgreSQL, KMS/envelope encryption, and production recommendations.
 - [Threat model](./THREAT-MODEL.md) - trust boundaries, attacker model, and enforced invariants.
-- [Operator CLI](./CLI.md) - read-only operational commands and diagnostics.
+- [Operator CLI](./CLI.md) - operational commands: reads are metadata-only; `migrate`, `revoke`, `rekey`, and `prune` mutate.
