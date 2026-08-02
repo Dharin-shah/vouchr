@@ -33,6 +33,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- Pre-beta schema markers (v6-v11) are no longer migratable — they never shipped in a published
+  release; `vouchr migrate` refuses them with the same recreate-fresh error v1-v5 get (recreate
+  the database fresh, or migrate through 1.0.0-beta.1 first). Only v12-v14 remain migratable.
 - **Lifecycle fences now compare PostgreSQL time at microsecond resolution (#290).** Every
   PostgreSQL-clock fence timestamp — the offboard, break-glass, and channel-interaction tombstones,
   `connection.generation_at`, and pending consent/provisioning/session/approval state — is stored

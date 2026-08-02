@@ -74,8 +74,20 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
   assert.equal(await tableExists('channel_interaction_tombstone'), true);
   assert.equal(await tableExists('user_offboard_scope_tombstone'), true);
   assert.equal(await tableExists('provisioning_revocation_tombstone'), true);
-  assert.equal(await tableExists('channel_preview'), false, 'fresh schemas must not recreate the removed preview store');
   const raw = rawDb(t, url);
+  // These indexes live in migrate(), not schema(): a fresh install must still get consent's
+  // single-active-generation uniqueness, the consent retention index, and approval dedup uniqueness.
+  const indexdef = async (name: string) =>
+    (await raw.get<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes WHERE schemaname=current_schema() AND indexname=$1`,
+      [name],
+    ))?.indexdef ?? '';
+  assert.match(
+    await indexdef('uq_consent_request_active'),
+    /UNIQUE.*\(team_id, user_id, provider\).*WHERE \(superseded_at IS NULL\)/i,
+  );
+  assert.match(await indexdef('idx_consent_request_created_at'), /\(created_at\)/i);
+  assert.match(await indexdef('uq_approval_request_action'), /UNIQUE.*\(action_key\)$/i);
   const governanceColumn = await raw.get<{ is_nullable: string }>(
     `SELECT is_nullable FROM information_schema.columns
       WHERE table_schema=current_schema()
@@ -94,7 +106,7 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
           'api.acme.test','/write','C1','TH1',NULL,'pending',1,9999999999999)`,
     ),
     /null value.*governable_channel/i,
-    'fresh v12 schemas reject approval rows without an explicit governance scope',
+    'fresh schemas reject approval rows without an explicit governance scope',
   );
 
   // A second migrate on the same schema must be a no-op (idempotent), not error, same version.
@@ -126,239 +138,30 @@ test('openDb() succeeds after migrate()', async (t) => {
   assert.equal((await db.all('SELECT COUNT(*)::int AS n FROM connection'))[0].n, 0);
 });
 
-test('current runtime refuses a v8 schema until the drained migration runs', async (t) => {
-  if (!(await pgReachable())) return t.skip(SKIP);
-  const { url } = await emptySchema(t);
-  const raw = rawDb(t, url);
-  await raw.exec('CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
-  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version', '8')`);
-
-  await assert.rejects(
-    () => openDb({ databaseUrl: url }),
-    new RegExp(`schema version 8.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
-    'the current runtime must not start against v8 while old replicas are being drained',
-  );
-});
-
-test('current migration invalidates prerelease-v9 consent and preserves current lifecycle rows', async (t) => {
+// No published release ever shipped schemas v6-v11 (v0.2.0 was pre-v6; v1.0.0-beta/-beta.1 are
+// v12), so migrate() refuses them with the same recreate-fresh guidance a v1-v5 marker gets.
+test('migrate() refuses a pre-beta v6-v11 marker with the recreate-fresh error', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url, tableExists } = await emptySchema(t);
   const raw = rawDb(t, url);
-  // Materialize the complete predecessor shape, then remove the v10 relations and restore the v9
-  // marker. This catches migrations that work on a synthetic marker-only DB but not a real v9.
-  await migrate({ databaseUrl: url });
-  await raw.run(
-    `INSERT INTO consent_request
-       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
-     VALUES
-       ('pre-v10-state',NULL,'T1','U1','acme','C1','verifier',1)`,
-  );
-  await raw.run(
-    `INSERT INTO offboard_tombstone (team_id,user_id,created_at) VALUES ('T1','U1',123)`,
-  );
-  await raw.exec('DROP TABLE user_provisioning_request');
-  await raw.exec('DROP TABLE channel_provisioning_request');
-  await raw.exec('DROP TABLE channel_interaction_tombstone');
-  await raw.exec('DROP TABLE user_offboard_scope_tombstone');
-  await raw.exec('DROP TABLE provisioning_revocation_tombstone');
-  await raw.run(`UPDATE meta SET value='9' WHERE key='schema_version'`);
-
-  await assert.rejects(
-    () => openDb({ databaseUrl: url }),
-    new RegExp(`schema version 9.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
-  );
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.equal(await tableExists('user_provisioning_request'), true);
-  assert.equal(await tableExists('channel_provisioning_request'), true);
-  assert.equal(await tableExists('channel_interaction_tombstone'), true);
-  assert.equal(await tableExists('user_offboard_scope_tombstone'), true);
-  assert.equal(await tableExists('provisioning_revocation_tombstone'), true);
-  const unique = await raw.get<{ indexdef: string }>(
-    `SELECT indexdef FROM pg_indexes
-     WHERE schemaname=current_schema() AND indexname='uq_user_provisioning_owner_provider'`,
-  );
-  assert.match(unique?.indexdef ?? '', /UNIQUE.*\(team_id, user_id, provider\)/i);
-  const channelUnique = await raw.get<{ indexdef: string }>(
-    `SELECT indexdef FROM pg_indexes
-     WHERE schemaname=current_schema() AND indexname='uq_channel_provisioning_actor_target'`,
-  );
-  assert.match(
-    channelUnique?.indexdef ?? '',
-    /UNIQUE.*\(team_id, channel, user_id, provider\)/i,
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request WHERE state='pre-v10-state'`))?.n,
-    0,
-    'a v9 state cannot prove that no artifact-free enterprise offboard happened before v10',
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM offboard_tombstone WHERE team_id='T1' AND user_id='U1'`))?.n,
-    1,
-    'a PostgreSQL-clock v9 team tombstone remains a useful lifecycle fence',
-  );
-  await raw.run(
-    `INSERT INTO user_provisioning_request
-       (id,team_id,user_id,provider,created_at,expires_at) VALUES
-       ('00000000-0000-4000-8000-000000000001','T1','U1','acme',1,9999999999999)`,
-  );
-  await raw.run(
-    `INSERT INTO channel_provisioning_request VALUES
-       ('00000000-0000-4000-8000-000000000002','T1','C1','U1','acme',1,9999999999999)`,
-  );
-  await raw.run(
-    `INSERT INTO channel_interaction_tombstone VALUES ('T1','C1','acme',1)`,
-  );
-  await raw.run(
-    `INSERT INTO user_offboard_scope_tombstone VALUES ('enterprise','E1','U1',1)`,
-  );
-  await raw.run(
-    `INSERT INTO provisioning_revocation_tombstone VALUES ('acme','global',$1,1)`,
-    ['A'.repeat(43)],
-  );
-  await raw.run(
-    `INSERT INTO consent_request
-       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
-     VALUES
-       ('current-state',NULL,'T1','U1','acme','C1','verifier',1)`,
-  );
-  await assert.rejects(
-    raw.run(`INSERT INTO user_offboard_scope_tombstone VALUES ('enterprise','','U2',1)`),
-    /check constraint/i,
-  );
-  await assert.rejects(
-    raw.run(`INSERT INTO user_offboard_scope_tombstone VALUES ('global','E1','U2',1)`),
-    /check constraint/i,
-  );
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM user_provisioning_request`))?.n,
-    1,
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM channel_provisioning_request`))?.n,
-    1,
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM channel_interaction_tombstone`))?.n,
-    1,
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM user_offboard_scope_tombstone`))?.n,
-    1,
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM provisioning_revocation_tombstone`))?.n,
-    1,
-  );
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request WHERE state='current-state'`))?.n,
-    1,
-    'an idempotent current migration must preserve current-version consent',
-  );
-});
-
-test('v10 to v12 drains pre-v11 consent authority and installs the single-generation lifecycle schema', async (t) => {
-  if (!(await pgReachable())) return t.skip(SKIP);
-  const { url } = await emptySchema(t);
-  const raw = rawDb(t, url);
-
-  // Start from the complete current schema, then faithfully remove the v11-only consent lifecycle
-  // surface and restore the v10 marker. This exercises the production carry without maintaining a
-  // second hand-written copy of every unrelated v10 table.
-  await migrate({ databaseUrl: url });
-  await raw.exec(`DROP INDEX uq_consent_request_active`);
-  await raw.exec(`DROP INDEX idx_consent_request_created_at`);
-  await raw.exec(`ALTER TABLE consent_request
-    DROP COLUMN consumed_at,
-    DROP COLUMN superseded_at,
-    DROP COLUMN delivery_token,
-    DROP COLUMN delivery_lease_expires_at,
-    DROP COLUMN delivered_at`);
-  await raw.run(
-    `INSERT INTO consent_request
-       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
-     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',1)`,
-    ['A'.repeat(43)],
-  );
-  await raw.run(`UPDATE meta SET value='10' WHERE key='schema_version'`);
-
-  await assert.rejects(
-    () => openDb({ databaseUrl: url }),
-    new RegExp(`schema version 10.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
-  );
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.equal(
-    (await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))?.n,
-    0,
-    'v10 consent cannot prove the v11 single-generation and delivery lifecycle invariants',
-  );
-  assert.equal(
-    (await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value,
-    String(SCHEMA_VERSION),
-  );
-
-  const columns = await raw.all<{ column_name: string; is_nullable: string; column_default: string | null }>(
-    `SELECT column_name,is_nullable,column_default
-       FROM information_schema.columns
-      WHERE table_schema=current_schema()
-        AND table_name='consent_request'
-        AND column_name IN
-          ('consumed_at','superseded_at','delivery_token','delivery_lease_expires_at','delivered_at')
-      ORDER BY column_name`,
-  );
-  assert.deepEqual(columns.map((column) => column.column_name), [
-    'consumed_at',
-    'delivered_at',
-    'delivery_lease_expires_at',
-    'delivery_token',
-    'superseded_at',
-  ]);
-  const deliveryLease = columns.find((column) => column.column_name === 'delivery_lease_expires_at');
-  assert.equal(deliveryLease?.is_nullable, 'NO');
-  assert.match(deliveryLease?.column_default ?? '', /0/);
-  const activeIndex = await raw.get<{ indexdef: string }>(
-    `SELECT indexdef FROM pg_indexes
-      WHERE schemaname=current_schema() AND indexname='uq_consent_request_active'`,
-  );
-  assert.match(
-    activeIndex?.indexdef ?? '',
-    /UNIQUE.*\(team_id, user_id, provider\).*WHERE \(superseded_at IS NULL\)/i,
-  );
-  const retentionIndex = await raw.get<{ indexdef: string }>(
-    `SELECT indexdef FROM pg_indexes
-      WHERE schemaname=current_schema() AND indexname='idx_consent_request_created_at'`,
-  );
-  assert.match(retentionIndex?.indexdef ?? '', /\(created_at\)/i);
-
-  const currentState = 'B'.repeat(43);
-  const deliveryToken = 'C'.repeat(43);
-  await raw.run(
-    `INSERT INTO consent_request
-       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at,
-        delivery_token,delivery_lease_expires_at,delivered_at)
-     VALUES ($1,NULL,'T1','U1','acme','C1','verifier',2,$2,3,4)`,
-    [currentState, deliveryToken],
-  );
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.deepEqual(
-    await raw.get<{
-      state: string;
-      delivery_token: string;
-      delivery_lease_expires_at: number;
-      delivered_at: number;
-    }>(
-      `SELECT state,delivery_token,delivery_lease_expires_at,delivered_at
-         FROM consent_request WHERE state=$1`,
-      [currentState],
-    ),
-    {
-      state: currentState,
-      delivery_token: deliveryToken,
-      delivery_lease_expires_at: 3,
-      delivered_at: 4,
-    },
-    'an idempotent v11 migration preserves v11-minted consent lifecycle state',
-  );
+  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  for (const version of ['6', '8', '11']) {
+    await raw.run(
+      `INSERT INTO meta (key, value) VALUES ('schema_version', $1)
+       ON CONFLICT (key) DO UPDATE SET value=excluded.value`,
+      [version],
+    );
+    await assert.rejects(
+      () => migrate({ databaseUrl: url }),
+      new RegExp(`schema version ${version} is not supported for migration.*recreate the database fresh`),
+    );
+    // The runtime independently fails closed on the older marker — nothing stamps or creates.
+    await assert.rejects(
+      () => openDb({ databaseUrl: url }),
+      new RegExp(`schema version ${version}.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
+    );
+    assert.equal(await tableExists('connection'), false, 'a refused pre-beta marker gets no baseline tables');
+  }
 });
 
 test('v12 to v13 converts every lifecycle-fence timestamp to microseconds exactly once', async (t) => {
@@ -580,41 +383,6 @@ test('v13 to v14 adds the browser-verification columns and leaves converted µs 
   );
 });
 
-test('v10 stamps legacy connections with a PostgreSQL credential-generation boundary', async (t) => {
-  if (!(await pgReachable())) return t.skip(SKIP);
-  const { url } = await emptySchema(t);
-  const raw = rawDb(t, url);
-  await migrate({ databaseUrl: url });
-  // Recreate the prerelease-v9 connection shape: those rows predate the trusted generation clock
-  // used to fence provider-addressed disconnects. The drained migration must conservatively stamp
-  // every existing row instead of leaving it addressable by an older delayed assertion/command.
-  await raw.exec(`ALTER TABLE connection DROP COLUMN generation_at`);
-  await raw.run(
-    `INSERT INTO connection
-       (id,enterprise_id,team_id,owner_kind,owner_id,provider,source,scopes,dry_run,created_at,updated_at)
-     VALUES ('00000000-0000-4000-8000-000000000001',NULL,'T1','user','U1','acme','vault','',0,1,1)`,
-  );
-  await raw.run(`UPDATE meta SET value='9' WHERE key='schema_version'`);
-
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  const migrated = await raw.get<{ generation_at: number }>(
-    `SELECT generation_at FROM connection WHERE id='00000000-0000-4000-8000-000000000001'`,
-  );
-  assert.ok(Number.isSafeInteger(migrated?.generation_at));
-  assert.ok((migrated?.generation_at ?? 0) > 0);
-
-  // An idempotent rerun must preserve the row's original boundary, not make an already-valid
-  // interaction stale merely because an operator safely repeated `vouchr migrate`.
-  const boundary = migrated!.generation_at;
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.equal(
-    (await raw.get<{ generation_at: number }>(
-      `SELECT generation_at FROM connection WHERE id='00000000-0000-4000-8000-000000000001'`,
-    ))?.generation_at,
-    boundary,
-  );
-});
-
 test('CLI top-level failures never serialize database-provided error text (SEC-1)', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url } = await emptySchema(t);
@@ -700,123 +468,6 @@ test('readiness: assertSchemaCurrent throws on an un-migrated schema and resolve
 });
 
 // ── #196/#204 review findings ─────────────────────────────────────────────────
-
-// Finding 1: the lineage stays monotonic, and migrate() carries a pre-#204 v6 database to head —
-// dropping union_optin and converting stored `union` modes.
-test('migrate() carries a legacy v6 database to head: accepts it, drops union_optin, converts union→per-user', async (t) => {
-  if (!(await pgReachable())) return t.skip(SKIP);
-  const { url, tableExists } = await emptySchema(t);
-  const raw = rawDb(t, url);
-  // A minimal pre-#204 v6 shape: the union_optin table migrate must drop, a channel_config row in the
-  // removed 'union' mode, and the v6 marker (which a reset-to-1 would have wrongly refused as "newer").
-  await raw.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT, PRIMARY KEY(team_id,channel,provider))`);
-  await raw.exec(`CREATE TABLE union_optin (team_id TEXT, channel_id TEXT, user_id TEXT, provider TEXT)`);
-  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-  await raw.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T1','C1','github','union')`);
-  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','6')`);
-
-  const { version } = await migrate({ databaseUrl: url }); // must NOT refuse the v6 DB as "newer"
-  assert.equal(version, SCHEMA_VERSION);
-  assert.ok(SCHEMA_VERSION > 6, 'lineage must be monotonic past the pre-#204 max of 6');
-  assert.equal(await tableExists('union_optin'), false, 'union_optin must be dropped');
-  const row = await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1' AND channel='C1' AND provider='github'`);
-  assert.equal(row?.mode, 'per-user', 'a stored union mode must convert to per-user');
-});
-
-test('migrate() carries v7 to head and deletes the retired preview configuration table', async (t) => {
-  if (!(await pgReachable())) return t.skip(SKIP);
-  const { url, tableExists } = await emptySchema(t);
-  const raw = rawDb(t, url);
-  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-  await raw.exec(`CREATE TABLE channel_preview (
-    team_id TEXT NOT NULL, channel TEXT NOT NULL, provider TEXT NOT NULL, visibility TEXT NOT NULL,
-    PRIMARY KEY(team_id, channel, provider)
-  )`);
-  await raw.run(`INSERT INTO channel_preview VALUES ('T1','C1','mcp','private')`);
-  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','7')`);
-
-  const { version } = await migrate({ databaseUrl: url });
-  assert.equal(version, SCHEMA_VERSION);
-  assert.equal(await tableExists('channel_preview'), false);
-  assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, String(SCHEMA_VERSION));
-});
-
-test('migrate() carries v8 to head: clears unbound interaction authority and is idempotent', async (t) => {
-  if (!(await pgReachable())) return t.skip(SKIP);
-  const { url, tableExists } = await emptySchema(t);
-  const raw = rawDb(t, url);
-  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-  await raw.exec(`CREATE TABLE approval_request (
-    id TEXT PRIMARY KEY, team_id TEXT NOT NULL, user_id TEXT NOT NULL,
-    owner_kind TEXT NOT NULL, owner_id TEXT NOT NULL, provider TEXT NOT NULL,
-    method TEXT NOT NULL, host TEXT NOT NULL, path TEXT NOT NULL, query_hash TEXT NOT NULL,
-    channel TEXT NOT NULL, thread TEXT NOT NULL, status TEXT NOT NULL, approved_by TEXT,
-    created_at BIGINT NOT NULL, expires_at BIGINT NOT NULL
-  )`);
-  await raw.exec(`CREATE TABLE session_grant (
-    team_id TEXT NOT NULL, channel TEXT NOT NULL, thread TEXT NOT NULL,
-    user_id TEXT NOT NULL, provider TEXT NOT NULL, created_at BIGINT NOT NULL,
-    expires_at BIGINT NOT NULL,
-    PRIMARY KEY (team_id, channel, thread, user_id, provider)
-  )`);
-  await raw.exec(`CREATE TABLE consent_request (
-    state TEXT PRIMARY KEY, enterprise_id TEXT, team_id TEXT NOT NULL, user_id TEXT NOT NULL,
-    provider TEXT NOT NULL, channel TEXT, pkce_verifier TEXT NOT NULL, created_at BIGINT NOT NULL
-  )`);
-  await raw.exec(`CREATE TABLE offboard_tombstone (
-    team_id TEXT NOT NULL, user_id TEXT NOT NULL, created_at BIGINT NOT NULL,
-    PRIMARY KEY(team_id,user_id)
-  )`);
-  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version', '8')`);
-  const values = ['T1', 'U1', 'user', 'U1', 'acme', 'POST', 'api.acme.test', '/pay', 'digest', 'C1', 'TH1'];
-  await raw.run(
-    `INSERT INTO approval_request VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',NULL,1,9999999999999)`,
-    ['a', ...values],
-  );
-  await raw.run(
-    `INSERT INTO approval_request VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',NULL,2,9999999999999)`,
-    ['b', ...values],
-  );
-  const longPath = `/${'long/'.repeat(800)}write`;
-  await raw.run(
-    `INSERT INTO approval_request VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending',NULL,3,9999999999999)`,
-    ['c', ...values.slice(0, 7), longPath, ...values.slice(8)],
-  );
-  await raw.run(`INSERT INTO session_grant VALUES ('T1','C1','TH1','U1','acme',1,9999999999999)`);
-  await raw.run(
-    `INSERT INTO consent_request
-       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
-     VALUES ('future-state',NULL,'T1','U1','acme','C1','verifier',9999999999999)`,
-  );
-  await raw.run(`INSERT INTO offboard_tombstone VALUES ('T1','U1',9999999999999)`);
-
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.equal(await tableExists('session_request'), true);
-  assert.equal((await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM approval_request`))?.n, 0);
-  assert.equal((await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM session_grant`))?.n, 0);
-  assert.equal((await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))?.n, 0);
-  assert.equal((await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM offboard_tombstone`))?.n, 0);
-  const index = await raw.get<{ indexdef: string }>(
-    `SELECT indexdef FROM pg_indexes
-     WHERE schemaname=current_schema() AND indexname='uq_approval_request_action'`,
-  );
-  assert.match(index?.indexdef ?? '', /\(action_key\)$/);
-  assert.doesNotMatch(index?.indexdef ?? '', /path/);
-  const originColumn = await raw.get<{ is_nullable: string }>(
-    `SELECT is_nullable FROM information_schema.columns
-     WHERE table_schema=current_schema() AND table_name='approval_request' AND column_name='origin'`,
-  );
-  assert.equal(originColumn?.is_nullable, 'NO');
-  await raw.run(
-    `INSERT INTO consent_request
-       (state,enterprise_id,team_id,user_id,provider,channel,pkce_verifier,created_at)
-     VALUES ('current-state',NULL,'T1','U1','acme','C1','verifier',1)`,
-  );
-  await raw.run(`INSERT INTO offboard_tombstone VALUES ('T1','U1',1)`);
-  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
-  assert.equal((await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM consent_request`))?.n, 1);
-  assert.equal((await raw.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM offboard_tombstone`))?.n, 1);
-});
 
 // Finding 2: only explicit databaseUrl / VOUCHR_DATABASE_URL is honored — no generic DATABASE_URL
 // fallback — and a hostless/malformed URL is refused (pg would otherwise resolve ambient defaults).
@@ -933,41 +584,34 @@ test('privilege split: a DML-only role runs the runtime but is denied CREATE', a
   await assert.rejects(() => db.exec('CREATE TABLE evil (x int)'), /permission denied|insufficient/i); // no DDL
 });
 
-// Finding 5: a REAL failed migration must roll back EVERY mutation — the drops, the mode
-// conversion, and the version stamp all run inside migrate()'s one transaction. Here union_optin is
-// a real TABLE (so the DROP succeeds) and a CHECK on meta.value forces the FINAL stamp to fail, so
-// the failure lands AFTER the drop + conversion — the strongest rollback proof.
-test('a failed v6 migration rolls back both drops, conversion, and stamp together', async (t) => {
+// Finding 5: a REAL failed migration must roll back EVERY mutation — the ×1000 fence conversion
+// and the version stamp run inside migrate()'s one transaction. A CHECK pins meta.value to '12' so
+// the FINAL stamp fails, i.e. the failure lands AFTER the data conversion — the strongest rollback
+// proof: a half-committed ×1000 would corrupt every lifecycle fence.
+test('a failed v12 migration rolls back the µs conversion and the stamp together', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
-  const { url, tableExists } = await emptySchema(t);
+  const { url } = await emptySchema(t);
   const raw = rawDb(t, url);
-  await raw.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT, PRIMARY KEY(team_id,channel,provider))`);
-  await raw.exec(`CREATE TABLE union_optin (team_id TEXT, channel_id TEXT, user_id TEXT, provider TEXT)`); // a REAL table — DROP will succeed
-  await raw.exec(`CREATE TABLE channel_preview (team_id TEXT, channel TEXT, provider TEXT, visibility TEXT)`);
-  await raw.run(`INSERT INTO channel_preview VALUES ('T1','C1','github','private')`);
-  // CHECK pins value to '6', so migrate()'s final stamp violates it — the deterministic failure.
-  await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (value = '6'))`);
-  await raw.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T1','C1','github','union')`);
-  await raw.run(`INSERT INTO meta (key, value) VALUES ('schema_version','6')`);
+  await migrate({ databaseUrl: url });
+  await raw.run(`INSERT INTO offboard_tombstone (team_id,user_id,created_at) VALUES ('T1','U1',222)`);
+  await raw.run(`UPDATE meta SET value='12' WHERE key='schema_version'`);
+  await raw.exec(`ALTER TABLE meta ADD CONSTRAINT meta_pin CHECK (value = '12')`);
 
   await assert.rejects(() => migrate({ databaseUrl: url }), /violates check constraint|check constraint/i);
 
-  // The stamp failed LAST, so a correct migrate rolls back the earlier drop + conversion too: the
-  // union_optin table is back, the union mode is unchanged, the marker is still 6, and none of the
-  // baseline tables migrate would have created were committed.
-  assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, '6');
-  assert.equal((await raw.get<{ mode: string }>(`SELECT mode FROM channel_config WHERE team_id='T1'`))?.mode, 'union', 'the union→per-user conversion rolled back');
-  assert.equal(await tableExists('union_optin'), true, 'the dropped union_optin table was restored by rollback');
-  assert.equal(await tableExists('channel_preview'), true, 'the dropped channel_preview table was restored by rollback');
-  assert.equal((await raw.get<{ visibility: string }>(`SELECT visibility FROM channel_preview`))?.visibility, 'private');
-  assert.equal(await tableExists('session_grant'), false, 'no baseline table migrate would create was committed');
+  assert.equal((await raw.get<{ value: string }>(`SELECT value FROM meta WHERE key='schema_version'`))?.value, '12');
+  assert.equal(
+    (await raw.get<{ created_at: number }>(`SELECT created_at FROM offboard_tombstone WHERE team_id='T1'`))?.created_at,
+    222,
+    'the ×1000 fence conversion rolled back with the failed stamp',
+  );
 });
 
-// Finding 1: unsupported lineages fail closed rather than being stamped v7 over an unknown shape.
+// Finding 1: unsupported lineages fail closed rather than being stamped over an unknown shape.
 test('migrate() refuses an unsupported lineage: a v1–v5 marker, and a markerless legacy schema', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
 
-  // A v3 marker (1–5 are unsupported: migrate only knows fresh / v6 / v7).
+  // A v3 marker (1–5 are unsupported: migrate only knows fresh / v12–v14).
   const a = await emptySchema(t);
   const rawA = rawDb(t, a.url);
   await rawA.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
