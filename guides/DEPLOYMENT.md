@@ -114,7 +114,11 @@ version, and `200` once the runtime can reach a current schema.
 
 ### Upgrading from 1.0.0-beta.1
 
-`1.0.0-beta.1` runs schema v12; this build runs schema v14. One `vouchr migrate` run converges the
+<!-- migratable-schema-versions: 12,13,14 -->
+
+`1.0.0-beta.1` runs schema v12; this build runs schema v14, and `vouchr migrate` accepts a fresh
+(empty) database or schema versions 12–14 only — anything else is refused before any DDL runs.
+One `vouchr migrate` run converges the
 database: the v13 ms→µs lifecycle-fence conversion runs exactly once on the way through (it is
 gated on the recorded predecessor version and advisory-locked, so re-runs and concurrent runs never
 convert twice), and the v13 → v14 consent columns are additive. The runtime's exact-version schema
