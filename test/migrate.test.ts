@@ -2,8 +2,16 @@ import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { Client, Pool } from 'pg';
-import { migrate, openDb, assertSchemaCurrent, SCHEMA_VERSION, type Db } from '../src/core/db';
+import {
+  migrate,
+  openDb,
+  assertSchemaCurrent,
+  SCHEMA_VERSION,
+  MIGRATABLE_SCHEMA_VERSIONS,
+  type Db,
+} from '../src/core/db';
 import { isPostgresUrl } from '../src/core/options';
 import { github } from '../src/core/providers';
 import { createVouchr } from '../src/adapters/bolt';
@@ -626,4 +634,18 @@ test('migrate() refuses an unsupported lineage: a v1–v5 marker, and a markerle
   await rawB.exec(`CREATE TABLE channel_config (team_id TEXT, channel TEXT, provider TEXT, mode TEXT)`);
   await assert.rejects(() => migrate({ databaseUrl: b.url }), /unrecognized database|no schema-version marker/i);
   assert.equal(await b.tableExists('connection'), false, 'the rejected markerless schema got no baseline tables');
+});
+
+// Guardrail (#304 review): the deployment guide must never claim a migration starting point the
+// code refuses. The guide carries one machine-readable marker; this pins it to the runtime set.
+test('DEPLOYMENT.md documents exactly the migratable schema versions', () => {
+  const guide = readFileSync('guides/DEPLOYMENT.md', 'utf8');
+  const markers = [...guide.matchAll(/<!-- migratable-schema-versions: ([0-9,\s]+) -->/g)];
+  assert.equal(markers.length, 1, 'guides/DEPLOYMENT.md must carry exactly one migratable-schema-versions marker');
+  const documented = markers[0][1]
+    .split(',')
+    .map((v) => Number(v.trim()))
+    .sort((a, b) => a - b);
+  const supported = [...MIGRATABLE_SCHEMA_VERSIONS].sort((a, b) => a - b);
+  assert.deepEqual(documented, supported, 'the guide and MIGRATABLE_SCHEMA_VERSIONS must agree');
 });

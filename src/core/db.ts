@@ -183,7 +183,7 @@ class PgClientDb implements Db {
  * controls differently.
  */
 export const SCHEMA_VERSION = 14;
-const MIGRATABLE_SCHEMA_VERSIONS = new Set([12, 13, SCHEMA_VERSION]);
+export const MIGRATABLE_SCHEMA_VERSIONS = new Set([12, 13, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
