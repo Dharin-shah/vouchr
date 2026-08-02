@@ -25,8 +25,8 @@ All notable changes to this project are documented here. This project adheres to
   connect under the other mode supersedes a still-pending prompt instead of reusing it, so a flag
   flip can neither leave a bypassable unenforced row behind a verify-hop URL nor a dead-end
   enforced row behind a direct URL. Schema v14 adds both columns (run `vouchr migrate`; **do not
-  enable the flag while any v13 process is still live** — see DEPLOYMENT § v13 → v14 for the
-  required rollout order). Off by default in
+  enable the flag while any v13 process is still live** — see guides/DEPLOYMENT.md
+  § "Upgrading from 1.0.0-beta.1" for the required rollout order). Off by default in
   the beta (no behaviour change unless enabled); slated ON-by-default for GA. Regression:
   `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
   guides/DEPLOYMENT.md § "Browser Slack-identity verification".
