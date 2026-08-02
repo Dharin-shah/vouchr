@@ -72,95 +72,17 @@ npm run pg:down # tear it down
 The schema is owned by the `vouchr migrate` command, and the runtime is DML-only — a deliberate
 split so the long-running process holds no DDL privileges.
 
-### Required v7 → v8 drained cutover
+### Supported migration starting points
 
-Schema v8 removes Vouchr's private-preview policy and storage. It is a maintenance cutover, not a
-mixed-version rolling upgrade:
+<!-- migratable-schema-versions: 12,13,14 -->
 
-1. Update the trusted host first so provider-output redaction, audience, data-loss prevention, and
-   rendering no longer depend on `ToolManifestEntry.visibility` or Vouchr's preview API. Export any
-   policy you need before proceeding; migration permanently drops `channel_preview`.
-2. Quiesce Slack/broker traffic, drain in-flight interactions, and stop **every** v7 replica.
-3. Run the v8 `vouchr migrate` command with the schema-owner role.
-4. Start only v8 replicas, confirm readiness, and restore traffic.
+`vouchr migrate` accepts a fresh (empty) database or a schema at version 12, 13, or 14 — v12 is
+the schema both published betas (v1.0.0-beta and v1.0.0-beta.1) stamp. Development schemas v6–v11
+never shipped in any release and are refused before any DDL runs. To keep data on one, run
+v1.0.0-beta.1's `vouchr migrate` first (it carries v6–v11 to v12), then upgrade; anything older
+must be recreated fresh.
 
-Do not migrate while any v7 process is live: it does not re-check the schema marker after startup
-and would query the table v8 drops. A v8 runtime refuses a v7 marker, and a v7 runtime refuses the v8
-marker, so mixed v7/v8 service and runtime-only rollback are unsupported. Rollback after migration
-requires stopping v8 and restoring the pre-migration database backup before starting v7. Old
-Share/Dismiss buttons cannot publish data after cutover; v8 acknowledges them with fixed expiry
-guidance.
-
-### Required v8, prerelease v9, v10, or v11 → v12 drained cutover
-
-Schema v9 introduced persistent thread-session controls, exact credential-generation bindings, and
-the bounded exact-action key for approval deduplication. Schema v10 retains those rules and adds
-`user_provisioning_request` and `channel_provisioning_request`, the durable single-use boundaries
-for Slack user and shared-channel key setup;
-`channel_interaction_tombstone`, the PostgreSQL-clock boundary that prevents a setup received before
-an effective channel credential/mode/tool mutation from persisting or committing afterward;
-`user_offboard_scope_tombstone`, which fences enterprise/global offboarding before artifact
-discovery; and `provisioning_revocation_tombstone`, whose fixed hashed scope selectors fence older
-user and shared-channel writes during confirmed break-glass revocation. Treat this as a maintenance
-cutover, not a mixed-version rolling upgrade. Schema v11 adds one active OAuth generation per
-workspace/user/provider, callback consumption/supersession state, cross-replica Slack delivery
-leases, and the partial unique active-generation index. Schema v12 extends cross-replica delivery
-leases to static-key setup, binds approval delivery to the current approver class and exact
-recipient set, and binds every approval to its exact mutable-governance scope. Every pre-v11 consent
-row is deleted fail-closed because it cannot prove the v11 generation and delivery invariants.
-
-1. Back up PostgreSQL and verify that the backup can be restored.
-2. Quiesce Slack and broker traffic **including identity-assertion minting**, drain in-flight
-   fetches/interactions, and stop **every** pre-v12 replica.
-3. When upgrading from v8 or prerelease v9, wait at least **6 minutes 30 seconds after the last old
-   assertion was minted** (the 5-minute
-   maximum lifetime plus the conservative 90-second cluster-skew horizon documented below). Do not
-   restore the minter during this interval. This closes the stateless authority that a prerelease-v9
-   artifact-free enterprise offboard could not record in a scope tombstone. A v10 or v11 deployment
-   may proceed after the traffic drain because it already has that durable scope fence.
-4. Run this build's v12 `vouchr migrate` command with the schema-owner role. From v8, it creates
-   `session_request`, adds exact credential-generation bindings and the bounded approval action key,
-   and deletes every pre-v9 approval/session grant fail-closed because those rows cannot identify
-   which connection generation was authorized. It also clears pre-v9 consent requests and offboard
-   tombstones because those rows used per-pod application clocks. From a prerelease v9 database, it
-   preserves already-bound session/approval rows but deletes all pre-v10 consent: those states cannot
-   prove that no artifact-free enterprise offboard happened before the scope table existed. Both
-   paths add the bounded user/channel-provisioning, channel-interaction, cross-workspace offboard,
-   and scoped break-glass tombstone tables and their indexes. The migration also adds
-   `connection.generation_at` using PostgreSQL time; existing rows receive the drained-cutover
-   boundary, and later reconnects replace it atomically with their own generation time. This is what
-   lets a delayed provider-addressed command/assertion prove it cannot target a newer row. For
-   v8-v10 markers, v12 then drains old OAuth state and installs the consumption, supersession,
-   delivery-lease, and active-generation constraints atomically with the version stamp. From every
-   accepted pre-v12 marker, it adds key-prompt delivery leases and audience-bound approval delivery.
-5. Start only v12 replicas, confirm readiness, and restore traffic and assertion minting. Users
-   coming from v8 make fresh
-   decisions; setup buttons rendered by v8 or prerelease v9 are rejected with fixed
-   ask-the-agent-again guidance because they do not carry a provisioning-request id. Every pre-v11
-   OAuth URL is intentionally stale and must be requested again.
-
-This is a source-breaking security cutover for low-level headless integrations. `SessionGrants` and
-`Approvals` are no longer package exports; the safe broker-to-Slack interaction facade is
-`ConnectContext.recoverBrokerDenial` in the trusted control plane (#194). `ChannelConfig` and `ChannelTools` remain public read stores, but raw `setMode`,
-`setEnabled`, and `applyEnabled` writes are removed. Migrate governance writes to packaged Bolt/App
-Home or `POST /v1/admin/mode` and `POST /v1/admin/tools`; those paths keep authorization, lifecycle
-locks, dependent-state purge, and audit atomic. Do not write the interaction/config tables directly:
-v12 deliberately makes old authority unusable after the connection row changes and old OAuth state
-unusable after the generation-model cutover.
-`ApprovalRequiredError` no longer exposes the raw `path`: its constructor now takes the bounded
-`actionFingerprint` and opaque `approvalId` before `queryParamCount` and `newRequest`. Update any
-catch-site field access and direct construction together; never reconstruct an approval decision
-from those display/routing fields.
-
-Do not leave any pre-v12 process live during or after migration. Older processes do not re-check the
-marker after startup; v8 cannot supply the required approval action key, v9 can still accept an
-unfenced static/reference write, and v10 does not enforce the single-generation OAuth contract.
-Runtime startup requires the exact schema version, so mixed v8/v9/v10/v11/v12/v13 service is unsupported.
-Rollback from this cutover requires stopping v12, restoring the matching pre-migration backup, and
-only then starting the binary that created it; running an older binary against schema v12 is refused
-and unsafe. (v13 rollback has its own sequence below.)
-
-### Required v12 (or any earlier supported marker) → v13 drained cutover
+### Required v12 → v13 drained cutover
 
 Schema v13 (#290) moves every PostgreSQL-clock lifecycle-fence timestamp — the offboard,
 break-glass, and channel-interaction tombstones, `connection.generation_at`, and all pending
@@ -176,8 +98,7 @@ created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-milliseconds.
    with v13 data; the exact-version runtime check refuses it at boot, and this drain is what keeps
    one from staying live across the conversion.
 3. Run this build's `vouchr migrate` with the schema-owner role. From v12 it multiplies every
-   stored fence timestamp by exactly 1000, atomically with the version stamp; from an earlier
-   supported marker it first applies the carries above and converts whatever survives them. The
+   stored fence timestamp by exactly 1000, atomically with the version stamp. The
    conversion is gated on the recorded predecessor version, so re-running migrate (or racing a
    concurrent run — the advisory lock serializes them) never multiplies twice.
 4. Start only v13 replicas, confirm readiness, and restore traffic. This step drains no
@@ -195,7 +116,7 @@ condition this drained sequence exists to prevent.
 Schema v14 adds two nullable/defaulted columns to `consent_request` (`slack_verified_at`,
 `slack_verify_required`); no data conversion. Pre-v14 consent rows carry
 `slack_verify_required = 0`, which is exact: their prompt URL never offered the verify hop. A
-pre-v13 database reaches v14 through the drained v13 sequence above in the same `vouchr migrate`
+v12 database reaches v14 through the drained v13 sequence above in the same `vouchr migrate`
 run — the ms→µs conversion still applies exactly once on the way through.
 
 The DDL is additive, but the **rollout order is load-bearing**: a v13 process that was already
@@ -232,8 +153,8 @@ state must therefore never coexist with a live v13 process. Two safe sequences:
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
   if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
-  Job / initContainer) to completion before new runtime replicas start. For v7 → v8 and any
-  supported pre-v13 marker → v13, use the applicable drained maintenance sequence above instead.
+  Job / initContainer) to completion before new runtime replicas start. For v12 → v13, use the
+  drained maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 
