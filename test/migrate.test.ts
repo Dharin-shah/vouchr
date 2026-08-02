@@ -223,8 +223,8 @@ test('v12 to v13 converts every lifecycle-fence timestamp to microseconds exactl
      VALUES ('00000000-0000-4000-8000-0000000000ae','k1','T1','U1','user','U1','cred','acme','POST',
         'https://api.acme.test','api.acme.test','/x','C1','TH1','C1','pending',13,14,17,18)`,
   );
-  // A real v12 catalog also carries the millisecond column DEFAULT (CREATE TABLE IF NOT EXISTS and
-  // ADD COLUMN IF NOT EXISTS never touch it), and vault writers omit generation_at and rely on it.
+  // A real v12 catalog also carries the millisecond column DEFAULT, which no baseline DDL
+  // rewrites, and vault writers omit generation_at and rely on it.
   await raw.exec(
     `ALTER TABLE connection ALTER COLUMN generation_at
        SET DEFAULT (extract(epoch from clock_timestamp())*1000)::bigint`,

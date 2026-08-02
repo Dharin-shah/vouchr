@@ -168,9 +168,11 @@ class PgClientDb implements Db {
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
  * The lineage stays MONOTONIC — never reset it, or an older marker would be wrongly refused as
- * "newer" by {@link guardSchemaVersion}. Versions 1-11 predate the published releases: v1-v5 are the
- * pre-#204 dual-backend era, and v6-v11 only ever existed on unreleased main between releases — no
- * released version shipped them, so none of them are migratable (recreate fresh instead).
+ * "newer" by {@link guardSchemaVersion}. Versions 1-11 predate the published releases: v1-v6 are
+ * the pre-#204 dual-backend era (v6 its last stamp), and v7-v11 only ever existed on unreleased
+ * main between releases — no released version shipped them, so none are migratable here. Data on
+ * a v6-v11 schema can first be carried to v12 by v1.0.0-beta.1's migrate; earlier schemas must be
+ * recreated fresh.
  * Version 12 is the first published beta schema (v1.0.0-beta / v1.0.0-beta.1). Version 13 moves
  * every PostgreSQL-clock lifecycle-fence timestamp from millisecond to microsecond resolution
  * (#290) so unrelated operations no longer tie inside the clock's truncation window. Version 14
@@ -239,7 +241,8 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
   if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 12, 13, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`.`,
+        `version 12, 13, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`. ` +
+        `To keep data on a v6-v11 development schema, run v1.0.0-beta.1's \`vouchr migrate\` first (it carries v6-v11 to v12), then upgrade.`,
     );
   }
   return found;
