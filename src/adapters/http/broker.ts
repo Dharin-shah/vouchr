@@ -589,6 +589,15 @@ function typedHttpError(status: number, error: string, typed: unknown): HttpErro
   return new HttpError(status, { error, ...safeErrorFields(typed) });
 }
 
+/** The signed interaction's authority was superseded while the request was in flight. */
+function staleInteraction(status: 403 | 409, error: string): HttpError {
+  return typedHttpError(status, error, new InteractionStateChangedError('connection', 'authorization'));
+}
+
+function notConnected(providerId: string, owner?: Owner['kind']): HttpError {
+  return typedHttpError(409, 'not connected', new NoConnectionError(`No connection for provider "${providerId}"`, owner));
+}
+
 function mapUpstreamError(e: unknown): never {
   const fields = safeErrorFields(e);
   if (e instanceof EgressBlockedError) throw new HttpError(403, { error: 'egress blocked', ...fields });
@@ -675,13 +684,6 @@ async function relayMcpResponse(upstream: Response, res: http.ServerResponse, ab
     abort.abort();
     res.destroy();
   }
-}
-
-function ownerFromClaims(c: IdentityClaims): { owner: Owner; acting: SlackIdentity } {
-  const acting: SlackIdentity = { enterpriseId: c.enterpriseId ?? null, teamId: c.teamId, userId: c.userId };
-  // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
-  // supplies an id, so a forged body can't cross tenants.
-  return { owner: userOwner(acting), acting };
 }
 
 export function createBroker(rawOpts: BrokerOptions): BrokerServer {
@@ -907,13 +909,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       userId: claims.userId,
     };
     const issuedAt = await userInteractionIssuedAt(claims);
-    if (!(await userInteractionIsCurrent(opts.db, identity, issuedAt))) {
-      throw typedHttpError(
-        409,
-        'authorization changed; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (!(await userInteractionIsCurrent(opts.db, identity, issuedAt))) throw staleInteraction(409, 'authorization changed; resolve and retry');
     return { identity, issuedAt };
   }
 
@@ -990,13 +986,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       // meaningful when channelConfig is opted in; otherwise mode stays null and the gate is inert.
       const owner = userOwner(acting);
       const credentialId = await opts.vault.liveId(owner, ref.provider);
-      if (!credentialId) {
-        throw typedHttpError(
-          409,
-          'not connected',
-          new NoConnectionError(`No connection for provider "${ref.provider}"`, owner.kind),
-        );
-      }
+      if (!credentialId) throw notConnected(ref.provider, owner.kind);
       let mode: ChannelMode | null = null;
       let hasSessionGrant = false;
       const thread = claims.threadTs ?? null;
@@ -1020,13 +1010,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       }
       // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
       // resolved owner here — the injector 409s later if the credential is missing.
-      if (r.status !== 'resolved') {
-        throw typedHttpError(
-          409,
-          'not connected',
-          new NoConnectionError(`No connection for provider "${ref.provider}"`, 'user'),
-        );
-      }
+      if (r.status !== 'resolved') throw notConnected(ref.provider, 'user');
       return { owner: r.owner, acting: r.acting, credentialId };
     }
 
@@ -1054,13 +1038,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // The channel path only ever yields resolved or refused; anything else fails closed (defensive).
     if (r.status !== 'resolved') throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
     const credentialId = await opts.vault.liveId(r.owner, ref.provider);
-    if (!credentialId) {
-      throw typedHttpError(
-        409,
-        'not connected',
-        new NoConnectionError(`No connection for provider "${ref.provider}"`, r.owner.kind),
-      );
-    }
+    if (!credentialId) throw notConnected(ref.provider, r.owner.kind);
     return { owner: r.owner, acting: r.acting, credentialId };
   }
 
@@ -1405,7 +1383,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (!isBrokeredProvider(registry.get(ref.provider))) {
       throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     }
-    const { owner } = ownerFromClaims(claims);
+    // The owner id comes ONLY from verified claims (the acting user). The request body's handle never
+    // supplies an id, so a forged body can't cross tenants.
+    const owner = userOwner({ enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId });
     const credentialId = await opts.vault.liveId(owner, ref.provider);
     const connected = credentialId !== null;
     // NO secret: only existence, a coarse consent state, and—when explicitly requested—the opaque
@@ -1492,13 +1472,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         issuance,
         { enterpriseId: claims.enterpriseId, userId: targetUserId },
       );
-      if (!authorized) {
-        throw typedHttpError(
-          409,
-          'admin assertion no longer current; resolve and retry',
-          new InteractionStateChangedError('connection', 'authorization'),
-        );
-      }
+      if (!authorized) throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
       const summary = await offboardUserEverywhere(opts.db, opts.vault, opts.audit, consent, { enterpriseId: claims.enterpriseId, userId: targetUserId }, registry);
       // Truthful completeness (GHSA-25m2 r3): ok:true ONLY when every touched workspace fully
       // offboarded. A credential left in one workspace must never read as a successful sweep.
@@ -1507,13 +1481,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     }
     const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
     const authorized = await markUserOffboardedByActor(opts.db, actor, issuance, target);
-    if (!authorized) {
-      throw typedHttpError(
-        409,
-        'admin assertion no longer current; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (!authorized) throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
     const outcome = await offboardUserDetailed(
       opts.vault,
       opts.audit,
@@ -1580,13 +1548,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         });
       },
     });
-    if (!stored) {
-      throw typedHttpError(
-        409,
-        'channel credential setup no longer valid; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (!stored) throw staleInteraction(409, 'channel credential setup no longer valid; resolve and retry');
     return { ok: true };
   }
 
@@ -1661,13 +1623,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       mode,
       issuance,
     });
-    if (!configured) {
-      throw typedHttpError(
-        409,
-        'admin assertion no longer current; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (!configured) throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
     return { ok: true };
   }
 
@@ -1705,13 +1661,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       // the separate credential-owner gate and is not silently broadened into a new API requirement.
       assertEligible: async () => undefined,
     });
-    if (configured === 'stale') {
-      throw typedHttpError(
-        409,
-        'admin assertion no longer current; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (configured === 'stale') throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
     return { ok: true };
   }
 
@@ -1772,13 +1722,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Persist the signed assertion's issuance, not request-receipt time: an assertion minted before
     // offboarding cannot manufacture a fresh post-tombstone OAuth state by being presented later.
     const pending = await consent.beginFenced(identity, provider, redirectUri, claims.channel, issuedAt);
-    if (!pending) {
-      throw typedHttpError(
-        403,
-        'credential setup no longer valid; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (!pending) throw staleInteraction(403, 'credential setup no longer valid; resolve and retry');
     return pending;
   }
 
@@ -1922,13 +1866,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const result = await referenceUserCredential({
       vault: opts.vault, audit: opts.audit, identity, providerId, reference, issuance: issuedAt,
     });
-    if (result !== 'stored') {
-      throw typedHttpError(
-        403,
-        'credential setup no longer valid; resolve and retry',
-        new InteractionStateChangedError('connection', 'authorization'),
-      );
-    }
+    if (result !== 'stored') throw staleInteraction(403, 'credential setup no longer valid; resolve and retry');
     return { ok: true };
   }
 
