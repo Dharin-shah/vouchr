@@ -625,6 +625,20 @@ export class ConnectionHandle {
     }
   }
 
+  /** Spend one unit of the provider's per-(owner, provider) budget (provider.rateLimit) or throw
+   *  RateLimitedError. One helper for the real fetch and the #296 backchannel request, which must
+   *  not be a free way to queue prompts past the budget the eventual action itself is held to. */
+  private async takeRateBudget(host: string): Promise<void> {
+    const rl = this.provider.rateLimit;
+    if (!rl) return;
+    const taken = await this.rateLimits.take(credentialLockKey(this.owner, this.provider.id), 1, rl.perMinute / 60_000, rl.burst ?? rl.perMinute);
+    if (!taken.ok) {
+      this.emit({ type: 'rate_limited', provider: this.provider.id, host });
+      await this.audit.record('rate_limited', this.acting, this.provider.id, { host, owner: this.owner.kind });
+      throw new RateLimitedError(this.provider.id, rl.perMinute, taken.retryAfterMs ?? 60_000);
+    }
+  }
+
   /**
    * The exact action key a grant covers (#113). The grant carries TWO identities, matched
    * independently on consume:
@@ -685,6 +699,8 @@ export class ConnectionHandle {
     if (this.useStillValid && !(await this.useStillValid())) {
       throw new InteractionStateChangedError('connection', 'authorization');
     }
+    // Same budget, same order as fetch: after the egress gates, before any credential binding.
+    await this.takeRateBudget(url.hostname);
     const credentialId = await this.bindCredential();
     const pending = await this.approvals.requestAudited(
       this.approvalKey(url, canonical, credentialId),
@@ -730,15 +746,7 @@ export class ConnectionHandle {
     // owner kind only — never the full url (a query string could carry sensitive params). Every value
     // written here is already validated: provider from the registry, host past the allowlist above,
     // owner kind from the typed Owner.
-    const rl = this.provider.rateLimit;
-    if (rl) {
-      const taken = await this.rateLimits.take(credentialLockKey(this.owner, this.provider.id), 1, rl.perMinute / 60_000, rl.burst ?? rl.perMinute);
-      if (!taken.ok) {
-        this.emit({ type: 'rate_limited', provider: this.provider.id, host: url.hostname });
-        await this.audit.record('rate_limited', this.acting, this.provider.id, { host: url.hostname, owner: this.owner.kind });
-        throw new RateLimitedError(this.provider.id, rl.perMinute, taken.retryAfterMs ?? 60_000);
-      }
-    }
+    await this.takeRateBudget(url.hostname);
 
     // Bind authority to the exact live row before approval/session state is consulted. This is a
     // metadata-only read; the credential remains encrypted until every gate below has passed.

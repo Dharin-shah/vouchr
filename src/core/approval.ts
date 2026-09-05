@@ -131,6 +131,14 @@ export function assertBindingMessage(value: unknown): string {
   if (Buffer.byteLength(value, 'utf8') > MAX_BINDING_MESSAGE_BYTES) {
     throw new Error(`bindingMessage must be at most ${MAX_BINDING_MESSAGE_BYTES} bytes`);
   }
+  // C0 controls (except newline/tab) and DEL: PostgreSQL TEXT refuses NUL outright (an internal
+  // error after the assertion is spent), and the rest have no place in a statement a human reads.
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    if ((code < 0x20 && code !== 0x0a && code !== 0x09) || code === 0x7f) {
+      throw new Error('bindingMessage must not contain control characters');
+    }
+  }
   return value;
 }
 
@@ -810,14 +818,18 @@ export class Approvals {
     return { id, status, expiresAt: row.expires_at };
   }
 
-  /** #296: live backchannel requests whose decision surface has not been delivered — the rows the
-   *  Bolt control plane delivers on its timer. Oldest first, bounded per pass. A row whose delivery
-   *  keeps failing is retried each pass until its pending TTL reclaims it (bounded by design). */
+  /** #296: live backchannel requests whose decision surface has not been delivered and is not
+   *  currently being delivered — the rows the Bolt control plane delivers on its timer. A row under
+   *  a live delivery lease (a post in flight, or one whose outcome was ambiguous and kept its
+   *  lease) is skipped until the lease lapses, so a degraded Slack cannot yield a second post per
+   *  pass. Oldest first, bounded per pass; a row whose delivery keeps failing is retried once per
+   *  lease window until its pending TTL reclaims it (bounded by design). */
   async listUndeliveredBackchannel(limit: number): Promise<ApprovalRow[]> {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('listUndeliveredBackchannel requires a positive limit');
     const rows = await this.db.all<any>(
       `SELECT * FROM approval_request
        WHERE status='pending' AND binding_message IS NOT NULL AND delivered_at IS NULL
+         AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
          AND expires_at>${POSTGRES_NOW_US_SQL}
        ORDER BY created_at LIMIT ?`,
       [limit],

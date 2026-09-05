@@ -4852,21 +4852,23 @@ export async function createVouchr(opts: VouchrOptions) {
     // #296 delivery timer: single-flight per process (a slow Slack pass never stacks a second one),
     // per-row failures are swallowed inside the pass, and the lease dedupes across replicas.
     let deliveryTimer: ReturnType<typeof setInterval> | undefined;
+    let deliveryPass: Promise<void> | undefined;
     if (deliveryMs > 0) {
-      let inFlight = false;
       deliveryTimer = setInterval(() => {
-        if (inFlight) return;
-        inFlight = true;
-        void deliverPendingAuthorizations().catch(() => undefined).finally(() => { inFlight = false; });
+        deliveryPass ??= deliverPendingAuthorizations()
+          .then(() => undefined, () => undefined)
+          .finally(() => { deliveryPass = undefined; });
       }, deliveryMs);
       deliveryTimer.unref();
     }
-    // stop() tears down what install() started: the timers, and (only if Vouchr opened it) the
-    // db pool. An injected db is the caller's to close.
+    // stop() tears down what install() started: the timers (waiting for a delivery pass already in
+    // flight, so its Slack posts and lease confirmations settle before the pool goes away), and
+    // (only if Vouchr opened it) the db pool. An injected db is the caller's to close.
     return {
       stop: async () => {
         if (timer) clearInterval(timer);
         if (deliveryTimer) clearInterval(deliveryTimer);
+        await deliveryPass;
         if (ownsDb) await db.close();
       },
     };

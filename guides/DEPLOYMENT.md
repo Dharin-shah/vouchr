@@ -144,14 +144,24 @@ state must therefore never coexist with a live v13 process. Two safe sequences:
 Schema v15 adds one nullable column, `approval_request.binding_message`; no data conversion. It is
 non-NULL only on rows minted by `POST /v1/authorization` (an agent-initiated request), which the
 Bolt control plane delivers to Slack on its own timer; every pre-v15 row stays NULL and keeps its
-relayed-denial delivery path. Denied approvals are now retained as `status='denied'` for one
-pending-TTL window so a poller can read the outcome; every pending/grant read already excludes them.
+relayed-denial delivery path. The DDL itself is additive and a v14 process never reads the column.
 
-The DDL is additive and safe to apply with v14 replicas still running (they never read the column).
-The only rollout consequence is functional, not a safety one: a v14 Bolt process runs no delivery
-timer, so a backchannel request created while only v14 control planes are live expires undelivered
-(the agent polls `expired`). Roll the Bolt control plane to v15 before pointing background agents
-at the route.
+What is **not** additive is the new `approval_request.status` value: a v15 process retains a
+denied approval as `status='denied'` for one pending-TTL window (so a poller can read the
+outcome), and a v14 process does not know that value. A v14 replica sharing the database with a
+v15 deny therefore misbehaves in two ways: its request dedup treats the denied row as the live
+request, so an in-turn ask for the same action re-prompts against a control whose delivery it then
+reports stale for up to 10 minutes instead of minting a fresh request; and its sweep audits the
+already-audited denial a second time as `approval-expired`. Neither grants access — a denied row
+is never spendable on any version — but both are wrong outcomes.
+
+Required order, therefore: **drain every v14 replica (Bolt control planes and brokers) before any
+v15 process can handle a deny.** Run `vouchr migrate`, stop every v14 process, start only v15
+processes, then point background agents at `POST /v1/authorization`. A v14 process that is merely
+still running when migrate stamps v15 keeps serving (the exact-version check runs only at boot),
+so "migrate, then roll" is not sufficient here — stop v14 first. A v14 Bolt process also runs no
+delivery timer, so a backchannel request created while only v14 control planes are live expires
+undelivered (the agent polls `expired`).
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent

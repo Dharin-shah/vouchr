@@ -374,16 +374,29 @@ fresh single-use assertion per poll) returns the same shape:
 | `status` | Meaning | Agent action |
 | --- | --- | --- |
 | `pending` | Awaiting the human. Pending requests live 10 minutes. | Poll with back-off; never re-initiate while pending (the exact action deduplicates to the same id anyway). |
-| `approved` | One live, single-use grant exists, valid for the provider's `ttlMs` (default 5 minutes). | Call `/v1/fetch` with the **identical** method, host, path, and query. The grant is spent once; a second identical call re-denies with `approval_required`. |
+| `approved` | One live, single-use grant exists, valid for the provider's `ttlMs` (default 5 minutes). | Call `/v1/fetch` with the **identical** method, host, path, and query, under an identity token carrying the **identical `channel`, `threadTs`, and `channelType` claims** as the initiating token (see below). The grant is spent once; a second identical call re-denies with `approval_required`. |
 | `denied` | The human refused. Retained for one pending-TTL window so this outcome is readable. | Stop. A new `POST /v1/authorization` is a new decision — never loop. |
 | `expired` | Nobody decided in time, or the grant went unspent. | Stop; a new request is a new decision. |
 | `404 { "error": "unknown authorization" }` | The id was never this requester's, the grant was spent, or the row was reclaimed by the sweep. | Treat as terminal for that id. |
 
+**The grant is bound to the conversation claims, not just the action.** The approval key includes
+the initiating token's `channel`, `threadTs`, and governance scope (from `channelType`) exactly as
+an in-turn approval does. The spend call must therefore be minted with the **same** `channel`,
+`threadTs`, and `channelType` as the initiating call: a spend token that omits `threadTs` (or names
+a different channel) does not match the grant — it gets `403 approval_required` and mints a
+*second*, ordinary pending request for that other conversation, which has no binding message and
+which the delivery timer therefore never posts. Keep the claim set fixed for the lifetime of one
+authorization; if the agent has no conversation, omit all three consistently on both calls.
+
 Other outcomes mirror `/v1/fetch`: `400` for a missing/empty/whitespace/over-long `bindingMessage`
-(`MAX_BINDING_MESSAGE_BYTES`, exported with `assertBindingMessage` so a client can reject before the
-wire) and for an action the provider's `approval` rule does not cover (call `/v1/fetch` directly —
-there is nothing to decide); `405` when the broker refuses writes; `403 egress_blocked`, `409
-not_connected`, `401` on a replayed assertion. The `bindingMessage` is bounded, stored for the
+or one carrying control characters other than newline and tab (`MAX_BINDING_MESSAGE_BYTES` and
+`assertBindingMessage` are exported so a client can reject before the wire; a `400` here is
+returned before identity verification, so the assertion is not spent), `400` for an action the
+provider's `approval` rule does not cover (call `/v1/fetch` directly — there is nothing to decide);
+`405` when the broker refuses writes; `403 egress_blocked`; `409 not_connected`; `401` on a
+replayed assertion; and `429 rate_limited` — the provider's `rateLimit` budget is spent by an
+authorization request exactly as by the action itself, so a background agent cannot queue prompts
+past the budget its eventual calls are held to. The `bindingMessage` is bounded, stored for the
 prompt, rendered as plain text (no mrkdwn, so it cannot impersonate Vouchr's copy or render links),
 and **never audited** — the audit trail correlates on the salted action fingerprint, exactly like an
 in-turn approval: `approval_requested` → `approved`/`denied` → `approval_consumed`.
@@ -394,9 +407,11 @@ process on the same PostgreSQL delivers it: `install()` runs a bounded delivery 
 context from the stored row — identity, channel, thread — and runs the same trusted
 `recoverBrokerDenial` bridge an in-turn relay would (registry-derived self/admin rule, current
 authority revalidation, cross-replica delivery lease), then the click revalidates everything again
-at the mutation. `sweepExpired()` also runs one pass, for hosts that drive lifecycle themselves. A
-pure headless deployment with no Slack control plane gets enforcement only: requests expire
-undelivered, as with in-turn approvals.
+at the mutation. A row whose post failed ambiguously keeps its delivery lease and is not retried
+until the lease lapses (30 s), so a degraded Slack yields at most one post per lease window, and
+`stop()` waits for a pass already in flight. `sweepExpired()` also runs one pass, for hosts that
+drive lifecycle themselves. A pure headless deployment with no Slack control plane gets
+enforcement only: requests expire undelivered, as with in-turn approvals.
 
 Not in scope: OIDC CIBA wire conformance (`bc-authorize`), callbacks/webhooks (poll), and any
 widening of standing grants — an approved request authorizes exactly one action, once.
