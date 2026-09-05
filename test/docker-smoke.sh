@@ -71,9 +71,12 @@ docker network create "$NET" >/dev/null
 docker run -d --name "$PG_NAME" --network "$NET" \
   -e POSTGRES_USER=vouchr -e POSTGRES_PASSWORD=vouchr -e POSTGRES_DB=vouchr \
   postgres:16-alpine >/dev/null
+# Probe over TCP, not the socket: the image's first boot runs a socket-only bootstrap server (before
+# the vouchr database exists) that answers a socket pg_isready; the real server listens on TCP only
+# after every init step is done.
 wait_pg() {
   for i in $(seq 1 30); do
-    if docker exec "$PG_NAME" pg_isready -U vouchr >/dev/null 2>&1; then echo "    pg ready after ${i}s"; return 0; fi
+    if docker exec "$PG_NAME" pg_isready -h 127.0.0.1 -U vouchr -d vouchr >/dev/null 2>&1; then echo "    pg ready after ${i}s"; return 0; fi
     sleep 1
   done
   echo "FAIL: Postgres never became ready"; docker logs "$PG_NAME"; exit 1

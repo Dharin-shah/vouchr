@@ -1128,14 +1128,17 @@ and not a two-node deployment; treat it as the ordering of the bounds, not as ca
 | | served req/s | served P50 / P95 / P99 (ms) | 503 shed | peak pool (total / active / waiting) | peak RSS (whole harness process) |
 |---|---|---|---|---|---|
 | 2 replicas (default) | 518 | 131 / 154 / 256 | 210 | 20 / 20 / 78 | 182 MiB |
-| 1 replica (`BENCH_REPLICAS=1`) | see below | | | | |
+| 1 replica (`BENCH_REPLICAS=1`) | 519 | 72 / 97 / 165 | 400 | 10 / 10 / 32 | 158 MiB |
 
-Reading it: with 120 callers against an 80-slot single-provider fleet, admission shed ~210 requests
-per 5 s with `Retry-After` and served latency stayed under 300 ms at P99; the pools ran at their
+Reading it: with 120 callers, admission shed with `Retry-After` (400 per 5 s against one 40-slot
+replica, 210 against the 80-slot pair) and served P99 stayed under 300 ms; the pools ran at their
 10-connection ceiling with callers queued (`waiting`), so the PostgreSQL pool, not the in-flight
-ceiling, is the first bound to size (`VOUCHR_PG_POOL_MAX`). RSS covers both replicas and the load
-generator in one process. Re-run on your hardware before setting limits; a run on a loaded host
-(load average > cores) is dominated by scheduling noise and must be discarded.
+ceiling, is the first bound to size (`VOUCHR_PG_POOL_MAX`). Two in-process replicas served no more
+per second than one: on a single host the replicas, the load generator and PostgreSQL share the
+same cores, so this harness cannot show replica scaling — only a real two-node deployment can.
+RSS covers every replica and the load generator in one process. Re-run on your hardware before
+setting limits; a run on a loaded host (load average > cores) is dominated by scheduling noise
+and must be discarded.
 
 ## Slack app + OAuth install flow
 
