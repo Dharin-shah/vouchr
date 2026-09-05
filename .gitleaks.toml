@@ -1,18 +1,20 @@
-# Gitleaks configuration for vouchr.
+# Gitleaks configuration for vouchr. gitleaks-action and `gitleaks git`/`gitleaks dir` on the checkout
+# pick this file up automatically; security.yml's canary step proves the config still flags a
+# credential-shaped value under test/**.
 #
-# The scheduled security scan walks the FULL git history (`git log -p --all`). Without this config it
-# flags the deliberately credential-SHAPED fixtures our tests use — e.g. the fake Slack token
-# `xoxb-…` in test/audit.test.ts that exists ONLY to assert the audit log redacts it. Those are
-# never real secrets; a credential broker's redaction/injection/crypto tests must contain
-# credential-shaped strings to be meaningful. Application code (src/), bin/, and config are still
-# scanned with the complete default ruleset.
+# The scheduled security scan walks the FULL git history. test/ is scanned exactly like src/: the
+# credential-shaped fixtures the redaction/injection/crypto tests need (`xoxb-NOT-A-REAL-SLACK-TOKEN`
+# and friends) pass the default ruleset on their own. The ONLY exception is one exact synthetic value
+# in test/audit.test.ts's history (commit 880b2680, rewritten since): it is not a real secret, and
+# rewriting history to drop it is worse than naming it here. No path is exempt: a global allowlist
+# with `paths` skips the whole file even under condition = "AND" (verified on 8.30.1), so an entry
+# here is always the exact value, never a path. Add one only for a confirmed false positive.
 title = "vouchr gitleaks config"
 
 [extend]
 useDefault = true
 
-[allowlist]
-description = "Test fixtures are intentionally credential-shaped fake values (redaction/injection/crypto tests), not real secrets."
-paths = [
-  '''^test/''',
-]
+[[allowlists]]
+description = "historical synthetic Slack-token fixture in test/audit.test.ts (880b2680), not a real secret"
+regexTarget = "secret"
+regexes = ['''^xoxb-123456789012-abcdefghijklmnop$''']

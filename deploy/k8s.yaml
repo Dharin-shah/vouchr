@@ -75,8 +75,9 @@ spec:
         runAsNonRoot: true
         seccompProfile: { type: RuntimeDefault }
       # Graceful drain: on SIGTERM the broker stops accepting, drops idle keep-alives and finishes
-      # in-flight requests within VOUCHR_SHUTDOWN_TIMEOUT_MS (default 10s). Keep this above that
-      # deadline so the kubelet's SIGKILL never cuts a request the broker would have finished.
+      # in-flight requests within VOUCHR_SHUTDOWN_TIMEOUT_MS (default 10s). Keep this above the
+      # preStop sleep below PLUS that deadline so the kubelet's SIGKILL never cuts a request the
+      # broker would have finished.
       terminationGracePeriodSeconds: 30
       containers:
         - name: broker
@@ -86,6 +87,11 @@ spec:
           image: REPLACE_ME/vouchr-broker:1.0.0-beta.1
           ports:
             - { name: http, containerPort: 3000 }
+          # Endpoint removal and SIGTERM race on termination: a pod can still be handed a new
+          # connection after SIGTERM, when the broker has already stopped accepting. Sleep before
+          # SIGTERM so the pod keeps serving until every endpoint controller has dropped it. coreutils
+          # `sleep` is in the runtime image and needs no writable filesystem.
+          lifecycle: { preStop: { exec: { command: ["sleep", "5"] } } }
           # Secrets (VOUCHR_IDENTITY_SECRET, optional VOUCHR_IDENTITY_SECRET_PREVIOUS,
           # VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, provider client secrets, optional
           # VOUCHR_BROKER_TOKEN) come from a Secret your secret manager syncs (e.g.

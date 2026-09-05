@@ -7,8 +7,9 @@
 #   - `vouchr migrate` runs as a SEPARATE step with the schema-owner role; the replicas connect with
 #     the DML-only role (which provably cannot CREATE) — the two roles from DEPLOYMENT.md § Migrations;
 #   - two replicas serve /readyz against ONE PostgreSQL; startup logs leak no secret;
-#   - rolling restart: each replica drains on SIGTERM (exit 0), restarts and returns ready while the
-#     other replica answers every request (what an LB honouring /readyz sees: zero failed requests);
+#   - rolling restart: each replica drains on SIGTERM (exit 0), restarts and returns ready while every
+#     request sent to the OTHER replica succeeds (the terminating replica's LB hand-off is not measured;
+#     deploy/k8s.yaml's preStop sleep covers that race);
 #   - graceful drain: a request in flight when SIGTERM arrives still receives its response;
 #   - dependency failure: PostgreSQL down → /readyz 503 on every replica (LB pulls them) while
 #     /healthz stays 200 (no restart storm); PostgreSQL back → /readyz 200 with no replica restart.
@@ -115,21 +116,23 @@ echo "    image declares a numeric non-root user"
 # The runtime never creates tables (DML-only role, fails closed on an unmigrated DB), so migrate first
 # using the SAME image as a separate step with the schema-owner role — the deploy/k8s.yaml Job.
 echo "==> migrate the schema as vouchr_owner (separate step, same image)"
-docker run --rm --network "$NET" -e VOUCHR_DATABASE_URL="$OWNER_URL" \
+docker run --rm --read-only --network "$NET" -e VOUCHR_DATABASE_URL="$OWNER_URL" \
   "$IMAGE" node dist/bin/vouchr.js migrate \
   || { echo "FAIL: vouchr migrate errored"; exit 1; }
 echo "==> the DML-only runtime role holds no DDL privilege"
-if docker exec "$PG_NAME" psql -q -U vouchr_app -d vouchr -c 'CREATE TABLE smoke_ddl_probe ()' >/dev/null 2>&1; then
-  echo "FAIL: vouchr_app was able to CREATE TABLE — the runtime role must be DML-only"; exit 1
-fi
-echo "    vouchr_app cannot CREATE"
+# Require the privilege error itself: any other psql failure (bad role, wrong db, connection) is not proof.
+DDL_OUT="$(docker exec "$PG_NAME" psql -q -U vouchr_app -d vouchr -c 'CREATE TABLE smoke_ddl_probe ()' 2>&1)" \
+  && { echo "FAIL: vouchr_app was able to CREATE TABLE — the runtime role must be DML-only"; exit 1; }
+grep -qF 'permission denied for schema public' <<<"$DDL_OUT" \
+  || { echo "FAIL: vouchr_app's CREATE TABLE failed, but not for lack of privilege:"; echo "$DDL_OUT"; exit 1; }
+echo "    vouchr_app cannot CREATE (permission denied for schema public)"
 
 # Two stateless replicas, one migrated database, DML-only credentials. The reference manifest pins no
 # UID and requires a read-only root filesystem, so replica 2 runs as an ARBITRARY numeric non-root user
 # (a Restricted platform assigns one from its range); replica 1 uses the image default. Both read-only.
 run_replica() { # N PORT [extra docker run flags]
   local n="$1" port="$2"; shift 2
-  docker run -d --name "$NAME-$n" --network "$NET" --read-only --tmpfs /tmp "$@" \
+  docker run -d --name "$NAME-$n" --network "$NET" --read-only "$@" \
     -e VOUCHR_IDENTITY_SECRET="$SECRET" \
     -e VOUCHR_DEPLOYMENT_ID="$DEPLOYMENT_ID" \
     -e VOUCHR_MASTER_KEY="$MASTER_KEY" \
@@ -169,8 +172,9 @@ echo "    logs clean of secrets"
 
 # Rolling restart, one replica at a time, as a Deployment rollout does (2 replicas: maxUnavailable 0).
 # While replica N is stopped (SIGTERM → drain → exit 0) and restarted, a tight request loop against the
-# OTHER replica must see only 200s: through a load balancer that honours /readyz that is zero failed
-# requests. The drained process must exit 0 — exit 1 means the VOUCHR_SHUTDOWN_TIMEOUT_MS deadline hit.
+# OTHER replica must see only 200s. Only the surviving replica is measured: whether the terminating one
+# still receives new connections is the LB's hand-off (deploy/k8s.yaml preStop), not covered here. The
+# drained process must exit 0 — exit 1 means the VOUCHR_SHUTDOWN_TIMEOUT_MS deadline hit.
 echo "==> rolling restart: each replica drains and returns ready while the other serves every request"
 roll() { # N PORT OTHER_PORT
   local n="$1" port="$2" other="$3" stop="$TMP/stop-$1" fails="$TMP/fails-$1" count="$TMP/count-$1"
@@ -225,4 +229,4 @@ wait_code "$PORT1" /readyz 200 30 "replica 1 recovered" || fail "replica 1 never
 wait_code "$PORT2" /readyz 200 30 "replica 2 recovered" || fail "replica 2 never recovered after PostgreSQL returned"
 for n in 1 2; do running "$NAME-$n" || fail "replica $n is not running after the outage"; done
 
-echo "==> PASS: image builds; schema-owner migrate + DML-only replicas; 2 replicas ready (default + arbitrary uid, read-only root); logs leak no secret; rolling restart lost 0 requests; in-flight request survived SIGTERM; PostgreSQL outage fails closed and recovers"
+echo "==> PASS: image builds; schema-owner migrate + DML-only replicas; 2 replicas ready (default + arbitrary uid, read-only root); logs leak no secret; rolling restart: the surviving replica served every request; in-flight request survived SIGTERM; PostgreSQL outage fails closed and recovers"

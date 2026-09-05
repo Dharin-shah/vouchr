@@ -1221,12 +1221,14 @@ replicas behind a load balancer that honours `/readyz`. Everything below assumes
 | `vouchr migrate` as `vouchr_owner`, replicas as `vouchr_app` | the [Migrations](#migrations) role split works end to end; `vouchr_app` cannot `CREATE` |
 | two replicas, read-only root, one as the image uid and one as uid 12345 | the manifest's `readOnlyRootFilesystem` + arbitrary-UID contract boots and serves `/readyz` on one shared database |
 | startup logs | provider ids present, no identity secret / master key value |
-| rolling restart, one replica at a time | SIGTERM drains and exits `0`, the replica returns ready, the other replica answered every request meanwhile (zero failures through a readiness-aware LB) |
+| rolling restart, one replica at a time | SIGTERM drains and exits `0`, the replica returns ready, and every request sent to the other replica meanwhile succeeded. Only the surviving replica is measured: whether the terminating one still receives new connections is the load balancer's hand-off, covered by the manifest's `preStop` sleep and not by the script |
 | in-flight request across SIGTERM | a request whose body arrives after SIGTERM still gets its response before the process exits `0` |
 | PostgreSQL stopped, then started | `/readyz` 503 on every replica while `/healthz` stays 200 (no restart storm); `/readyz` 200 again after recovery with no replica restart |
 
 Not covered by that script and still to be run by hand against staging before a production
-declaration: KMS unavailable/throttled and KEK rotation overlap (the image ships without
+declaration: any authenticated `connect`/`fetch`/`refresh`/`offboard` through the image replicas (the
+script's traffic is `/readyz` polling plus one malformed `POST /v1/fetch`; those paths are covered by
+the suite against the same code, not on the image), KMS unavailable/throttled and KEK rotation overlap (the image ships without
 `@aws-sdk/client-kms`; see [KMS envelope encryption](#kms-envelope-encryption-production)), a backup
 restore drill ([Backup and restore](#backup-and-restore)), PostgreSQL primary failover, a slow and an
 oversized provider (unit-covered in `test/http-bounds.test.ts` / `test/egress-response.test.ts`,
@@ -1242,12 +1244,15 @@ broker code in-process).
    [Migrations](#migrations) (v12 → v13 is drained; v13 → v14 is a staged flag rollout).
 3. Roll the Deployment. With `replicas: 2` the default `RollingUpdate` (`maxUnavailable` rounds to
    0, `maxSurge` to 1) starts a new pod, waits for its `/readyz`, then terminates an old one:
-   the fleet never drops below two ready pods. `terminationGracePeriodSeconds: 30` outlives the
-   broker's 10 s drain deadline (`VOUCHR_SHUTDOWN_TIMEOUT_MS`).
+   the fleet never drops below two ready pods. Endpoint removal and SIGTERM race on the old pod, so
+   its container `preStop` sleeps 5 s before SIGTERM to keep accepting until the Service has dropped
+   it; `terminationGracePeriodSeconds: 30` outlives that plus the broker's 10 s drain deadline
+   (`VOUCHR_SHUTDOWN_TIMEOUT_MS`).
 4. Rollback = roll the Deployment back to the previous digest. The runtime is DML-only and the
-   schema marker is exact-version, so a rollback across a schema version is refused at boot
-   (`/readyz` stays 503) — restore the matching backup instead, as [Migrations](#migrations)
-   describes per version. Rollback never runs `vouchr migrate`.
+   schema marker is exact-version, so an older build against a newer schema fails `openDb` at boot:
+   the process exits `1` and the pod goes `CrashLoopBackOff` (it never reaches `/readyz`) — restore
+   the matching backup instead, as [Migrations](#migrations) describes per version. Rollback never
+   runs `vouchr migrate`.
 
 ### Graceful shutdown
 

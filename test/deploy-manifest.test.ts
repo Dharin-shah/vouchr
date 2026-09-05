@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { DEFAULT_SHUTDOWN_TIMEOUT_MS } from '../bin/broker-server';
 
 // Static validation of the reference Kubernetes manifest (#216, #258). No YAML dependency: the
 // checks are string/structural so a security control silently dropped from either pod template
@@ -37,12 +38,16 @@ test('both containers carry the Restricted container-level controls', () => {
   }
 });
 
-test('the Deployment grants SIGTERM more time than the broker drain deadline (graceful drain, #216)', () => {
-  // bin/broker-server.ts defaults VOUCHR_SHUTDOWN_TIMEOUT_MS to 10s; the pod must outlive it or the
-  // kubelet's SIGKILL cuts requests the broker was about to finish.
+test('the Deployment sleeps in preStop and grants SIGTERM more time than that plus the drain deadline (#216)', () => {
+  // Endpoint removal races SIGTERM, so the container must keep accepting for a moment before the
+  // broker drains; then the pod must outlive VOUCHR_SHUTDOWN_TIMEOUT_MS or the kubelet's SIGKILL cuts
+  // requests the broker was about to finish.
   const deployment = podTemplates.find((d) => kindOf(d) === 'Deployment') ?? '';
+  const preStop = Number(deployment.match(/preStop:\s*\{\s*exec:\s*\{\s*command:\s*\["sleep",\s*"(\d+)"\]/)?.[1]);
+  assert.ok(preStop > 0, 'the broker container must sleep in a preStop hook');
   const grace = Number(deployment.match(/terminationGracePeriodSeconds:\s*(\d+)/)?.[1]);
-  assert.ok(grace > 10, `terminationGracePeriodSeconds must exceed the 10s drain deadline (got ${grace})`);
+  const drain = DEFAULT_SHUTDOWN_TIMEOUT_MS / 1000;
+  assert.ok(grace > preStop + drain, `terminationGracePeriodSeconds must exceed preStop ${preStop}s + the ${drain}s drain deadline (got ${grace})`);
 });
 
 test('both containers bound CPU and memory in requests AND limits', () => {

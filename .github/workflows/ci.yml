@@ -9,10 +9,11 @@ on:
   schedule:
     - cron: '13 3 * * 2'
 
-# Superseded PR runs auto-cancel so pushes don't pile up burning minutes.
+# Superseded PR runs auto-cancel so pushes don't pile up burning minutes. The weekly schedule shares
+# the main-ref group with pushes to main, so it must never be the one cancelled.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name != 'schedule' }}
 
 jobs:
   test:

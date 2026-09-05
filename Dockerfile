@@ -20,11 +20,12 @@ COPY --from=build /app/dist ./dist
 COPY --from=build /app/package.json ./package.json
 # For KMS-backed deployments, insert this BEFORE the `rm -rf` line below (npm is gone after it):
 #   RUN npm install --no-save @aws-sdk/client-kms && npm cache clean --force
-# The runtime needs `node` only. Strip the base image's npm/npx/corepack: a package manager is attack
-# surface a production image must not carry, and npm's bundled dependencies are what the container
-# vulnerability scan (Trivy, docker-smoke.yml / release.yml) flags — none of them is in Vouchr's
-# production dependency tree.
-RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+# The runtime needs `node` only. Strip the base image's npm/npx/corepack/yarn: a package manager is
+# attack surface a production image must not carry, and npm's bundled dependencies are what the
+# container vulnerability scan (Trivy, docker-smoke.yml / release.yml) flags — none of them is in
+# Vouchr's production dependency tree.
+RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack \
+  /opt/yarn-v* /usr/local/bin/yarn /usr/local/bin/yarnpkg
 # Set HOME explicitly. uid 1000 already resolves to /home/node via the base image's passwd entry
 # (os.homedir() works), but Docker leaves the HOME env var unset for a numeric USER, and some tooling
 # reads $HOME directly rather than the passwd entry. Pinning it gives every user — including an
