@@ -23,6 +23,7 @@ import {
   POSTGRES_NOW_US_SQL,
   PROMPT_DELIVERY_LEASE_US,
   PROMPT_REDELIVERY_DEBOUNCE_US,
+  usFromMs,
 } from '../src/core/interaction';
 import { approvalNeeded, ConnectionHandle, EgressBlockedError } from '../src/core/injector';
 import { defineProvider, github, ProviderRegistry, type Provider } from '../src/core/providers';
@@ -2315,14 +2316,17 @@ test('a requester-stale channel approval is removed so re-onboarding can request
     await new Consent(vouchr.db).markOffboarded(ID);
     assert.equal((await approvalRows()).length, 1);
 
-    // Re-onboarding is represented by a newly received Slack event after the tombstone. Leave a
-    // small PostgreSQL-clock margin so the conservative receipt conversion is unambiguously newer.
+    // Re-onboarding is represented by a newly received Slack event after the tombstone. The receipt
+    // conversion is deliberately conservative: it backdates the event by one PostgreSQL round trip
+    // (fail closed), so the margin here must cover a slow query, not just clock resolution. A 10µs
+    // margin flaked in CI (#306 run): the return leg of connect()'s own clock query exceeded it and
+    // the fresh event was fenced as pre-offboard (InteractionStateChangedError, not a new prompt).
     const tombstone = await vouchr.db.get<{ created_at: number }>(
       `SELECT created_at FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
       [ID.teamId, ID.userId],
     );
     assert.ok(tombstone);
-    while (await vouchr.vault.userProvisioningIssuedAt() <= tombstone.created_at + 10) {
+    while (await vouchr.vault.userProvisioningIssuedAt() <= tombstone.created_at + usFromMs(250)) {
       await new Promise((resolve) => setTimeout(resolve, 1));
     }
     const args: any = {
