@@ -48,6 +48,11 @@ All notable changes to this project are documented here. This project adheres to
   `MAX_BINDING_MESSAGE_BYTES`, `assertBindingMessage`. Wire goldens: `authorization.*`,
   `error.authorization.*`. Regression: `test/authorization.test.ts`. See guides/HEADLESS.md
   § "Backchannel authorization for background agents".
+- `examples/python-client` (#278): a stdlib-only Python worker client for the packaged broker —
+  `fetch`, `status`, the #296 backchannel calls; every denial is one `VouchrError` carrying the typed
+  `code` / `retryable` / `recovery` / `retryAfterMs` envelope, with one `retryAfterMs` retry on a
+  fresh token. Minting stays TypeScript-side. Proven against a real broker by
+  `test/python-client.test.ts`.
 
 ### Fixed
 
@@ -100,6 +105,9 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Docs
 
+- HEADLESS.md gained a route index (every broker route, where the identity rides, and its exported
+  response type) and points other-language workers at `test/golden/wire` as the pinned
+  machine-readable contract (#278).
 - Pruned pre-beta upgrade paths from the guides (the bare-secret broker cutover and the headless
   TTL-default note, both older than `1.0.0-beta`), and aligned README, SECURITY's support table,
   and `vision.md` on the shipped `1.0.0-beta.1` release: beta, not yet independently assessed.

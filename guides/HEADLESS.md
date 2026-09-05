@@ -638,3 +638,37 @@ worker receives only that short-lived assertion and never the signing key. The T
 [`examples/broker-client`](../examples/broker-client) is the reference request shape to reproduce in
 another language — reproduce its minter/worker split; its `main` block collapses the two into one
 process for local development only.
+
+A stdlib-only Python port of the worker half lives in
+[`examples/python-client`](../examples/python-client): `fetch`, `status`, and the #296 backchannel
+calls, with every denial raised as one `VouchrError` carrying `code` / `retryable` / `recovery` /
+`retryAfterMs`. It takes a `mint` callable rather than a key: minting stays in the trusted
+TypeScript service. The pinned machine-readable contract is
+[`test/golden/wire`](../test/golden/wire) — one `{ status, shape }` file per route and outcome,
+regenerated only on an intentional (semver-major) change.
+
+### Route index
+
+`POST` routes carry the signed identity as `identityToken` in the JSON body; `GET /v1/admin/config`
+and `GET /v1/authorization/{id}` carry it in the `x-vouchr-identity` header (a GET has no body;
+never a query string, which access logs keep); `GET /v1/manifest` and the probes need none. Response types are the exported
+`Broker*Response` interfaces in `src/broker-types.ts`; every 4xx/5xx body is `BrokerError`.
+
+| Route | Purpose | Response |
+| --- | --- | --- |
+| `POST /v1/fetch` | Brokered provider request, credential injected | `BrokerFetchResponse` `{ status, contentType, body }` |
+| `POST /v1/mcp` | Streamed MCP passthrough (`mcp` provider knob) | the upstream stream, verbatim |
+| `POST /v1/authorization` | Initiate a human decision for one exact action (#296); nothing executes | `BrokerAuthorizationResponse` |
+| `GET /v1/authorization/{id}` | Poll that decision: `pending` · `approved` · `denied` · `expired`; spent or swept is `404` | `BrokerAuthorizationResponse` |
+| `POST /v1/status` | The acting user's state across every brokered provider | `BrokerStatusResponse` |
+| `POST /v1/resolve` | One provider's state; `includeCredentialId: true` adds the opaque id | `BrokerResolveResponse` |
+| `POST /v1/connect` | Authorize URL bound to the verified user (single-use `state`) | `BrokerConnectResponse` |
+| `POST /v1/disconnect` | Remove the caller's own credential by opaque id | `{ ok, revoked }` |
+| `POST /v1/audit` | The caller's own recent audit rows (never `meta`) | `BrokerAuditResponse` |
+| `POST /v1/user/reference` | Point the caller's credential at a secret-manager reference | `{ ok }` |
+| `GET /v1/manifest` | Provider ids and identity kind, channel-independent | `BrokerManifestResponse` |
+| `POST /v1/manifest` | Channel-scoped tool manifest for the signed channel | `BrokerChannelManifestResponse` |
+| `GET /v1/admin/config` | Channel modes and tool allowlist (signed `isAdmin`) | `BrokerAdminConfigResponse` |
+| `POST /v1/admin/mode` · `/v1/admin/tools` · `/v1/admin/reference` | Channel governance writes (signed `isAdmin`) | `BrokerAdminOkResponse` |
+| `POST /v1/admin/audit` · `/v1/admin/offboard` | Channel audit read · offboard a user (signed `isAdmin`) | `BrokerAuditResponse` · `{ ok, revoked }` |
+| `GET /healthz` · `GET /readyz` | Liveness · readiness; unauthenticated | `{ ok }` |
