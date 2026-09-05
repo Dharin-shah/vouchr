@@ -47,6 +47,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- README is a short overview (what, the problem, one example, modes, providers, headless, links);
+  the Beta callout is gone and the status badge is the status signal. `vision.md` and
+  `SECURITY.md` no longer list an independent security assessment as a release gate (operator
+  decision); the remaining production-ready gates are unchanged.
 - Pre-beta schema markers (v6-v11) are no longer migratable — they never shipped in a published
   release; `vouchr migrate` refuses them with the same recreate-fresh error v1-v5 get (recreate
   the database fresh, or migrate through 1.0.0-beta.1 first). Only v12-v14 remain migratable.

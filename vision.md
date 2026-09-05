@@ -270,12 +270,10 @@ state machines do not conflict. #192, #208, #209, #211, #212, and #241 are compl
 - [#217](https://github.com/Dharin-shah/vouchr/issues/217): require one reviewed, protected, scanned,
   reproducible build and release gate.
 
-### 5. Obtain independent assurance and release
+### 5. Release
 
 - Freeze one commit, image digest, identity-minter build, and production-like configuration.
-- [#225](https://github.com/Dharin-shah/vouchr/issues/225): commission one source-assisted security
-  assessment, remediate findings, and independently retest every high or critical fix.
-- Complete the production-release stage of #223 using the assessed artifact or a reviewed
+- Complete the production-release stage of #223 using the frozen artifact or a reviewed
   remediation-only descendant.
 
 ## Definition of production-ready
@@ -288,10 +286,7 @@ Vouchr is production-ready only when all of the following are evidenced:
    through the packed public API, and in the focused staging deployment as appropriate.
 4. The exact image passes the two-replica restore, failover, rolling-upgrade, dependency-failure,
    graceful-drain, and load proof.
-5. Independent assessment has no unresolved high or critical finding and remediation has passed
-   retest.
-6. The reviewed assessed artifact is published with accurate upgrade, support, and security
-   guidance.
+5. The reviewed artifact is published with accurate upgrade, support, and security guidance.
 
 Green CI, high coverage, or an automated scanner alone is not production readiness.
 

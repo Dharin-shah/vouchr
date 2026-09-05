@@ -868,11 +868,9 @@ Before a production claim, verify all of the following with the exact image and 
 This checklist is not sufficient by itself. The canonical release contract remains
 [#226](https://github.com/Dharin-shah/vouchr/issues/226): complete the containment/recovery gate in
 [#239](https://github.com/Dharin-shah/vouchr/issues/239), the exact-image, two-replica,
-failover/rolling/load proof in [#216](https://github.com/Dharin-shah/vouchr/issues/216), the
+failover/rolling/load proof in [#216](https://github.com/Dharin-shah/vouchr/issues/216), and the
 protected reproducible scanned release gate in
-[#217](https://github.com/Dharin-shah/vouchr/issues/217), and the independent source-assisted
-assessment plus retest in [#225](https://github.com/Dharin-shah/vouchr/issues/225) before a
-production-ready claim.
+[#217](https://github.com/Dharin-shah/vouchr/issues/217) before a production-ready claim.
 
 ### Rotation order
 
