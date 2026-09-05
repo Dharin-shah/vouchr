@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { Client } from 'pg';
 import { Audit, MAX_AUDIT_PRUNE_BATCH, PRUNE_BATCH_SQL } from '../src/core/audit';
 import { openDb, type Db } from '../src/core/db';
 import { openTestDb, testDbUrl, pgReachable } from './support/pg';
@@ -32,17 +33,31 @@ function recordingDb(real: Db): { db: Db; calls: Call[] } {
   return { db, calls };
 }
 
-/** Bulk-insert `n` rows spread across teams/users/channels/providers/time in ONE statement. */
-async function seed(db: Db, n: number, now: number): Promise<void> {
-  await db.exec(
-    `INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at)
-     SELECT gen_random_uuid()::text,
-            'T' || (g % 50), 'U' || (g % 500),
-            (ARRAY['github','gitlab','notion'])[1 + (g % 3)],
-            'inject', NULL, 'C' || (g % 100), '{}',
-            ${now} - (g * 1000)
-     FROM generate_series(1, ${n}) g`,
-  );
+/** Bulk-insert `n` rows spread across teams/users/channels/providers/time in ONE statement, then
+ *  ANALYZE. Fixture work, not the path under test: it runs on its own untimed connection so the
+ *  runtime pool's 10s query timeout (a production bound the plan assertions still run under) cannot
+ *  cancel a 50k-row, 4-index seed that a contended database stretches past it. */
+async function seed(url: string, n: number, now: number): Promise<void> {
+  const seeder = new Client(url);
+  await seeder.connect();
+  try {
+    await seeder.query(
+      `INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at)
+       SELECT gen_random_uuid()::text,
+              'T' || (g % 50), 'U' || (g % 500),
+              (ARRAY['github','gitlab','notion'])[1 + (g % 3)],
+              'inject', NULL, 'C' || (g % 100), '{}',
+              ${now} - (g * 1000)
+       FROM generate_series(1, ${n}) g`,
+    );
+    await seeder.query(
+      `INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at)
+       SELECT gen_random_uuid()::text,'T1','U_ADMIN','github','config',NULL,'C1','{}', ${now} - (g*1000) FROM generate_series(1,20) g`,
+    );
+    await seeder.query(`ANALYZE audit`);
+  } finally {
+    await seeder.end();
+  }
 }
 
 /** Stringified JSON query plan (EXPLAIN, plan-only — never executes) for a parameterized query. */
@@ -54,17 +69,13 @@ const seqScans = (planJson: string) => /"Node Type":"Seq Scan"/.test(planJson);
 
 test('audit plans: the ACTUAL production queries (+ the prune DELETE) ride an index, not a seq scan', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
-  const real = await openTestDb(t);
+  const url = await testDbUrl(t);
+  const real = await openDb({ databaseUrl: url });
+  t.after(() => real.close());
   const now = Date.now();
-  // 50k keeps the seed under the test pool's statement_timeout (the migrated schema has 4 audit
-  // indexes to maintain per insert). The plans are deterministic, so this suffices to assert them;
-  // the 1M-row EXPLAIN ANALYZE / P95 / WAL reference is the opt-in `bench:audit` harness (#208).
-  await seed(real, 50_000, now);
-  await real.exec(
-    `INSERT INTO audit (id, team_id, user_id, provider, action, actor, channel, meta, at)
-     SELECT gen_random_uuid()::text,'T1','U_ADMIN','github','config',NULL,'C1','{}', ${now} - (g*1000) FROM generate_series(1,20) g`,
-  );
-  await real.exec(`ANALYZE audit`);
+  // 50k rows are enough for the planner to prefer the indexes (the plans are deterministic from
+  // there); the 1M-row EXPLAIN ANALYZE / P95 / WAL reference is the opt-in `bench:audit` harness (#208).
+  await seed(url, 50_000, now);
 
   // Capture the SQL each production method actually issues (not a copy), then EXPLAIN THAT.
   const rec = recordingDb(real);

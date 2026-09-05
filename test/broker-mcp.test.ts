@@ -14,6 +14,7 @@ import { defineProvider, type Provider } from '../src/core/providers';
 import { channelOwner, userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { waitFor, within } from './support/clock';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // #65 POST /v1/mcp — MCP-aware egress proxy: SSE + session-header passthrough, stateless.
@@ -619,8 +620,16 @@ test('#65 mcp: maxStreamBytes terminates the stream — client receives <= cap, 
   }
 });
 
+// The deadline tests below freeze `setTimeout` (t.mock.timers) and fire the route deadline explicitly
+// once the request has provably reached the stage under test. A real 60-80ms timer would race the
+// vault/identity reads that precede egress — on a loaded host those reads alone outlast it, and the
+// 504 fires before the upstream (or resolver) is ever called. Real I/O is awaited with `waitFor`
+// (wall clock); only the production timer is virtual. `server.timeout` (an internal socket timer,
+// not mocked) is lifted well clear so it never pre-empts the typed route timeout under load.
+
 test('#65 mcp: maxStreamMs aborts a stream that never ends', async (t) => {
   const { server, port } = await makeMcpBroker(t, { maxStreamMs: 80 });
+  server.timeout = 60_000;
   const up = mockUpstream(() => new Response(
     new ReadableStream<Uint8Array>({
       start(controller) {
@@ -629,8 +638,13 @@ test('#65 mcp: maxStreamMs aborts a stream that never ends', async (t) => {
     }),
     { status: 200, headers: { 'content-type': 'text/event-stream' } },
   ));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
-    const r = await postRaw(port, '/v1/mcp', envelope());
+    let relayed = '';
+    const pending = postRaw(port, '/v1/mcp', envelope(), (sofar) => { relayed = sofar; });
+    await waitFor(() => relayed.includes('hello')); // the pre-deadline event reached the client
+    t.mock.timers.tick(80); // maxStreamMs elapses on the silent stream
+    const r = await within(pending); // the teardown must follow the deadline, not the socket-idle guard
     assert.equal(r.status, 200);
     assert.ok(r.raw.includes('hello'), 'bytes before the deadline still flowed');
     assert.equal(r.clean, false, 'the hung stream was torn down, not cleanly ended');
@@ -645,16 +659,23 @@ test('#194 fetch/MCP: pre-header timeouts expose conservative unknown-outcome me
   const { server, port } = await makeMcpBroker(t, { maxStreamMs: 80, fetchDeadlineMs: 80 });
   // Keep Node's general socket-idle guard above the route deadlines; this test targets the typed
   // route timeout, not the server-level hard destroy that intentionally has no JSON response.
-  server.timeout = 1_000;
+  server.timeout = 60_000;
   const up = mockUpstream((_url, init) => new Promise<Response>((_resolve, reject) => {
     const signal = init.signal as AbortSignal;
     const abort = () => reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
     if (signal.aborted) abort();
     else signal.addEventListener('abort', abort, { once: true });
   }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const timedOut = async (path: string, body: unknown, upstreamCalls: number) => {
+    const pending = postRaw(port, path, body);
+    await waitFor(() => up.seen.length === upstreamCalls); // the request is hung upstream, pre-header
+    t.mock.timers.tick(80); // the route deadline elapses
+    return pending;
+  };
   try {
-    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
-    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
+    const viaMcp = await timedOut('/v1/mcp', envelope(), 1);
+    const viaFetch = await timedOut('/v1/fetch', fetchEnvelope(), 2);
     for (const response of [viaFetch, viaMcp]) {
       assert.equal(response.status, 504);
       assert.equal(response.clean, true, 'a pre-header timeout is a complete JSON error, not a torn stream');
@@ -787,20 +808,28 @@ test('#194 typed recovery: invalid fulfilled resolver values fail closed on fetc
 });
 
 test('#194 typed recovery: a resolver deadline is retryable on fetch/MCP because provider egress never began', async (t) => {
+  let resolverCalls = 0;
   const { server, port, vault } = await makeMcpBroker(t, {
     fetchDeadlineMs: 60,
     maxStreamMs: 60,
-    resolvers: { 'aws-sm': async () => await new Promise<string>(() => undefined) },
+    resolvers: { 'aws-sm': async () => { resolverCalls++; return await new Promise<string>(() => undefined); } },
   });
-  server.timeout = 1_000;
+  server.timeout = 60_000;
   await vault.reference(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     source: 'aws-sm',
     secretRef: 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouchr/hung-wire-resolver',
   });
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const resolverTimedOut = async (path: string, body: unknown, calls: number) => {
+    const pending = postRaw(port, path, body);
+    await waitFor(() => resolverCalls === calls); // the request is hung inside the resolver
+    t.mock.timers.tick(60); // the route deadline elapses before any provider egress
+    return pending;
+  };
   try {
-    const viaFetch = await postRaw(port, '/v1/fetch', fetchEnvelope());
-    const viaMcp = await postRaw(port, '/v1/mcp', envelope());
+    const viaFetch = await resolverTimedOut('/v1/fetch', fetchEnvelope(), 1);
+    const viaMcp = await resolverTimedOut('/v1/mcp', envelope(), 2);
     for (const response of [viaFetch, viaMcp]) {
       assert.equal(response.status, 502);
       assert.deepEqual(JSON.parse(response.raw), {
