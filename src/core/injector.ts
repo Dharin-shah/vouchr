@@ -179,6 +179,16 @@ export class ResponseBlockedError extends Error {
  * `provider.mcp.paths` gate (STR-2: one matcher, one semantics): `'/'` allows everything; a prefix
  * ending in `/` matches by startsWith; otherwise the exact segment or any subpath of it.
  */
+/**
+ * RFC 1035 §2.3.4 ceiling on a full domain name. WHATWG `URL` parses a hostname of any length, so
+ * without this bound a caller-controlled target of tens of kilobytes would reach `denyEgress` and be
+ * persisted verbatim as `meta.host` on the `denied` audit row (and the `egress_denied` event) before
+ * any allowlist check — an unvalidated, unbounded external value in an audit column (SEC-4, IMP-3).
+ * A name past this limit can never resolve, so it is a malformed URL, not an egress attempt: it is
+ * refused exactly like an unparseable URL, with no audit row, no event, and no gate reached.
+ */
+export const MAX_URL_HOSTNAME_LENGTH = 253;
+
 export function pathAllowed(pathname: string, allowed: string): boolean {
   if (allowed === '/') return true;
   if (allowed.endsWith('/')) return pathname.startsWith(allowed);
@@ -585,6 +595,7 @@ export class ConnectionHandle {
     const method = canonicalMethod(init.method ?? 'GET');
     if (!method) throw new TypeError('Invalid HTTP method.');
     const url = new URL(input);
+    if (url.hostname.length > MAX_URL_HOSTNAME_LENGTH) throw new TypeError('Invalid URL.');
     if (url.username || url.password) {
       await this.denyEgress(url.hostname, 'host', `Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
     }

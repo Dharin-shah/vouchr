@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { ConnectionHandle } from '../src/core/injector';
+import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { defineProvider, github } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
@@ -60,6 +60,48 @@ test('egress: allowed path + method passes, reads the token, and injects', async
     assert.equal(res.status, 200);
     assert.equal(sawAuth, 'Bearer super-secret-token'); // token resolved and injected
     assert.equal(calls(), 1);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// WHATWG URL parses a hostname of any length, so an agent-supplied target of tens of kilobytes used to
+// sail into denyEgress and land verbatim in the `denied` audit row's meta.host and the egress_denied
+// event — an unbounded, unvalidated external value persisted before any check (SEC-4). Past the RFC
+// 1035 ceiling a name cannot resolve: it is a malformed URL, refused with no row, no event, no gate.
+test('egress: an over-long hostname is a malformed URL — no audit row, no event, no secret read (SEC-4)', async (t) => {
+  const realFetch = globalThis.fetch;
+  let fetched = false;
+  globalThis.fetch = (async () => {
+    fetched = true;
+    return new Response('{}', { status: 200 });
+  }) as any;
+  try {
+    const db = await openTestDb(t);
+    const vault = new Vault(db, KEY);
+    const audit = new Audit(db);
+    let resolverCalls = 0;
+    await vault.reference(O1, guarded.id, { source: 'ext', secretRef: 'arn:secret' });
+    const events: VouchrEvent[] = [];
+    const handle = new ConnectionHandle(
+      guarded, O1, ID, vault, audit,
+      { ext: async () => { resolverCalls++; return 'super-secret-token'; } },
+      new Map(), (e) => events.push(e),
+    );
+    // 254 chars: one past the ceiling. A dotted label pattern so audit's high-entropy redaction cannot
+    // mask the persistence (a bare 40+ alnum run would be scrubbed to '[redacted]' and hide the bug).
+    const host = `${'a.'.repeat(126)}ab`;
+    assert.equal(host.length, 254);
+    await assert.rejects(() => handle.fetch(`https://${host}/user`), TypeError);
+    assert.deepEqual(await db.all(`SELECT action FROM audit`), []);
+    assert.deepEqual(events, []);
+    assert.equal(resolverCalls, 0);
+    assert.equal(fetched, false);
+    // Exactly at the ceiling is still a real (non-allowlisted) target: audited and denied as before.
+    const maxHost = `${'a.'.repeat(126)}a`;
+    assert.equal(maxHost.length, 253);
+    await assert.rejects(() => handle.fetch(`https://${maxHost}/user`), /not in the allowlist/);
+    assert.deepEqual(await db.all(`SELECT action, meta FROM audit`), [{ action: 'denied', meta: JSON.stringify({ host: maxHost, reason: 'host' }) }]);
   } finally {
     globalThis.fetch = realFetch;
   }

@@ -955,7 +955,7 @@ test('fetch: brokerToken network gate — wrong/absent token 401, correct token 
 });
 
 test('fetch: a malformed host -> clean 400, not a 500', async (t) => {
-  const { server, port } = await makeBroker(t);
+  const { server, port, db } = await makeBroker(t);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -963,6 +963,15 @@ test('fetch: a malformed host -> clean 400, not a 500', async (t) => {
       method: 'GET', path: '/x', host: 'api.acme.example:notaport',
     });
     assert.equal(r.status, 400);
+    // A hostname past the RFC 1035 ceiling parses fine but can never resolve: it is malformed input
+    // (400), and it must never be persisted as a `denied` audit row's meta.host (SEC-4) — a caller
+    // could otherwise write ~64KB of arbitrary text into the audit table per request.
+    const huge = await post(port, '/v1/fetch', {
+      handle: { provider: 'acme', owner: 'user' }, identityToken: signIdentity(claims(), SECRET),
+      method: 'GET', path: '/x', host: `${'a.'.repeat(20_000)}a`,
+    });
+    assert.equal(huge.status, 400);
+    assert.deepEqual(await db.all(`SELECT action FROM audit WHERE action='denied'`), []);
   } finally {
     up.restore();
     server.close();

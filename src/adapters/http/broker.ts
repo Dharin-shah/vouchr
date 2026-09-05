@@ -9,7 +9,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import { configureChannelTools, type ChannelTools } from '../../core/tools';
 import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, canonicalMethod, hasAmbiguousPathEncoding, withEgressDefaults, type Provider } from '../../core/providers';
-import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, approvalNeeded, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
+import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, approvalNeeded, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, MAX_URL_HOSTNAME_LENGTH, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
 import { MAX_TIMER_MS } from '../../core/options';
@@ -540,6 +540,9 @@ function buildTargetUrl(provider: Provider, body: { host?: string; path?: string
   } catch {
     throw new HttpError(400, { error: 'invalid host or path' });
   }
+  // The injector refuses this as a malformed URL too (the invariant lives there); mapping it here
+  // keeps caller input a 4xx instead of the generic upstream 502.
+  if (url.hostname.length > MAX_URL_HOSTNAME_LENGTH) throw new HttpError(400, { error: 'invalid host or path' });
   for (const [k, v] of Object.entries(body.query ?? {})) url.searchParams.set(k, v);
   return url;
 }
