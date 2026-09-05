@@ -251,13 +251,6 @@ export class SessionGrants {
     return result.changes === 1;
   }
 
-  /** Prompt-post rollback: remove only the row minted by this caller, never a context-wide row that
-   *  a later request may have replaced. */
-  async discardRequest(id: string): Promise<boolean> {
-    if (!isInteractionId(id)) return false;
-    return (await this.db.run(`DELETE FROM session_request WHERE id=?`, [id])).changes === 1;
-  }
-
   /** Resolve only a live request bound to the verified click context. This authority-free read is
    *  used solely to choose the canonical provider lock; grantRequested() reloads and locks the row
    *  before any mutation. */

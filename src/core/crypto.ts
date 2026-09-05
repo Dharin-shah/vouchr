@@ -511,8 +511,8 @@ export async function open(
   throw envErr; // not legacy → this was a real envelope row; surface its clear error, not the GCM one.
 }
 
-/** Coerce a DB BYTEA/BLOB value to a Buffer. Postgres returns a Buffer already; SQLite may hand
- *  back other shapes. A no-op guard shared by the Vault and the installation store. */
+/** Coerce a DB BYTEA value to a Buffer. pg returns a Buffer already; the guard keeps the boundary
+ *  explicit. Shared by the Vault, rekey, and the installation store. */
 export function toBuffer(v: unknown): Buffer {
   return Buffer.isBuffer(v) ? v : Buffer.from(v as any);
 }

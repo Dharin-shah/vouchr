@@ -686,6 +686,16 @@ Store selection (shared with the app):
                          (encrypts new writes), the rest decrypt-only (rotation)`);
 }
 
+/** Open the store for one command and always close it, even when the command throws. */
+async function withDb<T>(databaseUrl: string | undefined, run: (db: Db) => Promise<T>): Promise<T> {
+  const db = await openDb({ databaseUrl });
+  try {
+    return await run(db);
+  } finally {
+    await db.close();
+  }
+}
+
 async function main(): Promise<number> {
   const [cmd, ...rest] = process.argv.slice(2);
   // Non-destructive commands parse strictly here, BEFORE any DB opens; the destructive ones parse
@@ -714,13 +724,7 @@ async function main(): Promise<number> {
     }
     case 'inventory':
     case 'channels': {
-      const db = await openDb({ databaseUrl: f.db });
-      try {
-        if (cmd === 'inventory') await cmdInventory(db, f);
-        else await cmdChannels(db, f);
-      } finally {
-        await db.close();
-      }
+      await withDb(f.db, (db) => cmd === 'inventory' ? cmdInventory(db, f) : cmdChannels(db, f));
       return 0;
     }
     case 'revoke': {
@@ -730,32 +734,17 @@ async function main(): Promise<number> {
       if ('error' in p) { console.error(`revoke: ${p.error}`); return 2; }
       const plan = planRevoke(p.values);
       if ('error' in plan) { console.error(`revoke: ${plan.error}`); return 2; }
-      const db = await openDb({ databaseUrl: plan.db });
-      try {
-        return plan.mode === 'all' ? await cmdRevokeAll(db, plan.execute) : await cmdRevoke(db, plan);
-      } finally {
-        await db.close();
-      }
+      return withDb(plan.db, (db) => plan.mode === 'all' ? cmdRevokeAll(db, plan.execute) : cmdRevoke(db, plan));
     }
     case 'rekey': {
-      const db = await openDb({ databaseUrl: f.db });
-      try {
-        return await cmdRekey(db, f);
-      } finally {
-        await db.close();
-      }
+      return withDb(f.db, (db) => cmdRekey(db, f));
     }
     case 'prune': {
       const p = strictParse(rest, PRUNE_SPEC);
       if ('error' in p) { console.error(`prune: ${p.error}`); return 2; }
       const pre = planPrune(p.values); // days/batch/confirmation validated BEFORE the DB opens
       if ('error' in pre) { console.error(`prune: ${pre.error}`); return 2; }
-      const db = await openDb({ databaseUrl: p.values.db as string | undefined });
-      try {
-        return await runPrune(db, pre);
-      } finally {
-        await db.close();
-      }
+      return withDb(p.values.db as string | undefined, (db) => runPrune(db, pre));
     }
     case 'doctor':
       return cmdDoctor(f);

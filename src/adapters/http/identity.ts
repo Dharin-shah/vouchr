@@ -112,9 +112,6 @@ export interface IdentityConfig {
   readonly keys: readonly IdentityKey[];
 }
 
-/** A validated deployment-bound snapshot, deep-frozen at runtime. */
-export type NormalizedIdentityConfig = IdentityConfig;
-
 /** Module-private brand: only snapshots produced by the validator get the normalize-once fast path. */
 const NORMALIZED_IDENTITY_CONFIGS = new WeakSet<object>();
 
@@ -223,9 +220,9 @@ export function assertStrongIdentitySecret(secret: string): void {
  * verified. The returned clone is deep-frozen so later caller mutation cannot change a live broker's
  * trust root.
  */
-export function normalizeIdentityConfig(config: IdentityConfig): NormalizedIdentityConfig {
+export function normalizeIdentityConfig(config: IdentityConfig): IdentityConfig {
   if (config && typeof config === 'object' && NORMALIZED_IDENTITY_CONFIGS.has(config)) {
-    return config as NormalizedIdentityConfig;
+    return config as IdentityConfig;
   }
   if (!isPlainRecord(config)) throw new Error('identity config must be a plain object');
   assertExactFields(config, IDENTITY_CONFIG_FIELDS, ['issuer', 'audience', 'keys'], 'identity config');
@@ -353,7 +350,7 @@ export function assertIdentityPurposeDistinct(
 export function loadIdentityConfig(
   env: NodeJS.ProcessEnv,
   otherSecrets: readonly SecretMaterial[] = [],
-): NormalizedIdentityConfig {
+): IdentityConfig {
   const active = env.VOUCHR_IDENTITY_SECRET;
   if (!active || !active.trim()) {
     throw new Error('VOUCHR_IDENTITY_SECRET is required (the HS256 secret shared with the identity-token minter)');
