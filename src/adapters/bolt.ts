@@ -503,6 +503,21 @@ function interactionLocation(body: any): { channel: string; thread: string | nul
   return { channel, thread };
 }
 
+/** The `/vouchr disconnect` and Disconnect-button receipt (UX-3): what committed, what could not be
+ *  confirmed, and what to do next. `p` is the already-escaped provider id (SEC-5); `nothingText` is
+ *  each surface's own no-op copy (UX-2). */
+function disconnectReceipt(
+  p: string,
+  o: Awaited<ReturnType<typeof disconnectProvider>>,
+  nothingText: string,
+): string {
+  if (o.removed && !o.ok) return `Disconnected *${p}* locally, but complete revocation could not be confirmed. Retry \`/vouchr disconnect ${p}\` to invalidate older setup requests, and revoke or rotate Vouchr’s access in ${p} directly if needed.`;
+  if (o.removed && !o.audited) return `Disconnected *${p}* locally, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`;
+  if (o.removed) return `Disconnected *${p}*. The agent can no longer act as you on ${p}.`;
+  if (!o.ok) return `Could not confirm that older *${p}* setup requests were invalidated. Retry \`/vouchr disconnect ${p}\` before reconnecting.`;
+  return nothingText;
+}
+
 /**
  * The adapter half of invariant 6, ONE implementation for every mutation path: fetch the channel
  * class (null on any error → fails closed) and apply the core rule (channelIneligibleReason), so a
@@ -2664,6 +2679,18 @@ export async function createVouchr(opts: VouchrOptions) {
     await client.chat.postMessage({ channel: identity.userId, text }).catch(() => undefined);
   };
 
+  /** Button feedback: an ephemeral through the interaction's `respond`, falling back to a DM. */
+  const replyToActor = (respond: any, client: WebClient, identity: SlackIdentity | null) =>
+    async (text: string, replaceOriginal = true) => {
+      if (respond) {
+        try {
+          await respond({ replace_original: replaceOriginal, response_type: 'ephemeral', text });
+          return;
+        } catch { /* fall back to a private DM */ }
+      }
+      if (identity) await dmActor(client, identity, text);
+    };
+
   /** Replace the private pending modal with its committed outcome. If the view is gone, fall back
    *  to a DM; if both Slack deliveries fail, the already-acknowledged pending view still contains
    *  truthful unknown-state recovery guidance. */
@@ -3585,17 +3612,8 @@ export async function createVouchr(opts: VouchrOptions) {
         }
         if (!outcome.recognized) return respond(UNKNOWN_DISCONNECT_PROVIDER_TEXT);
         const p = escapeMrkdwn(arg); // recognized current/stored id; still escape at render (SEC-5)
-        if (!outcome.removed && !outcome.ok) {
-          return respond(`Could not confirm that older *${p}* setup requests were invalidated. Retry \`/vouchr disconnect ${p}\` before reconnecting.`);
-        }
-        if (!outcome.removed) return respond(`You have no connected *${p}* account, so there was nothing to disconnect.`);
-        emit({ type: 'revoked', provider: arg, ok: outcome.ok });
-        if (!outcome.audited && outcome.ok) {
-          return respond(`Disconnected *${p}* locally, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
-        }
-        return respond(outcome.ok
-          ? `Disconnected *${p}*. The agent can no longer act as you on ${p}.`
-          : `Disconnected *${p}* locally, but complete revocation could not be confirmed. Retry \`/vouchr disconnect ${p}\` to invalidate older setup requests, and revoke or rotate Vouchr’s access in ${p} directly if needed.`);
+        if (outcome.removed) emit({ type: 'revoked', provider: arg, ok: outcome.ok });
+        return respond(disconnectReceipt(p, outcome, `You have no connected *${p}* account, so there was nothing to disconnect.`));
       }
 
       // Self-service transparency: where your credential was used. `audit channel` (admin-gated) shows
@@ -4350,22 +4368,9 @@ export async function createVouchr(opts: VouchrOptions) {
       if (outcome && provider) {
         const p = escapeMrkdwn(provider);
         if (outcome.removed) emit({ type: 'revoked', provider, ok: outcome.ok });
-        if (outcome.removed && !outcome.ok) {
-          await dmActor(client, identity, `Disconnected *${p}* locally, but complete revocation could not be confirmed. Retry \`/vouchr disconnect ${p}\` to invalidate older setup requests, and revoke or rotate Vouchr’s access in ${p} directly if needed.`);
-        } else if (outcome.removed && !outcome.audited) {
-          await dmActor(client, identity, `Disconnected *${p}* locally, but Vouchr could not confirm the audit record. Ask an admin to check the Vouchr logs.`);
-        } else if (outcome.removed) {
-          // A modal/Home refresh is best effort and may fail after the destructive mutation has
-          // committed. Always send one explicit receipt so a failed refresh never leaves the click
-          // looking ignored (#194 UX-1/5).
-          await dmActor(client, identity, `Disconnected *${p}*. The agent can no longer act as you on ${p}.`);
-        } else if (!outcome.ok) {
-          await dmActor(client, identity, `Could not confirm that older *${p}* setup requests were invalidated. Retry \`/vouchr disconnect ${p}\` before reconnecting.`);
-        } else {
-          // A duplicate click is still a valid interaction. It owns no mutation/event/audit, but it
-          // must receive one idempotent receipt even if the subsequent view refresh also fails.
-          await dmActor(client, identity, `No *${p}* account was connected, so there was nothing to disconnect.`);
-        }
+        // One explicit receipt per click, duplicate clicks included: the modal/Home refresh below is
+        // best effort and may fail after the destructive mutation has committed (#194 UX-1/5).
+        await dmActor(client, identity, disconnectReceipt(p, outcome, `No *${p}* account was connected, so there was nothing to disconnect.`));
       }
       const channel = homeSelectedChannel(body.view);
       if (surface === 'home') return publishHome(identity, client, channel);
@@ -4465,15 +4470,7 @@ export async function createVouchr(opts: VouchrOptions) {
       const identity = resolveIdentity({ body });
       const location = interactionLocation(body);
       const id = body.actions?.[0]?.value;
-      const reply = async (text: string, replaceOriginal = true) => {
-        if (respond) {
-          try {
-            await respond({ replace_original: replaceOriginal, response_type: 'ephemeral', text });
-            return;
-          } catch { /* fall back to a private DM */ }
-        }
-        if (identity) await dmActor(client, identity, text);
-      };
+      const reply = replyToActor(respond, client, identity);
       const stale = 'This session request expired or was already completed. Ask the agent again in this thread.';
       if (!identity || !location?.thread || typeof id !== 'string') return reply(stale);
 
@@ -4544,15 +4541,7 @@ export async function createVouchr(opts: VouchrOptions) {
       const identity = resolveIdentity({ body });
       const location = interactionLocation(body);
       const id = body.actions?.[0]?.value;
-      const reply = async (text: string, replaceOriginal = true) => {
-        if (respond) {
-          try {
-            await respond({ replace_original: replaceOriginal, response_type: 'ephemeral', text });
-            return;
-          } catch { /* fall back to a private DM */ }
-        }
-        if (identity) await dmActor(client, identity, text);
-      };
+      const reply = replyToActor(respond, client, identity);
       const stale = 'This approval expired or was already decided. Ask the agent again.';
       if (!identity || typeof id !== 'string') return reply(stale);
       const pending = await approvals.get(id);

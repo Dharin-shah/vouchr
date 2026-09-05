@@ -91,7 +91,7 @@
     "@aws-sdk/client-secrets-manager": "^3.1075.0",
     "@biomejs/biome": "^2.5.2",
     "@types/node": "^26.1.0",
-    "@types/pg": "^8.20.0",
+    "@types/pg": "^8.20.4",
     "tsx": "^4.0.0",
     "typescript": "^7.0.2"
   }

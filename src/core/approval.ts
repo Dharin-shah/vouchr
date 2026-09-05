@@ -373,12 +373,6 @@ export async function credentialUseStateFenced(
   return fenced.status === 'current' ? fenced.value : 'authorization';
 }
 
-export async function credentialUseStillCurrent(
-  input: CredentialUseValidationInput,
-): Promise<boolean> {
-  return (await credentialUseState(input)) === 'current';
-}
-
 export async function credentialUseStillCurrentFenced(
   input: CredentialUseValidationInput,
 ): Promise<boolean> {
@@ -397,7 +391,7 @@ export async function approvalOwnerStillCurrent(input: {
   channelTools?: ChannelTools | null;
   channelConfig?: ChannelConfig | null;
 }): Promise<boolean> {
-  return credentialUseStillCurrent({
+  return (await credentialUseState({
     binding: input.row,
     db: input.db,
     registry: input.registry,
@@ -410,7 +404,7 @@ export async function approvalOwnerStillCurrent(input: {
     // Use the governance scope PERSISTED with the row, so the decision revalidation classifies a
     // group DM (MPIM) that its id alone cannot — instead of re-deriving it (and wrongly governing it).
     governableChannel: input.row.governableChannel,
-  });
+  })) === 'current';
 }
 
 /** Owners whose lifecycle locks fence an approval decision. The channel owner is always included

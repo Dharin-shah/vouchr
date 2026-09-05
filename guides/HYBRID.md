@@ -249,6 +249,10 @@ Enterprise-wide deprovisioning requires the documented SCIM/admin offboarding pa
 workspace. Because `db` was injected, `install().stop()` does not close it; shutdown must stop Bolt,
 stop the Vouchr lifecycle, and then `await db.close()`.
 
+`DbInstallationStore(db, keys, envelope?, options?: DbInstallationStoreOptions)` implements Bolt's
+`InstallationStore`; `Installation`, `InstallationQuery`, and `InstallationStore` are re-exported
+from `@vouchr/core` so a host wiring the store never imports `@slack/bolt` types directly.
+
 > [!NOTE]
 > `DbInstallationStore` accepts the same `EnvelopeProvider` as `createVouchr`, so with a KMS
 > envelope configured multi-workspace Slack installation `bot_token`/`data` are envelope-encrypted
@@ -718,6 +722,13 @@ The private modal is titled **Channel credential** and accepts exactly one value
 - **External secret reference** — shown only for secret-manager resolvers configured in the Bolt
   process, with the available sources named in the hint; or
 - **…or paste a key directly**. When Bolt has no resolver, this is the only field shown.
+
+It is the exported `configureModal(provider, channel, referenceSources?, requestId?, disabled?)`
+builder (callback id `CONFIGURE_CALLBACK`); its self-service twin is `userKeyModal(provider,
+referenceSources?, requestId?)` (`USER_KEY_CALLBACK`), opened from the `SETUP_KEY_ACTION` button.
+`configModal` and `homeView` take `ToolRow` (`{ provider, enabled, mode? }`) and `ConfigAdminRow`
+(adds `mode`, `identity`) rows, and their Disconnect buttons carry `DISCONNECT_ACTION`. A host that
+renders these with its own client owns the handlers for those ids: Bolt runs every matching listener.
 
 ```text
 Channel credential
