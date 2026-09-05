@@ -1532,11 +1532,12 @@ export class ConnectContext {
     return this.allowWrites ? provider : readOnlyEgress(provider);
   }
 
-  /** The Bolt-side deny mapping of the shared authorizeProvider check. connectChannel keeps its own
-   * variant because its audit metadata carries `owner: 'channel'`. */
+  /** The Bolt-side deny mapping of the shared authorizeProvider check. `meta` is spread into the
+   * denial audit row (connectChannel adds `owner: 'channel'`). */
   private async requireProviderAuthorized(
     providerId: string,
     resolvedGovernanceChannel?: string | null,
+    meta: Record<string, unknown> = {},
   ): Promise<void> {
     // Static Policy evaluates against the real delivery channel (this.channel — a DM included), while
     // the mutable tool allowlist is scoped to governableChannel (null in a DM, so deny-by-default
@@ -1553,12 +1554,12 @@ export class ConnectContext {
       providerId,
     );
     if (denial === 'policy') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel });
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, ...meta });
       this.emit({ type: 'policy_denied', provider: providerId });
       throw new PolicyDeniedError();
     }
     if (denial === 'tool-disabled') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'tool-disabled' });
+      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, ...meta, reason: 'tool-disabled' });
       throw new ToolDisabledError();
     }
   }
@@ -1968,23 +1969,7 @@ export class ConnectContext {
     // Same authorization gate as connect() (the shared core CHECK): a deny applies to shared channel
     // creds too. A shared credential only exists in a governed channel, so governableChannel == the
     // real channel here. Audit meta carries owner:'channel'; like connect(), no policy_denied on tool-disabled.
-    const denial = await authorizeProvider(
-      this.policy,
-      this.channelTools,
-      this.identity,
-      this.channel,
-      governableChannel,
-      providerId,
-    );
-    if (denial === 'policy') {
-      await this.audit.record('denied', this.identity, providerId, { channel: this.channel, owner: 'channel' });
-      this.emit({ type: 'policy_denied', provider: providerId });
-      throw new PolicyDeniedError();
-    }
-    if (denial === 'tool-disabled') {
-      await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'tool-disabled' });
-      throw new ToolDisabledError();
-    }
+    await this.requireProviderAuthorized(providerId, governableChannel, { owner: 'channel' });
     const m = await cfg.getMode(owner.teamId, channel, providerId);
     if (m != null && m !== 'shared') {
       throw new Error(`Channel "${channel}" uses ${m} credentials for "${providerId}"; use connect() instead.`);
