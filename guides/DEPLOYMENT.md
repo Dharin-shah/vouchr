@@ -72,6 +72,73 @@ npm run pg:down # tear it down
 The schema is owned by the `vouchr migrate` command, and the runtime is DML-only — a deliberate
 split so the long-running process holds no DDL privileges.
 
+### Supported migration starting points
+
+<!-- migratable-schema-versions: 12,13,14 -->
+
+`vouchr migrate` accepts a fresh (empty) database or a schema at version 12, 13, or 14 — v12 is
+the schema both published betas (v1.0.0-beta and v1.0.0-beta.1) stamp. Development schemas v6–v11
+never shipped in any release and are refused before any DDL runs. To keep data on one, run
+v1.0.0-beta.1's `vouchr migrate` first (it carries v6–v11 to v12), then upgrade; anything older
+must be recreated fresh.
+
+### Required v12 → v13 drained cutover
+
+Schema v13 (#290) moves every PostgreSQL-clock lifecycle-fence timestamp — the offboard,
+break-glass, and channel-interaction tombstones, `connection.generation_at`, and all pending
+consent/provisioning/session/approval state — from millisecond to microsecond resolution, so
+unrelated sequential operations no longer tie inside the clock's truncation window while every
+`>=` fence still fails a genuine tie closed. It is a pure data conversion (each stored value
+×1000), not a table-shape change; application-clock columns (`audit.at`, connection
+created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-milliseconds.
+
+1. Back up PostgreSQL and verify that the backup can be restored.
+2. Quiesce Slack and broker traffic, drain in-flight interactions, and stop **every** pre-v13
+   replica. A v12 binary reads and writes millisecond fences and must never share the database
+   with v13 data; the exact-version runtime check refuses it at boot, and this drain is what keeps
+   one from staying live across the conversion.
+3. Run this build's `vouchr migrate` with the schema-owner role. From v12 it multiplies every
+   stored fence timestamp by exactly 1000, atomically with the version stamp. The
+   conversion is gated on the recorded predecessor version, so re-running migrate (or racing a
+   concurrent run — the advisory lock serializes them) never multiplies twice.
+4. Start only v13 replicas, confirm readiness, and restore traffic. This step drains no
+   user-visible state: pending prompts, grants, and durable tombstones carry over at the new
+   resolution.
+
+Rollback from v13 requires stopping **every** v13 replica, restoring the matching pre-v13 backup,
+and only then starting the older binary that created that backup. The order matters: the
+exact-version startup check refuses a mismatched binary only at boot, so a v13 process left live
+across the restore would read the restored millisecond fences as microseconds — the mixed-unit
+condition this drained sequence exists to prevent.
+
+### v13 → v14 (browser Slack-identity verification, #302)
+
+Schema v14 adds two nullable/defaulted columns to `consent_request` (`slack_verified_at`,
+`slack_verify_required`); no data conversion. Pre-v14 consent rows carry
+`slack_verify_required = 0`, which is exact: their prompt URL never offered the verify hop. A
+v12 database reaches v14 through the drained v13 sequence above in the same `vouchr migrate`
+run — the ms→µs conversion still applies exactly once on the way through.
+
+The DDL is additive, but the **rollout order is load-bearing**: a v13 process that was already
+running when migrate stamps v14 keeps serving (the exact-version check runs only at boot) and
+predates `slack_verify_required` — its callback would complete an *enforced* consent unstamped,
+which is precisely the bypass the flag exists to prevent. An enforced (`slack_verify_required=1`)
+state must therefore never coexist with a live v13 process. Two safe sequences:
+
+- **Drained cutover (simplest):** stop every v13 replica, run `vouchr migrate`, start only v14
+  replicas (flag on or off). Same shape as the v13 sequence above.
+- **Staged, no drain — flag off until v13 is gone:**
+  1. Run `vouchr migrate` (stamps v14). Already-running v13 replicas keep serving; any v13
+     restart/scale-up is refused at boot by the exact-version check.
+  2. Roll every replica to v14 with `requireBrowserSlackIdentity` **off**. Both binaries treat the
+     resulting `slack_verify_required=0` states identically, so this phase is safe to overlap.
+  3. Only when **zero** v13 processes remain, enable the flag everywhere. Enforced states now only
+     ever meet v14 callbacks, which honor the row unconditionally (regression:
+     `test/browser-identity.test.ts`, two-instance shared-database tests). A still-pending
+     unenforced prompt is superseded on the user's next connect — the persisted mode is part of the
+     consent generation's identity, so a mode flip mints a fresh generation instead of reusing the
+     old row (off→on and on→off regressions in the same file).
+
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
   and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
@@ -85,9 +152,9 @@ split so the long-running process holds no DDL privileges.
 
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
-  if the database isn't migrated. On a fresh install, run the migrate step (a Job / initContainer)
-  to completion before the first runtime replicas start. When upgrading a released deployment, use
-  the drained sequence in [Upgrading from 1.0.0-beta.1](#upgrading-from-100-beta1) below.
+  if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
+  Job / initContainer) to completion before new runtime replicas start. For v12 → v13, use the
+  drained maintenance sequence above instead.
 
 Example roles and grants (adjust names to taste):
 
@@ -111,36 +178,6 @@ ALTER DEFAULT PRIVILEGES FOR ROLE vouchr_owner IN SCHEMA public
 Point the migrate step at `vouchr_owner` and the runtime at `vouchr_app`. The `/readyz` probe
 reflects schema readiness: it returns `503` until the database has been migrated to the current
 version, and `200` once the runtime can reach a current schema.
-
-### Upgrading from 1.0.0-beta.1
-
-<!-- migratable-schema-versions: 12,13,14 -->
-
-`1.0.0-beta.1` runs schema v12; this build runs schema v14, and `vouchr migrate` accepts a fresh
-(empty) database or schema versions 12–14 only — anything else is refused before any DDL runs.
-One `vouchr migrate` run converges the
-database: the v13 ms→µs lifecycle-fence conversion runs exactly once on the way through (it is
-gated on the recorded predecessor version and advisory-locked, so re-runs and concurrent runs never
-convert twice), and the v13 → v14 consent columns are additive. The runtime's exact-version schema
-check runs **only at boot** — an already-running old replica keeps serving against a migrated
-database — so the upgrade is a drained cutover, not a rolling overlap:
-
-1. Quiesce Slack and broker traffic, drain in-flight interactions, and stop **every** old replica.
-   An old binary reads and writes millisecond fences and must never share the database with
-   converted data.
-2. Back up PostgreSQL and verify the backup can be restored.
-3. Run this build's `vouchr migrate` with the schema-owner role.
-4. Start only new-version replicas, confirm readiness (`/readyz`), and restore traffic. Pending
-   prompts, grants, and durable tombstones carry over at the new resolution.
-5. Enable `requireBrowserSlackIdentity` (if you want it) only after **zero** pre-v14 processes
-   remain. A pre-v14 callback predates `slack_verify_required` and would complete an *enforced*
-   consent unstamped — exactly the bypass the flag prevents — so an enforced state must never
-   coexist with a live pre-v14 process. See
-   [Browser Slack-identity verification](#browser-slack-identity-verification-requirebrowserslackidentity-302).
-
-Rollback: stop **every** new replica, restore the matching pre-migration backup, and only then
-start the old binary that created it. The boot-only version check cannot protect a process left
-live across the restore.
 
 Upgrading from `0.2.0` (pre-PostgreSQL): there is no SQLite importer and no data migration — start
 from a fresh PostgreSQL database (`vouchr migrate`) and re-connect accounts.
@@ -356,7 +393,7 @@ mode is also part of the consent generation's identity: a connect handled under 
 supersedes a still-pending prompt and mints a fresh generation, so a flag flip never leaves a
 verify-hop URL over an unenforced row or an un-completable direct URL over an enforced one. Do not
 enable the flag while any pre-v14 process is still live — see
-[Upgrading from 1.0.0-beta.1](#upgrading-from-100-beta1) for the required order. Slack's
+[v13 → v14](#v13--v14-browser-slack-identity-verification-302) for the required order. Slack's
 OIDC endpoints are fixed and not
 configurable: the id_token is accepted from Slack's token endpoint over TLS without signature
 verification, so a configurable endpoint would be an identity-forging seam.
