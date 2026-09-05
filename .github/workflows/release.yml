@@ -21,6 +21,8 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # the test suite runs without the workflow's id-token/packages write
     # Vouchr is PostgreSQL-only, so `npm test` (the real-PG suite) needs a live Postgres — mirror the
     # service ci.yml uses, on the localhost:5432 the suite defaults to. Without it the suite has no DB
     # and the release can't pass. Container-only; there is no offline/PGlite tier.
@@ -40,22 +42,32 @@ jobs:
           --health-retries 5
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0 # full history: the guard below proves the tag is contained in main
       # Gate BEFORE any publish (verify precedes every publish job): npm/GHCR are irreversible. Hard-
       # fail unless the ref is a v* tag — a workflow_dispatch from a branch would otherwise skip the
       # version logic and publish `main`. Then require a matching CHANGELOG section. A manual re-run is
       # still fine as long as it targets a tag. github-release re-extracts the same section to publish.
       # Also require tag == package.json version: npm publishes whatever package.json says, so a
       # mismatched tag would ship one version under another's name/Release notes.
-      - name: Guard — release only from a v* tag matching package.json, with a CHANGELOG entry
+      # #217: the tagged commit must be an ancestor of protected `main` — a tag on a side branch (or a
+      # commit that never went through PR review + required checks) cannot release.
+      - name: Guard — release only from a v* tag on main, matching package.json, with a CHANGELOG entry
         run: |
           case "$GITHUB_REF" in
             refs/tags/v*) ;;
             *) echo "::error::release publishes only from a v* tag (got $GITHUB_REF); a manual dispatch must target a tag, not a branch"; exit 1 ;;
           esac
+          git merge-base --is-ancestor HEAD origin/main \
+            || { echo "::error::tag $GITHUB_REF_NAME ($(git rev-parse HEAD)) is not contained in protected main — only reviewed commits on main release"; exit 1; }
           VERSION="${GITHUB_REF_NAME#v}"
           PKG_VERSION="$(node -p 'require("./package.json").version')"
           [ "$PKG_VERSION" = "$VERSION" ] \
             || { echo "::error::tag v$VERSION does not match package.json version $PKG_VERSION — bump package.json before tagging"; exit 1; }
+          # A re-run of a finished release, or a force-moved tag, must not rebuild and re-push the image
+          # under a new digest while `npm publish` fails on the duplicate version.
+          npm view "@vouchr/core@$VERSION" version >/dev/null 2>&1 \
+            && { echo "::error::@vouchr/core@$VERSION is already published — a release runs once per version"; exit 1; }
           awk -v ver="$VERSION" 'index($0,"## ["ver"]")==1{g=1;next} g&&/^## /{g=0} g{print}' CHANGELOG.md | grep -q . \
             || { echo "::error::no CHANGELOG section for $VERSION — add a '## [$VERSION]' entry before tagging"; exit 1; }
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -95,18 +107,26 @@ jobs:
           npm publish --provenance --tag "${TAG}"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # #217 verify after publication: the registry's copy must name THIS commit (npm records the
+      # checkout's HEAD as gitHead). Retried briefly for registry read-after-write lag.
+      - name: Verify the published package resolves to this commit
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          for i in $(seq 1 10); do
+            GIT_HEAD="$(npm view "@vouchr/core@${VERSION}" gitHead 2>/dev/null || true)"
+            [ -n "$GIT_HEAD" ] && break
+            sleep 6
+          done
+          [ "$GIT_HEAD" = "$(git rev-parse HEAD)" ] \
+            || { echo "::error::published @vouchr/core@${VERSION} gitHead '${GIT_HEAD}' != release commit $(git rev-parse HEAD)"; exit 1; }
+          echo "@vouchr/core@${VERSION} gitHead = ${GIT_HEAD}"
 
-  # Build + boot the image and prove it serves /healthz BEFORE it can be pushed to GHCR — a broken
-  # Dockerfile must never reach the registry. Same script CI runs on docker-touching PRs.
-  docker-smoke:
-    needs: verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: npm run docker-smoke
-
+  # Build ONCE, push, then smoke-test and scan the exact pushed digest and only then sign it (#216,
+  # #217: promote the tested image instead of rebuilding). An unsigned digest is not a release: the
+  # documented deploy step is `cosign verify`, and github-release needs this job. Docker-touching PRs
+  # already ran the same smoke + scan pre-merge (docker-smoke.yml).
   docker-ghcr:
-    needs: [verify, docker-smoke]
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -144,6 +164,26 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           echo "IMAGE_REF=$(head -n1 <<<"$TAGS" | cut -d: -f1)@$DIGEST" >> "$GITHUB_ENV"
+      # The two-replica deployment proof (test/docker-smoke.sh) against the pushed digest — no rebuild.
+      - name: Smoke-test the pushed digest (migrate role split, 2 replicas, rolling restart, drain, PG outage)
+        run: npm run docker-smoke
+        env:
+          VOUCHR_SMOKE_IMAGE: ${{ env.IMAGE_REF }}
+      # #217 one commit everywhere: the image's OCI revision label (metadata-action sets it from the
+      # workflow sha) must resolve to the same commit the package and tag name.
+      - name: Verify the pushed image's revision label is this commit
+        run: |
+          REV="$(docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$IMAGE_REF")"
+          [ "$(git rev-parse --verify "${REV}^{commit}")" = "$(git rev-parse HEAD)" ] \
+            || { echo "::error::image revision label '${REV}' != release commit $(git rev-parse HEAD)"; exit 1; }
+      # Container vulnerability policy (#217): a fixed HIGH/CRITICAL finding in the image's OS packages
+      # or bundled node_modules blocks signing. Same scan docker-smoke.yml runs on PRs.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE_REF }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
       - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
@@ -182,7 +222,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx -y @cyclonedx/cyclonedx-npm --output-file sbom.json
+      - run: npx -y @cyclonedx/cyclonedx-npm@6.0.1 --output-file sbom.json
       - name: Create GitHub Release from CHANGELOG
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

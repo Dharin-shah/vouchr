@@ -1140,6 +1140,30 @@ sessions, and local KMS-shaped envelope call counts. Tune `BENCH_REPLICAS`, `BEN
 The KMS adapter in this harness is local and records call count only; the production-deployment proof
 must repeat representative load with the real configured KMS and exact container image.
 
+#### Measured envelope (harness defaults, medians of 3 runs)
+
+What was measured: `npm run bench:perf` with its defaults — **2 simulated replicas in one Node
+process** (one PostgreSQL pool of 10 each), `BENCH_MAX_INFLIGHT=50`,
+`BENCH_MAX_INFLIGHT_PER_PROVIDER=40`, 120 concurrent callers, 5 s, 8 ms simulated provider, local
+KMS-shaped envelope — against PostgreSQL 17.10 (Homebrew) on the same machine: Apple M1 Max (10
+cores, 32 GiB), macOS 14.1.2, Node 22.22.0, commit of this section. It is not the container image
+and not a two-node deployment; treat it as the ordering of the bounds, not as capacity.
+
+| | served req/s | served P50 / P95 / P99 (ms) | 503 shed | peak pool (total / active / waiting) | peak RSS (whole harness process) |
+|---|---|---|---|---|---|
+| 2 replicas (default) | 518 | 131 / 154 / 256 | 210 | 20 / 20 / 78 | 182 MiB |
+| 1 replica (`BENCH_REPLICAS=1`) | 519 | 72 / 97 / 165 | 400 | 10 / 10 / 32 | 158 MiB |
+
+Reading it: with 120 callers, admission shed with `Retry-After` (400 per 5 s against one 40-slot
+replica, 210 against the 80-slot pair) and served P99 stayed under 300 ms; the pools ran at their
+10-connection ceiling with callers queued (`waiting`), so the PostgreSQL pool, not the in-flight
+ceiling, is the first bound to size (`VOUCHR_PG_POOL_MAX`). Two in-process replicas served no more
+per second than one: on a single host the replicas, the load generator and PostgreSQL share the
+same cores, so this harness cannot show replica scaling — only a real two-node deployment can.
+RSS covers every replica and the load generator in one process. Re-run on your hardware before
+setting limits; a run on a loaded host (load average > cores) is dominated by scheduling noise
+and must be discarded.
+
 ## Slack app + OAuth install flow
 
 Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)
@@ -1205,6 +1229,92 @@ static-policy enforcement, rather than assuming a Slack control write reaches ev
 
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as
 having run this in production. Vouchr has not yet been run in production. Treat this list as the gap.
+
+## Operator runbook (#216)
+
+One supported shape: the published image, one PostgreSQL, a KMS envelope, two or more stateless
+replicas behind a load balancer that honours `/readyz`. Everything below assumes it.
+
+### What the deployment proof covers, and how to re-run it
+
+`npm run docker-smoke` (`test/docker-smoke.sh`; runs in CI on every image-touching PR and, in
+`release.yml`, against the exact pushed digest before it is signed) builds the image and proves:
+
+| Step | What it proves |
+|---|---|
+| `vouchr migrate` as `vouchr_owner`, replicas as `vouchr_app` | the [Migrations](#migrations) role split works end to end; `vouchr_app` cannot `CREATE` |
+| two replicas, read-only root, one as the image uid and one as uid 12345 | the manifest's `readOnlyRootFilesystem` + arbitrary-UID contract boots and serves `/readyz` on one shared database |
+| startup logs | provider ids present, no identity secret / master key value |
+| rolling restart, one replica at a time | SIGTERM drains and exits `0`, the replica returns ready, and every request sent to the other replica meanwhile succeeded. Only the surviving replica is measured: whether the terminating one still receives new connections is the load balancer's hand-off, covered by the manifest's `preStop` sleep and not by the script |
+| in-flight request across SIGTERM | a request whose body arrives after SIGTERM still gets its response before the process exits `0` |
+| PostgreSQL stopped, then started | `/readyz` 503 on every replica while `/healthz` stays 200 (no restart storm); `/readyz` 200 again after recovery with no replica restart |
+
+Not covered by that script and still to be run by hand against staging before a production
+declaration: any authenticated `connect`/`fetch`/`refresh`/`offboard` through the image replicas (the
+script's traffic is `/readyz` polling plus one malformed `POST /v1/fetch`; those paths are covered by
+the suite against the same code, not on the image), KMS unavailable/throttled and KEK rotation overlap (the image ships without
+`@aws-sdk/client-kms`; see [KMS envelope encryption](#kms-envelope-encryption-production)), a backup
+restore drill ([Backup and restore](#backup-and-restore)), PostgreSQL primary failover, a slow and an
+oversized provider (unit-covered in `test/http-bounds.test.ts` / `test/egress-response.test.ts`,
+not on the image), and representative load on the exact image (the harness below runs the same
+broker code in-process).
+
+### Rolling upgrade and rollback
+
+1. Verify the new digest ([cosign](#verifying-the-ghcr-image-cosign-sbom-provenance)) and pin
+   `name@digest` in both the migrate Job and the Deployment.
+2. Run the migrate Job to completion with the schema-owner role. It is idempotent and
+   advisory-locked. A version that changes the schema in a way old replicas cannot serve says so in
+   [Migrations](#migrations) (v12 → v13 is drained; v13 → v14 is a staged flag rollout).
+3. Roll the Deployment. With `replicas: 2` the default `RollingUpdate` (`maxUnavailable` rounds to
+   0, `maxSurge` to 1) starts a new pod, waits for its `/readyz`, then terminates an old one:
+   the fleet never drops below two ready pods. Endpoint removal and SIGTERM race on the old pod, so
+   its container `preStop` sleeps 5 s before SIGTERM to keep accepting until the Service has dropped
+   it; `terminationGracePeriodSeconds: 30` outlives that plus the broker's 10 s drain deadline
+   (`VOUCHR_SHUTDOWN_TIMEOUT_MS`).
+4. Rollback = roll the Deployment back to the previous digest. The runtime is DML-only and the
+   schema marker is exact-version, so an older build against a newer schema fails `openDb` at boot:
+   the process exits `1` and the pod goes `CrashLoopBackOff` (it never reaches `/readyz`) — restore
+   the matching backup instead, as [Migrations](#migrations) describes per version. Rollback never
+   runs `vouchr migrate`.
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` the broker logs `draining connections`, stops accepting, closes idle
+keep-alive sockets and lets in-flight requests finish, then closes the pool and exits `0`. If
+in-flight work outlives `VOUCHR_SHUTDOWN_TIMEOUT_MS` (default 10 s) remaining connections are cut
+and it exits `1` — alert on non-zero broker exits. Keep the orchestrator's kill grace above the
+deadline (the reference manifest uses 30 s).
+
+### Outages
+
+- **PostgreSQL.** `/readyz` fails within ~2 s (schema marker + replay-store probes), so the LB
+  stops routing to every replica; requests already inside a replica fail closed (no credential is
+  served, minted, refreshed or resolved without the store). `/healthz` stays 200 — do not restart
+  pods for a DB outage. When PostgreSQL returns the pools reconnect on demand and `/readyz` goes
+  200 with no restart (proved by the smoke above). Idle-client errors are logged as
+  `postgres idle-client error` and are expected during the outage.
+- **KMS (envelope mode).** Readiness checks KMS *configuration* at boot, not KMS availability: a
+  wrap/unwrap that times out, is throttled, or fails makes that request fail closed with no fallback
+  to a direct key and no plaintext in the error. Alert on KMS errors and latency; the fleet stays in
+  rotation for requests that need no KMS call. Repointing `VOUCHR_KMS_KEY_ID` is not recovery — see
+  the KMS section's re-wrap warning.
+- **A provider.** A hung upstream is cut at `VOUCHR_FETCH_DEADLINE_MS` (`upstream_timeout`); a
+  slow provider is boxed by `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` so it cannot consume the global
+  budget; over either ceiling the broker sheds with `503` + `Retry-After`. Nothing is retried
+  automatically except one refresh on 401.
+- **Slack.** Bolt-only surface: headless broker credential use is unaffected. Slash commands,
+  modals and the post-connect DM fail visibly rather than silently; users retry once Slack is back.
+
+### Suspected credential exposure, break-glass offboarding
+
+Use the deployment-wide procedure in [Incident break-glass (#239)](#incident-break-glass-239):
+`VOUCHR_LOCKDOWN=1` on every replica (readiness 503, every functional route refused), then
+`vouchr revoke --all --confirm ALL-CREDENTIALS`, then key/role rotation and reconnect. A single
+user's emergency removal is `vouchr revoke --provider <id> --team <id> --user <id> --yes` (dry-run
+without `--yes`) or `POST /v1/admin/offboard`
+(see [Lifecycle](#lifecycle-disconnect-offboard-ttl-sweep-54)); Bolt deployments wire
+`registerOffboarding` so deactivated Slack users are removed automatically.
 
 ## Key rotation
 

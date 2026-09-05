@@ -1,15 +1,17 @@
 name: Docker smoke
 
-# Build the broker image and prove it BOOTS + serves /healthz (see test/docker-smoke.sh). Path-gated:
-# the build is ~1min and only relevant when the image's inputs change. GitHub has no per-job path
-# filter, so this is a separate workflow rather than a job in ci.yml. Release publishing gates on the
-# same script (release.yml) so a broken image can never reach GHCR.
+# Build the broker image and run the two-replica deployment proof (test/docker-smoke.sh: schema-owner
+# migrate + DML-only replicas, rolling restart, graceful drain, PostgreSQL outage; #216), then the
+# container vulnerability scan (#217). Path-gated: the build is ~1min and only relevant when the
+# image's inputs change. GitHub has no per-job path filter, so this is a separate workflow rather than
+# a job in ci.yml. release.yml runs the same script + scan against the exact pushed digest before
+# signing it.
 on:
   push:
     branches: [main]
-    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json, test/docker-smoke.sh, .github/workflows/docker-smoke.yml]
+    paths: [Dockerfile, .dockerignore, 'bin/**', 'src/**', package.json, package-lock.json, test/docker-smoke.sh, .github/workflows/docker-smoke.yml]
   pull_request:
-    paths: [Dockerfile, .dockerignore, bin/broker-server.ts, package.json, package-lock.json, test/docker-smoke.sh, .github/workflows/docker-smoke.yml]
+    paths: [Dockerfile, .dockerignore, 'bin/**', 'src/**', package.json, package-lock.json, test/docker-smoke.sh, .github/workflows/docker-smoke.yml]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,3 +23,11 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: npm run docker-smoke
+      # Container vulnerability policy (#217): a fixed HIGH/CRITICAL finding in the built image's OS
+      # packages or bundled node_modules red-X's here; unfixed base-image CVEs are reported, not blocking.
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: vouchr-smoke
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'

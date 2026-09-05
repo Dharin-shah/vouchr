@@ -51,6 +51,9 @@ export interface BuiltBroker {
   shutdownTimeoutMs: number;
 }
 
+/** #209 graceful-drain deadline default (ms). deploy/k8s.yaml's termination grace must outlive it. */
+export const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
 /**
  * Start one bounded graceful drain. `close()` first stops new accepts, idle keep-alive sockets are
  * dropped immediately, and active requests keep their connections until they settle. The hard
@@ -199,7 +202,7 @@ export async function buildBrokerServer(
     requestTimeoutMs: timerEnv(env.VOUCHR_REQUEST_TIMEOUT_MS, 'VOUCHR_REQUEST_TIMEOUT_MS'),
     keepAliveTimeoutMs: timerEnv(env.VOUCHR_KEEPALIVE_TIMEOUT_MS, 'VOUCHR_KEEPALIVE_TIMEOUT_MS'),
   });
-  const shutdownTimeoutMs = timerEnv(env.VOUCHR_SHUTDOWN_TIMEOUT_MS, 'VOUCHR_SHUTDOWN_TIMEOUT_MS') ?? 10_000;
+  const shutdownTimeoutMs = timerEnv(env.VOUCHR_SHUTDOWN_TIMEOUT_MS, 'VOUCHR_SHUTDOWN_TIMEOUT_MS') ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
 
   // #54 TTL policy: 0 disables one dimension. TTLs are stored timestamps, not Node timers, so they
   // may exceed MAX_TIMER_MS but must still be canonical non-negative safe integers.
