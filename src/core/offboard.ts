@@ -137,8 +137,9 @@ export async function disconnectProviderAtReceipt(
 }
 
 /** Internal exact-generation form shared by provider-addressed public calls and Vouchr-owned Slack
- * controls. `null` is a stale generation verdict: it is reached before a provisioning marker,
- * credential delete, upstream revoke, or audit write. */
+ * controls. `null` is a stale generation verdict: it is reached before a credential delete, upstream
+ * revoke, or audit write. A generation that vanished between authorization and the delete keeps the
+ * provisioning marker written at authorization (see prepareUserDisconnect). */
 async function disconnectProviderAtGeneration(
   vault: Vault,
   audit: Audit,
@@ -172,8 +173,17 @@ async function disconnectProviderAtGeneration(
           issuedAt,
         })
     : { removed: false, ok: true, attempted: false, fenced: prepared.fenced };
-  if (!outcome.removed && prepared.expectedId && await vault.has(userOwner(identity), provider)) {
-    throw new InteractionStateChangedError('connection', 'credential');
+  // The generation snapshotted at authorization is gone at the delete: a concurrent disconnect,
+  // offboard, or reconnect changed this interaction first. A Vouchr-owned control that named that
+  // exact generation gets the stale verdict (what every other double-decision path reports), never
+  // "nothing to disconnect". A provider-addressed request stays idempotent for the losing duplicate,
+  // but must not retarget onto a replacement credential that now exists.
+  if (
+    !outcome.removed
+    && prepared.expectedId
+    && (expectedId !== undefined || await vault.has(userOwner(identity), provider))
+  ) {
+    return null;
   }
   const ok = outcome.ok && outcome.fenced;
   // A no-op is not a revoke event. Keep duplicate/idempotent calls quiet: there is no committed
