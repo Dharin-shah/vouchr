@@ -482,7 +482,7 @@ export function buildCallbackUrl(baseUrl: string, callbackPath: string): string 
  * matches. Accept only a bare hostname — no scheme, userinfo, port, path, query, or fragment — and
  * return it lower-cased so `egressAllow.includes(url.hostname)` works regardless of how it was written.
  */
-export function canonicalEgressHost(host: string, _id?: string): string {
+export function canonicalEgressHost(host: string): string {
   if (typeof host !== 'string' || !host.trim()) {
     throw new Error('Provider has an invalid egressAllow host: entries must be non-empty bare hostnames.');
   }
