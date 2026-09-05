@@ -433,6 +433,8 @@ export function normalizeBrokerResourceBounds(input: BrokerResourceBoundsInput):
 // headers (opaque and POTENTIALLY SENSITIVE per MCP security guidance: relayed verbatim, never
 // stored or logged, never accepted as authentication) and keeps Accept + Content-Type because MCP
 // Streamable HTTP requires `Accept: application/json, text/event-stream`.
+/** #296 exact route key for `GET /v1/authorization/{id}` once its id has been parsed and validated. */
+const AUTHORIZATION_STATUS_ROUTE = '/v1/authorization/{id}';
 const FETCH_FORWARD_HEADERS = ['accept', 'accept-language', 'if-none-match', 'content-type'];
 const MCP_FORWARD_HEADERS = ['accept', 'content-type', 'mcp-session-id', 'mcp-protocol-version'];
 // RESPONSE headers /v1/mcp relays back (content-type so SSE parses; the Mcp-* plumbing so the
@@ -1329,7 +1331,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
     const claims = await verify(token);
     const { identity } = await requireCurrentActor(claims);
-    const row = isInteractionId(id) ? await approvals.authorizationStatus(id, identity) : null;
+    const row = await approvals.authorizationStatus(id, identity); // re-checks the id grammar itself
     if (!row) throw new HttpError(404, { error: 'unknown authorization' });
     return authorizationPayload(row);
   }
@@ -2037,6 +2039,13 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       };
       try {
         const url = req.url ?? '/';
+        // #296 the one parameterized route. Parsed ONCE, up front, into an exact route key plus an
+        // id that already passed the interaction-id grammar — so the perimeter/identity gates below
+        // stay keyed on constant route strings like every other branch, never on a prefix test of
+        // raw request input. Anything else (extra segments, a query, a malformed id) is a plain 404.
+        const authorizationSegment = /^\/v1\/authorization\/([^/?#]+)$/.exec(url)?.[1];
+        const authorizationId = isInteractionId(authorizationSegment) ? authorizationSegment : undefined;
+        const route = authorizationId === undefined ? url : AUTHORIZATION_STATUS_ROUTE;
         // #101 liveness + readiness probes: registered FIRST, BEFORE the perimeter/identity gate and
         // exempt from replay — a k8s probe carries no bearer and must never touch the vault.
         if (req.method === 'GET' && (url === '/healthz' || url === '/health')) {
@@ -2164,10 +2173,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           await perimeter(req, requestSignal);
           return send(200, { ...await handleAuthorize(await readJson(req)) });
         }
-        if (req.method === 'GET' && url.startsWith('/v1/authorization/')) {
+        if (req.method === 'GET' && route === AUTHORIZATION_STATUS_ROUTE) {
           await perimeter(req, requestSignal);
           return send(200, {
-            ...await handleAuthorizationStatus(url.slice('/v1/authorization/'.length), req.headers['x-vouchr-identity']),
+            ...await handleAuthorizationStatus(authorizationId!, req.headers['x-vouchr-identity']),
           });
         }
         if (req.method === 'POST' && url === '/v1/mcp') {
