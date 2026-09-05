@@ -247,8 +247,8 @@ test('disconnectChannelShared truthful missing + stale (#1): no-credential, newe
   assert.equal(await cfg.getMode('T1', 'C_NEW', 'mcp'), 'shared'); // unchanged
   assert.ok(await vault.get(channelOwner('T1', 'C_NEW'), 'mcp')); // the newer credential survives
 
-  // stale (SAME-millisecond replacement, no sleeps): a credential whose generation equals the command
-  // issuance to the millisecond must fail closed (`>=`) — it is a replacement racing the command and
+  // stale (SAME-microsecond replacement, no sleeps): a credential whose generation equals the command
+  // issuance to the microsecond must fail closed (`>=`) — it is a replacement racing the command and
   // must not be deleted. Deterministic: set generation_at EXACTLY to the issuance.
   await writeChannelMode(cfg, 'T1', 'C_EQ', 'mcp', 'shared');
   await vault.upsert(channelOwner('T1', 'C_EQ'), 'mcp', { accessToken: 'eq-sk', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
@@ -395,19 +395,14 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
 
   // The configure gate is asserted FIRST, on purpose. `enable`/`disable` write a channel-interaction
   // tombstone (core/tools.ts → purgeChannelInteractionState), and the provisioning fence
-  // (bolt.ts → provisioningIssuedAtFromReceipt) deliberately backdates its receipt by up to 1ms so
-  // that it fails closed. `tombstoneBlocks` counts a tie as blocked, so a connect-shared issued in
-  // the SAME millisecond as a preceding config mutation is correctly refused: the loading modal is
-  // replaced by "Review current status" instead of the configure modal, and h.hydrated() is
-  // null. The refusal itself is right — the fence backdates by >=1ms so that it fails closed — but a
-  // test can fire three slash commands sub-millisecond apart, which two separately signed HTTPS POSTs
-  // never do. Asserting the independent gates in this order leaves the fence nothing to tie against.
-  // Do NOT paper over it with a sleep; if the post-disable ordering is ever wanted deliberately, use
-  // a second commandHarness — each gets a fresh schema and no tombstone.
-  //
-  // This is NOT unique to this test: the same millisecond-tie family also flakes
-  // test/dry-run.test.ts's "P1-B ... atomic" and the late shared-handle validation case. The
-  // systemic fix (microsecond fence resolution) is issue #290; this reorder is the local one.
+  // (bolt.ts → provisioningIssuedAtFromReceipt) deliberately backdates its receipt (>=1µs) so that
+  // it fails closed: `tombstoneBlocks` counts a tie as blocked, so a connect-shared issued in the
+  // SAME fence-clock instant as a preceding config mutation is refused with "Review current status"
+  // and h.hydrated() stays null. Since #290 the fence clock is microseconds, so back-to-back slash
+  // commands no longer tie in practice — but the ordering here still deliberately leaves the fence
+  // nothing to tie against, keeping this test about the admin gates rather than fence timing. The
+  // aged-tombstone test below covers the non-blocking fence direction explicitly. Do NOT add
+  // sleeps; for post-disable ordering use a second commandHarness (fresh schema, no tombstone).
   await h.run('connect-shared mcp');
   assert.equal(h.opened()?.trigger_id, 'trig'); // loading modal consumed the trigger immediately
   assert.equal(h.hydrated()?.callback_id, CONFIGURE_CALLBACK);
@@ -420,6 +415,29 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
 
   await h.run('disable mcp');
   assert.match(h.out[1], /Disabled/);
+});
+
+// #290 regression — the OTHER direction of tombstoneBlocks through the real Slack surface: a
+// channel-interaction tombstone strictly OLDER than the connect-shared receipt must NOT fence the
+// configure gate. `enable` writes the tombstone (core/tools.ts → purgeChannelInteractionState);
+// aging it by 10s (µs) makes the outcome deterministic at any clock resolution — no sleeps — so
+// this pins the fence comparison itself, not scheduler timing. Blocking-direction coverage lives
+// in test/safe-error.test.ts; without this test an always-block regression would pass the suite.
+test('flag on: a channel tombstone older than the setup receipt does not block connect-shared', async (t) => {
+  const h = await commandHarness(t, { creator: ID.userId, allowCreator: true });
+  await h.run('enable mcp');
+  assert.match(h.out[0], /Enabled/);
+  await h.lan.db.run(
+    `UPDATE channel_interaction_tombstone SET created_at=created_at-?
+      WHERE team_id=? AND channel=? AND provider=?`,
+    [10_000_000, 'T1', 'C_FIN', 'mcp'],
+  );
+  await h.run('connect-shared mcp');
+  assert.equal(
+    h.hydrated()?.callback_id,
+    CONFIGURE_CALLBACK,
+    'an older tombstone must not fence a later issuance (tombstoneBlocks, non-blocking direction)',
+  );
 });
 
 // Flag off (default): the creator is denied on the same command paths — workspace-admin-only.

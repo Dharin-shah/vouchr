@@ -20,9 +20,9 @@ import {
 import {
   approvalActionKey,
   InteractionStateChangedError,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_DELIVERY_LEASE_MS,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_DELIVERY_LEASE_US,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
 } from '../src/core/interaction';
 import { approvalNeeded, ConnectionHandle, EgressBlockedError } from '../src/core/injector';
 import { defineProvider, github, ProviderRegistry, type Provider } from '../src/core/providers';
@@ -455,8 +455,8 @@ test('#2: a persisted governance scope drives approval revalidation (group DM st
     provider: provider.id, method: 'POST', origin: 'https://api.acme.test', host: 'api.acme.test',
     path: '/repos', queryHash: '', channel, thread, governableChannel,
   });
-  const revalidate = (k: ApprovalKey): Promise<boolean> => approvalOwnerStillCurrent({
-    row: k, db, registry, policy: new Policy(), vault, actorIssuedAt: Date.now(), channelTools, channelConfig,
+  const revalidate = async (k: ApprovalKey): Promise<boolean> => approvalOwnerStillCurrent({
+    row: k, db, registry, policy: new Policy(), vault, actorIssuedAt: await vault.userProvisioningIssuedAt(), channelTools, channelConfig,
   });
   const stored = async (id: string): Promise<string> =>
     (await db.get(`SELECT governable_channel FROM approval_request WHERE id=?`, [id]) as any).governable_channel;
@@ -579,8 +579,8 @@ test('an aged durable self-approval DM remains deduplicated', async (t) => {
     assert.equal(dms.length, 1);
 
     await vouchr.db.run(
-      `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_MS_SQL}-? WHERE id=?`,
-      [PROMPT_REDELIVERY_DEBOUNCE_MS + 1_000, first.approvalId],
+      `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_US_SQL}-? WHERE id=?`,
+      [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000, first.approvalId],
     );
     await expectApprovalRequired(
       handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
@@ -1288,10 +1288,10 @@ test('PostgreSQL clock owns approval TTL/lease and expired delivered pending/gra
 
   const first = await withClockOffset(60 * 60_000, () => a.request(key));
   const firstRow = await dbA.get<any>(`SELECT * FROM approval_request WHERE id=?`, [first]);
-  const dbNow = await dbA.get<{ now_ms: number }>(
-    `SELECT (extract(epoch from clock_timestamp()) * 1000)::bigint AS now_ms`,
+  const dbNow = await dbA.get<{ now_us: number }>(
+    `SELECT ${POSTGRES_NOW_US_SQL} AS now_us`,
   );
-  assert.ok(Math.abs(firstRow.created_at - dbNow!.now_ms) < 5_000, 'pod clock never stamps authority TTL');
+  assert.ok(Math.abs(firstRow.created_at - dbNow!.now_us) < 5_000_000, 'pod clock never stamps authority TTL');
   const firstAudience = approvalDeliveryAudienceKey(first, 'self', ['U1']);
   const claim = await withClockOffset(60 * 60_000, () => a.claimDelivery(first, firstAudience));
   assert.equal(claim.status, 'claimed');
@@ -1585,7 +1585,7 @@ test('approval fan-out reserves a post, pool wait, query confirmation, and margi
       + DB_CONNECTION_TIMEOUT_MS
       + DB_RUNTIME_QUERY_TIMEOUT_MS
       + APPROVAL_DELIVERY_SAFETY_MARGIN_MS,
-    PROMPT_DELIVERY_LEASE_MS,
+    PROMPT_DELIVERY_LEASE_US / 1_000,
     'the component bounds and explicit safety margin must exactly consume the lease budget',
   );
 });

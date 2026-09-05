@@ -62,7 +62,8 @@ export type OAuthCallbackOutcome =
   | 'state_expired'
   | 'state_stale'
   | 'exchange_failed'
-  | 'setup_changed';
+  | 'setup_changed'
+  | 'identity_unverified';
 export type AttributedOAuthCallbackOutcome = Exclude<
   OAuthCallbackOutcome,
   'connected' | 'service_unavailable' | 'state_unavailable'
@@ -148,7 +149,7 @@ async function recordDenied(
   deps: CallbackDeps,
   identity: SlackIdentity,
   provider: string,
-  reason: 'consent_denied' | 'consent_incomplete' | 'offboarded' | 'revoked',
+  reason: 'consent_denied' | 'consent_incomplete' | 'offboarded' | 'revoked' | 'browser_unverified',
 ): Promise<boolean> {
   try {
     await deps.audit.record('denied', identity, provider, { reason });
@@ -224,6 +225,33 @@ export async function handleOAuthCallback(
   }
 
   const provider = deps.registry.get(row.provider);
+  // #302: this consent was MINTED requiring browser Slack-identity verification, and the hop never
+  // stamped it. The requirement is read from the ROW, never a process-local option, so a replica
+  // with the flag off (rollout, config drift) still enforces a state minted by an enforcing
+  // replica. Refuse BEFORE any denial classification or token exchange — a forwarded or replayed
+  // link must not mint a provider token, and a provider-side "Deny" on an unverified flow must not
+  // be recorded as the bound user's decision. The state is already spent (consume() above), so a
+  // direct callback burns it instead of bypassing the hop.
+  if (row.slackVerifyRequired && row.slackVerifiedAt == null) {
+    const recorded = await recordDenied(deps, row.identity, provider.id, 'browser_unverified');
+    emitConsent(
+      deps,
+      row.identity,
+      provider.id,
+      new URL(provider.tokenUrl).hostname,
+      'consent_failed',
+      recorded ? 403 : 500,
+    );
+    return attributedFailure(
+      'identity_unverified',
+      recorded ? 403 : 500,
+      recorded
+        ? 'This connection request was not completed through Slack verification. Ask the agent for a new connection prompt.'
+        : 'This connection request was not completed through Slack verification, and Vouchr could not record the outcome. Contact an administrator.',
+      recorded ? 'connect' : 'contact_admin',
+      context,
+    );
+  }
   // A user denial is exactly `error=access_denied` (RFC 6749 §4.1.2.1). Every other redirect error
   // (`server_error`, `temporarily_unavailable`, `invalid_scope`, or anything unrecognized) is a
   // provider-side failure the user never decided — classifying it as a denial would DM a false

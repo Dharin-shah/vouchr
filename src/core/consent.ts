@@ -8,17 +8,18 @@ import { DRY_RUN_CODE } from './dryRun';
 import {
   isInteractionId,
   newInteractionId,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_DELIVERY_LEASE_MS,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_DELIVERY_LEASE_US,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
   type PromptDeliveryClaim,
   type PromptDeliveryOptions,
 } from './interaction';
 
-export const STATE_TTL_MS = 10 * 60 * 1000;
+/** Microseconds, like every duration compared against the PostgreSQL fence clock. */
+export const STATE_TTL_US = 10 * 60 * 1_000_000;
 /** Expired state has no authority, but its owner-bound row remains briefly so the callback can give
  * precise private recovery instead of becoming indistinguishable from hostile random input. */
-export const STATE_RECOVERY_RETENTION_MS = 24 * 60 * 60 * 1000;
+export const STATE_RECOVERY_RETENTION_US = 24 * 60 * 60 * 1_000_000;
 export const MAX_CONSENT_SWEEP_BATCH = 1_000;
 /** One bounded retention statement. The created_at subquery rides
  * idx_consent_request_created_at; the state array lets PostgreSQL use the primary key when that is
@@ -104,7 +105,7 @@ function userOffboardLockKeys(identity: SlackIdentity): string[] {
 
 async function writeTeamOffboardMarker(tx: Db, identity: SlackIdentity): Promise<void> {
   await tx.run(
-    `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,${POSTGRES_NOW_MS_SQL})
+    `INSERT INTO offboard_tombstone (team_id, user_id, created_at) VALUES (?,?,${POSTGRES_NOW_US_SQL})
      ON CONFLICT(team_id, user_id) DO UPDATE SET created_at=GREATEST(
        offboard_tombstone.created_at,
        excluded.created_at
@@ -119,7 +120,7 @@ async function writeScopeOffboardMarkers(
   scopes: readonly OffboardScope[],
 ): Promise<void> {
   const clock = await tx.get<{ created_at: number }>(
-    `SELECT ${POSTGRES_NOW_MS_SQL} AS created_at`,
+    `SELECT ${POSTGRES_NOW_US_SQL} AS created_at`,
   );
   if (!Number.isSafeInteger(clock?.created_at)) {
     throw new Error('could not establish cross-team offboard fence');
@@ -269,7 +270,7 @@ export async function markProvisioningRevoked(
   const key = provisioningRevocationLockKey(filter.provider, scope.key);
   const mark = async (tx: Db): Promise<number> => {
     const clock = await tx.get<{ created_at: number }>(
-      `SELECT ${POSTGRES_NOW_MS_SQL} AS created_at`,
+      `SELECT ${POSTGRES_NOW_US_SQL} AS created_at`,
     );
     if (!Number.isSafeInteger(clock?.created_at)) {
       throw new Error('could not establish provisioning revocation fence');
@@ -456,7 +457,7 @@ export async function markUserOffboardedEverywhere(
   await withOffboardLocks(db, keys, (tx) => writeScopeOffboardMarkers(tx, user.userId, scopes));
 }
 
-interface ConsentRow {
+export interface ConsentRow {
   state: string;
   identity: SlackIdentity;
   provider: string;
@@ -464,6 +465,13 @@ interface ConsentRow {
   pkceVerifier: string;
   /** When the consent state was minted — the callback write-gate compares it to the tombstone. */
   createdAt: number;
+  /** When the browser completing this consent proved the bound Slack identity via the Slack OIDC
+   * hop (#302). NULL until then. */
+  slackVerifiedAt: number | null;
+  /** Whether this consent was MINTED under `requireBrowserSlackIdentity` (#302). Enforcement
+   * authority travels with the row: every callback on every replica honors this value, so a
+   * replica whose own flag is off can never complete an enforced consent unverified. */
+  slackVerifyRequired: boolean;
 }
 
 export interface ConsentRequest {
@@ -489,6 +497,8 @@ function consentRow(row: any): ConsentRow {
     channel: row.channel,
     pkceVerifier: row.pkce_verifier,
     createdAt: row.created_at,
+    slackVerifiedAt: row.slack_verified_at ?? null,
+    slackVerifyRequired: Number(row.slack_verify_required) === 1,
   };
 }
 
@@ -496,10 +506,14 @@ function consentRow(row: any): ConsentRow {
 export class Consent {
   /** `dryRun` (#116): begin() then returns a LOCAL authorize URL — the redirect target itself with
    *  a synthetic code — instead of the provider's, so clicking Connect completes instantly and
-   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery. */
+   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery.
+   *  `browserVerifyUri` (#302): when set, every minted authorize URL is the Vouchr browser-verify
+   *  hop (`<verifyUri>?state=S`) instead of the provider's, so the ONE URL swap covers every
+   *  prompt surface; {@link providerAuthorizeUrl} rebuilds the real URL after Slack verification. */
   constructor(
     private db: Db,
     private dryRun = false,
+    private browserVerifyUri?: string,
   ) {}
 
   /** Create a single-use consent request and return the provider authorize URL. */
@@ -510,7 +524,7 @@ export class Consent {
     channel: string | null,
   ): Promise<ConsentRequest> {
     const clock = await this.db.get<{ issued_at: number }>(
-      `SELECT ${POSTGRES_NOW_MS_SQL} AS issued_at`,
+      `SELECT ${POSTGRES_NOW_US_SQL} AS issued_at`,
     );
     if (!Number.isSafeInteger(clock?.issued_at)) throw new Error('could not issue consent fence');
     const pending = await this.beginFenced(
@@ -571,17 +585,24 @@ export class Consent {
     revokedAt: number | null,
   ): Promise<ConsentRequest | null> {
     const existing = await db.get<any>(
-      `SELECT *, ${POSTGRES_NOW_MS_SQL} AS observed_at
+      `SELECT *, ${POSTGRES_NOW_US_SQL} AS observed_at
        FROM consent_request
        WHERE team_id=? AND user_id=? AND provider=? AND superseded_at IS NULL
        FOR UPDATE`,
       [i.teamId, i.userId, provider.id],
     );
     if (existing) {
+      // #302: the persisted verification mode is part of the generation's identity. Reusing across
+      // a mode flip would either hand out a verify-hop URL for a row the callback never enforces
+      // (off→on: the old direct provider URL could still bypass the hop) or a direct provider URL
+      // for a row the callback refuses unstamped (on→off: a dead-end prompt). A mismatch
+      // supersedes the old generation and mints one that matches the minting replica's mode.
+      const sameMode = Number(existing.slack_verify_required) === (this.browserVerifyUri ? 1 : 0);
       const sameContext = existing.enterprise_id === i.enterpriseId
-        && existing.channel === channel;
+        && existing.channel === channel
+        && sameMode;
       const live = existing.consumed_at == null
-        && existing.observed_at - existing.created_at <= STATE_TTL_MS;
+        && existing.observed_at - existing.created_at <= STATE_TTL_US;
       const lifecycleCurrent = !tombstoneBlocks(offboardedAt, existing.created_at)
         && !tombstoneBlocks(revokedAt, existing.created_at);
       if (sameContext && live && lifecycleCurrent) {
@@ -594,23 +615,23 @@ export class Consent {
       }
       // A delayed older request may reuse an already-visible prompt in the same context, but it may
       // not replace a newer generation or move that prompt to another channel.
-      if (existing.created_at > issuedAt || existing.observed_at - issuedAt > STATE_TTL_MS) {
+      if (existing.created_at > issuedAt || existing.observed_at - issuedAt > STATE_TTL_US) {
         return null;
       }
       await db.run(
         `UPDATE consent_request
-         SET superseded_at=${POSTGRES_NOW_MS_SQL}
+         SET superseded_at=${POSTGRES_NOW_US_SQL}
          WHERE state=? AND superseded_at IS NULL`,
         [existing.state],
       );
     } else {
       const clock = await db.get<{ observed_at: number }>(
-        `SELECT ${POSTGRES_NOW_MS_SQL} AS observed_at`,
+        `SELECT ${POSTGRES_NOW_US_SQL} AS observed_at`,
       );
       if (!Number.isSafeInteger(clock?.observed_at)) {
         throw new Error('could not establish consent generation');
       }
-      if (clock!.observed_at - issuedAt > STATE_TTL_MS) return null;
+      if (clock!.observed_at - issuedAt > STATE_TTL_US) return null;
     }
 
     const state = randomBytes(32).toString('base64url');
@@ -618,9 +639,13 @@ export class Consent {
 
     await db.run(
       `INSERT INTO consent_request
-         (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt],
+         (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at,
+          slack_verify_required)
+       VALUES (?,?,?,?,?,?,?,?,?)`,
+      // #302: the requirement is PERSISTED at mint time — the callback enforces the row's value,
+      // never a completing replica's process-local flag, so a mixed-config fleet stays fail-closed.
+      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt,
+        this.browserVerifyUri ? 1 : 0],
     );
 
     return this.requestFor(provider, redirectUri, state, pkceVerifier);
@@ -642,6 +667,26 @@ export class Consent {
       return { authorizeUrl: u.toString(), state };
     }
 
+    // #302: with browser verification on, the ONLY URL a prompt ever carries is the Vouchr verify
+    // hop. The provider authorize URL is rebuilt by providerAuthorizeUrl() strictly after the Slack
+    // OIDC hop proves the bound identity, so no surface can hand out a direct provider URL.
+    if (this.browserVerifyUri) {
+      const u = new URL(this.browserVerifyUri);
+      u.searchParams.set('state', state);
+      return { authorizeUrl: u.toString(), state };
+    }
+
+    return { authorizeUrl: this.providerAuthorizeUrl(provider, redirectUri, state, pkceVerifier), state };
+  }
+
+  /** The real provider authorize URL for an already-minted state. Called by requestFor when browser
+   *  verification is off, and by the verify hop's post-verification redirect when it is on. */
+  providerAuthorizeUrl(
+    provider: Provider,
+    redirectUri: string,
+    state: string,
+    pkceVerifier: string,
+  ): string {
     const url = new URL(provider.authorizeUrl);
     // Provider extras FIRST, so the Vouchr-owned params below always win even if one slipped past the
     // definition-time reserved-key guard (RESERVED_AUTHORIZE_PARAMS in defineProvider). Belt and
@@ -660,7 +705,33 @@ export class Consent {
       url.searchParams.set('code_challenge', sha256base64url(pkceVerifier));
       url.searchParams.set('code_challenge_method', 'S256');
     }
-    return { authorizeUrl: url.toString(), state };
+    return url.toString();
+  }
+
+  /** Read — never spend — one still-active consent row, for the browser-verify hop (#302). The same
+   * live predicate as claimDelivery/latestStateFor: unconsumed, unsuperseded, within the state TTL. */
+  async activeRow(state: string): Promise<ConsentRow | null> {
+    if (!isConsentState(state)) return null;
+    const raw = await this.db.get<any>(
+      `SELECT * FROM consent_request
+       WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?`,
+      [state, STATE_TTL_US],
+    );
+    return raw ? consentRow(raw) : null;
+  }
+
+  /** Stamp a still-active consent as browser-verified (#302). Atomic against consume/supersede/TTL:
+   * false means the state was spent, replaced, or expired since the hop began — the caller fails
+   * closed rather than resurrecting authority. */
+  async markSlackVerified(state: string): Promise<boolean> {
+    if (!isConsentState(state)) return false;
+    return (await this.db.run(
+      `UPDATE consent_request SET slack_verified_at=${POSTGRES_NOW_US_SQL}
+       WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?`,
+      [state, STATE_TTL_US],
+    )).changes === 1;
   }
 
   /** Delete any in-flight consent for a user, preventing a pending OAuth from
@@ -694,8 +765,8 @@ export class Consent {
     // Sample PostgreSQL time once. A volatile clock_timestamp() inside the row predicate becomes a
     // per-row filter instead of an index condition and can make an empty sweep scan the whole table.
     const rawCutoff = await this.db.get<{ cutoff: unknown }>(
-      `SELECT ${POSTGRES_NOW_MS_SQL} - ? AS cutoff`,
-      [STATE_RECOVERY_RETENTION_MS],
+      `SELECT ${POSTGRES_NOW_US_SQL} - ? AS cutoff`,
+      [STATE_RECOVERY_RETENTION_US],
     );
     const cutoff = Number(rawCutoff?.cutoff);
     if (!Number.isSafeInteger(cutoff)) throw new Error('consent retention cutoff is unavailable');
@@ -716,9 +787,9 @@ export class Consent {
     const row = (await this.db.get(
       `SELECT state FROM consent_request WHERE user_id=? AND provider=?${teamId ? ' AND team_id=?' : ''}
          AND superseded_at IS NULL AND consumed_at IS NULL
-         AND created_at >= ${POSTGRES_NOW_MS_SQL} - ?
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?
        ORDER BY created_at DESC LIMIT 1`,
-      teamId ? [userId, provider, teamId, STATE_TTL_MS] : [userId, provider, STATE_TTL_MS],
+      teamId ? [userId, provider, teamId, STATE_TTL_US] : [userId, provider, STATE_TTL_US],
     )) as any;
     return row?.state ?? null;
   }
@@ -729,9 +800,9 @@ export class Consent {
     if (!isConsentState(state)) return { status: 'unavailable' };
     const raw = await this.db.get<any>(
       `UPDATE consent_request
-       SET consumed_at=${POSTGRES_NOW_MS_SQL}
+       SET consumed_at=${POSTGRES_NOW_US_SQL}
        WHERE state=? AND consumed_at IS NULL
-       RETURNING *, ${POSTGRES_NOW_MS_SQL} AS observed_at`,
+       RETURNING *, ${POSTGRES_NOW_US_SQL} AS observed_at`,
       [state],
     );
     if (!raw) return { status: 'unavailable' };
@@ -768,7 +839,7 @@ export class Consent {
     // finalizeProvisioning() re-checks the tombstones inside the credential transaction, so an
     // offboard/revoke that wins during token exchange still blocks the write.
     if (raw.superseded_at != null) return { status: 'superseded', row };
-    if (raw.observed_at - raw.created_at > STATE_TTL_MS) return { status: 'expired', row };
+    if (raw.observed_at - raw.created_at > STATE_TTL_US) return { status: 'expired', row };
     return { status: 'active', row };
   }
 
@@ -818,39 +889,39 @@ export class Consent {
       const token = newInteractionId();
       const claimed = await this.db.get<{ state: string }>(
         `UPDATE consent_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_US_SQL}+?, delivered_at=NULL
          WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
-           AND created_at >= ${POSTGRES_NOW_MS_SQL}-?
+           AND created_at >= ${POSTGRES_NOW_US_SQL}-?
            AND (
              delivered_at IS NULL
-             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_US_SQL}-?)
            )
-           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
          RETURNING state`,
         [
           token,
-          PROMPT_DELIVERY_LEASE_MS,
+          PROMPT_DELIVERY_LEASE_US,
           state,
-          STATE_TTL_MS,
+          STATE_TTL_US,
           options.redeliverDelivered === true,
-          PROMPT_REDELIVERY_DEBOUNCE_MS,
+          PROMPT_REDELIVERY_DEBOUNCE_US,
         ],
       );
       if (claimed) return { status: 'claimed', token };
       const current = await this.db.get<{
         delivered_at: number | null;
         delivery_lease_expires_at: number;
-        now_ms: number;
+        now_us: number;
       }>(
-        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
+        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_US_SQL} AS now_us
          FROM consent_request
          WHERE state=? AND superseded_at IS NULL AND consumed_at IS NULL
-           AND created_at >= ${POSTGRES_NOW_MS_SQL}-?`,
-        [state, STATE_TTL_MS],
+           AND created_at >= ${POSTGRES_NOW_US_SQL}-?`,
+        [state, STATE_TTL_US],
       );
       if (!current) return { status: 'stale' };
       if (current.delivered_at != null) return { status: 'delivered' };
-      if (current.delivery_lease_expires_at > current.now_ms) return { status: 'in-flight' };
+      if (current.delivery_lease_expires_at > current.now_us) return { status: 'in-flight' };
     }
     return { status: 'in-flight' };
   }
@@ -859,10 +930,10 @@ export class Consent {
     if (!isConsentState(state) || !isInteractionId(token)) return false;
     return (await this.db.run(
       `UPDATE consent_request
-       SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
+       SET delivered_at=${POSTGRES_NOW_US_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
        WHERE state=? AND delivery_token=? AND superseded_at IS NULL AND consumed_at IS NULL
-         AND delivered_at IS NULL AND created_at >= ${POSTGRES_NOW_MS_SQL}-?`,
-      [state, token, STATE_TTL_MS],
+         AND delivered_at IS NULL AND created_at >= ${POSTGRES_NOW_US_SQL}-?`,
+      [state, token, STATE_TTL_US],
     )).changes === 1;
   }
 

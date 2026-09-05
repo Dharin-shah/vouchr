@@ -14,6 +14,7 @@ import { Consent } from '../core/consent';
 import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isSlackAdmin, isChannelAdmin, isChannelMember, listChannelMembers } from './slack-identity';
+import { BrowserIdentityVerifier, assertSlackOidcOptions, type SlackOidcOptions } from './slackVerify';
 import { userOwner, channelOwner, type Owner } from '../core/owner';
 import {
   authorizeProvider,
@@ -49,7 +50,7 @@ import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit,
 import { booleanEnv } from '../core/options';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
-import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_MS } from '../core/interaction';
+import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_US } from '../core/interaction';
 import {
   abandonUserProvisioningDelivery,
   ChannelProvisioningRequests,
@@ -334,7 +335,7 @@ export async function settledWithLimit<T>(
  * before the 30s lease. The timer begins BEFORE claimDelivery, conservatively including its round
  * trip, so even a late-wave first success starts confirmation with the supported database budget. */
 export const APPROVAL_DELIVERY_SAFETY_MARGIN_MS = 1_000;
-export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_MS
+export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_US / 1_000
   - SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS
   - DB_CONNECTION_TIMEOUT_MS
   - DB_RUNTIME_QUERY_TIMEOUT_MS
@@ -691,6 +692,21 @@ export interface VouchrOptions {
    * provider. See guides/THREAT-MODEL.md, "Write blast radius differs by transport".
    */
   allowWrites?: boolean;
+  /**
+   * #302: require the browser completing provider OAuth to prove, via Slack OpenID Connect, that it
+   * is signed in as the Slack user the consent `state` was bound to. Connect prompts then point at
+   * a Vouchr verify route (mounted beside `callbackPath`) that routes through Slack sign-in before
+   * revealing the provider authorize URL, and the callback refuses any consent the hop never
+   * stamped. Closes the "Forwarded consent link" hand-off (guides/THREAT-MODEL.md). Requires
+   * `slackOidc` credentials and is incompatible with `dryRun`. Default false.
+   */
+  requireBrowserSlackIdentity?: boolean;
+  /**
+   * Slack app OIDC credentials for `requireBrowserSlackIdentity` (the same Slack app that owns the
+   * bot). Falls back to `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`. The Slack app must list the
+   * `…/slack` route beside `callbackPath` as an OAuth redirect URL (see guides/DEPLOYMENT.md).
+   */
+  slackOidc?: SlackOidcOptions;
 }
 
 /**
@@ -872,14 +888,15 @@ type InternalConnectContextDeps = ConnectContextDeps & {
 };
 
 /** Map a verified handler's monotonic receipt instant into PostgreSQL's clock domain. Query latency
- * is included in the subtraction and fractional milliseconds round up, so uncertainty can only
- * make the issuance older (fail closed), never newer than the received interaction. */
+ * is included in the subtraction and fractional microseconds round up (the nanosecond monotonic
+ * receipt keeps sub-millisecond precision), so uncertainty can only make the issuance older (fail
+ * closed) — by at least 1µs — never newer than the received interaction. */
 async function provisioningIssuedAtFromReceipt(vault: Vault, receivedAt: bigint): Promise<number> {
   const pgNow = await vault.userProvisioningIssuedAt();
   const elapsedNs = process.hrtime.bigint() - receivedAt;
   if (elapsedNs < 0n) throw new Error('invalid provisioning receipt clock');
-  const elapsedMs = Number((elapsedNs + 999_999n) / 1_000_000n);
-  const issuedAt = pgNow - elapsedMs;
+  const elapsedUs = Number((elapsedNs + 999n) / 1_000n);
+  const issuedAt = pgNow - elapsedUs;
   if (!Number.isSafeInteger(issuedAt)) throw new Error('could not issue provisioning fence');
   return issuedAt;
 }
@@ -1009,7 +1026,7 @@ export class ConnectContext {
   }
 
   /** Map this verified request's monotonic receipt instant into PostgreSQL's clock domain. Query
-   * latency is included in the elapsed subtraction and fractional milliseconds round up, so clock
+   * latency is included in the elapsed subtraction and fractional microseconds round up, so clock
    * uncertainty can only make the issuance older (fail closed), never newer than the request. */
   private async provisioningIssuedAt(): Promise<number> {
     return provisioningIssuedAtFromReceipt(this.vault, this.provisioningReceivedAt);
@@ -1310,7 +1327,7 @@ export class ConnectContext {
   }
 
   /** Client for lease-guarded prompt posts. A leased post must terminate well inside its
-   * PROMPT_DELIVERY_LEASE_MS: the default WebClient has no request timeout and silently queues
+   * PROMPT_DELIVERY_LEASE_US: the default WebClient has no request timeout and silently queues
    * rate-limited retries for up to ~30 minutes, so a slow post outlives its lease and a takeover
    * replica double-delivers the prompt (the caller then also mis-reports its own landed post).
    * Real Bolt clients carry their resolved token — post through a bounded twin (no retries, short
@@ -2549,6 +2566,34 @@ export async function createVouchr(opts: VouchrOptions) {
   // and the OAuth redirect URI from interpreting relative/URL/query/fragment forms differently.
   const callbackPath = opts.callbackPath === undefined ? '/vouchr/oauth/callback' : opts.callbackPath;
   const redirectUri = buildCallbackUrl(opts.baseUrl, callbackPath);
+  // #302: validate the browser Slack-identity hop config BEFORE the pool opens, like every other
+  // no-db check above. The verify/slack routes mount beside callbackPath (same directory).
+  if (opts.requireBrowserSlackIdentity !== undefined && typeof opts.requireBrowserSlackIdentity !== 'boolean') {
+    throw new Error('createVouchr: requireBrowserSlackIdentity must be a boolean'); // SEC-4: fail closed, never coerce
+  }
+  const requireBrowserSlackIdentity = opts.requireBrowserSlackIdentity === true;
+  if (requireBrowserSlackIdentity && dryRun) {
+    throw new Error('createVouchr: requireBrowserSlackIdentity is incompatible with dryRun (the synthetic authorize URL never passes the Slack hop)');
+  }
+  const slackOidc = requireBrowserSlackIdentity
+    ? assertSlackOidcOptions(
+        opts.slackOidc ?? {
+          clientId: process.env.SLACK_CLIENT_ID ?? '',
+          clientSecret: process.env.SLACK_CLIENT_SECRET ?? '',
+        },
+        'createVouchr',
+      )
+    : undefined;
+  // Plain string slicing (not a regex): callbackPath was proven canonical above, and CodeQL flags
+  // an end-anchored [^/]+ replace as polynomial-time on adversarial input.
+  const callbackDir = callbackPath.slice(0, callbackPath.lastIndexOf('/') + 1);
+  const browserVerifyPath = `${callbackDir}verify`;
+  const slackRedirectPath = `${callbackDir}slack`;
+  if (slackOidc && (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath)) {
+    throw new Error('createVouchr: callbackPath must not end in /verify or /slack when requireBrowserSlackIdentity is on');
+  }
+  const browserVerifyUri = slackOidc ? buildCallbackUrl(opts.baseUrl, browserVerifyPath) : undefined;
+  const oidcRedirectUri = slackOidc ? buildCallbackUrl(opts.baseUrl, slackRedirectPath) : undefined;
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
@@ -2566,7 +2611,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope, lockdown);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
-  const consent = new Consent(db, dryRun);
+  const consent = new Consent(db, dryRun, browserVerifyUri);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
@@ -3051,7 +3096,13 @@ export async function createVouchr(opts: VouchrOptions) {
     await args.next();
   };
 
+  // #302: no flag here — the callback enforces the ROW's minted-time slack_verify_required.
   const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, dryRun };
+
+  // #302: one shared verifier owns the OIDC exchange + compare + stamp/spend sequence.
+  const browserVerifier = slackOidc
+    ? new BrowserIdentityVerifier({ consent, registry, redirectUri, oidcRedirectUri: oidcRedirectUri!, audit, auditSink, oidc: slackOidc })
+    : null;
 
   /**
    * #116 dry-run test helper: complete the NEWEST pending consent for (user, provider) through the
@@ -3100,8 +3151,42 @@ export async function createVouchr(opts: VouchrOptions) {
     if (outcome === 'stale') throw new Error('channel tool enable was superseded');
   };
 
-  /** Mount the OAuth callback on the receiver's Express router. */
+  /** One fixed text/plain error response for the browser routes (SEC-1/SEC-5: static text only). */
+  function sendPlain(res: any, status: number, text: string): any {
+    return res
+      .status(status)
+      .set({ 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' })
+      .send(text);
+  }
+
+  /** Mount the OAuth callback (and, with #302 on, the Slack verify hop) on the receiver's router. */
   function mountRoutes(router: any): void {
+    if (browserVerifier) {
+      // #302 hop 1: the Connect prompt's URL. Redirects the browser to Slack's OIDC authorize.
+      router.get(browserVerifyPath, async (req: any, res: any) => {
+        try {
+          const r = await browserVerifier.begin(req.query?.state);
+          if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
+          return sendPlain(res, r.status, r.error);
+        } catch {
+          sendPlain(res, 500, 'Connection failed. Please try again.');
+        }
+      });
+      // #302 hop 2: Slack's redirect back. A verified match continues to the provider authorize URL.
+      router.get(slackRedirectPath, async (req: any, res: any) => {
+        try {
+          const r = await browserVerifier.complete({
+            code: req.query?.code,
+            state: req.query?.state,
+            error: req.query?.error,
+          });
+          if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
+          return sendPlain(res, r.status, r.error);
+        } catch {
+          sendPlain(res, 500, 'Connection failed. Please try again.');
+        }
+      });
+    }
     router.get(callbackPath, async (req: any, res: any) => {
       try {
         const { code, state, error } = req.query;

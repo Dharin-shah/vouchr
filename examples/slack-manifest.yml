@@ -26,6 +26,10 @@ features:
       usage_hint: status | disconnect <provider> | connect-shared <provider>
       should_escape: false
 oauth_config:
+  # requireBrowserSlackIdentity (#302): uncomment so the Slack OIDC verify hop can redirect back
+  # (and pass the app's client id/secret as slackOidc / SLACK_CLIENT_ID + SLACK_CLIENT_SECRET).
+  # redirect_urls:
+  #   - https://YOUR_PUBLIC_URL/vouchr/oauth/slack
   scopes:
     bot:
       - app_mentions:read   # receive @-mentions
