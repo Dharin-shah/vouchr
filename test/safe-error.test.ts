@@ -109,7 +109,7 @@ test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe co
   );
   assert.match(
     safeUserMessage(new ConsentRequiredError('github', 'reused')),
-    /no longer visible/,
+    /no longer visible, ask again in 30 seconds\./,
   );
   assert.equal(
     safeUserMessage(new SessionApprovalRequiredError('github')),

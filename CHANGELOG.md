@@ -51,6 +51,10 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- The reused-Connect-prompt copy (`ConsentRequiredError` with `promptState: 'reused'` and its
+  `mapSafeError` text) tells the person to ask again in 30 seconds, the re-delivery window an
+  in-channel ephemeral actually has since #276, instead of the pre-#276 "up to 10 minutes". The
+  asserted `already posted` / `no longer visible` phrases are unchanged (#275).
 - The `bolt-github` example and the README snippet post Vouchr's fixed, secret-free copy as a
   private message when `connect()` refuses for a reason other than consent (for example, the
   provider is not yet enabled in the channel) instead of failing silently (UX-1).
