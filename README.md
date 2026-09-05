@@ -37,9 +37,8 @@ app.event('app_mention', async ({ context, event, client, say }) => {
     await say(`You're *${me.login}* on GitHub.`);
   } catch (error) {
     if (error instanceof ConsentRequiredError) return; // Vouchr already posted a private Connect prompt.
-    // Other refusals (provider not enabled here, blocked host, ...): tell the user privately in
-    // Vouchr's fixed, secret-free copy, then let Bolt log the error.
-    if (event.user) await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(error) });
+    // Any other refusal: show the user Vouchr's fixed, secret-free message, then let Bolt log it.
+    await client.chat.postEphemeral({ channel: event.channel, user: event.user!, text: safeUserMessage(error) });
     throw error;
   }
 });
@@ -48,6 +47,8 @@ app.event('app_mention', async ({ context, event, client, say }) => {
 Channels are deny-by-default. Before first use in a channel, an admin runs `/vouchr enable github`.
 Direct messages need no enable. `connect()` then prompts the user privately. After one browser
 OAuth, the agent works.
+
+![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
 ## Quickstart
 
