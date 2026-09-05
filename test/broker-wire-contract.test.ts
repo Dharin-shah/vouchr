@@ -45,6 +45,16 @@ const svc = defineProvider({
   authorizeUrl: 'https://svc.example/auth', tokenUrl: 'https://svc.example/token',
   scopesDefault: ['x'], egressAllow: ['api.svc.example'], refresh: 'none', pkce: false,
 });
+// #296: the same seeded provider with a write that needs a human decision.
+const acmeApproval = defineProvider({
+  id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
+  scopesDefault: ['x'], egressAllow: ['api.acme.example'], egressMethods: ['GET', 'POST'],
+  approval: { approver: 'self' }, refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
+});
+const authorizationBody = () => ({
+  handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(),
+  method: 'POST', path: '/data', bindingMessage: 'Create the demo record',
+});
 
 function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
@@ -156,6 +166,17 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
       globalThis.fetch = (async () => new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'GET', path: '/data' }); }
       finally { globalThis.fetch = real; server.close(); }
+  } },
+  { name: 'authorization.create', run: async (t) => {
+      const { server, port } = await makeBroker(t, { providers: [acmeApproval, svc], allowWrites: true });
+      try { return await request(port, 'POST', '/v1/authorization', authorizationBody()); } finally { server.close(); }
+  } },
+  { name: 'authorization.status', run: async (t) => {
+      const { server, port } = await makeBroker(t, { providers: [acmeApproval, svc], allowWrites: true });
+      try {
+        const created = await request(port, 'POST', '/v1/authorization', authorizationBody());
+        return await request(port, 'GET', `/v1/authorization/${(created.json as any).authorizationId}`, undefined, { 'x-vouchr-identity': userToken() });
+      } finally { server.close(); }
   } },
   { name: 'status', run: async (t) => {
       const { server, port } = await makeBroker(t);
@@ -315,6 +336,14 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
   { name: 'error.notFound.404', run: async (t) => {
       const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/v1/does-not-exist'); } finally { server.close(); }
+  } },
+  { name: 'error.authorization.notFound.404', run: async (t) => {
+      const { server, port } = await makeBroker(t, { providers: [acmeApproval, svc], allowWrites: true });
+      try { return await request(port, 'GET', `/v1/authorization/${randomUUID()}`, undefined, { 'x-vouchr-identity': userToken() }); } finally { server.close(); }
+  } },
+  { name: 'error.authorization.notRequired.400', run: async (t) => {
+      const { server, port } = await makeBroker(t, { providers: [acmeApproval, svc], allowWrites: true });
+      try { return await request(port, 'POST', '/v1/authorization', { ...authorizationBody(), method: 'GET' }); } finally { server.close(); }
   } },
 ];
 

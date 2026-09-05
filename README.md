@@ -77,8 +77,9 @@ Vault) work too. Request only the scopes you use: `github({ scopes: ['read:user'
 ## Headless
 
 Agent workers in another process or language call a private HTTP broker instead of Bolt. The token
-still never leaves Vouchr. See the [headless guide](./guides/HEADLESS.md) and the
-[hybrid guide](./guides/HYBRID.md).
+still never leaves Vouchr. A background agent with no Slack turn (cron, CI, a durable workflow)
+initiates the human decision itself with `POST /v1/authorization` and polls for the outcome. See
+the [headless guide](./guides/HEADLESS.md) and the [hybrid guide](./guides/HYBRID.md).
 
 ## Learn more
 

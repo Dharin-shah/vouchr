@@ -443,6 +443,10 @@ export function approvalBlocks(o: {
   requester: string;
   id: string;
   approver: 'self' | 'admin';
+  /** #296: the agent's plain transaction statement for a backchannel request; absent (null) for an
+   * in-process/fetch-minted approval. Host-supplied free text — rendered as `plain_text`, never
+   * interpolated into mrkdwn (SEC-5 by construction). */
+  bindingMessage?: string | null;
 }): unknown[] {
   const p = escapeMrkdwn(o.provider);
   const n = o.queryParamCount;
@@ -471,11 +475,19 @@ export function approvalBlocks(o: {
       type: 'section',
       text: { type: 'plain_text', text: action, emoji: false },
     },
+    // The agent's own statement of what it is doing (#296). Plain text (never mrkdwn) so a crafted
+    // message cannot render links, mentions, or formatting that impersonates Vouchr's copy.
+    ...(o.bindingMessage
+      ? [{
+          type: 'section',
+          text: { type: 'plain_text', text: `Agent's statement: ${o.bindingMessage}`, emoji: false },
+        }]
+      : []),
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `${query ? `${query}. ` : ''}The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires if unused.${bound} The raw path and request body are not displayed or inspected.`,
+        text: `${query ? `${query}. ` : ''}The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires if unused.${bound} The raw path and request body are not displayed or inspected.${o.bindingMessage ? ' The agent’s statement is its own claim, not verified by Vouchr.' : ''}`,
       },
     },
     {

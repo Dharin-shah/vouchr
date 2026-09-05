@@ -17,6 +17,7 @@ export type {
   BrokerServer,
   BrokerFetchRequest,
   BrokerMcpRequest,
+  BrokerAuthorizationRequest,
   ConnectionHandleRef,
 } from './adapters/http/broker';
 
@@ -72,7 +73,14 @@ export type { ConsentPromptState, VouchrErrorCode, VouchrRecovery, VouchrSafeErr
 // The broker maps this typed control-flow error to 403. Interaction stores are not exported: the
 // shipped hybrid bridge reaches their safe mutations only through the trusted Bolt
 // ConnectContext.recoverBrokerDenial surface; a pure-headless host gets no raw mutation API.
-export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval';
+// #296: the backchannel binding-message bound + validator, so a client can reject before the wire.
+export {
+  ApprovalPathTooLongError,
+  ApprovalRequiredError,
+  MAX_BINDING_MESSAGE_BYTES,
+  assertBindingMessage,
+} from './core/approval';
+export type { AuthorizationStatus } from './core/approval';
 export { sweepExpired } from './core/sweep';
 
 // ── signed identity minting/verification (the headless auth contract) ──
@@ -166,4 +174,5 @@ export type {
   BrokerAdminOkResponse,
   BrokerAdminConfigResponse,
   BrokerAuditResponse,
+  BrokerAuthorizationResponse,
 } from './broker-types';

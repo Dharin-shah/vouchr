@@ -24,6 +24,7 @@ export type {
   BrokerServer,
   BrokerFetchRequest,
   BrokerMcpRequest,
+  BrokerAuthorizationRequest,
   ConnectionHandleRef,
 } from './adapters/http/broker';
 export {
@@ -39,7 +40,13 @@ export { InteractionStateChangedError } from './core/interaction';
 // #113 human-in-the-loop approval for sensitive writes. Typed control-flow errors remain public;
 // persisted interaction stores are intentionally internal so
 // package consumers cannot bypass the packaged Bolt/broker mutation+lock+audit facades.
-export { ApprovalPathTooLongError, ApprovalRequiredError } from './core/approval';
+export {
+  ApprovalPathTooLongError,
+  ApprovalRequiredError,
+  MAX_BINDING_MESSAGE_BYTES,
+  assertBindingMessage,
+} from './core/approval';
+export type { AuthorizationStatus } from './core/approval';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
 // (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
 // `./headless`. A direct createBroker() result owns safe interaction cleanup through its
@@ -172,4 +179,5 @@ export type {
   BrokerAdminOkResponse,
   BrokerAdminConfigResponse,
   BrokerAuditResponse,
+  BrokerAuthorizationResponse,
 } from './broker-types';

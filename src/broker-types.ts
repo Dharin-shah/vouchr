@@ -9,6 +9,7 @@
 
 import type { ChannelMode } from './core/channelConfig';
 import type { AuditRow } from './core/audit';
+import type { AuthorizationStatus } from './core/approval';
 import type { ToolManifestEntry } from './core/tools';
 import type { VouchrErrorCode, VouchrRecovery } from './core/errors';
 
@@ -87,6 +88,17 @@ export interface BrokerAdminOkResponse {
  *  and always null for a service tool, which has no Vouchr-owned credential. */
 export interface BrokerAdminConfigResponse {
   providers: { provider: string; mode: ChannelMode | null; enabled: boolean }[];
+}
+
+/** `POST /v1/authorization` · `GET /v1/authorization/{id}` — one backchannel (CIBA-style)
+ *  authorization request (#296). `status` is the durable lifecycle as the requester sees it:
+ *  `pending` → `approved` (a live single-use grant the retried action will spend) | `denied` |
+ *  `expired`. A consumed grant or a swept row is `404`, never a status. `expiresAt` is epoch-ms.
+ *  The id is an opaque lookup handle bound to the requesting identity — never authority. */
+export interface BrokerAuthorizationResponse {
+  authorizationId: string;
+  status: AuthorizationStatus;
+  expiresAt: number;
 }
 
 /** `POST /v1/audit` · `POST /v1/admin/audit` — a read-only slice of the audit trail: the caller's own

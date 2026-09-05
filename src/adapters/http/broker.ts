@@ -47,10 +47,12 @@ import {
   Approvals,
   ApprovalPathTooLongError,
   ApprovalRequiredError,
+  assertBindingMessage,
   credentialUseStateFenced,
   credentialUseStillCurrentFenced,
   type ApprovalKey,
 } from '../../core/approval';
+import type { BrokerAuthorizationResponse } from '../../broker-types';
 import {
   disconnectProvider,
   disconnectProviderAtReceipt,
@@ -130,6 +132,24 @@ export interface BrokerMcpRequest {
   host?: string; // optional pick among a multi-host provider; defaults to egressAllow[0]
   headers?: Record<string, string>; // MCP plumbing allowlist only; Authorization is dropped (broker injects)
   body: string; // the JSON-RPC message, forwarded verbatim (capped like /v1/fetch write bodies)
+}
+
+/**
+ * #296 `POST /v1/authorization` request: the /v1/fetch target envelope WITHOUT a body or headers —
+ * only the exact action (method + host + path + query) the agent asks a human to authorize, plus
+ * the plain `bindingMessage` the human reads. Nothing is executed; the retried `/v1/fetch` (or
+ * `/v1/mcp`) for the identical action spends the single-use grant through the normal injection path.
+ */
+export interface BrokerAuthorizationRequest {
+  handle: ConnectionHandleRef;
+  identityToken: string; // caller-minted, HS256-signed, single-use; broker verifies (see identity.ts)
+  method: string;
+  path: string;
+  host?: string;
+  query?: Record<string, string>;
+  /** The transaction statement rendered on the decision surface as plain text (never mrkdwn, never
+   * audited). Bounded by MAX_BINDING_MESSAGE_BYTES; must be non-empty and non-whitespace. */
+  bindingMessage: string;
 }
 
 export interface BrokerOptions {
@@ -413,6 +433,8 @@ export function normalizeBrokerResourceBounds(input: BrokerResourceBoundsInput):
 // headers (opaque and POTENTIALLY SENSITIVE per MCP security guidance: relayed verbatim, never
 // stored or logged, never accepted as authentication) and keeps Accept + Content-Type because MCP
 // Streamable HTTP requires `Accept: application/json, text/event-stream`.
+/** #296 exact route key for `GET /v1/authorization/{id}` once its id has been parsed and validated. */
+const AUTHORIZATION_STATUS_ROUTE = '/v1/authorization/{id}';
 const FETCH_FORWARD_HEADERS = ['accept', 'accept-language', 'if-none-match', 'content-type'];
 const MCP_FORWARD_HEADERS = ['accept', 'content-type', 'mcp-session-id', 'mcp-protocol-version'];
 // RESPONSE headers /v1/mcp relays back (content-type so SSE parses; the Mcp-* plumbing so the
@@ -1243,6 +1265,77 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     }
   }
 
+  /** Wire view of one authorization row: the µs PostgreSQL expiry becomes epoch-ms like every
+   * other broker timestamp. */
+  const authorizationPayload = (
+    row: { id: string; status: BrokerAuthorizationResponse['status']; expiresAt: number },
+  ): BrokerAuthorizationResponse => ({
+    authorizationId: row.id,
+    status: row.status,
+    expiresAt: Math.floor(row.expiresAt / 1000),
+  });
+
+  /**
+   * #296 `POST /v1/authorization` — initiate a backchannel (CIBA-style) authorization request for
+   * ONE exact action without executing it. The SAME gate pipeline as /v1/fetch runs first
+   * (perimeter, identity + replay, current actor, provider, policy + channel tools, owner
+   * resolution, then the injector's egress gates), so an agent can never mint a decision surface for
+   * a target it could not call. The pending row is the very row a later /v1/fetch spends: the human
+   * decides once, in Slack, and the grant stays bound to the exact action fingerprint. The broker
+   * cannot render the decision surface; the Bolt control plane delivers it on its own timer.
+   */
+  async function handleBackchannelRequest(body: BrokerAuthorizationRequest): Promise<BrokerAuthorizationResponse> {
+    const method = requestMethod(body.method);
+    // Same fail-closed read-only default as /v1/fetch: a write the broker would refuse to execute
+    // must not be able to mint a human decision for itself.
+    if (!opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
+      throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
+    }
+    let bindingMessage: string;
+    try {
+      bindingMessage = assertBindingMessage(body.bindingMessage); // SEC-4: bounded before any read/write
+    } catch (e) {
+      throw new HttpError(400, { error: (e as Error).message });
+    }
+    const { handle, provider, acting } = await resolveTarget(body, fetchDeadlineMs);
+    const url = buildTargetUrl(provider, body);
+    let pending: { id: string; created: boolean } | null;
+    try {
+      pending = await handle.requestApproval(url.toString(), method, bindingMessage);
+    } catch (e) {
+      mapUpstreamError(e);
+    }
+    if (!pending) {
+      throw new HttpError(400, { error: 'this action does not require approval; call /v1/fetch directly' });
+    }
+    const row = await approvals.authorizationStatus(pending.id, acting);
+    if (!row) {
+      // The row was reclaimed/replaced between the write and this read (a concurrent decision or
+      // reconnect): the caller resolves current state rather than trusting a vanished id.
+      throw typedHttpError(
+        409,
+        'authorization changed; resolve and retry',
+        new InteractionStateChangedError('approval', 'authorization'),
+      );
+    }
+    return authorizationPayload(row);
+  }
+
+  /**
+   * #296 `GET /v1/authorization/{id}` — poll one authorization request. Identity rides the
+   * `x-vouchr-identity` header (a GET carries no body; never a query string, which access logs keep)
+   * and is single-use like every other route: mint a fresh assertion per poll. The row is bound to
+   * the verified requester; any other caller — or a consumed/swept id — reads `404`.
+   */
+  async function handleBackchannelStatus(id: string, token: unknown): Promise<BrokerAuthorizationResponse> {
+    if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
+    const claims = await verify(token);
+    const { identity } = await requireCurrentActor(claims);
+    const row = await approvals.authorizationStatus(id, identity); // re-checks the id grammar itself
+    if (!row) throw new HttpError(404, { error: 'unknown authorization' });
+    return authorizationPayload(row);
+  }
+
   /**
    * #65 `POST /v1/mcp` — MCP-aware egress proxy for providers whose tool surface is an MCP server
    * over Streamable HTTP (which is just HTTP with a bearer). It runs the SAME pipeline as /v1/fetch
@@ -1946,6 +2039,13 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       };
       try {
         const url = req.url ?? '/';
+        // #296 the one parameterized route. Parsed ONCE, up front, into an exact route key plus an
+        // id that already passed the interaction-id grammar — so the perimeter/identity gates below
+        // stay keyed on constant route strings like every other branch, never on a prefix test of
+        // raw request input. Anything else (extra segments, a query, a malformed id) is a plain 404.
+        const authorizationSegment = /^\/v1\/authorization\/([^/?#]+)$/.exec(url)?.[1];
+        const authorizationId = isInteractionId(authorizationSegment) ? authorizationSegment : undefined;
+        const route = authorizationId === undefined ? url : AUTHORIZATION_STATUS_ROUTE;
         // #101 liveness + readiness probes: registered FIRST, BEFORE the perimeter/identity gate and
         // exempt from replay — a k8s probe carries no bearer and must never touch the vault.
         if (req.method === 'GET' && (url === '/healthz' || url === '/health')) {
@@ -2068,6 +2168,16 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
             requestSignal,
           );
           return send(r.status, r.payload);
+        }
+        if (req.method === 'POST' && url === '/v1/authorization') {
+          await perimeter(req, requestSignal);
+          return send(200, { ...await handleBackchannelRequest(await readJson(req)) });
+        }
+        if (req.method === 'GET' && route === AUTHORIZATION_STATUS_ROUTE) {
+          await perimeter(req, requestSignal);
+          return send(200, {
+            ...await handleBackchannelStatus(authorizationId!, req.headers['x-vouchr-identity']),
+          });
         }
         if (req.method === 'POST' && url === '/v1/mcp') {
           await perimeter(req, requestSignal);

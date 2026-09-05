@@ -116,6 +116,36 @@ export function approvalDeliveryAudienceKey(
 /** Default validity of an approval once granted (#113): 5 minutes, unless the provider sets ttlMs. */
 export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
 
+/** Finite bound for a backchannel binding message (#296). It is rendered verbatim (escaped) on the
+ * decision surface, so it stays far under Slack's section-text limit and never becomes a payload. */
+export const MAX_BINDING_MESSAGE_BYTES = 500;
+
+/** Validate the host-supplied binding message at the lowest reusable layer (IMP-3): a non-empty,
+ * non-whitespace string within the bound. Returns the RAW value — never trimmed or normalized, so
+ * what the human reads is byte-exact what the agent stated. Throws a plain fixed-text Error; the
+ * broker maps it to 400. */
+export function assertBindingMessage(value: unknown): string {
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new Error('bindingMessage must be a non-empty string');
+  }
+  if (Buffer.byteLength(value, 'utf8') > MAX_BINDING_MESSAGE_BYTES) {
+    throw new Error(`bindingMessage must be at most ${MAX_BINDING_MESSAGE_BYTES} bytes`);
+  }
+  // C0 controls (except newline/tab) and DEL: PostgreSQL TEXT refuses NUL outright (an internal
+  // error after the assertion is spent), and the rest have no place in a statement a human reads.
+  for (const ch of value) {
+    const code = ch.codePointAt(0)!;
+    if ((code < 0x20 && code !== 0x0a && code !== 0x09) || code === 0x7f) {
+      throw new Error('bindingMessage must not contain control characters');
+    }
+  }
+  return value;
+}
+
+/** Wire status of one backchannel authorization request (#296): the row's lifecycle as the polling
+ * agent sees it. A consumed grant (the approved action ran) or a swept row is absent, not a status. */
+export type AuthorizationStatus = 'pending' | 'approved' | 'denied' | 'expired';
+
 /**
  * Thrown by the injector when a request matches a provider's `approval` predicate and no live,
  * matching, unconsumed grant exists (#113). Control flow, exactly like ConsentRequiredError: the
@@ -204,13 +234,18 @@ export interface ApprovalKey {
   governableChannel: string | null;
 }
 
-/** One pending request / unspent grant, as the approve/deny surface and the sweep read it. */
+/** One pending request / unspent grant / persisted denial, as the approve/deny surface and the
+ * sweep read it. `denied` rows (#296) exist only so a backchannel poller can observe the outcome;
+ * no read path treats them as pending or spendable, and the sweep reclaims them unaudited. */
 export interface ApprovalRow extends ApprovalKey {
   id: string;
-  status: 'pending' | 'granted';
+  status: 'pending' | 'granted' | 'denied';
+  /** The deciding human for granted AND denied rows (the column name predates persisted denials). */
   approvedBy: string | null;
   createdAt: number;
   expiresAt: number;
+  /** #296: non-null only for an agent-initiated backchannel request; rendered on the prompt. */
+  bindingMessage: string | null;
 }
 
 /** Result of one persisted approval-button decision. `invalidated` means the stored action no
@@ -424,6 +459,7 @@ function toRow(r: any): ApprovalRow {
     approvedBy: r.approved_by ?? null,
     createdAt: r.created_at,
     expiresAt: r.expires_at,
+    bindingMessage: r.binding_message ?? null,
   };
 }
 
@@ -493,13 +529,21 @@ export class Approvals {
   }
 
   /** Insert or reuse the one live row for an exact action. The unique action index linearizes two
-   *  replicas; an expired row is atomically replaced. A live granted row may win the consume→request
-   *  race, in which case its id is returned without a duplicate prompt and the caller retries. */
-  private async requestOn(db: Db, k: ApprovalKey): Promise<{ id: string; created: boolean }> {
+   *  replicas; an expired or denied row is atomically replaced (a denial is a terminal outcome the
+   *  poller may still be reading, but a new request IS a new decision — #296). A live granted row
+   *  may win the consume→request race, in which case its id is returned without a duplicate prompt
+   *  and the caller retries. A reused pending row adopts the binding message only if it had none,
+   *  so the human never reads a statement that changed under an already-delivered prompt. */
+  private async requestOn(
+    db: Db,
+    k: ApprovalKey,
+    bindingMessage: string | null = null,
+  ): Promise<{ id: string; created: boolean }> {
     if (!isInteractionId(k.credentialId)) {
       throw new Error('approval request requires a valid credential generation id');
     }
     assertApprovalPathBounded(k.path);
+    const message = bindingMessage === null ? null : assertBindingMessage(bindingMessage);
     const params = this.keyParams(k);
     const actionKey = approvalActionKey(k);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -507,14 +551,14 @@ export class Approvals {
       const row = await db.get<{ id: string }>(
         `INSERT INTO approval_request
            (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, query_hash,
-            channel, thread, governable_channel, status, approved_by, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?)
+            channel, thread, governable_channel, status, approved_by, created_at, expires_at, binding_message)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?,?)
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
            governable_channel=excluded.governable_channel,
            delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL,
-           delivery_audience=NULL
+           delivery_audience=NULL, binding_message=excluded.binding_message
          WHERE approval_request.team_id=excluded.team_id
            AND approval_request.user_id=excluded.user_id
            AND approval_request.owner_kind=excluded.owner_kind
@@ -528,9 +572,9 @@ export class Approvals {
            AND approval_request.query_hash=excluded.query_hash
            AND approval_request.channel=excluded.channel
            AND approval_request.thread=excluded.thread
-           AND approval_request.expires_at<=${POSTGRES_NOW_US_SQL}
+           AND (approval_request.expires_at<=${POSTGRES_NOW_US_SQL} OR approval_request.status='denied')
          RETURNING id`,
-        [id, actionKey, ...params, PENDING_INTERACTION_TTL_US],
+        [id, actionKey, ...params, PENDING_INTERACTION_TTL_US, message],
       );
       if (row) return { id: row.id, created: true };
       const live = await db.get<{ id: string }>(
@@ -539,10 +583,18 @@ export class Approvals {
            AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
            AND method=? AND origin=? AND host=? AND path=? AND query_hash=? AND channel=? AND thread=?
            AND governable_channel=?
-           AND expires_at>${POSTGRES_NOW_US_SQL}`,
+           AND status<>'denied' AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [actionKey, ...params],
       );
-      if (live) return { id: live.id, created: false };
+      if (live) {
+        if (message !== null) {
+          await db.run(
+            `UPDATE approval_request SET binding_message=? WHERE id=? AND status='pending' AND binding_message IS NULL`,
+            [message, live.id],
+          );
+        }
+        return { id: live.id, created: false };
+      }
     }
     throw new Error('approval request could not be recorded; retry');
   }
@@ -554,16 +606,18 @@ export class Approvals {
   }
 
   /** Deduplicated request plus `approval_requested` audit in one transaction. Reuse writes no
-   *  duplicate audit row and tells Bolt not to post another prompt. */
+   *  duplicate audit row and tells Bolt not to post another prompt. `bindingMessage` (#296) marks
+   *  an agent-initiated backchannel request; it is stored for the prompt and never audited. */
   async requestAudited(
     k: ApprovalKey,
     audit: Audit,
     acting: SlackIdentity,
     vault?: Pick<Vault, 'withCredentialLocks'>,
     validate?: (key: ApprovalKey, tx: Db, locked: Pick<Vault, 'liveId'>) => Promise<boolean>,
+    bindingMessage: string | null = null,
   ): Promise<{ id: string; created: boolean }> {
     const write = async (tx: Db) => {
-      const result = await this.requestOn(tx, k);
+      const result = await this.requestOn(tx, k, bindingMessage);
       if (result.created) {
         await audit.record('approval_requested', acting, k.provider, this.auditMeta(k), undefined, tx);
       }
@@ -725,14 +779,62 @@ export class Approvals {
     return changes === 1;
   }
 
-  /** Deny (delete) a pending request. Returns the row for the audit/notify pair, or null if gone. */
-  async deny(id: string): Promise<ApprovalRow | null> {
-    if (!isInteractionId(id)) return null;
-    const row = await this.db.get<any>(
-      `DELETE FROM approval_request WHERE id=? AND status='pending' RETURNING *`,
-      [id],
+  /** Deny a pending request. The row is PERSISTED as `denied` (#296) for one more pending-TTL
+   *  window so a backchannel poller observes the outcome instead of an indistinguishable absence;
+   *  every pending/grant read path already excludes it, a re-request replaces it, and the sweep
+   *  reclaims it without a second denial audit. Atomic on status='pending'. */
+  private async denyOn(db: Db, id: string, decidedBy: string | null): Promise<ApprovalRow | null> {
+    const row = await db.get<any>(
+      `UPDATE approval_request SET status='denied', approved_by=?, expires_at=${POSTGRES_NOW_US_SQL}+?
+       WHERE id=? AND status='pending' RETURNING *`,
+      [decidedBy, PENDING_INTERACTION_TTL_US, id],
     );
     return row ? toRow(row) : null;
+  }
+
+  /** Low-level deny primitive. Returns the row for the audit/notify pair, or null if gone. */
+  async deny(id: string): Promise<ApprovalRow | null> {
+    if (!isInteractionId(id)) return null;
+    return this.denyOn(this.db, id, null);
+  }
+
+  /** #296: the lifecycle of one authorization request as its REQUESTER may read it. Bound to the
+   *  requesting team + user, so an opaque id copied across tenants reads as unknown. Null when the
+   *  row is absent — swept, consumed by the approved action, or never this caller's. */
+  async authorizationStatus(
+    id: string,
+    requester: Pick<SlackIdentity, 'teamId' | 'userId'>,
+  ): Promise<{ id: string; status: AuthorizationStatus; expiresAt: number } | null> {
+    if (!isInteractionId(id)) return null;
+    const row = await this.db.get<{ status: string; expires_at: number; live: boolean }>(
+      `SELECT status, expires_at, expires_at>${POSTGRES_NOW_US_SQL} AS live
+       FROM approval_request WHERE id=? AND team_id=? AND user_id=?`,
+      [id, requester.teamId, requester.userId],
+    );
+    if (!row) return null;
+    const status: AuthorizationStatus = row.status === 'denied'
+      ? 'denied'
+      : !row.live ? 'expired' : row.status === 'granted' ? 'approved' : 'pending';
+    return { id, status, expiresAt: row.expires_at };
+  }
+
+  /** #296: live backchannel requests whose decision surface has not been delivered and is not
+   *  currently being delivered — the rows the Bolt control plane delivers on its timer. A row under
+   *  a live delivery lease (a post in flight, or one whose outcome was ambiguous and kept its
+   *  lease) is skipped until the lease lapses, so a degraded Slack cannot yield a second post per
+   *  pass. Oldest first, bounded per pass; a row whose delivery keeps failing is retried once per
+   *  lease window until its pending TTL reclaims it (bounded by design). */
+  async listUndeliveredBackchannel(limit: number): Promise<ApprovalRow[]> {
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('listUndeliveredBackchannel requires a positive limit');
+    const rows = await this.db.all<any>(
+      `SELECT * FROM approval_request
+       WHERE status='pending' AND binding_message IS NOT NULL AND delivered_at IS NULL
+         AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
+         AND expires_at>${POSTGRES_NOW_US_SQL}
+       ORDER BY created_at LIMIT ?`,
+      [limit],
+    );
+    return rows.map(toRow);
   }
 
   /**
@@ -934,7 +1036,8 @@ export class Approvals {
               row: { ...row, status: 'granted', approvedBy: input.approvedBy, expiresAt },
             } as const;
           }
-          await tx.run(`DELETE FROM approval_request WHERE id=?`, [row.id]);
+          const denied = await this.denyOn(tx, row.id, input.approvedBy);
+          if (!denied) return { status: 'stale' } as const;
           await input.audit.record(
             'denied',
             lockedRequester,
@@ -943,7 +1046,7 @@ export class Approvals {
             input.approvedBy,
             tx,
           );
-          return { status: 'decided', row } as const;
+          return { status: 'decided', row: denied } as const;
         },
       );
       if (fenced.status === 'current') return fenced.value;
@@ -966,8 +1069,9 @@ export class Approvals {
     );
   }
 
-  /** Delete expired rows (unanswered prompts AND unspent grants), returning them so the sweep can
-   *  audit each expiry. Run on the same timer as the connection TTL sweep. */
+  /** Delete expired rows (unanswered prompts, unspent grants, AND retained denials), returning them
+   *  so the sweep can audit each expiry — a denial was already audited at decision time, so the
+   *  sweep skips `denied` rows. Run on the same timer as the connection TTL sweep. */
   async sweepExpired(): Promise<ApprovalRow[]> {
     const rows = await this.db.all<any>(
       `DELETE FROM approval_request WHERE expires_at<${POSTGRES_NOW_US_SQL} RETURNING *`,
