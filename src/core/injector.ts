@@ -1,5 +1,5 @@
 import { canonicalMethod, hasAmbiguousPathEncoding, isLoopbackHost, type Provider } from './providers';
-import type { Vault, StoredCredential } from './vault';
+import { credentialLockKey, type Vault, type StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import type { Db } from './db';
@@ -271,9 +271,6 @@ function outboundInit(init: RequestInit, method: string, headers: Headers, signa
   }
   return out;
 }
-function isIdempotentMethod(method: string): boolean {
-  return IDEMPOTENT_METHODS.has(method);
-}
 
 export class ConnectionHandle {
   constructor(
@@ -356,16 +353,10 @@ export class ConnectionHandle {
     hideInternals(this);
   }
 
-  /** The identity key for this handle's (owner, provider) pair — the single-flight refresh map and
-   *  the rate-limit buckets key on the same fact. */
-  private ownerKey(): string {
-    return `${this.owner.teamId}:${this.owner.kind}:${this.owner.id}:${this.provider.id}`;
-  }
-
   /** Refresh single-flight identity includes the exact row generation. A rotation for generation A
    * can never be shared with a handle bound to replacement B. Called only after bindCredential(). */
   private refreshKey(): string {
-    return `${this.ownerKey()}:${this.credentialId ?? 'unbound'}`;
+    return `${credentialLockKey(this.owner, this.provider.id)}:${this.credentialId ?? 'unbound'}`;
   }
 
   /** Pin an unbound direct/headless handle to the current live connection without decrypting it. */
@@ -646,7 +637,7 @@ export class ConnectionHandle {
     // owner kind from the typed Owner.
     const rl = this.provider.rateLimit;
     if (rl) {
-      const taken = await this.rateLimits.take(this.ownerKey(), 1, rl.perMinute / 60_000, rl.burst ?? rl.perMinute);
+      const taken = await this.rateLimits.take(credentialLockKey(this.owner, this.provider.id), 1, rl.perMinute / 60_000, rl.burst ?? rl.perMinute);
       if (!taken.ok) {
         this.emit({ type: 'rate_limited', provider: this.provider.id, host: url.hostname });
         await this.audit.record('rate_limited', this.acting, this.provider.id, { host: url.hostname, owner: this.owner.kind });
@@ -835,7 +826,7 @@ export class ConnectionHandle {
       // REPLAYED only for an idempotent method. A non-idempotent write (POST/PATCH) that returned 401
       // may already have side-effected upstream; blindly resending it could double-apply. Such a 401
       // is returned to the caller AS-IS (body intact), for the caller to retry if it is safe to.
-      if (refreshed && isIdempotentMethod(method)) {
+      if (refreshed && IDEMPOTENT_METHODS.has(method)) {
         // Drain the discarded 401: undici pins the socket to its unread body until GC otherwise.
         res.body?.cancel().catch(() => undefined);
         res = await send(refreshed);
