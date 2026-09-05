@@ -1392,14 +1392,35 @@ test('two replicas: a changing approval audience cannot replace an active delive
 });
 
 test('ordering: an egress-denied target throws EgressBlockedError and never mints a prompt', async (t) => {
-  const { ctx, ephemerals, auditRows, approvalRows } = await harness(t);
+  const { ctx, vouchr, ephemerals, auditRows, approvalRows } = await harness(t);
+  // Count credential reads across the refused requests. The sibling test above pins this for
+  // *malformed* methods; a well-formed method the provider simply never declared is the case a
+  // model actually produces, and examples/multi-provider-agent leans on it — the model picks the
+  // URL and the method, so the gate has to be what stops it, not the tool schema.
+  //
+  // Note the baseline: connect() itself reads once (existence check), so the property is that a
+  // refused request adds NO read — not that no read has ever happened. Asserting 0 total would be
+  // asserting something untrue about connect().
+  const realGet = vouchr.vault.get.bind(vouchr.vault);
+  let credentialReads = 0;
+  (vouchr.vault as unknown as { get: unknown }).get = (...args: unknown[]) => {
+    credentialReads += 1;
+    return (realGet as (...a: unknown[]) => unknown)(...args);
+  };
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
+    const afterConnect = credentialReads;
     // Host off the allowlist: egress wins.
     await assert.rejects(() => handle.fetch('https://evil.test/x', { method: 'POST' }), EgressBlockedError);
     // Method off egressMethods (GET/POST): egress wins over the approval predicate too.
     await assert.rejects(() => handle.fetch('https://api.acme.test/x', { method: 'DELETE' }), EgressBlockedError);
+    // PATCH: well-formed, plausible, undeclared here — the shape a model emits unprompted.
+    await assert.rejects(() => handle.fetch('https://api.acme.test/x', { method: 'PATCH' }), EgressBlockedError);
     assert.equal(calls.length, 0);
+    assert.equal(
+      credentialReads, afterConnect,
+      'an egress-denied request must be refused without reading the credential',
+    );
     assert.equal(ephemerals.length, 0, 'no approval prompt for an egress-denied request');
     assert.equal((await approvalRows()).length, 0, 'no pending approval row minted');
     assert.ok(!(await auditRows()).some((r) => r.action === 'approval_requested'));
