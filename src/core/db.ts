@@ -57,6 +57,17 @@ export interface DbOptions {
 // Positional rewrite. Our SQL never contains a literal '?', so a plain replace is safe.
 function toPositional(sql: string): string { let i = 0; return sql.replace(/\?/g, () => `$${++i}`); }
 
+/** Take every advisory transaction lock in canonical (sorted, de-duplicated) order with ONE round trip.
+ *  unnest() emits the array elements in order and the lock call runs per emitted row, so the
+ *  canonical order that keeps concurrent multi-key writers deadlock-free is preserved; a loop of
+ *  single-key statements cost one round trip per key on every fenced credential use. */
+async function acquireXactLocks(client: PoolClient, keys: readonly string[]): Promise<void> {
+  await client.query(
+    'SELECT pg_advisory_xact_lock(hashtext(k)) FROM unnest($1::text[]) AS k',
+    [[...new Set(keys)].sort()],
+  );
+}
+
 class PgDb implements Db {
   // Dedicated small pool for token refresh, separate from the read pool, so a hung provider
   // /token endpoint inside a held lock can't starve the connections serving normal requests.
@@ -100,9 +111,7 @@ class PgDb implements Db {
       // Acquire locks BEFORE arming statement_timeout: a loser blocks until the winner COMMITs,
       // which can exceed 8s for a slow /token round-trip. Canonical order prevents two multi-key
       // governance writers from deadlocking while retaining the single-key refresh behavior.
-      for (const key of [...new Set(keys)].sort()) {
-        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]);
-      }
+      await acquireXactLocks(client, keys);
       await client.query("SET LOCAL statement_timeout = '8s'");
       const out = await fn(new PgClientDb(client));
       await client.query('COMMIT');
@@ -157,9 +166,7 @@ class PgClientDb implements Db {
     return this.withRefreshLocks([key], fn);
   }
   async withRefreshLocks<T>(keys: readonly string[], fn: (txDb: Db) => Promise<T>): Promise<T> {
-    for (const key of [...new Set(keys)].sort()) {
-      await this.client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [key]);
-    }
+    await acquireXactLocks(this.client, keys);
     return fn(this);
   }
   async close() { /* lifecycle owned by withRefreshLock (BEGIN/COMMIT/release); nothing to do here */ }

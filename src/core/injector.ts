@@ -380,12 +380,13 @@ export class ConnectionHandle {
 
   /** Pin an unbound direct/headless handle to the current live connection without decrypting it. */
   private async bindCredential(): Promise<string> {
+    // Already pinned by the adapter (Bolt/broker): the exact-row vault read enforces generation +
+    // TTL, and exactCredentialMissingError() re-reads liveId only on that failure path, so another
+    // liveId round trip here decides nothing the read below doesn't.
+    if (this.credentialId !== undefined) return this.credentialId;
     const id = await this.vault.liveId(this.owner, this.provider.id);
     if (!id) {
       throw new NoConnectionError(`No connection for provider "${this.provider.id}"`, this.owner.kind);
-    }
-    if (this.credentialId !== undefined && id !== this.credentialId) {
-      throw new InteractionStateChangedError('connection', 'credential');
     }
     this.credentialId = id;
     return id;
@@ -857,14 +858,17 @@ export class ConnectionHandle {
     // Mark the connection used (resets its idle TTL) and audit AS THE ACTING HUMAN, never the secret.
     // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
     // failed fetch (the caller might retry a non-idempotent request).
-    await this.vault.touch(this.owner, this.provider.id, credentialId).catch(() => undefined);
     // Attribute the injection to the channel it happened in (origin channel, or the owning channel for a
     // channel-owned cred). Powers per-channel usage analytics across ALL modes, not just shared.
     const ch = this.auditChannel();
     const channelMeta = ch ? { channel: ch } : {};
-    await this.audit
-      .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta })
-      .catch(() => undefined);
+    // Independent writes: overlap the two round trips instead of paying them back to back.
+    await Promise.all([
+      this.vault.touch(this.owner, this.provider.id, credentialId).catch(() => undefined),
+      this.audit
+        .record('inject', this.acting, this.provider.id, { host: url.hostname, method, status: res.status, ...channelMeta })
+        .catch(() => undefined),
+    ]);
     // No-secret observability: provider/host/status/ownerKind only, never the token or the actor.
     this.emit({ type: 'injected', provider: this.provider.id, host: url.hostname, status: res.status, ownerKind: this.owner.kind, ms: fetchMs });
     // Audit stream copy (raw actor id, for host-side ingestion). Lossy; the audit table is authoritative.

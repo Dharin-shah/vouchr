@@ -1442,7 +1442,7 @@ test('cross-pool reconnect after session grant check cannot make connect adopt t
   const releaseP = new Promise<void>((resolve) => { release = resolve; });
   const db: Db = {
     get: async (sql, params) => {
-      if (blockExactRead && /SELECT \* FROM connection/.test(sql) && /AND id=\?/.test(sql)) {
+      if (blockExactRead && /FROM connection\s+WHERE/.test(sql) && /AND id=\?/.test(sql)) {
         reached();
         await releaseP;
       }
