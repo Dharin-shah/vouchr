@@ -68,7 +68,7 @@ export async function rekey(db: Db, keys: MasterKeys, opts: RekeyOptions = {}): 
   for (const { table, cols } of TARGETS) {
     const total = ((await db.get<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`))?.n ?? 0) as number;
     let done = 0;
-    let lastId = ''; // TEXT primary keys ('' sorts before every real id in both engines)
+    let lastId = ''; // TEXT primary keys ('' sorts before every real id)
     for (;;) {
       const rows = await db.all<any>(
         `SELECT id, ${cols.join(', ')} FROM ${table} WHERE id > ? ORDER BY id LIMIT ?`,
