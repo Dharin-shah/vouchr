@@ -106,7 +106,7 @@ The error carries a `promptState`:
 | `promptState` | Meaning |
 | --- | --- |
 | `'posted'` | A fresh prompt was just posted. |
-| `'reused'` | A still-live prompt from moments ago was reused rather than re-posted. An in-channel prompt is an ephemeral, so it may no longer be visible. |
+| `'reused'` | A still-live prompt from moments ago was reused rather than re-posted. An in-channel prompt is an ephemeral, so it may no longer be visible; a re-ask 30 seconds or more after the last delivery re-posts it. An off-channel DM prompt is durable and is never re-posted. |
 
 Branch on the error class or its `code`, **never on message text** — `mapSafeError` copy differs by
 state and is not a stable contract.
