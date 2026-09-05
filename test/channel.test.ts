@@ -24,7 +24,7 @@ const provider = defineProvider({
 // `convo` shapes the mocked conversations.info: a class object (default normal), or a thrower.
 async function ctx(
   t: TestContext,
-  isAdmin: boolean,
+  member: boolean,
   channel: string | null = 'C_FIN',
   convo: any = {},
   policy = new Policy(),
@@ -39,12 +39,12 @@ async function ctx(
     failModeWrite ? async () => { throw new Error('mode unavailable'); } : undefined,
   );
   const client = {
-    users: { info: async () => ({ user: { is_admin: isAdmin } }) },
     conversations: {
       info: async () => {
         if (convo === 'throw') throw new Error('channel_not_found');
         return { channel: { id: 'C_FIN', is_channel: true, ...convo } };
       },
+      members: async () => ({ members: member ? [ID.userId] : [] }),
     },
   } as any;
   const freshContext = () => new ConnectContext({
@@ -58,10 +58,10 @@ async function ctx(
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
 const connCount = async (db: any) => ((await db.get('SELECT COUNT(*) n FROM connection')) as any).n;
 
-// T6: non-admin denied+audited; admin allowed+audited; overwrite is atomic.
-test('T6 setChannelSecret: admin-gated, audited, atomic overwrite', async (t) => {
+// T6: non-member denied+audited; member allowed+audited; overwrite is atomic.
+test('T6 setChannelSecret: member-gated, audited, atomic overwrite', async (t) => {
   const deny = await ctx(t, false);
-  await assert.rejects(() => deny.c.setChannelSecret('mcp', SECRET), /admin/);
+  await assert.rejects(() => deny.c.setChannelSecret('mcp', SECRET), /member of this channel/);
   assert.equal(await deny.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null); // nothing stored
   assert.deepEqual((await auditRows(deny.db)).map((r) => r.action), ['denied']);
 
@@ -81,7 +81,7 @@ test('T7 setChannelSecret: secret never leaks to audit/return/error', async (t) 
   assert.equal(ret, undefined); // method returns nothing
   for (const r of await auditRows(ok.db)) assert.ok(!r.meta.includes(SECRET), 'secret in audit meta');
 
-  // Non-admin path's error must not echo the secret either.
+  // Non-member path's error must not echo the secret either.
   let msg = '';
   try {
     await (await ctx(t, false)).c.setChannelSecret('mcp', SECRET);

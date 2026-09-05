@@ -44,9 +44,9 @@ app.event('app_mention', async ({ context, event, client, say }) => {
 });
 ```
 
-Channels are deny-by-default. Before first use in a channel, an admin runs `/vouchr enable github`.
-Direct messages need no enable. `connect()` then prompts the user privately. After one browser
-OAuth, the agent works.
+Channels are deny-by-default. Before first use in a channel, a member of that channel runs
+`/vouchr enable github`. Direct messages need no enable. `connect()` then prompts the user
+privately. After one browser OAuth, the agent works.
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
@@ -64,7 +64,24 @@ Each channel picks how a provider is authorized. Your handler code does not chan
 | --- | --- | --- |
 | `per-user` | Each person uses their own connected account. | GitHub, Google, Jira |
 | `session` | Usable only inside the approving thread, for a limited time. | Sensitive writes |
-| `shared` | The channel uses one admin-configured credential. | Team tools, internal APIs |
+| `shared` | The channel uses one credential a channel member configures. | Team tools, internal APIs |
+
+## Human approval from any agent
+
+An agent can do most of a task on its own and stop at each sensitive step. The team decides
+those steps. Mark a provider's sensitive actions with the `approval` knob, for example
+`github({ approval: { approver: 'member', methods: ['POST', 'PUT'] } })`. When the agent reaches
+one, Vouchr posts a prompt in the channel that owns the credential. It shows who asked, the
+provider, the method, and the host. Any other member of that channel clicks Approve or Deny. On
+approval the agent runs exactly that action, once. Then it asks again for the next sensitive step.
+
+For example, an agent drafts a release and reviews the changes on its own. It pauses to publish the
+release and to merge the pull request. The team approves each in Slack. The agent finishes.
+
+`approver: 'self'` asks the person driving the agent instead. In a direct message there is no
+team, so `member` behaves like `self`. This also works for agents outside Slack. They call the
+broker, and the same prompt lands in the same channel. See the
+[headless guide](./guides/HEADLESS.md#human-in-the-loop-approvals-113).
 
 ## Providers
 

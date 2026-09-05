@@ -238,7 +238,7 @@ export function mapSafeError(error: unknown): VouchrSafeError {
     if (error instanceof PolicyDeniedError) {
       return {
         code: 'policy_denied',
-        message: 'Provider policy denies this request. Contact an eligible admin.',
+        message: 'Provider policy denies this request. Contact the Vouchr operator.',
         retryable: false,
         recovery: 'contact_admin',
       };
@@ -246,7 +246,7 @@ export function mapSafeError(error: unknown): VouchrSafeError {
     if (error instanceof ToolDisabledError) {
       return {
         code: 'tool_disabled',
-        message: 'This provider is disabled in the channel. Contact an eligible admin.',
+        message: 'This provider is disabled in the channel. Any member can run `/vouchr enable` there.',
         retryable: false,
         recovery: 'contact_admin',
       };
@@ -256,7 +256,7 @@ export function mapSafeError(error: unknown): VouchrSafeError {
       return {
         code: 'not_connected',
         message: channelOwned
-          ? 'No shared channel credential is configured. Ask an eligible admin to configure it.'
+          ? 'No shared channel credential is configured. Any member can run `/vouchr connect-shared` there.'
           : 'No credential is connected. Connect the provider, then retry.',
         retryable: false,
         recovery: channelOwned ? 'fix_configuration' : 'connect',

@@ -35,7 +35,7 @@ Of particular interest:
   persisted or cached.
 - **Tenant / owner isolation**: any query or code path that lets one `(team, owner_kind,
   owner_id, provider)` read or overwrite another's credential.
-- **Authorization**: bypassing the admin gate on channel-credential configuration, or using
+- **Authorization**: bypassing the channel-member gate on channel-credential configuration, or using
   a channel credential without proven authorization for that channel.
 - **OAuth flow**: `state` reuse/fixation, PKCE downgrade, or open-redirect / egress-allowlist
   bypass at the injection boundary.
@@ -155,12 +155,12 @@ Vouchr is self-hosted; some of the security posture is yours to own:
   credential tables away from every other workload: encryption keeps the token bytes confidential,
   but deciding which owner row a stored blob belongs to is a separate property (threat model →
   ["Database writer"](./guides/THREAT-MODEL.md#database-writer)).
-- Understand the admin gate's trust boundary: channel-credential configuration is gated on
-  Slack **workspace** admin/owner status (`users.info` `is_admin`/`is_owner`), which is
-  workspace-wide, not channel-membership-scoped. By design, a workspace admin can configure a
-  shared credential for a channel they are not a member of. On the headless broker there is no Slack
-  client: admin authority is the **signed `isAdmin` claim**, so your minter makes that determination
-  and Vouchr enforces it fail-closed.
+- Understand the member gate's trust boundary: the channel is the team. Channel-credential
+  configuration and `member` approvals are gated on **current membership of that channel**
+  (`conversations.members`, fail-closed), so govern agents from channels whose membership you
+  control; in a public channel every member can configure and approve. On the headless broker there
+  is no Slack client: the signed channel claim is that authority, so your minter asserts only the
+  channel the verified Slack event came from.
 - Treat the headless `identitySecret` as a trust root of the same rank as the master key. It belongs
   only in the trusted Slack-facing minter and the broker replicas — never in an agent worker or any
   process running model or tool code, which is the deployment mistake that turns one prompt injection

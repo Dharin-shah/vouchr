@@ -1,6 +1,6 @@
 import type { AuditRow, StatsRow } from '../core/audit';
 import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
-import { isBrokeredProvider } from '../core/providers';
+import { isBrokeredProvider, type Approver } from '../core/providers';
 import { SECRET_REFERENCE_SOURCES, type SecretReferenceSource } from '../core/reference';
 import type { VouchrRecovery } from '../core/errors';
 import type { AttributedOAuthCallbackOutcome } from '../core/oauthCallback';
@@ -442,7 +442,7 @@ export function approvalBlocks(o: {
   queryParamCount: number | null;
   requester: string;
   id: string;
-  approver: 'self' | 'admin';
+  approver: Approver;
   /** #296: the agent's plain transaction statement for a backchannel request; absent (null) for an
    * in-process/fetch-minted approval. Host-supplied free text — rendered as `plain_text`, never
    * interpolated into mrkdwn (SEC-5 by construction). */
@@ -460,8 +460,8 @@ export function approvalBlocks(o: {
   const bound = n !== 0
     ? ' The exact query string is bound byte-for-byte (its parameters are not displayed); any change re-prompts.'
     : '';
-  const intro = o.approver === 'admin'
-    ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`
+  const intro = o.approver === 'member'
+    ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. Another member of this channel must approve it.`
     : `The agent wants to run an action as you on ${p}.`;
   return [
     {

@@ -19,6 +19,7 @@ import {
   type ApprovalKey,
   type Approvals,
   MAX_APPROVAL_PATH_BYTES,
+  effectiveApprover,
 } from './approval';
 import { randomUUID } from 'node:crypto';
 import {
@@ -797,7 +798,7 @@ export class ConnectionHandle {
         // query is bound via the digest in the key above.
         throw new ApprovalRequiredError(
           this.provider.id,
-          ap.approver,
+          effectiveApprover(ap.approver, key.governableChannel),
           method,
           url.hostname,
           approvalActionFingerprint(key),

@@ -73,17 +73,20 @@ test('statsByChannel attributes REAL per-user usage to the origin channel (the P
   assert.equal(rows[0].distinctActors, 1);
 });
 
-async function harness(t: TestContext, opts: { isAdmin?: boolean } = {}) {
+async function harness(t: TestContext, opts: { member?: boolean } = {}) {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [mk('github'), mk('gitlab'), mk('idle')], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t),
-    ...(opts.isAdmin !== undefined ? { isAdmin: async () => opts.isAdmin! } : {}),
   });
   let handler: any;
   lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
   const audit = new Audit(lan.db);
-  const client = { users: { info: async () => ({ user: { is_admin: false } }) },
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_X' } }) } };
+  const client = {
+    conversations: {
+      info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_X' } }),
+      members: async () => ({ members: opts.member ? ['U_A'] : ['U_SOMEONE_ELSE'] }),
+    },
+  };
   const run = async (text: string) => {
     const out: any[] = [];
     await handler({ command: { team_id: 'T1', user_id: 'U_A', channel_id: 'C_FIN', trigger_id: 't', text },
@@ -93,8 +96,8 @@ async function harness(t: TestContext, opts: { isAdmin?: boolean } = {}) {
   return { lan, audit, run };
 }
 
-test('/vouchr stats (admin): shows used providers with counts and flags an enabled-but-idle tool', async (t) => {
-  const { lan, audit, run } = await harness(t, { isAdmin: true });
+test('/vouchr stats (member): shows used providers with counts and flags an enabled-but-idle tool', async (t) => {
+  const { lan, audit, run } = await harness(t, { member: true });
   const tools = new ChannelTools(lan.db);
   for (const p of ['github', 'gitlab', 'idle']) await setChannelToolEnabled(tools, 'T1', 'C_FIN', p, true);
   // github used by 2 people, gitlab by 1; 'idle' is enabled but never used.
@@ -113,9 +116,9 @@ test('/vouchr stats (admin): shows used providers with counts and flags an enabl
   assert.match(response.text, /disable <provider>/);
 });
 
-test('/vouchr stats: a non-admin is refused via the admin gate and the denial is audited', async (t) => {
-  const { audit, run } = await harness(t); // no isAdmin override; users.info is_admin=false, not creator
-  assert.match(String(await run('stats')), /Only a workspace admin/);
+test('/vouchr stats: a non-member is refused via the member gate and the denial is audited', async (t) => {
+  const { audit, run } = await harness(t); // conversations.members does not list U_A
+  assert.match(String(await run('stats')), /Only a current member of this channel/);
   const rows = await audit.listByChannel('T1', 'C_FIN', 20);
   assert.ok(rows.some((r) => r.action === 'denied' && r.provider === 'stats'));
 });

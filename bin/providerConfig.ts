@@ -20,7 +20,7 @@ const ALLOWED = new Set([
   'publicClient', 'authorizeParams', 'tokenAuth', 'bodyFormat', 'revokeUrl', 'revokeAuth', 'revokeTarget',
   'oauthTimeoutMs', // #209 shared token exchange/refresh, revoke, and built-in probe deadline
   'mcp', // #65 /v1/mcp opt-in: { paths: string[], allowContentTypes?: string[] }
-  'approval', // #113 human-in-the-loop approval: { methods?, paths?, approver: 'self'|'admin', ttlMs? }
+  'approval', // #113 human-in-the-loop approval: { methods?, paths?, approver: 'self'|'member', ttlMs? }
 ]);
 
 function toProvider(entry: any, env: NodeJS.ProcessEnv): Provider {

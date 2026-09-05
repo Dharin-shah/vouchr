@@ -30,7 +30,6 @@ test('#194 identity minter round-trips the signed enterprise offboard target', (
   const claims = verifyIdentity(mintIdentity({
     ...who,
     enterpriseId: 'E1',
-    isAdmin: true,
     offboardTargetUserId: 'U_TARGET',
   }, cfg(), 60_000, now), cfg(), { now });
   assert.equal(claims.offboardTargetUserId, 'U_TARGET');

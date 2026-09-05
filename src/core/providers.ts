@@ -9,6 +9,12 @@ import { MAX_TIMER_MS } from './options';
 export type RefreshStrategy = 'rotating' | 'static' | 'none';
 export type RevokeTarget = 'access' | 'refresh' | 'both' | 'grant';
 
+/** Who may decide a #113 approval: the acting user, or any other current member of the owning
+ * channel (#322). The one source for the enum: the provider validator, the core approval store, the
+ * Bolt renderer/handlers, and the declarative config all import it. */
+export const APPROVERS = ['self', 'member'] as const;
+export type Approver = (typeof APPROVERS)[number];
+
 /** A provider is declarative OAuth2 + a refresh strategy + an egress allowlist. */
 export interface Provider {
   id: string;
@@ -95,11 +101,12 @@ export interface Provider {
    *    but GET/HEAD) — see `approvalNeeded` in the injector, the one place that default lives.
    *  - `paths`: narrow the requirement to these paths (same matcher semantics as `egressPaths`).
    *    Default: every path.
-   *  - `approver`: REQUIRED — 'self' (the acting user confirms their own action) or 'admin' (an
-   *    eligible channel admin confirms; same gate as the channel-config commands).
+   *  - `approver`: REQUIRED — 'self' (the acting user confirms their own action) or 'member' (any
+   *    OTHER current member of the owning channel confirms, #322; in a DM/group DM, where no channel
+   *    governs the action, `member` degrades to `self` — see `effectiveApprover`).
    *  - `ttlMs`: how long a granted approval stays spendable. Default 5 minutes.
    */
-  approval?: { methods?: string[]; paths?: string[]; approver: 'self' | 'admin'; ttlMs?: number };
+  approval?: { methods?: string[]; paths?: string[]; approver: Approver; ttlMs?: number };
   /**
    * How the secret is attached to the outbound request. Mutate `headers` in place.
    * Default (unset): `Authorization: Bearer <secret>`. Use for non-Bearer APIs/MCPs,
@@ -749,7 +756,9 @@ export function defineProvider(spec: Provider): Provider {
   if (spec.approval !== undefined) {
     if (!isPlainRecord(spec.approval)) providerError('approval', 'must be an object');
     assertKnownKeys(spec.approval, ['methods', 'paths', 'approver', 'ttlMs'], 'approval');
-    if (spec.approval.approver !== 'self' && spec.approval.approver !== 'admin') providerError('approval.approver', 'has an unsupported value');
+    // Declarative config is raw JSON, so the removed value is compared as unknown (#322).
+    if ((spec.approval.approver as unknown) === 'admin') providerError('approval.approver', "'admin' was removed: workspace admins are not a Vouchr role. Use 'member' (any other member of the owning channel) or 'self'");
+    if (!(APPROVERS as readonly unknown[]).includes(spec.approval.approver)) providerError('approval.approver', 'has an unsupported value');
     const methods = canonicalMethods(spec.approval.methods, 'approval.methods');
     const paths = canonicalPaths(spec.approval.paths, 'approval.paths');
     const ttlMs = spec.approval.ttlMs;

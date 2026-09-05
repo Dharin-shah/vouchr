@@ -69,11 +69,12 @@ Vouchr supports three modes:
 | --- | --- |
 | `per-user` | Each person uses their own connected account. This is the default. |
 | `session` | A person's credential is usable only in the approved Slack thread for a bounded time. |
-| `shared` | A workspace administrator configures one channel-owned service credential. |
+| `shared` | A member of the channel configures one channel-owned service credential. |
 
 `shared` is for an intentional service account, not for silently borrowing another person's
-account. It remains admin-gated, attributable to the triggering human, and unavailable where the
-channel trust boundary is unsafe.
+account. It remains gated on current channel membership (the channel is the team and the trust
+boundary), attributable to the triggering human, and unavailable where the channel trust boundary
+is unsafe.
 
 ### Providers
 
@@ -231,7 +232,7 @@ parallel when it does not create conflicting foundations.
   outcomes, and private Bolt recovery. The trusted broker-to-Slack recovery bridge is complete:
   `context.vouchr.recoverBrokerDenial` maps the stable broker denials (`not_connected`,
   `session_approval_required`, `approval_required`) to the correct private connect/key, thread
-  session, or self/admin approval surface from verified Slack state, with a two-process
+  session, or self/member approval surface from verified Slack state, with a two-process
   Bolt + packaged-broker integration proof over one PostgreSQL database.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility

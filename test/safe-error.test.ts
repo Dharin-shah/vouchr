@@ -676,8 +676,7 @@ test('modal reference submits share the core validator and reject whitespace bef
   });
   const outcomes: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: { update: async ({ view }: any) => { outcomes.push(view); } },
     chat: { postMessage: async () => ({}) },
   };
@@ -739,8 +738,7 @@ test('channel modal received before break-glass cannot save after a stalled ackn
   const resumeAck = new Promise<void>((resolve) => { releaseAck = resolve; });
   const outcomes: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: { update: async ({ view }: any) => { outcomes.push(view); } },
     chat: { postMessage: async () => ({}) },
   };
@@ -788,8 +786,7 @@ test('channel modal opened before break-glass cannot recreate authority afterwar
   let hydrated: any;
   const updates: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: {
       open: async (value: any) => {
         opened = value;
@@ -834,8 +831,7 @@ test('channel credential modal consumes one request and a duplicate submit canno
   let hydrated: any;
   const receipts: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: {
       open: async () => ({ view: { id: 'V_LOADING' } }),
       update: async ({ view }: any) => {
@@ -881,8 +877,10 @@ test('channel setup open rejection performs no gates or ticket write and reports
   let channelReads = 0;
   const dms: string[] = [];
   const client = {
-    users: { info: async () => { userReads++; return { user: { is_admin: true } }; } },
-    conversations: { info: async () => { channelReads++; return { channel: { id: 'C1' } }; } },
+    conversations: {
+      info: async () => { channelReads++; return { channel: { id: 'C1' } }; },
+      members: async () => { userReads++; return { members: ['U1'] }; },
+    },
     views: { open: async () => { throw new Error('accepted_then_disconnected'); } },
     chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } },
   };
@@ -912,8 +910,7 @@ test('a channel mutation while the loading view opens fences the older setup rec
   let hydrated = false;
   const updates: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: {
       open: async () => {
         openStarted();
@@ -961,15 +958,15 @@ test('channel setup opens its loading view before slow gates and preserves the o
   let hydrated = false;
   const updates: any[] = [];
   const client = {
-    users: {
-      info: async () => {
-        order.push('admin');
+    conversations: {
+      info: async () => ({ channel: { id: 'C1', is_channel: true } }),
+      members: async () => {
+        order.push('member');
         gateStarted();
         await resumeGate;
-        return { user: { is_admin: true } };
+        return { members: ['U1'] };
       },
     },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
     views: {
       open: async () => {
         order.push('open');
@@ -984,7 +981,7 @@ test('channel setup opens its loading view before slow gates and preserves the o
   };
   const opening = surface.open(client);
   await atGate;
-  assert.deepEqual(order, ['open', 'admin']);
+  assert.deepEqual(order, ['open', 'member']);
   await purgePendingForProvider(
     db,
     { provider: 'acme', teamId: 'T1', channel: 'C1' },
@@ -998,7 +995,7 @@ test('channel setup opens its loading view before slow gates and preserves the o
   assert.equal((await db.get<any>('SELECT COUNT(*)::int AS n FROM channel_provisioning_request')).n, 0);
 });
 
-test('channel setup reserves before slow admin checks so a sibling write invalidates it', async (t) => {
+test('channel setup reserves before slow membership checks so a sibling write invalidates it', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const db = await openTestDb(t);
   const vouchr = await createVouchr({
@@ -1012,14 +1009,14 @@ test('channel setup reserves before slow admin checks so a sibling write invalid
   let hydrated = false;
   const updates: any[] = [];
   const client = {
-    users: {
-      info: async () => {
+    conversations: {
+      info: async () => ({ channel: { id: 'C1', is_channel: true } }),
+      members: async () => {
         gateStarted();
         await resumeGate;
-        return { user: { is_admin: true } };
+        return { members: ['U1'] };
       },
     },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
     views: {
       open: async () => ({ view: { id: 'V_LOADING' } }),
       update: async ({ view }: any) => {
@@ -1062,8 +1059,7 @@ test('a refused concurrent opener cannot invalidate an already-hydrated setup fo
   const surface = channelSetupSurface(vouchr);
   let firstForm: any;
   const firstClient = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: {
       open: async () => ({ view: { id: 'V_FIRST' } }),
       update: async ({ view }: any) => {
@@ -1077,8 +1073,10 @@ test('a refused concurrent opener cannot invalidate an already-hydrated setup fo
 
   const secondOutcomes: any[] = [];
   const secondClient = {
-    users: { info: async () => ({ user: { is_admin: false } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: {
+      info: async () => ({ channel: { id: 'C1', is_channel: true } }),
+      members: async () => ({ members: ['U_SOMEONE_ELSE'] }),
+    },
     views: {
       open: async () => ({ view: { id: 'V_SECOND' } }),
       update: async ({ view }: any) => { secondOutcomes.push(view); },
@@ -1109,8 +1107,7 @@ test('channel setup request, credential, and config audit roll back together on 
   let hydrated: any;
   const outcomes: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }) },
+    conversations: { info: async () => ({ channel: { id: 'C1', is_channel: true } }), members: async () => ({ members: ['U1'] }) },
     views: {
       open: async () => ({ view: { id: 'V_LOADING' } }),
       update: async ({ view }: any) => {
@@ -1147,10 +1144,10 @@ test('channel setup request, credential, and config audit roll back together on 
   assert.match(JSON.stringify(outcomes), /Credential saved/);
 });
 
-// Regression (#97 issue #132): the deliberate admin-denial for `/vouchr mode` is thrown as a plain
+// Regression (#97 issue #132): the deliberate member-denial for `/vouchr mode` is thrown as a plain
 // refusal, NOT one of the 4 whitelisted classes. It must still reach the user verbatim — before the
 // UserFacingError marker it collapsed to "Something went wrong (Error)...".
-test('command: a non-admin /vouchr mode gets the real admin-denied message, not the generic mask', async (t) => {
+test('command: a non-member /vouchr mode gets the real member-denied message, not the generic mask', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   let cmd: any;
@@ -1159,13 +1156,16 @@ test('command: a non-admin /vouchr mode gets the real admin-denied message, not 
     view: () => undefined,
     action: () => undefined,
   });
-  const nonAdmin = { users: { info: async () => ({ user: { is_admin: false, is_owner: false } }) } };
+  const nonMember = { conversations: { members: async () => ({ members: ['U_SOMEONE_ELSE'] }) } };
   let said = '';
   await cmd({
     command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'mode acme per-user', trigger_id: 'x' },
-    ack: async () => {}, respond: async (m: any) => { said = m; }, client: nonAdmin,
+    ack: async () => {}, respond: async (m: any) => { said = m; }, client: nonMember,
   });
-  assert.equal(said, 'Only a workspace admin can configure channel credentials.');
+  assert.equal(
+    said,
+    'Only a current member of this channel can configure channel credentials. If you are one, make sure Vouchr is in the channel and try again.',
+  );
 });
 
 // Regression: a mode-locked channel rejecting a STATIC key after Slack has acknowledged the modal.
@@ -1182,8 +1182,7 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
   // Admin + a normal (eligible) channel: both mutations pass the admin gate + eligibility check.
   const dms: string[] = [];
   const admin = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
-    conversations: { info: async () => ({ channel: {} }) },
+    conversations: { info: async () => ({ channel: {} }), members: async () => ({ members: ['U1'] }) },
     chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } },
   };
   // 1) Admin locks the channel to per-user.

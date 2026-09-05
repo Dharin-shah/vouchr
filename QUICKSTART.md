@@ -203,9 +203,9 @@ If Slack asks you to reinstall the app afterwards, do it — the bot token doesn
 In your Slack workspace, `#demo` channel:
 
 1. **Invite the bot to the channel** once: `/invite @vouchr`.
-2. **Enable GitHub in the channel** once — channels are deny-by-default: a channel admin runs
+2. **Enable GitHub in the channel** once — channels are deny-by-default: any member of the channel runs
    `/vouchr enable github` in `#demo`. Without it the first mention gets a private *"This provider is
-   disabled in the channel. Contact an eligible admin."* A direct message needs no enable — DMs are personal, not governed.
+   disabled in the channel. Any member can run `/vouchr enable` there."* A direct message needs no enable — DMs are personal, not governed.
 3. **Mention it:** `@vouchr who am I on github?` (any text works — the mention is the trigger).
    → Vouchr posts a **private** *"Connect your GitHub account"* message with a **Connect** button.
    *Narrate: only you can see this — it's an ephemeral, not a channel post.*

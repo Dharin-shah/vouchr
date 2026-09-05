@@ -153,7 +153,6 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
   const ephemerals: any[] = [];
   const dms: any[] = [];
   const client = {
-    users: { info: async ({ user }: any) => ({ user: { is_admin: user === 'U1' } }) },
     conversations: {
       info: async ({ channel }: any) => ({ channel: { id: channel, is_channel: true, creator: 'U1' } }),
       members: async () => ({ members: ['U1'] }),

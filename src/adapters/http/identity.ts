@@ -33,18 +33,12 @@ export interface IdentityClaims {
   aud?: string;
   iat?: number;
   kid?: string;
-  /**
-   * Admin authority for admin-gated routes (#54 `/v1/admin/*`). The broker cannot verify workspace
-   * admin itself (no Slack client), so the trusted caller sets this AFTER its own admin check and
-   * SIGNS it. The broker fails closed: an admin route with this absent/false is refused. A forged
-   * request body can never assert it.
-   */
-  isAdmin?: boolean;
-  /** Enterprise/global lifecycle mutations bind their subject into the signed assertion. An admin
-   * body may repeat this value for routing, but cannot nominate a foreign user after minting. */
+  /** `POST /v1/admin/offboard` binds its subject into the signed assertion (#54, #322): the trusted
+   * deprovision hook signs exactly who is being removed, so a body can repeat the value for routing
+   * but can never nominate a different user after minting. Required on that route. */
   offboardTargetUserId?: string;
   /**
-   * Enterprise/org id (#54). When present on an admin offboard, the removal spans EVERY workspace the
+   * Enterprise/org id (#54). When present on an offboard, the removal spans EVERY workspace the
    * target touches (Enterprise Grid / SCIM deprovision) via offboardUserEverywhere. Signed.
    */
   enterpriseId?: string;
@@ -68,7 +62,7 @@ export interface IdentityClaims {
    * guessing from the id: an MPIM 'G…' id is indistinguishable from a private channel without it.
    * Absent → the broker falls back to the id heuristic (a 1:1 DM 'D…' is still exempt; a group DM
    * with no type stays governed). Static Policy always evaluates against the raw `channel`, so this
-   * only widens/narrows the admin-mutable allowlist scope, never the deployment policy.
+   * only widens/narrows the member-mutable allowlist scope, never the deployment policy.
    */
   channelType?: SlackConversationType;
 }
@@ -403,15 +397,14 @@ export function signIdentity(claims: IdentityClaims, secret: string): string {
 }
 
 /** The acting-human fields a caller supplies per request; the minter fills `jti` and `exp` safely.
- *  The admin/lifecycle (#54) and channel-fact (#51) fields are optional and default to a non-admin,
- *  single-workspace, user-owned request when omitted. */
+ *  The lifecycle (#54) and channel-fact (#51) fields are optional and default to a single-workspace,
+ *  user-owned request when omitted. */
 export type MintIdentityInput = Pick<
   IdentityClaims,
   | 'teamId'
   | 'userId'
   | 'channel'
   | 'threadTs'
-  | 'isAdmin'
   | 'offboardTargetUserId'
   | 'enterpriseId'
   | 'ownerKind'
@@ -428,10 +421,11 @@ export type MintIdentityInput = Pick<
  * Call it in the TRUSTED MINTER — the Slack-facing service that verified the Slack event signature
  * and holds the signing key — NOT in the agent worker that makes the broker call. Send the returned
  * string to the worker, which puts it in the /v1/fetch body as `identityToken`. The signing secret
- * is the broker's trust root and its ONLY source of identity, `isAdmin`, and channel eligibility:
- * any process that can sign can assert any user, including `isAdmin: true`, and can therefore USE
- * every credential the deployment serves (no route returns token bytes, but the provider's response
- * does come back). Keep it in the minter and the broker only — never in a worker, a model, or a
+ * is the broker's trust root and its ONLY source of identity, channel, and channel eligibility: any
+ * process that can sign can assert any user in any channel (the channel is the trust boundary, #322,
+ * so that includes configuring it), and can therefore USE every credential the deployment serves (no
+ * route returns token bytes, but the provider's response does come back). Keep it in the minter and
+ * the broker only — never in a worker, a model, or a
  * tool surface. Mint per request; do not cache or reuse a token across calls.
  */
 export function mintIdentity(input: MintIdentityInput, key: string | IdentityConfig, ttlMs = 60_000, now = Date.now()): string {
@@ -451,7 +445,6 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
     userId: input.userId,
     channel: input.channel,
     ...(input.threadTs !== undefined ? { threadTs: input.threadTs } : {}),
-    ...(input.isAdmin !== undefined ? { isAdmin: input.isAdmin } : {}),
     ...(input.offboardTargetUserId !== undefined
       ? { offboardTargetUserId: input.offboardTargetUserId }
       : {}),
@@ -512,9 +505,7 @@ function isClaims(v: unknown): v is IdentityClaims {
     (c.aud === undefined || typeof c.aud === 'string') &&
     (c.iat === undefined || typeof c.iat === 'number') &&
     (c.kid === undefined || typeof c.kid === 'string') &&
-    // Admin/lifecycle claims (#54): reject a wrong-typed value rather than coercing — a malformed
-    // signed isAdmin fails closed (it can't slip through as true).
-    (c.isAdmin === undefined || typeof c.isAdmin === 'boolean') &&
+    // Lifecycle claims (#54): reject a wrong-typed value rather than coercing it.
     (c.offboardTargetUserId === undefined || typeof c.offboardTargetUserId === 'string') &&
     (c.enterpriseId === undefined || typeof c.enterpriseId === 'string') &&
     // Channel-fact claims (#51): reject a wrong-typed value rather than coercing it — a malformed

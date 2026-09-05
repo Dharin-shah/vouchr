@@ -84,9 +84,9 @@ verification failure on the broker is an `IdentityError` (401; the message carri
 
 > [!WARNING]
 > **The signing key stays in that Slack-facing service — never in the worker.** It is the broker's
-> trust root: the broker has no Slack client, so identity, the `isAdmin` claim, and channel
-> eligibility have no second source. Anything that can sign mints `{ userId: <any human>, isAdmin:
-> true }` and can use every credential the deployment serves. Minting inside the agent runtime
+> trust root: the broker has no Slack client, so identity, the acting channel, and channel
+> eligibility have no second source. Anything that can sign mints `{ userId: <any human>, channel:
+> <any channel> }` and can use every credential the deployment serves. Minting inside the agent runtime
 > collapses the trust boundary — one prompt injection that reads the process environment owns the
 > workspace. Give the worker the minted `identityToken` only. The reference example
 > ([`examples/broker-client/client.ts`](../examples/broker-client/client.ts)) marks its single-process
@@ -144,7 +144,7 @@ automatic replay of an uncertain or non-idempotent write.
 | `ApprovalPathTooLongError` | `approval_path_too_large` | `fix_configuration` | The approval endpoint exceeds the bounded exact-action path; narrow it before retrying. |
 | `InteractionStateChangedError` | `interaction_state_changed` | `resolve_again` | The credential generation or current authorization changed; discard the stale handle and resolve current access before retrying. |
 | `PolicyDeniedError` | `policy_denied` | `contact_admin` | Provider/channel policy denied the request; retrying cannot change governance. |
-| `ToolDisabledError` | `tool_disabled` | `contact_admin` | The channel allowlist disabled the provider; an eligible admin must change it. |
+| `ToolDisabledError` | `tool_disabled` | `contact_admin` | The channel allowlist disabled the provider; a member of the channel must enable it. |
 | `NoConnectionError` | `not_connected` | `connect` for user credentials; `fix_configuration` for shared channel credentials | No usable credential exists for the resolved owner. |
 | `EgressBlockedError` | `egress_blocked` | `fix_configuration` | Host/path/method/validator policy refused the request before credential use. |
 | `ResponseBlockedError` | `response_blocked` | `fix_configuration` | Provider response policy withheld the response. |
@@ -169,9 +169,9 @@ only `{ "ok": false }`). Failures a worker should handle explicitly include:
 | `403` | `{ "error": "egress blocked", "code": "egress_blocked", "retryable": false, "recovery": "fix_configuration" }` | Correct the provider/egress configuration; unchanged retries remain denied. |
 | `403` | `{ "error": "approval_required", "approvalId": "…", "code": "approval_required", "retryable": false, "recovery": "request_approval" }` | Stop the turn and relay the body to the trusted control plane's `recoverBrokerDenial`, which delivers the decision surface. The opaque id is a lookup handle, never authority. |
 | `403` / `409` | `{ "error": "authorization changed; resolve and retry", "code": "interaction_state_changed", "retryable": false, "recovery": "resolve_again" }` (`409` uses connection-changed prose) | Discard the stale handle, re-resolve current credential/mode/tool/session authority, mint a fresh identity token, and retry only if the operation is still allowed. |
-| `403` | `{ "error": "policy denies this provider in this channel", "code": "policy_denied", "retryable": false, "recovery": "contact_admin" }` | Static/channel policy denied use. Retrying cannot change governance; contact an eligible admin. |
-| `403` | `{ "error": "provider is not enabled in this channel", "code": "tool_disabled", "retryable": false, "recovery": "contact_admin" }` | The channel tool allowlist disabled the provider; contact an eligible admin. |
-| `409` | `{ "error": "not connected", "code": "not_connected", "retryable": false, "recovery": "connect" }` | Start personal connection recovery. For a shared-owner request, `recovery` is `fix_configuration` so an eligible admin configures the channel credential instead. |
+| `403` | `{ "error": "policy denies this provider in this channel", "code": "policy_denied", "retryable": false, "recovery": "contact_admin" }` | Static/channel policy denied use. Retrying cannot change governance; contact the Vouchr operator. |
+| `403` | `{ "error": "provider is not enabled in this channel", "code": "tool_disabled", "retryable": false, "recovery": "contact_admin" }` | The channel tool allowlist disabled the provider; a member of the channel enables it. |
+| `409` | `{ "error": "not connected", "code": "not_connected", "retryable": false, "recovery": "connect" }` | Start personal connection recovery. For a shared-owner request, `recovery` is `fix_configuration` so a channel member configures the channel credential instead. |
 | `413` | `{ "error": "approval action path too large", "code": "approval_path_too_large", "retryable": false, "recovery": "fix_configuration" }` | Narrow the provider endpoint; an unchanged request cannot create a bounded exact-action approval. |
 | `413` / `502` | `{ "error": "response blocked", "code": "response_blocked", "retryable": false, "recovery": "fix_configuration" }` | Provider response policy withheld the body. The broker's default content-type denial retains `error: "disallowed content-type"` but uses the same machine fields. Generic byte caps retain their established prose-only shape. |
 | `429` | `{ "error": "rate limited", "code": "rate_limited", "retryable": true, "recovery": "retry_later", "retryAfterMs": 1000 }` | Honour `Retry-After`, then retry only if the operation itself is safe to replay. |
@@ -249,13 +249,14 @@ row predates the assertion's conservative issuance boundary. A recently connecte
 clock-ambiguous across the minter and broker, so that legacy form returns the same `409`; resolve the
 current opaque id and retry instead of waiting or blindly replaying.
 
-### Admin offboarding
+### Offboarding
 
-`POST /v1/admin/offboard` accepts `{ "identityToken": "…", "targetUserId": "…" }`; admin
-authority comes only from the signed assertion. A single-team response keeps every committed local
+`POST /v1/admin/offboard` accepts `{ "identityToken": "…", "targetUserId": "…" }`; the assertion
+must bind the exact target in signed `offboardTargetUserId` (#322), so an ordinary user assertion
+cannot be pointed at a subject through the body. A single-team response keeps every committed local
 deletion in `revoked`, but returns `ok: false` if supported upstream revocation or its authoritative
-audit row could not be confirmed. An Enterprise/Grid assertion must also bind the exact target in
-signed `offboardTargetUserId`; any incomplete workspace adds to `incompleteTeams`. Both paths may
+audit row could not be confirmed. On Enterprise/Grid, any incomplete workspace adds to
+`incompleteTeams`. Both paths may
 return HTTP 200 with `ok: false` because successful local deletion is retained—directory hooks must
 inspect the body and reconcile until `ok` is true.
 
@@ -267,11 +268,11 @@ One core, two front doors — both reach the same credential boundary.
 | --- | --- | --- |
 | Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
 | Use a `shared` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
-| Set the channel mode (`shared`/`per-user`/`session`) | ✅ `/vouchr mode` | ✅ `POST /v1/admin/mode` (admin claim) |
-| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` | ✅ `POST /v1/admin/tools` (signed admin; packaged broker or injected `ChannelTools`) |
+| Set the channel mode (`shared`/`per-user`/`session`) | ✅ `/vouchr mode` (any channel member) | ✅ `POST /v1/admin/mode` (signed channel) |
+| Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` (any channel member) | ✅ `POST /v1/admin/tools` (signed channel; packaged broker or injected `ChannelTools`) |
 | Apply static provider-by-channel policy | ✅ `Policy` option | ✅ `Policy` option; packaged broker loads `VOUCHR_POLICY` or `VOUCHR_POLICY_FILE` |
 | Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` · channel-scoped `POST /v1/manifest` |
-| See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (admin) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (channel, admin claim) |
+| See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (any channel member) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (signed channel) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`connect-shared` / key setup) | ❌ rejected; reference routes never accept raw values |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `POST /v1/admin/reference` (channel) · `POST /v1/user/reference` (self) |
@@ -301,7 +302,7 @@ verification, replay guard, policy, channel-tool, host/path/method, and HTTPS ch
 
 ## Human-in-the-loop approvals (#113)
 
-A provider declaring the `approval` knob (`{ methods?, paths?, approver: 'self' | 'admin',
+A provider declaring the `approval` knob (`{ methods?, paths?, approver: 'self' | 'member',
 ttlMs? }`; default = every non-GET/HEAD method) requires a live, single-use human approval per
 matching action — enforced in the shared injector, so this door inherits it identically: strictly
 AFTER every egress gate (never a bypass) and BEFORE the credential is read. The broker **cannot
@@ -325,7 +326,7 @@ render Approve/Deny buttons**, so the split is deliberate:
   write, and — the #194 bridge — when the trusted control plane relays a broker 403 body to
   `context.vouchr.recoverBrokerDenial(provider, denial)`: the pending row named by the opaque
   `approvalId` is re-read from shared storage, bound to the verified team/user/channel, the
-  self/admin rule is re-derived from the registry, and the same leased delivery + click-time
+  self/member rule is re-derived from the registry, and the same leased delivery + click-time
   revalidation path runs. The required Slack eligibility checks, lifecycle locks, current-state
   validation, mutation, and audit stay one canonical operation. Do not mutate interaction tables or
   import internal stores.
@@ -418,7 +419,7 @@ in-turn approval: `approval_requested` → `approved`/`denied` → `approval_con
 process on the same PostgreSQL delivers it: `install()` runs a bounded delivery pass every
 `authorizationDeliveryIntervalMs` (default 15 s; `0` disables) that rebuilds the requester's exact
 context from the stored row — identity, channel, thread — and runs the same trusted
-`recoverBrokerDenial` bridge an in-turn relay would (registry-derived self/admin rule, current
+`recoverBrokerDenial` bridge an in-turn relay would (registry-derived self/member rule, current
 authority revalidation, cross-replica delivery lease), then the click revalidates everything again
 at the mutation. A row whose post failed ambiguously keeps its delivery lease and is not retried
 until the lease lapses (30 s), so a degraded Slack yields at most one post per lease window, and
@@ -513,16 +514,16 @@ Rules and limits:
 
 Channel governance mirrors the Bolt `/vouchr` commands: `POST /v1/admin/mode` sets a provider's
 channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool allowlist, and
-`GET /v1/admin/config` reads both back. All three are gated on the SIGNED `isAdmin` claim — admin
-authority comes only from the verified identity token, never the request body — and are scoped to
-the signed channel.
+`GET /v1/admin/config` reads both back. All three act on the SIGNED `channel` claim only — the
+channel is the trust boundary (#322), so any member the minter asserts in that channel may configure
+it; the request body carries no authority.
 
 Direct `createBroker()` callers opt into the mutable gate by supplying the read-only `channelTools` store.
 The packaged `buildBrokerServer()` constructs it from its existing PostgreSQL handle unconditionally,
-so the broker admin routes and Bolt write through one audited, lifecycle-locked core mutation, while
-admin config, the channel manifest, `/v1/fetch`, and `/v1/mcp` read and enforce that same state. No
-allowlist cache or additional environment switch is involved. Service tools are included in admin
-config and the channel manifest and may be enabled or disabled there; because Vouchr never executes
+so the broker configuration routes and Bolt write through one audited, lifecycle-locked core mutation, while
+`/v1/admin/config`, the channel manifest, `/v1/fetch`, and `/v1/mcp` read and enforce that same state. No
+allowlist cache or additional environment switch is involved. Service tools are included in
+`/v1/admin/config` and the channel manifest and may be enabled or disabled there; because Vouchr never executes
 their service-authenticated egress, the trusted host must refuse a service call when its manifest row
 has `enabled:false`.
 
@@ -530,7 +531,7 @@ The packaged broker separately loads static operator `Policy` from exactly one o
 or `VOUCHR_POLICY_FILE`; see the deployment guide's
 [strict JSON contract](./DEPLOYMENT.md#static-channel-policy-declarative). Policy keys are validated
 against the configured provider registry at boot and evaluation uses only the signed channel claim.
-Static policy and mutable `ChannelTools` intersect, so an admin enable cannot override an operator
+Static policy and mutable `ChannelTools` intersect, so a member's enable cannot override an operator
 deny and a policy allow cannot override a disabled channel tool. A direct `new Policy(rules, …)`
 takes a provider-keyed map of `PolicyRule` (`{ defaultAllow, allowChannels?, denyChannels? }`), the
 typed form of that JSON contract.
@@ -576,8 +577,8 @@ Once a request passes the final provider-send fence and is dispatched, later off
 recall it. Under
 the documented ±30-second minter, broker, and PostgreSQL clock bounds, wait the conservative
 90-second cluster-skew horizon before minting the replacement assertion. `/v1/admin/reference`
-applies the same age-preserving fence to the acting admin while it atomically writes the channel
-reference, shared mode, and config audit; an assertion minted before that admin's offboarding cannot
+applies the same age-preserving fence to the acting member while it atomically writes the channel
+reference, shared mode, and config audit; an assertion minted before that member's offboarding cannot
 gain fresh channel-setup authority by being replayed later. Enterprise/global offboarding writes its
 scope
 before artifact discovery, so this also holds for a Grid workspace with no existing Vouchr row.
@@ -587,8 +588,8 @@ Legacy assertions without a verified `iat` fail closed at the production broker 
 
 - **Deployment identity.** Build `identitySecret` with `loadIdentityConfig(process.env)` in exactly
   two places: the trusted Slack verifier/minter and every broker replica. It must not be readable by
-  an agent worker, a model/tool runtime, or any other process — a holder can assert any user and
-  `isAdmin: true` (see the warning above and the threat model). Keep it distinct from the Slack
+  an agent worker, a model/tool runtime, or any other process — a holder can assert any user in any
+  channel (see the warning above and the threat model). Keep it distinct from the Slack
   signing secret, encryption keys, broker bearer, and provider OAuth client secrets; the equality
   check is enforced, not advisory. See the deployment guide for the required upgrade and rotation
   order.
@@ -696,7 +697,7 @@ never a query string, which access logs keep); `GET /v1/manifest` and the probes
 | `POST /v1/user/reference` | Point the caller's credential at a secret-manager reference | `{ ok }` |
 | `GET /v1/manifest` | Provider ids and identity kind, channel-independent | `BrokerManifestResponse` |
 | `POST /v1/manifest` | Channel-scoped tool manifest for the signed channel | `BrokerChannelManifestResponse` |
-| `GET /v1/admin/config` | Channel modes and tool allowlist (signed `isAdmin`) | `BrokerAdminConfigResponse` |
-| `POST /v1/admin/mode` · `/v1/admin/tools` · `/v1/admin/reference` | Channel governance writes (signed `isAdmin`) | `BrokerAdminOkResponse` |
-| `POST /v1/admin/audit` · `/v1/admin/offboard` | Channel audit read · offboard a user (signed `isAdmin`) | `BrokerAuditResponse` · `{ ok, revoked }` |
+| `GET /v1/admin/config` | Channel modes and tool allowlist (signed `channel`) | `BrokerAdminConfigResponse` |
+| `POST /v1/admin/mode` · `/v1/admin/tools` · `/v1/admin/reference` | Channel governance writes (signed `channel`; any member of it, #322) | `BrokerAdminOkResponse` |
+| `POST /v1/admin/audit` · `/v1/admin/offboard` | Channel audit read (signed `channel`) · offboard a user (signed `offboardTargetUserId`) | `BrokerAuditResponse` · `{ ok, revoked }` |
 | `GET /healthz` · `GET /readyz` | Liveness · readiness; unauthenticated | `{ ok }` |

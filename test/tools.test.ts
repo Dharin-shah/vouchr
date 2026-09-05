@@ -36,14 +36,16 @@ const other = defineProvider({
 const PROVIDER_IDS = ['mcp', 'other'];
 
 // Mirrors test/channel.test.ts: builds a ConnectContext over an in-memory DB + a mocked Slack client.
-async function ctx(t: TestContext, isAdmin = true, channel: string | null = 'C_FIN', policy = new Policy()) {
+async function ctx(t: TestContext, member = true, channel: string | null = 'C_FIN', policy = new Policy()) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const tools = new ChannelTools(db);
   const client = {
-    users: { info: async () => ({ user: { is_admin: isAdmin } }) },
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }) },
+    conversations: {
+      info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }),
+      members: async () => ({ members: member ? [ID.userId] : [] }),
+    },
   } as any;
   const c = new ConnectContext({
     identity: ID, channel, client, registry: new ProviderRegistry([mcp, other]), vault, audit,
@@ -56,7 +58,7 @@ async function ctx(t: TestContext, isAdmin = true, channel: string | null = 'C_F
 const auditRows = async (db: any) => (await db.all('SELECT action, meta FROM audit')) as any[];
 const chOwner = { teamId: 'T1', kind: 'channel', id: 'C_FIN' } as const;
 
-// Deny-by-default: a channel with no tool rows enables nothing until an admin opts a provider in.
+// Deny-by-default: a channel with no tool rows enables nothing until a member opts a provider in.
 test('no rows => deny-by-default: every provider disabled', async (t) => {
   const { tools } = await ctx(t);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'mcp'), false);

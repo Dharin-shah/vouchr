@@ -22,7 +22,6 @@ import { PolicyDeniedError } from '../src/core/authz';
 import { SessionGrants } from '../src/core/session';
 import { createBroker } from '../src/adapters/http/broker';
 import {
-  APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS,
   ConnectContext,
   ConsentRequiredError,
   createVouchr,
@@ -67,7 +66,7 @@ const keyProv = defineProvider({
   egressAllow: ['api.test'], refresh: 'none', pkce: false,
 });
 
-const approvalProv = (approver: 'self' | 'admin' = 'self'): Provider => defineProvider({
+const approvalProv = (approver: 'self' | 'member' = 'self'): Provider => defineProvider({
   id: 'acme', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
   egressAllow: ['api.acme.test'], egressMethods: ['GET', 'POST'],
   approval: { approver },
@@ -77,14 +76,12 @@ const approvalProv = (approver: 'self' | 'admin' = 'self'): Provider => definePr
 /** Real createVouchr + middleware + registered action handlers, Slack transport faked. */
 async function harness(t: TestContext, o: {
   providers?: Provider[];
-  slackAdmins?: string[];
   members?: string[];
   policy?: Policy;
   channelInfo?: Record<string, unknown>;
   postMessage?: (payload: any, attempt: number) => Promise<unknown>;
   postEphemeral?: (payload: any, attempt: number) => Promise<unknown>;
   memberPage?: (payload: any, attempt: number) => Promise<unknown>;
-  userInfo?: (payload: any, attempt: number) => Promise<unknown>;
   clientToken?: string;
   slackClientOptions?: Record<string, unknown>;
 } = {}) {
@@ -98,8 +95,8 @@ async function harness(t: TestContext, o: {
     policy: o.policy,
     slackClientOptions: o.slackClientOptions,
   });
-  // Deny-by-default: opt the registered providers into the channels these tests exercise, mirroring an
-  // admin having run `/vouchr enable`. Tests that assert a denial set their own session/shared state.
+  // Deny-by-default: opt the registered providers into the channels these tests exercise, mirroring a
+  // member having run `/vouchr enable`. Tests that assert a denial set their own session/shared state.
   for (const chan of ['C1', 'C9']) {
     for (const p of (o.providers ?? [oauthGh])) {
       await setChannelToolEnabled(new ChannelTools(db), 'T1', chan, p.id, true);
@@ -113,19 +110,12 @@ async function harness(t: TestContext, o: {
   });
   const ephemerals: any[] = [];
   const dms: any[] = [];
-  const admins = new Set(o.slackAdmins ?? []);
   const members = o.members ?? ['U1'];
   let messageAttempts = 0;
   let ephemeralAttempts = 0;
   let memberAttempts = 0;
-  let userInfoAttempts = 0;
   const client = {
     ...(o.clientToken ? { token: o.clientToken } : {}),
-    users: { info: async (payload: any) => {
-      userInfoAttempts += 1;
-      return o.userInfo?.(payload, userInfoAttempts)
-        ?? { user: { is_admin: admins.has(payload.user) } };
-    } },
     conversations: {
       info: async ({ channel }: any) => ({
         channel: { id: channel, is_channel: true, creator: 'UCREATOR', ...o.channelInfo },
@@ -188,7 +178,7 @@ async function harness(t: TestContext, o: {
     });
     return responses;
   };
-  return { db, key, vouchr, actions, client, ephemerals, dms, admins, members, context, click };
+  return { db, key, vouchr, actions, client, ephemerals, dms, members, context, click };
 }
 
 /** Stub global fetch (TEST-3), recording outbound calls; ALWAYS restored in finally. */
@@ -686,10 +676,10 @@ test('bridge: session denial without a thread yields the fixed off-thread guidan
   assert.equal(h.ephemerals.length, 0);
 });
 
-// ── not_connected, shared owner → direct an eligible admin to channel configuration ───────────────
+// ── not_connected, shared owner → direct the asking member to channel configuration ──────────────
 
 async function sharedModeVia(h: Awaited<ReturnType<typeof harness>>, adminId: string, providerId = 'gh') {
-  // The audited admin mutation (writes the 'config' row lastChannelConfigActor reads).
+  // The audited member mutation (writes the 'config' row lastChannelConfigActor reads).
   await setChannelCredentialMode({
     vault: h.vouchr.vault,
     audit: h.vouchr.audit,
@@ -702,74 +692,26 @@ async function sharedModeVia(h: Awaited<ReturnType<typeof harness>>, adminId: st
   });
 }
 
-test('bridge: shared-owner miss directs an admin-eligible actor in place (never a personal prompt)', async (t) => {
-  const h = await harness(t, { slackAdmins: ['U1'] });
-  await sharedModeVia(h, 'UADM');
-  const r = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected', recovery: 'fix_configuration' });
-  assert.deepEqual(r, { status: 'configuration_required', provider: 'gh' });
-  assert.equal(h.ephemerals.length, 1);
-  assert.match(h.ephemerals[0].text, /\/vouchr connect-shared gh/);
-  assert.equal(h.dms.length, 0, 'the actor IS the eligible admin — no extra DM');
-  assert.equal((await h.db.all('SELECT 1 AS x FROM consent_request')).length, 0, 'no personal connect flow');
-});
-
-test('bridge: shared-owner miss DMs the responsible admin once per window for a non-admin actor', async (t) => {
-  const h = await harness(t, { slackAdmins: ['UADM'], members: ['U1', 'UADM'] });
-  await sharedModeVia(h, 'UADM');
+test('bridge: shared-owner miss directs the asking member to connect-shared in place (never a personal prompt)', async (t) => {
+  const h = await harness(t);
+  await sharedModeVia(h, 'UOTHER');
   const denial = { code: 'not_connected', recovery: 'fix_configuration' };
   const r = await (await h.context()).recoverBrokerDenial('gh', denial);
   assert.deepEqual(r, { status: 'configuration_required', provider: 'gh' });
-  assert.equal(h.dms.length, 1, 'the last configuring admin is asked');
-  assert.equal(h.dms[0].channel, 'UADM');
-  assert.match(h.dms[0].text, /\/vouchr connect-shared gh/);
-  assert.match(h.ephemerals[0].text, /has been asked/);
+  assert.equal(h.ephemerals.length, 1);
+  assert.match(h.ephemerals[0].text, /Run `\/vouchr connect-shared gh` here/);
   assert.ok(!h.ephemerals[0].text.includes(TOKEN));
-
-  // Repeated relays do not spam: the 24h notification window is already claimed.
+  assert.equal(h.dms.length, 0, 'any member may configure (#322): nobody else is DMed');
+  assert.equal((await h.db.all('SELECT 1 AS x FROM consent_request')).length, 0, 'no personal connect flow');
+  // Repeated relays repeat the same private guidance; there is no cross-replica claim to spend.
   const again = await (await h.context()).recoverBrokerDenial('gh', denial);
   assert.deepEqual(again, { status: 'configuration_required', provider: 'gh' });
-  assert.equal(h.dms.length, 1, 'debounced');
-  assert.match(
-    h.ephemerals[1].text,
-    /may already have been notified/,
-    'an existing claim never overstates that Slack confirmed delivery',
-  );
-});
-
-test('bridge: shared-owner miss with no known admin gives the actor the ask-an-admin step', async (t) => {
-  const h = await harness(t);
-  // Mode written without the audited mutation: no 'config' row → no responsible admin on record.
-  await writeChannelMode(new ChannelConfig(h.db), 'T1', 'C1', 'gh', 'shared');
-  const r = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
-  assert.deepEqual(r, { status: 'configuration_required', provider: 'gh' });
   assert.equal(h.dms.length, 0);
-  assert.match(h.ephemerals[0].text, /Ask a channel admin to run/);
-});
-
-test('bridge: shared-owner miss never DMs a former or removed configuring admin', async (t) => {
-  for (const scenario of [
-    { name: 'demoted', slackAdmins: [] as string[], members: ['U1', 'UOLD'] },
-    { name: 'removed', slackAdmins: ['UOLD'], members: ['U1'] },
-  ]) {
-    await t.test(scenario.name, async (st) => {
-      const h = await harness(st, {
-        slackAdmins: scenario.slackAdmins,
-        members: scenario.members,
-      });
-      await sharedModeVia(h, 'UOLD');
-      const r = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
-      assert.deepEqual(r, { status: 'configuration_required', provider: 'gh' });
-      assert.equal(h.dms.length, 0, 'stale audit identity receives no channel disclosure');
-      assert.match(h.ephemerals[0].text, /Ask a channel admin to run/);
-    });
-  }
+  assert.equal((await h.db.all("SELECT 1 AS x FROM notification_state")).length, 0);
 });
 
 test('bridge: shared-owner miss rechecks channel eligibility before configuration direction', async (t) => {
-  const h = await harness(t, {
-    slackAdmins: ['U1'],
-    channelInfo: { is_ext_shared: true },
-  });
+  const h = await harness(t, { channelInfo: { is_ext_shared: true } });
   await sharedModeVia(h, 'U1');
   await assert.rejects(
     (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' }),
@@ -777,59 +719,6 @@ test('bridge: shared-owner miss rechecks channel eligibility before configuratio
   );
   assert.equal(h.dms.length, 0);
   assert.equal(h.ephemerals.length, 0);
-});
-
-test('bridge: ambiguous admin DM retains the debounce claim and cannot duplicate', async (t) => {
-  const h = await harness(t, {
-    slackAdmins: ['UADM'],
-    members: ['U1', 'UADM'],
-    postMessage: async () => { throw slackWebApiError(SlackErrorCode.RequestError); },
-  });
-  await sharedModeVia(h, 'UADM');
-
-  const first = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
-  assert.deepEqual(first, { status: 'configuration_required', provider: 'gh' });
-  assert.equal(h.dms.length, 1, 'one ambiguous send was attempted');
-  assert.match(h.ephemerals[0].text, /may already have been notified/);
-  assert.equal(
-    (await h.db.all("SELECT 1 AS x FROM notification_state WHERE type='not_configured'")).length,
-    1,
-    'ambiguous acceptance keeps the cross-replica debounce claim',
-  );
-
-  const again = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
-  assert.deepEqual(again, { status: 'configuration_required', provider: 'gh' });
-  assert.equal(h.dms.length, 1, 'the retained claim prevents duplicate delivery');
-});
-
-test('bridge: definite admin DM rejection releases the debounce claim for retry', async (t) => {
-  for (const code of [SlackErrorCode.PlatformError, SlackErrorCode.RateLimitedError]) {
-    await t.test(code, async (st) => {
-      const h = await harness(st, {
-        slackAdmins: ['UADM'],
-        members: ['U1', 'UADM'],
-        postMessage: async (_payload, attempt) => {
-          if (attempt === 1) throw slackWebApiError(code);
-          return {};
-        },
-      });
-      await sharedModeVia(h, 'UADM');
-
-      const first = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
-      assert.deepEqual(first, { status: 'configuration_required', provider: 'gh' });
-      assert.match(h.ephemerals[0].text, /Ask a channel admin to run/);
-      assert.equal(
-        (await h.db.all("SELECT 1 AS x FROM notification_state WHERE type='not_configured'")).length,
-        0,
-        'known non-delivery releases the claim',
-      );
-
-      const again = await (await h.context()).recoverBrokerDenial('gh', { code: 'not_connected' });
-      assert.deepEqual(again, { status: 'configuration_required', provider: 'gh' });
-      assert.equal(h.dms.length, 2, 'the next relay retries the known-undelivered DM');
-      assert.match(h.ephemerals[1].text, /has been asked/);
-    });
-  }
 });
 
 test('bridge: shared-owner relay resolves once the channel credential exists', async (t) => {
@@ -899,140 +788,28 @@ test('bridge: broker approval denial delivers ONE self decision surface; approve
   });
 });
 
-test('bridge: admin approval denial fans out to eligible admins only', async (t) => {
-  const provider = approvalProv('admin');
-  const h = await harness(t, { providers: [provider], slackAdmins: ['UADM'], members: ['U1', 'U2', 'UADM'] });
+test('bridge: member approval denial posts one channel message in the stored thread (#322)', async (t) => {
+  const provider = approvalProv('member');
+  const h = await harness(t, { providers: [provider], members: ['U1', 'U2'] });
   await h.vouchr.vault.upsert(userOwner(ID), 'acme', {
     accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const { denial } = await brokerApprovalDenial(t, h.db, h.key, provider);
   const r = await (await h.context()).recoverBrokerDenial('acme', denial);
-  assert.deepEqual(r, { status: 'approval_prompted', provider: 'acme', approver: 'admin' });
-  assert.equal(h.ephemerals.length, 1, 'one eligible admin, one prompt');
-  assert.equal(h.ephemerals[0].user, 'UADM');
-});
-
-test('bridge: approval delivery follows the current admin audience, not an old delivered marker', async (t) => {
-  const provider = approvalProv('admin');
-  const h = await harness(t, {
-    providers: [provider],
-    slackAdmins: ['UOLD'],
-    members: ['U1', 'UOLD'],
-  });
-  await h.vouchr.vault.upsert(userOwner(ID), 'acme', {
-    accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const { denial } = await brokerApprovalDenial(t, h.db, h.key, provider);
-
-  const first = await (await h.context()).recoverBrokerDenial('acme', denial);
-  assert.deepEqual(first, { status: 'approval_prompted', provider: 'acme', approver: 'admin' });
-  assert.deepEqual(h.ephemerals.map((post) => post.user), ['UOLD']);
-  const oldAudience = (await h.db.get<{ delivery_audience: string }>(
-    'SELECT delivery_audience FROM approval_request WHERE id=?',
-    [denial.approvalId],
-  ))?.delivery_audience;
-
-  h.admins.delete('UOLD');
-  h.admins.add('UNEW');
-  h.members.splice(0, h.members.length, 'U1', 'UNEW');
-  const next = await (await h.context()).recoverBrokerDenial('acme', denial);
-  assert.deepEqual(next, { status: 'approval_prompted', provider: 'acme', approver: 'admin' });
-  assert.deepEqual(
-    h.ephemerals.map((post) => post.user),
-    ['UOLD', 'UNEW'],
-    'the newly eligible admin receives a usable surface despite the old delivery',
-  );
-  const newAudience = (await h.db.get<{ delivery_audience: string }>(
-    'SELECT delivery_audience FROM approval_request WHERE id=?',
-    [denial.approvalId],
-  ))?.delivery_audience;
-  assert.notEqual(newAudience, oldAudience, 'the persisted delivery is bound to the recipient set');
-});
-
-test('bridge: a never-settling member read times out before approval delivery is claimed', async (t) => {
-  const provider = approvalProv('admin');
-  let nowNs = 0n;
-  const h = await harness(t, {
-    providers: [provider],
-    memberPage: async () => {
-      nowNs = BigInt(APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS + 1) * 1_000_000n;
-      return new Promise(() => {});
-    },
-  });
-  await h.vouchr.vault.upsert(userOwner(ID), 'acme', {
-    accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const { denial } = await brokerApprovalDenial(t, h.db, h.key, provider);
-  const hrtime = process.hrtime as typeof process.hrtime & { bigint: () => bigint };
-  const realHrtime = hrtime.bigint;
-  hrtime.bigint = () => nowNs;
-  try {
-    await assert.rejects(
-      (await h.context()).recoverBrokerDenial('acme', denial),
-      (error: any) => error?.recovery === 'retry_later'
-        && /current approval recipients/i.test(error.message),
-    );
-  } finally {
-    hrtime.bigint = realHrtime;
-  }
-  assert.equal(h.ephemerals.length, 0);
-  assert.deepEqual(
-    await h.db.get(
-      'SELECT delivery_token,delivery_audience FROM approval_request WHERE id=?',
-      [denial.approvalId],
-    ),
-    { delivery_token: null, delivery_audience: null },
-  );
-});
-
-test('bridge: multi-page large-channel admin resolution fails closed on its overall deadline', async (t) => {
-  const provider = approvalProv('admin');
-  let nowNs = 0n;
-  let pages = 0;
-  let adminReads = 0;
-  const h = await harness(t, {
-    providers: [provider],
-    memberPage: async ({ cursor }) => {
-      pages += 1;
-      return cursor
-        ? { members: Array.from({ length: 1_000 }, (_, i) => `U_B_${i}`) }
-        : {
-            members: Array.from({ length: 1_000 }, (_, i) => `U_A_${i}`),
-            response_metadata: { next_cursor: 'page-2' },
-          };
-    },
-    userInfo: async () => {
-      adminReads += 1;
-      nowNs = BigInt(APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS + 1) * 1_000_000n;
-      return new Promise(() => {});
-    },
-  });
-  await h.vouchr.vault.upsert(userOwner(ID), 'acme', {
-    accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const { denial } = await brokerApprovalDenial(t, h.db, h.key, provider);
-  const hrtime = process.hrtime as typeof process.hrtime & { bigint: () => bigint };
-  const realHrtime = hrtime.bigint;
-  hrtime.bigint = () => nowNs;
-  try {
-    await assert.rejects(
-      (await h.context()).recoverBrokerDenial('acme', denial),
-      (error: any) => error?.recovery === 'retry_later',
-    );
-  } finally {
-    hrtime.bigint = realHrtime;
-  }
-  assert.equal(pages, 2, 'the complete paginated member set was attempted');
-  assert.ok(adminReads > 0 && adminReads <= 16, 'admin work is concurrency-capped');
-  assert.equal(h.ephemerals.length, 0);
-  assert.deepEqual(
-    await h.db.get(
-      'SELECT delivery_token,delivery_audience FROM approval_request WHERE id=?',
-      [denial.approvalId],
-    ),
-    { delivery_token: null, delivery_audience: null },
-    'a partial audience never reaches the delivery lease',
-  );
+  assert.deepEqual(r, { status: 'approval_prompted', provider: 'acme', approver: 'member' });
+  assert.equal(h.ephemerals.length, 0, 'not an ephemeral: the channel decides');
+  assert.equal(h.dms.length, 1, 'one regular message');
+  assert.equal(h.dms[0].channel, 'C1');
+  assert.equal(h.dms[0].thread_ts, 'TH1', 'delivered into the stored originating thread');
+  assert.equal(h.dms[0].user, undefined);
+  const rendered = JSON.stringify(h.dms[0].blocks);
+  assert.match(rendered, /Another member of this channel must approve it/);
+  assert.match(rendered, /<@U1>/);
+  assert.ok(!rendered.includes(TOKEN));
+  // A repeated relay reuses the durable channel message instead of posting a second one.
+  const again = await (await h.context()).recoverBrokerDenial('acme', denial);
+  assert.deepEqual(again, { status: 'approval_prompted', provider: 'acme', approver: 'member' });
+  assert.equal(h.dms.length, 1, 'a durable channel prompt is never re-posted');
 });
 
 test('bridge: approval references are lookup handles — mismatches and garbage are stale', async (t) => {
@@ -1109,7 +886,6 @@ test('bridge: shared approval rechecks live channel class and requester membersh
       const provider = approvalProv('self');
       const h = await harness(st, {
         providers: [provider],
-        slackAdmins: ['UADM'],
         channelInfo: scenario.channelInfo,
         members: scenario.members,
       });
@@ -1144,7 +920,6 @@ test('bridge: cyclic Slack membership pagination fails closed before prompt deli
   const provider = approvalProv('self');
   const h = await harness(t, {
     providers: [provider],
-    slackAdmins: ['UADM'],
     memberPage: async () => ({
       members: ['UNRELATED'],
       response_metadata: { next_cursor: 'repeated-cursor' },
@@ -1191,7 +966,6 @@ test('bridge: hostile membership pages cannot bypass the finite scan budget', as
       const provider = approvalProv('self');
       const h = await harness(st, {
         providers: [provider],
-        slackAdmins: ['UADM'],
         memberPage: scenario.memberPage,
       });
       await sharedModeVia(h, 'UADM', 'acme');

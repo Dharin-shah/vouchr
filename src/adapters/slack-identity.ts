@@ -30,45 +30,6 @@ export function resolveIdentity(args: {
   return { enterpriseId, teamId, userId };
 }
 
-/**
- * Whether `userId` is a Slack workspace admin/owner, the gate for channel-credential
- * config (invariant 7). Fail-closed: any API error or missing flag → not admin.
- */
-export async function isSlackAdmin(
-  client: { users: { info: (a: { user: string }) => Promise<any> } },
-  userId: string,
-): Promise<boolean> {
-  try {
-    const res = await client.users.info({ user: userId });
-    return Boolean(res?.user?.is_admin || res?.user?.is_owner);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Whether `userId` created `channel`, the portable "channel owner" notion (public channels have no
- * admin boolean). Alongside `isSlackAdmin`, this widens who may CONFIGURE channel credentials to the
- * channel creator, not just workspace admins. Fail-closed: no channel, any API error, or a missing
- * creator → not a channel admin.
- * Caveats: for a PRIVATE channel the bot must be a member for conversations.info to return it, else
- * this fails closed and only the workspace-admin path applies. `creator` is immutable and can point
- * at a since-deactivated user.
- */
-export async function isChannelAdmin(
-  client: { conversations: { info: (a: { channel: string }) => Promise<any> } },
-  channel: string,
-  userId: string,
-): Promise<boolean> {
-  if (!channel) return false;
-  try {
-    const res = await client.conversations.info({ channel });
-    return res?.channel?.creator === userId;
-  } catch {
-    return false;
-  }
-}
-
 interface ChannelMemberPaginationBounds {
   maxMembers: number;
   maxPages: number;
@@ -147,28 +108,4 @@ export async function isChannelMember(
   bounds: ChannelMemberPaginationBounds,
 ): Promise<boolean> {
   return (await scanChannelMembers(client, channel, bounds, (member) => member === userId)) === true;
-}
-
-/**
- * The user ids of every member of `channel`, paged from conversations.members. Used to find the
- * channel's eligible approvers (#113). `null` means the complete current set could not be proven
- * because an API read failed, the caller's overall deadline elapsed, or the configured work cap was
- * exceeded; an empty array means the complete set was read and contained no members.
- */
-export async function listChannelMembers(
-  client: {
-    conversations: {
-      members: (a: { channel: string; cursor?: string; limit?: number }) => Promise<any>;
-    };
-  },
-  channel: string,
-  bounds: ChannelMemberPaginationBounds,
-): Promise<string[] | null> {
-  const out = new Set<string>();
-  const complete = await scanChannelMembers(client, channel, bounds, (member) => {
-    out.add(member);
-    return false;
-  });
-  if (complete === null) return null;
-  return [...out];
 }

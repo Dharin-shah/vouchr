@@ -34,7 +34,6 @@ import { userOwner, channelOwner } from '../src/core/owner';
 import { sweepExpired } from '../src/core/sweep';
 import {
   APPROVAL_DELIVERY_SAFETY_MARGIN_MS,
-  APPROVAL_FANOUT_CONCURRENCY,
   APPROVAL_FANOUT_DEADLINE_MS,
   ConnectContext,
   createVouchr,
@@ -58,7 +57,7 @@ import { mapSafeError, type VouchrRecovery } from '../src/core/errors';
 
 // #113 human-in-the-loop approval for sensitive writes: the full state machine (prompt → approve →
 // consume → re-prompt; deny; TTL expiry; the double-consume race), gate ordering (egress beats
-// approval), the admin/self approver matrices with forged clicks, the broker's 403 shape, the sweep,
+// approval), the member/self approver matrices with forged clicks, the broker's 403 shape, the sweep,
 // and the no-knob zero-change guarantee. No network: outbound fetch is stubbed (restored in
 // finally), Slack is a fake client, and the SQL runs on a throwaway PostgreSQL schema.
 
@@ -149,12 +148,12 @@ async function expectUserRecovery(
  */
 async function harness(t: TestContext, o: {
   provider?: Provider;
-  slackAdmins?: string[];
   members?: string[];
   sharedChannel?: boolean;
   channel?: string | null;
   thread?: string | null;
   postEphemeral?: (payload: any) => Promise<unknown>;
+  postMessage?: (payload: any) => Promise<unknown>;
   db?: Db;
   onSlackRead?: () => void | Promise<void>;
   masterKey?: Buffer;
@@ -174,22 +173,24 @@ async function harness(t: TestContext, o: {
   });
   const ephemerals: any[] = [];
   const dms: any[] = [];
-  const admins = new Set(o.slackAdmins ?? []);
+  const members = o.members ?? ['U1'];
   const client = {
-    users: { info: async ({ user }: any) => { await o.onSlackRead?.(); return { user: { is_admin: admins.has(user) } }; } },
     conversations: {
       info: async ({ channel }: any) => {
         await o.onSlackRead?.();
         return { channel: { id: channel, is_channel: true, creator: 'U_CREATOR' } };
       },
-      members: async () => { await o.onSlackRead?.(); return { members: o.members ?? ['U1'] }; },
+      members: async () => { await o.onSlackRead?.(); return { members }; },
     },
     chat: {
       postEphemeral: async (p: any) => {
         ephemerals.push(p);
         return o.postEphemeral ? o.postEphemeral(p) : {};
       },
-      postMessage: async (p: any) => { dms.push(p); return {}; },
+      postMessage: async (p: any) => {
+        dms.push(p);
+        return o.postMessage ? o.postMessage(p) : {};
+      },
     },
   } as any;
   const channel = o.channel === undefined ? 'C1' : o.channel;
@@ -228,14 +229,16 @@ async function harness(t: TestContext, o: {
     value: string,
     responds: any[] = [],
     ack: () => Promise<void> = async () => {},
+    /** The Slack-signed conversation the click arrives from (defaults to the request's). */
+    location: { channel: string; thread?: string } = { channel: 'C1', thread: 'TH1' },
   ) =>
     actions[actionId]({
       ack,
       body: {
         team: { id: 'T1' },
         user: { id: clicker },
-        channel: { id: 'C1' },
-        container: { channel_id: 'C1', thread_ts: 'TH1' },
+        channel: { id: location.channel },
+        container: { channel_id: location.channel, ...(location.thread ? { thread_ts: location.thread } : {}) },
         actions: [{ value }],
       },
       client,
@@ -245,7 +248,7 @@ async function harness(t: TestContext, o: {
     (await vouchr.db.all(`SELECT action, user_id, actor, meta FROM audit ORDER BY at`)) as any[];
   const approvalRows = async () =>
     (await vouchr.db.all(`SELECT * FROM approval_request`)) as any[];
-  return { vouchr, ctx, ephemerals, dms, click, auditRows, approvalRows, provider, admins, client };
+  return { vouchr, ctx, ephemerals, dms, click, auditRows, approvalRows, provider, members, client };
 }
 
 // The OAuth "Connect" button is a url button, but Slack still delivers a block_actions interaction for
@@ -1342,14 +1345,18 @@ test('approval delivery is reusable only by the same approver class and recipien
   );
   assert.deepEqual(await approvals.claimDelivery(id, selfAudience), { status: 'delivered' });
 
-  const adminAudience = approvalDeliveryAudienceKey(id, 'admin', ['UNEW']);
-  const adminClaim = await approvals.claimDelivery(id, adminAudience);
-  assert.equal(adminClaim.status, 'claimed', 'self delivery cannot suppress the new admin audience');
+  const memberAudience = approvalDeliveryAudienceKey(id, 'member', ['C1']);
+  const memberClaim = await approvals.claimDelivery(id, memberAudience);
+  assert.equal(memberClaim.status, 'claimed', 'self delivery cannot suppress the new member surface');
   assert.equal(
-    await approvals.confirmDelivery(id, (adminClaim as { token: string }).token, adminAudience),
+    await approvals.confirmDelivery(id, (memberClaim as { token: string }).token, memberAudience),
     true,
   );
-  assert.deepEqual(await approvals.claimDelivery(id, adminAudience), { status: 'delivered' });
+  assert.deepEqual(await approvals.claimDelivery(id, memberAudience), { status: 'delivered' });
+  // The digest is bound to exactly one surface id: no surface, or more than one, is not an audience.
+  assert.throws(() => approvalDeliveryAudienceKey(id, 'member', []), /invalid approval delivery audience/);
+  assert.throws(() => approvalDeliveryAudienceKey(id, 'member', ['C1', 'C2']), /invalid approval delivery audience/);
+  assert.throws(() => approvalDeliveryAudienceKey(id, 'admin' as any, ['U1']), /invalid approval delivery audience/);
 });
 
 // ── gate ordering: approval is an ADDITIONAL gate, never a bypass ─────────────────────────────────
@@ -1368,15 +1375,15 @@ test('two replicas: a changing approval audience cannot replace an active delive
     origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
     channel: 'C1', thread: 'TH1', governableChannel: 'C1',
   });
-  const oldAudience = approvalDeliveryAudienceKey(id, 'admin', ['UOLD']);
-  const newAudience = approvalDeliveryAudienceKey(id, 'admin', ['UNEW']);
+  const oldAudience = approvalDeliveryAudienceKey(id, 'self', ['U1']);
+  const newAudience = approvalDeliveryAudienceKey(id, 'member', ['C1']);
 
   const held = await firstReplica.claimDelivery(id, oldAudience);
   assert.equal(held.status, 'claimed');
   assert.deepEqual(
     await secondReplica.claimDelivery(id, newAudience),
     { status: 'in-flight' },
-    'roster churn must not invalidate a post already in progress on another replica',
+    'a rule change must not invalidate a post already in progress on another replica',
   );
   assert.equal(
     await firstReplica.confirmDelivery(id, (held as { token: string }).token, oldAudience),
@@ -1458,158 +1465,138 @@ test('ordering: invalid request methods reach no approval, audit, Slack, credent
 
 // ── approver matrices ─────────────────────────────────────────────────────────────────────────────
 
-test("admin approver: prompts go to eligible admins; forged/ineligible clicks are rejected AND audited; an admin's approval works", async (t) => {
-  const { ctx, ephemerals, dms, click, auditRows } = await harness(t, {
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    slackAdmins: ['U_ADM'],
-    members: ['U1', 'U_ADM', 'U_RANDO'],
+test('member approver (#322): one channel message; the requester and a non-member are refused and audited; another member approves and the action runs once with the requester\'s credential', async (t) => {
+  const { vouchr, ctx, ephemerals, dms, click, auditRows, approvalRows } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
+  });
+  // The approving colleague has their own credential too: the grant must still spend the REQUESTER's.
+  await vouchr.vault.upsert(userOwner({ ...ID, userId: 'U_MEMBER' }), 'acme', {
+    accessToken: 'tok_member_never_used', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
-    assert.equal(e.approver, 'admin');
-    // The prompt goes to the one eligible admin — not the requester, not a random member.
-    assert.deepEqual(ephemerals.map((p) => p.user), ['U_ADM']);
-    assert.ok(!JSON.stringify(ephemerals).includes(BODY_SENTINEL), 'SEC-1: no body in the admin prompt');
+    assert.equal(e.approver, 'member');
+    // One regular message in the owning channel, in the originating thread — not an ephemeral.
+    assert.equal(ephemerals.length, 0);
+    assert.equal(dms.length, 1);
+    assert.equal(dms[0].channel, 'C1');
+    assert.equal(dms[0].thread_ts, 'TH1');
+    assert.equal(dms[0].user, undefined);
+    const rendered = JSON.stringify(dms[0]);
+    assert.match(rendered, /Another member of this channel must approve it/);
+    assert.match(rendered, /<@U1>/);
+    assert.ok(!rendered.includes(BODY_SENTINEL), 'SEC-1: no body in the channel prompt');
+    assert.ok(!rendered.includes(TOKEN), 'SEC-1: no credential in the channel prompt');
+    assert.ok(!rendered.includes('/repos'), 'raw path never rendered');
 
-    // SEC-3: every interaction field is forgeable — a non-admin click (even the requester's own)
-    // is re-checked server-side, rejected, and audited.
-    await click(APPROVAL_APPROVE_ACTION, 'U_RANDO', e.approvalId);
-    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
+    // SEC-3: the requester's own click, and a click from someone who is not a member, are
+    // re-checked server-side, rejected, and audited; the prompt stays pending.
+    const own: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId, own);
+    assert.match(String(own[0]?.text), /not eligible/i);
+    assert.equal(own[0]?.replace_original, false, 'the channel prompt is left in place for a teammate');
+    await click(APPROVAL_APPROVE_ACTION, 'U_OUTSIDER', e.approvalId);
     const rejected = (await auditRows()).filter((r) => r.action === 'denied' && r.meta.includes('not-approver'));
-    assert.equal(rejected.length, 2);
-    assert.deepEqual(rejected.map((r) => r.user_id).sort(), ['U1', 'U_RANDO']);
+    assert.deepEqual(rejected.map((r) => r.user_id).sort(), ['U1', 'U_OUTSIDER']);
+    assert.equal((await approvalRows())[0]?.status, 'pending');
     await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
     assert.equal(calls.length, 0, 'no grant existed after the rejected clicks');
+    assert.equal(dms.length, 1, 'the durable channel prompt is not re-posted');
 
-    // The real admin approves the SECOND prompt; the retry executes; audit credits the admin.
-    const e2 = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    await click(APPROVAL_APPROVE_ACTION, 'U_ADM', e2.approvalId);
+    // Another member approves; the retry executes exactly once, with the requester's credential.
+    const receipt: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', e.approvalId, receipt);
+    assert.match(String(receipt[0]?.text), /Approved/);
     const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST' });
     assert.equal(res.status, 200);
     assert.equal(calls.length, 1);
+    assert.equal(new Headers(calls[0].init?.headers).get('authorization'), `Bearer ${TOKEN}`, 'the requester\'s credential, never the approver\'s');
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(calls.length, 1, 'single-use');
     const consumed = (await auditRows()).find((r) => r.action === 'approval_consumed');
-    assert.equal(consumed.actor, 'U_ADM');
+    assert.equal(consumed.actor, 'U_MEMBER');
+    assert.equal(consumed.user_id, 'U1');
     // The requester was told their request was approved (ephemeral in the channel).
     assert.ok(ephemerals.some((p) => p.user === 'U1' && /approved/i.test(String(p.text))));
-    assert.equal(dms.length, 0);
   });
 });
 
-test('admin approval fan-out posts concurrently, staying inside the delivery lease', async (t) => {
-  const admins = Array.from({ length: 12 }, (_, i) => `U_ADM_${i}`);
-  let started = 0;
-  let releaseAll!: () => void;
-  const allStarted = new Promise<void>((resolve) => { releaseAll = resolve; });
-  const { ctx } = await harness(t, {
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    slackAdmins: admins,
-    members: ['U1', ...admins],
-    // Every admin post blocks until ALL of them have started. Sequential fan-out could never open
-    // that gate (the first post would wait on posts that never begin), so the flow settles only if
-    // the whole channel is prompted in one concurrent wave — the property that keeps a larger
-    // channel's fan-out inside the 30s lease (a sequential wave would let a replica take over and
-    // duplicate the controls). Proved by ordering, never by measuring wall time.
-    postEphemeral: async (p: { user: string }) => {
-      if (!admins.includes(p.user)) return {};
-      if (++started === admins.length) releaseAll();
-      await allStarted;
-      return {};
-    },
+test('member approver: a click whose signed channel differs from the request\'s channel decides nothing', async (t) => {
+  const { ctx, click, approvalRows, auditRows } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
   });
-  await withFetch(async () => {
+  await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
-    const prompted = expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
-    let ceiling: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        allStarted,
-        prompted.then(() => { throw new Error(`approval flow settled after only ${started}/${admins.length} admin posts`); }),
-        new Promise<never>((_, reject) => {
-          ceiling = setTimeout(() => reject(new Error(`admin fan-out was not concurrent: ${started}/${admins.length} posts started`)), 10_000);
-        }),
-      ]);
-    } finally {
-      if (ceiling) clearTimeout(ceiling);
-      releaseAll(); // never strand a blocked post behind a failed assertion
-    }
-    await prompted;
-    assert.equal(started, admins.length, 'every admin was prompted exactly once in the wave');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    const responds: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', e.approvalId, responds, undefined, { channel: 'C_OTHER', thread: 'TH1' });
+    assert.match(responds[0]?.text ?? '', /expired or was already decided/);
+    assert.equal((await approvalRows())[0]?.status, 'pending', 'the real pending request is untouched');
+    assert.ok(!(await auditRows()).some((r) => r.action === 'approved'));
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(calls.length, 0);
   });
 });
 
-test('a later-wave first delivery commits before its tail finishes, blocking a second replica', async (t) => {
+test('member approver: two members clicking at once on two Bolt instances yield exactly one decision', async (t) => {
   const url = await testDbUrl(t);
   const dbA = await openDb({ databaseUrl: url });
   const dbB = await openDb({ databaseUrl: url });
-  t.after(async () => {
-    await Promise.all([dbA.close(), dbB.close()]);
+  t.after(async () => { await Promise.all([dbA.close(), dbB.close()]); });
+  const provider = approvalProvider({ approval: { approver: 'member' } });
+  const { ctx, click, auditRows, approvalRows, client } = await harness(t, {
+    db: dbA, provider, members: ['U1', 'U_M1', 'U_M2'],
   });
-  const admins = Array.from({ length: 20 }, (_, i) => `U_ADM_${i}`);
-  let postsStarted = 0;
-  let promptSettled = false;
-  let signalFirst!: () => void;
-  let releaseTail!: () => void;
-  const firstPosted = new Promise<void>((resolve) => { signalFirst = resolve; });
-  const tailGate = new Promise<void>((resolve) => { releaseTail = resolve; });
-  const { ctx } = await harness(t, {
-    db: dbA,
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    slackAdmins: admins,
-    members: ['U1', ...admins],
-    postEphemeral: async () => {
-      const index = postsStarted++;
-      if (index < APPROVAL_FANOUT_CONCURRENCY) {
-        throw slackWebApiError(SlackErrorCode.PlatformError);
-      }
-      if (index === APPROVAL_FANOUT_CONCURRENCY) {
-        signalFirst();
-        return {};
-      }
-      await tailGate;
-      return {};
-    },
+  // A second replica over the same store, with its own registered Approve/Deny handlers.
+  const replica = await createVouchr({ providers: [provider], baseUrl: 'http://127.0.0.1:1', db: dbB });
+  const actionsB: Record<string, any> = {};
+  replica.registerCommands({ command: () => undefined, view: () => undefined, action: (id: string, h: any) => (actionsB[id] = h) });
+  const clickB = (clicker: string, value: string, responds: any[]) => actionsB[APPROVAL_APPROVE_ACTION]({
+    ack: async () => {},
+    body: { team: { id: 'T1' }, user: { id: clicker }, channel: { id: 'C1' }, container: { channel_id: 'C1', thread_ts: 'TH1' }, actions: [{ value }] },
+    client,
+    respond: async (m: any) => { responds.push(m); },
   });
-  await withFetch(async () => {
+  await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
-    const prompted = expectApprovalRequired(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }),
-    );
-    void prompted.then(
-      () => { promptSettled = true; },
-      () => { promptSettled = true; },
-    );
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    try {
-      await Promise.race([
-        firstPosted,
-        prompted.then(() => { throw new Error('approval flow settled before a later-wave delivery'); }),
-        new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(new Error('timed out waiting for a later-wave delivery')), 5_000);
-        }),
-      ]);
-      let row: { id: string; delivered_at: number | null } | undefined;
-      for (let attempt = 0; attempt < 100; attempt++) {
-        row = await dbB.get(`SELECT id, delivered_at FROM approval_request LIMIT 1`);
-        if (row?.delivered_at != null) break;
-        await new Promise((resolve) => setTimeout(resolve, 10));
-      }
-      assert.ok(row?.delivered_at != null, 'the first delivery was not committed on the shared store');
-      assert.ok(postsStarted > APPROVAL_FANOUT_CONCURRENCY, 'the first wave did not fail before delivery');
-      assert.equal(promptSettled, false, 'the best-effort tail unexpectedly finished before confirmation');
-      assert.deepEqual(
-        await new Approvals(dbB).claimDelivery(
-          row.id,
-          approvalDeliveryAudienceKey(row.id, 'admin', admins),
-        ),
-        { status: 'delivered' },
-        'a second replica must observe delivery instead of reclaiming the lease',
-      );
-    } finally {
-      if (timeout) clearTimeout(timeout);
-      releaseTail();
-      await prompted;
-    }
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    const a: any[] = [];
+    const b: any[] = [];
+    await Promise.all([click(APPROVAL_APPROVE_ACTION, 'U_M1', e.approvalId, a), clickB('U_M2', e.approvalId, b)]);
+    const texts = [a[0]?.text, b[0]?.text].map(String);
+    assert.equal(texts.filter((x) => /Approved/.test(x)).length, 1, `exactly one winner: ${texts.join(' | ')}`);
+    assert.equal(texts.filter((x) => /expired or was already decided/.test(x)).length, 1, 'the loser sees the fixed stale receipt');
+    const [row] = await approvalRows();
+    assert.equal(row.status, 'granted');
+    assert.ok(['U_M1', 'U_M2'].includes(row.approved_by));
+    assert.equal((await auditRows()).filter((r) => r.action === 'approved').length, 1, 'one decision audit row');
+    const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST' });
+    assert.equal(res.status, 200);
+    assert.equal(calls.length, 1);
+  });
+});
+
+test('member approver in a DM degrades to self: the requester is prompted privately and decides', async (t) => {
+  const { ctx, ephemerals, dms, click } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    channel: 'D0PERSONAL',
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(e.approver, 'self', 'no channel governs a DM, so the rule resolves to self');
+    assert.equal(dms.length, 0, 'no channel message');
+    assert.equal(ephemerals.length, 1);
+    assert.equal(ephemerals[0].channel, 'D0PERSONAL');
+    assert.equal(ephemerals[0].user, 'U1');
+    assert.match(JSON.stringify(ephemerals[0]), /as you on/);
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId, [], undefined, { channel: 'D0PERSONAL', thread: 'TH1' });
+    const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST' });
+    assert.equal(res.status, 200);
+    assert.equal(calls.length, 1);
   });
 });
 
@@ -1636,13 +1623,11 @@ test('an elapsed start budget sends nothing, releases its lease, and reports kno
   let monotonicNow = 0n;
   hrtime.bigint = () => monotonicNow;
   try {
-    for (const approver of ['self', 'admin'] as const) {
+    for (const approver of ['self', 'member'] as const) {
       monotonicNow = 0n;
-      const admin = approver === 'admin';
       const { ctx, approvalRows, ephemerals, dms } = await harness(t, {
         provider: approvalProvider({ approval: { approver } }),
-        slackAdmins: admin ? ['U_ADM'] : [],
-        members: admin ? ['U1', 'U_ADM'] : ['U1'],
+        members: ['U1', 'U_MEMBER'],
       });
       const approvals = (ctx as any).approvals;
       const realClaim = approvals.claimDelivery.bind(approvals);
@@ -1668,21 +1653,26 @@ test('an elapsed start budget sends nothing, releases its lease, and reports kno
   }
 });
 
-test('admin approver: deny notifies the requester ephemerally and audits the admin as actor', async (t) => {
-  const { ctx, ephemerals, click, auditRows } = await harness(t, {
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    slackAdmins: ['U_ADM'],
-    members: ['U1', 'U_ADM'],
+test('member approver: deny is retained (#296), notifies the requester ephemerally, and audits the member as actor', async (t) => {
+  const { ctx, ephemerals, click, auditRows, approvalRows } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
   });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
     const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    await click(APPROVAL_DENY_ACTION, 'U_ADM', e.approvalId);
+    await click(APPROVAL_DENY_ACTION, 'U_MEMBER', e.approvalId);
     const denied = (await auditRows()).find((r) => r.action === 'denied' && r.meta.includes('approval-denied'));
     assert.equal(denied.user_id, 'U1');
-    assert.equal(denied.actor, 'U_ADM');
+    assert.equal(denied.actor, 'U_MEMBER');
     const note = ephemerals.find((p) => p.user === 'U1' && /denied/i.test(String(p.text)));
     assert.ok(note, 'requester was notified of the denial');
+    const [row] = await approvalRows();
+    assert.equal(row.status, 'denied', 'the denial is persisted, not deleted');
+    assert.equal(calls.length, 0);
+    // No auto-retry: the same action re-asks with a NEW request rather than reviving the denied one.
+    const again = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.notEqual(again.approvalId, e.approvalId);
     assert.equal(calls.length, 0);
   });
 });
@@ -1778,14 +1768,12 @@ test('identical pending actions converge on one opaque id, prompt, and requested
   });
 });
 
-test('admin prompt: platform rejection across every recipient is definite and immediately retryable', async (t) => {
+test('member prompt: platform rejection of the channel message is definite and immediately retryable', async (t) => {
   let reject = true;
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows, ephemerals } = await harness(t, {
-    provider,
-    slackAdmins: ['U_ADMIN_A', 'U_ADMIN_B'],
-    members: ['U_ADMIN_A', 'U_ADMIN_B'],
-    postEphemeral: async () => {
+  const { ctx, approvalRows, dms } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
+    postMessage: async () => {
       if (reject) throw slackWebApiError(SlackErrorCode.PlatformError);
       return {};
     },
@@ -1798,26 +1786,24 @@ test('admin prompt: platform rejection across every recipient is definite and im
       /Slack rejected the approval prompt before delivery/i,
     );
     assert.ok(!error.message.includes(FOREIGN_SLACK_ERROR));
-    assert.equal(ephemerals.length, 2, 'fan-out tries every eligible admin before classifying failure');
+    assert.equal(dms.length, 1);
     assert.equal((await approvalRows()).length, 0, 'a definitely undelivered new request is removed');
 
     reject = false;
     await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    assert.equal(ephemerals.length, 4, 'the cleared delivery state allows an immediate fan-out retry');
+    assert.equal(dms.length, 2, 'the cleared delivery state allows an immediate retry');
     const [retried] = await approvalRows();
     assert.equal(retried?.delivery_token, null);
     assert.ok(retried?.delivered_at != null);
   });
 });
 
-test('admin prompt: rate limiting across every recipient is definite and immediately retryable', async (t) => {
+test('member prompt: rate limiting of the channel message is definite and immediately retryable', async (t) => {
   let reject = true;
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows, ephemerals } = await harness(t, {
-    provider,
-    slackAdmins: ['U_ADMIN_A', 'U_ADMIN_B'],
-    members: ['U_ADMIN_A', 'U_ADMIN_B'],
-    postEphemeral: async () => {
+  const { ctx, approvalRows, dms } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
+    postMessage: async () => {
       if (reject) throw slackWebApiError(SlackErrorCode.RateLimitedError);
       return {};
     },
@@ -1830,83 +1816,49 @@ test('admin prompt: rate limiting across every recipient is definite and immedia
       /Slack rate-limited the approval prompt before delivery/i,
     );
     assert.ok(!error.message.includes(FOREIGN_SLACK_ERROR));
-    assert.equal(ephemerals.length, 2, 'fan-out tries every eligible admin before classifying failure');
     assert.equal((await approvalRows()).length, 0, 'a definitely undelivered new request is removed');
-
     reject = false;
     await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    assert.equal(ephemerals.length, 4, 'the cleared delivery state allows an immediate fan-out retry');
+    assert.equal(dms.length, 2);
     assert.equal((await approvalRows()).length, 1);
   });
 });
 
-test('admin prompt: one ambiguous request failure dominates definite fan-out rejection', async (t) => {
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows, ephemerals, click } = await harness(t, {
-    provider,
-    slackAdmins: ['U_PLATFORM', 'U_REQUEST'],
-    members: ['U_PLATFORM', 'U_REQUEST'],
-    postEphemeral: async (payload) => {
-      throw slackWebApiError(
-        payload.user === 'U_PLATFORM' ? SlackErrorCode.PlatformError : SlackErrorCode.RequestError,
-      );
-    },
-  });
-  await withFetch(async () => {
-    const handle = await ctx.connect('acme');
-    const error = await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'retry_later',
-      /could not confirm approval-prompt delivery/i,
-    );
-    assert.ok(!error.message.includes(FOREIGN_SLACK_ERROR));
-    const [row] = await approvalRows();
-    assert.ok(row?.delivery_token, 'unknown outcome retains the live lease and request');
-    await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'retry_later',
-      /still being delivered/i,
-    );
-    assert.equal(ephemerals.length, 2, 'every admin was attempted, but no second fan-out starts during the live lease');
-    // Slack may have accepted before rejecting locally: the visible button remains decidable.
-    const receipt: any[] = [];
-    await click(APPROVAL_APPROVE_ACTION, 'U_REQUEST', row.id, receipt);
-    assert.match(receipt[0]?.text ?? '', /Approved/);
-    assert.equal((await approvalRows())[0]?.status, 'granted');
-  });
-});
-
-test('admin prompt: a bare rejected value still makes a mixed fan-out ambiguous and decidable', async (t) => {
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows, ephemerals, click } = await harness(t, {
-    provider,
-    slackAdmins: ['U_PLATFORM', 'U_BARE'],
-    members: ['U_PLATFORM', 'U_BARE'],
-    postEphemeral: (payload) => Promise.reject(
-      payload.user === 'U_PLATFORM' ? slackWebApiError(SlackErrorCode.PlatformError) : undefined,
-    ),
-  });
-  await withFetch(async () => {
-    const handle = await ctx.connect('acme');
-    await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'retry_later',
-      /could not confirm approval-prompt delivery/i,
-    );
-    const [row] = await approvalRows();
-    assert.ok(row?.delivery_token, 'even a bare ambiguous rejection retains the delivery lease');
-    await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'retry_later',
-      /still being delivered/i,
-    );
-    assert.equal(ephemerals.length, 2, 'the live lease prevents another fan-out');
-
-    const receipt: any[] = [];
-    await click(APPROVAL_APPROVE_ACTION, 'U_BARE', row.id, receipt);
-    assert.match(receipt[0]?.text ?? '', /Approved/);
-    assert.equal((await approvalRows())[0]?.status, 'granted');
-  });
+test('member prompt: an ambiguous channel-message failure retains the lease and stays decidable by a member', async (t) => {
+  for (const [name, reason] of [
+    ['request error', () => slackWebApiError(SlackErrorCode.RequestError)],
+    ['bare rejected value', () => undefined],
+  ] as const) {
+    await t.test(name, async (st) => {
+      const { ctx, approvalRows, dms, click } = await harness(st, {
+        provider: approvalProvider({ approval: { approver: 'member' } }),
+        members: ['U1', 'U_MEMBER'],
+        postMessage: () => Promise.reject(reason()),
+      });
+      await withFetch(async () => {
+        const handle = await ctx.connect('acme');
+        const error = await expectUserRecovery(
+          handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
+          'retry_later',
+          /could not confirm approval-prompt delivery/i,
+        );
+        assert.ok(!error.message.includes(FOREIGN_SLACK_ERROR));
+        const [row] = await approvalRows();
+        assert.ok(row?.delivery_token, 'unknown outcome retains the live lease and request');
+        await expectUserRecovery(
+          handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
+          'retry_later',
+          /still being delivered/i,
+        );
+        assert.equal(dms.length, 1, 'no second post starts during the live lease');
+        // Slack may have accepted before rejecting locally: the visible button remains decidable.
+        const receipt: any[] = [];
+        await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', row.id, receipt);
+        assert.match(receipt[0]?.text ?? '', /Approved/);
+        assert.equal((await approvalRows())[0]?.status, 'granted');
+      });
+    });
+  }
 });
 
 test('hostile Slack error proxies stay ambiguous without leaking their contents', async (t) => {
@@ -1943,29 +1895,6 @@ test('hostile Slack error proxies stay ambiguous without leaking their contents'
       });
     });
   }
-});
-
-test('admin prompt: rate limiting dominates platform rejection across a definite fan-out', async (t) => {
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows, ephemerals } = await harness(t, {
-    provider,
-    slackAdmins: ['U_PLATFORM', 'U_RATE'],
-    members: ['U_PLATFORM', 'U_RATE'],
-    postEphemeral: (payload) => Promise.reject(slackWebApiError(
-      payload.user === 'U_PLATFORM' ? SlackErrorCode.PlatformError : SlackErrorCode.RateLimitedError,
-    )),
-  });
-  await withFetch(async () => {
-    const handle = await ctx.connect('acme');
-    const error = await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'retry_later',
-      /Slack rate-limited the approval prompt before delivery/i,
-    );
-    assert.ok(!error.message.includes(FOREIGN_SLACK_ERROR));
-    assert.equal(ephemerals.length, 2);
-    assert.equal((await approvalRows()).length, 0, 'every send was definitely rejected');
-  });
 });
 
 test('definite rejection after an ambiguous approval takeover retains the old decidable row', async (t) => {
@@ -2017,10 +1946,9 @@ test('approval prompt confirmation drift reports resolve-again recovery', async 
 
 test('approval prompt confirmation failure reports an unknown outcome without leaking database text', async (t) => {
   const sentinel = 'RAW_DATABASE_CONFIRMATION_ERROR_MUST_NOT_ESCAPE';
-  const { ctx, approvalRows, ephemerals } = await harness(t, {
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    slackAdmins: ['U_ADM'],
-    members: ['U1', 'U_ADM'],
+  const { ctx, approvalRows, dms } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
   });
   (ctx as any).approvals.confirmDelivery = async () => { throw new Error(sentinel); };
   await withFetch(async () => {
@@ -2031,64 +1959,10 @@ test('approval prompt confirmation failure reports an unknown outcome without le
       /delivered, but Vouchr could not confirm its delivery state/i,
     );
     assert.ok(!error.message.includes(sentinel));
-    assert.ok(!JSON.stringify(ephemerals).includes(sentinel));
-    assert.deepEqual(ephemerals.map((prompt) => prompt.user), ['U_ADM']);
+    assert.ok(!JSON.stringify(dms).includes(sentinel));
+    assert.deepEqual(dms.map((prompt) => prompt.channel), ['C1']);
     const [row] = await approvalRows();
     assert.ok(row?.delivery_token, 'an unknown confirmation outcome must retain the delivery lease');
-  });
-});
-
-test('admin prompt: zero eligible admins leaves no parked row and a later eligible retry is prompted', async (t) => {
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows, admins, ephemerals } = await harness(t, {
-    provider,
-    members: ['U1'],
-  });
-  await withFetch(async () => {
-    const handle = await ctx.connect('acme');
-    await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'fix_configuration',
-      /could not find an approval decision surface/i,
-    );
-    assert.equal((await approvalRows()).length, 0);
-    assert.match(ephemerals[0]?.text, /no eligible admin/i);
-
-    admins.add('U1');
-    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    assert.equal((await approvalRows()).length, 1);
-    assert.ok(ephemerals.at(-1)?.blocks, 'the newly eligible admin receives an actionable prompt');
-  });
-});
-
-test('no-decision-surface cleanup drift reports resolve-again recovery', async (t) => {
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows } = await harness(t, { provider, members: ['U1'] });
-  (ctx as any).approvals.abandonDelivery = async () => false;
-  await withFetch(async () => {
-    const handle = await ctx.connect('acme');
-    await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'resolve_again',
-      /request changed before its undelivered state could be cleared/i,
-    );
-    assert.ok((await approvalRows())[0]?.delivery_token, 'cleanup drift cannot silently discard the request');
-  });
-});
-
-test('no-decision-surface cleanup failure reports retry-later recovery', async (t) => {
-  const provider = approvalProvider({ approval: { approver: 'admin' } });
-  const { ctx, approvalRows } = await harness(t, { provider, members: ['U1'] });
-  (ctx as any).approvals.abandonDelivery = async () => { throw new Error(FOREIGN_SLACK_ERROR); };
-  await withFetch(async () => {
-    const handle = await ctx.connect('acme');
-    const error = await expectUserRecovery(
-      handle.fetch('https://api.acme.test/repos', { method: 'POST' }),
-      'retry_later',
-      /no approval decision surface.*could not reset its request state/i,
-    );
-    assert.ok(!error.message.includes(FOREIGN_SLACK_ERROR));
-    assert.ok((await approvalRows())[0]?.delivery_token, 'failed cleanup cannot silently discard the request');
   });
 });
 
@@ -2277,7 +2151,7 @@ test('approval action acknowledges Slack before its first database lookup', asyn
   });
 });
 
-test('admin eligibility Slack reads happen before, never inside, the decision transaction', async (t) => {
+test('member eligibility Slack reads happen before, never inside, the decision transaction', async (t) => {
   const raw = await openTestDb(t);
   let insideTransaction = false;
   const wrapped: Db = {
@@ -2307,29 +2181,27 @@ test('admin eligibility Slack reads happen before, never inside, the decision tr
   };
   const { ctx, click } = await harness(t, {
     db: wrapped,
-    provider: approvalProvider({ approval: { approver: 'admin' } }),
-    slackAdmins: ['U_ADMIN'],
-    members: ['U_ADMIN'],
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
     onSlackRead: () => assert.equal(insideTransaction, false, 'Slack I/O must not pin a DB transaction'),
   });
   await withFetch(async () => {
     const handle = await ctx.connect('acme');
     const pending = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
-    await click(APPROVAL_APPROVE_ACTION, 'U_ADMIN', pending.approvalId);
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', pending.approvalId);
   });
 });
 
 for (const decision of ['approve', 'deny'] as const) {
-  test(`an admin offboarded during Slack eligibility checks cannot ${decision} a pending request`, async (t) => {
+  test(`a member offboarded during Slack eligibility checks cannot ${decision} a pending request`, async (t) => {
     let armed = false;
     let reachedSlackRead!: () => void;
     let releaseSlackRead!: () => void;
     const atSlackRead = new Promise<void>((resolve) => { reachedSlackRead = resolve; });
     const resumeSlackRead = new Promise<void>((resolve) => { releaseSlackRead = resolve; });
     const { vouchr, ctx, click, approvalRows, auditRows } = await harness(t, {
-      provider: approvalProvider({ approval: { approver: 'admin' } }),
-      slackAdmins: ['U_ADMIN'],
-      members: ['U1', 'U_ADMIN'],
+      provider: approvalProvider({ approval: { approver: 'member' } }),
+      members: ['U1', 'U_MEMBER'],
       onSlackRead: async () => {
         if (!armed) return;
         armed = false;
@@ -2347,7 +2219,7 @@ for (const decision of ['approve', 'deny'] as const) {
       armed = true;
       const deciding = click(
         decision === 'approve' ? APPROVAL_APPROVE_ACTION : APPROVAL_DENY_ACTION,
-        'U_ADMIN',
+        'U_MEMBER',
         pending.approvalId,
         responses,
       );
@@ -2355,7 +2227,7 @@ for (const decision of ['approve', 'deny'] as const) {
       await new Consent(vouchr.db).markOffboarded({
         enterpriseId: null,
         teamId: 'T1',
-        userId: 'U_ADMIN',
+        userId: 'U_MEMBER',
       });
       releaseSlackRead();
       await deciding;
