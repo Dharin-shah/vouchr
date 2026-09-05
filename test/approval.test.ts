@@ -764,6 +764,41 @@ test('P1-A(a): a grant minted for one credential owner cannot be consumed for an
   assert.ok(await approvals.consume(forOwner('U_OWNER_A')));
 });
 
+test('approval consumption matches governance scope exactly without burning the grant', async (t) => {
+  const db = await openTestDb(t);
+  const approvals = new Approvals(db);
+  const base = {
+    teamId: 'T1', userId: 'U_CALLER', ownerKind: 'user' as const, ownerId: 'U_OWNER',
+    credentialId: GENERATION, provider: 'acme', method: 'POST',
+    origin: 'https://api.acme.test', host: 'api.acme.test', path: '/repos', queryHash: '',
+    channel: 'GROUPDM01', thread: 'TH1',
+  };
+
+  // Exercise both directions. A personal-conversation grant cannot authorize the same Slack
+  // action after it is classified as governed, and a governed grant cannot be spent after the
+  // classification is changed to personal. The mismatched lookup must not burn the real grant.
+  for (const [storedScope, wrongScope] of [
+    [null, 'GROUPDM01'],
+    ['GROUPDM01', null],
+  ] as const) {
+    const stored = { ...base, governableChannel: storedScope };
+    const id = await approvals.request(stored);
+    assert.ok(await approvals.approve(id, 'U_APPROVER', 60_000));
+
+    assert.equal(
+      await approvals.consume({ ...base, governableChannel: wrongScope }),
+      null,
+      'a different governance classification must not consume the grant',
+    );
+    assert.deepEqual(
+      await approvals.consume(stored),
+      { approvedBy: 'U_APPROVER' },
+      'the exact persisted governance classification remains spendable',
+    );
+    assert.equal(await approvals.consume(stored), null, 'the exact grant remains single-use');
+  }
+});
+
 test('P1-A(b): reconnect invalidates the old handle and a new generation needs fresh approval', async (t) => {
   // Mint + approve a grant, then disconnect (vault.delete — the shared disconnect/offboard/revoke/
   // expiry primitive) and reconnect (vault.upsert). The old grant must be gone. Fail-before: without

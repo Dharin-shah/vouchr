@@ -116,6 +116,19 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
     /null value.*governable_channel/i,
     'fresh schemas reject approval rows without an explicit governance scope',
   );
+  await assert.rejects(
+    () => raw.run(
+      `INSERT INTO approval_request
+         (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,
+          origin,host,path,channel,thread,status,created_at,expires_at)
+       VALUES
+         ('00000000-0000-4000-8000-000000000097','action','T1','U1','user','U1',
+          '00000000-0000-4000-8000-000000000096','acme','POST','https://api.acme.test',
+          'api.acme.test','/write','C1','TH1','pending',1,9999999999999)`,
+    ),
+    /null value.*governable_channel/i,
+    'fresh schemas reject approval writers that omit the governance classification',
+  );
 
   // A second migrate on the same schema must be a no-op (idempotent), not error, same version.
   const second = await migrate({ databaseUrl: url });
