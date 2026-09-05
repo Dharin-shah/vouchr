@@ -53,6 +53,14 @@ test('a usage error never echoes the offending argument (SEC-1)', () => {
   }
 });
 
+test('--version prints the package version and nothing else', () => {
+  for (const flag of ['--version', '-v']) {
+    const res = run([flag]);
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(res.stdout.trim(), require('../package.json').version);
+  }
+});
+
 test('help lists only the commands the CLI implements', () => {
   const res = run(['help']);
   assert.equal(res.status, 0, res.stderr);

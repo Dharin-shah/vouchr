@@ -52,7 +52,7 @@ npm install @vouchr/core
 
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
-import { createVouchr, github, ConsentRequiredError } from '@vouchr/core';
+import { createVouchr, github, ConsentRequiredError, safeUserMessage } from '@vouchr/core';
 
 const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET! });
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
@@ -60,14 +60,17 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
 vouchr.install(app, receiver);
 
-app.event('app_mention', async ({ context, say }) => {
+app.event('app_mention', async ({ context, event, client, say }) => {
   try {
     const gh = await context.vouchr.connect('github');
     const me = await (await gh.fetch('https://api.github.com/user')).json();
     await say(`You're *${me.login}* on GitHub.`);
   } catch (error) {
-    if (!(error instanceof ConsentRequiredError)) throw error;
-    // Vouchr already posted a private Connect prompt — stop the turn.
+    if (error instanceof ConsentRequiredError) return; // Vouchr already posted a private Connect prompt.
+    // Any other refusal (provider not enabled here, egress blocked, …): fixed, secret-free copy,
+    // privately — then let Bolt log the error.
+    if (event.user) await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(error) });
+    throw error;
   }
 });
 ```
@@ -149,7 +152,9 @@ prompt from verified state. See the [hybrid architecture](./guides/HYBRID.md) an
 
 ## Status
 
-Beta. Every push runs the full test suite against real PostgreSQL, plus CodeQL and dependency
-checks. Want to help? See [CONTRIBUTING.md](./CONTRIBUTING.md).
+Beta: not yet independently assessed, and not production-ready until the gates in
+[vision.md](./vision.md#definition-of-production-ready) are met. Every push runs the full test suite
+against real PostgreSQL, plus CodeQL and dependency checks. Want to help? See
+[CONTRIBUTING.md](./CONTRIBUTING.md).
 
 License: [Apache-2.0](./LICENSE).

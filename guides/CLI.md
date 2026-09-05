@@ -13,8 +13,7 @@ npm run cli -- <command> [options]
 node --import tsx bin/vouchr.ts <command> [options]
 ```
 
-(The file has a `#!/usr/bin/env -S node --import tsx` shebang, so after `chmod +x`
-and `npm link`/install it can also be invoked as `vouchr`.)
+(Installed from npm, the package's `vouchr` bin runs the same compiled file: `npx vouchr <command>`.)
 
 ## Store selection (same env as the app)
 
@@ -170,3 +169,6 @@ vouchr prune --older-than-days 90 --yes      # delete, in bounded batches
 
 ### `help`
 Usage.
+
+### `--version`
+Prints the installed package version (also `-v`).

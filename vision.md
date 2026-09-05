@@ -1,8 +1,7 @@
 # Vouchr Vision
 
 **Status:** Adopted product direction, 2026-07-11
-**Current product stage:** Beta (`1.0.0-beta.1`); not yet independently assessed — see
-[Definition of production-ready](#definition-of-production-ready) for what remains
+**Current product stage:** Beta (`1.0.0-beta.1`)
 
 This document is the canonical product and scope direction for Vouchr. When an older design,
 assessment, example, or guide conflicts with it, this document wins for product direction.

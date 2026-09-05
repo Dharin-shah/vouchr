@@ -1,5 +1,5 @@
 import { App, ExpressReceiver } from '@slack/bolt';
-import { createVouchr, github, ConsentRequiredError } from '../../src';
+import { createVouchr, github, ConsentRequiredError, safeUserMessage } from '../../src';
 
 // 1. Bolt with an ExpressReceiver so Vouchr can mount the OAuth callback route.
 const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET! });
@@ -19,6 +19,9 @@ app.event('app_mention', async ({ context, event, client }) => {
     });
   } catch (e) {
     if (e instanceof ConsentRequiredError) return; // Connect prompt already posted.
+    // Any other refusal (provider not enabled in this channel, egress blocked, …): tell the user
+    // privately in Vouchr's fixed, secret-free copy, then let Bolt log the error.
+    if (event.user) await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(e) });
     throw e;
   }
 });
