@@ -79,12 +79,7 @@ export {
 } from './core/injector';
 export type { Resolvers, VouchrEvent, EventSink } from './core/injector';
 export { SECRET_REFERENCE_ERROR_CODES, SECRET_REFERENCE_SOURCES, SecretReferenceError } from './core/reference';
-export type {
-  SecretReference,
-  SecretReferenceErrorCode,
-  SecretReferenceInput,
-  SecretReferenceSource,
-} from './core/reference';
+export type { SecretReferenceErrorCode, SecretReferenceSource } from './core/reference';
 // Per-(owner, provider) rate limiting at the injection boundary (provider.rateLimit). The error is
 // exported so callers can catch/branch on a throttled fetch; the store type so a multi-instance
 // deployment can plug a shared backend via VouchrOptions/BrokerOptions.rateLimitStore.

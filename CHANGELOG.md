@@ -103,6 +103,17 @@ All notable changes to this project are documented here. This project adheres to
   guides/DEPLOYMENT.md § Migrations. (Superseded as the current version by v14 above; the v13
   conversion still runs unchanged on the way through.)
 
+### Removed
+
+- `SecretReference` is no longer re-exported from `@vouchr/core` / `@vouchr/core/headless` (ADOPT-1):
+  it is the internal normalized shape of the reference path and no exported function, option, or
+  response carries it.
+- `SecretReferenceInput` is no longer re-exported from either entry point (ADOPT-1): the same
+  internal path's `unknown`-typed input; `ConnectContext.referenceUserSecret`/`referenceChannelSecret`
+  and the `/v1/{admin,user}/reference` routes declare their own request shapes. `SecretReferenceError`,
+  `SECRET_REFERENCE_ERROR_CODES`/`SecretReferenceErrorCode`, and
+  `SECRET_REFERENCE_SOURCES`/`SecretReferenceSource` stay exported.
+
 ### Docs
 
 - HEADLESS.md gained a route index (every broker route, where the identity rides, and its exported
