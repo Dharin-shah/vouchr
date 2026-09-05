@@ -34,6 +34,7 @@ import {
   InteractionStateChangedError,
   POSTGRES_NOW_US_SQL,
   PROMPT_REDELIVERY_DEBOUNCE_US,
+  usFromMs,
 } from '../src/core/interaction';
 import { mapSafeError, type VouchrRecovery } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
@@ -291,6 +292,14 @@ async function sessionHarness(t: TestContext, o: {
   };
   await vouchr.middleware(middlewareArgs);
   const freshContext = async (): Promise<ConnectContext> => {
+    // The receipt conversion backdates a fresh event by one PostgreSQL round trip (fail closed), so a
+    // context minted right after a provisioning write can be fenced as OLDER than that write on a slow
+    // runner: setChannelSecret then throws ChannelProvisioningStaleError before the test reaches what
+    // it asserts (#317 CI, Node 24 job). Same margin as approval.test.ts (#306): let the PostgreSQL
+    // clock move past one slow round trip before the context's receipt instant is taken.
+    const floor = await vouchr.vault.userProvisioningIssuedAt();
+    do { await new Promise((resolve) => setTimeout(resolve, 250)); }
+    while (await vouchr.vault.userProvisioningIssuedAt() <= floor + usFromMs(250));
     const args = { ...middlewareArgs, context: {} };
     await vouchr.middleware(args);
     return args.context.vouchr as ConnectContext;
@@ -1442,7 +1451,7 @@ test('cross-pool reconnect after session grant check cannot make connect adopt t
   const releaseP = new Promise<void>((resolve) => { release = resolve; });
   const db: Db = {
     get: async (sql, params) => {
-      if (blockExactRead && /SELECT \* FROM connection/.test(sql) && /AND id=\?/.test(sql)) {
+      if (blockExactRead && /FROM connection\s+WHERE/.test(sql) && /AND id=\?/.test(sql)) {
         reached();
         await releaseP;
       }

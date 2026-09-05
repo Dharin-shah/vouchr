@@ -1689,7 +1689,10 @@ export class ConnectContext {
       // resolved → fall through to the stored-credential / consent tail below (as before).
     }
 
-    if (credentialId && await this.vault.get(owner, providerId, undefined, credentialId)) {
+    // Metadata-only, TTL-aware read of the EXACT generation bound above: the same linearization point
+    // the decrypting read gave (a cross-pool reconnect landing after the session check still falls
+    // through to consent), without a KMS unwrap the handle's fetch() is about to repeat.
+    if (credentialId && await this.vault.getAccount(owner, providerId, credentialId)) {
       return this.notifyApprovalRequired(this.notifyRateLimited(new ConnectionHandle(
         provider, owner, this.identity, this.vault, this.audit, this.resolvers, this.inflight, this.sink, this.auditSink,
         this.channel, // origin channel: attribute this user's usage to the channel it happened in (stats)
@@ -1975,7 +1978,7 @@ export class ConnectContext {
       throw new Error(`Channel "${channel}" uses ${m} credentials for "${providerId}"; use connect() instead.`);
     }
     const credentialId = await this.vault.liveId(owner, providerId);
-    if (!credentialId || !(await this.vault.get(owner, providerId, undefined, credentialId))) {
+    if (!credentialId || !(await this.vault.getAccount(owner, providerId, credentialId))) { // exact row, no decrypt
       // Typed (code 'not_connected', owner 'channel' → recovery 'fix_configuration'): the same fact
       // the broker's shared-owner 409 reports, so the recovery bridge and in-process hosts branch on
       // one class instead of prose. Message text unchanged.
