@@ -440,9 +440,9 @@ against the configured provider registry at boot and evaluation uses only the si
 Static policy and mutable `ChannelTools` intersect, so an admin enable cannot override an operator
 deny and a policy allow cannot override a disabled channel tool.
 
-`ChannelConfig` and `ChannelTools` are public read stores. Their former raw `setMode`, `setEnabled`,
-and `applyEnabled` methods are removed in v10 because they could bypass interaction invalidation and
-audit. Use `POST /v1/admin/mode` and `POST /v1/admin/tools` (or packaged Bolt/App Home) for writes.
+`ChannelConfig` and `ChannelTools` are public read stores with no raw write methods — a direct
+write could bypass interaction invalidation and audit. Use `POST /v1/admin/mode` and
+`POST /v1/admin/tools` (or packaged Bolt/App Home) for writes.
 
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).

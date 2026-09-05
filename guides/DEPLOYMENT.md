@@ -179,12 +179,8 @@ Point the migrate step at `vouchr_owner` and the runtime at `vouchr_app`. The `/
 reflects schema readiness: it returns `503` until the database has been migrated to the current
 version, and `200` once the runtime can reach a current schema.
 
-### Breaking upgrade — no SQLite import
-
-Vouchr is greenfield/pre-1.0 and PostgreSQL-only. There is **no** SQLite importer and **no** data
-migration from any prior embedded store: the upgrade path is a **fresh PostgreSQL database** that
-you `vouchr migrate`. Any data in a previous SQLite file is not imported — re-connect accounts in
-the new Postgres-backed deployment.
+Upgrading from `0.2.0` (pre-PostgreSQL): there is no SQLite importer and no data migration — start
+from a fresh PostgreSQL database (`vouchr migrate`) and re-connect accounts.
 
 Multi-instance notes:
 - All instances share one Postgres; credentials are isolated by `team_id`, so multiple workspaces
@@ -396,7 +392,7 @@ provider redirect lands on a v14 replica whose flag is off (rollout, config drif
 mode is also part of the consent generation's identity: a connect handled under the other mode
 supersedes a still-pending prompt and mints a fresh generation, so a flag flip never leaves a
 verify-hop URL over an unenforced row or an un-completable direct URL over an enforced one. Do not
-enable the flag while any pre-v14 (v13) process is still live — see
+enable the flag while any pre-v14 process is still live — see
 [v13 → v14](#v13--v14-browser-slack-identity-verification-302) for the required order. Slack's
 OIDC endpoints are fixed and not
 configurable: the id_token is accepted from Slack's token endpoint over TLS without signature
@@ -448,31 +444,7 @@ cannot be replayed against deployment B, and fails closed on weak configuration:
   fleet's tokens. During a staged rotation, active-key order differs temporarily by design while the
   two-key verification set remains compatible.
 
-**Upgrade from an older bare-secret broker.** The packaged broker now requires deployment-bound
-configuration. Do not roll brokers before their trusted minter:
-
-1. Keep the existing signing secret, choose `VOUCHR_DEPLOYMENT_ID`, and upgrade the minter first so it
-   uses `loadIdentityConfig` and emits `iss`/`aud`/`iat`/`kid`. An older broker verifies that signature
-   with the same secret and ignores the additive bound claims.
-2. After every minter emits bound assertions, let the old 5-minute maximum token lifetime plus the
-   30-second verifier allowance elapse. This avoids turning an already-issued unbound assertion into
-   a user-visible failure when the new broker intentionally rejects it.
-3. Perform the broker format change as a **drained cutover, not an ordinary rolling overlap**. Stop
-   all old broker replicas and pause broker traffic; after the last old replica stops, keep the
-   broker unavailable for the conservative 90-second cluster-skew horizon, then start the new
-   replicas together with the same deployment id, issuer, and secret. Old replicas prune replay rows
-   at raw expiry, while new replicas deliberately retain them through clock tolerance; the short
-   no-broker gap ensures a row removed by an old pruner cannot be accepted by a new verifier.
-4. Resume broker traffic, then rotate the signing key only after every replica is on the bound
-   format. Normal active/previous key rotations below remain rolling and downtime-free.
-
-If the existing secret is shorter than 32 bytes, a known placeholder, or reused for another purpose,
-it cannot enter the overlap set. Drain identity-token traffic for the old token lifetime plus clock
-tolerance, stop every old broker for the same conservative 90-second gap, then cut the minter and
-brokers over together during a maintenance window with a new random secret. Do not weaken the
-validator to carry an unsafe legacy key forward.
-
-**Rolling key rotation (no downtime, after the format upgrade).** Use two rollout phases; changing the
+**Rolling key rotation (no downtime).** Use two rollout phases; changing the
 active key everywhere in one ordinary rolling deployment is unsafe because a new token can land on an
 old replica that has never seen that key.
 
@@ -898,9 +870,7 @@ The headless broker can **revoke** credentials, not just inject them — the two
   mutators.
   The numeric result remains the expired-credential count for compatibility even though all lifecycle
   families are swept. The operation is idempotent, so overlapping runs across replicas are safe.
-  **Note:** the
-  default TTL now matches the Bolt path — a pure-headless deployment that previously kept credentials
-  forever will start expiring them; set both TTL vars to `0` to preserve unbounded lifetime.
+  Set both TTL vars to `0` for unbounded credential lifetime.
 
 For in-process control, `offboardUser`, the lower-level core `sweepExpired`, and `disconnectProvider`
 are exported from the package root. A direct broker must use its own `server.sweepExpired()` method so
@@ -966,7 +936,7 @@ Vouchr ships two ways; pick by how your platform builds:
 
   **`:latest` is stale — do not use it.** The release workflow tags images with the exact version
   (`type=semver`), and `latest` only moves on a *stable* release, so it still points at the
-  pre-PostgreSQL `0.2.0` image. Use the explicit version tag (`1.0.0-beta`) or, better, the digest
+  pre-PostgreSQL `0.2.0` image. Use the explicit version tag (`1.0.0-beta.1`) or, better, the digest
   you verified below.
 
 ### Running the image
@@ -975,7 +945,7 @@ Migrate first, then start the broker. Both use the same image; the migrate step 
 schema-owner URL and the runtime the DML-only one (see [Migrations](#migrations)):
 
 ```bash
-IMAGE=ghcr.io/dharin-shah/vouchr-broker:1.0.0-beta
+IMAGE=ghcr.io/dharin-shah/vouchr-broker:1.0.0-beta.1
 docker run --rm -e VOUCHR_DATABASE_URL="postgres://vouchr_owner:...@host:5432/vouchr" \
   "$IMAGE" node dist/bin/vouchr.js migrate
 docker run -d --name vouchr-broker -p 3000:3000 \

@@ -92,8 +92,7 @@ all decided in one place; an adapter only supplies verified inputs (e.g.
 
 For trusted custom adapters only: `Consent.begin()` and `beginFenced()` return the minimal
 `ConsentRequest` `{ authorizeUrl, state }`, and `Consent.consume()` returns the classified
-claim directly. This is a greenfield breaking contract — there is no legacy nullable-row
-wrapper, and the internal callback row (including PKCE material) is not a root-package
+claim directly. The internal callback row (including PKCE material) is not a root-package
 export. Prefer the packaged Bolt or broker callback path unless implementing another
 trusted adapter.
 

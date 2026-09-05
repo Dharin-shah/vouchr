@@ -22,8 +22,9 @@ Only the current release line is supported with fixes.
 
 | Version | Supported |
 | --- | --- |
-| `1.0.0-beta` | ✅ current release (PostgreSQL-only, deny-by-default) |
-| `< 1.0` | ❌ superseded — upgrade to `1.0.0-beta` (breaking; greenfield, no data migration) |
+| `1.0.0-beta.1` | ✅ current release — beta; PostgreSQL-only, deny-by-default, not yet independently assessed |
+| `1.0.0-beta` | ❌ superseded — upgrade to `1.0.0-beta.1` (security fixes, no schema change) |
+| `< 1.0` | ❌ superseded — upgrade to `1.0.0-beta.1` (breaking; greenfield, no data migration) |
 
 ## Scope
 
