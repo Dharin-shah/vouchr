@@ -57,6 +57,15 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- Two concurrent clicks on the same Disconnect button (or two deliveries of one click) now end in
+  one `Disconnected` receipt, one "no longer current" receipt, and a single `revoke` audit row. The
+  loser used to report "nothing to disconnect" when the exact generation it snapshotted at
+  authorization was already deleted by the time its own delete ran; that mismatch is now the stale
+  verdict, as on every other double-decision path (#327).
+- A real user credential write (`vault.upsert`/`reference`, the OAuth callback) is no longer refused
+  as stale by a dry-run row that landed after the write's issuance. The newest-generation fence keeps
+  its fail-closed `>=` comparison, but a synthetic row now fences only other synthetic writes, so the
+  real row survives every interleaving of the `examples/dry-run` P1-B race (#116, #327).
 - The reused-Connect-prompt copy (`ConsentRequiredError` with `promptState: 'reused'` and its
   `mapSafeError` text) tells the person to ask again in 30 seconds, the re-delivery window an
   in-channel ephemeral actually has since #276, instead of the pre-#276 "up to 10 minutes". The
