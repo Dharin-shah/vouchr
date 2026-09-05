@@ -27,10 +27,15 @@ import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/hea
 
 `@vouchr/core/headless` re-exports exactly the headless surface — `createBroker`, its `BrokerServer`
 type, `buildBrokerServer` (env → wired server), identity minting/verification, providers, the owner
-model, and the low-level building blocks (`openDb`, `Vault`, `Audit`, `Consent`, `sweepExpired`,
-`Policy`, `ChannelTools`) — plus the typed wire response types (`BrokerFetchResponse`,
-`BrokerStatusResponse`, `BrokerAdminConfigResponse`, …), typed operational errors, and the Bolt-free
-`mapSafeError` recovery mapper. The root `@vouchr/core` entry exports the same error contract plus the
+model, and the low-level building blocks (`openDb`/`migrate` and their `DbOptions`, `Vault`, `Audit`,
+`Consent`, `sweepExpired`, `Policy`, `ChannelTools`) — plus the typed wire request types
+(`BrokerFetchRequest`, `BrokerMcpRequest`, `BrokerAuthorizationRequest`, and the `ConnectionHandleRef`
+`handle` they carry) and response types (`BrokerFetchResponse`, `BrokerResolveResponse`,
+`BrokerStatusResponse`, `BrokerConnectResponse`, `BrokerManifestResponse`,
+`BrokerChannelManifestResponse`, `BrokerAdminOkResponse`, `BrokerAdminConfigResponse`,
+`BrokerAuditResponse`, `BrokerAuthorizationResponse`, `BrokerError`, and the `BrokerConsentState`
+union — `connected` | `needs_consent` — the resolve/status bodies use), typed operational errors, and
+the Bolt-free `mapSafeError` recovery mapper. The root `@vouchr/core` entry exports the same error contract plus the
 Bolt adapter; neither entry exports the internal session/approval mutation stores.
 
 A directly constructed broker owns those private stores. Schedule the safe method on the returned
@@ -52,7 +57,8 @@ the cleanup commits.
 The lower-level core `sweepExpired(vault, audit, consent, …)` export remains for non-broker lifecycle
 integrations, but it does not own a broker's private interaction stores and is not a substitute for
 this method. The returned number counts expired credential deletions; all interaction families are
-still swept on every call.
+still swept on every call. `TtlPolicy` (`{ idleMs?, maxAgeMs? }`) is the `Vault` constructor's
+credential idle/max-age bound that the sweep enforces.
 
 Headless is primarily the credential **use path**, not a replacement for Slack consent. Users still
 connect or approve access through the Slack app first (or through the headless OAuth flow when it is
@@ -70,6 +76,11 @@ const identityToken = mintIdentity(
   identity,
 );
 ```
+
+`mintIdentity` takes a `MintIdentityInput` (the acting-human fields; it fills a fresh `jti` and a
+ceiling-clamped `exp` for you) and produces the same HS256 token the lower-level
+`signIdentity(claims: IdentityClaims, secret)` does for a minter that manages those itself. Any
+verification failure on the broker is an `IdentityError` (401; the message carries no token material).
 
 > [!WARNING]
 > **The signing key stays in that Slack-facing service — never in the worker.** It is the broker's
@@ -110,10 +121,12 @@ returns only the provider response.
 Both package entrypoints (`@vouchr/core` and `@vouchr/core/headless`) export the same Bolt-free
 error contract. `mapSafeError()` returns `{ code, message, retryable, recovery, retryAfterMs? }`;
 `retryAfterMs` is always milliseconds, and `recovery` is one of `connect`, `request_approval`,
-`resolve_again`, `retry_later`, `fix_configuration`, or `contact_admin`. The exported
-`VOUCHR_ERROR_CODES` / `VOUCHR_RECOVERY_ACTIONS` are the runtime registries, and token failures
-also publish the closed `TOKEN_ENDPOINT_FAILURE_KINDS` registry (`credential`, `configuration`, or
-`transient`). The fixed `message` is safe to render privately, but remains presentation text, not
+`resolve_again`, `retry_later`, `fix_configuration`, or `contact_admin` (the exported `VouchrRecovery`
+union). The exported `VOUCHR_ERROR_CODES` / `VOUCHR_RECOVERY_ACTIONS` are the runtime registries,
+token failures also publish the closed `TOKEN_ENDPOINT_FAILURE_KINDS` registry (`credential`,
+`configuration`, or `transient`; the `TokenEndpointFailureKind` union), and `SecretReferenceError.code`
+is drawn from `SECRET_REFERENCE_ERROR_CODES` (the `SecretReferenceErrorCode` union). The fixed
+`message` is safe to render privately, but remains presentation text, not
 control flow. Foreign errors — including custom provider, resolver, KMS, and database messages —
 map to fixed `internal_error` copy without revealing their message or class name. `UserFacingError`
 is the deliberate exception: constructing it explicitly opts Vouchr-authored fixed text into
@@ -518,16 +531,22 @@ or `VOUCHR_POLICY_FILE`; see the deployment guide's
 [strict JSON contract](./DEPLOYMENT.md#static-channel-policy-declarative). Policy keys are validated
 against the configured provider registry at boot and evaluation uses only the signed channel claim.
 Static policy and mutable `ChannelTools` intersect, so an admin enable cannot override an operator
-deny and a policy allow cannot override a disabled channel tool.
+deny and a policy allow cannot override a disabled channel tool. A direct `new Policy(rules, …)`
+takes a provider-keyed map of `PolicyRule` (`{ defaultAllow, allowChannels?, denyChannels? }`), the
+typed form of that JSON contract.
 
 `ChannelConfig` and `ChannelTools` are public read stores with no raw write methods — a direct
 write could bypass interaction invalidation and audit. Use `POST /v1/admin/mode` and
-`POST /v1/admin/tools` (or packaged Bolt/App Home) for writes.
+`POST /v1/admin/tools` (or packaged Bolt/App Home) for writes. A channel mode is the `ChannelMode`
+union (`shared` | `per-user` | `session`); `CHANNEL_MODES` is its runtime list and `isChannelMode`
+the guard, so a host rendering its own mode picker never hard-codes them.
 
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).
 Both routes validate a bounded supported reference form, derive its source server-side, and require a
-configured resolver function before any credential, mode, or audit write. A compatibility
+configured resolver function before any credential, mode, or audit write. The supported sources are
+`SECRET_REFERENCE_SOURCES` (`aws-sm`, `gcp-sm`, `azure-kv`, `vault`; the `SecretReferenceSource`
+union), also the `referenceSources` argument of the exported modal builders. A compatibility
 `source` field may be supplied only when it exactly matches that derived source; optional scopes
 must be a bounded unique subset of the provider's declared scopes. Saving does not invoke the
 resolver or prove IAM, network, or secret availability; resolution remains just in time at
@@ -573,6 +592,15 @@ Legacy assertions without a verified `iat` fail closed at the production broker 
   signing secret, encryption keys, broker bearer, and provider OAuth client secrets; the equality
   check is enforced, not advisory. See the deployment guide for the required upgrade and rotation
   order.
+- **Browser Slack identity (#302).** `requireBrowserSlackIdentity: true` on `createBroker` (or
+  `createVouchr`) also needs `slackOidc`, a `SlackOidcOptions` `{ clientId, clientSecret }` for the
+  Slack app; construction fails closed without it. The rollout order is in the deployment guide.
+- **Break-glass revocation (#239).** `revokeAllCredentials(db, deps: RevokeAllDeps, { execute })` is
+  the primitive behind `vouchr revoke --all`: `RevokeAllDeps` is `{ vault, audit, registry? }`, and
+  the returned `RevokeAllReport` holds counts only — `matched: RevokeLocalCounts` per table, and one
+  `RevokeProviderReport` per registered provider whose `upstream` buckets are keyed by
+  `RevokeCategory` (`revoked`, `revoke_failed`, `unsupported`, `undecryptable`, `unresolved`,
+  `external_reference`, `would_attempt` on dry-run, `synthetic`).
 - **Replay protection.** Automatic when you use a shared database — every db-configured broker
   uses the durable PostgreSQL `DbReplayStore`, so a `jti` spent on one pod is rejected on the others.
   The replay store is not configurable; the exported in-memory `ReplayGuard` is only for direct

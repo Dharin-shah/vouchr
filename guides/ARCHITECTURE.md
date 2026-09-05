@@ -73,7 +73,8 @@ Two phases:
 
 The security logic lives in `src/core/`, which is **transport-agnostic**: it imports
 nothing from `@slack/*` or `src/adapters/`. The Bolt adapter (`src/adapters/bolt.ts`)
-is a thin consumer: it resolves identity and channel from verified Slack events, fetches
+is a thin consumer: it resolves identity (a `SlackIdentity`: `{ enterpriseId, teamId, userId }`)
+and channel from verified Slack events, fetches
 Slack-side facts (admin status, channel class), and delegates every security decision to
 core.
 
@@ -175,9 +176,11 @@ may also be `vault` for HashiCorp Vault, so `source` alone does not distinguish 
 ## Provider model
 
 A `Provider` is **declarative OAuth2** (`src/core/providers.ts`): `authorizeUrl`,
-`tokenUrl`, `scopesDefault`, a `refresh` strategy (`rotating` / `static` / `none`),
-`pkce`, and an `egressAllow` host list. Built-ins: `github()`, `google()`, `gitlab()`,
-`notion()`; most custom providers are ~10 lines via `defineProvider`. Knobs cover
+`tokenUrl`, `scopesDefault`, a `refresh` strategy (`rotating` / `static` / `none`, the
+`RefreshStrategy` type), `pkce`, and an `egressAllow` host list. Built-ins: `github()`, `google()`,
+`gitlab()`, `notion()`, `databricks()`; each takes a `ProviderConfig` (`clientId`, `clientSecret`,
+`scopes`, the finer egress knobs), and `databricks()` a `DatabricksConfig` that adds the required
+workspace `host`. Most custom providers are ~10 lines via `defineProvider`. Knobs cover
 real-world divergence without special-casing: `tokenAuth: 'basic'` and
 `bodyFormat: 'json'` (Notion), `authorizeParams` (Google's `access_type=offline`),
 `inject` (non-Bearer attach, e.g. `x-api-key`).
@@ -186,8 +189,9 @@ real-world divergence without special-casing: `tokenAuth: 'basic'` and
   key or an external reference into a private modal.
 - **Revoke** is declarative (RFC 7009 `revokeUrl` + optional `revokeAuth: 'body'`) with a
   `revoke` function escape hatch for non-standard endpoints (GitHub's DELETE + Basic
-  auth). `revokeTarget` declares whether complete invalidation requires the access token, refresh
-  token, both, or one grant-level operation; refresh-capable revocable providers must be explicit.
+  auth). `revokeTarget` (`RevokeTarget`: `access` / `refresh` / `both` / `grant`) declares whether
+  complete invalidation requires the access token, refresh token, both, or one grant-level
+  operation; refresh-capable revocable providers must be explicit.
   Honest no-op when a provider has no documented endpoint (Notion).
 - **Envelope encryption** is runtime-optional (`EnvelopeProvider`, `src/core/crypto.ts`): a fresh
   per-secret data key encrypts each secret and is wrapped by an external KEK (KMS/Vault). The
