@@ -204,13 +204,13 @@ In your Slack workspace, `#demo` channel:
 
 1. **Invite the bot to the channel** once: `/invite @vouchr`.
 2. **Enable GitHub in the channel** once — channels are deny-by-default: a channel admin runs
-   `/vouchr enable github` in `#demo`. Without it the first mention is refused with *"This provider is
-   disabled in the channel."* A direct message needs no enable — DMs are personal, not governed.
+   `/vouchr enable github` in `#demo`. Without it the first mention gets a private *"This provider is
+   disabled in the channel. Contact an eligible admin."* A direct message needs no enable — DMs are personal, not governed.
 3. **Mention it:** `@vouchr who am I on github?` (any text works — the mention is the trigger).
    → Vouchr posts a **private** *"Connect your GitHub account"* message with a **Connect** button.
    *Narrate: only you can see this — it's an ephemeral, not a channel post.*
 4. **Click Connect** → your browser opens GitHub's authorize screen → **Authorize** → you land on a
-   plain *"You're connected"* page.
+   plain *"github connected"* page that names the Slack user it is linked to.
 5. **Mention it again:** `@vouchr who am I on github?`
    → In-thread reply: **`You are *yourlogin* on GitHub, N public repos.`**
 6. **Land the point** (this is the whole pitch): the bot code just ran

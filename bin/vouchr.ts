@@ -515,7 +515,7 @@ async function cmdRekey(db: Db, f: Flags): Promise<number> {
   try {
     ring = loadKeyring();
   } catch {
-    console.error('rekey: master key configuration is invalid');
+    console.error('rekey: master key configuration is invalid — set VOUCHR_MASTER_KEYS to id:base64key entries (first = primary)');
     return 2;
   }
   const dryRun = f['dry-run'] === true;
@@ -556,7 +556,7 @@ async function cmdDoctor(f: Flags): Promise<number> {
     if (ring.primary.id === null && ring.legacy.length === 1) pass('master key', '32 bytes');
     else pass('master key', `${ring.legacy.length} keys; new writes under '${ring.primary.id}'`);
   } catch {
-    fail('master key', 'invalid');
+    fail('master key', 'invalid — set VOUCHR_MASTER_KEY (openssl rand -base64 32) or VOUCHR_MASTER_KEYS');
   }
 
   // 2. Backend in use (informational).
@@ -675,6 +675,7 @@ Commands:
                 --batch <N>            rows per delete (default 10000)
                 --yes                  actually delete (default is a dry-run count)
   help        This message.
+  --version   Print the installed package version.
 
 Store selection (shared with the app):
   --db <url>             PostgreSQL connection string (overrides VOUCHR_DATABASE_URL)
@@ -764,6 +765,11 @@ async function main(): Promise<number> {
     case '-h':
       usage();
       return 0;
+    case '--version':
+    case '-v':
+      // Package self-reference: resolves from the repo (tsx) and from an installed copy (dist).
+      console.log(require('@vouchr/core/package.json').version);
+      return 0;
     default:
       // `cmd` is raw argv and may be a credential pasted in the wrong position (SEC-1).
       console.error('Unknown command.\n');
@@ -778,6 +784,6 @@ main()
     // Database drivers and extension points can put connection strings, provider payloads, or
     // credential material in thrown values. The command-specific paths above already print safe
     // usage diagnostics; an unexpected top-level failure must stay deliberately opaque (SEC-1).
-    console.error('vouchr: command failed');
+    console.error('vouchr: command failed. Run `vouchr doctor` to diagnose.');
     process.exit(1);
   });

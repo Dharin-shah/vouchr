@@ -418,7 +418,7 @@ test('CLI top-level failures never serialize database-provided error text (SEC-1
     { encoding: 'utf8' },
   );
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /^vouchr: command failed\s*$/);
+  assert.match(result.stderr, /^vouchr: command failed\. Run `vouchr doctor` to diagnose\.\s*$/);
   assert.doesNotMatch(result.stderr + result.stdout, new RegExp(secret));
 });
 

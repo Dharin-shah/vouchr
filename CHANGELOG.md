@@ -31,8 +31,26 @@ All notable changes to this project are documented here. This project adheres to
   `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
   guides/DEPLOYMENT.md § "Browser Slack-identity verification".
 
+### Added
+
+- `vouchr --version` (also `-v`) prints the installed package version; it was an unknown command.
+
+### Fixed
+
+- The `bolt-github` example and the README snippet post Vouchr's fixed, secret-free copy as a
+  private message when `connect()` refuses for a reason other than consent (for example, the
+  provider is not yet enabled in the channel) instead of failing silently (UX-1).
+- The `vouchr` CLI's catch-all failure now says what to do next (`Run \`vouchr doctor\` to
+  diagnose.`), and `doctor` / `rekey` name the master-key variable to set when it is missing or
+  invalid; the existing `vouchr: command failed`, `FAIL master key: invalid`, and
+  `rekey: master key configuration is invalid` prefixes are unchanged.
+
 ### Changed
 
+- README is a short overview (what, the problem, one example, modes, providers, headless, links);
+  the Beta callout is gone and the status badge is the status signal. `vision.md` and
+  `SECURITY.md` no longer list an independent security assessment as a release gate (operator
+  decision); the remaining production-ready gates are unchanged.
 - Pre-beta schema markers (v6-v11) are no longer migratable — they never shipped in a published
   release; `vouchr migrate` refuses them with the same recreate-fresh error v1-v5 get (recreate
   the database fresh, or migrate through 1.0.0-beta.1 first). Only v12-v14 remain migratable.
