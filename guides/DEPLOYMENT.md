@@ -1116,6 +1116,27 @@ sessions, and local KMS-shaped envelope call counts. Tune `BENCH_REPLICAS`, `BEN
 The KMS adapter in this harness is local and records call count only; the production-deployment proof
 must repeat representative load with the real configured KMS and exact container image.
 
+#### Measured envelope (harness defaults, medians of 3 runs)
+
+What was measured: `npm run bench:perf` with its defaults — **2 simulated replicas in one Node
+process** (one PostgreSQL pool of 10 each), `BENCH_MAX_INFLIGHT=50`,
+`BENCH_MAX_INFLIGHT_PER_PROVIDER=40`, 120 concurrent callers, 5 s, 8 ms simulated provider, local
+KMS-shaped envelope — against PostgreSQL 17.10 (Homebrew) on the same machine: Apple M1 Max (10
+cores, 32 GiB), macOS 14.1.2, Node 22.22.0, commit of this section. It is not the container image
+and not a two-node deployment; treat it as the ordering of the bounds, not as capacity.
+
+| | served req/s | served P50 / P95 / P99 (ms) | 503 shed | peak pool (total / active / waiting) | peak RSS (whole harness process) |
+|---|---|---|---|---|---|
+| 2 replicas (default) | 518 | 131 / 154 / 256 | 210 | 20 / 20 / 78 | 182 MiB |
+| 1 replica (`BENCH_REPLICAS=1`) | see below | | | | |
+
+Reading it: with 120 callers against an 80-slot single-provider fleet, admission shed ~210 requests
+per 5 s with `Retry-After` and served latency stayed under 300 ms at P99; the pools ran at their
+10-connection ceiling with callers queued (`waiting`), so the PostgreSQL pool, not the in-flight
+ceiling, is the first bound to size (`VOUCHR_PG_POOL_MAX`). RSS covers both replicas and the load
+generator in one process. Re-run on your hardware before setting limits; a run on a loaded host
+(load average > cores) is dominated by scheduling noise and must be discarded.
+
 ## Slack app + OAuth install flow
 
 Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.yml)
