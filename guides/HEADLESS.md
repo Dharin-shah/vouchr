@@ -263,6 +263,7 @@ One core, two front doors — both reach the same credential boundary.
 | Ingest a **raw** key/secret | ✅ private modal (`connect-shared` / key setup) | ❌ rejected; reference routes never accept raw values |
 | Point a credential at a secret-manager **reference** | ✅ | ✅ `POST /v1/admin/reference` (channel) · `POST /v1/user/reference` (self) |
 | Approve a human-in-the-loop write (`approval` provider knob, #113) | ✅ Approve/Deny buttons for in-process use | ✅ broker enforces 403 `approval_required`; the trusted control plane delivers the decision surface via `recoverBrokerDenial` |
+| Initiate a human decision from a background agent and poll for it (#296) | ✅ delivers the prompt on `install()`'s timer / `sweepExpired()` | ✅ `POST /v1/authorization` · `GET /v1/authorization/{id}` |
 | Test the integration offline (dry-run #116) | ✅ `createVouchr({ dryRun: true })` + `vouchr.dryRun.enableTool` (deny-by-default: enable the provider in the channel first) + `vouchr.dryRun.completeConsent` | ✅ `BrokerOptions.dryRun` / `VOUCHR_DRY_RUN=1` |
 
 ## Writes are opt-in
@@ -335,6 +336,70 @@ custom headless decision UI; the decision surface stays in the trusted control p
 Bolt prompts and approval audits expose only method, host, parameter count, and a salted action
 fingerprint. Raw paths/queries may contain secrets or PII and stay out of Slack, public errors, and
 audit. A path over 16 KiB fails before rate budget, interaction state, credential reads, or egress.
+
+## Backchannel authorization for background agents (#296)
+
+The `approval_required` flow above assumes a live conversational turn: the broker denies, the host
+relays the denial from the verified Slack event, the human clicks, the agent asks again. A cron- or
+event-triggered agent, a CI job, or a durable-workflow worker has no such turn. For those, the broker
+offers the CIBA-shaped alternative: the agent **initiates** the human decision itself, Vouchr
+notifies the approver out-of-band, and the agent **polls** for the outcome. The requester and the
+approver are decoupled; the credential boundary is not — an approved request proceeds through the
+same `/v1/fetch` (or `/v1/mcp`) spend path, bound to the same exact action fingerprint, single-use.
+
+`POST /v1/authorization` takes the `/v1/fetch` target envelope without a body or headers, plus the
+plain statement the human will read:
+
+```json
+{
+  "handle": { "provider": "github", "owner": "user" },
+  "identityToken": "<fresh, single-use>",
+  "method": "POST",
+  "path": "/repos/acme/demo/merges",
+  "bindingMessage": "Merge release-1.4 into main for the nightly deploy"
+}
+```
+
+It runs every `/v1/fetch` gate first — perimeter, identity + replay, current actor, provider, static
+policy + channel tools, owner resolution, the injector's egress host/path/method/validator checks and
+the 16 KiB path bound — then records (and audits, `approval_requested`) the pending approval
+**without executing anything or reading the credential**. The response is the request's durable
+state; `GET /v1/authorization/{authorizationId}` (identity in the `x-vouchr-identity` header, a
+fresh single-use assertion per poll) returns the same shape:
+
+```json
+{ "authorizationId": "…", "status": "pending", "expiresAt": 1722000600000 }
+```
+
+| `status` | Meaning | Agent action |
+| --- | --- | --- |
+| `pending` | Awaiting the human. Pending requests live 10 minutes. | Poll with back-off; never re-initiate while pending (the exact action deduplicates to the same id anyway). |
+| `approved` | One live, single-use grant exists, valid for the provider's `ttlMs` (default 5 minutes). | Call `/v1/fetch` with the **identical** method, host, path, and query. The grant is spent once; a second identical call re-denies with `approval_required`. |
+| `denied` | The human refused. Retained for one pending-TTL window so this outcome is readable. | Stop. A new `POST /v1/authorization` is a new decision — never loop. |
+| `expired` | Nobody decided in time, or the grant went unspent. | Stop; a new request is a new decision. |
+| `404 { "error": "unknown authorization" }` | The id was never this requester's, the grant was spent, or the row was reclaimed by the sweep. | Treat as terminal for that id. |
+
+Other outcomes mirror `/v1/fetch`: `400` for a missing/empty/whitespace/over-long `bindingMessage`
+(`MAX_BINDING_MESSAGE_BYTES`, exported with `assertBindingMessage` so a client can reject before the
+wire) and for an action the provider's `approval` rule does not cover (call `/v1/fetch` directly —
+there is nothing to decide); `405` when the broker refuses writes; `403 egress_blocked`, `409
+not_connected`, `401` on a replayed assertion. The `bindingMessage` is bounded, stored for the
+prompt, rendered as plain text (no mrkdwn, so it cannot impersonate Vouchr's copy or render links),
+and **never audited** — the audit trail correlates on the salted action fingerprint, exactly like an
+in-turn approval: `approval_requested` → `approved`/`denied` → `approval_consumed`.
+
+**Delivery is the Slack control plane's job.** The broker cannot post the decision surface. A Bolt
+process on the same PostgreSQL delivers it: `install()` runs a bounded delivery pass every
+`authorizationDeliveryIntervalMs` (default 15 s; `0` disables) that rebuilds the requester's exact
+context from the stored row — identity, channel, thread — and runs the same trusted
+`recoverBrokerDenial` bridge an in-turn relay would (registry-derived self/admin rule, current
+authority revalidation, cross-replica delivery lease), then the click revalidates everything again
+at the mutation. `sweepExpired()` also runs one pass, for hosts that drive lifecycle themselves. A
+pure headless deployment with no Slack control plane gets enforcement only: requests expire
+undelivered, as with in-turn approvals.
+
+Not in scope: OIDC CIBA wire conformance (`bc-authorize`), callbacks/webhooks (poll), and any
+widening of standing grants — an approved request authorizes exactly one action, once.
 
 ## MCP servers (Streamable HTTP): `POST /v1/mcp`
 

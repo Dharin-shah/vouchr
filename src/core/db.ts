@@ -177,27 +177,31 @@ class PgClientDb implements Db {
  * every PostgreSQL-clock lifecycle-fence timestamp from millisecond to microsecond resolution
  * (#290) so unrelated operations no longer tie inside the clock's truncation window. Version 14
  * adds `consent_request.slack_verified_at` + `slack_verify_required` — the browser Slack-identity
- * verification stamp and the minted-time requirement the OAuth callback enforces (#302).
- * `migrate()` accepts v12-v14 and applies every idempotent cleanup before stamping 14.
+ * verification stamp and the minted-time requirement the OAuth callback enforces (#302). Version 15
+ * adds `approval_request.binding_message` — the plain transaction statement of a backchannel
+ * (agent-initiated, CIBA-style) authorization request, and the marker that the Bolt control plane
+ * delivers its decision surface on a timer instead of waiting for a relayed denial (#296).
+ * `migrate()` accepts v12-v15 and applies every idempotent cleanup before stamping 15.
  * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
  * controls differently.
  */
-export const SCHEMA_VERSION = 14;
-export const MIGRATABLE_SCHEMA_VERSIONS = new Set([12, 13, SCHEMA_VERSION]);
+export const SCHEMA_VERSION = 15;
+export const MIGRATABLE_SCHEMA_VERSIONS = new Set([12, 13, 14, SCHEMA_VERSION]);
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
  * Migration entry guard — runs BEFORE any DDL. `migrate()` creates a fresh baseline, carries a
- * v12/v13 database to v14, or idempotently verifies v14. The ONLY inputs it can correctly converge are:
+ * v12-v14 database to v15, or idempotently verifies v15. The ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
  *  - a v12 database → the ms→µs lifecycle-fence timestamp conversion (#290);
  *  - a v13 database → the browser Slack-identity verification columns on consent (#302);
- *  - a v14 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v14 over an unknown shape (a v1–v11
+ *  - a v14 database → the backchannel authorization binding-message column (#296);
+ *  - a v15 database → idempotent no-op.
+ * Everything else fails closed rather than getting stamped v15 over an unknown shape (a v1–v11
  * marker — none of which any published release shipped — a pre-marker legacy schema whose columns
- * this build never created, or a NEWER-than-v14 downgrade — which would let old code corrupt
+ * this build never created, or a NEWER-than-v15 downgrade — which would let old code corrupt
  * encrypted rows). The fix for a rejected database is to recreate it fresh (or migrate through
  * v1.0.0-beta.1 first), not to add historical migrations.
  */
@@ -241,7 +245,7 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
   if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 12, 13, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`. ` +
+        `version 12, 13, 14, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`. ` +
         `To keep data on a v6-v11 development schema, run v1.0.0-beta.1's \`vouchr migrate\` first (it carries v6-v11 to v12), then upgrade.`,
     );
   }
@@ -437,7 +441,11 @@ function schema(): string {
       delivery_token TEXT,
       delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
       delivered_at ${int},
-      delivery_audience TEXT
+      delivery_audience TEXT,
+      -- #296 backchannel authorization: the host-supplied plain transaction statement rendered on
+      -- the decision surface. Non-NULL marks an agent-initiated request the Bolt control plane
+      -- delivers on its own timer (no relayed denial); NULL is an in-process/fetch-minted row.
+      binding_message TEXT
     );
 
     CREATE TABLE IF NOT EXISTS notification_state (
@@ -618,6 +626,9 @@ export async function migrate(opts: DbOptions = {}): Promise<{ version: number }
       // ignores them; a pre-v14 row gets required=0 (its prompt URL never offered the hop).
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS slack_verified_at BIGINT`);
       await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS slack_verify_required BIGINT NOT NULL DEFAULT 0`);
+      // v15 (#296): the backchannel binding message. Nullable and additive; a pre-v15 pending row
+      // is an in-process/fetch-minted approval (NULL) and keeps its relayed-denial delivery path.
+      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS binding_message TEXT`);
       // Consent lifecycle indexes live here, not in schema(): runtime recovery sweeps use the
       // created_at index as an exact range condition, and the partial unique index enforces the
       // single-active-generation consent invariant.

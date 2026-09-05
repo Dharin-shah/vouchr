@@ -47,7 +47,7 @@ import {
   disconnectConnectionGeneration,
 } from '../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
-import { booleanEnv } from '../core/options';
+import { booleanEnv, MAX_TIMER_MS } from '../core/options';
 import { sweepLifecycle } from '../core/sweep';
 import { SessionGrants, type SessionGrantResult } from '../core/session';
 import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_US } from '../core/interaction';
@@ -112,6 +112,11 @@ import {
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
  *  how long a single approval can live before the user must re-approve in the thread. */
 const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+/** #296: how often `install()` delivers pending backchannel authorization prompts. Well inside the
+ * 10-minute pending TTL; each pass is bounded and lease-deduplicated across replicas. */
+const DEFAULT_AUTHORIZATION_DELIVERY_INTERVAL_MS = 15_000;
+/** #296: rows one delivery pass may post. Bounds Slack work per interval; the rest wait a pass. */
+const MAX_AUTHORIZATION_DELIVERIES_PER_PASS = 50;
 
 // One-release tombstones for preview controls issued by a drained v7 replica. These handlers retain
 // no provider response, perform no share, and are deliberately not exported as a supported surface.
@@ -796,6 +801,8 @@ type ApprovalPromptSpec = {
    * only releases the delivery lease so a later attempt can post. */
   newRequest: boolean;
   thread: string | null;
+  /** #296: the stored backchannel statement; null for an in-process/fetch-minted approval. */
+  bindingMessage: string | null;
 };
 
 /**
@@ -1100,6 +1107,7 @@ export class ConnectContext {
             queryParamCount: e.queryParamCount,
             newRequest: e.newRequest,
             thread: this.thread,
+            bindingMessage: null,
           });
         }
         throw e;
@@ -1125,6 +1133,7 @@ export class ConnectContext {
         requester: this.identity.userId,
         id: spec.approvalId,
         approver: spec.approver,
+        bindingMessage: spec.bindingMessage,
       }) as any;
       prompt = { blocks, fallback: optionalBlockFallback(blocks) };
     } catch {
@@ -2182,6 +2191,7 @@ export class ConnectContext {
         queryParamCount: row.queryHash === '' ? 0 : null,
         newRequest: false,
         thread: row.thread,
+        bindingMessage: row.bindingMessage,
       });
       return { status: 'approval_prompted', provider: providerId, approver: approval.approver };
     }
@@ -3210,7 +3220,8 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
-  /** Build a per-request ConnectContext bound to a specific channel (for the modal submit). */
+  /** Build a per-request ConnectContext bound to a specific channel (for the modal submit, and —
+   *  with `thread` — for a stored backchannel row's exact conversation, #296). */
   function contextFor(
     identity: SlackIdentity,
     channel: string | null,
@@ -3218,13 +3229,14 @@ export async function createVouchr(opts: VouchrOptions) {
     provisioningReceivedAt?: bigint,
     channelIssuance?: ChannelProvisioningIssuance,
     governableChannel?: string | null,
+    thread: string | null = null,
   ): ConnectContext {
     const deps: InternalConnectContextDeps = {
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       adminCheck: opts.isAdmin, allowChannelCreatorConfig,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread: null, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
+      thread, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
       allowWrites: opts.allowWrites ?? true,
       slackClientOptions: opts.slackClientOptions,
     };
@@ -4757,10 +4769,45 @@ export async function createVouchr(opts: VouchrOptions) {
     });
   }
 
+  /**
+   * #296: deliver the Approve/Deny surface for every live backchannel authorization request that
+   * has none yet. A background agent's request arrives with no Slack turn to relay a denial from,
+   * so this pass plays that turn: for each undelivered row it rebuilds the requester's context
+   * (identity, channel, thread — from the stored row, never the wire) and runs the SAME trusted
+   * recovery bridge an in-turn relay would (`recoverBrokerDenial`): registry-derived approver rule,
+   * current-authority revalidation, leased cross-replica delivery. Bounded per pass; a row whose
+   * delivery keeps failing is retried until its pending TTL reclaims it. A provider the channel now
+   * forbids is discarded so the pass does not re-audit that denial every interval. Per-row failures
+   * never stop the pass or the caller's timer. Returns how many prompts this pass delivered.
+   */
+  async function deliverPendingAuthorizations(): Promise<number> {
+    let delivered = 0;
+    for (const row of await approvals.listUndeliveredBackchannel(MAX_AUTHORIZATION_DELIVERIES_PER_PASS)) {
+      const identity: SlackIdentity = { enterpriseId: null, teamId: row.teamId, userId: row.userId };
+      const client = await confirmClientFor(identity);
+      if (!client) continue; // no bot token for this workspace (or lockdown): nothing can be posted
+      try {
+        const outcome = await contextFor(
+          identity, row.channel, client, undefined, undefined, row.governableChannel, row.thread,
+        ).recoverBrokerDenial(row.provider, { code: 'approval_required', approvalId: row.id });
+        if (outcome.status === 'approval_prompted') delivered++;
+      } catch (e) {
+        if (e instanceof PolicyDeniedError || e instanceof ToolDisabledError) {
+          await approvals.discardPending(row.id).catch(() => undefined);
+        }
+        // Slack/DB/lease failures: the row stays undelivered and the next pass retries (bounded by TTL).
+      }
+    }
+    return delivered;
+  }
+
   /** Delete every connection past its TTL plus every stale interaction family through the one core
-   *  lifecycle coordinator. Expired approvals are audited there (#113). Run on a timer. */
+   *  lifecycle coordinator. Expired approvals are audited there (#113). Then deliver any pending
+   *  backchannel decision surfaces (#296). Run on a timer. */
   async function sweep(): Promise<number> {
-    return sweepLifecycle({ db, vault, audit, sink, health, dryRun });
+    const count = await sweepLifecycle({ db, vault, audit, sink, health, dryRun });
+    await deliverPendingAuthorizations();
+    return count;
   }
 
   /**
@@ -4768,7 +4815,11 @@ export async function createVouchr(opts: VouchrOptions) {
    * the credential-injection middleware, the OAuth callback route, the `/vouchr` slash command, the
    * deactivation → offboard hook, and the hourly TTL sweep (once at startup, then on a timer). The
    * granular methods above remain for apps that need finer control. Returns `{ stop }` to clear the
-   * sweep timer on shutdown. `sweepIntervalMs: 0` disables the timer (drive `sweepExpired()` yourself).
+   * timers on shutdown. `sweepIntervalMs: 0` disables the sweep timer (drive `sweepExpired()`
+   * yourself — it also delivers pending backchannel prompts). `authorizationDeliveryIntervalMs`
+   * (#296, default 15s, `0` disables) is the separate, much shorter cadence at which pending
+   * backchannel authorization prompts reach Slack: a background agent's request has a 10-minute
+   * pending TTL, so the hourly sweep alone would let most of them expire undelivered.
    */
   function install(
     app: {
@@ -4779,8 +4830,14 @@ export async function createVouchr(opts: VouchrOptions) {
       event: (name: string, handler: (args: any) => Promise<void>) => void;
     },
     receiver: { router: any },
-    opts: { sweepIntervalMs?: number } = {},
+    opts: { sweepIntervalMs?: number; authorizationDeliveryIntervalMs?: number } = {},
   ): { stop: () => Promise<void> } {
+    const deliveryMs = opts.authorizationDeliveryIntervalMs ?? DEFAULT_AUTHORIZATION_DELIVERY_INTERVAL_MS;
+    // A non-integer/NaN/oversized interval would fire immediately and continuously (Node clamps
+    // out-of-range timers to 1ms) — fail closed at wiring time instead. Bounded to MAX_TIMER_MS.
+    if (!Number.isSafeInteger(deliveryMs) || deliveryMs < 0 || deliveryMs > MAX_TIMER_MS) {
+      throw new Error(`install: authorizationDeliveryIntervalMs must be an integer between 0 and ${MAX_TIMER_MS}`);
+    }
     app.use(middleware);
     mountRoutes(receiver.router);
     registerCommands(app);
@@ -4792,9 +4849,27 @@ export async function createVouchr(opts: VouchrOptions) {
       timer = setInterval(() => void sweep().catch(() => undefined), intervalMs);
       timer.unref(); // never keep the process alive for the sweep alone
     }
-    // stop() tears down what install() started: the sweep timer, and (only if Vouchr opened it) the
+    // #296 delivery timer: single-flight per process (a slow Slack pass never stacks a second one),
+    // per-row failures are swallowed inside the pass, and the lease dedupes across replicas.
+    let deliveryTimer: ReturnType<typeof setInterval> | undefined;
+    if (deliveryMs > 0) {
+      let inFlight = false;
+      deliveryTimer = setInterval(() => {
+        if (inFlight) return;
+        inFlight = true;
+        void deliverPendingAuthorizations().catch(() => undefined).finally(() => { inFlight = false; });
+      }, deliveryMs);
+      deliveryTimer.unref();
+    }
+    // stop() tears down what install() started: the timers, and (only if Vouchr opened it) the
     // db pool. An injected db is the caller's to close.
-    return { stop: async () => { if (timer) clearInterval(timer); if (ownsDb) await db.close(); } };
+    return {
+      stop: async () => {
+        if (timer) clearInterval(timer);
+        if (deliveryTimer) clearInterval(deliveryTimer);
+        if (ownsDb) await db.close();
+      },
+    };
   }
 
   /** Close the store pool if Vouchr opened it (a no-op for an injected db, which the caller owns).

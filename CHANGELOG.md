@@ -34,6 +34,20 @@ All notable changes to this project are documented here. This project adheres to
 ### Added
 
 - `vouchr --version` (also `-v`) prints the installed package version; it was an unknown command.
+- **Backchannel (CIBA-style) authorization for background agents (#296).** `POST /v1/authorization`
+  lets a cron/CI/durable-workflow agent with no live Slack turn *initiate* the human decision for one
+  exact action (the `/v1/fetch` target envelope plus a bounded plain `bindingMessage`) without
+  executing it, and `GET /v1/authorization/{id}` polls the durable outcome
+  (`pending → approved | denied | expired`; a spent grant or swept row is `404`). Every `/v1/fetch`
+  gate runs first; the pending row is the same single-use, action-fingerprint-bound approval a later
+  `/v1/fetch` spends, so the credential boundary is unchanged. The Bolt control plane delivers the
+  Approve/Deny surface on its own bounded timer (`install({ authorizationDeliveryIntervalMs })`,
+  default 15 s; `sweepExpired()` runs one pass too) through the existing `recoverBrokerDenial`
+  bridge, rendering the agent's statement as plain text on the prompt. New exports:
+  `BrokerAuthorizationRequest`, `BrokerAuthorizationResponse`, `AuthorizationStatus`,
+  `MAX_BINDING_MESSAGE_BYTES`, `assertBindingMessage`. Wire goldens: `authorization.*`,
+  `error.authorization.*`. Regression: `test/authorization.test.ts`. See guides/HEADLESS.md
+  § "Backchannel authorization for background agents".
 
 ### Fixed
 
@@ -51,6 +65,12 @@ All notable changes to this project are documented here. This project adheres to
   the Beta callout is gone and the status badge is the status signal. `vision.md` and
   `SECURITY.md` no longer list an independent security assessment as a release gate (operator
   decision); the remaining production-ready gates are unchanged.
+- **Schema version 15 (#296):** `approval_request.binding_message` (nullable, additive; run
+  `vouchr migrate`, no drain required — see guides/DEPLOYMENT.md § v14 → v15). A **denied**
+  approval is now retained as `status='denied'` for one pending-TTL window instead of being deleted
+  at once, so a backchannel poller can read the outcome; no pending/grant read path sees it, a
+  re-request replaces it, and the sweep reclaims it without a second denial audit. In-turn behaviour
+  is unchanged (a denied action still re-prompts on the next ask).
 - Pre-beta schema markers (v6-v11) are no longer migratable — they never shipped in a published
   release; `vouchr migrate` refuses them with the same recreate-fresh error v1-v5 get (recreate
   the database fresh, or migrate through 1.0.0-beta.1 first). Only v12-v14 remain migratable.

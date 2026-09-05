@@ -579,13 +579,11 @@ export class ConnectionHandle {
     return account.externalAccount;
   }
 
-  async fetch(input: string, init: RequestInit = {}): Promise<Response> {
-    // Validate the raw caller value before any mutable gate (rate budget, approval/audit rows,
-    // credential metadata/read, or Slack prompt). The same canonical spelling drives every policy
-    // decision and is explicitly forwarded at the network edge below.
-    const method = canonicalMethod(init.method ?? 'GET');
-    if (!method) throw new TypeError('Invalid HTTP method.');
-    const url = new URL(input);
+  /** Every egress gate, in order, BEFORE any mutable state or secret is touched — one pipeline for
+   *  the real fetch and for a #296 backchannel authorization request (STR-3). Throws typed
+   *  EgressBlockedError (audited) on the first refusal; returns normally when the target is allowed.
+   *  An over-long hostname is refused as a plain TypeError first, before any denied audit row. */
+  private async egressGate(url: URL, method: string, init: RequestInit): Promise<void> {
     if (url.hostname.length > MAX_URL_HOSTNAME_LENGTH) throw new TypeError('Invalid URL.');
     if (url.username || url.password) {
       await this.denyEgress(url.hostname, 'host', `Egress blocked: URL credentials are not allowed for provider "${this.provider.id}"`);
@@ -625,6 +623,92 @@ export class ConnectionHandle {
     if (this.provider.egressValidate && !this.provider.egressValidate(url, { ...init, method })) {
       await this.denyEgress(url.hostname, 'validator', `Egress blocked: validator rejected the request for provider "${this.provider.id}"`);
     }
+  }
+
+  /**
+   * The exact action key a grant covers (#113). The grant carries TWO identities, matched
+   * independently on consume:
+   *  - userId = the human DRIVING the agent (the caller = the acting user), who the adapter
+   *    prompts and who self-approval matches.
+   *  - ownerKind/ownerId = the credential this write will actually use. Binding it means a grant
+   *    minted for one credential can't be spent after a per-user→shared mode change: the write can
+   *    never run against a different credential than the human approved. It is also the purge key
+   *    when the credential is revoked/reconnected (purgeApprovalsForOwner, run inside the vault
+   *    mutation).
+   * request() + consume() (and the #296 backchannel request) share this one builder, so every site
+   * stays consistent by construction. Audit still attributes to `acting` + the approver.
+   */
+  private approvalKey(url: URL, method: string, credentialId: string): ApprovalKey {
+    return {
+      teamId: this.acting.teamId, userId: this.acting.userId,
+      ownerKind: this.owner.kind, ownerId: this.owner.id, credentialId, provider: this.provider.id,
+      // queryHash (GHSA-pg84): the grant binds the exact query string sent upstream, as a
+      // digest — a retry with ANY textual change to the query re-prompts instead of spending
+      // the human's approval.
+      method, origin: url.origin, host: url.hostname, path: url.pathname,
+      queryHash: queryDigest(url.search),
+      channel: this.auditChannel(), thread: this.thread,
+      // The governance scope stored for the DECISION revalidation. Prefer the channel_type-aware
+      // value the adapter passed; fall back to the id heuristic for a directly-constructed handle.
+      governableChannel: this.approvalGovernableChannel !== undefined
+        ? this.approvalGovernableChannel
+        : governanceChannelOf(this.auditChannel()),
+    };
+  }
+
+  /**
+   * #296 backchannel (CIBA-style) authorization: record — or reuse — the pending approval for one
+   * exact action WITHOUT executing it, so a background agent can initiate a human decision and
+   * poll for it. Runs the identical egress gates, path bound, retained-use revalidation, and
+   * credential binding as `fetch`, then the same deduplicated `requestAudited` write; it never
+   * consumes a grant and never reads the secret. Returns null when the provider's `approval` rule
+   * does not cover this action (nothing to decide — the agent calls the action directly).
+   * `bindingMessage` is the plain transaction statement rendered on the decision surface.
+   */
+  async requestApproval(
+    input: string,
+    method: string,
+    bindingMessage: string,
+  ): Promise<{ id: string; created: boolean } | null> {
+    const canonical = canonicalMethod(method);
+    if (!canonical) throw new TypeError('Invalid HTTP method.');
+    const url = new URL(input);
+    await this.egressGate(url, canonical, { method: canonical });
+    const approval = this.provider.approval;
+    if (!approval || !approvalNeeded(approval, canonical, url.pathname)) return null;
+    if (Buffer.byteLength(url.pathname, 'utf8') > MAX_APPROVAL_PATH_BYTES) {
+      throw new ApprovalPathTooLongError();
+    }
+    if (!this.approvals) {
+      throw new Error(`Provider "${this.provider.id}" requires human approval but no approval store is wired.`);
+    }
+    if (this.useStillValid && !(await this.useStillValid())) {
+      throw new InteractionStateChangedError('connection', 'authorization');
+    }
+    const credentialId = await this.bindCredential();
+    const pending = await this.approvals.requestAudited(
+      this.approvalKey(url, canonical, credentialId),
+      this.audit,
+      this.acting,
+      this.vault,
+      this.approvalRequestValid,
+      bindingMessage,
+    );
+    if (pending.created) {
+      this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
+    }
+    return pending;
+  }
+
+  async fetch(input: string, init: RequestInit = {}): Promise<Response> {
+    // Validate the raw caller value before any mutable gate (rate budget, approval/audit rows,
+    // credential metadata/read, or Slack prompt). The same canonical spelling drives every policy
+    // decision and is explicitly forwarded at the network edge below.
+    const method = canonicalMethod(init.method ?? 'GET');
+    if (!method) throw new TypeError('Invalid HTTP method.');
+    const url = new URL(input);
+    // Egress allowlist and every finer control first, before any secret is even read.
+    await this.egressGate(url, method, init);
 
     const approval = this.provider.approval;
     const requiresApproval = !!approval && approvalNeeded(approval, method, url.pathname);
@@ -678,31 +762,9 @@ export class ConnectionHandle {
         // the store must hard-fail, not silently skip the gate. A wiring bug, and it says so.
         throw new Error(`Provider "${this.provider.id}" requires human approval but no approval store is wired.`);
       }
-      // The grant carries TWO identities, matched independently on consume:
-      //  - userId = the human DRIVING the agent (the caller = the acting user), who the adapter
-      //    prompts and who self-approval matches.
-      //  - ownerKind/ownerId = the credential this write will actually use. Binding it means a grant
-      //    minted for one credential can't be spent after a per-user→shared mode change: the write can
-      //    never run against a different credential than the human approved. It is also the purge key
-      //    when the credential is revoked/reconnected (purgeApprovalsForOwner, run inside the vault
-      //    mutation).
-      // request() + consume() share this one key object, so both sites stay consistent by
-      // construction. Audit still attributes to `acting` + the approver (below).
-      const key = {
-        teamId: this.acting.teamId, userId: this.acting.userId,
-        ownerKind: this.owner.kind, ownerId: this.owner.id, credentialId, provider: this.provider.id,
-        // queryHash (GHSA-pg84): the grant binds the exact query string sent upstream, as a
-        // digest — a retry with ANY textual change to the query re-prompts instead of spending
-        // the human's approval.
-        method, origin: url.origin, host: url.hostname, path: url.pathname,
-        queryHash: queryDigest(url.search),
-        channel: this.auditChannel(), thread: this.thread,
-        // The governance scope stored for the DECISION revalidation. Prefer the channel_type-aware
-        // value the adapter passed; fall back to the id heuristic for a directly-constructed handle.
-        governableChannel: this.approvalGovernableChannel !== undefined
-          ? this.approvalGovernableChannel
-          : governanceChannelOf(this.auditChannel()),
-      };
+      // One key builder (approvalKey) feeds request, consume, and the backchannel request, so every
+      // site stays consistent by construction. Audit still attributes to `acting` + the approver.
+      const key = this.approvalKey(url, method, credentialId);
       const grant = await this.approvals.consumeAudited(
         key,
         this.audit,

@@ -1,0 +1,6 @@
+{
+  "status": 400,
+  "shape": {
+    "error": "string"
+  }
+}

@@ -59,6 +59,8 @@ async function sweepExpiredOn(vault: Vault, audit: Audit, consent: Consent, sink
   // reason names the expiry.
   if (approvals) {
     for (const row of await approvals.sweepExpired()) {
+      // A retained denial (#296) was audited by its human decision; reclaiming it is not a second one.
+      if (row.status === 'denied') continue;
       const id = { enterpriseId: null, teamId: row.teamId, userId: row.userId };
       const channelMeta = row.channel ? { channel: row.channel } : {};
       await audit.record('denied', id, row.provider,

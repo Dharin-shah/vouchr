@@ -404,6 +404,38 @@ test('v13 to v14 adds the browser-verification columns and leaves converted µs 
   );
 });
 
+test('v14 to v15 adds approval_request.binding_message; existing rows stay NULL (#296)', async (t) => {
+  if (!(await pgReachable())) return t.skip(SKIP);
+  const { url } = await emptySchema(t);
+  const raw = rawDb(t, url);
+
+  // Materialize head, then recreate the exact v14 predecessor: every v13/v14 shape is present, only
+  // the #296 column is missing. A pending row minted by a v14 process must survive as NULL.
+  await migrate({ databaseUrl: url });
+  await raw.exec(`ALTER TABLE approval_request DROP COLUMN binding_message`);
+  const micros = 1_722_000_000_000_000;
+  await raw.run(
+    `INSERT INTO approval_request
+       (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,origin,host,path,
+        channel,thread,governable_channel,status,created_at,expires_at)
+     VALUES ('00000000-0000-4000-8000-000000000296','k','T1','U1','user','U1','00000000-0000-4000-8000-000000000001',
+             'acme','POST','https://api.acme.test','api.acme.test','/repos','C1','TH1','C1','pending',$1,$2)`,
+    [micros, micros + 600_000_000],
+  );
+  await raw.run(`UPDATE meta SET value='14' WHERE key='schema_version'`);
+
+  await assert.rejects(
+    () => openDb({ databaseUrl: url }),
+    new RegExp(`schema version 14.*needs ${SCHEMA_VERSION}.*vouchr migrate`, 'i'),
+  );
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION);
+  const row = await raw.get<Record<string, unknown>>(
+    `SELECT status, binding_message, created_at FROM approval_request WHERE id='00000000-0000-4000-8000-000000000296'`,
+  );
+  assert.deepEqual(row, { status: 'pending', binding_message: null, created_at: micros }, 'additive: no conversion, pre-v15 rows are not backchannel');
+  assert.equal((await migrate({ databaseUrl: url })).version, SCHEMA_VERSION, 'idempotent at head');
+});
+
 test('CLI top-level failures never serialize database-provided error text (SEC-1)', async (t) => {
   if (!(await pgReachable())) return t.skip(SKIP);
   const { url } = await emptySchema(t);

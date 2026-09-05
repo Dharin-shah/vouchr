@@ -74,9 +74,9 @@ split so the long-running process holds no DDL privileges.
 
 ### Supported migration starting points
 
-<!-- migratable-schema-versions: 12,13,14 -->
+<!-- migratable-schema-versions: 12,13,14,15 -->
 
-`vouchr migrate` accepts a fresh (empty) database or a schema at version 12, 13, or 14 — v12 is
+`vouchr migrate` accepts a fresh (empty) database or a schema at version 12, 13, 14, or 15 — v12 is
 the schema both published betas (v1.0.0-beta and v1.0.0-beta.1) stamp. Development schemas v6–v11
 never shipped in any release and are refused before any DDL runs. To keep data on one, run
 v1.0.0-beta.1's `vouchr migrate` first (it carries v6–v11 to v12), then upgrade; anything older
@@ -138,6 +138,20 @@ state must therefore never coexist with a live v13 process. Two safe sequences:
      unenforced prompt is superseded on the user's next connect — the persisted mode is part of the
      consent generation's identity, so a mode flip mints a fresh generation instead of reusing the
      old row (off→on and on→off regressions in the same file).
+
+### v14 → v15 (backchannel authorization, #296)
+
+Schema v15 adds one nullable column, `approval_request.binding_message`; no data conversion. It is
+non-NULL only on rows minted by `POST /v1/authorization` (an agent-initiated request), which the
+Bolt control plane delivers to Slack on its own timer; every pre-v15 row stays NULL and keeps its
+relayed-denial delivery path. Denied approvals are now retained as `status='denied'` for one
+pending-TTL window so a poller can read the outcome; every pending/grant read already excludes them.
+
+The DDL is additive and safe to apply with v14 replicas still running (they never read the column).
+The only rollout consequence is functional, not a safety one: a v14 Bolt process runs no delivery
+timer, so a backchannel request created while only v14 control planes are live expires undelivered
+(the agent polls `expired`). Roll the Bolt control plane to v15 before pointing background agents
+at the route.
 
 - **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
   deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
