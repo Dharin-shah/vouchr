@@ -36,6 +36,9 @@ permissions, their consent.
 - **Accountable and revocable.** Every action ties to the Slack identity that authorized it, and
   deactivating someone in Slack revokes their credentials. For a full compromise there is a tested
   break-glass — see [SECURITY.md](./SECURITY.md).
+- **Consent bound to the person, not just the link.** Opt-in `requireBrowserSlackIdentity` makes the
+  browser completing OAuth sign in with Slack first, so a forwarded Connect link cannot bind someone
+  else's account — see [guides/DEPLOYMENT.md](./guides/DEPLOYMENT.md).
 - **Self-hosted.** Your infrastructure, your PostgreSQL, your keys (or your KMS).
 
 ## Quickstart

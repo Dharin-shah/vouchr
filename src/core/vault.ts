@@ -8,7 +8,7 @@ import { purgeSessionsForOwner } from './session';
 import {
   InteractionStateChangedError,
   isInteractionId,
-  POSTGRES_NOW_MS_SQL,
+  POSTGRES_NOW_US_SQL,
   purgeChannelInteractionState,
 } from './interaction';
 import {
@@ -574,7 +574,7 @@ export class Vault {
           // Provider-addressed slash/headless requests carry no opaque row id. This PostgreSQL-clock
           // boundary proves the current row already existed when the trusted request/assertion was
           // issued; a delayed request can never retarget a later reconnect. Timestamp equality FAILS
-          // CLOSED (`>=`): a reconnect committed in the SAME millisecond as this request's issuance is
+          // CLOSED (`>=`): a reconnect committed in the SAME microsecond as this request's issuance is
           // treated as newer and left intact, matching the write-side generation fence and the
           // channel-shared disconnect — a legitimate disconnect arrives on a strictly-later receipt.
           if (expectedId === undefined && row && row.generation_at >= issuedAt) {
@@ -727,7 +727,7 @@ export class Vault {
    * {@link referenceUser}. Persisted Slack requests and verified headless assertions carry their
    * own earlier issuance time instead. */
   async userProvisioningIssuedAt(): Promise<number> {
-    const row = await this.db.get<{ issued_at: number }>(`SELECT ${POSTGRES_NOW_MS_SQL} AS issued_at`);
+    const row = await this.db.get<{ issued_at: number }>(`SELECT ${POSTGRES_NOW_US_SQL} AS issued_at`);
     if (!Number.isSafeInteger(row?.issued_at)) throw new Error('could not issue user provisioning fence');
     return row!.issued_at;
   }
@@ -764,7 +764,7 @@ export class Vault {
         if (tombstoneBlocks(revokedAt, issuedAt)) return 'revoked';
         // Newest-generation fence for EVERY user write, whatever the issuance shape. A credential
         // whose generation (write time) is at or after this request's issuance must never be
-        // overwritten — EQUALITY FAILS CLOSED (`>=`): both are integer PostgreSQL milliseconds, so a
+        // overwritten — EQUALITY FAILS CLOSED (`>=`): both are integer PostgreSQL microseconds, so a
         // credential that committed just after an older request can compare equal, and a strict `>`
         // would let the stale write win the tie. A stalled OAuth/key/reference request therefore
         // loses. Legitimate replacements are not ties: each real re-key/re-reference/re-auth arrives
@@ -790,12 +790,12 @@ export class Vault {
         // generation fence would fail that consent's callback closed (`>=`), so its URL is dead.
         // Supersede those rows in the SAME transaction (under the provisioning lock) so a fresh
         // connect cannot reuse one. The threshold MUST match the fence: `<= issuedAt` fails the
-        // equal-millisecond consent closed too — a strict `<` would leave a same-ms consent reusable
+        // equal-microsecond consent closed too — a strict `<` would leave a same-µs consent reusable
         // even though its callback can never complete. The consent that minted THIS write (OAuth) is
         // already consumed and deleted by finalizeProvisioning; a strictly-newer pending consent
         // (created_at > issuedAt) is deliberately left alone.
         await fencedTx.run(
-          `UPDATE consent_request SET superseded_at=${POSTGRES_NOW_MS_SQL}
+          `UPDATE consent_request SET superseded_at=${POSTGRES_NOW_US_SQL}
            WHERE team_id=? AND user_id=? AND provider=?
              AND superseded_at IS NULL AND consumed_at IS NULL AND created_at <= ?`,
           [owner.teamId, owner.id, provider, issuedAt],

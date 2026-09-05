@@ -6,10 +6,11 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle, pathAllowed } from '../src/core/injector';
 import { Policy, type PolicyRule } from '../src/core/policy';
-import { Consent, STATE_TTL_MS } from '../src/core/consent';
+import { Consent, STATE_TTL_US } from '../src/core/consent';
 import { defineProvider, github, google, gitlab, notion, type Provider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
+import { POSTGRES_NOW_US_SQL } from '../src/core/interaction';
 
 // Property / fuzz tests: generate many randomized + crafted inputs in-process and assert that the
 // core invariants hold for all of them. Loops are bounded so the suite stays fast.
@@ -399,11 +400,11 @@ test('property: rows older than the TTL are classified as expired', async (t) =>
   for (let i = 0; i < N; i++) {
     const state = randomBytes(32).toString('base64url');
     // Insert a row directly with a created_at older than the TTL (can't control the clock otherwise).
-    const age = STATE_TTL_MS + 1000 + rint(60_000);
+    const age = STATE_TTL_US + 1_000_000 + rint(60_000_000);
     await db.run(
       `INSERT INTO consent_request (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
-       VALUES (?,?,?,?,?,?,?,?)`,
-      [state, null, 'T1', `U${i}`, 'cp', null, 'verifier', Date.now() - age],
+       VALUES (?,?,?,?,?,?,?,${POSTGRES_NOW_US_SQL}-?)`,
+      [state, null, 'T1', `U${i}`, 'cp', null, 'verifier', age],
     );
     assert.equal((await consent.consume(state)).status, 'expired', 'expired state must be classified');
   }

@@ -2,22 +2,23 @@ import { createHmac, randomUUID } from 'node:crypto';
 import type { Db } from './db';
 
 /** One lifetime for unanswered, human-facing interaction requests. Pending rows are authority-free
- *  lookup handles, but keeping them short-lived bounds stale controls and retained metadata. */
-export const PENDING_INTERACTION_TTL_MS = 10 * 60 * 1000;
+ *  lookup handles, but keeping them short-lived bounds stale controls and retained metadata.
+ *  Microseconds, like every duration compared against {@link POSTGRES_NOW_US_SQL}. */
+export const PENDING_INTERACTION_TTL_US = 10 * 60 * 1_000_000;
 
 /** A prompt delivery claim is deliberately much shorter than the pending interaction TTL. It
  * prevents duplicate Slack posts across replicas without holding a database transaction over
- * Slack I/O; after a crashed claimant's lease expires, another turn can take over. */
-export const PROMPT_DELIVERY_LEASE_MS = 30_000;
+ * Slack I/O; after a crashed claimant's lease expires, another turn can take over. Microseconds. */
+export const PROMPT_DELIVERY_LEASE_US = 30_000_000;
 
 /**
  * Re-delivery debounce (#194 UX). Transient prompt surfaces can vanish on reload/device-switch, so
  * an adapter may explicitly let a genuine re-ask re-post the same generation once its last delivery
  * is older than this window. Durable surfaces must leave the option off so retries do not duplicate
  * messages. The atomic delivery lease is the race guard; this is only the UX cooldown. Same value as
- * the lease (they are conceptually distinct and may change independently).
+ * the lease (they are conceptually distinct and may change independently). Microseconds.
  */
-export const PROMPT_REDELIVERY_DEBOUNCE_MS = 30_000;
+export const PROMPT_REDELIVERY_DEBOUNCE_US = 30_000_000;
 
 /** Delivery policy supplied by the adapter that owns the actual prompt surface. Defaulting to
  * false preserves durable-message deduplication for direct core callers. */
@@ -25,9 +26,18 @@ export interface PromptDeliveryOptions {
   redeliverDelivered?: boolean;
 }
 
-/** PostgreSQL is the one clock for cross-replica delivery leases. Application clocks may differ by
- * more than the lease itself; using Date.now() here would let a fast pod steal a live claim. */
-export const POSTGRES_NOW_MS_SQL = `(extract(epoch from clock_timestamp()) * 1000)::bigint`;
+/** PostgreSQL is the one clock for cross-replica delivery leases and lifecycle fences. Application
+ * clocks may differ by more than the lease itself; using Date.now() here would let a fast pod steal
+ * a live claim. Microsecond resolution (#290): `clock_timestamp()` is natively µs-precise, so
+ * unrelated operations no longer tie inside a coarser truncation window while every `>=` fence
+ * still fails a genuine tie closed. µs epoch (~1.8e15) stays well under 2^53. */
+export const POSTGRES_NOW_US_SQL = `(extract(epoch from clock_timestamp()) * 1000000)::bigint`;
+
+/** The one ms→µs conversion for durations that originate in the application/Date.now() domain
+ * (public TTL knobs, JWT `iat` age) but are compared against {@link POSTGRES_NOW_US_SQL}. */
+export function usFromMs(ms: number): number {
+  return ms * 1000;
+}
 
 export type PromptDeliveryClaim =
   | { status: 'claimed'; token: string }
@@ -175,7 +185,7 @@ export async function purgeChannelInteractionState(
   provider: string,
 ): Promise<void> {
   const clock = await db.get<{ created_at: number }>(
-    `SELECT ${POSTGRES_NOW_MS_SQL} AS created_at`,
+    `SELECT ${POSTGRES_NOW_US_SQL} AS created_at`,
   );
   if (!Number.isSafeInteger(clock?.created_at)) {
     throw new Error('could not establish channel interaction fence');

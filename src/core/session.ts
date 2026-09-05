@@ -9,10 +9,11 @@ import {
   isInteractionId,
   InteractionStateChangedError,
   newInteractionId,
-  PENDING_INTERACTION_TTL_MS,
-  POSTGRES_NOW_MS_SQL,
-  PROMPT_DELIVERY_LEASE_MS,
-  PROMPT_REDELIVERY_DEBOUNCE_MS,
+  PENDING_INTERACTION_TTL_US,
+  POSTGRES_NOW_US_SQL,
+  PROMPT_DELIVERY_LEASE_US,
+  PROMPT_REDELIVERY_DEBOUNCE_US,
+  usFromMs,
   type PromptDeliveryClaim,
   type PromptDeliveryOptions,
 } from './interaction';
@@ -87,15 +88,15 @@ export class SessionGrants {
       const row = await this.db.get<{ id: string }>(
         `INSERT INTO session_request
            (id, team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at)
-         VALUES (?,?,?,?,?,?,?,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
+         VALUES (?,?,?,?,?,?,?,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?)
          ON CONFLICT(team_id, channel, thread, user_id, provider) DO UPDATE SET
            id=excluded.id, credential_id=excluded.credential_id,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
            delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL
-         WHERE session_request.expires_at<=${POSTGRES_NOW_MS_SQL}
+         WHERE session_request.expires_at<=${POSTGRES_NOW_US_SQL}
             OR session_request.credential_id<>excluded.credential_id
          RETURNING id`,
-        [id, ...key, credentialId, PENDING_INTERACTION_TTL_MS],
+        [id, ...key, credentialId, PENDING_INTERACTION_TTL_US],
       );
       if (row) return { id: row.id, created: true };
 
@@ -104,7 +105,7 @@ export class SessionGrants {
       const live = await this.db.get<{ id: string }>(
         `SELECT id FROM session_request
          WHERE team_id=? AND channel=? AND thread=? AND user_id=? AND provider=?
-           AND credential_id=? AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+           AND credential_id=? AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [...key, credentialId],
       );
       if (live) return { id: live.id, created: false };
@@ -190,35 +191,35 @@ export class SessionGrants {
       const token = newInteractionId();
       const claimed = await this.db.get<{ id: string }>(
         `UPDATE session_request
-         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_MS_SQL}+?, delivered_at=NULL
-         WHERE id=? AND expires_at>${POSTGRES_NOW_MS_SQL}
+         SET delivery_token=?, delivery_lease_expires_at=${POSTGRES_NOW_US_SQL}+?, delivered_at=NULL
+         WHERE id=? AND expires_at>${POSTGRES_NOW_US_SQL}
            AND (
              delivered_at IS NULL
-             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_MS_SQL}-?)
+             OR (?::boolean AND delivered_at <= ${POSTGRES_NOW_US_SQL}-?)
            )
-           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_MS_SQL})
+           AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
          RETURNING id`,
         [
           token,
-          PROMPT_DELIVERY_LEASE_MS,
+          PROMPT_DELIVERY_LEASE_US,
           id,
           options.redeliverDelivered === true,
-          PROMPT_REDELIVERY_DEBOUNCE_MS,
+          PROMPT_REDELIVERY_DEBOUNCE_US,
         ],
       );
       if (claimed) return { status: 'claimed', token };
       const row = await this.db.get<{
         delivered_at: number | null;
         delivery_lease_expires_at: number;
-        now_ms: number;
+        now_us: number;
       }>(
-        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_MS_SQL} AS now_ms
-         FROM session_request WHERE id=? AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+        `SELECT delivered_at, delivery_lease_expires_at, ${POSTGRES_NOW_US_SQL} AS now_us
+         FROM session_request WHERE id=? AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [id],
       );
       if (!row) return { status: 'stale' };
       if (row.delivered_at != null) return { status: 'delivered' };
-      if (row.delivery_lease_expires_at > row.now_ms) return { status: 'in-flight' };
+      if (row.delivery_lease_expires_at > row.now_us) return { status: 'in-flight' };
     }
     return { status: 'in-flight' };
   }
@@ -226,8 +227,8 @@ export class SessionGrants {
   async confirmDelivery(id: string, token: string): Promise<boolean> {
     if (!isInteractionId(id) || !isInteractionId(token)) return false;
     return (await this.db.run(
-      `UPDATE session_request SET delivered_at=${POSTGRES_NOW_MS_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
-       WHERE id=? AND delivery_token=? AND delivered_at IS NULL AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+      `UPDATE session_request SET delivered_at=${POSTGRES_NOW_US_SQL}, delivery_token=NULL, delivery_lease_expires_at=0
+       WHERE id=? AND delivery_token=? AND delivered_at IS NULL AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id, token],
     )).changes === 1;
   }
@@ -270,7 +271,7 @@ export class SessionGrants {
     const row = await this.db.get<any>(
        `SELECT * FROM session_request
        WHERE id=? AND team_id=? AND user_id=? AND channel=? AND thread=?
-         AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [id, identity.teamId, identity.userId, channel, thread],
     );
     return row ? toRequest(row) : null;
@@ -304,7 +305,7 @@ export class SessionGrants {
         const raw = await tx.get<any>(
           `SELECT * FROM session_request
            WHERE id=? AND team_id=? AND user_id=? AND channel=? AND thread=?
-             AND expires_at>${POSTGRES_NOW_MS_SQL}
+             AND expires_at>${POSTGRES_NOW_US_SQL}
            FOR UPDATE`,
           [input.id, input.identity.teamId, input.identity.userId, input.channel, input.thread],
         );
@@ -322,10 +323,10 @@ export class SessionGrants {
         await tx.run(`DELETE FROM session_request WHERE id=?`, [row.id]);
         await tx.run(
           `INSERT INTO session_grant (team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at)
-           VALUES (?,?,?,?,?,?,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
+           VALUES (?,?,?,?,?,?,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?)
            ON CONFLICT(team_id, channel, thread, user_id, provider) DO UPDATE SET
              credential_id=excluded.credential_id, created_at=excluded.created_at, expires_at=excluded.expires_at`,
-          [row.teamId, row.channel, row.thread, row.userId, row.provider, row.credentialId, input.ttlMs],
+          [row.teamId, row.channel, row.thread, row.userId, row.provider, row.credentialId, usFromMs(input.ttlMs)],
         );
         await input.audit.record(
           'session',
@@ -354,10 +355,10 @@ export class SessionGrants {
     if (!isInteractionId(credentialId)) throw new Error('session grant requires a valid credential generation id');
     await this.db.run(
       `INSERT INTO session_grant (team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at)
-       VALUES (?,?,?,?,?,?,${POSTGRES_NOW_MS_SQL},${POSTGRES_NOW_MS_SQL}+?)
+       VALUES (?,?,?,?,?,?,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?)
        ON CONFLICT(team_id, channel, thread, user_id, provider) DO UPDATE SET
          credential_id=excluded.credential_id, created_at=excluded.created_at, expires_at=excluded.expires_at`,
-      [i.teamId, channel, thread, i.userId, provider, credentialId, ttlMs],
+      [i.teamId, channel, thread, i.userId, provider, credentialId, usFromMs(ttlMs)],
     );
   }
 
@@ -373,7 +374,7 @@ export class SessionGrants {
     const row = (await this.db.get(
       `SELECT 1 AS x FROM session_grant
        WHERE team_id=? AND channel=? AND thread=? AND user_id=? AND provider=?
-         AND credential_id=? AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         AND credential_id=? AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [i.teamId, channel, thread, i.userId, provider, credentialId],
     )) as { x: number } | undefined;
     return !!row;
@@ -390,7 +391,7 @@ export class SessionGrants {
     const row = await this.db.get<{ credential_id: string }>(
       `SELECT credential_id FROM session_grant
        WHERE team_id=? AND channel=? AND thread=? AND user_id=? AND provider=?
-         AND expires_at>${POSTGRES_NOW_MS_SQL}`,
+         AND expires_at>${POSTGRES_NOW_US_SQL}`,
       [i.teamId, channel, thread, i.userId, provider],
     );
     return row?.credential_id || null;
@@ -425,8 +426,8 @@ export class SessionGrants {
   async sweepExpired(): Promise<number> {
     if (!this.db.transaction) throw new Error('session sweep requires database transaction support');
     return this.db.transaction(async (tx) => {
-      const requests = (await tx.run(`DELETE FROM session_request WHERE expires_at<${POSTGRES_NOW_MS_SQL}`)).changes;
-      const grants = (await tx.run(`DELETE FROM session_grant WHERE expires_at<${POSTGRES_NOW_MS_SQL}`)).changes;
+      const requests = (await tx.run(`DELETE FROM session_request WHERE expires_at<${POSTGRES_NOW_US_SQL}`)).changes;
+      const grants = (await tx.run(`DELETE FROM session_grant WHERE expires_at<${POSTGRES_NOW_US_SQL}`)).changes;
       return requests + grants;
     });
   }
