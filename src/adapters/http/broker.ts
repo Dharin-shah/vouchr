@@ -1179,17 +1179,24 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     return { handle, provider, acting };
   }
 
+  /** Canonical method, or 405 under the default fail-closed read-only mode — BEFORE identity, vault,
+   *  or upstream, for `/v1/fetch` and the #296 `/v1/authorization` request alike: a write the broker
+   *  would refuse to execute must not be able to mint a human decision for itself. */
+  function allowedMethod(raw: unknown): string {
+    const method = requestMethod(raw);
+    if (!opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
+      throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
+    }
+    return method;
+  }
+
   async function handleFetch(
     body: BrokerFetchRequest,
     trace: Record<string, string>,
     requestSignal: AbortSignal,
   ): Promise<{ status: number; payload: Record<string, unknown> }> {
     requestSignal.throwIfAborted();
-    const method = requestMethod(body.method);
-    // Default fail-closed read-only. Reject non-GET/HEAD with 405 BEFORE identity/vault/upstream.
-    if (!opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
-      throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
-    }
+    const method = allowedMethod(body.method);
     const outboundBody = requestBody(body.body);
     if ((method === 'GET' || method === 'HEAD') && outboundBody !== undefined) {
       throw new HttpError(400, { error: 'GET and HEAD requests cannot carry a body' });
@@ -1285,12 +1292,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * cannot render the decision surface; the Bolt control plane delivers it on its own timer.
    */
   async function handleBackchannelRequest(body: BrokerAuthorizationRequest): Promise<BrokerAuthorizationResponse> {
-    const method = requestMethod(body.method);
-    // Same fail-closed read-only default as /v1/fetch: a write the broker would refuse to execute
-    // must not be able to mint a human decision for itself.
-    if (!opts.allowWrites && method !== 'GET' && method !== 'HEAD') {
-      throw new HttpError(405, { error: 'only GET and HEAD are allowed' });
-    }
+    const method = allowedMethod(body.method);
     let bindingMessage: string;
     try {
       bindingMessage = assertBindingMessage(body.bindingMessage); // SEC-4: bounded before any read/write
