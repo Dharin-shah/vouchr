@@ -54,6 +54,11 @@ function mrkdwnSections(lines: string[], o: SectionPackOptions = {}): unknown[] 
   return sections.map((text) => ({ type: 'section', text: { type: 'mrkdwn', text } }));
 }
 
+/** One mrkdwn context block: the small note under a section. */
+function contextBlock(text: string): unknown {
+  return { type: 'context', elements: [{ type: 'mrkdwn', text }] };
+}
+
 /** Build the parsed top-level `text` Slack uses for notifications and screen readers from exactly
  *  the copy displayed in supported message blocks. Only visible text is read: URLs, action values,
  *  metadata, input fields, and other payload data are deliberately ignored. `plain_text` labels are
@@ -145,7 +150,7 @@ export function statsBlocks(enabled: string[], stats: StatsRow[], windowDays: nu
   return [
     { type: 'header', text: { type: 'plain_text', text: `Tool usage — last ${windowDays} days`, emoji: true } },
     ...mrkdwnSections(lines, { maxSections: 48 }),
-    { type: 'context', elements: [{ type: 'mrkdwn', text: 'Idle tools can be removed with `/vouchr disable <provider>`.' }] },
+    contextBlock('Idle tools can be removed with `/vouchr disable <provider>`.'),
   ];
 }
 
@@ -552,24 +557,18 @@ export function configModal(o: {
   if (o.connections.length) {
     for (const c of o.connections.slice(0, CONFIG_CONNECTION_ROWS_MAX)) blocks.push(connectionRow(c));
     if (o.connections.length > CONFIG_CONNECTION_ROWS_MAX) {
-      blocks.push({
-        type: 'context',
-        elements: [{
-          type: 'mrkdwn',
-          text: `+${o.connections.length - CONFIG_CONNECTION_ROWS_MAX} more — use \`/vouchr status\` to browse every connection, then \`/vouchr disconnect <provider>\`.`,
-        }],
-      });
+      blocks.push(contextBlock(`+${o.connections.length - CONFIG_CONNECTION_ROWS_MAX} more — use \`/vouchr status\` to browse every connection, then \`/vouchr disconnect <provider>\`.`));
     }
   } else {
-    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No connected accounts yet. They are created on demand when an agent needs one.' }] });
+    blocks.push(contextBlock('No connected accounts yet. They are created on demand when an agent needs one.'));
   }
 
   blocks.push({ type: 'divider' });
   blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Tools in this channel', emoji: true } });
   if (!o.channel) {
-    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'Open `/vouchr` from inside a channel to see and configure its tools.' }] });
+    blocks.push(contextBlock('Open `/vouchr` from inside a channel to see and configure its tools.'));
   } else if (!o.tools.length) {
-    blocks.push({ type: 'context', elements: [{ type: 'mrkdwn', text: 'No providers are registered.' }] });
+    blocks.push(contextBlock('No providers are registered.'));
   } else {
     blocks.push(...mrkdwnSections(o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}`), { maxSections: 96 }));
   }
@@ -697,10 +696,7 @@ export function connectedBlocks(
           `encrypted and is never shown to the agent or posted in Slack.`,
       },
     },
-    {
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: `Disconnect any time with \`/vouchr disconnect ${p}\`.` }],
-    },
+    contextBlock(`Disconnect any time with \`/vouchr disconnect ${p}\`.`),
   ];
 }
 
@@ -729,10 +725,7 @@ export function consentDeniedBlocks(provider: string, reason?: string): unknown[
           `${why} Nothing was sent on your behalf.`,
       },
     },
-    {
-      type: 'context',
-      elements: [{ type: 'mrkdwn', text: 'Re-run the request to be prompted to connect again.' }],
-    },
+    contextBlock('Re-run the request to be prompted to connect again.'),
   ];
 }
 
@@ -796,15 +789,9 @@ export function statusBlocks(
   return [
     { type: 'header', text: { type: 'plain_text', text: 'Your Vouchr connections', emoji: true } },
     ...mrkdwnSections(connections.map(connectionLine), { maxSections: 48 }),
-    {
-      type: 'context',
-      elements: [{
-        type: 'mrkdwn',
-        text: pagination
-          ? `Page ${pagination.page} of ${pagination.totalPages}. Browse with \`/vouchr status <page>\`. Disconnect with \`/vouchr disconnect <provider>\`.`
-          : 'Disconnect with `/vouchr disconnect <provider>`.',
-      }],
-    },
+    contextBlock(pagination
+      ? `Page ${pagination.page} of ${pagination.totalPages}. Browse with \`/vouchr status <page>\`. Disconnect with \`/vouchr disconnect <provider>\`.`
+      : 'Disconnect with `/vouchr disconnect <provider>`.'),
   ];
 }
 
@@ -873,7 +860,6 @@ export function homeView(o: {
     tools?: ConfigAdminRow[];
   };
 }): unknown {
-  const note = (text: string): unknown => ({ type: 'context', elements: [{ type: 'mrkdwn', text }] });
   const connected = new Set(o.connections.map((c) => c.provider));
   const available = o.providers.filter((p) => !connected.has(p));
   const blocks: unknown[] = [
@@ -890,7 +876,7 @@ export function homeView(o: {
   ];
   for (const c of o.connections.slice(0, HOME_MAX_ROWS)) blocks.push(connectionRow(c));
   if (o.connections.length > HOME_MAX_ROWS) {
-    blocks.push(note(`+${o.connections.length - HOME_MAX_ROWS} more — browse them with \`/vouchr status\`.`));
+    blocks.push(contextBlock(`+${o.connections.length - HOME_MAX_ROWS} more — browse them with \`/vouchr status\`.`));
   }
   if (available.length) {
     blocks.push({ type: 'divider' });
@@ -898,7 +884,7 @@ export function homeView(o: {
       type: 'section',
       text: { type: 'mrkdwn', text: '*Available providers*\n' + available.slice(0, HOME_MAX_ROWS).map((p) => `• ${escapeMrkdwn(p)}`).join('\n') },
     });
-    blocks.push(note('Connections are created on demand — ask the agent and you will be prompted to connect.'));
+    blocks.push(contextBlock('Connections are created on demand — ask the agent and you will be prompted to connect.'));
   }
 
   if (o.governance) {
@@ -922,14 +908,14 @@ export function homeView(o: {
       ],
     });
     if (!g.channel) {
-      blocks.push(note('Pick a channel to see and configure which tools its members can use.'));
+      blocks.push(contextBlock('Pick a channel to see and configure which tools its members can use.'));
     } else if (g.note) {
       // g.note is Vouchr-authored constant text; the channel id came from an interaction payload,
       // so it is escaped at render (SEC-5).
-      blocks.push(note(`<#${escapeMrkdwn(g.channel)}>: ${g.note}`));
+      blocks.push(contextBlock(`<#${escapeMrkdwn(g.channel)}>: ${g.note}`));
     } else {
       const tools = g.tools ?? [];
-      if (!tools.length) blocks.push(note('No providers are registered.'));
+      if (!tools.length) blocks.push(contextBlock('No providers are registered.'));
       for (const t of tools.slice(0, HOME_MAX_ROWS)) {
         // One row per REGISTERED provider (#111): brokered tools get the full set; a 'service' tool
         // keeps ONLY Enable/Disable — its allowlist bit is a valid channel control, while mode and
@@ -986,7 +972,7 @@ export function homeView(o: {
         });
       }
       if (tools.length > HOME_MAX_ROWS) {
-        blocks.push(note(`+${tools.length - HOME_MAX_ROWS} more — use \`/vouchr\` in the channel.`));
+        blocks.push(contextBlock(`+${tools.length - HOME_MAX_ROWS} more — use \`/vouchr\` in the channel.`));
       }
     }
   }
