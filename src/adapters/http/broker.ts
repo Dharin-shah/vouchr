@@ -1284,7 +1284,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * decides once, in Slack, and the grant stays bound to the exact action fingerprint. The broker
    * cannot render the decision surface; the Bolt control plane delivers it on its own timer.
    */
-  async function handleAuthorize(body: BrokerAuthorizationRequest): Promise<BrokerAuthorizationResponse> {
+  async function handleBackchannelRequest(body: BrokerAuthorizationRequest): Promise<BrokerAuthorizationResponse> {
     const method = requestMethod(body.method);
     // Same fail-closed read-only default as /v1/fetch: a write the broker would refuse to execute
     // must not be able to mint a human decision for itself.
@@ -1327,7 +1327,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * and is single-use like every other route: mint a fresh assertion per poll. The row is bound to
    * the verified requester; any other caller — or a consumed/swept id — reads `404`.
    */
-  async function handleAuthorizationStatus(id: string, token: unknown): Promise<BrokerAuthorizationResponse> {
+  async function handleBackchannelStatus(id: string, token: unknown): Promise<BrokerAuthorizationResponse> {
     if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
     const claims = await verify(token);
     const { identity } = await requireCurrentActor(claims);
@@ -2171,12 +2171,12 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         }
         if (req.method === 'POST' && url === '/v1/authorization') {
           await perimeter(req, requestSignal);
-          return send(200, { ...await handleAuthorize(await readJson(req)) });
+          return send(200, { ...await handleBackchannelRequest(await readJson(req)) });
         }
         if (req.method === 'GET' && route === AUTHORIZATION_STATUS_ROUTE) {
           await perimeter(req, requestSignal);
           return send(200, {
-            ...await handleAuthorizationStatus(authorizationId!, req.headers['x-vouchr-identity']),
+            ...await handleBackchannelStatus(authorizationId!, req.headers['x-vouchr-identity']),
           });
         }
         if (req.method === 'POST' && url === '/v1/mcp') {
