@@ -17,6 +17,7 @@ import {
   type BrokerOptions,
 } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { waitFor } from './support/clock';
 import { MAX_TIMER_MS } from '../src/core/options';
 
 // #209 resource bounds at the HTTP boundary: finite upstream deadlines + client-cancel propagation,
@@ -84,14 +85,6 @@ function chunkedPost(
 async function listen(server: http.Server): Promise<number> {
   await new Promise<void>((r) => server.listen(0, r));
   return (server.address() as any).port;
-}
-
-async function waitFor(pred: () => boolean, timeoutMs = 2000): Promise<void> {
-  const start = Date.now();
-  while (!pred()) {
-    if (Date.now() - start > timeoutMs) throw new Error('waitFor timed out');
-    await new Promise((r) => setTimeout(r, 5));
-  }
 }
 
 /** Send an intentionally incomplete HTTP/1.1 request and resolve only when the server closes it. */
@@ -263,12 +256,21 @@ test('/v1/fetch: declared oversize is answered and closed without waiting for th
 });
 
 // ── upstream deadline + client cancellation ───────────────────────────────────
+// The deadline tests freeze `setTimeout` (t.mock.timers) and fire the route deadline explicitly
+// once the request has provably reached the stage under test. A real 80-150ms timer would race the
+// vault/identity reads that precede egress — on a loaded host those reads alone outlast it, and
+// the 504 fires before the upstream (or resolver) is ever called. Real I/O is awaited with
+// `waitFor` (wall clock); only the production timer is virtual.
 
 test('/v1/fetch: a hung upstream is cut at fetchDeadlineMs → 504, and the upstream fetch is aborted (#209)', async (t) => {
   const { port } = await buildBroker(t, { fetchDeadlineMs: 150 });
   const up = hangingUpstream();
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
-    const r = await post(port, '/v1/fetch', fetchBody());
+    const pending = post(port, '/v1/fetch', fetchBody());
+    await waitFor(() => up.calls() === 1); // the request reached the (hung) upstream
+    t.mock.timers.tick(150); // fetchDeadlineMs elapses
+    const r = await pending;
     assert.equal(r.status, 504);
     assert.equal(r.json.error, 'upstream timed out');
     assert.ok(up.aborts() >= 1, 'the deadline must abort the upstream fetch (socket released)');
@@ -430,8 +432,12 @@ test('/v1/fetch: a resolver that ignores cancellation is cut at the deadline and
     status: 200,
     headers: { 'content-type': 'application/json' },
   })) as typeof fetch;
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
-    const timedOut = await post(port, '/v1/fetch', fetchBody());
+    const pending = post(port, '/v1/fetch', fetchBody());
+    await waitFor(() => resolverCalls === 1); // the hung resolver is holding both slots
+    t.mock.timers.tick(80); // fetchDeadlineMs elapses while the resolver ignores its signal
+    const timedOut = await pending;
     assert.equal(timedOut.status, 502);
     assert.deepEqual(timedOut.json, {
       error: 'credential resolution failed',
@@ -488,10 +494,14 @@ test('/v1/fetch: the per-provider ceiling returns 503 scope=provider while the g
 test('/v1/fetch: repeated deadline timeouts release the slot — a later request is not starved (#209)', async (t) => {
   const { port } = await buildBroker(t, { maxInflight: 2, maxInflightPerProvider: 2, fetchDeadlineMs: 80 });
   const up = hangingUpstream();
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   try {
     // If a global/per-provider slot leaked on timeout, iteration 3+ would 503 instead of 504.
     for (let i = 0; i < 8; i++) {
-      const r = await post(port, '/v1/fetch', fetchBody());
+      const pending = post(port, '/v1/fetch', fetchBody());
+      await waitFor(() => up.calls() === i + 1); // admitted and hung upstream
+      t.mock.timers.tick(80); // fetchDeadlineMs elapses
+      const r = await pending;
       assert.equal(r.status, 504, `iteration ${i} must time out (slot released each time)`);
     }
     // Swap to a working upstream: if any slot had leaked across the 8 timeouts, the ceilings would be

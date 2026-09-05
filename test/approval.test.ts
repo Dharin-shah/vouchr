@@ -1498,25 +1498,43 @@ test("admin approver: prompts go to eligible admins; forged/ineligible clicks ar
 
 test('admin approval fan-out posts concurrently, staying inside the delivery lease', async (t) => {
   const admins = Array.from({ length: 12 }, (_, i) => `U_ADM_${i}`);
-  const POST_MS = 80;
+  let started = 0;
+  let releaseAll!: () => void;
+  const allStarted = new Promise<void>((resolve) => { releaseAll = resolve; });
   const { ctx } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'admin' } }),
     slackAdmins: admins,
     members: ['U1', ...admins],
-    // Each prompt post takes POST_MS. Sequential fan-out would be admins.length × POST_MS (~960ms),
-    // which for a larger channel exceeds the 30s lease and permits a replica takeover + duplicate
-    // controls. Concurrent (bounded) fan-out finishes in ~one POST_MS wave.
-    postEphemeral: async () => { await new Promise((r) => setTimeout(r, POST_MS)); return {}; },
+    // Every admin post blocks until ALL of them have started. Sequential fan-out could never open
+    // that gate (the first post would wait on posts that never begin), so the flow settles only if
+    // the whole channel is prompted in one concurrent wave — the property that keeps a larger
+    // channel's fan-out inside the 30s lease (a sequential wave would let a replica take over and
+    // duplicate the controls). Proved by ordering, never by measuring wall time.
+    postEphemeral: async (p: { user: string }) => {
+      if (!admins.includes(p.user)) return {};
+      if (++started === admins.length) releaseAll();
+      await allStarted;
+      return {};
+    },
   });
   await withFetch(async () => {
     const handle = await ctx.connect('acme');
-    const start = Date.now();
-    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
-    const elapsed = Date.now() - start;
-    assert.ok(
-      elapsed < POST_MS * admins.length / 2,
-      `admin fan-out was not concurrent: ${elapsed}ms for ${admins.length} sequential-would-be ${POST_MS * admins.length}ms`,
-    );
+    const prompted = expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    let ceiling: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        allStarted,
+        prompted.then(() => { throw new Error(`approval flow settled after only ${started}/${admins.length} admin posts`); }),
+        new Promise<never>((_, reject) => {
+          ceiling = setTimeout(() => reject(new Error(`admin fan-out was not concurrent: ${started}/${admins.length} posts started`)), 10_000);
+        }),
+      ]);
+    } finally {
+      if (ceiling) clearTimeout(ceiling);
+      releaseAll(); // never strand a blocked post behind a failed assertion
+    }
+    await prompted;
+    assert.equal(started, admins.length, 'every admin was prompted exactly once in the wave');
   });
 });
 
