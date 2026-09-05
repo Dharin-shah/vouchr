@@ -74,6 +74,10 @@ spec:
       securityContext:
         runAsNonRoot: true
         seccompProfile: { type: RuntimeDefault }
+      # Graceful drain: on SIGTERM the broker stops accepting, drops idle keep-alives and finishes
+      # in-flight requests within VOUCHR_SHUTDOWN_TIMEOUT_MS (default 10s). Keep this above that
+      # deadline so the kubelet's SIGKILL never cuts a request the broker would have finished.
+      terminationGracePeriodSeconds: 30
       containers:
         - name: broker
           # Pin to your registry + an immutable tag (ideally the digest you verified — see

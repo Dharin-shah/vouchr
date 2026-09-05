@@ -37,11 +37,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
+      # Default ruleset, NO path allowlist: test/, examples/ and docs are scanned like src/. The
+      # credential-shaped test fixtures (fake `xoxb-…` etc.) pass the default rules on their own —
+      # the scheduled full-history scan proves it weekly. Version pinned (#217 reviewed tool versions).
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_VERSION: 8.30.1
           # No GITLEAKS_LICENSE: org-level scanning needs one, but plain repo
           # scans run free with the default ruleset.
+      # #217 acceptance: a credential-like value under test/** must FAIL the scan (nothing exempts the
+      # test tree). Uses the binary the action just installed, against a throwaway tree holding one
+      # randomly generated AWS-shaped key — no credential-shaped string is committed (SEC-1).
+      - name: "Canary: a credential-shaped value under test/** fails the scan"
+        run: |
+          d="$(mktemp -d)"; mkdir -p "$d/test"
+          printf 'export const fixture = "AKIA%s";\n' "$(LC_ALL=C tr -dc 'A-Z2-7' </dev/urandom | head -c 16)" > "$d/test/canary.test.ts"
+          set +e; gitleaks dir "$d" --no-banner >/dev/null 2>&1; rc=$?; set -e
+          rm -rf "$d"
+          [ "$rc" = 1 ] || { echo "::error::gitleaks did not flag a credential-shaped value under test/** (exit $rc; 1 = leak found)"; exit 1; }
+          echo "gitleaks flags a credential-shaped value under test/**"
 
   sbom:
     runs-on: ubuntu-latest

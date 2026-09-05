@@ -7,6 +7,7 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Security
 
+- **Deployment proof and release gate (#216, #217):** `test/docker-smoke.sh` now proves the two-replica shape on the image (schema-owner migrate vs DML-only replicas, read-only root + arbitrary uid, rolling restart with zero failed requests, in-flight request across SIGTERM, PostgreSQL outage fail-closed + recovery); `release.yml` publishes only a tag contained in `main`, smokes + Trivy-scans the exact pushed digest before signing it, and verifies the npm `gitHead` and image revision label are the release commit; CI enforces a coverage floor (lines 95 / branches 87), packs on Node 22 + 24, runs a weekly higher-iteration property job, and proves a credential-shaped value under `test/**` fails Gitleaks (the unused `test/` allowlist is gone). `guides/DEPLOYMENT.md` gains an operator runbook.
 - **`requireBrowserSlackIdentity` (#302): opt-in Slack OpenID Connect verification of the browser
   completing provider OAuth — the prevention for the "Forwarded consent link" hand-off.** With the
   flag on (both surfaces: `createVouchr` and `createBroker`/`vouchr-broker` via

@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Weekly bounded higher-iteration property run (#217): a fresh seed and 25x the per-property loops.
+  # Failures show in Actions; nothing opens issues.
+  schedule:
+    - cron: '13 3 * * 2'
 
 # Superseded PR runs auto-cancel so pushes don't pile up burning minutes.
 concurrency:
@@ -59,12 +63,22 @@ jobs:
       # (e.g. the headless @slack-free module-graph check), and an emit/declaration break fails fast here.
       - run: npm run build
       # Both legs run the suite once: the 24 leg plain, the 22 leg with node:test native coverage so
-      # the per-file src/** table prints in the job log. Phase 1 = visibility only — no failing
-      # threshold yet; a ratchet (--test-coverage-lines) lands as a follow-up once the floor is known.
+      # the per-file src/** table prints in the job log, enforcing the #217 floor (lines 95 / branches
+      # 87, set below the 97.8 / 90.9 post-PostgreSQL baseline measured at the commit that added it).
+      # Property tests (test/property.test.ts) run a FIXED seed on push/PR so a red check is
+      # reproducible byte-for-byte; the weekly schedule uses the run id as a fresh seed (logged, so
+      # VOUCHR_TEST_SEED=<it> replays a failure) with 25x iterations.
       - run: npm test
         if: matrix.node != 22
+        env:
+          VOUCHR_TEST_SEED: ${{ github.event_name == 'schedule' && github.run_id || 20260905 }}
+          VOUCHR_TEST_ITERS: ${{ github.event_name == 'schedule' && 25 || 1 }}
       - run: npm run test:coverage
         if: matrix.node == 22
+        env:
+          NODE_OPTIONS: --test-coverage-lines=95 --test-coverage-branches=87
+          VOUCHR_TEST_SEED: ${{ github.event_name == 'schedule' && github.run_id || 20260905 }}
+          VOUCHR_TEST_ITERS: ${{ github.event_name == 'schedule' && 25 || 1 }}
       # The advertised runnable dry-run example is a blocking regression: it exercises the real
       # first-use flow (admin enable → consent → egress gates) end to end, so a change like
       # deny-by-default that breaks first use fails here instead of only in a user's repo.
@@ -72,14 +86,19 @@ jobs:
 
   # Exercises the PUBLISHED artifact (pack → install into a fresh project → resolve every
   # entrypoint/bin/type). Separate job: a packaging break is distinct from a test failure, and it
-  # needs no Postgres. ~30s.
+  # needs no Postgres. ~30s. Same Node matrix as `test`: the packed consumer must work on 22 AND the
+  # next supported runtime (#217).
   pack-smoke:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
-          node-version: 22
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci
       - run: npm run pack-smoke

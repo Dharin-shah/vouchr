@@ -1182,6 +1182,87 @@ static-policy enforcement, rather than assuming a Slack control write reaches ev
 CI green (typecheck + tests, including the Postgres backend) is necessary but **not** the same as
 having run this in production. Vouchr has not yet been run in production. Treat this list as the gap.
 
+## Operator runbook (#216)
+
+One supported shape: the published image, one PostgreSQL, a KMS envelope, two or more stateless
+replicas behind a load balancer that honours `/readyz`. Everything below assumes it.
+
+### What the deployment proof covers, and how to re-run it
+
+`npm run docker-smoke` (`test/docker-smoke.sh`; runs in CI on every image-touching PR and, in
+`release.yml`, against the exact pushed digest before it is signed) builds the image and proves:
+
+| Step | What it proves |
+|---|---|
+| `vouchr migrate` as `vouchr_owner`, replicas as `vouchr_app` | the [Migrations](#migrations) role split works end to end; `vouchr_app` cannot `CREATE` |
+| two replicas, read-only root, one as the image uid and one as uid 12345 | the manifest's `readOnlyRootFilesystem` + arbitrary-UID contract boots and serves `/readyz` on one shared database |
+| startup logs | provider ids present, no identity secret / master key value |
+| rolling restart, one replica at a time | SIGTERM drains and exits `0`, the replica returns ready, the other replica answered every request meanwhile (zero failures through a readiness-aware LB) |
+| in-flight request across SIGTERM | a request whose body arrives after SIGTERM still gets its response before the process exits `0` |
+| PostgreSQL stopped, then started | `/readyz` 503 on every replica while `/healthz` stays 200 (no restart storm); `/readyz` 200 again after recovery with no replica restart |
+
+Not covered by that script and still to be run by hand against staging before a production
+declaration: KMS unavailable/throttled and KEK rotation overlap (the image ships without
+`@aws-sdk/client-kms`; see [KMS envelope encryption](#kms-envelope-encryption-production)), a backup
+restore drill ([Backup and restore](#backup-and-restore)), PostgreSQL primary failover, a slow and an
+oversized provider (unit-covered in `test/http-bounds.test.ts` / `test/egress-response.test.ts`,
+not on the image), and representative load on the exact image (the harness below runs the same
+broker code in-process).
+
+### Rolling upgrade and rollback
+
+1. Verify the new digest ([cosign](#verifying-the-ghcr-image-cosign-sbom-provenance)) and pin
+   `name@digest` in both the migrate Job and the Deployment.
+2. Run the migrate Job to completion with the schema-owner role. It is idempotent and
+   advisory-locked. A version that changes the schema in a way old replicas cannot serve says so in
+   [Migrations](#migrations) (v12 → v13 is drained; v13 → v14 is a staged flag rollout).
+3. Roll the Deployment. With `replicas: 2` the default `RollingUpdate` (`maxUnavailable` rounds to
+   0, `maxSurge` to 1) starts a new pod, waits for its `/readyz`, then terminates an old one:
+   the fleet never drops below two ready pods. `terminationGracePeriodSeconds: 30` outlives the
+   broker's 10 s drain deadline (`VOUCHR_SHUTDOWN_TIMEOUT_MS`).
+4. Rollback = roll the Deployment back to the previous digest. The runtime is DML-only and the
+   schema marker is exact-version, so a rollback across a schema version is refused at boot
+   (`/readyz` stays 503) — restore the matching backup instead, as [Migrations](#migrations)
+   describes per version. Rollback never runs `vouchr migrate`.
+
+### Graceful shutdown
+
+On `SIGTERM`/`SIGINT` the broker logs `draining connections`, stops accepting, closes idle
+keep-alive sockets and lets in-flight requests finish, then closes the pool and exits `0`. If
+in-flight work outlives `VOUCHR_SHUTDOWN_TIMEOUT_MS` (default 10 s) remaining connections are cut
+and it exits `1` — alert on non-zero broker exits. Keep the orchestrator's kill grace above the
+deadline (the reference manifest uses 30 s).
+
+### Outages
+
+- **PostgreSQL.** `/readyz` fails within ~2 s (schema marker + replay-store probes), so the LB
+  stops routing to every replica; requests already inside a replica fail closed (no credential is
+  served, minted, refreshed or resolved without the store). `/healthz` stays 200 — do not restart
+  pods for a DB outage. When PostgreSQL returns the pools reconnect on demand and `/readyz` goes
+  200 with no restart (proved by the smoke above). Idle-client errors are logged as
+  `postgres idle-client error` and are expected during the outage.
+- **KMS (envelope mode).** Readiness checks KMS *configuration* at boot, not KMS availability: a
+  wrap/unwrap that times out, is throttled, or fails makes that request fail closed with no fallback
+  to a direct key and no plaintext in the error. Alert on KMS errors and latency; the fleet stays in
+  rotation for requests that need no KMS call. Repointing `VOUCHR_KMS_KEY_ID` is not recovery — see
+  the KMS section's re-wrap warning.
+- **A provider.** A hung upstream is cut at `VOUCHR_FETCH_DEADLINE_MS` (`upstream_timeout`); a
+  slow provider is boxed by `VOUCHR_MAX_INFLIGHT_PER_PROVIDER` so it cannot consume the global
+  budget; over either ceiling the broker sheds with `503` + `Retry-After`. Nothing is retried
+  automatically except one refresh on 401.
+- **Slack.** Bolt-only surface: headless broker credential use is unaffected. Slash commands,
+  modals and the post-connect DM fail visibly rather than silently; users retry once Slack is back.
+
+### Suspected credential exposure, break-glass offboarding
+
+Use the deployment-wide procedure in [Incident break-glass (#239)](#incident-break-glass-239):
+`VOUCHR_LOCKDOWN=1` on every replica (readiness 503, every functional route refused), then
+`vouchr revoke --all --confirm ALL-CREDENTIALS`, then key/role rotation and reconnect. A single
+user's emergency removal is `vouchr revoke --provider <id> --team <id> --user <id> --yes` (dry-run
+without `--yes`) or `POST /v1/admin/offboard`
+(see [Lifecycle](#lifecycle-disconnect-offboard-ttl-sweep-54)); Bolt deployments wire
+`registerOffboarding` so deactivated Slack users are removed automatically.
+
 ## Key rotation
 
 How rotation works depends on which at-rest mode you run (`src/core/crypto.ts`).

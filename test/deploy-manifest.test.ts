@@ -37,6 +37,14 @@ test('both containers carry the Restricted container-level controls', () => {
   }
 });
 
+test('the Deployment grants SIGTERM more time than the broker drain deadline (graceful drain, #216)', () => {
+  // bin/broker-server.ts defaults VOUCHR_SHUTDOWN_TIMEOUT_MS to 10s; the pod must outlive it or the
+  // kubelet's SIGKILL cuts requests the broker was about to finish.
+  const deployment = podTemplates.find((d) => kindOf(d) === 'Deployment') ?? '';
+  const grace = Number(deployment.match(/terminationGracePeriodSeconds:\s*(\d+)/)?.[1]);
+  assert.ok(grace > 10, `terminationGracePeriodSeconds must exceed the 10s drain deadline (got ${grace})`);
+});
+
 test('both containers bound CPU and memory in requests AND limits', () => {
   // A request only affects scheduling; a limit is the hard ceiling. Require both dimensions on both.
   for (const doc of podTemplates) {
