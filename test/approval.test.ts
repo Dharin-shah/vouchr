@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb, testDbUrl } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -2576,7 +2577,7 @@ test('broker: unapproved write → 403 { error: "approval_required", approvalId 
   const provider = approvalProvider();
   await vault.upsert(userOwner(ID), 'acme', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const tok = () => signIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID() }, SECRET);
   const fetchBody = { handle: { provider: 'acme', owner: 'user' }, method: 'POST', path: '/repos', body: '{}' };
@@ -2676,7 +2677,7 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
   };
 
   const withTools = createBroker({ ...brokerOptions, channelTools: new ChannelTools(dbA) });
-  await new Promise<void>((resolve) => withTools.listen(0, resolve));
+  await listen(t, withTools);
   const toolsPort = (withTools.address() as any).port;
   try {
     await withFetch(async (calls) => {
@@ -2758,7 +2759,7 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
   // row likewise stays inert when channelConfig is omitted (historical user-only/no-mode broker).
   await writeChannelMode(new ChannelConfig(dbB), 'T1', 'C1', 'acme', 'session');
   const withoutTools = createBroker(brokerOptions);
-  await new Promise<void>((resolve) => withoutTools.listen(0, resolve));
+  await listen(t, withoutTools);
   const plainPort = (withoutTools.address() as any).port;
   try {
     await withFetch(async (calls) => {

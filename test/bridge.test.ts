@@ -9,6 +9,7 @@ import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import { openTestDb, testDbUrl } from './support/pg';
+import { listen } from './support/http';
 import { identityConfig, signIdentity } from './support/identity';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
@@ -239,8 +240,7 @@ async function brokerApprovalDenial(
     allowWrites: true,
     channelConfig: options.channelConfig,
   });
-  await new Promise<void>((r) => server.listen(0, r));
-  t.after(() => new Promise((r) => server.close(() => r(null))));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const deny = async () => post(port, '/v1/fetch', {
     handle: { provider: provider.id, owner },

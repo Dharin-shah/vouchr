@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider, type Provider } from '../src/core/providers';
@@ -132,8 +133,7 @@ async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Pr
     providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET),
     allowWrites: o.allowWrites ?? true,
   });
-  await new Promise<void>((r) => server.listen(0, r));
-  t.after(() => new Promise<void>((r) => server.close(() => r())));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const slack = fakeSlack(o.members);
   const vouchr = await createVouchr({

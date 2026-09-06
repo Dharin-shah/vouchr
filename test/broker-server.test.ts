@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { testDbUrl } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -332,7 +333,7 @@ async function baseEnv(t: TestContext, extra: Record<string, string> = {}): Prom
 
 test('buildBrokerServer: boots on PostgreSQL and serves /healthz + /health + /readyz', async (t) => {
   const built = await buildBrokerServer(await baseEnv(t, { VOUCHR_PORT: '0' }));
-  await new Promise<void>((r) => built.server.listen(0, r));
+  await listen(t, built.server);
   const port = (built.server.address() as any).port;
   try {
     assert.equal(built.backend, 'postgres');
@@ -365,7 +366,7 @@ test('#236 packaged policy trusts the signed channel and denies before credentia
       },
     },
   });
-  await new Promise<void>((resolve) => built.server.listen(0, resolve));
+  await listen(t, built.server);
   const port = (built.server.address() as any).port;
   const vault = new Vault(built.db, Buffer.from(KEY_B64, 'base64'));
   const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
@@ -476,7 +477,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
   const built = await buildBrokerServer(env, {
     resolvers: { 'aws-sm': async () => { resolverCalls++; return 'resolved-secret'; } },
   });
-  await new Promise<void>((resolve) => built.server.listen(0, resolve));
+  await listen(t, built.server);
   const port = (built.server.address() as any).port;
   const realFetch = globalThis.fetch;
   let upstreamCalls = 0;
@@ -657,7 +658,7 @@ test('#65 buildBrokerServer: an env-declared mcp provider serves POST /v1/mcp en
     VOUCHR_ALLOW_WRITES: '1',
     VOUCHR_PROVIDERS: JSON.stringify([MCP_INTERNAL]),
   }));
-  await new Promise<void>((r) => built.server.listen(0, r));
+  await listen(t, built.server);
   const port = (built.server.address() as any).port;
   const real = globalThis.fetch;
   let upstreamAuth: string | null = null;

@@ -6,6 +6,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider } from '../src/core/providers';
@@ -87,7 +88,7 @@ async function makeVerifiedBroker(t: TestContext, extra: Partial<Parameters<type
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
     baseUrl: 'https://broker.example', requireBrowserSlackIdentity: true, slackOidc: OIDC, ...extra,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, audit, db, port: (server.address() as any).port };
 }
 
@@ -278,8 +279,8 @@ test('#302 guardrail: the requirement is the ROW\'s, not the replica\'s — a fl
   // Instance A mints with enforcement ON; instance B (rollout / config drift) has the flag OFF.
   const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
   const serverOff = createBroker({ ...base });
-  await new Promise<void>((r) => serverOn.listen(0, r));
-  await new Promise<void>((r) => serverOff.listen(0, r));
+  await listen(t, serverOn);
+  await listen(t, serverOff);
   const portOn = (serverOn.address() as any).port;
   const portOff = (serverOff.address() as any).port;
   const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
@@ -313,8 +314,8 @@ test('#302 mode flip off→on: the unenforced prompt is superseded, the replacem
   const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
   const serverOff = createBroker({ ...base });
   const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
-  await new Promise<void>((r) => serverOff.listen(0, r));
-  await new Promise<void>((r) => serverOn.listen(0, r));
+  await listen(t, serverOff);
+  await listen(t, serverOn);
   const portOff = (serverOff.address() as any).port;
   const portOn = (serverOn.address() as any).port;
   const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
@@ -355,8 +356,8 @@ test('#302 mode flip on→off: the enforced prompt is superseded instead of beco
   const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
   const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
   const serverOff = createBroker({ ...base });
-  await new Promise<void>((r) => serverOn.listen(0, r));
-  await new Promise<void>((r) => serverOff.listen(0, r));
+  await listen(t, serverOn);
+  await listen(t, serverOff);
   const portOn = (serverOn.address() as any).port;
   const portOff = (serverOff.address() as any).port;
   const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
@@ -397,7 +398,7 @@ test('#302 mismatch with a failing audit store: state stays spent, but the respo
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
     baseUrl: 'https://broker.example', requireBrowserSlackIdentity: true, slackOidc: OIDC,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken({ sub: 'U-EVIL' }) } }));
   try {
@@ -476,7 +477,7 @@ test('#302 flag off: /v1/connect returns the provider authorize URL directly and
     providers: [acme], vault, audit: new Audit(db), db,
     identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example',
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   try {
     const { authorize } = await beginFlow(port);

@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -46,7 +47,7 @@ async function harness(t: TestContext) {
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { audit, db, server, port: (server.address() as any).port };
 }
 

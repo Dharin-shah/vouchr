@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import { openTestDb, testDbUrl } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
 import http from 'node:http';
@@ -800,7 +801,7 @@ test('dry-run broker: /v1/connect → local callback → /v1/fetch echo, fully o
     providers: [acme()], vault, audit: new Audit(db), db,
     identitySecret: identityConfig('shh'), baseUrl: 'https://broker.test', dryRun: true,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   try {
     // Mint the consent: the authorize URL points at THIS broker's own callback with a synthetic code.
@@ -855,7 +856,7 @@ test('dry-run broker: callback refuses a foreign code and never clobbers a real 
     providers: [acme()], vault, audit: new Audit(db), db,
     identitySecret: identityConfig('shh'), baseUrl: 'https://broker.test', dryRun: true,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   try {
     // (a) A code the local stub didn't mint is a REAL provider redirect: refuse loudly, write nothing.
@@ -886,7 +887,7 @@ test('dry-run broker: fails every request closed against a vault with real crede
   const vault = new Vault(db, randomBytes(32));
   await vault.upsert(userOwner(ID), 'acme', { ...FRESH, externalAccount: 'octocat' }); // a REAL row
   const server = createBroker({ providers: [acme()], vault, audit: new Audit(db), db, identitySecret: identityConfig('shh'), dryRun: true });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   try {
     assert.equal((await get(port, '/healthz')).status, 200); // liveness stays green: the process IS up

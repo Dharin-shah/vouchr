@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -100,7 +101,7 @@ async function makeMcpBroker(
   });
   const resolvedExtra = typeof extra === 'function' ? await extra(db) : extra;
   const server = createBroker({ providers: [mcpAcme], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true, ...resolvedExtra });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
 
@@ -927,7 +928,7 @@ test('#194 typed recovery: pre-handle database failures return fixed internal me
   const server = createBroker({
     providers: [mcpAcme], vault, audit, db: failingDb, identitySecret: identityConfig(SECRET), allowWrites: true,
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
@@ -965,7 +966,7 @@ test('#194 typed recovery: vault/KMS failures stay secret-free and aligned acros
   const server = createBroker({
     providers: [mcpAcme], vault: failingVault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true,
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
