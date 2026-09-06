@@ -12,6 +12,8 @@ test('connectedHtml: shows the provider account and granted scopes', () => {
   assert.doesNotMatch(connectedHtml('github', 'octocat', undefined, ID), /with: <code>/);
   // The old, false "acting as you" copy must be gone: it lies to a forwarded-link completer.
   assert.doesNotMatch(html, /acting as you/);
+  // #348: the page names the next step, not only "close this tab".
+  assert.match(html, /Now go back to Slack and ask the agent again\. You can close this tab\./);
 });
 
 test('connectedHtml: the bound identity is human-recognizable (deep link), not only raw ids', () => {

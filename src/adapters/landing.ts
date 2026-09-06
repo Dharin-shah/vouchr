@@ -37,6 +37,6 @@ export function connectedHtml(
     <h2>✅ ${p} connected${who}</h2>
     <p style="color:#555">This connection is now linked to <a href="${profileLink}">this Slack user</a> (<code>${escapeHtml(identity.userId)}</code> in workspace <code>${escapeHtml(identity.teamId)}</code>). The agent will act as that Slack user${withScopes}.</p>
     <p style="color:#b00">If that is not your Slack account, you have connected this ${p} account${acct} to someone else — open the link above to check who, then contact your Slack admin.</p>
-    <p>You can close this tab.</p>
+    <p>Now go back to Slack and ask the agent again. You can close this tab.</p>
   </body></html>`;
 }

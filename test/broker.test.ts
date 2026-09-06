@@ -1411,7 +1411,7 @@ test('/v1/disconnect returns a static 404 for an unregistered, unstored provider
       handle: { provider: untrusted }, identityToken: signIdentity(claims(), SECRET),
     });
     assert.equal(r.status, 404);
-    assert.deepEqual(r.json, { error: 'unknown provider' });
+    assert.deepEqual(r.json, { error: 'unknown provider', code: 'not_found', retryable: false, recovery: 'fix_configuration' });
     assert.ok(!r.raw.includes(untrusted));
     assert.equal(((await db.get(`SELECT COUNT(*) AS n FROM audit WHERE action='revoke'`)) as any).n, 0);
   } finally {
@@ -2258,7 +2258,9 @@ test('#194 stale assertions cannot read resolve, status, or the channel manifest
       });
       const replay = await post(port, route.path, route.staleBody);
       assert.equal(replay.status, 401, `${route.name} must spend even a refused assertion`);
-      assert.deepEqual(replay.json, { error: 'invalid identity token' });
+      // #348: a spent assertion is a distinct machine code from a malformed/expired one, with the
+      // same prose (no oracle on which check failed).
+      assert.deepEqual(replay.json, { error: 'invalid identity token', code: 'identity_replayed', retryable: false, recovery: 'resolve_again' });
     }
 
     // Make fresh assertions unambiguously post-tombstone without a wall-clock race. Exact boundary
@@ -2357,7 +2359,9 @@ test('#194 stale assertions reach no mutation-route probe, denial audit, or stat
       });
       const replay = await post(port, route.path, route.request);
       assert.equal(replay.status, 401, `${route.name} must spend the refused assertion`);
-      assert.deepEqual(replay.json, { error: 'invalid identity token' });
+      // #348: a spent assertion is a distinct machine code from a malformed/expired one, with the
+      // same prose (no oracle on which check failed).
+      assert.deepEqual(replay.json, { error: 'invalid identity token', code: 'identity_replayed', retryable: false, recovery: 'resolve_again' });
     }
     assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit`))!.n, 0);
     assert.equal((await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM connection`))!.n, 1);

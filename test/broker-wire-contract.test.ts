@@ -65,12 +65,13 @@ const userToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims(ov
 const adminToken = (over: Partial<IdentityClaims> = {}) =>
   signIdentity(claims({ channelEligible: true, ...over }), SECRET);
 
-async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof createBroker>[0]> = {}) {
+async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof createBroker>[0]> = {}, lockdown = false) {
   const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
+  // The broker's vault may be locked down (#239); seeding always goes through an open one.
+  const vault = new Vault(db, KEY, {}, undefined, lockdown);
   const audit = new Audit(db);
   // Seed U1's acme credential so /v1/fetch, /v1/resolve, /v1/status have something to report.
-  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
+  await new Vault(db, KEY).upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   // Backdate the seed's generation to a prior session (realistic): a fresh request's skew-backdated
@@ -266,10 +267,26 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
       try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: adminToken({ userId: 'ADMIN', offboardTargetUserId: 'U1' }), targetUserId: 'U1' }); } finally { server.close(); }
   } },
 
-  // ── error shapes (every 4xx/5xx body is `{ error: string }`; the STATUS is the contract) ──
+  // ── error shapes (every 4xx/5xx body carries `error` prose plus, since #348, the machine fields
+  //    `code` / `retryable` / `recovery` on perimeter refusals too; the STATUS is the contract) ──
   { name: 'error.fetch.badToken.401', run: async (t) => {
       const { server, port } = await makeBroker(t);
       try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: 'not-a-real-token', method: 'GET', path: '/data' }); } finally { server.close(); }
+  } },
+  { name: 'error.status.replayedToken.401', run: async (t) => {
+      const { server, port } = await makeBroker(t);
+      // The same single-use assertion presented twice: the second read is `identity_replayed`, a
+      // distinct code from a malformed/expired token, with the same prose (#348).
+      const body = { identityToken: userToken() };
+      try { await request(port, 'POST', '/v1/status', body); return await request(port, 'POST', '/v1/status', body); } finally { server.close(); }
+  } },
+  { name: 'error.fetch.bodyTooLarge.413', run: async (t) => {
+      const { server, port } = await makeBroker(t);
+      try { return await request(port, 'POST', '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(), method: 'GET', path: '/data', query: { pad: 'A'.repeat(70_000) } }); } finally { server.close(); }
+  } },
+  { name: 'error.lockedDown.503', run: async (t) => {
+      const { server, port } = await makeBroker(t, {}, true);
+      try { return await request(port, 'GET', '/v1/manifest'); } finally { server.close(); }
   } },
   { name: 'error.fetch.methodNotAllowed.405', run: async (t) => {
       const { server, port } = await makeBroker(t);

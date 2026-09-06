@@ -250,6 +250,23 @@ test('createVouchr validates VOUCHR_LOCKDOWN before key or database acquisition'
   }
 });
 
+/** Raw GET for browser routes: status, content-type, and body text. */
+function getPage(port: number, path: string): Promise<{ status: number; contentType: string; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, path, method: 'GET' }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({
+        status: res.statusCode ?? 0,
+        contentType: String(res.headers['content-type'] ?? ''),
+        body: Buffer.concat(chunks).toString('utf8'),
+      }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
 function getStatus(port: number, path: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const req = http.request({ host: '127.0.0.1', port, path, method: 'GET' }, (res) => {
@@ -277,6 +294,17 @@ test('lockdown broker: liveness stays 200, readiness is 503, and functional rout
     assert.equal(await getStatus(port, '/readyz'), 503, 'a locked-down replica must not be ready');
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
     assert.equal(r.status, 503, 'functional routes must be refused under lockdown');
+    // #348: a worker branches on the machine code, not on prose.
+    assert.deepEqual(r.json, { ok: false, error: 'locked_down', code: 'locked_down', retryable: false, recovery: 'contact_admin' });
     assert.equal(up.seen.length, 0, 'no credential may be served under lockdown');
+    // #348: a human's browser on the callback and Slack-hop paths gets a page that names the next
+    // step, not raw JSON; nothing is consumed or exchanged.
+    for (const path of ['/oauth/callback?code=x&state=y', '/oauth/verify?state=y', '/oauth/slack?code=x&state=y']) {
+      const page = await getPage(port, path);
+      assert.equal(page.status, 503, path);
+      assert.match(page.contentType, /^text\/html/, path);
+      assert.match(page.body, /Connection setup is temporarily unavailable\. Contact an administrator\./, path);
+      assert.doesNotMatch(page.body, /locked_down/, path);
+    }
   } finally { up.restore(); server.close(); }
 });
