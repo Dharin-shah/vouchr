@@ -59,12 +59,12 @@ const STALE: BrowserVerifyResult = {
   status: 400,
   error: `${CONNECT_PROMPT_STALE_TEXT} The prompt in Slack now offers a new link.`,
 };
-// An in-channel prompt was replaced on click (#347) while its state stays live, so point at the
-// agent (a re-ask reposts the same generation) rather than at a prompt that may be gone.
+// The state stays live. An in-channel prompt was replaced on click (#347) and a re-ask reposts the
+// same generation; a channel-less DM prompt is durable and never redelivered. One sentence covers both.
 const INCOMPLETE: BrowserVerifyResult = {
   ok: false,
   status: 400,
-  error: 'Slack sign-in did not complete. Ask the agent again to get the connection prompt back.',
+  error: 'Slack sign-in did not complete. Go back to Slack. If the connection prompt is still there, use it; if not, ask the agent again.',
 };
 const EXCHANGE_FAILED: BrowserVerifyResult = {
   ok: false,

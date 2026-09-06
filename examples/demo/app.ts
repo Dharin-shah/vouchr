@@ -58,7 +58,14 @@ app.event('app_mention', async ({ context, event, client }) => {
     await reply(`You are *${me.login}* on GitHub, ${me.public_repos} public repos.`);
   } catch (e) {
     // Vouchr already posted the Connect prompt, the thread session prompt, or the Approve/Deny prompt.
-    if (e instanceof ConsentRequiredError || e instanceof SessionApprovalRequiredError || e instanceof ApprovalRequiredError) return;
+    if (e instanceof ConsentRequiredError || e instanceof SessionApprovalRequiredError) {
+      // 'reused': the earlier ephemeral may be gone after a Slack reload; repeat the fixed copy privately.
+      if (e.promptState === 'reused' && event.user) {
+        await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(e) });
+      }
+      return;
+    }
+    if (e instanceof ApprovalRequiredError) return;
     if (event.user) await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(e) });
     throw e;
   }

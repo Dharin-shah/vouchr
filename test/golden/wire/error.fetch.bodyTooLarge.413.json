@@ -1,5 +1,5 @@
 {
-  "status": 404,
+  "status": 413,
   "shape": {
     "code": "string",
     "error": "string",

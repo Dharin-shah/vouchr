@@ -903,7 +903,7 @@ test('dry-run: the Slack verify hop routes are not mounted on either adapter, so
     const state = new URL(c.json.authorizeUrl).searchParams.get('state')!;
     const hop2 = await get(port, `/oauth/slack?code=x&state=${state}`);
     assert.equal(hop2.status, 404);
-    assert.deepEqual(JSON.parse(hop2.body), { error: 'not found' }); // the same 404 as any unmounted path
+    assert.deepEqual(JSON.parse(hop2.body), { error: 'not found', code: 'not_found', retryable: false, recovery: 'fix_configuration' }); // the same 404 as any unmounted path
     assert.equal((await get(port, `/oauth/verify?state=${state}`)).status, 404);
     assert.equal(fetches, 0);
     assert.ok(await new Consent(db, true).activeRow(state)); // the state was not spent by a dead hop

@@ -513,7 +513,17 @@ test('connect(): covered provider deduplicates one opaque in-thread request and 
   assert.ok(!button.value.includes('TH_A'));
 
   // A repeated agent turn converges on the same live row and does not post/audit another prompt.
-  await assert.rejects(() => make('TH_A').connect('gh'), SessionApprovalRequiredError);
+  // #348: the reused in-thread ephemeral may be gone after a Slack reload, so the error says so
+  // instead of claiming a button was just posted.
+  await assert.rejects(() => make('TH_A').connect('gh'), (error: unknown) => {
+    assert.ok(error instanceof SessionApprovalRequiredError);
+    assert.equal(error.promptState, 'reused');
+    assert.match(
+      mapSafeError(error).message,
+      /An approval prompt was already posted in the thread; if it is no longer visible, ask again in 30 seconds\./,
+    );
+    return true;
+  });
   assert.equal(posted.length, 1);
   const pending = (await db.all(`SELECT id, provider, thread FROM session_request`)) as any[];
   assert.deepEqual(pending, [{ id: button.value, provider: 'gh', thread: 'TH_A' }]);
@@ -526,7 +536,11 @@ test('connect(): covered provider deduplicates one opaque in-thread request and 
     `UPDATE session_request SET delivered_at=${POSTGRES_NOW_US_SQL}-? WHERE id=?`,
     [PROMPT_REDELIVERY_DEBOUNCE_US + 1_000, button.value],
   );
-  await assert.rejects(() => make('TH_A').connect('gh'), SessionApprovalRequiredError);
+  await assert.rejects(() => make('TH_A').connect('gh'), (error: unknown) => {
+    assert.ok(error instanceof SessionApprovalRequiredError);
+    assert.equal(error.promptState, 'posted', 'a re-posted prompt is on screen again');
+    return true;
+  });
   assert.equal(posted.length, 2, 'the vanished session ephemeral is re-posted after the debounce');
   assert.equal(
     (await auditRows()).filter((r) => r.action === 'session').length,
@@ -555,7 +569,8 @@ test('connect(): covered provider off-thread is refused (no thread to scope a se
   await vault.upsert(userOwner(ID), 'gh', {
     accessToken: 'sk-x', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  await assert.rejects(() => make(null).connect('gh'), /thread-scoped session/);
+  // #348: typed, so a host's safeUserMessage renders the next step instead of "check the logs".
+  await expectUserRecovery(make(null).connect('gh'), 'resolve_again', /^"gh" needs a thread-scoped session; ask me inside a thread\.$/);
   const denied = (await auditRows()).filter((r) => r.action === 'denied');
   assert.equal(denied.length, 1);
   assert.match(denied[0].meta, /no-thread/);

@@ -203,7 +203,7 @@ test('connectChannel: handle on shared cred, refuses per-user and unconfigured',
   // Flip to per-user: the shared cred is removed and connectChannel refuses.
   await ok.c.setChannelMode('mcp', 'per-user');
   assert.equal(await ok.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-  await assert.rejects(async () => ok.c.connectChannel('mcp'), /per-user/);
+  await assert.rejects(async () => ok.c.connectChannel('mcp'), /does not share a "mcp" credential\. Ask the agent again/);
 });
 
 // Policy denial applies to shared channel creds, not just per-user connect().

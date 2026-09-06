@@ -24,7 +24,7 @@ import {
 import { openDb, type Db } from '../src/core/db';
 import { ConsentRequiredError, mapSafeError, UserFacingError } from '../src/core/errors';
 import type { SlackIdentity } from '../src/core/identity';
-import { handleOAuthCallback } from '../src/core/oauthCallback';
+import { handleOAuthCallback, OAUTH_CONNECTION_FAILED } from '../src/core/oauthCallback';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { Policy } from '../src/core/policy';
 import { CredentialLockdownError, Vault } from '../src/core/vault';
@@ -453,7 +453,13 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   assert.equal(await consent.sweepStale(), 0, 'authority expiry must retain bounded recovery context');
   const expired = await handleOAuthCallback(deps, 'code', expiredState.state);
   assert.equal(!expired.ok && expired.outcome, 'state_expired');
-  assert.equal((await handleOAuthCallback(deps, 'code', expiredState.state)).outcome, 'state_unavailable');
+  const replayed = await handleOAuthCallback(deps, 'code', expiredState.state);
+  assert.equal(replayed.outcome, 'state_unavailable');
+  // #348: a consumed/replayed link names the next step instead of "please retry".
+  assert.equal(
+    !replayed.ok && replayed.error,
+    'This link was already used. Go back to Slack and ask the agent for a new Connect prompt.',
+  );
 
   const abandoned = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   await db.run(
@@ -486,6 +492,7 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   try {
     const failed = await handleOAuthCallback(deps, 'code', failedState.state);
     assert.equal(!failed.ok && failed.outcome, 'exchange_failed');
+    assert.equal(!failed.ok && failed.error, OAUTH_CONNECTION_FAILED);
     assert.equal(!failed.ok && failed.recovery, 'retry_later');
     assert.equal(!failed.ok && failed.retryable, false, 'a spent code is never callback-retryable');
     assert.ok(!JSON.stringify(failed).includes(foreign));

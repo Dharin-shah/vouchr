@@ -16,10 +16,41 @@ All notable changes to this project are documented here. This project adheres to
   lease as an agent turn and swaps the fresh prompt in place. The browser stale page keeps its
   fixed copy and adds `The prompt in Slack now offers a new link.` The click never spends the
   state; a tampered or another user's value gets the fixed stale copy and writes nothing.
-  `connectBlocks` gains an optional fourth `state` argument (host-rendered prompts without it keep
-  the bare-ack behavior); `OAUTH_RENEW_ACTION` joins `OAUTH_CONNECT_ACTION` in the package
+  `connectBlocks` gains a required fourth `state` argument, so every rendered button is addressable
+  by its click; `OAUTH_RENEW_ACTION` joins `OAUTH_CONNECT_ACTION` in the package
   exports, and `connectExpiredBlocks`, `CONNECT_PROMPT_STALE_TEXT`, and
   `CONNECT_PROMPT_OPENING_TEXT` are exported from `src/adapters/blocks`.
+
+### Fixed
+
+- **Every terminal state names the next action, and no stale prompt survives (#348).** Found by a
+  code-walk audit after a live demo. Slack: session mode outside a thread, a non-member using a
+  shared credential, and a channel without a shared credential now raise `UserFacingError` with the
+  next step instead of collapsing to "check the Vouchr logs"; an ineligible Approve/Deny click says
+  who can decide; every prompt states its ten-minute lifetime; a re-asked session prompt inside the
+  redelivery window reports `promptState: 'reused'` like consent does; `CredentialLockdownError` maps
+  to fixed `locked_down` copy. Browser: a consumed or replayed callback link, a failed exchange, and
+  the post-connect landing page all say to go back to Slack and ask the agent again; the broker's
+  hop and callback paths render that page under lockdown instead of raw JSON. Core copy:
+  `not_connected` (user), `upstream_timeout`, `approval_required` for a `member` approver, and the
+  channel-ineligible reasons now name what to do. Expired, never-clicked Approve/Deny channel
+  messages lose their buttons on the next sweep (best-effort `chat.update` from the posting process;
+  no schema change). The README, `examples/bolt-github`, and `examples/demo` hosts post the fixed
+  "already posted, ask again in 30 seconds" copy privately for a reused prompt instead of going silent.
+  Connect-click follow-ups: a failed `response_url` write falls back to a DM instead of a second
+  `replace_original` write that could overwrite the installed "Send a new link" prompt, and a
+  cancelled Slack sign-in says "Go back to Slack. If the connection prompt is still there, use it;
+  if not, ask the agent again." (true for channel ephemerals and durable DM prompts alike).
+
+### Changed
+
+- **Broker perimeter refusals carry the machine fields (#348).** `401`, `404`, `413`, and the
+  lockdown `503` bodies now include `code` / `retryable` / `recovery` like typed failures, with
+  `identity_replayed` distinct from `invalid_identity`. Additive for JSON readers; the wire goldens
+  and `guides/HEADLESS.md` list the new codes (`unauthorized`, `invalid_identity`,
+  `identity_replayed`, `request_too_large`, `not_found`, `locked_down`).
+- **`SessionApprovalRequiredError` requires `promptState`.** Constructing it directly now takes the
+  same second argument as `ConsentRequiredError`.
 
 ## [1.1.0] — 2026-09-06
 

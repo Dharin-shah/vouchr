@@ -10,6 +10,7 @@ import {
   ResponseBlockedError,
 } from './injector';
 import { RateLimitedError } from './rateLimit';
+import { CredentialLockdownError } from './vault';
 import {
   InteractionStateChangedError,
   isInteractionKind,
@@ -27,8 +28,10 @@ import {
   type TokenEndpointFailureKind,
 } from './tokens';
 
-/** Stable machine codes returned by {@link mapSafeError}. Reference-validation codes retain their
- * existing public values; transports and hosts must branch on these values, never error prose. */
+/** Stable machine codes returned by {@link mapSafeError} and by the broker's perimeter refusals
+ * (#348: `unauthorized`, `invalid_identity`, `identity_replayed`, `request_too_large`, `not_found`).
+ * Reference-validation codes retain their existing public values; transports and hosts must branch
+ * on these values, never error prose. */
 export const VOUCHR_ERROR_CODES = Object.freeze([
   'consent_required',
   'session_approval_required',
@@ -46,6 +49,12 @@ export const VOUCHR_ERROR_CODES = Object.freeze([
   'rate_limited',
   'overloaded',
   'token_endpoint_failed',
+  'locked_down',
+  'unauthorized',
+  'invalid_identity',
+  'identity_replayed',
+  'request_too_large',
+  'not_found',
   ...SECRET_REFERENCE_ERROR_CODES,
   'user_facing',
   'internal_error',
@@ -113,12 +122,18 @@ export class ConsentRequiredError extends Error {
   }
 }
 
-/** Thrown by `connect()` after a thread-scoped session prompt is posted: stop this turn. */
+/** Thrown by `connect()` after a thread-scoped session prompt is posted (or a still-live earlier
+ * one reused): stop this turn. The prompt is an in-thread ephemeral, so `promptState` is REQUIRED
+ * for the same reason as {@link ConsentRequiredError}: a reused prompt may no longer be visible. */
 export class SessionApprovalRequiredError extends Error {
   readonly code = 'session_approval_required' as const;
 
-  constructor(public provider: string) {
-    super(`Session approval required for "${provider}": an approval button was posted in the thread.`);
+  constructor(public provider: string, readonly promptState: ConsentPromptState) {
+    super(
+      promptState === 'reused'
+        ? `Session approval required for "${provider}". An approval prompt was already posted in the thread; if it is no longer visible, ask again in ${PROMPT_REDELIVERY_SECONDS} seconds.`
+        : `Session approval required for "${provider}": an approval button was posted in the thread.`,
+    );
     this.name = 'SessionApprovalRequiredError';
   }
 }
@@ -201,7 +216,9 @@ export function mapSafeError(error: unknown): VouchrSafeError {
     if (error instanceof SessionApprovalRequiredError) {
       return {
         code: 'session_approval_required',
-        message: 'Thread-scoped session approval is required. Approve the private prompt, then retry.',
+        message: error.promptState === 'reused'
+          ? `Thread-scoped session approval is required. An approval prompt was already posted in the thread; if it is no longer visible, ask again in ${PROMPT_REDELIVERY_SECONDS} seconds.`
+          : 'Thread-scoped session approval is required. Approve the private prompt, then retry.',
         retryable: false,
         recovery: 'request_approval',
       };
@@ -209,7 +226,10 @@ export function mapSafeError(error: unknown): VouchrSafeError {
     if (error instanceof ApprovalRequiredError) {
       return {
         code: 'approval_required',
-        message: 'Human approval is required. Request approval, then retry.',
+        // The requester cannot decide a 'member' prompt: name who can, so the copy is not a dead end.
+        message: error.approver === 'member'
+          ? 'Waiting for another channel member to approve the prompt; retry after they do.'
+          : 'Human approval is required. Approve the prompt Vouchr posted to you, then retry.',
         retryable: false,
         recovery: 'request_approval',
       };
@@ -257,7 +277,7 @@ export function mapSafeError(error: unknown): VouchrSafeError {
         code: 'not_connected',
         message: channelOwned
           ? 'No shared channel credential is configured. Any member can run `/vouchr connect-shared` there.'
-          : 'No credential is connected. Connect the provider, then retry.',
+          : 'No credential is connected. Ask the agent again; it will post a Connect prompt.',
         retryable: false,
         recovery: channelOwned ? 'fix_configuration' : 'connect',
       };
@@ -295,9 +315,19 @@ export function mapSafeError(error: unknown): VouchrSafeError {
     if (error instanceof UpstreamTimeoutError) {
       return {
         code: 'upstream_timeout',
-        message: 'The upstream request timed out. Its outcome may be unknown; do not retry automatically.',
+        message: 'The upstream request timed out and its outcome is unknown. Check the provider for the result, then ask the agent again.',
         retryable: false,
         recovery: 'retry_later',
+      };
+    }
+    if (error instanceof CredentialLockdownError) {
+      // #348: the incident state is already visible on every refused route; naming it beats the
+      // generic "check the logs" dead end. Fixed copy, no detail about the cause.
+      return {
+        code: 'locked_down',
+        message: 'Vouchr is locked down by an administrator. Ask them before retrying.',
+        retryable: false,
+        recovery: 'contact_admin',
       };
     }
     if (error instanceof RateLimitedError) {

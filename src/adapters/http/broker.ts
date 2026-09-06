@@ -4,7 +4,7 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import type { ReadableStream as WebReadableStream } from 'node:stream/web';
 import { assertSchemaCurrent, type Db } from '../../core/db';
-import type { Vault } from '../../core/vault';
+import { CredentialLockdownError, type Vault } from '../../core/vault';
 import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import { configureChannelTools, type ChannelTools } from '../../core/tools';
@@ -14,7 +14,13 @@ import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
 import { MAX_TIMER_MS } from '../../core/options';
 import { awaitWithSignal, disposableDeadline } from '../../core/httpBounds';
-import { mapSafeError, SessionApprovalRequiredError, UpstreamTimeoutError } from '../../core/errors';
+import {
+  mapSafeError,
+  SessionApprovalRequiredError,
+  UpstreamTimeoutError,
+  type VouchrErrorCode,
+  type VouchrRecovery,
+} from '../../core/errors';
 import { safeEmit } from '../../core/safe-emit';
 import type { CredentialHealthHook } from '../../core/health';
 import { channelOwner, userOwner, type Owner } from '../../core/owner';
@@ -61,7 +67,7 @@ import {
   offboardUserEverywhere,
 } from '../../core/offboard';
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, DryRunVaultError, dryRunAudit } from '../../core/dryRun';
-import { handleOAuthCallback } from '../../core/oauthCallback';
+import { handleOAuthCallback, OAUTH_SETUP_UNAVAILABLE } from '../../core/oauthCallback';
 import { sweepLifecycle } from '../../core/sweep';
 import {
   normalizeSecretReference,
@@ -454,6 +460,23 @@ class HttpError extends Error {
   }
 }
 
+/** #348: perimeter and transport refusals carry the same machine fields as typed core failures
+ *  (`code`, `retryable`, `recovery`), so a worker branches on `code` (a replayed assertion is not an
+ *  expired one) instead of prose. Never retryable: the same request cannot succeed unchanged. */
+function perimeterError(
+  status: number,
+  error: string,
+  code: VouchrErrorCode,
+  recovery: VouchrRecovery,
+  closeConnection = false,
+): HttpError {
+  return new HttpError(status, { error, code, retryable: false, recovery }, undefined, closeConnection);
+}
+
+const UNAUTHORIZED = () => perimeterError(401, 'unauthorized', 'unauthorized', 'fix_configuration');
+const INVALID_IDENTITY = () => perimeterError(401, 'invalid identity token', 'invalid_identity', 'resolve_again');
+const UNKNOWN_PROVIDER = () => perimeterError(404, 'unknown provider', 'not_found', 'fix_configuration');
+
 /** #25 default-deny. The rule now lives in core so the Bolt path cannot drift from it (STR-1/STR-2);
  *  re-exported here because it is published API and referenced by existing tests. */
 export { withEgressDefaults };
@@ -469,7 +492,7 @@ function requestBody(body: unknown): string | undefined {
   if (body == null) return undefined;
   if (typeof body !== 'string') throw new HttpError(400, { error: 'invalid body' });
   if (Buffer.byteLength(body, 'utf8') > WRITE_BODY_CAP) {
-    throw new HttpError(413, { error: 'request body too large' });
+    throw perimeterError(413, 'request body too large', 'request_too_large', 'fix_configuration');
   }
   return body;
 }
@@ -492,7 +515,7 @@ async function readJson(req: http.IncomingMessage, cap = READ_REQUEST_CAP): Prom
   // a lying/absent header still can't get past the streamed byte counter below (fail-closed).
   const declared = Number(req.headers['content-length']);
   if (Number.isFinite(declared) && declared > cap) {
-    throw new HttpError(413, { error: 'request body too large' }, undefined, true);
+    throw perimeterError(413, 'request body too large', 'request_too_large', 'fix_configuration', true);
   }
   const chunks: Buffer[] = [];
   let total = 0;
@@ -500,7 +523,7 @@ async function readJson(req: http.IncomingMessage, cap = READ_REQUEST_CAP): Prom
   // before the broker can send its stable 413. The error path marks Connection: close explicitly.
   for await (const chunk of req.iterator({ destroyOnReturn: false })) {
     total += chunk.length;
-    if (total > cap) throw new HttpError(413, { error: 'request body too large' }, undefined, true);
+    if (total > cap) throw perimeterError(413, 'request body too large', 'request_too_large', 'fix_configuration', true);
     chunks.push(chunk as Buffer);
   }
   if (!chunks.length) return {};
@@ -854,7 +877,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       } catch (e) {
         if (signal?.aborted) throw e;
         if (e instanceof HttpError) throw e;
-        throw new HttpError(401, { error: 'unauthorized' });
+        throw UNAUTHORIZED();
       }
       signal?.throwIfAborted();
       return;
@@ -862,7 +885,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (!opts.brokerToken) return;
     const a = Buffer.from(req.headers.authorization ?? '');
     const b = Buffer.from(`Bearer ${opts.brokerToken}`);
-    if (a.length !== b.length || !timingSafeEqual(a, b)) throw new HttpError(401, { error: 'unauthorized' });
+    if (a.length !== b.length || !timingSafeEqual(a, b)) throw UNAUTHORIZED();
   }
 
   async function verify(token: string): Promise<IdentityClaims> {
@@ -872,14 +895,17 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       // shared (possibly async) store, making single-use cluster-wide rather than per-process.
       claims = verifyIdentity(token, opts.identitySecret);
     } catch (e) {
-      if (e instanceof IdentityError) throw new HttpError(401, { error: 'invalid identity token' });
+      if (e instanceof IdentityError) throw INVALID_IDENTITY();
       throw e;
     }
     // #212: keep the persisted value as raw token expiry. DbReplayStore applies the fixed
     // cluster-skew grace to pruning, so every #212 replica preserves the row through every
     // verifier's acceptance window. The pre-#212 upgrade is drained because old replicas lack it.
     if (!(await replay.use(claims.jti, claims.exp))) {
-      throw new HttpError(401, { error: 'invalid identity token' });
+      // Same prose as any other 401 (no oracle on which check failed for an unsigned caller), but a
+      // distinct code so a worker holding a verified-then-refused assertion mints a new one instead
+      // of treating it as expiry (#348).
+      throw perimeterError(401, 'invalid identity token', 'identity_replayed', 'resolve_again');
     }
     return claims;
   }
@@ -889,16 +915,12 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * accepted identity skew both move the result earlier, so uncertainty fails closed. JWT `iat`
    * and the skew are milliseconds — convert once at this boundary. */
   async function userInteractionIssuedAt(claims: IdentityClaims): Promise<number> {
-    if (!Number.isSafeInteger(claims.iat)) {
-      throw new HttpError(401, { error: 'invalid identity token' });
-    }
+    if (!Number.isSafeInteger(claims.iat)) throw INVALID_IDENTITY();
     const pgNow = await opts.vault.userProvisioningIssuedAt();
     const observedAt = Date.now();
     const tokenAge = Math.max(0, observedAt - claims.iat!);
     const issuedAt = pgNow - usFromMs(tokenAge + IDENTITY_SKEW_MS);
-    if (!Number.isSafeInteger(issuedAt)) {
-      throw new HttpError(401, { error: 'invalid identity token' });
-    }
+    if (!Number.isSafeInteger(issuedAt)) throw INVALID_IDENTITY();
     return issuedAt;
   }
 
@@ -1011,7 +1033,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, reason: r.reason });
         throw new HttpError(403, {
           error: 'provider requires a thread-scoped session approval',
-          ...safeErrorFields(new SessionApprovalRequiredError(ref.provider)),
+          ...safeErrorFields(new SessionApprovalRequiredError(ref.provider, 'posted')),
         });
       }
       // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
@@ -1065,7 +1087,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const claims = await verify(body.identityToken);
     const { issuedAt: actorIssuedAt } = await requireCurrentActor(claims);
     const governableChannel = governanceChannelOf(claims.channel, claims.channelType);
-    if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
+    if (!registry.has(ref.provider)) throw UNKNOWN_PROVIDER();
     // Service-to-service tools have no human credential to broker (see ToolManifestEntry.identity):
     // Vouchr is deliberately not in that path, so the broker refuses them just like connect() does.
     if (!isBrokeredProvider(registry.get(ref.provider))) {
@@ -1311,11 +1333,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * the verified requester; any other caller — or a consumed/swept id — reads `404`.
    */
   async function handleBackchannelStatus(id: string, token: unknown): Promise<BrokerAuthorizationResponse> {
-    if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
+    if (typeof token !== 'string' || !token) throw INVALID_IDENTITY();
     const claims = await verify(token);
     const { identity } = await requireCurrentActor(claims);
     const row = await approvals.authorizationStatus(id, identity); // re-checks the id grammar itself
-    if (!row) throw new HttpError(404, { error: 'unknown authorization' });
+    if (!row) throw perimeterError(404, 'unknown authorization', 'not_found', 'fix_configuration');
     return authorizationPayload(row);
   }
 
@@ -1456,7 +1478,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     await requireCurrentActor(claims);
-    if (!registry.has(ref.provider)) throw new HttpError(404, { error: 'unknown provider' });
+    if (!registry.has(ref.provider)) throw UNKNOWN_PROVIDER();
     // Service-to-service tools are not brokered by Vouchr — don't even report their consent state
     // (else /v1/resolve would call a service tool "connected"/"needs_consent"). Refuse like /v1/fetch.
     if (!isBrokeredProvider(registry.get(ref.provider))) {
@@ -1516,7 +1538,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       }
       throw error;
     }
-    if (!outcome.recognized) throw new HttpError(404, { error: 'unknown provider' });
+    if (!outcome.recognized) throw UNKNOWN_PROVIDER();
     // Preserve the established wire shape. A committed local delete stays in `revoked`; `ok` is
     // false when either upstream revocation or authoritative auditing could not be confirmed.
     return { ok: outcome.ok && outcome.audited, revoked: outcome.removed ? [providerId] : [] };
@@ -1592,7 +1614,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const claims = await verify(body.identityToken);
     const { identity: acting, issuedAt } = await requireCurrentActor(claims);
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
-    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    if (!registry.has(providerId)) throw UNKNOWN_PROVIDER();
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     // Derive the source and prove a resolver is configured before any mutation or denial audit.
@@ -1642,7 +1664,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   ): Promise<{ claims: IdentityClaims; identity: SlackIdentity; issuedAt: number }> {
     const claims = await verify(token);
     const current = await requireCurrentActor(claims);
-    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    if (!registry.has(providerId)) throw UNKNOWN_PROVIDER();
     return { claims, ...current };
   }
 
@@ -1775,7 +1797,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     const { identity, issuedAt } = await requireCurrentActor(claims);
-    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    if (!registry.has(providerId)) throw UNKNOWN_PROVIDER();
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     if (provider.credential === 'key') throw new HttpError(400, { error: 'provider has no OAuth flow; supply a key instead' });
@@ -1913,7 +1935,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     const { identity, issuedAt } = await requireCurrentActor(claims);
-    if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
+    if (!registry.has(providerId)) throw UNKNOWN_PROVIDER();
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
     const reference = normalizeSecretReference(body, opts.resolvers, provider.scopesDefault);
@@ -2029,7 +2051,17 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         // #239 containment: once the deployment is locked down, refuse EVERY functional route 503
         // before touching the admission lease, perimeter, identity, or vault — no credential is
         // served, minted, refreshed, or resolved. Liveness/readiness were handled above.
-        if (lockdown) return send(503, { ok: false, error: 'locked_down' });
+        if (lockdown) {
+          // A human's browser on the hop/callback paths gets a page, not JSON (#348). Nothing is
+          // consumed or exchanged: the state stays untouched for recovery, exactly as the callback's
+          // own lockdown check behaves.
+          const pathname = new URL(url, 'http://localhost').pathname;
+          if (req.method === 'GET' && (pathname === callbackPath || pathname === browserVerifyPath || pathname === slackRedirectPath)) {
+            res.writeHead(503, { 'content-type': 'text/html; charset=utf-8' });
+            return res.end(landingHtml('Connection unavailable', OAUTH_SETUP_UNAVAILABLE));
+          }
+          return send(503, { ok: false, error: 'locked_down', ...safeErrorFields(new CredentialLockdownError()) });
+        }
 
         // #209 one true global admission lease for every functional request. It is acquired before
         // async perimeter authorization or body buffering and released only after BOTH the handler
@@ -2191,7 +2223,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           // A GET carries no JSON body, so the signed identity token rides a header (never a query
           // string — keeps it out of access logs). Channel and team come from this signed token.
           const token = req.headers['x-vouchr-identity'];
-          if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
+          if (typeof token !== 'string' || !token) throw INVALID_IDENTITY();
           return send(200, { ...await handleAdminConfig(token) });
         }
         if (req.method === 'POST' && url === '/v1/status') {
@@ -2210,7 +2242,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           await perimeter(req, requestSignal);
           return send(200, await handleUserReference(await readJson(req)));
         }
-        send(404, { error: 'not found' });
+        send(404, { error: 'not found', code: 'not_found', retryable: false, recovery: 'fix_configuration' });
       } catch (e) {
         // A request-scoped abort means the caller is gone. Never continue with a JSON error write or
         // log it as an internal failure; the close/aborted listener already carries the no-secret cause.

@@ -109,6 +109,11 @@ The error carries a `promptState`:
 | `'posted'` | A fresh prompt was just posted. |
 | `'reused'` | A still-live prompt from moments ago was reused rather than re-posted. An in-channel prompt is an ephemeral, so it may no longer be visible; a re-ask 30 seconds or more after the last delivery re-posts it. An off-channel DM prompt is durable and is never re-posted. |
 
+`SessionApprovalRequiredError` carries the same `promptState` for the in-thread session prompt,
+which is also an ephemeral. A host that goes silent on `'reused'` leaves a person who reloaded
+Slack with nothing on screen; post `safeUserMessage(error)` privately in that state (see the
+README snippet).
+
 Branch on the error class or its `code`, **never on message text** — `mapSafeError` copy differs by
 state and is not a stable contract.
 

@@ -113,6 +113,13 @@ export type CallbackResult =
       context: CallbackContext;
     };
 
+/** Fixed browser copy for a failed exchange/probe/vault write, shared by every callback surface so the
+ * next step is named once (#348). */
+export const OAUTH_CONNECTION_FAILED = 'Connection failed. Go back to Slack and ask the agent for a new prompt.';
+
+/** Fixed browser copy while the deployment is locked down (#239); shared with the broker's hop routes. */
+export const OAUTH_SETUP_UNAVAILABLE = 'Connection setup is temporarily unavailable. Contact an administrator.';
+
 function unavailable(error: string): CallbackResult {
   return {
     ok: false,
@@ -129,7 +136,7 @@ function serviceUnavailable(): CallbackResult {
     ok: false,
     outcome: 'service_unavailable',
     status: 503,
-    error: 'Connection setup is temporarily unavailable. Contact an administrator.',
+    error: OAUTH_SETUP_UNAVAILABLE,
     retryable: false,
     recovery: 'retry_later',
   };
@@ -181,7 +188,7 @@ export async function handleOAuthCallback(
 
   const claim = await deps.consent.consume(state);
   if (claim.status === 'unavailable') {
-    return unavailable('Invalid or expired state. Please retry.');
+    return unavailable('This link was already used. Go back to Slack and ask the agent for a new Connect prompt.');
   }
   const row = claim.row;
   const context = { identity: row.identity, provider: row.provider };
@@ -474,7 +481,7 @@ export async function handleOAuthCallback(
     return attributedFailure(
       'exchange_failed',
       500,
-      'Connection failed. Please try again.',
+      OAUTH_CONNECTION_FAILED,
       safe.recovery,
       context,
     );

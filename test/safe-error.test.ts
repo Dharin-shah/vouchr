@@ -112,8 +112,12 @@ test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe co
     /no longer visible, ask again in 30 seconds\./,
   );
   assert.equal(
-    safeUserMessage(new SessionApprovalRequiredError('github')),
+    safeUserMessage(new SessionApprovalRequiredError('github', 'posted')),
     'Thread-scoped session approval is required. Approve the private prompt, then retry.',
+  );
+  assert.match(
+    safeUserMessage(new SessionApprovalRequiredError('github', 'reused')),
+    /already posted in the thread; if it is no longer visible, ask again in 30 seconds\./,
   );
   assert.equal(
     safeUserMessage(new EgressBlockedError('Egress blocked: host not allowed')),
@@ -125,7 +129,7 @@ test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe co
   );
   assert.equal(
     safeUserMessage(new NoConnectionError('No connection for github')),
-    'No credential is connected. Connect the provider, then retry.',
+    'No credential is connected. Ask the agent again; it will post a Connect prompt.',
   );
   assert.equal(
     safeUserMessage(new ResolverFailedError()),

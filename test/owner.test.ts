@@ -274,7 +274,7 @@ test('direct handle maps only its own provider deadline to upstream_timeout', as
         assert.ok(error instanceof UpstreamTimeoutError);
         assert.deepEqual(mapSafeError(error), {
           code: 'upstream_timeout',
-          message: 'The upstream request timed out. Its outcome may be unknown; do not retry automatically.',
+          message: 'The upstream request timed out and its outcome is unknown. Check the provider for the result, then ask the agent again.',
           retryable: false,
           recovery: 'retry_later',
         });

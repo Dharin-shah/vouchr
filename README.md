@@ -56,7 +56,14 @@ app.event('app_mention', async ({ context, event, client, say }) => {
     const me = await (await gh.fetch('https://api.github.com/user')).json();
     await say(`You're *${me.login}* on GitHub.`);
   } catch (error) {
-    if (error instanceof ConsentRequiredError) return; // Vouchr already posted a private Connect prompt.
+    if (error instanceof ConsentRequiredError) {
+      // 'posted': the private Connect prompt is on screen. 'reused': a Slack reload may have removed
+      // the earlier ephemeral, so repeat Vouchr's fixed copy privately instead of going silent.
+      if (error.promptState === 'reused') {
+        await client.chat.postEphemeral({ channel: event.channel, user: event.user!, text: safeUserMessage(error) });
+      }
+      return;
+    }
     await client.chat.postEphemeral({ channel: event.channel, user: event.user!, text: safeUserMessage(error) });
     throw error;
   }
