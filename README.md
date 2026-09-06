@@ -110,15 +110,14 @@ Built in: `github()`, `google()`, `gitlab()`, `notion()`, `databricks()`. Any ot
 about ten lines with `defineProvider`. API keys and secret-manager references work too. Ask only
 for the scopes you use. See [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
 
-## Agents outside Slack
+## Headless
 
-Workers in another process or language call a private HTTP broker. The token still never leaves
-Vouchr. A background agent with no Slack turn asks for approval with `POST /v1/authorization` and
-polls for the answer. The prompt lands in the same channel. See the
-[headless guide](./guides/HEADLESS.md).
-A job with no human requester, such as a ticket-driven worker or a cron, runs as the app's bot user
-and any channel member approves; see
-[Autonomous workers](./guides/HEADLESS.md#autonomous-workers).
+Agents outside Slack, in another process or language, call a private HTTP broker. The token still
+never leaves Vouchr. A background agent with no Slack turn asks for approval with
+`POST /v1/authorization` and polls for the answer. The prompt lands in the same channel. A job with
+no human requester, such as a ticket-driven worker or a cron, runs as the app's bot user and any
+channel member approves. See the [headless guide](./guides/HEADLESS.md) and its
+[Autonomous workers](./guides/HEADLESS.md#autonomous-workers) section.
 
 ## Quickstart
 
