@@ -406,6 +406,11 @@ fresh single-use assertion per poll) returns the same shape:
 { "authorizationId": "…", "status": "pending", "expiresAt": 1722000600000 }
 ```
 
+The in-process twin of that poll is `context.vouchr.waitForApproval(approvalId, { timeoutMs })` on the
+Bolt surface (#363): the same status read, repeated every 1 to 2 seconds with jitter, capped by
+`timeoutMs` and the request's 10-minute lifetime, resolving `approved`, `denied`, or `expired`
+(`ApprovalDecision`). A headless worker keeps polling the route on its own cadence.
+
 | `status` | Meaning | Agent action |
 | --- | --- | --- |
 | `pending` | Awaiting the human. Pending requests live 10 minutes. | Poll with back-off; never re-initiate while pending (the exact action deduplicates to the same id anyway). |

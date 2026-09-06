@@ -85,8 +85,11 @@ both yours; acting as the channel, a teammate approves the team credential's use
 A worker with no human requester asks its channel, and a member authorizes the action as themselves,
 so the call runs with that member's own credential and the thread becomes their session for the
 worker. No team credential is involved by default; the shared channel credential stays an explicit
-opt-in (`/vouchr connect-shared`). One click covers exactly that call, once, for five minutes. Then the agent continues to the next
-step and asks again when it has to. A credential only ever goes to the provider's own hosts.
+opt-in (`/vouchr connect-shared`). One click covers exactly that call, once, for five minutes. You
+confirm, and the agent continues: the host waits for the decision with
+`context.vouchr.waitForApproval(approvalId, { timeoutMs })` (a bounded poll of the stored request,
+resolving `approved`, `denied`, or `expired`) and runs the same call once, then asks again when it has
+to. A credential only ever goes to the provider's own hosts.
 
 The `approval` setting on a provider narrows or widens that.
 

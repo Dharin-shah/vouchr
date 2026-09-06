@@ -1,5 +1,5 @@
 import { App, ExpressReceiver } from '@slack/bolt';
-import { createVouchr, github, ConsentRequiredError, safeUserMessage } from '../../src';
+import { ApprovalRequiredError, createVouchr, github, ConsentRequiredError, safeUserMessage } from '../../src';
 
 // 1. Bolt with an ExpressReceiver so Vouchr can mount the OAuth callback route.
 const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET! });
@@ -7,16 +7,25 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 
 // 2. An agent action that needs to act AS the user on GitHub.
 app.event('app_mention', async ({ context, event, client }) => {
-  try {
+  const reply = (text: string) => client.chat.postMessage({ channel: event.channel, thread_ts: event.ts, text });
+  const act = async (): Promise<void> => {
     const gh = await context.vouchr.connect('github');
     // The token is injected at the HTTP boundary. This code never sees it.
     const res = await gh.fetch('https://api.github.com/user');
     const me: any = await res.json();
-    await client.chat.postMessage({
-      channel: event.channel,
-      thread_ts: event.ts,
-      text: `You are *${me.login}* on GitHub, ${me.public_repos} public repos.`,
-    });
+    await reply(`You are *${me.login}* on GitHub, ${me.public_repos} public repos.`);
+  };
+  try {
+    try {
+      await act();
+    } catch (e) {
+      // A write needs a human: Vouchr posted the Approve/Deny prompt. Wait for the decision, then run
+      // the same turn once. This example only reads, so this is the shape, not a path it takes.
+      if (!(e instanceof ApprovalRequiredError)) throw e;
+      const decision = await context.vouchr.waitForApproval(e.approvalId);
+      if (decision === 'approved') return await act();
+      await reply(decision === 'denied' ? 'The action was denied. Nothing was sent.' : 'The approval expired before a decision. Nothing was sent.');
+    }
   } catch (e) {
     if (e instanceof ConsentRequiredError) {
       // 'posted': the private Connect prompt is on screen. 'reused': an earlier prompt is still live

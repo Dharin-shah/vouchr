@@ -224,7 +224,9 @@ In your Slack workspace, in the `#demo` channel:
    `/vouchr status` to see the managed connection, and `/vouchr disconnect github` to revoke it.
 7. Writes ask by default. Any call other than GET or HEAD posts an Approve/Deny prompt before the
    call goes out: to you privately when the agent acts as you, to the channel for a teammate when it
-   acts as the channel. Reads go straight through.
+   acts as the channel. You confirm, and the agent continues: the example waits for the decision with
+   `context.vouchr.waitForApproval(approvalId)` and then runs the same call once, so nobody repeats
+   the request. Reads go straight through.
 
 ## Troubleshooting
 

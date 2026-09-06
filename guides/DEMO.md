@@ -188,9 +188,11 @@ line: `Still waiting for you to decide the github action above.`
 
 Alex clicks **Approve**. The prompt is replaced by:
 
-> ✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.
+> ✅ Approved the *github* action. This covers one call, once, within 5 minutes. The agent will continue.
 
-Alex repeats the exact same mention. Reply: `Opened https://github.com/alex/vouchr-demo/issues/1 as *alex*.`
+The app was waiting for the decision (`context.vouchr.waitForApproval(approvalId)`, a bounded poll of
+the stored request, #363), so the same turn now runs the write once and replies:
+`Opened https://github.com/alex/vouchr-demo/issues/1 as *alex*.` Alex does not repeat the request.
 
 Alex repeats it once more. A new approval prompt appears. Approvals are single use
 (`test/demo.test.ts`, "(e) a write as Alex waits for Alex").
@@ -249,9 +251,9 @@ Alex clicks **Approve**. Private reply, the prompt stays (`src/adapters/bolt.ts`
 
 > You are not eligible to decide this approval; another channel member must.
 
-Sam approves: `✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.`
-Alex gets a private note: `✅ <@sam> approved your *github-team* action. Ask the agent to retry.`
-Alex repeats the mention: `Opened https://github.com/alex/vouchr-demo/issues/2 as *<token owner>*.`
+Sam approves: `✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. The agent will continue.`
+Alex gets a private note: `✅ <@sam> approved your *github-team* action. The agent will continue.`
+The waiting turn runs the write: `Opened https://github.com/alex/vouchr-demo/issues/2 as *<token owner>*.`
 
 Audit: `denied` with `reason: 'not-approver'` for Alex's click, `approved` and `approval_consumed`
 with Sam as `actor`. `/vouchr audit channel` shows `by <@sam>` on the approval rows.

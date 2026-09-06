@@ -51,7 +51,9 @@ export {
   delegationOf,
 } from './core/approval';
 export type { Delegation } from './core/approval';
-export type { AuthorizationStatus } from './core/approval';
+export type { AuthorizationStatus, ApprovalDecision } from './core/approval';
+// #363 the host's wait cadence for a decision (context.vouchr.waitForApproval / Approvals.waitForDecision).
+export { APPROVAL_WAIT_POLL_MIN_MS, APPROVAL_WAIT_POLL_JITTER_MS } from './core/approval';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
 // (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on
 // `./headless`. A direct createBroker() result owns safe interaction cleanup through its

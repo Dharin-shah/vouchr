@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { Audit, AuditMeta } from './audit';
 import {
   authorizeProvider,
@@ -237,6 +238,15 @@ export function approvalStatement(input: { reason?: unknown; link?: unknown }): 
 /** Wire status of one backchannel authorization request (#296): the row's lifecycle as the polling
  * agent sees it. A consumed grant (the approved action ran) or a swept row is absent, not a status. */
 export type AuthorizationStatus = 'pending' | 'approved' | 'denied' | 'expired';
+
+/** What a host's wait for one decision resolves to (#363). A wait never resolves `pending`: it ends
+ * with the row's decision, or `expired` when the row lapsed, is absent, or the wait's own bound hit. */
+export type ApprovalDecision = Exclude<AuthorizationStatus, 'pending'>;
+
+/** The host's poll cadence while waiting for a human (#363): one status read every 1 to 2 seconds,
+ * jittered so many waiting turns do not read in lockstep. Milliseconds. */
+export const APPROVAL_WAIT_POLL_MIN_MS = 1_000;
+export const APPROVAL_WAIT_POLL_JITTER_MS = 1_000;
 
 /**
  * Thrown by the injector when a request matches the provider's approval rule and no live matching
@@ -966,6 +976,33 @@ export class Approvals {
       ? 'denied'
       : !row.live ? 'expired' : row.status === 'granted' ? 'approved' : 'pending';
     return { id, status, expiresAt: row.expires_at };
+  }
+
+  /** #363: wait for the decision on one request as its REQUESTER, so an in-process host continues
+   *  without the person re-asking. A polite poll of {@link authorizationStatus} every 1 to 2 seconds
+   *  (jittered), bounded by the smaller of the caller's `timeoutMs` and the pending request TTL; the
+   *  row's own expiry (PostgreSQL clock) ends it sooner. Reads only: nothing is spent or mutated,
+   *  and the following fetch still consumes the grant exactly as a retry would. An unknown, foreign,
+   *  swept, or already spent id reads as `expired`; so does a wait whose own bound elapses first. */
+  async waitForDecision(
+    id: string,
+    requester: Pick<SlackIdentity, 'teamId' | 'userId'>,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<ApprovalDecision> {
+    const { timeoutMs } = opts;
+    if (timeoutMs !== undefined && !(Number.isFinite(timeoutMs) && timeoutMs >= 0)) {
+      throw new Error('timeoutMs must be a non-negative finite number of milliseconds');
+    }
+    const deadline = Date.now() + Math.min(timeoutMs ?? Infinity, PENDING_INTERACTION_TTL_US / 1_000);
+    for (;;) {
+      const row = await this.authorizationStatus(id, requester);
+      if (!row) return 'expired';
+      if (row.status !== 'pending') return row.status;
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return 'expired';
+      const pause = APPROVAL_WAIT_POLL_MIN_MS + Math.random() * APPROVAL_WAIT_POLL_JITTER_MS;
+      await sleep(Math.min(pause, remaining));
+    }
   }
 
   /** #296: live backchannel requests whose decision surface has not been delivered and is not

@@ -74,6 +74,7 @@ import {
   approvalOwnerStillCurrent,
   credentialUseStateFenced,
   credentialUseStillCurrentFenced,
+  type ApprovalDecision,
   type ApprovalDecisionResult,
   type ApprovalKey,
   approvalDecider,
@@ -1818,6 +1819,20 @@ export class ConnectContext {
       // A shared credential only lives in a governed channel, so its governance scope is that channel.
       governableChannel,
     )));
+  }
+
+  /**
+   * #363: wait for the human's decision on the approval this turn's fetch just asked for, then
+   * continue in the same turn: `catch (e) { if (e instanceof ApprovalRequiredError) { if (await
+   * context.vouchr.waitForApproval(e.approvalId) === 'approved') retry the same fetch once } }`. A
+   * polite poll of the persisted row (1 to 2 seconds, jittered), bound to this requester, capped by
+   * `timeoutMs` and the prompt's 10-minute lifetime. Reads only; the retried fetch spends the grant.
+   * Resolves `expired` for an unknown id and when the wait's own bound elapses. The headless twin is
+   * `GET /v1/authorization/{id}`.
+   */
+  async waitForApproval(approvalId: string, opts: { timeoutMs?: number } = {}): Promise<ApprovalDecision> {
+    if (!this.approvals) return 'expired';
+    return this.approvals.waitForDecision(approvalId, this.identity, opts);
   }
 
   /**
@@ -4459,11 +4474,11 @@ export async function createVouchr(opts: VouchrOptions) {
         } else if (delegation === 'bound') {
           await reply(`✅ Approved the *${p}* action. It runs as you, once. The worker can retry now.`);
         } else {
-          await reply(`✅ Approved the *${p}* action. ${grantCovers(pending.provider, pending.grant, ttlMs)} Have the agent retry now.`);
+          await reply(`✅ Approved the *${p}* action. ${grantCovers(pending.provider, pending.grant, ttlMs)} The agent will continue.`);
         }
         // A worker requester is a bot user: nobody reads its ephemeral.
         if (identity.userId !== pending.userId && delegation === 'none') {
-          await tellRequester(`✅ <@${escapeMrkdwn(identity.userId)}> approved your *${p}* action. Ask the agent to retry.`);
+          await tellRequester(`✅ <@${escapeMrkdwn(identity.userId)}> approved your *${p}* action. The agent will continue.`);
         }
       } else {
         emit({ type: 'approval_denied', provider: pending.provider, host: pending.host });

@@ -7,6 +7,14 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Added
 
+- `context.vouchr.waitForApproval(approvalId, { timeoutMs })` (#363): an in-process host waits for
+  the decision on the approval its fetch just asked for and continues in the same turn, so the person
+  who approves never repeats the request. A polite poll of the stored request (every 1 to 2 seconds,
+  jittered), bound to the requester, capped by `timeoutMs` and the prompt's 10-minute lifetime,
+  resolving `approved`, `denied`, or `expired`; an unknown id and a wait whose bound elapses resolve
+  `expired`. Reads only; the retried fetch spends the grant. Exported beside it: the
+  `ApprovalDecision` type and `APPROVAL_WAIT_POLL_MIN_MS` / `APPROVAL_WAIT_POLL_JITTER_MS`, from both
+  entry points. Headless workers keep polling `GET /v1/authorization/{id}`.
 - A worker's request is authorized by a channel member as themselves (#360). An identity token
   minted with `worker: true` (the app's bot user, `owner: 'user'` handle) in a channel where the agent
   acts as each person posts one channel message with the worker, provider, method, path, reason, and
@@ -28,6 +36,11 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- The approval receipt for a person's request reads "The agent will continue." instead of "Have the
+  agent retry now.", and the requester's note after a teammate approves says the same (#363). The
+  demo, bolt-github, and multi-provider-agent examples catch `ApprovalRequiredError`, wait for the
+  decision, and run the same call once; denied and expired each get one fixed reply. Worker
+  receipts keep "The worker can retry now.", since the worker polls on its own.
 - Schema version 3: `approval_request.delegated` and the `worker_session` table. Vouchr is greenfield
   for database compatibility; recreate the database and run `vouchr migrate` (#360).
 - A person's private prompts (Connect, approval, notices) are placed where they asked: in the thread
