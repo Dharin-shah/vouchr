@@ -13,7 +13,7 @@ import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION, CONFIGURE_CALLBACK } fro
 import { POSTGRES_NOW_US_SQL } from '../src/core/interaction';
 import { channelOwner, userOwner } from '../src/core/owner';
 
-// guides/DEMO.md, scenarios (a) to (m) except (j) (the autonomous worker, test/authorization.test.ts)
+// guides/DEMO.md, scenarios (a) to (m) except (j) (the autonomous worker, test/worker-authorization.test.ts)
 // plus the #350 edge rows, on the production path with the
 // exact Slack copy: a real createVouchr, its middleware, its registered slash command, view, and
 // action handlers, a faked Slack client, a stubbed provider egress, and a throwaway PostgreSQL
