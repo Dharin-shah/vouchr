@@ -488,17 +488,25 @@ export function approvalBlocks(o: {
   ttlMs: number;
   reason?: string | null;
   link?: string | null;
+  /** #360 a worker's request: `unbound` asks any member to authorize it with their own account;
+   * `bound` asks the member whose session this thread is. Absent for an ordinary request. */
+  delegated?: 'unbound' | 'bound';
 }): unknown[] {
   const p = escapeMrkdwn(o.provider);
-  const intro = o.approver === 'member'
-    ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. Another member of this channel must approve it.`
-    : `The agent wants to run an action as you on ${p}.`;
+  const requester = `<@${escapeMrkdwn(o.requester)}>`;
+  const intro = o.delegated === 'unbound'
+    ? `The worker ${requester} wants to run an action on ${p} and has no account of its own. A member of this channel can authorize it with their own account; the call then runs as that member, once.`
+    : o.delegated === 'bound'
+      ? `The worker ${requester} wants to run another action on ${p} in this thread, where you authorized it with your account. It runs as you, once, if you approve.`
+      : o.approver === 'member'
+        ? `The agent wants to run an action on ${p} for ${requester}. Another member of this channel must approve it.`
+        : `The agent wants to run an action as you on ${p}.`;
   return [
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `:lock: *Approve this ${p} action?*\n${intro}`,
+        text: `:lock: *${o.delegated === 'unbound' ? 'Authorize' : 'Approve'} this ${p} action?*\n${intro}`,
       },
     },
     // The action, plain: method, host, and the exact path. Plain text (never mrkdwn) so a crafted
@@ -525,7 +533,7 @@ export function approvalBlocks(o: {
       elements: [
         {
           type: 'button',
-          text: { type: 'plain_text', text: 'Approve', emoji: true },
+          text: { type: 'plain_text', text: o.delegated === 'unbound' ? 'Authorize with your account' : 'Approve', emoji: true },
           action_id: APPROVAL_APPROVE_ACTION,
           value: o.id,
           style: 'primary',

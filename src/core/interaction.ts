@@ -20,6 +20,21 @@ export const PROMPT_DELIVERY_LEASE_US = 30_000_000;
  */
 export const PROMPT_REDELIVERY_DEBOUNCE_US = 30_000_000;
 
+/** Idle lifetime of a worker's thread session (#360): the member who authorized a worker's first
+ * action in a thread keeps deciding its later actions there until this long passes with no decision
+ * or spend BY THAT MEMBER. The worker's own requests never extend it, so a looping worker cannot
+ * keep an absent member as its authorizer. Bounded like every other interaction lifetime; the sweep
+ * reclaims expired sessions. Microseconds. */
+export const WORKER_SESSION_IDLE_TTL_US = 30 * 60 * 1_000_000;
+
+/** Absolute lifetime of a bound worker session (#360), from the member's authorizing click: however
+ * active the member stays, the session ends this long after `bound_at` and the next request goes
+ * back to any member. Every extension clamps to it. Microseconds. */
+export const WORKER_SESSION_MAX_TTL_US = 8 * 60 * 60 * 1_000_000;
+if (!(WORKER_SESSION_MAX_TTL_US > WORKER_SESSION_IDLE_TTL_US)) {
+  throw new Error('WORKER_SESSION_MAX_TTL_US must exceed WORKER_SESSION_IDLE_TTL_US');
+}
+
 /** Delivery policy supplied by the adapter that owns the actual prompt surface. Defaulting to
  * false preserves durable-message deduplication for direct core callers. */
 export interface PromptDeliveryOptions {

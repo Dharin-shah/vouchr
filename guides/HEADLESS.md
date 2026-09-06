@@ -364,15 +364,21 @@ Bolt prompts and approval audits expose only method, host, parameter count, and 
 fingerprint. Raw paths/queries may contain secrets or PII and stay out of Slack, public errors, and
 audit. A path over 16 KiB fails before rate budget, interaction state, credential reads, or egress.
 
-## Backchannel authorization for background agents (#296)
+## Backchannel authorization for background agents (#296, #360)
 
 The `approval_required` flow above assumes a live conversational turn: the broker denies, the host
 relays the denial from the verified Slack event, the human clicks, the agent asks again. A cron- or
 event-triggered agent, a CI job, or a durable-workflow worker has no such turn. For those, the broker
 offers the CIBA-shaped alternative: the agent **initiates** the human decision itself, Vouchr
-notifies the approver out-of-band, and the agent **polls** for the outcome. The requester and the
-approver are decoupled; the credential boundary is not — an approved request proceeds through the
-same `/v1/fetch` (or `/v1/mcp`) spend path, bound to the same exact action fingerprint, single-use.
+notifies the approver out-of-band, and the agent **polls** for the outcome. The credential boundary
+does not move: an approved request proceeds through the same `/v1/fetch` (or `/v1/mcp`) spend path,
+bound to the same exact action fingerprint, single-use.
+
+Whoever the agent acts as is the one who authorizes. With a human requester the token is minted for
+that person and the decision is theirs (or a teammate's for the channel's shared credential), exactly
+as in-turn. With no human requester (a worker, below) the token is minted for the bot user with
+`worker: true`, and a channel member authorizes the action **as themselves**: the credential owner is
+decided by the member who clicks, not by anything in the token.
 
 `POST /v1/authorization` takes the `/v1/fetch` target envelope without a body or headers, plus the
 optional `reason` and `link` the human will read (the same two fields `/v1/fetch` and `/v1/mcp`
@@ -413,9 +419,8 @@ the initiating token's `channel`, `threadTs`, and governance scope (from `channe
 an in-turn approval does. The spend call must therefore be minted with the **same** `channel`,
 `threadTs`, and `channelType` as the initiating call: a spend token that omits `threadTs` (or names
 a different channel) does not match the grant — it gets `403 approval_required` and mints a
-*second*, ordinary pending request for that other conversation, which is not marked as
-agent-initiated and which the delivery timer therefore never posts. Keep the claim set fixed for the lifetime of one
-authorization; if the agent has no conversation, omit all three consistently on both calls.
+*second* pending request for that other conversation. Keep the claim set fixed for the lifetime of
+one authorization; if the agent has no conversation, omit all three consistently on both calls.
 
 Other outcomes mirror `/v1/fetch`: `400` for a `reason` that is empty, whitespace, over 500 bytes,
 or carries control characters other than newline and tab, or a `link` that is not an `https://` URL
@@ -437,50 +442,73 @@ salted action fingerprint, exactly like an in-turn approval: `approval_requested
 process on the same PostgreSQL delivers it: `install()` runs a bounded delivery pass every
 `authorizationDeliveryIntervalMs` (default 15 s; `0` disables) that rebuilds the requester's exact
 context from the stored row — identity, channel, thread — and runs the same trusted
-`recoverBrokerDenial` bridge an in-turn relay would (registry-derived self/member rule, current
-authority revalidation, cross-replica delivery lease), then the click revalidates everything again
-at the mutation. A row whose post failed ambiguously keeps its delivery lease and is not retried
-until the lease lapses (30 s), so a degraded Slack yields at most one post per lease window, and
-`stop()` waits for a pass already in flight. `sweepExpired()` also runs one pass, for hosts that
-drive lifecycle themselves. A pure headless deployment with no Slack control plane gets
-enforcement only: requests expire undelivered, as with in-turn approvals.
+`recoverBrokerDenial` bridge an in-turn relay would (who decides, current authority revalidation,
+cross-replica delivery lease), then the click revalidates everything again at the mutation. A row
+whose post failed ambiguously keeps its delivery lease and is not retried until the lease lapses
+(30 s), so a degraded Slack yields at most one post per lease window, and `stop()` waits for a pass
+already in flight. `sweepExpired()` also runs one pass, for hosts that drive lifecycle themselves. A
+pure headless deployment with no Slack control plane gets enforcement only: requests expire
+undelivered, as with in-turn approvals. A worker's `/v1/fetch` or `/v1/mcp` that needs approval is
+delivered the same way, since a worker has no turn to relay from.
 
 Not in scope: OIDC CIBA wire conformance (`bc-authorize`), callbacks/webhooks (poll), and any
 widening of standing grants — an approved request authorizes exactly one action, once.
 
 ## Autonomous workers
 
-A ticket-driven job, a cron, or a platform agent has no human requester. Vouchr still needs a
-requester identity and a human approver. Use the Slack app's own bot user (or a dedicated service
-user) as the requester, and let the channel's members approve.
+A ticket-driven job, a cron, or a platform agent has no human requester and no account of its own.
+Vouchr still needs a requester identity and a human who authorizes. The worker runs as the Slack
+app's bot user (or a dedicated service user); the humans are the members of its channel, and each
+of them authorizes with their own account. No standing team credential is involved.
 
-- **Requester.** Mint the identity token with the bot user id as `userId`. The bot must be a member
-  of the owning channel. Vouchr rechecks that membership when it delivers the prompt and again at
-  the click.
-- **Credential.** Set the channel's identity for the provider to `channel` (`/vouchr connect-shared`
-  does this) so the channel owns the credential. Mint
-  with `ownerKind: 'channel'`, `channelEligible: true`, `channel`, and `channelType`, exactly as the
-  [hybrid guide's minter](./HYBRID.md#4-mint-identity-only-from-verified-slack-facts) does. Send
-  `handle: { provider, owner: 'channel' }`.
-- **Approver.** Leave the provider's `approval` at its default. The credential is the channel's, so
-  the default approver is `member`: the bot is the requester and can never approve its own request,
-  and any human member of the channel can. Put the ticket reference in `reason`
-  and its URL in `link`; `grant: 'thread'` lets one approval cover a job's later writes in the same
-  thread.
+- **Requester.** Mint the identity token with the bot user id as `userId` and `worker: true`, from
+  the trusted minter (it is the one process that knows it mints for a job; a bot user id is an
+  ordinary Slack user id, so the broker cannot tell otherwise). Mint `channel`, `channelType`, and
+  `channelEligible: true` exactly as the [hybrid guide's minter](./HYBRID.md#4-mint-identity-only-from-verified-slack-facts)
+  does; add `threadTs` when the job works in a thread. Send `handle: { provider, owner: 'user' }`.
+- **Credential.** None for the worker. The channel's identity for the provider stays `person`, so
+  each member connects their own account as usual. The **credential owner is decided by the member
+  who authorizes**: the grant binds to that member's credential (owner, provider, exact generation)
+  when they click, and the worker's `/v1/fetch` or `/v1/mcp` runs with that member's token.
+- **Prompt.** `POST /v1/authorization` posts one message to the channel (or the thread the token
+  names): the worker, the provider, `METHOD host/path`, the reason, the link, and one button,
+  **Authorize with your account**. Any current member other than the worker may click. A member
+  with no connected credential for the provider is sent the private Connect prompt in the same
+  thread and the request stays pending; once connected, they click again. Nobody clicking means the
+  request expires at the pending TTL (10 minutes) with a `system` expiry audit.
+- **The thread is the session.** The member who authorizes the worker's first action in a thread
+  becomes that thread's human for that worker and provider. Every further approval-needing action the
+  worker takes there is minted for that member and asks them privately, in the thread, each time;
+  nothing runs unasked. A worker's grant is always `once`, whatever `approval.grant` the provider
+  declares: a `thread` grant never covers a worker's later calls, so each one asks the member again.
+  A request in another thread starts a new any-member authorization. The session ends after 30
+  minutes without a decision or spend by the bound member (the worker's own requests do not extend
+  it, so a looping worker cannot keep an absent member as its authorizer), at the latest 8 hours
+  after the authorizing click, or when the member disconnects the provider or is offboarded; each
+  fences the session's pending grants and the next request goes back to any member.
+- **A worker token without `threadTs`** makes the channel itself the session: the first member to
+  authorize becomes the channel-wide authorizer for that worker and provider until the idle TTL or
+  the cap ends it. That is the deliberate trade-off for jobs that do not work in a thread (each
+  action still asks that member, nothing runs unasked); mint `threadTs` when the job has a thread so
+  the session stays as narrow as the conversation.
+- **Refused.** A worker token for a DM (no channel members), a channel the signed `channelEligible`
+  verdict does not clear (Slack Connect, externally shared, archived) or that Slack reports as such
+  at delivery or click, and a channel whose identity for the provider is `channel` (mint
+  `ownerKind: 'channel'` and use the shared credential there instead) all answer `403`.
 - **Flow.** `POST /v1/authorization`, poll `GET /v1/authorization/{id}`, then `/v1/fetch` with the
-  same claims. This is the backchannel flow above, unchanged.
+  same claims. This is the backchannel flow above; the worker itself does nothing differently
+  between its first and later actions.
 
-The team sees one channel message. It names the bot as the requester and shows the provider, method,
-host, path, reason, and link. In the audit, `approval_requested` and `approval_consumed` carry the bot
-id as `user_id`; `approval_consumed` carries the approving member in `actor`.
+Audit on every spend: `approval_consumed` carries the bot id as `user_id` (the requester), the
+authorizing member as `actor` and `meta.owner`, the thread as `meta.thread`, and the agent's reason.
+`approval_requested` carries the bot id; `approved` carries the member as `actor` and `meta.owner`.
 
-Do not use `approver: 'self'` for a worker. `self` sends an ephemeral prompt to the requester. For a
-bot user nobody sees it, a member who clicks is refused as not eligible, and the request expires at
-the pending TTL (10 minutes) with a `system` expiry audit. The broker cannot refuse `self` here: it
-has no Slack client, and a bot user id is an ordinary Slack user id, so it cannot tell a bot from a
-person. The provider's `approval` knob is where this is decided.
+The shared channel credential (`/vouchr connect-shared`, identity `channel`) remains an explicit
+opt-in for key-only internal services and is never chosen by default. With it, the worker mints
+`ownerKind: 'channel'` and any other member approves, as before; the `worker` claim is ignored there.
 
-`test/authorization.test.ts` ("autonomous worker") runs both cases on the production path.
+`test/worker-authorization.test.ts` runs the full flow, the thread session, and every refusal on
+the production path.
 
 ## MCP servers (Streamable HTTP): `POST /v1/mcp`
 

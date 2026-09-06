@@ -9,6 +9,7 @@ import type { Audit, AuditSink } from '../../core/audit';
 import type { Policy } from '../../core/policy';
 import { configureChannelTools, type ChannelTools } from '../../core/tools';
 import { ProviderRegistry, isBrokeredProvider, buildCallbackUrl, canonicalMethod, hasAmbiguousPathEncoding, withEgressDefaults, type Provider } from '../../core/providers';
+import { resolveWorkerOwner } from '../../core/delegation';
 import { ConnectionHandle, EgressBlockedError, NoConnectionError, ResolverConfigurationError, ResolverFailedError, ResponseBlockedError, approvalNeeded, normalizeContentType, pathAllowed, DEFAULT_FETCH_DEADLINE_MS, MAX_URL_HOSTNAME_LENGTH, type Resolvers, type EventSink, type VouchrEvent } from '../../core/injector';
 import { MemoryRateLimitStore, RateLimitedError, type RateLimitStore } from '../../core/rateLimit';
 import { assertInflightLimits, InflightLimiter, OverloadedError } from '../../core/inflight';
@@ -1006,7 +1007,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     ref: ConnectionHandleRef,
     claims: IdentityClaims,
     governableChannel: string | null,
-  ): Promise<{ owner: Owner; acting: SlackIdentity; credentialId: string }> {
+  ): Promise<{ owner: Owner; acting: SlackIdentity; credentialId: string; worker: boolean }> {
     const ownerKind = claims.ownerKind ?? 'user';
     // The body handle's owner must MATCH the signed ownerKind — a forged body owner:'channel' on a plain
     // user token is refused, never silently downgraded. This claims-integrity check is broker-specific
@@ -1014,6 +1015,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (ref.owner !== ownerKind) throw new HttpError(403, { error: 'handle owner does not match verified claims' });
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
 
+    if (ownerKind === 'user' && claims.worker === true) return resolveWorker(ref, claims, acting, governableChannel);
     if (ownerKind === 'user') {
       // The user path resolves the person's own credential through the ONE core decision the Bolt
       // path calls too (resolveCredentialOwner), so the two transports cannot drift.
@@ -1024,7 +1026,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
       // resolved owner here; the injector 409s later if the credential is missing.
       if (r.status !== 'resolved') throw notConnected(ref.provider, 'user');
-      return { owner: r.owner, acting: r.acting, credentialId };
+      return { owner: r.owner, acting: r.acting, credentialId, worker: false };
     }
 
     // ── channel-owned (opt-in, fail-closed) ──
@@ -1052,7 +1054,42 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (r.status !== 'resolved') throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
     const credentialId = await opts.vault.liveId(r.owner, ref.provider);
     if (!credentialId) throw notConnected(ref.provider, r.owner.kind);
-    return { owner: r.owner, acting: r.acting, credentialId };
+    return { owner: r.owner, acting: r.acting, credentialId, worker: false };
+  }
+
+  /**
+   * #360 a worker's request (signed `worker: true`, user handle). The decision is core's
+   * (resolveWorkerOwner, STR-1); this reads the two adapter facts it needs (the signed eligibility
+   * verdict, the channel's configured identity) and maps its refusals to HTTP.
+   */
+  async function resolveWorker(
+    ref: ConnectionHandleRef,
+    claims: IdentityClaims,
+    acting: SlackIdentity,
+    governableChannel: string | null,
+  ): Promise<{ owner: Owner; acting: SlackIdentity; credentialId: string; worker: true }> {
+    const r = await resolveWorkerOwner(opts.db, {
+      acting,
+      provider: ref.provider,
+      governableChannel,
+      thread: claims.threadTs ?? null,
+      eligible: (opts.requireChannelEligibility ?? true) ? claims.channelEligible === true : true,
+      identity: governableChannel && opts.channelConfig
+        ? await opts.channelConfig.getIdentity(claims.teamId, governableChannel, ref.provider)
+        : 'person',
+      liveCredential: (member, provider) => opts.vault.liveId(userOwner(member), provider),
+    });
+    if (r.status === 'refused') {
+      if (r.code === 'no_channel') {
+        throw new HttpError(403, { error: 'a worker needs a channel whose members can authorize it; a personal conversation has none' });
+      }
+      if (r.code === 'ineligible') {
+        await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, reason: 'channel-ineligible' });
+        throw new HttpError(403, { error: 'channel is ineligible for worker authorization' });
+      }
+      throw new HttpError(403, { error: 'channel uses a shared credential for this provider; mint the worker with ownerKind channel' });
+    }
+    return { owner: r.owner, acting, credentialId: r.credentialId, worker: true };
   }
 
   // The ONE shared gate pipeline for the credential-use routes (/v1/fetch and /v1/mcp — STR-3):
@@ -1080,7 +1117,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     }
     await authorize(ref.provider, claims, governableChannel);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.allowWrites);
-    const { owner, acting, credentialId } = await resolveOwner(ref, claims, governableChannel);
+    const { owner, acting, credentialId, worker } = await resolveOwner(ref, claims, governableChannel);
     // A verified token makes the channel facts trustworthy, not immutable. Governance and the
     // selected connection generation can both change after resolveOwner's reads.
     // Re-resolve the complete use binding under the same canonical lifecycle locks both before any
@@ -1111,6 +1148,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
               provider: ref.provider,
               channel: claims.channel,
               thread: claims.threadTs ?? null,
+              delegated: worker,
             },
             db: tx,
             registry,
@@ -1162,6 +1200,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       },
       useStillValid,
       governableChannel,
+      worker,
     );
     return { handle, provider, acting };
   }

@@ -155,7 +155,7 @@ export async function sweepLifecycle({
     // owns any later table, fail/retry without waiting while holding a partial lock prefix.
     // Once acquired, the locks exclude every writer until provenance validation and cleanup commit.
     await tx.exec(
-      `LOCK TABLE connection, consent_request, approval_request,
+      `LOCK TABLE connection, consent_request, approval_request, worker_session,
         user_provisioning_request, channel_provisioning_request, channel_interaction_tombstone
         IN SHARE ROW EXCLUSIVE MODE NOWAIT`,
     );

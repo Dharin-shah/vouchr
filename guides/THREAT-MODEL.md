@@ -417,6 +417,23 @@ into many actions, or to skip the approval entirely.
   a provider-supplied action fingerprint, would close this; no built-in provider ships
   one today.) Approval prompts therefore show method, host, the salted action fingerprint, and query
   parameter count, while deliberately withholding the raw path/query and body.
+- **Delegated authorization for workers (#360).** A worker's identity token names the channel and
+  the worker, never a credential owner; the owner is decided at the click and persisted on the grant.
+  Until then the pending row carries the worker's unbound session generation as a placeholder and no
+  credential is read for it. The click rewrites the row to the authorizing member's own credential
+  generation inside the same locked decision that grants it, so the spend path resolves the
+  credential from the grant, never from the worker's identity, and never from another member. A
+  member without a credential is sent Connect and grants nothing. The thread session binds one member
+  to one worker, one provider, and one conversation; every action still asks them, nothing runs
+  unasked (a worker's grant is always `once`, whatever `approval.grant` the provider declares), and
+  the session is fenced by its idle lifetime, which only the member's own decisions and spends extend
+  (never the worker's requests, so a looping worker cannot keep an absent member as its authorizer),
+  by an absolute cap after the binding click, by the member's live credential generation (disconnect,
+  reconnect), by the member's offboard tombstone taken after the binding instant, and by the
+  channel's identity staying `person`. A token for a DM has no member to authorize it and is
+  refused; a channel the signed eligibility verdict does not clear (Slack Connect, externally shared,
+  archived) is refused at the broker and again at delivery and click. The worker cannot authorize
+  itself, and the standing shared credential remains an explicit opt-in that this path never uses.
 
 ### Replayed OAuth callback / state
 

@@ -82,7 +82,10 @@ Writes wait for a human by default. Every call other than GET or HEAD posts a pr
 the provider, the method, the path, and the agent's reason. Who decides follows who the agent acts
 as: acting as yourself, you confirm each write privately, since the credential and the request are
 both yours; acting as the channel, a teammate approves the team credential's use, in the channel.
-One click covers exactly that call, once, for five minutes. Then the agent continues to the next
+A worker with no human requester asks its channel, and a member authorizes the action as themselves,
+so the call runs with that member's own credential and the thread becomes their session for the
+worker. No team credential is involved by default; the shared channel credential stays an explicit
+opt-in (`/vouchr connect-shared`). One click covers exactly that call, once, for five minutes. Then the agent continues to the next
 step and asks again when it has to. A credential only ever goes to the provider's own hosts.
 
 The `approval` setting on a provider narrows or widens that.
@@ -144,8 +147,9 @@ for the scopes you use. See [provider configuration](./guides/DEPLOYMENT.md#prov
 Agents outside Slack, in another process or language, call a private HTTP broker. The token still
 never leaves Vouchr. A background agent with no Slack turn asks for approval with
 `POST /v1/authorization` and polls for the answer. The prompt lands in the same channel. A job with
-no human requester, such as a ticket-driven worker or a cron, runs as the app's bot user and any
-channel member approves. See the [headless guide](./guides/HEADLESS.md) and its
+no human requester, such as a ticket-driven worker or a cron, runs as the app's bot user; a channel
+member authorizes each action with their own account and the thread becomes that member's session.
+See the [headless guide](./guides/HEADLESS.md) and its
 [Autonomous workers](./guides/HEADLESS.md#autonomous-workers) section.
 
 ## Quickstart

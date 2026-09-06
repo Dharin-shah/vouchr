@@ -168,7 +168,7 @@ test('dry-run mutates nothing and emits no secret', async (t) => {
   assert.equal(report.matched.installations, 2);
   assert.deepEqual(report.cleared, {
     connections: 0, consents: 0, approvals: 0,
-    userProvisioning: 0, channelProvisioning: 0, notifications: 0, installations: 0,
+    userProvisioning: 0, channelProvisioning: 0, notifications: 0, workerSessions: 0, installations: 0,
   }, 'dry-run must never describe matched rows as cleared');
   assert.deepEqual(report.remaining, {
     credentials: 10,

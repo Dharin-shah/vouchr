@@ -47,7 +47,10 @@ export {
   assertReason,
   assertLink,
   effectiveApprover,
+  approvalDecider,
+  delegationOf,
 } from './core/approval';
+export type { Delegation } from './core/approval';
 export type { AuthorizationStatus } from './core/approval';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
 // (openDb → new Vault → new Audit) instead of only via the env-driven buildBrokerServer. Also on

@@ -57,7 +57,7 @@ Follow [QUICKSTART.md](../QUICKSTART.md) steps 2 to 8 once, with these differenc
 
    ```bash
    VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr npm run cli -- migrate
-   # prints: OK schema migrated to version 2
+   # prints: OK schema migrated to version 3
    npm run example:demo
    # prints: ⚡ Vouchr demo on :3000. Callback at https://<tunnel host>/vouchr/oauth/callback
    ```
@@ -96,7 +96,9 @@ None of the shipped examples has both a read and a governed write, so
   as the person who asked, with a `reason` and `link` on the call.
 - `@vouchr open a team issue titled <title> in repo <owner>/<name>` does the same write with the
   channel's `github-team` credential.
-- Replies come in a thread under the mention. `examples/demo/worker.ts` is the headless job for (j).
+- Replies come in a thread under the mention. `examples/demo/worker.ts` is the headless job for (j):
+  it runs as the app's bot user with no credential of its own, and a member authorizes each write
+  with their own `github` account.
 
 Nobody picks a mode. Who the agent acts as is one setting per channel per provider, `person` (the
 default) or `channel`, and `connect-shared` sets it for you.
@@ -306,9 +308,10 @@ Shots: Jo's sidebar, the enable reply in the public channel.
 
 ### (j) An autonomous worker
 
-A job with no human requester asks the channel for approval over the broker and runs the write with
-the `github-team` credential from (g). The broker is a second process on the same database. In a
-second terminal:
+A job with no human requester asks the channel over the broker, and a member authorizes the write
+with their own `github` account. No team credential: the shared `github-team` credential from (g) is
+not involved, and nothing is connected for the bot. The broker is a second process on the same
+database. In a second terminal:
 
 ```bash
 export VOUCHR_MASTER_KEY=<same as .env>
@@ -318,7 +321,8 @@ export VOUCHR_IDENTITY_SECRET=$(openssl rand -base64 32)
 export VOUCHR_DEPLOYMENT_ID=demo
 export VOUCHR_BASE_URL=http://localhost:3001     # the broker's connect routes are not used here
 export VOUCHR_PORT=3001 VOUCHR_ALLOW_WRITES=1
-export VOUCHR_PROVIDERS='[{"id":"github-team","credential":"key","egressAllow":["api.github.com"],"approval":{"grant":"thread","ttlMs":1800000}}]'
+export VOUCHR_PROVIDER_GITHUB_CLIENT_ID=$GITHUB_CLIENT_ID VOUCHR_PROVIDER_GITHUB_CLIENT_SECRET=$GITHUB_CLIENT_SECRET
+export VOUCHR_PROVIDERS='[{"id":"github","authorizeUrl":"https://github.com/login/oauth/authorize","tokenUrl":"https://github.com/login/oauth/access_token","scopesDefault":["repo"],"egressAllow":["api.github.com"],"refresh":"none","pkce":false}]'
 npm run broker
 ```
 
@@ -329,25 +333,39 @@ DEMO_TEAM=T... DEMO_BOT_USER=U... DEMO_CHANNEL=C... DEMO_REPO=alex/vouchr-demo \
   node --import tsx examples/demo/worker.ts
 ```
 
-The worker mints an identity for the bot user bound to `#demo-team`, calls `POST /v1/authorization`
-with a `reason` and a `link`, prints `authorization 200 { authorizationId: '…', status: 'pending', expiresAt: … }`,
-then `poll pending` every five seconds. Within fifteen seconds the Slack app delivers the prompt to `#demo-team`:
+The worker mints an identity for the bot user with `worker: true`, bound to `#demo-team`, calls
+`POST /v1/authorization` with a `reason` and a `link`, prints
+`authorization 200 { authorizationId: '…', status: 'pending', expiresAt: … }`, then `poll pending`
+every five seconds. Within fifteen seconds the Slack app posts one message to `#demo-team`:
 
-> :lock: *Approve this github-team action?*
-> The agent wants to run an action on github-team for <@vouchr>. Another member of this channel must approve it.
+> :lock: *Authorize this github action?*
+> The worker <@vouchr> wants to run an action on github and has no account of its own. A member of this channel can authorize it with their own account; the call then runs as that member, once.
 > POST api.github.com/repos/alex/vouchr-demo/issues
 > Reason: TICKET-42: open the release checklist issue
 > Link: https://tracker.example/TICKET-42
-> This covers every github-team call that needs approval in this thread for 30 minutes. ...
+> This covers one call, once, within 5 minutes. ...
+> [Authorize with your account] [Deny]
 
-Sam approves. The worker prints `poll approved`, sends `POST /v1/fetch` with the same claims, and
-prints `fetch 200 { status: 201, url: 'https://github.com/alex/vouchr-demo/issues/4' }`.
+Jo, who never connected GitHub, clicks first: a private Connect prompt appears for Jo in the channel,
+with `Connect your *github* account first. Vouchr sent you a private Connect prompt in this channel;
+once connected, click *Authorize with your account* again. The request stays open for 10 minutes if
+nobody authorizes it.` The request stays pending. Sam clicks:
+`✅ Authorized the *github* action with your account. It runs as you, once. Further *github* actions
+this worker takes in this channel will ask you privately, each time, until 30 minutes pass without
+one. The worker can retry now.` The worker prints `poll approved`, sends `POST /v1/fetch` with the
+same claims, and prints `fetch 200 { status: 201, url: 'https://github.com/alex/vouchr-demo/issues/4' }`.
+The issue is opened by Sam's GitHub account.
 
-Same channel, two providers: humans use `github` as themselves, the worker uses `github-team` as the
-channel. Audit: `approval_requested` and `approval_consumed` carry the bot's user id as `user_id`;
-`approval_consumed` carries Sam in `actor` (`test/authorization.test.ts`, "autonomous worker").
+Run the worker again with a different title: the request is minted for Sam and Sam alone gets a
+private prompt (`The worker <@vouchr> wants to run another action on github in this thread, where you
+authorized it with your account. It runs as you, once, if you approve.`), with a plain *Approve*
+button. Sam's `/vouchr disconnect github` ends that: the next run asks the channel again.
 
-Shots: the worker terminal, the prompt naming the bot, the fetch line, the issue.
+Audit: `approval_requested` and `approval_consumed` carry the bot's user id as `user_id`;
+`approval_consumed` carries Sam in `actor` and in `meta.owner`, plus the thread and the reason
+(`test/worker-authorization.test.ts`).
+
+Shots: the worker terminal, the channel message naming the bot, Jo's Connect line, Sam's receipt, the issue.
 
 ### (k) Offboarding
 

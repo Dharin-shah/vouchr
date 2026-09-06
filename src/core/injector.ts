@@ -20,7 +20,7 @@ import {
   type ApprovalStatement,
   type Approvals,
   MAX_APPROVAL_PATH_BYTES,
-  effectiveApprover,
+  approvalDecider,
 } from './approval';
 import { randomUUID } from 'node:crypto';
 import {
@@ -352,6 +352,11 @@ export class ConnectionHandle {
     // id alone cannot. Undefined ⇒ derive from originChannel by the id heuristic (the direct/test
     // default). Only stored on the approval row; it never gates injection here.
     private approvalGovernableChannel?: string | null,
+    // #360 this handle acts for an autonomous worker: no human requester drives it, so a channel
+    // member authorizes each approval-needing action as themselves. Every approval row it mints is
+    // delegated (its owner/credential are decided by that member, see delegationOf) and backchannel
+    // (no Slack turn can relay it; the control plane delivers it on its timer).
+    private worker = false,
   ) {
     if (!Number.isSafeInteger(fetchDeadlineMs) || fetchDeadlineMs <= 0 || fetchDeadlineMs > MAX_TIMER_MS) {
       throw new Error(`ConnectionHandle: fetchDeadlineMs must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
@@ -666,14 +671,17 @@ export class ConnectionHandle {
       // the human's approval.
       method, origin: url.origin, host: url.hostname, path: url.pathname,
       queryHash: queryDigest(url.search),
-      // A thread grant needs a thread to bind to; outside one it is a once grant (#350).
-      grant: rule.grant === 'thread' && this.thread ? 'thread' : 'once',
+      // A thread grant needs a thread to bind to; outside one it is a once grant (#350). A worker's
+      // request is always a once grant whatever the provider declares (#360): the member authorizes
+      // exactly one action, and every later call in the thread asks them again.
+      grant: !this.worker && rule.grant === 'thread' && this.thread ? 'thread' : 'once',
       channel: this.auditChannel(), thread: this.thread,
       // The governance scope stored for the DECISION revalidation. Prefer the channel_type-aware
       // value the adapter passed; fall back to the id heuristic for a directly-constructed handle.
       governableChannel: this.approvalGovernableChannel !== undefined
         ? this.approvalGovernableChannel
         : governanceChannelOf(this.auditChannel()),
+      delegated: this.worker,
     };
   }
 
@@ -797,6 +805,7 @@ export class ConnectionHandle {
           this.vault,
           this.approvalRequestValid,
           statement,
+          this.worker,
         );
         if (pending.created) {
           this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
@@ -805,7 +814,7 @@ export class ConnectionHandle {
         // names and values are caller-controlled, SEC-1) and is bound by the digest in the key.
         throw new ApprovalRequiredError(
           this.provider.id,
-          effectiveApprover(approval.approver, key.ownerKind, key.governableChannel),
+          approvalDecider(approval.approver, key).approver,
           method,
           url.hostname,
           url.pathname,

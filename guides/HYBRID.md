@@ -398,8 +398,10 @@ Use a schema-owner role only for `vouchr migrate`; both runtimes use DML-only cr
 
 The trusted Slack service or a narrow internal gateway mints a fresh, single-use assertion for each
 broker request. Never let a model, untrusted MCP client, or generic worker supply `teamId`, `userId`,
-`channel`, `threadTs`, `enterpriseId`, `offboardTargetUserId`, `ownerKind`, or `channelEligible` —
-or `channelType`.
+`channel`, `threadTs`, `enterpriseId`, `offboardTargetUserId`, `ownerKind`, `channelEligible`,
+`channelType`, or `worker`. Set `worker: true` only when the minter itself runs the job for the app's
+bot user (see the [headless guide](./HEADLESS.md#autonomous-workers)); a channel member then
+authorizes each of its actions as themselves.
 
 ```ts
 import {

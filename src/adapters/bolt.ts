@@ -49,7 +49,14 @@ import {
 import { assertDryRunFlag, assertDryRunLocalKey, assertDryRunVault, dryRunAudit, DRY_RUN_CODE } from '../core/dryRun';
 import { booleanEnv, MAX_TIMER_MS } from '../core/options';
 import { sweepLifecycle } from '../core/sweep';
-import { InteractionStateChangedError, isInteractionId, PROMPT_DELIVERY_LEASE_US } from '../core/interaction';
+import {
+  InteractionStateChangedError,
+  isInteractionId,
+  PENDING_INTERACTION_TTL_US,
+  PROMPT_DELIVERY_LEASE_US,
+  WORKER_SESSION_IDLE_TTL_US,
+  WORKER_SESSION_MAX_TTL_US,
+} from '../core/interaction';
 import {
   abandonUserProvisioningDelivery,
   ChannelProvisioningRequests,
@@ -69,7 +76,9 @@ import {
   credentialUseStillCurrentFenced,
   type ApprovalDecisionResult,
   type ApprovalKey,
-  effectiveApprover,
+  approvalDecider,
+  delegationOf,
+  type Delegation,
 } from '../core/approval';
 import { NotificationState, type CredentialHealthEvent, type CredentialHealthHook } from '../core/health';
 import {
@@ -655,6 +664,11 @@ export interface ConnectContextDeps {
   requireMembership?: boolean;
   /** The Slack thread (thread_ts) this request is in; a `thread` grant binds to it. Null off-thread. */
   thread?: string | null;
+  /** Where this request's PRIVATE prompts (ephemerals) are placed: the thread the request was asked
+   *  from, or null for a top-level message. An ephemeral is not a reply, so one posted under a root
+   *  with no replies shows no indicator and is never seen; the middleware therefore sets this only
+   *  when the triggering message itself sits inside an existing thread. Defaults to `thread`. */
+  replyThread?: string | null;
   /** #113 human-in-the-loop approval store (provider.approval). Absent + a provider whose approval
    *  is not `false` = the injector fails closed (an approval rule is never silently skipped). */
   approvals?: Approvals;
@@ -695,6 +709,11 @@ type ApprovalPromptSpec = {
   /** The agent's reason and link as stored on the row (#350); null when it gave none. */
   reason: string | null;
   link: string | null;
+  /** Who receives a private ('self') prompt: the requester, or the bound member for a worker's
+   * request in their thread session (#360). */
+  decider: string;
+  /** #360 how the request is delegated (see delegationOf); 'none' for an ordinary request. */
+  delegated: Delegation;
 };
 
 /**
@@ -781,6 +800,10 @@ const INTERNAL_POSTED_APPROVAL_PROMPTS = Symbol('vouchr.posted-approval-prompts'
 /** Fixed reply for a click on a prompt whose pending row is gone; also what the sweep writes over an
  *  unclicked prompt's buttons (#348). One constant, both surfaces. */
 const APPROVAL_STALE_TEXT = 'This approval expired or was already decided. Ask the agent again.';
+/** Whole minutes of the pending-request and worker-session lifetimes, for click receipts (#360). */
+const PENDING_APPROVAL_MINUTES = Math.round(PENDING_INTERACTION_TTL_US / 60_000_000);
+const WORKER_SESSION_IDLE_MINUTES = Math.round(WORKER_SESSION_IDLE_TTL_US / 60_000_000);
+const WORKER_SESSION_MAX_HOURS = Math.round(WORKER_SESSION_MAX_TTL_US / 3_600_000_000);
 
 /** Approve/Deny messages this process posted and can still edit: `chat.update` needs the channel and
  *  ts, and no approval_request column stores them (#348). Best-effort by design: a restart or another
@@ -954,6 +977,7 @@ export class ConnectContext {
   private providerIds: string[];
   private requireMembership: boolean;
   private thread: string | null;
+  private replyThread: string | null;
   private approvals: Approvals | null;
   private auditSink: AuditSink;
   private health: CredentialHealthHook;
@@ -998,6 +1022,7 @@ export class ConnectContext {
     this.providerIds = deps.providerIds ?? [];
     this.requireMembership = deps.requireMembership ?? false;
     this.thread = deps.thread ?? null;
+    this.replyThread = deps.replyThread === undefined ? this.thread : deps.replyThread;
     this.approvals = deps.approvals ?? null;
     this.auditSink = deps.auditSink ?? (() => {});
     this.health = deps.health ?? (() => {});
@@ -1120,6 +1145,8 @@ export class ConnectContext {
             thread: this.thread,
             reason: e.reason,
             link: e.link,
+            decider: this.identity.userId,
+            delegated: 'none',
           });
         }
         throw e;
@@ -1156,6 +1183,7 @@ export class ConnectContext {
         ttlMs: this.approvalTtlMs(spec.provider),
         reason: spec.reason,
         link: spec.link,
+        ...(spec.delegated === 'none' ? {} : { delegated: spec.delegated }),
       }) as any;
       prompt = { blocks, fallback: optionalBlockFallback(blocks) };
     } catch {
@@ -1185,7 +1213,7 @@ export class ConnectContext {
     const audience = approvalDeliveryAudienceKey(
       spec.approvalId,
       spec.approver,
-      [spec.approver === 'self' ? this.identity.userId : this.channel!],
+      [spec.approver === 'self' ? spec.decider : this.channel!],
     );
     // Start the conservative local budget BEFORE the claim round-trip. PostgreSQL creates the
     // lease during that call, so including the whole round-trip can only shorten our posting
@@ -1212,9 +1240,11 @@ export class ConnectContext {
     // message stays where it is, so the requester learns why nothing new appeared.
     if (delivery.status === 'delivered') {
       await this.postPrivateNotice(
-        spec.approver === 'member'
-          ? `Still waiting for another member of this channel to approve the ${escapeMrkdwn(spec.provider)} action.`
-          : `Still waiting for you to decide the ${escapeMrkdwn(spec.provider)} action above.`,
+        spec.delegated === 'unbound'
+          ? `Still waiting for a member of this channel to authorize the ${escapeMrkdwn(spec.provider)} action.`
+          : spec.approver === 'member'
+            ? `Still waiting for another member of this channel to approve the ${escapeMrkdwn(spec.provider)} action.`
+            : `Still waiting for you to decide the ${escapeMrkdwn(spec.provider)} action above.`,
       );
     }
     if (delivery.status === 'claimed') {
@@ -1338,6 +1368,7 @@ export class ConnectContext {
               provider,
               channel,
               thread,
+              delegated: false,
             },
             db: tx,
             registry: this.registry,
@@ -1396,9 +1427,12 @@ export class ConnectContext {
       const posted = await client.chat.postMessage({ channel: this.channel!, ...threadArg, blocks, ...fallback, unfurl_links: false, unfurl_media: false });
       this.postedApprovalPrompts?.remember(spec.approvalId, client, posted);
     } else if (this.channel) {
-      await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
+      // An ephemeral is placed where the asker is looking (replyThread), not necessarily where the
+      // grant binds (spec.thread): under a top-level message it goes to the channel view.
+      const replyArg = this.replyThread ? { thread_ts: this.replyThread } : {};
+      await client.chat.postEphemeral({ channel: this.channel, user: spec.decider, ...replyArg, blocks, ...fallback });
     } else {
-      const posted = await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback, unfurl_links: false, unfurl_media: false });
+      const posted = await client.chat.postMessage({ channel: spec.decider, blocks, ...fallback, unfurl_links: false, unfurl_media: false });
       this.postedApprovalPrompts?.remember(spec.approvalId, client, posted);
     }
     // Preserve false (state drift) separately from rejection (database outcome unknown) so
@@ -1929,7 +1963,7 @@ export class ConnectContext {
           return { status: 'stale', provider: providerId };
         }
       }
-      const approver = effectiveApprover(approval.approver, row.ownerKind, row.governableChannel);
+      const { approver, decider } = approvalDecider(approval.approver, row);
       await this.deliverApprovalPrompt({
         provider: providerId,
         approver,
@@ -1942,6 +1976,8 @@ export class ConnectContext {
         thread: row.thread,
         reason: row.reason,
         link: row.link,
+        decider,
+        delegated: delegationOf(row),
       });
       return { status: 'approval_prompted', provider: providerId, approver };
     }
@@ -1990,7 +2026,7 @@ export class ConnectContext {
     if (!channel) return 'no-channel'; // a relayed call outside any conversation
     // Thread placement matches every other private surface in this file: a question asked in a
     // thread is answered in that thread, not in the channel view where the user is not looking.
-    const threadArg = this.thread ? { thread_ts: this.thread } : {};
+    const threadArg = this.replyThread ? { thread_ts: this.replyThread } : {};
     try {
       await this.promptClient().chat.postEphemeral({
         channel, user: this.identity.userId, ...threadArg, text,
@@ -2127,9 +2163,12 @@ export class ConnectContext {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
     if (this.channel) {
+      // Same placement rule as every private prompt: in the thread the person asked from, at channel
+      // level for a top-level message (an ephemeral under an unreplied root is never seen).
       await client.chat.postEphemeral({
         channel: this.channel,
         user: this.identity.userId,
+        ...(this.replyThread ? { thread_ts: this.replyThread } : {}),
         blocks: blocks as any,
         ...fallback,
       });
@@ -2706,6 +2745,15 @@ export async function createVouchr(opts: VouchrOptions) {
         ?? args.body?.container?.message_ts
         ?? args.body?.message?.ts
         ?? null;
+      // Where PRIVATE prompts go: only an existing thread (a message whose thread_ts differs from its
+      // own ts, or an action inside a thread). A top-level message is its own root, and an ephemeral
+      // posted under an unreplied root shows no reply indicator, so it goes to the channel view.
+      const eventThread = args.event?.thread_ts;
+      const replyThread: string | null =
+        (typeof eventThread === 'string' && eventThread !== args.event?.ts ? eventThread : undefined)
+        ?? args.body?.container?.thread_ts
+        ?? args.body?.message?.thread_ts
+        ?? null;
       // A DM / group-DM is a personal conversation that no channel governs, so channel governance (the tool
       // allowlist + identity) does not apply; the request must NOT be denied by the deny-by-default
       // allowlist there. The connect prompt is still delivered to `channel` (and static Policy still
@@ -2735,6 +2783,7 @@ export async function createVouchr(opts: VouchrOptions) {
         providerIds,
         requireMembership: opts.requireChannelMembership ?? false,
         thread,
+        replyThread,
         approvals,
         auditSink,
         health,
@@ -2897,11 +2946,13 @@ export async function createVouchr(opts: VouchrOptions) {
     governableChannel?: string | null,
     thread: string | null = null,
   ): ConnectContext {
+    // A stored row carries the binding thread only; whether its root has replies is unknown here, so
+    // private prompts for it keep the historical thread placement.
     const deps: InternalConnectContextDeps = {
       identity, channel, client, registry, vault, audit, consent, policy, redirectUri, resolvers,
       channelConfig, channelTools, inflight, rateLimits, sink, providerIds,
       requireMembership: opts.requireChannelMembership ?? false,
-      thread, approvals, auditSink, health, notifications: notifyState, dryRun,
+      thread, replyThread: thread, approvals, auditSink, health, notifications: notifyState, dryRun,
       allowWrites: opts.allowWrites ?? true,
       slackClientOptions: opts.slackClientOptions,
       [INTERNAL_POSTED_APPROVAL_PROMPTS]: postedApprovalPrompts,
@@ -4227,8 +4278,39 @@ export async function createVouchr(opts: VouchrOptions) {
       };
       const ttlMs = approval.ttlMs;
       // Resolved for the request's own identity and conversation (unset follows the persisted owner
-      // kind, a DM degrades 'member' to 'self'), from the persisted row — never from the payload.
-      const approverRule = effectiveApprover(approval.approver, pending.ownerKind, pending.governableChannel);
+      // kind, a DM degrades 'member' to 'self'; a worker's request asks any member, then the bound
+      // member), from the persisted row — never from the payload.
+      const delegation = delegationOf(pending);
+      const { approver: approverRule, decider } = approvalDecider(approval.approver, pending);
+      // #360 a worker's request is authorized by a member AS themselves: the grant binds to the
+      // clicking member's own credential. A member without one is sent the private Connect prompt in
+      // this conversation and the request stays pending for them (or anyone) to authorize later.
+      let delegate: { ownerId: string; credentialId: string } | undefined;
+      if (delegation === 'unbound' && decision === 'approve') {
+        if (!pending.channel || identity.userId === pending.userId) {
+          return reply('You are not eligible to authorize this request; a member of this channel other than the worker must.', false);
+        }
+        const credentialId = await vault.liveId(userOwner(identity), pending.provider);
+        if (!credentialId) {
+          if (!(await boundedChannelMembership(client, pending.channel, identity.userId, opts.slackClientOptions))) {
+            return reply('You are not eligible to authorize this request; a current member of this channel must.', false);
+          }
+          try {
+            await contextFor(
+              identity, pending.channel, client, provisioningReceivedAt, undefined, pending.governableChannel, pending.thread,
+            ).connect(pending.provider);
+          } catch (error) {
+            if (!(error instanceof ConsentRequiredError)) return reply(safeUserMessage(error), false);
+          }
+          return reply(
+            `Connect your *${p}* account first. Vouchr sent you a private Connect prompt${pending.thread ? ' in this thread' : ' in this channel'}; `
+            + 'once connected, click *Authorize with your account* again. The request stays open for '
+            + `${PENDING_APPROVAL_MINUTES} minutes if nobody authorizes it.`,
+            false,
+          );
+        }
+        delegate = { ownerId: identity.userId, credentialId };
+      }
       let decided: ApprovalDecisionResult;
       try {
         // Slack facts cannot be queried through PostgreSQL. Resolve them before taking lifecycle
@@ -4237,7 +4319,7 @@ export async function createVouchr(opts: VouchrOptions) {
         // 'member' decision surface: both are invalid once the channel class is no longer safe (a
         // Slack Connect conversion puts foreign-org users in conversations.members), and a
         // channel-owned approval also needs its original requester to still be a member.
-        const channelBound = pending.ownerKind === 'channel' || approverRule === 'member';
+        const channelBound = pending.ownerKind === 'channel' || approverRule === 'member' || delegation !== 'none';
         let channelFactsValid = true;
         if (channelBound) {
           if (!pending.channel) channelFactsValid = false;
@@ -4263,13 +4345,19 @@ export async function createVouchr(opts: VouchrOptions) {
           ? channelFactsValid
             && identity.userId !== pending.userId
             && await boundedChannelMembership(client, pending.channel!, identity.userId, opts.slackClientOptions)
-          : identity.userId === pending.userId;
+          : delegation === 'bound'
+            ? channelFactsValid
+              && identity.userId === decider
+              && await boundedChannelMembership(client, pending.channel!, identity.userId, opts.slackClientOptions)
+            : identity.userId === pending.userId;
         // Snapshot the identity only to choose every possibly-relevant lock. The authoritative
         // identity/owner/policy/tool decision is reloaded after those canonical locks are held below.
         const actAs = pending.channel
           ? await channelConfig.getIdentity(pending.teamId, pending.channel, pending.provider)
           : 'person';
-        const owners = approvalDecisionLockOwners(pending, actAs);
+        // The authorizing member's own credential scope is locked too, so their disconnect cannot
+        // race the bind (#360).
+        const owners = [...approvalDecisionLockOwners(pending, actAs), ...(delegate ? [userOwner(identity)] : [])];
         const issuance = await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt);
         decided = await vault.withCredentialLocks(
           owners.map((owner) => ({ owner, provider: pending.provider })),
@@ -4283,6 +4371,7 @@ export async function createVouchr(opts: VouchrOptions) {
               ttlMs,
               audit,
               enterpriseId: identity.enterpriseId,
+              delegate,
               validate: async (row, decisionTx) => {
                 // Exact signed conversation binding is checked again while the pending row is
                 // locked. It is immutable, but keeping it beside every other mutation-time fact
@@ -4302,8 +4391,8 @@ export async function createVouchr(opts: VouchrOptions) {
                 if (!currentApproval || !approvalNeeded(currentApproval, row.method, row.path)) {
                   return 'invalidated';
                 }
-                if (effectiveApprover(currentApproval.approver, row.ownerKind, row.governableChannel) !== approverRule) return 'invalidated';
-                if ((row.ownerKind === 'channel' || approverRule === 'member') && !channelFactsValid) return 'invalidated';
+                if (delegationOf(row) !== delegation || approvalDecider(currentApproval.approver, row).approver !== approverRule) return 'invalidated';
+                if (channelBound && !channelFactsValid) return 'invalidated';
                 if (!(await approvalOwnerStillCurrent({
                   row,
                   db: decisionTx,
@@ -4313,6 +4402,9 @@ export async function createVouchr(opts: VouchrOptions) {
                   enterpriseId: identity.enterpriseId,
                   actorIssuedAt: row.createdAt,
                 }))) return 'invalidated';
+                // The member's credential must still be the generation read above: a disconnect that
+                // landed in between leaves the request pending for a member who holds one.
+                if (delegate && (await locked.liveId(userOwner(identity), row.provider)) !== delegate.credentialId) return 'ineligible';
                 return approverEligible ? 'valid' : 'ineligible';
               },
             });
@@ -4342,9 +4434,13 @@ export async function createVouchr(opts: VouchrOptions) {
       }
       if (decided.status === 'ineligible') {
         return reply(
-          approverRule === 'member'
-            ? 'You are not eligible to decide this approval; another channel member must.'
-            : 'You are not eligible to decide this approval; only the requester can.',
+          delegation === 'unbound'
+            ? 'You are not eligible to authorize this request right now. A current member of this channel with a connected account must; if that is you, click again.'
+            : delegation === 'bound'
+              ? 'You are not eligible to decide this approval; only the member who authorized this worker in this thread can.'
+              : approverRule === 'member'
+                ? 'You are not eligible to decide this approval; another channel member must.'
+                : 'You are not eligible to decide this approval; only the requester can.',
           false,
         );
       }
@@ -4353,14 +4449,26 @@ export async function createVouchr(opts: VouchrOptions) {
       postedApprovalPrompts.forget(id);
       if (decision === 'approve') {
         emit({ type: 'approval_approved', provider: pending.provider, host: pending.host });
-        await reply(`✅ Approved the *${p}* action. ${grantCovers(pending.provider, pending.grant, ttlMs)} Have the agent retry now.`);
-        if (identity.userId !== pending.userId) {
+        if (delegation === 'unbound') {
+          await reply(
+            `✅ Authorized the *${p}* action with your account. It runs as you, once. Further *${p}* actions this worker takes `
+            + `${pending.thread ? 'in this thread' : 'in this channel'} will ask you privately, each time, until `
+            + `${WORKER_SESSION_IDLE_MINUTES} minutes pass without a decision from you, or ${WORKER_SESSION_MAX_HOURS} hours from now. `
+            + 'The worker can retry now.',
+          );
+        } else if (delegation === 'bound') {
+          await reply(`✅ Approved the *${p}* action. It runs as you, once. The worker can retry now.`);
+        } else {
+          await reply(`✅ Approved the *${p}* action. ${grantCovers(pending.provider, pending.grant, ttlMs)} Have the agent retry now.`);
+        }
+        // A worker requester is a bot user: nobody reads its ephemeral.
+        if (identity.userId !== pending.userId && delegation === 'none') {
           await tellRequester(`✅ <@${escapeMrkdwn(identity.userId)}> approved your *${p}* action. Ask the agent to retry.`);
         }
       } else {
         emit({ type: 'approval_denied', provider: pending.provider, host: pending.host });
         await reply(`🚫 Denied the *${p}* action. Nothing was sent.`);
-        if (identity.userId !== pending.userId) {
+        if (identity.userId !== pending.userId && delegation === 'none') {
           await tellRequester(`🚫 <@${escapeMrkdwn(identity.userId)}> denied your *${p}* action. Nothing was sent.`);
         }
       }
