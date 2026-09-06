@@ -74,9 +74,12 @@ and a release is built once from protected main. Upgrade from `1.0.0-beta.1` wit
   and the `/v1/{admin,user}/reference` routes declare their own request shapes. `SecretReferenceError`,
   `SECRET_REFERENCE_ERROR_CODES`/`SecretReferenceErrorCode`, and
   `SECRET_REFERENCE_SOURCES`/`SecretReferenceSource` stay exported.
+- `ConfigAdminRow` is no longer exported (ADOPT-1). It is renamed to `ConfigMemberRow` with the same
+  shape: the rows describe what a channel member can configure, and there is no admin role.
 
 ### Added
 
+- `ConfigMemberRow` type export: the former `ConfigAdminRow`, same shape (ADOPT-1).
 - **`approver: 'member'` (#322): any other member of the owning channel approves an agent's
   sensitive action.** The prompt is posted as one regular message in the channel (in the originating
   thread when there is one) through the existing cross-replica delivery lease, so two replicas post

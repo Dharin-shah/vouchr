@@ -83,7 +83,7 @@ Required for Vouchr's control surface:
 
 Add `app_mentions:read` and the `app_mention` event only when the same Slack app is also the agent.
 `channels:read`, `groups:read`, and `mpim:read` are security inputs: they let Vouchr verify channel
-type, creator, membership, and shared-credential eligibility, and distinguish an MPIM from a
+type, membership, and shared-credential eligibility, and distinguish an MPIM from a
 governed `G…` private channel. Invite the app to private channels it must govern; when Slack will
 not reveal a conversation, access fails closed.
 
@@ -727,7 +727,7 @@ The private modal is titled **Channel credential** and accepts exactly one value
 It is the exported `configureModal(provider, channel, referenceSources?, requestId?, disabled?)`
 builder (callback id `CONFIGURE_CALLBACK`); its self-service twin is `userKeyModal(provider,
 referenceSources?, requestId?)` (`USER_KEY_CALLBACK`), opened from the `SETUP_KEY_ACTION` button.
-`configModal` and `homeView` take `ToolRow` (`{ provider, enabled, mode? }`) and `ConfigAdminRow`
+`configModal` and `homeView` take `ToolRow` (`{ provider, enabled, mode? }`) and `ConfigMemberRow`
 (adds `mode`, `identity`) rows, and their Disconnect buttons carry `DISCONNECT_ACTION`. A host that
 renders these with its own client owns the handlers for those ids: Bolt runs every matching listener.
 

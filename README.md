@@ -12,7 +12,12 @@ Vouchr is a self-hosted credential broker for Slack agents.
 When a Slack agent calls GitHub, Google, or Jira, it usually holds one bot token with everyone's
 power, or it carries user tokens through prompts and logs. Vouchr removes both. Each person
 connects their own account once, in Slack. Your code gets a handle, never a token, and Vouchr adds
-the credential only when the request leaves for the provider.
+the credential only when the request leaves for the provider. Vouchr does not read or filter provider
+responses, so what the model does with data it is allowed to see stays your responsibility.
+
+Token vaults and integration platforms hand the token to your code or to a hosted service. Vouchr
+keeps it out of your code, your model, and your logs, and asks the owning team before sensitive
+actions. It is self-hosted and PostgreSQL-only.
 
 ## Example
 

@@ -78,7 +78,7 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
     `UPDATE connection SET generation_at = generation_at - 3600000000 WHERE team_id='T1' AND owner_id='U1' AND provider='acme'`,
   );
   // Deny-by-default: opt the registered providers into channel C1 (the token's default channel),
-  // mirroring an admin having run `/vouchr enable`. Denial cases below drive their own state.
+  // mirroring a member having run `/vouchr enable`. Denial cases below drive their own state.
   const channelTools = new ChannelTools(db);
   for (const p of [acme, svc]) await setChannelToolEnabled(channelTools, 'T1', 'C1', p.id, true);
   const server = createBroker({

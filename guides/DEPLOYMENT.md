@@ -355,7 +355,7 @@ Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST
 `POST /v1/mcp`, `POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `POST /v1/status`,
 `POST /v1/audit` (the caller's own credential-usage trail), `POST /v1/user/reference`,
 `GET /v1/manifest`, `POST /v1/manifest`, `POST /v1/admin/tools`, `GET /v1/admin/config`,
-`POST /v1/admin/audit` (that channel's usage, admin claim), `GET /healthz` (liveness, alias
+`POST /v1/admin/audit` (that channel's usage, signed channel claim), `GET /healthz` (liveness, alias
 `/health`), and `GET /readyz` (readiness). When channel modes are enabled it additionally makes
 `POST /v1/admin/mode` and `POST /v1/admin/reference` usable. The service listens on `VOUCHR_PORT`
 (default 3000) and runs the TTL sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it

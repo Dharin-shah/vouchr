@@ -532,7 +532,7 @@ export type Connection = {
 export type ToolRow = { provider: string; enabled: boolean; mode?: string | null };
 
 /** One provider's governance control row: channel mode (null = unconfigured) + tool-enabled. */
-export type ConfigAdminRow = {
+export type ConfigMemberRow = {
   provider: string;
   mode: string | null;
   enabled: boolean;
@@ -561,7 +561,7 @@ export function configModal(o: {
   channel: string | null;
   connections: Connection[];
   tools: ToolRow[];
-  admin?: ConfigAdminRow[];
+  admin?: ConfigMemberRow[];
 }): unknown {
   const blocks: unknown[] = [
     { type: 'header', text: { type: 'plain_text', text: 'Your connections', emoji: true } },
@@ -869,7 +869,7 @@ export function homeView(o: {
   governance?: {
     channel: string | null;
     note?: string | null;
-    tools?: ConfigAdminRow[];
+    tools?: ConfigMemberRow[];
   };
 }): unknown {
   const connected = new Set(o.connections.map((c) => c.provider));

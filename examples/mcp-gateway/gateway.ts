@@ -27,7 +27,7 @@ import {
 
 /**
  * An internal/first-party API exposed as a Vouchr provider. It's a `key` provider
- * (a user/admin pastes a static key into a private modal, no OAuth), and its
+ * (a user or channel member pastes a static key into a private modal, no OAuth), and its
  * egress allowlist pins the one host its key may ever be sent to. The key is
  * attached as `x-api-key` at the fetch boundary, not by the tool.
  *

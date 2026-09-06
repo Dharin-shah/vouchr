@@ -106,7 +106,7 @@ const disconnectValue = (view: any): string => {
   return button.value;
 };
 
-test('no-arg /vouchr opens the modal; non-admin sees NO admin controls (no submit)', async (t) => {
+test('no-arg /vouchr opens the modal; non-member sees NO channel controls (no submit)', async (t) => {
   const h = await harness(t, { member: false });
   const view = await h.openModal();
   assert.equal(view?.callback_id, CONFIG_CALLBACK);
@@ -114,7 +114,7 @@ test('no-arg /vouchr opens the modal; non-admin sees NO admin controls (no submi
   assert.ok(!view.blocks.some((b: any) => typeof b.block_id === 'string' && b.block_id.startsWith('mode:')));
 });
 
-test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable controls', async (t) => {
+test('no-arg /vouchr opens the modal; member sees per-provider mode + enable controls', async (t) => {
   const h = await harness(t, { member: true });
   const view = await h.openModal();
   assert.equal(view.submit?.text?.text ?? view.submit?.text, 'Save');
@@ -124,7 +124,7 @@ test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable cont
   assert.equal(Object.hasOwn(JSON.parse(view.private_metadata).open[0], 'v'), false);
 });
 
-test('no-arg /vouchr in a DM shows personal tools without channel-admin controls', async (t) => {
+test('no-arg /vouchr in a DM shows personal tools without channel controls', async (t) => {
   let conversationReads = 0;
   const h = await harness(t, {
     member: true,
@@ -351,7 +351,7 @@ test('a member offboarded during modal verification cannot change mode or tools'
   assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
-test('admin mode change via the modal == /vouchr mode: same channel_config + audit', async (t) => {
+test('member mode change via the modal == /vouchr mode: same channel_config + audit', async (t) => {
   const viaCommand = await harness(t, { member: true });
   await viaCommand.runCommand('mode mcp per-user');
   assert.equal(await modeRow(viaCommand.lan.db), 'per-user');
@@ -459,20 +459,20 @@ test('enabling one provider materializes the full allowlist; the others stay dis
   await h.submit({ 'tool:a': unchecked(), 'tool:b': checked(), 'tool:c': unchecked() }, async () => {}, pm);
   const tools = new ChannelTools(h.lan.db);
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'a'), false); // untouched → stays disabled
-  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // the one the admin enabled
+  assert.equal(await tools.isEnabled('T1', 'C_FIN', 'b'), true); // the one the member enabled
   assert.equal(await tools.isEnabled('T1', 'C_FIN', 'c'), false); // NOT silently enabled by materialization
   assert.deepEqual(await auditActions(h.lan.db), ['config']); // only the real change (b) audited
 });
 
 // Finding 2: a stale save (untouched select re-submitting its open value) must not revert a change
-// another admin made in between, nor delete the shared credential leaving 'shared' mode.
+// another member made in between, nor delete the shared credential leaving 'shared' mode.
 test('untouched mode select does not revert a concurrent change or delete the shared credential', async (t) => {
   const h = await harness(t, { member: true });
   const cfg = new ChannelConfig(h.lan.db);
   await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'per-user');
   const view = await h.openModal(); // opens with mode 'per-user' as the select's initial
   const pm = view.private_metadata;
-  // Between open and save, another admin flips to shared and connects a shared credential.
+  // Between open and save, another member flips to shared and connects a shared credential.
   await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'shared');
   await h.lan.vault.upsert({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp', { accessToken: 'SHARED', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // A saves the modal without touching the mode select (it re-submits its open value 'per-user').
@@ -481,7 +481,7 @@ test('untouched mode select does not revert a concurrent change or delete the sh
   assert.ok(await h.lan.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp')); // cred survived
 });
 
-// Finding 3: a policy-denied provider must not be spuriously written by an untouched save. The admin
+// Finding 3: a policy-denied provider must not be spuriously written by an untouched save. The member
 // checkbox reflects the ALLOWLIST bit (deny-by-default here → unchecked), not the policy-intersected
 // manifest, so re-submitting the open value is a true no-op.
 test('untouched save with a policy-denied provider writes no channel_tool row', async (t) => {

@@ -130,7 +130,7 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
   const db = await openDb({ databaseUrl });
   t.after(() => db.close());
   // Deny-by-default: opt the registered providers into the channels this test exercises (C1, C2),
-  // mirroring an admin having run `/vouchr enable`. The session/approval denials below come from
+  // mirroring a member having run `/vouchr enable`. The session/approval denials below come from
   // channel MODE and missing grants, not from the tool being disabled.
   for (const chan of ['C1', 'C2']) {
     for (const p of PROVIDERS) {
@@ -231,7 +231,7 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
   assert.equal((await fetchVia({ token: spent })).status, 401, 'jti replay refused cluster-wide');
 
   // ════ 2. Session recovery: session_approval_required → in-thread prompt → click → retry. ═══════
-  // An admin sets the channel mode through the public Bolt surface (audited, shared PG row).
+  // A member sets the channel mode through the public Bolt surface (audited, shared PG row).
   await (await context({ channel: 'C2' })).setChannelMode('ghlite', 'session');
   const needsSession = await fetchVia({ channel: 'C2', thread: 'TH2' });
   assert.equal(needsSession.status, 403);

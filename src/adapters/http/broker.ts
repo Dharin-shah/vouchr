@@ -2208,7 +2208,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         if (req.method === 'GET' && url === '/v1/admin/config') {
           await perimeter(req, requestSignal);
           // A GET carries no JSON body, so the signed identity token rides a header (never a query
-          // string — keeps it out of access logs). Channel/team/admin all come from this signed token.
+          // string — keeps it out of access logs). Channel and team come from this signed token.
           const token = req.headers['x-vouchr-identity'];
           if (typeof token !== 'string' || !token) throw new HttpError(401, { error: 'invalid identity token' });
           return send(200, { ...await handleAdminConfig(token) });

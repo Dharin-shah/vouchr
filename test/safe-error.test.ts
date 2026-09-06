@@ -1179,19 +1179,19 @@ test('modal submit: a mode-locked channel keeps the real "static keys are not al
     view: (id: string, h: any) => { if (id === CONFIGURE_CALLBACK) configureView = h; },
     action: () => undefined,
   });
-  // Admin + a normal (eligible) channel: both mutations pass the admin gate + eligibility check.
+  // Member + a normal (eligible) channel: both mutations pass the membership gate + eligibility check.
   const dms: string[] = [];
   const admin = {
     conversations: { info: async () => ({ channel: {} }), members: async () => ({ members: ['U1'] }) },
     chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } },
   };
-  // 1) Admin locks the channel to per-user.
+  // 1) The member locks the channel to per-user.
   await cmd({
     command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'mode acme per-user', trigger_id: 'x' },
     ack: async () => {}, respond: async () => {}, client: admin,
   });
   const requestId = await issueChannelRequest(vouchr.db, vouchr);
-  // 2) Admin then tries to save a STATIC key → refused by the mode lock; message must reach the modal.
+  // 2) The member then tries to save a STATIC key → refused by the mode lock; message must reach the modal.
   let acked = false;
   await configureView({
     ack: async () => { acked = true; },

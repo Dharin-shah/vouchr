@@ -440,7 +440,7 @@ test('union mode is rejected at the config boundary, writing nothing (SEC-4)', a
   assert.equal(isChannelMode('union'), false);
   for (const m of ['shared', 'per-user', 'session']) assert.equal(isChannelMode(m), true);
 
-  // Slash command: an admin creator runs `mode mcp union` → the usage message, and NO row is written.
+  // Slash command: a channel member runs `mode mcp union` → the usage message, and NO row is written.
   const h = await commandHarness(t, { member: true });
   await h.run('mode mcp union');
   assert.match(h.out[0], /Usage: `\/vouchr mode/);

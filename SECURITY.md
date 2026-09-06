@@ -89,13 +89,15 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   Disconnect reports completion. For shared credentials, every effective credential, mode, or tool
   mutation advances a channel/provider tombstone atomically with dependent-state cleanup. Setup
   received before that marker cannot hydrate or commit afterward, including when Slack modal or
-  admin checks delayed request persistence. Same-value governance retries leave current forms valid.
+  membership checks delayed request persistence. Same-value governance retries leave current forms valid.
 - **Confirmed break-glass revoke is a scoped provisioning fence.** `vouchr revoke --yes` commits a
   provider+scope marker before it enumerates pending or live state. Older matching user and shared
   channel writes cannot land after the command reports no local access; outstanding opaque channel
   setup requests are counted and purged with their channel/team/global scope. A fresh setup begun
   after the marker remains possible. `--user` and `--channel` are distinct owner scopes, dry-run
   writes no marker, and raw scope ids are represented durably only by fixed server-derived hashes.
+- **A malicious self-hosted operator or full KMS/root-key compromise is outside Vouchr's protection.**
+  An operator with root on the host, the KMS key, or the master key can read every stored credential.
 - **Deployment-wide compromise has its own break-glass.** Distinguish two incidents. A **read-only
   PostgreSQL dump with the KMS/master key uncompromised** exposes owner/provider/scope/timestamp
   metadata but not token plaintext — contain the database incident and check KMS access logs; global

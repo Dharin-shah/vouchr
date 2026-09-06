@@ -107,7 +107,7 @@ import {
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
   escapeMrkdwn, blocksFallbackText, connectedDmText, oauthRecoveryBlocks,
-  type Connection, type ConfigAdminRow,
+  type Connection, type ConfigMemberRow,
 } from './blocks';
 
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
@@ -3652,7 +3652,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // mode+enabled controls, meaningless for them). The App Home instead renders every
       // row and per-row picks which controls a service tool gets (Enable/Disable only).
       const admin = member && channelId
-        ? adminToolRows(manifest.tools, manifest.toolAllowed).filter((r) => isBrokeredProvider(r))
+        ? memberToolRows(manifest.tools, manifest.toolAllowed).filter((r) => isBrokeredProvider(r))
         : undefined;
       return configModal({ channel: channelId, connections, tools: manifest.tools, admin });
     }
@@ -3668,10 +3668,10 @@ export async function createVouchr(opts: VouchrOptions) {
      * disable (config-modal findings 3/1); the manifest keeps the intersected value for the
      * read-only displays.
      */
-    function adminToolRows(
+    function memberToolRows(
       tools: ToolManifestEntry[],
       toolAllowed: (provider: string) => boolean,
-    ): ConfigAdminRow[] {
+    ): ConfigMemberRow[] {
       // Raw tool-allowlist bit (NOT the manifest's policy-intersected `enabled`) reuses the manifest's
       // channel snapshot, so governance rendering adds no query and cannot drift to a second DB window.
       return tools.map((t) => ({
@@ -3862,10 +3862,10 @@ export async function createVouchr(opts: VouchrOptions) {
       const connections = await listBrokeredConnections(identity);
       // "Available providers" advertises connect-on-demand, so it lists only providers Vouchr
       // actually brokers a user credential for — a service tool must not be advertised as
-      // connectable. Governance rows are separate (adminToolRows, same brokered filter as the modal).
+      // connectable. Governance rows are separate (memberToolRows, same brokered filter as the modal).
       const connectable = providerIds.filter((p) => isBrokeredProvider(registry.get(p)));
 
-      let governance: { channel: string | null; note?: string; tools?: ConfigAdminRow[] } = { channel: selected };
+      let governance: { channel: string | null; note?: string; tools?: ConfigMemberRow[] } = { channel: selected };
       if (selected) {
         let info: ChannelInfo | null = null;
         try { info = ((await client.conversations.info({ channel: selected })) as any)?.channel ?? null; } catch { info = null; }
@@ -3876,7 +3876,7 @@ export async function createVouchr(opts: VouchrOptions) {
           governance = { channel: selected, note: memberOnly('configure this channel') };
         } else {
           const manifest = await manifestSnapshotFor(identity, selected, selected);
-          governance = { channel: selected, tools: adminToolRows(manifest.tools, manifest.toolAllowed) };
+          governance = { channel: selected, tools: memberToolRows(manifest.tools, manifest.toolAllowed) };
         }
       }
       // Ownership stamp: ONLY this internal publisher marks the view as Vouchr's and carries the

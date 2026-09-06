@@ -210,7 +210,7 @@ test('connectChannel: handle on shared cred, refuses per-user and unconfigured',
 test('connectChannel: refused + audited when policy denies the provider in this channel', async (t) => {
   const deny = new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } });
   const ok = await ctx(t, true, 'C_FIN', {}, deny);
-  await ok.c.setChannelSecret('mcp', SECRET); // config is admin-gated, not policy-gated
+  await ok.c.setChannelSecret('mcp', SECRET); // config is member-gated, not policy-gated
   await assert.rejects(
     async () => ok.c.connectChannel('mcp'),
     (error: unknown) => mapSafeError(error).code === 'policy_denied',

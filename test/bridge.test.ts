@@ -281,7 +281,7 @@ test('bridge: non-bridgeable and malformed denials change nothing', async (t) =>
 // ── denials that need a human, not a button (transport parity) ────────────────────────────────────
 
 test('bridge: tool_disabled reaches the user privately, in the SAME words as the Bolt path', async (t) => {
-  // Channels are deny-by-default, so "the admin never enabled this provider" is the single most
+  // Channels are deny-by-default, so "no member enabled this provider" is the single most
   // likely first-run failure of a hybrid deployment. Through the broker it used to reach nobody:
   // recoverBrokerDenial returned not_bridgeable and the user saw only whatever the agent said.
   const h = await harness(t);
@@ -391,7 +391,7 @@ test('bridge: every VouchrErrorCode is explicitly bridged or explicitly not (REV
 
 test('deny-by-default: a real Slack DM is ungoverned — a provider works there without a channel enable (#1)', async (t) => {
   const h = await harness(t);
-  // A DM channel id starts with 'D'. The middleware treats it as ungoverned (no admins to govern it),
+  // A DM channel id starts with 'D'. The middleware treats it as ungoverned (no channel members to govern it),
   // so the tool allowlist is skipped and connect() reaches the CONSENT flow — NOT tool-disabled —
   // even though no channel_tool row exists for it. This is the recovery path deny-by-default must keep.
   const dm = await h.context({ channel: 'D0PERSONAL' });
@@ -733,7 +733,7 @@ test('bridge: shared-owner relay resolves once the channel credential exists', a
   assert.equal(h.dms.length, 0);
 });
 
-// ── approval_required → the self/admin decision surface, hydrated from the stored row ────────────
+// ── approval_required → the self/member decision surface, hydrated from the stored row ────────────
 
 test('bridge: broker approval denial delivers ONE self decision surface; approve → single-use grant', async (t) => {
   const provider = approvalProv('self');

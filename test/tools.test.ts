@@ -108,7 +108,7 @@ test("connect() refuses a disabled provider (audited 'tool-disabled') and allows
 test('connectChannel() refuses a disabled provider and allows an enabled one', async (t) => {
   const { c, vault, tools } = await ctx(t, true);
   await setChannelToolEnabled(tools, 'T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, other off
-  await c.setChannelSecret('mcp', 'sk-shared'); // admin config (not tool-gated)
+  await c.setChannelSecret('mcp', 'sk-shared'); // member config (not tool-gated)
 
   assert.ok(await c.connectChannel('mcp')); // enabled + shared cred → handle
   assert.equal((await vault.get(chOwner, 'mcp'))?.accessToken, 'sk-shared');

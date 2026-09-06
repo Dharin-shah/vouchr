@@ -60,7 +60,7 @@ test('defineProvider: key provider needs no OAuth client', () => {
   );
 });
 
-// Self-service: a user sets their OWN key: no admin gate, keyed to the user.
+// Self-service: a user sets their OWN key: no membership gate, keyed to the user.
 test('setUserSecret: self-service, stored under the user', async (t) => {
   const { c, vault } = await ctx(t);
   await c.setUserSecret('customdb', SECRET);

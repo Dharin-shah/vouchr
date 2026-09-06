@@ -595,6 +595,8 @@ non-goals live in [SECURITY.md -> "What Vouchr does not protect against"](../SEC
 - Disconnect/offboard deletes locally first; upstream revocation is best-effort.
 - Audit metadata is caller-supplied; don't put secrets in it.
 - The Postgres database is not wholly encrypted at rest.
+- A malicious self-hosted operator or full KMS/root-key compromise is outside Vouchr's protection:
+  root on the host, the KMS key, or the master key reads every stored credential.
 - Audit completeness is best-effort, not guaranteed (see below).
 
 ### Audit completeness is best-effort by design

@@ -1,6 +1,5 @@
 // Slack-semantic identity helpers. These KNOW Slack's payload shapes and Web API (Bolt bodies,
-// users.info is_admin/is_owner, conversations.members) so they live in the adapter layer, not in
-// transport-agnostic core. Core keeps only the SlackIdentity TYPE (the vault key), imported here.
+// conversations.members) so they live in the adapter layer, not in transport-agnostic core. Core keeps only the SlackIdentity TYPE (the vault key), imported here.
 import type { SlackIdentity } from '../core/identity';
 
 /**
