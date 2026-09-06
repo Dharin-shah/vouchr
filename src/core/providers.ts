@@ -791,7 +791,9 @@ export function defineProvider(spec: ProviderSpec): Provider {
     const methods = canonicalMethods(rule.methods, 'approval.methods');
     const paths = canonicalPaths(rule.paths, 'approval.paths');
     const ttlMs = rule.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
-    if (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0) providerError('approval.ttlMs', 'must be a positive safe integer');
+    if (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0 || (ttlMs as number) > MAX_TIMER_MS) {
+      providerError('approval.ttlMs', `must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
+    }
     approval = { approver, grant, ttlMs: ttlMs as number, ...(methods ? { methods } : {}), ...(paths ? { paths } : {}) };
   }
 

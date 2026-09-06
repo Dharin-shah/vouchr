@@ -1374,7 +1374,9 @@ export class ConnectContext {
 
   /** Post the Approve/Deny prompt for one pending approval to its decision surface: the requester
    * (ephemeral in the channel, else a DM) for 'self'; one regular message in the owning channel, in
-   * the originating thread when there is one, for 'member' (#322). */
+   * the originating thread when there is one, for 'member' (#322). The agent's `link` is untrusted, so
+   * chat.postMessage never unfurls it into a picture or card beside the Approve button
+   * (chat.postEphemeral has no unfurl knobs and never unfurls). */
   private async postApprovalPrompt(
     spec: ApprovalPromptSpec,
     prompt: { blocks: any; fallback: { text: string } | Record<string, never> },
@@ -1391,12 +1393,12 @@ export class ConnectContext {
       throw new ApprovalPromptNotStartedError('approval delivery budget elapsed before posting');
     }
     if (spec.approver === 'member') {
-      const posted = await client.chat.postMessage({ channel: this.channel!, ...threadArg, blocks, ...fallback });
+      const posted = await client.chat.postMessage({ channel: this.channel!, ...threadArg, blocks, ...fallback, unfurl_links: false, unfurl_media: false });
       this.postedApprovalPrompts?.remember(spec.approvalId, client, posted);
     } else if (this.channel) {
       await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
     } else {
-      const posted = await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
+      const posted = await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback, unfurl_links: false, unfurl_media: false });
       this.postedApprovalPrompts?.remember(spec.approvalId, client, posted);
     }
     // Preserve false (state drift) separately from rejection (database outcome unknown) so

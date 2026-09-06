@@ -399,6 +399,17 @@ test('admin config routes validate input and require the stores to be enabled', 
     assert.equal(badMode.status, 400);
     const badEnabled = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: 'yes', identityToken: admin() } as any);
     assert.equal(badEnabled.status, 400);
+    // The verifier accepts any string channel claim; every channel-scoped admin route refuses an
+    // empty one before any read, write, or audit (same rule as /v1/admin/audit).
+    for (const [path, body] of [
+      ['/v1/admin/identity', { provider: 'acme', identity: 'channel' }],
+      ['/v1/admin/tools', { provider: 'acme', enabled: true }],
+      ['/v1/admin/reference', { handle: { provider: 'acme' }, secretRef: 'ref' }],
+    ] as const) {
+      const r = await post(port, path, { ...body, identityToken: admin({ channel: '' }) });
+      assert.equal(r.status, 400, path);
+      assert.equal(r.json.error, 'channel-scoped identity token required', path);
+    }
   } finally {
     server.close();
   }

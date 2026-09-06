@@ -642,10 +642,12 @@ export class Approvals {
         [actionKey, ...params],
       );
       if (live) {
+        // A later reason/link is adopted only while the prompt is undelivered: a delivered prompt and
+        // its approval_requested audit row were rendered without it and never change afterwards.
         if (reason !== null || link !== null) {
           await db.run(
             `UPDATE approval_request SET reason=COALESCE(reason, ?), link=COALESCE(link, ?)
-             WHERE id=? AND status='pending'`,
+             WHERE id=? AND status='pending' AND delivered_at IS NULL`,
             [reason, link, live.id],
           );
         }

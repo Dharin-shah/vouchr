@@ -28,6 +28,7 @@ import {
 } from '../src/core/interaction';
 import { approvalNeeded, ConnectionHandle, EgressBlockedError } from '../src/core/injector';
 import { defineProvider, github, ProviderRegistry, DEFAULT_APPROVAL_TTL_MS, type ApprovalRule, type Provider, type ProviderSpec } from '../src/core/providers';
+import { MAX_TIMER_MS } from '../src/core/options';
 import { ChannelConfig, writeChannelIdentity, type ChannelIdentity } from '../src/core/channelConfig';
 import { setChannelCredentialIdentity } from '../src/core/channelCredential';
 import { ChannelTools, configureChannelTools, setChannelToolEnabled } from '../src/core/tools';
@@ -294,6 +295,10 @@ test('defineProvider: garbage approval knobs are rejected at definition time (SE
   assert.throws(spec({ approver: 'self', paths: [] }), /approval\.paths/);
   assert.throws(spec({ approver: 'self', ttlMs: 0 }), /approval\.ttlMs/);
   assert.throws(spec({ approver: 'self', ttlMs: Number.NaN }), /approval\.ttlMs/);
+  // The grant TTL shares the timer cap every other provider deadline has: a 9e15 ttl would mint a
+  // grant the sweep never reclaims and render an absurd lifetime on the prompt.
+  assert.throws(spec({ approver: 'self', ttlMs: MAX_TIMER_MS + 1 }), new RegExp(`approval\\.ttlMs.*no greater than ${MAX_TIMER_MS}`));
+  assert.equal((approvalProvider({ approval: { ttlMs: MAX_TIMER_MS } }).approval as ApprovalRule).ttlMs, MAX_TIMER_MS);
   // #350: the defaults. An omitted or empty rule asks another member once for five minutes; false is off.
   assert.deepEqual(approvalProvider({ approval: undefined }).approval, { approver: 'member', grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
   assert.deepEqual(approvalProvider({ approval: {} }).approval, { approver: 'member', grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
@@ -594,6 +599,8 @@ test('an aged durable self-approval DM remains deduplicated', async (t) => {
     );
     assert.equal(ephemerals.length, 0);
     assert.equal(dms.length, 1);
+    assert.equal(dms[0].unfurl_links, false, 'the DM prompt never unfurls the agent link either');
+    assert.equal(dms[0].unfurl_media, false);
 
     await vouchr.db.run(
       `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_US_SQL}-? WHERE id=?`,
@@ -1496,6 +1503,9 @@ test('member approver (#322): one channel message; the requester and a non-membe
     assert.equal(dms[0].channel, 'C1');
     assert.equal(dms[0].thread_ts, 'TH1');
     assert.equal(dms[0].user, undefined);
+    // The agent's link must never unfurl into an attacker-chosen picture beside the Approve button.
+    assert.equal(dms[0].unfurl_links, false);
+    assert.equal(dms[0].unfurl_media, false);
     const rendered = JSON.stringify(dms[0]);
     assert.match(rendered, /Another member of this channel must approve it/);
     assert.match(rendered, /<@U1>/);
@@ -1824,6 +1834,25 @@ test('identical pending actions converge on one opaque id, prompt, and requested
     assert.equal((await approvalRows()).length, 1);
     assert.equal((await auditRows()).filter((r) => r.action === 'approval_requested').length, 1);
     assert.ok(!JSON.stringify(await auditRows()).includes(first.approvalId));
+  });
+});
+
+test('a reason on a re-ask is not adopted onto an already-delivered prompt (the human saw none, the audit has none)', async (t) => {
+  const { ctx, ephemerals, approvalRows, auditRows } = await harness(t);
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const first = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    const [delivered] = await approvalRows();
+    assert.ok(delivered.delivered_at, 'the prompt was delivered without a reason');
+    const second = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', reason: 'late reason', link: 'https://tracker.example/T-1' }));
+    assert.equal(second.approvalId, first.approvalId);
+    const [row] = await approvalRows();
+    assert.equal(row.reason, null, 'a delivered prompt keeps the reason it was rendered with');
+    assert.equal(row.link, null);
+    assert.ok(!JSON.stringify(ephemerals).includes('late reason'), 'nothing rendered carries the late reason');
+    const requested = (await auditRows()).filter((r) => r.action === 'approval_requested');
+    assert.equal(requested.length, 1);
+    assert.ok(!requested[0].meta.includes('late reason'), 'the audit row written without a reason stays that way');
   });
 });
 

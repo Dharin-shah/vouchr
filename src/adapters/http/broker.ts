@@ -1611,6 +1611,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     const { identity: acting, issuedAt } = await requireCurrentActor(claims);
+    const channel = channelClaim(claims);
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     if (!registry.has(providerId)) throw UNKNOWN_PROVIDER();
     const provider = registry.get(providerId);
@@ -1621,13 +1622,20 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
 
     const stored = await referenceChannelCredential({
       vault: opts.vault, audit: opts.audit, channelConfig: opts.channelConfig,
-      identity: acting, channel: claims.channel, providerId, reference, issuance: issuedAt,
+      identity: acting, channel, providerId, reference, issuance: issuedAt,
       // Membership is what the signed channel claim asserts; there is no further gate (#322).
       authorize: async () => undefined,
       assertEligible: () => assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential'),
     });
     if (!stored) throw staleInteraction(409, 'channel credential setup no longer valid; resolve and retry');
     return { ok: true };
+  }
+
+  /** The channel a channel-scoped admin route acts on. The verifier accepts any string claim, so an
+   * empty one would otherwise write or read a channel row keyed on '' (#322). */
+  function channelClaim(claims: IdentityClaims): string {
+    if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
+    return claims.channel;
   }
 
   /** The broker's only channel-class fact is the SIGNED `channelEligible` verdict (it has no Slack
@@ -1687,6 +1695,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       providerId,
       body.identityToken,
     );
+    const channel = channelClaim(claims);
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     // Choosing `channel` must be symmetric with /v1/admin/reference (and Bolt's assertChannelEligible):
     // refuse a channel credential on an ineligible (Slack-Connect / externally-shared) channel from the
@@ -1702,7 +1711,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       audit: opts.audit,
       channelConfig: opts.channelConfig,
       identity: acting,
-      channel: claims.channel,
+      channel,
       providerId,
       actAs,
       issuance,
@@ -1726,13 +1735,14 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       providerId,
       body.identityToken,
     );
+    const channel = channelClaim(claims);
     if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
     const configured = await configureChannelTools({
       channelTools: opts.channelTools,
       vault: opts.vault,
       audit: opts.audit,
       identity: acting,
-      channel: claims.channel,
+      channel,
       changes: [[providerId, body.enabled]],
       allProviders: providerIds,
       issuance,
@@ -1869,8 +1879,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   async function handleAdminAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
     const claims = await verify(body.identityToken);
     await requireCurrentActor(claims);
-    if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
-    const events = await opts.audit.listByChannel(claims.teamId, claims.channel, 20);
+    const events = await opts.audit.listByChannel(claims.teamId, channelClaim(claims), 20);
     return { events };
   }
 

@@ -11,7 +11,7 @@ import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import type { Db } from '../src/core/db';
-import { defineProvider, type Provider } from '../src/core/providers';
+import { defineProvider, type Provider, type ProviderSpec } from '../src/core/providers';
 import { channelOwner, userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
@@ -34,9 +34,10 @@ const SECRET = 'broker-signing-secret';
 const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK'; // the vaulted token that must never escape
 
 // An MCP-serving provider: POST is how JSON-RPC rides Streamable HTTP (so the provider opts into
-// it), and the /v1/mcp route itself is a second, declarative opt-in via the `mcp` knob.
-const mcpAcme = defineProvider({
-  approval: false,
+// it), and the /v1/mcp route itself is a second, declarative opt-in via the `mcp` knob. Approval is
+// switched off because every MCP hop is a POST and so counts as a write to Vouchr (#350; the
+// default-approval test below pins that rule).
+const mcpAcmeSpec: ProviderSpec = {
   id: 'acme',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',
@@ -48,7 +49,8 @@ const mcpAcme = defineProvider({
   pkce: false,
   clientId: 'id',
   clientSecret: 'sec',
-});
+};
+const mcpAcme = defineProvider({ ...mcpAcmeSpec, approval: false });
 
 function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
@@ -1062,6 +1064,23 @@ test('#194 typed recovery: fetch and MCP mask an extension throw behind the same
 });
 
 // ── audit parity + statelessness ──
+
+test('#350 mcp: every hop is a POST, so a provider with default approval prompts on initialize, not only on tools/call', async (t) => {
+  const { server, port, db } = await makeMcpBroker(t, { providers: [defineProvider(mcpAcmeSpec)] });
+  const up = mockUpstream(() => new Response('{}', { status: 200 }));
+  try {
+    const r = await postRaw(port, '/v1/mcp', envelope({ body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} }) }));
+    assert.equal(r.status, 403, r.raw);
+    assert.deepEqual(recoveryFields(r.raw), { code: 'approval_required', retryable: false, recovery: 'request_approval' });
+    assert.equal(up.seen.length, 0, 'nothing reaches the MCP server before a human approves');
+    // The gate is on the HTTP method: the pending row is the POST to the MCP endpoint, whatever the
+    // JSON-RPC method inside it. An MCP provider sets `approval: false` or narrows with `approval.paths`.
+    assert.deepEqual(await db.get(`SELECT method, path FROM approval_request`), { method: 'POST', path: '/mcp' });
+  } finally {
+    up.restore();
+    server.close();
+  }
+});
 
 test('#65 mcp: the inject audit row is indistinguishable in shape from a /v1/fetch write (STR-4)', async (t) => {
   const writeAcme = { ...mcpAcme, egressAllow: ['mcp.acme.example', 'api.acme.example'] } as Provider;
