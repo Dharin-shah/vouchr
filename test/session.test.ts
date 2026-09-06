@@ -258,7 +258,6 @@ async function sessionHarness(t: TestContext, o: {
   const ephemerals: any[] = [];
   const dms: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: true } }) },
     conversations: {
       info: async ({ channel }: any) => ({ channel: { id: channel, is_channel: true, creator: 'U1' } }),
       members: async () => ({ members: ['U1'] }),

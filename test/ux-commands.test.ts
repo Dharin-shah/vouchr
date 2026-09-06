@@ -12,6 +12,9 @@ import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { offboardUser } from '../src/core/offboard';
 
+/** A channel whose only member is the acting user U1: the member gate (#322) reads it on every governed command. */
+const MEMBER_CLIENT = { conversations: { members: async () => ({ members: ['U1'] }) } };
+
 // createVouchr builds the vault keyring from the env at construction (like the other command tests).
 process.env.VOUCHR_MASTER_KEY ??= randomBytes(32).toString('base64');
 
@@ -33,11 +36,11 @@ async function harness(t: TestContext, providers = [mcp]) {
   const vouchr = await createVouchr({ providers, baseUrl: 'https://app.test', db, onEvent: (e) => events.push(e) });
   let handler: any;
   vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
-  const run = async (text: string): Promise<string> => {
+  const run = async (text: string, client: unknown = MEMBER_CLIENT): Promise<string> => {
     const out: string[] = [];
     await handler({
       command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
-      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client,
     });
     return out[0] ?? '';
   };
@@ -56,7 +59,7 @@ async function failureHarness(providers = [mcp]) {
     close: async () => undefined,
   } as Db;
   const vouchr = await createVouchr({
-    providers, baseUrl: 'https://app.test', db, isAdmin: async () => true,
+    providers, baseUrl: 'https://app.test', db,
   });
   let handler: any;
   vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
@@ -147,7 +150,7 @@ test('read dependency failures ack first, respond once, and never disclose the r
         command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text: c.text },
         ack: async () => { order.push('ack'); },
         respond: async (response: unknown) => { order.push('respond'); responses.push(response); },
-        client: {},
+        client: MEMBER_CLIENT,
       });
 
       assert.equal(order[0], 'ack');
@@ -332,12 +335,13 @@ test('SEC-4: disconnect of an unknown provider writes no audit revoke row', asyn
 // A non-admin denial must not make a syntactically-valid but unrecognized argument durable. The
 // submitted value can be a credential pasted into the provider slot; unlike `meta`, the audit
 // provider column has no redaction layer. A fixed trusted denial subject is safe, the input is not.
-test('SEC-4: disconnect-shared non-admin denial never audits an unrecognized submitted marker', async (t) => {
+test('SEC-4: disconnect-shared non-member denial never audits an unrecognized submitted marker', async (t) => {
   const { run, db } = await harness(t);
   const marker = 'ghp_sensitive_disconnect_marker'; // valid provider-id syntax; not registered/stored
 
-  const msg = await run(`disconnect-shared ${marker}`);
-  assert.match(msg, /admin/i);
+  const nonMember = { conversations: { members: async () => ({ members: ['U_SOMEONE_ELSE'] }) } };
+  const msg = await run(`disconnect-shared ${marker}`, nonMember);
+  assert.match(msg, /Only a current member of this channel/);
   assert.ok(!msg.includes(marker));
 
   const rows = await db.all(`SELECT * FROM audit`);
@@ -567,14 +571,14 @@ test('disconnect preserves upstream-revoke guidance when the audit write also fa
 // current registry entry) and clean it up, instead of rejecting the id as unknown before the core runs.
 test('disconnect-shared cleans up a RETIRED (unregistered) provider’s lingering shared credential (#4)', async (t) => {
   const db = await openTestDb(t);
-  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db });
   let handler: any;
   vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
   const run = async (text: string): Promise<string> => {
     const out: string[] = [];
     await handler({
       command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
-      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: MEMBER_CLIENT,
     });
     return out[0] ?? '';
   };
@@ -603,14 +607,14 @@ test('disconnect-shared cleans up a RETIRED (unregistered) provider’s lingerin
 
 test('disconnect-shared reports a committed removal when only its post-commit revoke audit fails', async (t) => {
   const db = await openTestDb(t);
-  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db, isAdmin: async () => true });
+  const vouchr = await createVouchr({ providers: [mcp], baseUrl: 'https://app.test', db });
   let handler: any;
   vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
   const run = async (text: string): Promise<string> => {
     const out: string[] = [];
     await handler({
       command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
-      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: {},
+      ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client: MEMBER_CLIENT,
     });
     return out[0] ?? '';
   };
@@ -659,7 +663,6 @@ test('disconnect-shared truthfully warns Slack when upstream revocation fails af
     providers: [revocable],
     baseUrl: 'https://app.test',
     db,
-    isAdmin: async () => true,
   });
   let handler: any;
   vouchr.registerCommands({
@@ -687,7 +690,7 @@ test('disconnect-shared truthfully warns Slack when upstream revocation fails af
     respond: async (message: unknown) => {
       out.push(typeof message === 'string' ? message : JSON.stringify(message));
     },
-    client: {},
+    client: MEMBER_CLIENT,
   });
 
   const message = out[0] ?? '';

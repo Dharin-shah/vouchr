@@ -61,7 +61,7 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
 }
 const userToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims(over), SECRET);
 const adminToken = (over: Partial<IdentityClaims> = {}) =>
-  signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
+  signIdentity(claims({ channelEligible: true, ...over }), SECRET);
 
 async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof createBroker>[0]> = {}) {
   const db = await openTestDb(t);
@@ -259,9 +259,9 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
       try { return await request(port, 'POST', '/v1/disconnect', { handle: { provider: 'acme', credentialId }, identityToken: userToken() }); } finally { server.close(); }
   } },
   { name: 'admin.offboard.ok', run: async (t) => {
-      // Admin offboards U1 (who has acme) → revoked:[string].
+      // A deprovision hook whose assertion signs the target offboards U1 (who has acme) → revoked:[string].
       const { server, port } = await makeBroker(t);
-      try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: adminToken({ userId: 'ADMIN' }), targetUserId: 'U1' }); } finally { server.close(); }
+      try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: adminToken({ userId: 'ADMIN', offboardTargetUserId: 'U1' }), targetUserId: 'U1' }); } finally { server.close(); }
   } },
 
   // ── error shapes (every 4xx/5xx body is `{ error: string }`; the STATUS is the contract) ──
@@ -323,15 +323,10 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
         server.close();
       }
   } },
-  { name: 'error.admin.mode.forbidden.403', run: async (t) => {
-      const { server, port } = await makeBroker(t);
-      // Non-admin token; a forged body `isAdmin` must be ignored (authority = signed claim only).
-      try { return await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: userToken(), isAdmin: true } as any); } finally { server.close(); }
-  } },
   { name: 'error.admin.offboard.forbidden.403', run: async (t) => {
       const { server, port } = await makeBroker(t);
-      // Non-admin token; forged body isAdmin ignored (authority = signed claim only).
-      try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: userToken(), targetUserId: 'U2', isAdmin: true } as any); } finally { server.close(); }
+      // No signed offboardTargetUserId (#322): the body cannot nominate the subject.
+      try { return await request(port, 'POST', '/v1/admin/offboard', { identityToken: userToken(), targetUserId: 'U2' }); } finally { server.close(); }
   } },
   { name: 'error.notFound.404', run: async (t) => {
       const { server, port } = await makeBroker(t);

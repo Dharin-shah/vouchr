@@ -464,7 +464,7 @@ function provisioningWhere(f: RevokeFilter): { where: string; params: unknown[] 
   return { where: where.join(' AND '), params };
 }
 
-/** Channel setup authority belongs to its channel target, not to the admin actor who opened it.
+/** Channel setup authority belongs to its channel target, not to the member who opened it.
  * Therefore a user-scoped break-glass run excludes these rows; channel/team/global scopes include
  * the exact channel requests they can turn into. */
 function channelProvisioningWhere(f: RevokeFilter): { where: string; params: unknown[] } {

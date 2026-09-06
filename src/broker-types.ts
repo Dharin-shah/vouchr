@@ -84,7 +84,7 @@ export interface BrokerAdminOkResponse {
 }
 
 /** `GET /v1/admin/config` — the caller's channel's per-provider mode + tool-enabled state (read side
- *  of the admin config write routes). Policy bits only, NO secret. `mode` is null when unconfigured
+ *  of the `/v1/admin/*` config write routes). Policy bits only, NO secret. `mode` is null when unconfigured
  *  and always null for a service tool, which has no Vouchr-owned credential. */
 export interface BrokerAdminConfigResponse {
   providers: { provider: string; mode: ChannelMode | null; enabled: boolean }[];
@@ -102,7 +102,7 @@ export interface BrokerAuthorizationResponse {
 }
 
 /** `POST /v1/audit` · `POST /v1/admin/audit` — a read-only slice of the audit trail: the caller's own
- *  usage, or (admin) the current channel's. Non-secret columns ONLY — `meta` is never included (the
+ *  usage, or (`/v1/admin/audit`) the current channel's. Non-secret columns ONLY — `meta` is never included (the
  *  core read query omits it). Headless analogue of `/vouchr audit` / `/vouchr audit channel`. */
 export interface BrokerAuditResponse {
   events: AuditRow[];

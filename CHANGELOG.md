@@ -32,8 +32,47 @@ All notable changes to this project are documented here. This project adheres to
   `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
   guides/DEPLOYMENT.md § "Browser Slack-identity verification".
 
+### Removed
+
+- **The workspace-admin role is gone (#322): the channel is the team and the trust boundary.**
+  Breaking for the beta. Every place that used to ask "is this user a Slack workspace admin/owner?"
+  now asks "is this user a current member of this channel?", read from `conversations.members`
+  and fail-closed. Removed, with no replacement knob:
+  - `createVouchr({ isAdmin })` and `createVouchr({ allowChannelCreatorConfig })`, and the
+    `adminCheck`/`allowChannelCreatorConfig` `ConnectContextDeps`; the module-level
+    `isSlackAdmin`/`isChannelAdmin`/`listChannelMembers` Slack helpers (never in `src/index.ts`).
+  - `approver: 'admin'` on the provider `approval` knob. A config that still says `admin` fails
+    validation with a message naming `member`.
+  - The workspace-admin fan-out delivery of approval prompts (ephemeral per eligible admin) and its
+    module-level helpers `settledWithLimit` and `PromptFanoutDeadlineError` (never in `src/index.ts`).
+  - The `isAdmin` broker identity claim (`IdentityClaims`/`MintIdentityInput`/`mintIdentity`). The
+    `/v1/admin/mode`, `/v1/admin/tools`, `/v1/admin/reference`, `GET /v1/admin/config`, and
+    `POST /v1/admin/audit` routes keep their paths but act on the signed `channel` claim alone; a
+    token without `isAdmin` that used to get `403 admin authority required` now succeeds for its
+    own channel (wire golden `error.admin.mode.forbidden.403` deleted).
+  - The "direct the last configuring admin by DM" branch of shared-owner recovery
+    (`NotificationKind` no longer has `'not_configured'`): the asking member is told to run
+    `/vouchr connect-shared` in place.
+  - The `Only a workspace admin … can …` refusal copy, and the `not-admin` audit denial reason
+    (now `not-member`, the same reason shared-credential membership refusals already used).
+  Rationale and the honest tradeoff (in a public channel every member can configure and approve, so
+  govern agents from channels whose membership you control) are in guides/THREAT-MODEL.md.
+
 ### Added
 
+- **`approver: 'member'` (#322): any other member of the owning channel approves an agent's
+  sensitive action.** The prompt is posted as one regular message in the channel (in the originating
+  thread when there is one) through the existing cross-replica delivery lease, so two replicas post
+  once and a durable channel message is never re-posted. The click is accepted only when the signed
+  payload channel equals the persisted request's channel, the clicker is not the requester, the
+  clicker is a current member of that channel, and the same server-side revalidation as every
+  decision runs (pending, generation current, requester and approver not offboarded, team match);
+  concurrent clicks on two replicas yield exactly one decision. A `per-user` credential with
+  `member` still spends the requester's credential. In a DM or group DM, where no channel governs
+  the action, `member` degrades to `self` (`effectiveApprover`, exported). Applies identically to
+  in-process `connect().fetch`, `POST /v1/fetch`, `POST /v1/mcp`, and `POST /v1/authorization`.
+  New exports: `APPROVERS`, `Approver`, `effectiveApprover`. Regression: `test/approval.test.ts`,
+  `test/authorization.test.ts`, `test/bridge.test.ts`; README § "Human approval from any agent".
 - `vouchr --version` (also `-v`) prints the installed package version; it was an unknown command.
 - **Backchannel (CIBA-style) authorization for background agents (#296).** `POST /v1/authorization`
   lets a cron/CI/durable-workflow agent with no live Slack turn *initiate* the human decision for one
@@ -80,6 +119,27 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- `/vouchr tools` ends with `Any member: \`/vouchr enable|disable <provider>\`.` where it printed
+  `Admins: …`, and the config modal's governance header reads `Channel settings` (was `Channel
+  settings (admin)`) (#322). Bare `/vouchr` now consumes the trigger with a `Loading…` view and
+  hydrates it with the settings modal through `views.update`, so a large channel roster no longer
+  expires the `trigger_id` (PLAT-2).
+- `POST /v1/admin/tools` requires the signed `channelEligible: true` channel-class claim, like
+  `/v1/admin/reference` and `/v1/admin/mode` to `shared` (skipped only with
+  `requireChannelEligibility: false`); a token without it is refused 403 and audited `denied` /
+  `channel-ineligible`. Bolt already refused `/vouchr enable|disable` in an externally shared
+  channel; the two doors now agree.
+- Channel configuration (`/vouchr enable|disable|mode|connect-shared|disconnect-shared|stats|audit
+  channel`, the config modal, App Home governance) is available to any current member of the
+  channel (#322). The Slack app now needs `channels:read` (and `groups:read` plus membership of the
+  channel for private channels) to read the roster; a roster read that fails or exceeds its bound
+  refuses with `Only a current member of this channel can …`. App Home shows the channel picker to
+  everyone; controls render only for a channel the viewer is a member of.
+- `POST /v1/admin/offboard` requires the signed `offboardTargetUserId` to equal the body
+  `targetUserId` on every path, not only Enterprise Grid; an assertion without it is refused 403.
+- `mapSafeError` copy no longer names an admin: `policy_denied` says "Contact the Vouchr operator",
+  `tool_disabled` and the shared-owner `not_connected` say a channel member can run
+  `/vouchr enable` / `/vouchr connect-shared`. Machine codes and `recovery` values are unchanged.
 - README is a short overview (what, the problem, one example, modes, providers, headless, links);
   the Beta callout is gone and the status badge is the status signal. `vision.md` and
   `SECURITY.md` no longer list an independent security assessment as a release gate (operator

@@ -10,7 +10,7 @@
  *
  * !! The `main` block at the bottom runs BOTH roles in one process. That is LOCAL DEVELOPMENT ONLY.
  * The identity signing key is the broker's trust root: anything holding it can mint
- * `{ userId: <any human>, isAdmin: true }` and use every credential the deployment serves. Minting
+ * `{ userId: <any human>, channel: <any channel> }` and use every credential the deployment serves. Minting
  * inside the agent runtime therefore collapses the trust boundary — one prompt injection that can
  * read the process environment owns the workspace. In production, keep the key in the minter and
  * pass only `identityToken` over the wire. See guides/THREAT-MODEL.md, "Headless broker: leaked

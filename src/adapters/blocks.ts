@@ -1,13 +1,13 @@
 import type { AuditRow, StatsRow } from '../core/audit';
 import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
-import { isBrokeredProvider } from '../core/providers';
+import { isBrokeredProvider, type Approver } from '../core/providers';
 import { SECRET_REFERENCE_SOURCES, type SecretReferenceSource } from '../core/reference';
 import type { VouchrRecovery } from '../core/errors';
 import type { AttributedOAuthCallbackOutcome } from '../core/oauthCallback';
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
- *  unvalidated `/vouchr connect-shared <arg>` denial writes `arg` there), so an admin's `audit channel`
+ *  unvalidated `/vouchr connect-shared <arg>` denial writes `arg` there), so a member's `audit channel`
  *  view must not turn a stored string into a forged `<…|link>` or `<@user>` mention. */
 export const escapeMrkdwn = (s: string): string => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
@@ -278,7 +278,7 @@ function secretFields(referenceSources: readonly SecretReferenceSource[]): unkno
 /**
  * Private secret-entry modal (leak-safe UX). The value typed here lives only in this view,
  * never posted, logged, or put in audit meta. `meta` rides in private_metadata so the submit
- * binds to the right owner (a channel for admin config, or nothing for a per-user key).
+ * binds to the right owner (a channel for shared-credential config, or nothing for a per-user key).
  */
 function secretModal(o: {
   callbackId: string;
@@ -308,14 +308,14 @@ export function privateStatusModal(title: string, text: string): unknown {
   };
 }
 
-/** Admin modal: set the CHANNEL's shared credential (invariant 7, admin-gated upstream). */
+/** Channel-member modal: set the CHANNEL's shared credential (invariant 7, member-gated upstream). */
 export function configureModal(
   provider: string,
   channel: string,
   referenceSources: readonly SecretReferenceSource[] = SECRET_REFERENCE_SOURCES,
   requestId?: string,
   /** When the provider is DISABLED in this channel, warn that the credential is inert until enabled
-   *  (an admin may still pre-configure). Prevents a "configured but unusable" surprise. */
+   *  (a member may still pre-configure). Prevents a "configured but unusable" surprise. */
   disabled = false,
 ): unknown {
   const p = escapeMrkdwn(provider);
@@ -442,7 +442,7 @@ export function approvalBlocks(o: {
   queryParamCount: number | null;
   requester: string;
   id: string;
-  approver: 'self' | 'admin';
+  approver: Approver;
   /** #296: the agent's plain transaction statement for a backchannel request; absent (null) for an
    * in-process/fetch-minted approval. Host-supplied free text — rendered as `plain_text`, never
    * interpolated into mrkdwn (SEC-5 by construction). */
@@ -460,8 +460,8 @@ export function approvalBlocks(o: {
   const bound = n !== 0
     ? ' The exact query string is bound byte-for-byte (its parameters are not displayed); any change re-prompts.'
     : '';
-  const intro = o.approver === 'admin'
-    ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. An admin must approve it.`
+  const intro = o.approver === 'member'
+    ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. Another member of this channel must approve it.`
     : `The agent wants to run an action as you on ${p}.`;
   return [
     {
@@ -531,7 +531,7 @@ export type Connection = {
 /** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list. */
 export type ToolRow = { provider: string; enabled: boolean; mode?: string | null };
 
-/** One provider's admin control row: channel mode (null = unconfigured) + tool-enabled. */
+/** One provider's governance control row: channel mode (null = unconfigured) + tool-enabled. */
 export type ConfigAdminRow = {
   provider: string;
   mode: string | null;
@@ -548,14 +548,14 @@ const CONFIG_CONNECTION_ROWS_MAX = 10;
  *  - "Your connections" (EVERYONE): a bounded first set with Disconnect buttons, plus explicit
  *    `/vouchr status [page]` guidance when more rows exist.
  *  - "Tools in this channel" (EVERYONE): the read-only manifest (which providers are usable here).
- *  - "Channel settings" (ADMINS ONLY, `admin` present): per-provider mode select + Enabled checkbox,
- *    whose submit routes to the SAME mode/enable/disable mutations as the slash commands.
+ *  - "Channel settings" (CHANNEL MEMBERS ONLY, `admin` rows present): per-provider mode select +
+ *    Enabled checkbox, whose submit routes to the SAME mode/enable/disable mutations as the slash commands.
  *
- * The channel rides in `private_metadata` so the submit binds to the right channel. The admin controls'
- * mere presence is NOT the authorization — the submit handler re-checks admin server-side, so a forged
- * submission from a non-admin (who never saw these controls) is still rejected. A `submit` button is
- * only added when there ARE admin controls (otherwise there is nothing to submit; disconnect is an
- * immediate button action, not a form field).
+ * The channel rides in `private_metadata` so the submit binds to the right channel. The governance
+ * controls' mere presence is NOT the authorization — the submit handler re-checks membership
+ * server-side, so a forged submission from a non-member (who never saw these controls) is still
+ * rejected. A `submit` button is only added when there ARE governance controls (otherwise there is
+ * nothing to submit; disconnect is an immediate button action, not a form field).
  */
 export function configModal(o: {
   channel: string | null;
@@ -587,7 +587,7 @@ export function configModal(o: {
 
   if (o.admin && o.admin.length) {
     blocks.push({ type: 'divider' });
-    blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel settings (admin)', emoji: true } });
+    blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel settings', emoji: true } });
     for (const p of o.admin) {
       // Mode select — block_id `mode:<provider>` so the submit maps it back. Optional + initial set to
       // the current mode. The submit diffs against the OPEN-TIME value carried in private_metadata (not a
@@ -622,9 +622,9 @@ export function configModal(o: {
     }
   }
 
-  // Carry the channel AND the OPEN-TIME admin state (compact keys: p/m/e) so the submit can tell a
+  // Carry the channel AND the OPEN-TIME governance state (compact keys: p/m/e) so the submit can tell a
   // deliberately-changed control from an untouched one that merely re-submits its initial value — the
-  // basis for not reverting a concurrent admin's change and not writing spurious rows. Non-secret.
+  // basis for not reverting a concurrent member's change and not writing spurious rows. Non-secret.
   const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled }));
   if (blocks.length > 100) throw new Error('Vouchr configuration exceeds the Slack modal block limit.');
   const privateMetadata = JSON.stringify({ channel: o.channel, open });
@@ -853,7 +853,7 @@ const HOME_MAX_ROWS = 20;
  * Disconnect row/flow as the config modal — plus the providers available to connect. `governance`
  * (passed only for viewers the adapter authorized server-side) adds the per-channel console: a
  * channel picker + one control row per provider (mode select, Enable/Disable, Configure). Its mere
- * presence is UX, never the security boundary — every block action re-checks admin at the mutation
+ * presence is UX, never the security boundary — every block action re-checks membership at the mutation
  * (SEC-3). `note` replaces the control rows when the selected channel is ineligible/archived/deleted
  * or not this viewer's to configure. Omitting `governance` keeps the pre-#111 connections-only view.
  *
@@ -968,7 +968,7 @@ export function homeView(o: {
               action_id: HOME_TOOL_ACTION,
               // The TARGET state rides in the value (not a read-then-toggle), so a stale click can
               // never double-flip. Forgeable, like every interaction field — the handler re-validates
-              // the provider (SEC-4) and re-checks admin (SEC-3) before anything is written.
+              // the provider (SEC-4) and re-checks membership (SEC-3) before anything is written.
               value: `${t.enabled ? 'disable' : 'enable'}:${t.provider}`,
               ...(t.enabled ? {} : { style: 'primary' }),
             },

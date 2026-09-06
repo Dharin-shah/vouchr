@@ -36,10 +36,9 @@ export type CredentialHealthHook = (e: CredentialHealthEvent) => void;
 export const HEALTH_NOTIFY_DEBOUNCE_MS = 24 * 60 * 60 * 1000;
 
 /** The debounced notification families sharing {@link NotificationState}: the #117 credential-health
- * DMs, plus `'not_configured'` — the recovery bridge's admin direction for a shared channel whose
- * credential is missing (#194). One closed union so a new family is a deliberate addition here, not
- * an arbitrary string in the state table. */
-export type NotificationKind = CredentialHealthEvent['type'] | 'not_configured';
+ * DMs. One closed union so a new family is a deliberate addition here, not an arbitrary string in
+ * the state table. */
+export type NotificationKind = CredentialHealthEvent['type'];
 
 /**
  * Persistent per-(connection, type) notification debounce (#117). DB-backed on purpose: the 24h

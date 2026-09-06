@@ -6,7 +6,7 @@ an in-Slack button; Vouchr stores the token encrypted, keyed to the Slack identi
 to a channel, for shared service accounts), and injects it **only at the outbound HTTP
 boundary**, after an egress-allowlist check, so the token never reaches the agent code,
 the LLM, the chat transcript, logs, or the audit table. Credentials are owner-scoped
-(per-user by default, per-channel when an admin configures it) and isolated per Slack
+(per-user by default, per-channel when a channel member configures it) and isolated per Slack
 tenant.
 
 For the split-process version of this architecture—public Slack control plane plus a private
@@ -75,7 +75,7 @@ The security logic lives in `src/core/`, which is **transport-agnostic**: it imp
 nothing from `@slack/*` or `src/adapters/`. The Bolt adapter (`src/adapters/bolt.ts`)
 is a thin consumer: it resolves identity (a `SlackIdentity`: `{ enterpriseId, teamId, userId }`)
 and channel from verified Slack events, fetches
-Slack-side facts (admin status, channel class), and delegates every security decision to
+Slack-side facts (channel membership, channel class), and delegates every security decision to
 core.
 
 This boundary is enforced by `test/architecture.test.ts`, which scans every file in
@@ -290,7 +290,7 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    tombstones—not bounded-state purge success—are the load-bearing barrier against later user
    provisioning and retained use. Approval decisions and consumption compare trusted actor/request
    creation times with those tombstones. Channel/shared credentials are intentionally left for an
-   admin to review and remain usable by other current actors; the departed actor's older handles and
+   channel member to review and remain usable by other current actors; the departed actor's older handles and
    assertions are refused before secret access and provider send.
    Separately, confirmed `vouchr revoke --yes` commits one exact provider+scope marker before
    enumerating pending or live state. Matching older user and channel writers either finish before
@@ -318,7 +318,7 @@ or `session` therefore cannot race setup into leaving a dormant shared credentia
 every effective credential/mode/tool mutation advances a PostgreSQL-clock channel
 interaction tombstone in that transaction. A setup handler compares it with the original verified
 Slack receipt before hydrating or consuming the form, closing the window while `views.open` or
-admin checks are pending. Same-value governance retries do not advance the marker. Envelope/KMS
+membership checks are pending. Same-value governance retries do not advance the marker. Envelope/KMS
 wrapping is prepared before any credential, revocation, or actor-offboard lock is acquired. In
 `session` mode `connect()` adds an authorization gate before the credential is resolved: the
 provider is usable only inside the Slack thread the user approved it in (a grant keyed

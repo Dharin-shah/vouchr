@@ -47,6 +47,9 @@ function request(
       {
         host: '127.0.0.1', port, path, method,
         headers: { ...(data ? { 'content-type': 'application/json', 'content-length': data.length } : {}), ...headers },
+        // A fresh connection per call: a pooled keep-alive socket the server closes while a slow
+        // sweep runs between requests resets under load (same rule as broker-mcp.test.ts).
+        agent: false,
       },
       (res) => {
         const chunks: Buffer[] = [];
@@ -67,7 +70,7 @@ function request(
  * provider-egress stub owns): records every call the bounded notification client makes. `fail`
  * makes every call reject at the transport (an ambiguous outcome); `hold` parks each call until
  * it resolves (an in-flight post). */
-function fakeSlack(): {
+function fakeSlack(members: string[] = ['U1']): {
   fetch: typeof fetch;
   calls: { method: string; args: any }[];
   fail: Error | null;
@@ -86,7 +89,7 @@ function fakeSlack(): {
     if (state.fail) throw state.fail;
     const body = method === 'conversations.info'
       ? { ok: true, channel: { id: args.channel, is_channel: true, creator: 'U1' } }
-      : method === 'conversations.members' ? { ok: true, members: ['U1'] }
+      : method === 'conversations.members' ? { ok: true, members }
       : method === 'users.info' ? { ok: true, user: { is_admin: false } }
       : { ok: true };
     return new Response(JSON.stringify(body), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -113,7 +116,7 @@ function stubUpstream(t: TestContext): { url: string; init?: RequestInit }[] {
   return calls;
 }
 
-async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Provider } = {}) {
+async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Provider; members?: string[] } = {}) {
   const provider = o.provider ?? acme;
   const db = await openTestDb(t);
   const key = randomBytes(32);
@@ -132,7 +135,7 @@ async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Pr
   await new Promise<void>((r) => server.listen(0, r));
   t.after(() => new Promise<void>((r) => server.close(() => r())));
   const port = (server.address() as any).port;
-  const slack = fakeSlack();
+  const slack = fakeSlack(o.members);
   const vouchr = await createVouchr({
     providers: [provider], baseUrl: 'http://127.0.0.1:1', db,
     botToken: 'xoxb-test-bot-token',
@@ -148,7 +151,7 @@ async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Pr
     users: { info: async () => ({ user: { is_admin: false } }) },
     conversations: {
       info: async ({ channel }: any) => ({ channel: { id: channel, is_channel: true, creator: 'U1' } }),
-      members: async () => ({ members: ['U1'] }),
+      members: async () => ({ members: o.members ?? ['U1'] }),
     },
     chat: { postEphemeral: async () => ({}), postMessage: async () => ({}) },
   } as any;
@@ -232,6 +235,44 @@ test('#296 initiate → deliver on the control plane → approve → poll → th
   assert.equal(repeat.json.code, 'approval_required', 'single-use: the identical action re-prompts');
   assert.equal(upstream.length, 1);
   assert.equal((await h.audits('approval_consumed')).length, 1);
+});
+
+test('#322 member approver: the backchannel prompt is a channel message; the requester cannot approve it, a teammate can, once', async (t) => {
+  const upstream = stubUpstream(t);
+  const member = defineProvider({ ...acme, approval: { approver: 'member' } } as any);
+  const h = await harness(t, { provider: member, members: ['U1', 'U2'] });
+  const created = await h.authorize();
+  assert.equal(created.status, 200, JSON.stringify(created.json));
+  await h.vouchr.sweepExpired();
+  const posted = h.prompts();
+  assert.equal(posted.length, 1, 'exactly one prompt');
+  assert.equal(posted[0].method, 'chat.postMessage', 'a regular message the whole channel can act on');
+  assert.equal(posted[0].args.channel, 'C1');
+  assert.equal(posted[0].args.thread_ts, 'TH1', 'delivered into the stored conversation');
+  assert.equal(posted[0].args.user, undefined);
+  const rendered = JSON.stringify(posted[0].args.blocks);
+  assert.match(rendered, /Another member of this channel must approve it/);
+  assert.ok(rendered.includes('Create repository \\"demo\\" in org acme'), 'the binding message is on the prompt');
+  assert.ok(!rendered.includes(TOKEN), 'SEC-1');
+  await h.vouchr.sweepExpired();
+  assert.equal(h.prompts().length, 1, 'the durable channel message is not re-posted');
+
+  // The requester's own click is refused and audited; the row stays pending for a teammate.
+  const own = await h.click(APPROVAL_APPROVE_ACTION, created.json.authorizationId, 'U1');
+  assert.match(String(own[0]?.text), /not eligible/i);
+  assert.equal((await h.status(created.json.authorizationId)).json.status, 'pending');
+  assert.equal((await h.audits('denied')).filter((r) => r.meta.includes('not-approver')).length, 1);
+
+  // A teammate approves; the poller reads approved; the agent's spend runs exactly once.
+  await h.click(APPROVAL_APPROVE_ACTION, created.json.authorizationId, 'U2');
+  assert.equal((await h.status(created.json.authorizationId)).json.status, 'approved');
+  const done = await h.fetchAction();
+  assert.equal(done.status, 200, JSON.stringify(done.json));
+  assert.equal(upstream.length, 1, 'the approved action ran exactly once');
+  const consumed = await h.audits('approval_consumed');
+  assert.equal(consumed.length, 1);
+  assert.equal(consumed[0].actor, 'U2', 'the approver rides the actor column');
+  assert.equal(consumed[0].user_id, 'U1', 'the requester stays the acting user');
 });
 
 test('#296 deny persists the outcome for the poller, audits once, and a new request is a new decision', async (t) => {

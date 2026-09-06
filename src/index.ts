@@ -45,6 +45,7 @@ export {
   ApprovalRequiredError,
   MAX_BINDING_MESSAGE_BYTES,
   assertBindingMessage,
+  effectiveApprover,
 } from './core/approval';
 export type { AuthorizationStatus } from './core/approval';
 // Low-level building blocks so a headless consumer can direct-construct createBroker end-to-end
@@ -57,8 +58,8 @@ export { Vault, CredentialLockdownError } from './core/vault';
 export { Audit } from './core/audit';
 export { Consent } from './core/consent';
 export type { ConsentRequest } from './core/consent';
-export { github, google, gitlab, notion, databricks, defineProvider, ProviderRegistry } from './core/providers';
-export type { Provider, ProviderConfig, DatabricksConfig, RefreshStrategy, RevokeTarget } from './core/providers';
+export { APPROVERS, github, google, gitlab, notion, databricks, defineProvider, ProviderRegistry } from './core/providers';
+export type { Approver, Provider, ProviderConfig, DatabricksConfig, RefreshStrategy, RevokeTarget } from './core/providers';
 export { Policy } from './core/policy';
 export type { PolicyRule } from './core/policy';
 export {

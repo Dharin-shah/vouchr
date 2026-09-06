@@ -3,12 +3,10 @@ import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import {
-  APPROVAL_FANOUT_CONCURRENCY,
+  SLACK_NOTIFICATION_CLIENT_CONCURRENCY,
   ConnectContext,
   createVouchr,
   MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS,
-  PromptFanoutDeadlineError,
-  settledWithLimit,
 } from '../src/adapters/bolt';
 import { Audit } from '../src/core/audit';
 import {
@@ -1095,26 +1093,6 @@ test('supersession fails the equal-millisecond consent closed too (matches the >
   assert.equal((await consent.consume(pending.state)).status, 'superseded', 'the equal-time consent must be superseded');
 });
 
-test('the approval fan-out stops starting its tail after the monotonic start deadline', async () => {
-  const N = 60;
-  const items = Array.from({ length: N }, (_, i) => i);
-  let started = 0;
-  const start = Date.now();
-  const results = await settledWithLimit(items, 4, async () => {
-    started++;
-    await new Promise((r) => setTimeout(r, 100));
-  }, 150);
-  const elapsed = Date.now() - start;
-  // Sequential/uncapped would be (N/4) × 100ms = 1500ms; the deadline caps it near 150ms + one wave.
-  assert.ok(elapsed < 500, `fan-out ignored its deadline: ${elapsed}ms for ${N} items`);
-  assert.ok(started < N, 'the deadline must stop starting the tail');
-  assert.equal(results.length, N, 'every item still has a recorded outcome');
-  assert.ok(
-    results.some((r) => r.status === 'skipped' && r.reason instanceof PromptFanoutDeadlineError),
-    'items that never started are distinct from rejected delivery attempts',
-  );
-});
-
 test('re-authorization over a live credential replaces it; a delayed stale callback still loses', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
@@ -1260,8 +1238,8 @@ test('a leased prompt post is bounded AND preserves the operator Slack transport
     assert.equal(posted[0].apiUrl, 'https://slack-proxy.internal/api/', 'the operator transport must survive the bound');
     assert.equal(
       posted[0].concurrency,
-      APPROVAL_FANOUT_CONCURRENCY,
-      'the SDK queue cannot serialize one bounded fan-out wave beyond its lease',
+      SLACK_NOTIFICATION_CLIENT_CONCURRENCY,
+      'the SDK queue cannot serialize bounded notification posts beyond their lease',
     );
   } finally {
     prototype.apiCall = realApiCall;

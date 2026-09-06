@@ -274,7 +274,7 @@ const vouchr = await createVouchr({
 });
 ```
 
-An admin then runs `/vouchr connect-shared github` and pastes an ARN into the private modal. Full setup,
+A member of the channel then runs `/vouchr connect-shared github` and pastes an ARN into the private modal. Full setup,
 auth (ambient IAM role, no static creds), and the least-privilege policy
 (`secretsmanager:GetSecretValue` scoped to the specific ARNs, `kms:Decrypt` if the secret uses a CMK)
 are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manager/README.md).
@@ -495,11 +495,12 @@ for the full call.
 The packaged broker always constructs `ChannelTools` from its existing PostgreSQL handle; there is
 no additional environment switch or process-local cache. Bolt/App Home and `POST /v1/admin/tools`
 therefore write the same rows that `GET /v1/admin/config`, `POST /v1/manifest`, `/v1/fetch`, and
-`/v1/mcp` read and enforce. Team, channel, and admin authority come only from the signed identity
-assertion; same-named request-body fields have no authority.
+`/v1/mcp` read and enforce. Team and channel authority come only from the signed identity
+assertion (#322: the channel is the trust boundary, so any member of the signed channel may
+configure it); same-named request-body fields have no authority.
 
-A channel with no `channel_tool` rows enables no provider (deny-by-default); an admin opts each one in
-per channel before its first use. The first admin mutation atomically materializes the full provider
+A channel with no `channel_tool` rows enables no provider (deny-by-default); a member opts each one in
+per channel before its first use. The first mutation atomically materializes the full provider
 list before applying the requested changes, so toggling one provider cannot silently change its
 bystanders, including under concurrent first writes. The materialization, final changes, and canonical config audit rows commit
 as one transaction. A disabled brokered provider is refused before credential resolution or upstream
@@ -538,9 +539,9 @@ const token = mintIdentity(
 channels are **not** reachable this way — those are user-owned modes, so the caller uses
 `owner: "user"`.
 
-#### Admin channel-credential config (`POST /v1/admin/reference`, #53)
+#### Channel-credential config (`POST /v1/admin/reference`, #53)
 
-The headless contract lets an admin point a channel's **shared** credential at an external secret
+The headless contract lets a channel member point a channel's **shared** credential at an external secret
 manager when channel modes are enabled (`VOUCHR_CHANNEL_MODES=1`). The route shape is:
 
 ```
@@ -560,10 +561,12 @@ POST /v1/admin/reference
 - Raw values, malformed/unknown references, mismatched sources, invalid scopes, and missing resolvers
   are rejected before any credential, channel mode, or audit row is written. Errors use fixed copy
   and never echo the rejected value.
-- Admin authority comes from the **signed `isAdmin` claim** (your minter sets it after its own
-  workspace-admin check — the broker can't verify Slack admin itself); fail closed.
+- Authority is the **signed `channel` claim**: any member of that channel may configure it (#322),
+  and the minter asserts only the channel the verified Slack event came from.
 - Channel eligibility is enforced on the signed `channelEligible` claim (shared creds refused on
-  ineligible / externally-shared channels).
+  ineligible / externally-shared channels). `POST /v1/admin/mode` (to `shared`) and
+  `POST /v1/admin/tools` require the same `channelEligible: true` claim, as Bolt checks the channel
+  class on the same mutations; a token without it is refused 403 and audited `channel-ineligible`.
 - It stores only the validated non-secret reference (`vault.reference`) and flips the channel to
   `shared`. A headless host wanting static keys should point at a secret manager rather than send the
   value over this route. The route returns `{ ok: true }`.
@@ -733,7 +736,9 @@ on top of the write gating above, and locks the reachable endpoint + response me
 ```
 
 To require **human-in-the-loop approval** for a provider's writes (#113), declare the `approval`
-knob — `approver` is required (`"self"` or `"admin"`); `methods` defaults to every non-GET/HEAD
+knob — `approver` is required: `"self"` (the acting user confirms) or `"member"` (any other current
+member of the owning channel confirms; in a DM it behaves like `"self"`). `"admin"` was removed in
+#322 and fails validation. `methods` defaults to every non-GET/HEAD
 method, `paths` to all (same matcher as `egressPaths`), `ttlMs` to 5 minutes. Invalid shapes are
 rejected fail-closed at config load. A matching request with no live grant gets
 `403 { "error": "approval_required", "approvalId": "…", "code": "approval_required",
@@ -747,7 +752,7 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
     "credential": "key",
     "egressAllow": ["api.internal.example"],
     "egressMethods": ["GET", "POST"],
-    "approval": { "approver": "admin", "methods": ["POST"], "ttlMs": 300000 }
+    "approval": { "approver": "member", "methods": ["POST"], "ttlMs": 300000 }
   }
 ]
 ```
@@ -816,11 +821,11 @@ distinguish an intentional lockdown from a mistaken rollout.
 
 Static `Policy` does not replace `ChannelTools`. Policy is operator-owned deployment configuration;
 `ChannelTools` is the PostgreSQL-backed, runtime-mutable allowlist changed through Slack or
-`POST /v1/admin/tools` (deny-by-default: with no rows no provider is enabled until an admin opts it
-in). The broker
+`POST /v1/admin/tools` (deny-by-default: with no rows no provider is enabled until a channel member
+opts it in). The broker
 applies their intersection: the static policy **and** the mutable channel setting must both allow a
-provider. Use policy for reviewed deployment boundaries and `ChannelTools` for day-to-day admin
-enablement; neither can override a denial by the other.
+provider. Use policy for reviewed deployment boundaries and `ChannelTools` for day-to-day
+enablement by the channel's members; neither can override a denial by the other.
 
 ### Provisioning (how credentials get in)
 
@@ -844,7 +849,7 @@ enablement; neither can override a denial by the other.
 - **Per-user *referenced* credentials** (a user's own key for a non-OAuth provider): the user points
   their credential at an external secret-manager reference with `POST /v1/user/reference` (#58) —
   body `{ handle: { provider }, identityToken, secretRef, scopes? }`. It has the same supported-form,
-  derived-source, optional legacy-source match, and configured-resolver checks as the admin route.
+  derived-source, optional legacy-source match, and configured-resolver checks as the `/v1/admin/reference` route.
   Self-service authority comes from the signed identity token; **reference only** — no raw secret
   crosses the broker, and configured `resolvers` resolve JIT at egress. Raw-key ingest stays out of
   the broker by design.
@@ -871,13 +876,12 @@ The headless broker can **revoke** credentials, not just inject them — the two
   user-owned connections plus pending consent, thread grants, requester-bound approvals, and Slack
   credential-setup requests (wire it to your directory/deprovision hook). Shared channel credentials
   remain for other current users, but the target's old `/v1/fetch` and `/v1/mcp` assertions are
-  rejected before secret access and again at provider send. Admin authority comes from the **signed
-  `isAdmin` claim** — the broker can't verify workspace admin itself,
-  so your minter sets it after its own check; fail closed. A signed `enterpriseId` routes the
+  rejected before secret access and again at provider send. Authority is the **signed
+  `offboardTargetUserId` claim** (#322): your deprovision hook's minter sets it to the exact
+  `targetUserId` it authenticated, and an assertion without it (or naming a different user) is
+  refused with 403 before any mutation. A signed `enterpriseId` routes the
   cross-workspace (Grid/SCIM) case to `offboardUserEverywhere`, which writes an enterprise scope
-  tombstone before discovering artifacts and therefore also fences workspaces with no existing row.
-  For that Grid path, the minter must also set signed `offboardTargetUserId` to the exact
-  `targetUserId`; an admin assertion cannot nominate a different global user through the body. The
+  tombstone before discovering artifacts and therefore also fences workspaces with no existing row. The
   route deliberately remains HTTP 200 after committed local progress, so callers must inspect its
   body. On a single-team request, failed/skipped upstream revocation or a failed authoritative audit
   returns `{ ok: false, revoked }` while retaining every locally removed provider in `revoked`. On
@@ -1085,7 +1089,7 @@ recommend:
   > `EncryptionAlgorithm`, which Vouchr does not send.
 - **Static channel policy** (`VOUCHR_POLICY_FILE`) for sensitive providers — keep the reviewed JSON
   beside the deployment manifest and use `defaultDeny: true` when every provider must be explicitly
-  scoped. Runtime `ChannelTools` remains a second, independently enforced admin control.
+  scoped. Runtime `ChannelTools` remains a second, independently enforced member-controlled switch.
 
 The runtime will boot without KMS, but the adopted production vision requires it. Enabling KMS in the
 reference manifest means uncommenting `VOUCHR_KMS_KEY_ID`, adding `@aws-sdk/client-kms` to the
@@ -1176,13 +1180,16 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
 - **Interactivity:** enabled, and **required** for the Connect button and the key/connect-shared modals.
 - **Slash command:** bare `/vouchr` opens the settings modal (with a truthful status fallback if
   Slack cannot open it); `/vouchr help` is the canonical current command list. It includes personal
-  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and admin
+  `status`, `disconnect <provider>`, and `audit`; channel `tools`; and the channel-member commands
   `connect-shared`/`disconnect-shared <provider>`, `mode <provider> <shared|per-user|session>`,
   `enable`/`disable <provider>`, `stats`, and `audit channel`.
-- **Who may configure:** by default the `connect-shared`/`disconnect-shared`/`mode`/`enable`/`disable` commands are
-  **workspace-admin-only**. Set `allowChannelCreatorConfig: true` to also let a channel's **creator**
-  self-serve their own channel's config (off by default — in Slack anyone can create a public channel,
-  so `creator` isn't a privileged role). A custom `isAdmin` still fully overrides either default.
+- **Who may configure:** any **current member of the channel** (#322). The
+  `connect-shared`/`disconnect-shared`/`mode`/`enable`/`disable`/`stats`/`audit channel` commands,
+  the config modal, and App Home governance read `conversations.members` (needs `channels:read`, and
+  `groups:read` plus the app being in the channel for private channels) and fail closed. There is
+  no workspace-admin role, creator rule, or custom predicate. The roster scan is bounded
+  (`MAX_APPROVAL_AUDIENCE_MEMBERS`, 5000 members, within a 3 s deadline): a member beyond the scanned
+  prefix is refused with the same "make sure Vouchr is in the channel" copy as a non-member.
 
 Wire the four hooks (see the README example):
 

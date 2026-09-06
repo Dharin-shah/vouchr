@@ -60,7 +60,7 @@ flowchart TB
     core <-->|encrypted blobs| db
     core <-->|wrap/unwrap DEK,\nresolve secretRef JIT| kms
     core -->|token injected at\nHTTP boundary, egress-checked| provapi
-    adapter <-->|admin check, channel class,\nconfirm DM| slackapi
+    adapter <-->|membership check, channel class,\nconfirm DM| slackapi
 ```
 
 Boundaries, and what crosses each:
@@ -75,8 +75,8 @@ Boundaries, and what crosses each:
   any tool runtime) receives a `ConnectionHandle`, never the secret
   (`src/core/injector.ts`). The handle exposes `fetch()` and `account()` only.
 - **Identity minter ↔ headless broker (`/v1/*`).** The second front door. The broker has no Slack
-  client, so *who is acting*, *whether they are a workspace admin*, and *whether the channel is
-  eligible for a shared credential* arrive only as claims signed by the minter — the trusted
+  client, so *who is acting*, *in which channel*, and *whether the channel is eligible for a shared
+  credential* arrive only as claims signed by the minter — the trusted
   Slack-facing service that already verified the Slack event signature and holds `identitySecret`.
   That service is a trust anchor of the same rank as the master key; the worker on the other side of
   the boundary receives only minted assertions. The optional `brokerToken`/`authorize` perimeter
@@ -130,8 +130,10 @@ A Slack user tries to use someone else's credential or read another tenant's dat
   (`userOwner(identity)`), which comes from the Slack event, not from any argument.
   A user can only `connect()` to their own connection. Tenant isolation is enforced
   by the full owner key on every query (invariant: full-key tenant isolation).
-- A user cannot self-grant a channel credential: channel config is admin-gated
-  (`requireAdmin`).
+- A user cannot self-grant a channel credential from outside the team: channel config is gated on
+  current membership of that channel (`requireMember`), read from Slack and fail-closed. The
+  tradeoff is deliberate (#322): in a public channel every member can configure and approve, so
+  teams should govern agents from channels whose membership they control.
 
 ### Compromised channel
 
@@ -180,9 +182,9 @@ The agent runtime holds `identitySecret` — it mints its own assertions in-proc
 mounted into a worker's environment — and is prompt-injected or otherwise hostile.
 
 - **Not mitigated. This is total compromise of the headless door, by design of the boundary.** The
-  broker cannot verify anything about the acting human itself (no Slack client), so identity, admin
-  authority, and channel eligibility have no second source: whoever can sign, decides. The attacker
-  mints `{ teamId, userId: <any human>, isAdmin: true, ownerKind: 'channel', channelEligible: true }`
+  broker cannot verify anything about the acting human itself (no Slack client), so identity, the
+  acting channel, and channel eligibility have no second source: whoever can sign, decides. The
+  attacker mints `{ teamId, userId: <any human>, channel: <any>, ownerKind: 'channel', channelEligible: true }`
   and every gate downstream honours it. Impact: use of **every credential the deployment serves** via
   `/v1/fetch` and `/v1/mcp` — the token bytes still never leave the broker, but the attacker receives
   the provider's response to any allowlisted call made with that credential, which for most providers
@@ -220,9 +222,11 @@ enforce all of the following:
   key whose `kid` must be the canonical fingerprint of its secret.
 - **Owner ids are never read from the request body.** The vault owner key is built from verified
   claims only (`broker.ts:ownerFromClaims`); a forged `handle` cannot cross tenants.
-- **Admin fails closed and is audited.** `claims.isAdmin !== true` refuses the admin routes and
-  records a `denied` row; the Enterprise/Grid offboard path additionally requires the subject in the
-  signed `offboardTargetUserId`, so admin status alone cannot nominate a foreign user from the body.
+- **The channel routes are scoped by the signed channel, and offboarding binds its subject.** The
+  `/v1/admin/*` configuration routes act only on the channel the assertion names (#322: any member
+  of that channel may configure it, so the minter's channel claim is the whole gate). The offboard
+  route requires the subject in the signed `offboardTargetUserId`, so a body cannot nominate a
+  foreign user.
 - **Offboarding fences a retained assertion** — see "Deactivated user" above: a pre-tombstone
   assertion gets `409 interaction_state_changed`, and its replay gets `401`.
 
@@ -483,7 +487,7 @@ agent keep acting as them.
   best-effort; approval decision and consumption also fence their trusted actor/request creation
   times, so cleanup failure cannot revive old authority. Grid/SCIM offboarding commits an
   enterprise/unscoped/global scope tombstone **before** artifact discovery, so even an empty
-  workspace is fenced. On the packaged broker route the admin assertion must sign the exact
+  workspace is fenced. On the packaged broker route the signed offboard assertion must name the exact
   `offboardTargetUserId`; a direct SCIM integration instead binds the target from its authenticated
   directory event. The tombstone itself is durable scope state, not a signed object. Purge success is
   not the security boundary; the durable tombstone is
@@ -502,8 +506,8 @@ agent keep acting as them.
 
 ### Stale shared-channel setup
 
-An admin begins shared-credential setup, but another credential, mode, or tool mutation commits
-while Slack opens the loading view or Vouchr checks channel/admin state. The older handler must not
+A channel member begins shared-credential setup, but another credential, mode, or tool mutation commits
+while Slack opens the loading view or Vouchr checks channel class and membership. The older handler must not
 later overwrite the newer state.
 
 - **Mitigated.** Every effective channel/provider credential or governance mutation advances a
@@ -567,18 +571,18 @@ These mirror what the code (and the test suite) enforce:
    owner key `(team_id, owner_kind, owner_id, provider)`, with a matching UNIQUE
    constraint (`vault.ts`, `db.ts`). `teamId` is always the authenticated user's,
    never derived from the channel id (`owner.ts:channelOwner`).
-9. **Channel-credential config is admin-gated, default-closed.** `isSlackAdmin`
-   fails closed on any API error; non-admin attempts are audited as `denied`
-   (`adapters/slack-identity.ts`, `bolt.ts:requireAdmin`). On the headless door the same gate is the
-   signed `isAdmin` claim, refused and audited when absent (`broker.ts:requireAdmin`,
-   `handleOffboard`).
+9. **Channel-credential config is member-gated, default-closed.** `isChannelMember`
+   fails closed on any API error or incomplete read; non-member attempts are audited as `denied`
+   (`adapters/slack-identity.ts`, `bolt.ts:requireMember`). On the headless door the signed channel
+   claim is that gate, and offboarding requires the signed `offboardTargetUserId`
+   (`broker.ts:handleOffboard`).
 10. **Headless identity assertions are deployment-bound, ≤5-minute, and single-use cluster-wide.**
     Issuer, audience, `kid`, and `iat` are verified against the deployment's own
     `IdentityConfig`; the lifetime ceiling is enforced at verify, not trusted from the minter; each
     `jti` is spent once in the shared `broker_jti` table and the store is not swappable. The signing
     key has a 32-byte floor and must be byte-distinct from every other configured secret
     (`http/identity.ts`, `http/replayStore.ts`, `http/broker.ts:createBroker`). Whoever holds that key
-    can assert any identity, including `isAdmin` — see the headless attacker entry above.
+    can assert any identity in any channel — see the headless attacker entry above.
 
 ## Non-goals (cross-reference)
 
@@ -620,5 +624,5 @@ failure/refresh rows — swallows its own error (`.catch(() => undefined)` in
   ([DEPLOYMENT.md](./DEPLOYMENT.md#production-readiness-checklist)).
 
 Operator responsibilities (master key handling, least-privilege resolver IAM, at-rest
-encryption, understanding the workspace-wide admin gate) are likewise enumerated in
+encryption, understanding the channel-membership gate) are likewise enumerated in
 SECURITY.md.

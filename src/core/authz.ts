@@ -111,11 +111,11 @@ export async function snapshotChannelModes(
 }
 
 /**
- * A DM or group-DM is a PERSONAL conversation that per-channel admin governance (the mutable tool
- * allowlist + credential mode) does not reach: there are no channel admins to enable a provider, so
+ * A DM or group-DM is a PERSONAL conversation that per-channel governance (the mutable tool
+ * allowlist + credential mode) does not reach: there is no channel roster to enable a provider, so
  * deny-by-default must NOT lock it out. Map a VERIFIED delivery channel to its mutable-governance
  * scope — null for a personal conversation, else the channel itself. Static Policy is a DIFFERENT
- * axis (deployment config, not admin-mutable) and keeps evaluating against the real delivery channel,
+ * axis (deployment config, not channel-mutable) and keeps evaluating against the real delivery channel,
  * so a deployment can still deny a provider in DMs / allow it only in named channels.
  *
  * `channelType` is Slack's event `channel_type`; it identifies a group DM whose id is
@@ -217,7 +217,7 @@ export interface ToolManifestBuildOptions {
   governanceChannel?: string | null;
 }
 
-/** Build the public manifest and retain the raw allowlist predicate used to produce it. Admin
+/** Build the public manifest and retain the raw allowlist predicate used to produce it. Governance
  * renderers reuse that predicate instead of querying the same channel twice; the public manifest
  * wrapper below deliberately returns only the serializable rows. */
 export async function buildToolManifestSnapshot(o: ToolManifestBuildOptions): Promise<{

@@ -1543,34 +1543,29 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
 
   /**
    * #54 `POST /v1/admin/offboard` — remove ALL of a target user's connections + pending consent +
-   * thread grants (the headless analogue of the Bolt `registerOffboarding` hook). Admin authority
-   * comes from the SIGNED `isAdmin` claim (the broker can't verify workspace admin itself); fail
-   * closed. A signed `enterpriseId` routes the cross-workspace (Grid/SCIM) case to
-   * offboardUserEverywhere. On that cross-workspace path the target is repeated in the signed
-   * `offboardTargetUserId` claim: admin status alone must not let an E1 actor nominate a foreign
-   * global Slack user id in the body. `targetUserId` is the subject, never the actor.
+   * thread grants (the headless analogue of the Bolt `registerOffboarding` hook). Authority is the
+   * SIGNED `offboardTargetUserId` claim (#322): the trusted deprovision hook signs exactly who is
+   * being removed, so an ordinary user assertion cannot be pointed at a foreign user through the
+   * body; fail closed. A signed `enterpriseId` routes the cross-workspace (Grid/SCIM) case to
+   * offboardUserEverywhere. `targetUserId` is the subject, never the actor.
    */
   async function handleOffboard(body: { identityToken: string; targetUserId?: unknown }): Promise<Record<string, unknown>> {
     const claims = await verify(body.identityToken);
     const { identity: actor, issuedAt: issuance } = await requireCurrentActor(claims);
-    if (claims.isAdmin !== true) {
-      await opts.audit.record('denied', actor, 'offboard', { reason: 'not-admin' });
-      throw new HttpError(403, { error: 'admin authority required' });
-    }
     const targetUserId = body.targetUserId;
     if (typeof targetUserId !== 'string' || !targetUserId) throw new HttpError(400, { error: 'targetUserId is required' });
+    if (claims.offboardTargetUserId !== targetUserId) {
+      throw new HttpError(403, { error: 'signed offboard target required' });
+    }
     // Enterprise/Grid: span every workspace the target touches; else this one workspace.
     if (claims.enterpriseId) {
-      if (claims.offboardTargetUserId !== targetUserId) {
-        throw new HttpError(403, { error: 'signed offboard target required' });
-      }
       const authorized = await markUserOffboardedEverywhereByActor(
         opts.db,
         actor,
         issuance,
         { enterpriseId: claims.enterpriseId, userId: targetUserId },
       );
-      if (!authorized) throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
+      if (!authorized) throw staleInteraction(409, 'assertion no longer current; resolve and retry');
       const summary = await offboardUserEverywhere(opts.db, opts.vault, opts.audit, consent, { enterpriseId: claims.enterpriseId, userId: targetUserId }, registry);
       // Truthful completeness (GHSA-25m2 r3): ok:true ONLY when every touched workspace fully
       // offboarded. A credential left in one workspace must never read as a successful sweep.
@@ -1579,7 +1574,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     }
     const target: SlackIdentity = { enterpriseId: null, teamId: claims.teamId, userId: targetUserId };
     const authorized = await markUserOffboardedByActor(opts.db, actor, issuance, target);
-    if (!authorized) throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
+    if (!authorized) throw staleInteraction(409, 'assertion no longer current; resolve and retry');
     const outcome = await offboardUserDetailed(
       opts.vault,
       opts.audit,
@@ -1598,9 +1593,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   /**
    * #53 `POST /v1/admin/reference` — configure a channel's SHARED credential as an external
    * secret-manager REFERENCE (never a raw secret over the wire). Delegates the shared core mutation
-   * sequence also used by Bolt, so NO @slack dependency enters the broker. Admin authority +
-   * eligibility come ONLY from signed claims; fail closed. Stores only the non-secret ref; the
-   * injector resolves it JIT at egress via `resolvers`.
+   * sequence also used by Bolt, so NO @slack dependency enters the broker. Channel + eligibility
+   * come ONLY from signed claims (the channel is the trust boundary, #322: the minter asserts the
+   * user acts in it, and any member may configure it); fail closed. Stores only the non-secret ref;
+   * the injector resolves it JIT at egress via `resolvers`.
    */
   async function handleAdminReference(body: {
     handle?: { provider?: unknown };
@@ -1625,21 +1621,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const stored = await referenceChannelCredential({
       vault: opts.vault, audit: opts.audit, channelConfig: opts.channelConfig,
       identity: acting, channel: claims.channel, providerId, reference, issuance: issuedAt,
-      authorize: async () => {
-        // Admin authority: SIGNED claim only (the broker can't verify Slack admin).
-        if (claims.isAdmin === true) return;
-        await opts.audit.record('denied', acting, providerId, {
-          reason: 'not-admin', owner: 'channel', channel: claims.channel,
-        });
-        throw new HttpError(403, { error: 'admin authority required' });
-      },
-      assertEligible: async () => {
-        if (!(opts.requireChannelEligibility ?? true) || claims.channelEligible === true) return;
-        await opts.audit.record('denied', acting, providerId, {
-          reason: 'channel-ineligible', owner: 'channel', channel: claims.channel,
-        });
-        throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
-      },
+      // Membership is what the signed channel claim asserts; there is no further gate (#322).
+      authorize: async () => undefined,
+      assertEligible: () => assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential'),
       modeConflict: (mode) => {
         throw new HttpError(409, {
           error: `channel is ${mode} for this provider; shared references are not allowed`,
@@ -1648,6 +1632,24 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     });
     if (!stored) throw staleInteraction(409, 'channel credential setup no longer valid; resolve and retry');
     return { ok: true };
+  }
+
+  /** The broker's only channel-class fact is the SIGNED `channelEligible` verdict (it has no Slack
+   * client): refuse and audit an ineligible (Slack Connect / externally shared / DM / archived /
+   * unverified) channel at every governance write where Bolt runs assertChannelEligible, so the two
+   * doors agree and a foreign-org member of a shared channel cannot govern it. Fail closed: only an
+   * explicit true is eligible; requireChannelEligibility:false defers entirely to the minter. */
+  async function assertClaimedChannelEligible(
+    claims: IdentityClaims,
+    acting: SlackIdentity,
+    providerId: string,
+    error: string,
+  ): Promise<void> {
+    if (!(opts.requireChannelEligibility ?? true) || claims.channelEligible === true) return;
+    await opts.audit.record('denied', acting, providerId, {
+      reason: 'channel-ineligible', owner: 'channel', channel: claims.channel,
+    });
+    throw new HttpError(403, { error });
   }
 
   /** Verify identity before registry membership so an unauthenticated caller cannot enumerate
@@ -1672,21 +1674,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     return current;
   }
 
-  /** Admin gate, identical to the reference/offboard routes: authority is the SIGNED `isAdmin` claim
-   *  ONLY (the broker can't verify workspace admin). Fail closed + audited (no secret). Never the body. */
-  async function requireAdmin(claims: IdentityClaims, subject: string): Promise<SlackIdentity> {
-    const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
-    if (claims.isAdmin !== true) {
-      await opts.audit.record('denied', acting, subject, { reason: 'not-admin', channel: claims.channel });
-      throw new HttpError(403, { error: 'admin authority required' });
-    }
-    return acting;
-  }
-
   /**
    * `POST /v1/admin/mode` — set the channel's credential MODE for a provider (the headless analogue of
    * `/vouchr mode`). Body `{ provider, mode }`; the channel/team come ONLY from the signed claims (never
-   * the body), admin authority from the SIGNED `isAdmin` claim. Config, NOT secret ingest — calls the
+   * the body), and that channel claim is the authority (#322). Config, NOT secret ingest — calls the
    */
   async function handleAdminMode(body: { provider?: unknown; mode?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
     const providerId = body.provider;
@@ -1695,19 +1686,17 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (!isChannelMode(mode)) {
       throw new HttpError(400, { error: 'mode must be one of shared|per-user|session' });
     }
-    const { claims, issuedAt: issuance } = await verifyBrokerableProvider(
+    const { claims, identity: acting, issuedAt: issuance } = await verifyBrokerableProvider(
       providerId,
       body.identityToken,
     );
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
-    const acting = await requireAdmin(claims, providerId);
     // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
     // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
-    // channel from the SIGNED verdict. Fail closed + audited. resolveOwner re-checks at use, so this is
-    // defense-in-depth, but the two config doors must agree.
-    if (mode === 'shared' && (opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
-      await opts.audit.record('denied', acting, providerId, { reason: 'channel-ineligible', owner: 'channel', channel: claims.channel });
-      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+    // channel from the SIGNED verdict. resolveOwner re-checks at use, so this is defense-in-depth,
+    // but the two config doors must agree.
+    if (mode === 'shared') {
+      await assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential');
     }
     // The shared core lifecycle mutation serializes this mode flip with Bolt/headless credential
     // setup across replicas. A user-owned mode and a live shared credential cannot both commit.
@@ -1721,14 +1710,14 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       mode,
       issuance,
     });
-    if (!configured) throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
+    if (!configured) throw staleInteraction(409, 'assertion no longer current; resolve and retry');
     return { ok: true };
   }
 
   /**
    * `POST /v1/admin/tools` — enable/disable a provider in the channel's tool allowlist (the headless
-   * analogue of `/vouchr enable|disable`). Body `{ provider, enabled }`; channel/team + admin authority
-   * from the SIGNED claims only. Calls the SAME core first-write-safe mutation + audit helper the
+   * analogue of `/vouchr enable|disable`). Body `{ provider, enabled }`; channel/team (the authority,
+   * #322) from the SIGNED claims only. Calls the SAME core first-write-safe mutation + audit helper the
    * Bolt path uses. Service tools remain host-authenticated, but their manifest bit is governed here
    * too so one channel setting has one meaning. Requires channelTools opt-in; fail closed.
    */
@@ -1750,23 +1739,19 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       changes: [[providerId, body.enabled]],
       allProviders: providerIds,
       issuance,
-      authorize: async () => {
-        await requireAdmin(claims, providerId);
-        return true;
-      },
-      // The headless admin contract is scoped by the signed team/channel/admin facts. Unlike Bolt,
-      // this transport has no Slack channel-class lookup at mutation time; channelEligible remains
-      // the separate credential-owner gate and is not silently broadened into a new API requirement.
-      assertEligible: async () => undefined,
+      authorize: async () => true, // the signed channel claim is the membership fact (#322)
+      // Same channel-class gate as Bolt's `/vouchr enable|disable` (assertChannelEligible), from the
+      // signed verdict: a member of an externally shared channel must not govern it from either door.
+      assertEligible: () => assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for tool configuration'),
     });
-    if (configured === 'stale') throw staleInteraction(409, 'admin assertion no longer current; resolve and retry');
+    if (configured === 'stale') throw staleInteraction(409, 'assertion no longer current; resolve and retry');
     return { ok: true };
   }
 
   /**
    * `GET /v1/admin/config` — the read side of the two write routes above: the caller's channel's
-   * per-provider mode + tool-enabled state, so an agent can inspect before changing. Admin-gated
-   * (SIGNED `isAdmin` only); the channel/team come from the signed claims (identity token in the
+   * per-provider mode + tool-enabled state, so an agent can inspect before changing. Channel-scoped
+   * by the signed claims (identity token in the
    * `x-vouchr-identity` header — a GET carries no JSON body). Service tools are included because the
    * same allowlist governs their manifest bit, but their credential `mode` is always null. NO secret:
    * policy bits only. `mode` is null when channelConfig is unset; `enabled` defaults true when
@@ -1775,7 +1760,6 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
     await requireCurrentActor(claims);
-    await requireAdmin(claims, 'config');
     if (providerIds.length === 0) return { providers: [] };
     // Two channel-scoped batch reads (mode + tool allowlist) instead of getMode/isEnabled per provider,
     // so the query count is bounded by the channel, not the provider count (#209). `enabled` is the raw
@@ -1886,13 +1870,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   /**
    * `POST /v1/admin/audit` — the current channel's last ~20 audit events (all activity tagged with the
    * channel, headless analogue of `/vouchr audit channel`). Channel/team come ONLY from the signed claims (never the
-   * body); admin authority is the SIGNED `isAdmin` claim via requireAdmin (fail closed + audited).
-   * NO secret and NO `meta`.
+   * body); any member of that channel may read it (#322). NO secret and NO `meta`.
    */
   async function handleAdminAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
     const claims = await verify(body.identityToken);
     await requireCurrentActor(claims);
-    await requireAdmin(claims, 'audit'); // non-admin → 403 + audited denial, before any read
     if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
     const events = await opts.audit.listByChannel(claims.teamId, claims.channel, 20);
     return { events };
@@ -1914,7 +1896,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    * `POST /v1/manifest` — the CHANNEL-SCOPED tool manifest for the verified identity (the headless
    * analogue of Bolt's `toolManifest()`, via the SAME core builder so the two can't drift): per
    * provider, whether it's usable in the claims' channel, its credential mode, and who the agent acts
-   * as. Channel/team come ONLY from the signed claims. Not admin-gated — the
+   * as. Channel/team come ONLY from the signed claims. Self-service — the
    * same non-secret policy bits `/vouchr tools` shows every channel member. The GET above stays: it
    * is the channel-independent provider list; this is "what may I do here". Provider-output
    * rendering belongs to the host and is deliberately absent from Vouchr's manifest.
@@ -1936,7 +1918,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   /**
    * #58 `POST /v1/user/reference` — the acting user points their OWN credential for a provider at an
    * external secret-manager REFERENCE (the headless analogue of the Bolt key-setup modal's "reference
-   * a secret manager"). Self-service (NOT admin-gated — it's the user's own credential), identity from
+   * a secret manager"). Self-service (it's the user's own credential), identity from
    * the signed token. Reference only: no raw secret crosses the broker (the injector resolves it JIT
    * at egress via `resolvers`). Refuses service tools. No secret in the response.
    */

@@ -22,16 +22,16 @@ const mkProvider = (id: string): Provider => defineProvider({
 const provider = mkProvider('mcp');
 
 async function harness(t: TestContext, opts: {
-  slackAdmin?: boolean;
+  member?: boolean;
   providers?: Provider[];
   policy?: Policy;
   db?: Db;
-  usersInfo?: () => Promise<unknown>;
+  members?: () => Promise<unknown>;
   conversationsInfo?: (args: { channel: string }) => Promise<unknown>;
   updateThrows?: boolean;
   dmThrows?: boolean;
 } = {}) {
-  const { slackAdmin = false, providers = [provider], policy } = opts;
+  const { member = false, providers = [provider], policy } = opts;
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({ providers, baseUrl: 'http://127.0.0.1:1', db: opts.db ?? await openTestDb(t), policy });
   let command: any;
@@ -46,15 +46,17 @@ async function harness(t: TestContext, opts: {
   let updated: any = null;
   const dms: string[] = [];
   const client = {
-    users: { info: opts.usersInfo ?? (async () => ({ user: { is_admin: slackAdmin } })) },
     conversations: {
       info: opts.conversationsInfo
         ?? (async ({ channel }: { channel: string }) => ({ channel: { id: channel, is_channel: true, creator: 'U_OTHER' } })),
+      members: opts.members ?? (async () => ({ members: member ? [ID.userId] : ['U_OTHER'] })),
     },
     views: {
-      open: async (a: any) => (opened = a),
+      // PLAT-2: bare `/vouchr` consumes the trigger with a loading view and hydrates it by id.
+      open: async (a: any) => { opened = a; return { view: { id: 'V_LOADING' } }; },
       update: async (a: any) => {
-        if (opts.updateThrows) throw new Error('view_not_found');
+        // `updateThrows` models a failed refresh/result update, not the initial loading-view hydration.
+        if (opts.updateThrows && a?.view_id !== 'V_LOADING') throw new Error('view_not_found');
         updated = a;
       },
     },
@@ -67,8 +69,14 @@ async function harness(t: TestContext, opts: {
   const defaultMeta = JSON.stringify({ channel: 'C_FIN', open: [] });
   return {
     lan, client, dms,
-    /** Run no-arg `/vouchr`, return the opened modal view (with its real private_metadata). */
-    openModal: async (channelId = 'C_FIN') => { await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: channelId, trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client }); return opened?.view; },
+    /** Run no-arg `/vouchr`, return the settings modal view (with its real private_metadata): the
+     *  trigger opens a loading view; the built modal arrives through views.update (PLAT-2). */
+    openModal: async (channelId = 'C_FIN') => {
+      await command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: channelId, trigger_id: 'trig', text: '' }, ack: async () => {}, respond: async () => {}, client });
+      const view = updated?.view;
+      updated = null; // later `updated()` reads see only post-open refreshes
+      return view;
+    },
     runCommand: (text: string, respond?: any) => command({ command: { team_id: 'T1', user_id: ID.userId, channel_id: 'C_FIN', trigger_id: 'trig', text }, ack: async () => {}, respond: respond ?? (async () => {}), client }),
     submit: (state: any, ack: any, privateMetadata: string = defaultMeta, viewId?: string) => {
       const view = {
@@ -99,7 +107,7 @@ const disconnectValue = (view: any): string => {
 };
 
 test('no-arg /vouchr opens the modal; non-admin sees NO admin controls (no submit)', async (t) => {
-  const h = await harness(t, { slackAdmin: false });
+  const h = await harness(t, { member: false });
   const view = await h.openModal();
   assert.equal(view?.callback_id, CONFIG_CALLBACK);
   assert.equal(view.submit, undefined); // nothing to submit → no mutating controls shown
@@ -107,7 +115,7 @@ test('no-arg /vouchr opens the modal; non-admin sees NO admin controls (no submi
 });
 
 test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable controls', async (t) => {
-  const h = await harness(t, { slackAdmin: true });
+  const h = await harness(t, { member: true });
   const view = await h.openModal();
   assert.equal(view.submit?.text?.text ?? view.submit?.text, 'Save');
   assert.ok(view.blocks.some((b: any) => b.block_id === 'mode:mcp'));
@@ -119,7 +127,7 @@ test('no-arg /vouchr opens the modal; admin sees per-provider mode + enable cont
 test('no-arg /vouchr in a DM shows personal tools without channel-admin controls', async (t) => {
   let conversationReads = 0;
   const h = await harness(t, {
-    slackAdmin: true,
+    member: true,
     conversationsInfo: async () => {
       conversationReads++;
       throw new Error('a D-prefixed DM must not need classification');
@@ -137,7 +145,7 @@ test('no-arg /vouchr in a DM shows personal tools without channel-admin controls
 test('no-arg /vouchr resolves a G-prefixed MPIM and suppresses channel governance', async (t) => {
   let conversationReads = 0;
   const h = await harness(t, {
-    slackAdmin: true,
+    member: true,
     conversationsInfo: async ({ channel }) => {
       conversationReads++;
       return { channel: { id: channel, is_mpim: true } };
@@ -209,36 +217,68 @@ test('no-arg /vouchr dispatches independent DB and Slack reads before waiting', 
     close: () => base.close(),
   };
   const h = await harness(t, {
-    slackAdmin: true,
+    member: true,
     db,
-    usersInfo: async () => { started++; await gate; return { user: { is_admin: true } }; },
+    members: async () => { started++; await gate; return { members: [ID.userId] }; },
   });
 
   const opening = h.openModal();
   await new Promise<void>((resolve) => setImmediate(resolve));
-  // Connection metadata + two manifest snapshots + Slack's admin check all start together.
+  // Connection metadata + two manifest snapshots + Slack's membership read all start together.
   assert.equal(started, 4);
   release();
   const view = await opening;
   assert.equal(view?.callback_id, CONFIG_CALLBACK);
-  assert.equal(started, 4, 'admin rows must reuse the manifest snapshot, not start a fifth read');
+  assert.equal(started, 4, 'governance rows must reuse the manifest snapshot, not start a fifth read');
 });
 
 test('no-arg gives truthful command recovery when views.open fails (never silent)', async (t) => {
-  const h = await harness(t, { slackAdmin: true });
+  const h = await harness(t, { member: true });
   h.client.views.open = async () => { throw new Error('expired_trigger_id'); };
   let responded = '';
   await h.runCommand('', async (m: string) => { responded = m; });
   assert.equal(responded, 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
 });
 
+const SETTINGS_RECOVERY = 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.';
+
+/** A build failure after the loading view opened replaces that view with the fixed recovery (UX-1). */
+function assertLoadingViewRecovered(h: Awaited<ReturnType<typeof harness>>, responded: string): void {
+  assert.equal(responded, '', 'the loading view is the feedback surface once the trigger is consumed');
+  assert.equal(h.opened()?.view?.callback_id, undefined, 'only the authority-free loading view was opened');
+  assert.equal(h.updated()?.view_id, 'V_LOADING');
+  assert.equal(h.updated()?.view?.callback_id, undefined, 'an invalid modal must never be sent to Slack');
+  assert.match(JSON.stringify(h.updated()?.view), /Could not open Vouchr settings/);
+}
+
+test('no-arg /vouchr consumes the trigger with a loading view before its Slack membership read (PLAT-2)', async (t) => {
+  let openedBeforeRoster = false;
+  const h: Awaited<ReturnType<typeof harness>> = await harness(t, {
+    member: true,
+    members: async () => { openedBeforeRoster = h.opened() !== null; return { members: [ID.userId] }; },
+  });
+  await h.runCommand('');
+  assert.equal(openedBeforeRoster, true, 'views.open must not wait on the paginated roster scan');
+  assert.equal(h.opened()?.trigger_id, 'trig');
+  assert.equal(h.opened()?.view?.callback_id, undefined, 'the trigger is consumed by an authority-free loading view');
+  assert.equal(h.updated()?.view_id, 'V_LOADING');
+  assert.equal(h.updated()?.view?.callback_id, CONFIG_CALLBACK, 'the built settings modal hydrates the loading view');
+});
+
 test('no-arg gives the same recovery when a supported registry exceeds the modal block limit', async (t) => {
   const providers = Array.from({ length: 47 }, (_, i) => mkProvider(`provider-${i}`));
-  const h = await harness(t, { slackAdmin: true, providers });
+  const h = await harness(t, { member: true, providers });
   let responded = '';
   await h.runCommand('', async (m: string) => { responded = m; });
-  assert.equal(responded, 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
-  assert.equal(h.opened(), null, 'an invalid over-limit modal must never be sent to Slack');
+  assertLoadingViewRecovered(h, responded);
+});
+
+test('no-arg DMs the recovery when the loading view cannot be replaced', async (t) => {
+  const providers = Array.from({ length: 47 }, (_, i) => mkProvider(`provider-${i}`));
+  const h = await harness(t, { member: true, providers });
+  h.client.views.update = async () => { throw new Error('view_not_found'); };
+  await h.runCommand('');
+  assert.deepEqual(h.dms, [SETTINGS_RECOVERY]);
 });
 
 test('no-arg gives recovery when valid provider ids exceed Slack private_metadata', async (t) => {
@@ -246,29 +286,28 @@ test('no-arg gives recovery when valid provider ids exceed Slack private_metadat
     const prefix = `p${String(i).padStart(2, '0')}`;
     return mkProvider(prefix + 'x'.repeat(63 - prefix.length));
   });
-  const h = await harness(t, { slackAdmin: true, providers });
+  const h = await harness(t, { member: true, providers });
   let responded = '';
   await h.runCommand('', async (m: string) => { responded = m; });
-  assert.equal(responded, 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
-  assert.equal(h.opened(), null);
+  assertLoadingViewRecovered(h, responded);
 });
 
-test('forged non-admin submission is rejected by the same authz path (no mutation, audited denied)', async (t) => {
-  const h = await harness(t, { slackAdmin: false }); // NOT an admin, but forges a mode-change submission
+test('forged non-member submission is rejected by the same authz path (no mutation, audited denied)', async (t) => {
+  const h = await harness(t, { member: false }); // NOT a member, but forges a mode-change submission
   let acked = false;
   await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } }, async () => { acked = true; });
   assert.equal(acked, true);
-  assert.match(h.dms[0], /Only a workspace admin/);
+  assert.match(h.dms[0], /Only a current member of this channel/);
   assert.equal(await modeRow(h.lan.db), null); // nothing written
   assert.deepEqual(await auditActions(h.lan.db), ['denied']);
 });
 
-test('config modal acknowledges before its Slack admin lookup', async (t) => {
+test('config modal acknowledges before its Slack membership lookup', async (t) => {
   let acknowledged = false;
   const h = await harness(t, {
-    usersInfo: async () => {
-      assert.equal(acknowledged, true, 'admin lookup started before Slack acknowledgement');
-      return { user: { is_admin: false } };
+    members: async () => {
+      assert.equal(acknowledged, true, 'membership lookup started before Slack acknowledgement');
+      return { members: ['U_OTHER'] };
     },
   });
   await h.submit(
@@ -279,20 +318,20 @@ test('config modal acknowledges before its Slack admin lookup', async (t) => {
   assert.equal(await modeRow(h.lan.db), null);
 });
 
-test('an admin offboarded during modal verification cannot change mode or tools', async (t) => {
+test('a member offboarded during modal verification cannot change mode or tools', async (t) => {
   let enteredAdminLookup!: () => void;
   const adminLookupStarted = new Promise<void>((resolve) => { enteredAdminLookup = resolve; });
   let releaseAdminLookup!: () => void;
   const adminLookupGate = new Promise<void>((resolve) => { releaseAdminLookup = resolve; });
   let pause = true;
   const h = await harness(t, {
-    usersInfo: async () => {
+    members: async () => {
       if (pause) {
         pause = false;
         enteredAdminLookup();
         await adminLookupGate;
       }
-      return { user: { is_admin: true } };
+      return { members: [ID.userId] };
     },
   });
 
@@ -313,12 +352,12 @@ test('an admin offboarded during modal verification cannot change mode or tools'
 });
 
 test('admin mode change via the modal == /vouchr mode: same channel_config + audit', async (t) => {
-  const viaCommand = await harness(t, { slackAdmin: true });
+  const viaCommand = await harness(t, { member: true });
   await viaCommand.runCommand('mode mcp per-user');
   assert.equal(await modeRow(viaCommand.lan.db), 'per-user');
   assert.deepEqual(await auditActions(viaCommand.lan.db), ['config']);
 
-  const viaModal = await harness(t, { slackAdmin: true });
+  const viaModal = await harness(t, { member: true });
   let acked: any = null;
   await viaModal.submit({ 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } }, async (r?: any) => (acked = r ?? 'ack'));
   assert.equal(acked.response_action, 'update');
@@ -328,7 +367,7 @@ test('admin mode change via the modal == /vouchr mode: same channel_config + aud
 });
 
 test('a partially applied config batch reports confirmed and unconfirmed counts truthfully', async (t) => {
-  const h = await harness(t, { slackAdmin: true, providers: ['a', 'b'].map(mkProvider) });
+  const h = await harness(t, { member: true, providers: ['a', 'b'].map(mkProvider) });
   const record = h.lan.audit.record.bind(h.lan.audit);
   (h.lan.audit as any).record = async (...args: any[]) => {
     if (args[2] === 'a') throw new Error('audit unavailable');
@@ -346,7 +385,7 @@ test('a partially applied config batch reports confirmed and unconfirmed counts 
 });
 
 test('config submit leaves private unknown-state recovery when result update and DM both fail', async (t) => {
-  const h = await harness(t, { slackAdmin: true, updateThrows: true, dmThrows: true });
+  const h = await harness(t, { member: true, updateThrows: true, dmThrows: true });
   let acked: any = null;
   await h.submit(
     { 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } },
@@ -362,11 +401,11 @@ test('config submit leaves private unknown-state recovery when result update and
   assert.equal(h.updated(), null);
 });
 
-test('wrong-typed config metadata returns fixed recovery before admin lookup or mutation', async (t) => {
+test('wrong-typed config metadata returns fixed recovery before membership lookup or mutation', async (t) => {
   let adminLookups = 0;
   const h = await harness(t, {
-    slackAdmin: true,
-    usersInfo: async () => { adminLookups++; return { user: { is_admin: true } }; },
+    member: true,
+    members: async () => { adminLookups++; return { members: [ID.userId] }; },
   });
   let acked: any = null;
   await h.submit(
@@ -385,8 +424,8 @@ test('wrong-typed config metadata returns fixed recovery before admin lookup or 
 test('a pre-removal modal carrying preview state is rejected as stale before any mutation', async (t) => {
   let adminLookups = 0;
   const h = await harness(t, {
-    slackAdmin: true,
-    usersInfo: async () => { adminLookups++; return { user: { is_admin: true } }; },
+    member: true,
+    members: async () => { adminLookups++; return { members: [ID.userId] }; },
   });
   let acked: any = null;
   await h.submit(
@@ -403,7 +442,7 @@ test('a pre-removal modal carrying preview state is rejected as stale before any
 });
 
 test('forged invalid mode value is ignored server-side, never persisted', async (t) => {
-  const h = await harness(t, { slackAdmin: true });
+  const h = await harness(t, { member: true });
   let acked: any = null;
   await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'evil-mode' } } } }, async (r?: any) => (acked = r ?? 'ack'));
   assert.equal(acked.response_action, 'update');
@@ -414,7 +453,7 @@ test('forged invalid mode value is ignored server-side, never persisted', async 
 // Finding 1: enabling ONE provider on an unconfigured (deny-by-default) channel must not silently
 // enable the others when the first write materializes the full allowlist.
 test('enabling one provider materializes the full allowlist; the others stay disabled', async (t) => {
-  const h = await harness(t, { slackAdmin: true, providers: ['a', 'b', 'c'].map(mkProvider) });
+  const h = await harness(t, { member: true, providers: ['a', 'b', 'c'].map(mkProvider) });
   const view = await h.openModal();
   const pm = view.private_metadata; // real open-time state (all disabled, unconfigured)
   await h.submit({ 'tool:a': unchecked(), 'tool:b': checked(), 'tool:c': unchecked() }, async () => {}, pm);
@@ -428,7 +467,7 @@ test('enabling one provider materializes the full allowlist; the others stay dis
 // Finding 2: a stale save (untouched select re-submitting its open value) must not revert a change
 // another admin made in between, nor delete the shared credential leaving 'shared' mode.
 test('untouched mode select does not revert a concurrent change or delete the shared credential', async (t) => {
-  const h = await harness(t, { slackAdmin: true });
+  const h = await harness(t, { member: true });
   const cfg = new ChannelConfig(h.lan.db);
   await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'per-user');
   const view = await h.openModal(); // opens with mode 'per-user' as the select's initial
@@ -446,7 +485,7 @@ test('untouched mode select does not revert a concurrent change or delete the sh
 // checkbox reflects the ALLOWLIST bit (deny-by-default here → unchecked), not the policy-intersected
 // manifest, so re-submitting the open value is a true no-op.
 test('untouched save with a policy-denied provider writes no channel_tool row', async (t) => {
-  const h = await harness(t, { slackAdmin: true, policy: new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } }) }); // denies mcp in C_FIN
+  const h = await harness(t, { member: true, policy: new Policy({ mcp: { defaultAllow: true, denyChannels: ['C_FIN'] } }) }); // denies mcp in C_FIN
   const view = await h.openModal();
   const pm = view.private_metadata;
   await h.submit({ 'tool:mcp': unchecked() }, async () => {}, pm); // checkbox untouched (allowlist-disabled by default)
@@ -455,7 +494,7 @@ test('untouched save with a policy-denied provider writes no channel_tool row', 
 });
 
 test('the Disconnect button carries a confirm dialog (no accidental one-click revoke)', async (t) => {
-  const h = await harness(t, { slackAdmin: false });
+  const h = await harness(t, { member: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const view = await h.openModal();
   const btn = view.blocks.map((b: any) => b.accessory).find((a: any) => a?.action_id === DISCONNECT_ACTION);
@@ -463,7 +502,7 @@ test('the Disconnect button carries a confirm dialog (no accidental one-click re
 });
 
 test('disconnect button removes the user connection and refreshes the modal view', async (t) => {
-  const h = await harness(t, { slackAdmin: false });
+  const h = await harness(t, { member: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const view = await h.openModal();
   await h.disconnect(async () => {}, { ...view, id: 'V1' }, disconnectValue(view));
@@ -472,7 +511,7 @@ test('disconnect button removes the user connection and refreshes the modal view
 });
 
 test('disconnect button sends one committed receipt even when the modal refresh fails', async (t) => {
-  const h = await harness(t, { slackAdmin: false, updateThrows: true });
+  const h = await harness(t, { member: false, updateThrows: true });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const view = await h.openModal();
   await h.disconnect(async () => {}, { ...view, id: 'V1' }, disconnectValue(view));
@@ -482,7 +521,7 @@ test('disconnect button sends one committed receipt even when the modal refresh 
 });
 
 test('duplicate disconnect click reports its rendered generation as stale when refresh fails', async (t) => {
-  const h = await harness(t, { slackAdmin: false, updateThrows: true });
+  const h = await harness(t, { member: false, updateThrows: true });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const view = await h.openModal();
   const value = disconnectValue(view);
@@ -497,7 +536,7 @@ test('duplicate disconnect click reports its rendered generation as stale when r
 });
 
 test('disconnect button removes a retired provider that is still visible in the user connection list', async (t) => {
-  const h = await harness(t, { slackAdmin: false, providers: [] });
+  const h = await harness(t, { member: false, providers: [] });
   await h.lan.vault.upsert(userOwner(ID), 'retired', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const view = await h.openModal();
   assert.match(JSON.stringify(view.blocks), /retired/);
@@ -510,7 +549,7 @@ test('disconnect button removes a retired provider that is still visible in the 
 });
 
 test('concurrent retired Disconnect clicks each get one safe receipt when refresh fails', async (t) => {
-  const h = await harness(t, { slackAdmin: false, providers: [], updateThrows: true });
+  const h = await harness(t, { member: false, providers: [], updateThrows: true });
   await h.lan.vault.upsert(userOwner(ID), 'retired', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const opened = await h.openModal();
   const value = disconnectValue(opened);
@@ -533,7 +572,7 @@ test('concurrent retired Disconnect clicks each get one safe receipt when refres
 // Finding 4/6: the exported DISCONNECT_ACTION must NOT act when the click came from a foreign view
 // (a host embedding disconnectConfirmBlocks in their own modal) — else it double-fires + clobbers.
 test('disconnect action ignores a non-Vouchr view (no double-fire, no clobber)', async (t) => {
-  const h = await harness(t, { slackAdmin: false });
+  const h = await harness(t, { member: false });
   await h.lan.vault.upsert(userOwner(ID), 'mcp', { accessToken: 'TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await h.disconnect(async () => {}, { id: 'HOST', callback_id: 'host_modal', private_metadata: '{}' });
   assert.ok(await h.lan.vault.get(userOwner(ID), 'mcp')); // NOT disconnected — host owns this action
@@ -542,7 +581,7 @@ test('disconnect action ignores a non-Vouchr view (no double-fire, no clobber)',
 });
 
 test('provider-valued exported config-modal actions remain host-owned', async (t) => {
-  const h = await harness(t, { slackAdmin: false });
+  const h = await harness(t, { member: false });
   await h.disconnect(
     async () => {},
     { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) },
@@ -555,7 +594,7 @@ test('provider-valued exported config-modal actions remain host-owned', async (t
 
 // Finding 5: an unknown/forged opaque generation must not be revoked or written to the audit column.
 test('disconnect action rejects an unknown generation (no audit pollution)', async (t) => {
-  const h = await harness(t, { slackAdmin: false });
+  const h = await harness(t, { member: false });
   const untrusted = '123e4567-e89b-42d3-a456-426614174000';
   await h.disconnect(async () => {}, { id: 'V1', callback_id: CONFIG_CALLBACK, private_metadata: JSON.stringify({ channel: 'C_FIN' }) }, untrusted);
   assert.deepEqual(await auditActions(h.lan.db), []); // nothing audited for the bogus provider

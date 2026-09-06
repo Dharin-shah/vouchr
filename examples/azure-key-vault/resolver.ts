@@ -1,7 +1,7 @@
 // Azure Key Vault resolver for Vouchr.
 //
 // Resolves a secret JIT: when the injector needs the credential it calls this
-// resolver with the reference the admin configured, fetches the live secret value
+// resolver with the reference a channel member configured, fetches the live secret value
 // from Azure Key Vault, and hands it straight to the outbound request. Vouchr stores
 // only the non-secret reference and never caches the value here. Rotation stays
 // entirely in Key Vault, so a rotated secret is picked up on the next call.

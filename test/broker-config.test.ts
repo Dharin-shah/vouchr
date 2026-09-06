@@ -131,9 +131,10 @@ function getConfig(port: number, token?: string): Promise<{ status: number; json
   });
 }
 
-// Admin token; channelEligible defaults true so a `shared` write passes the eligibility gate (parity
-// with /v1/admin/reference and Bolt's assertChannelEligible). Override to false to exercise the refusal.
-const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, channelEligible: true, ...over }), SECRET);
+// Member token (#322: the signed channel claim is the authority); channelEligible defaults true so a
+// `shared` write passes the eligibility gate (parity with /v1/admin/reference and Bolt's
+// assertChannelEligible). Override to false to exercise the refusal.
+const admin = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ channelEligible: true, ...over }), SECRET);
 
 // #211: callbackPath is BOTH a Node route matcher and part of the public OAuth redirect URI. Admit
 // exactly one canonical absolute pathname so those parsers cannot disagree about what is mounted.
@@ -334,28 +335,6 @@ test('admin/tools: concurrent first writes retain both changes and every bystand
   }
 });
 
-// (c) a NON-admin token is refused (403) on all three routes — fail closed. A forged body isAdmin is ignored.
-test('config routes fail closed: a non-admin token gets 403 on mode/tools/config (forged body isAdmin ignored)', async (t) => {
-  const { server, port, channelConfig } = await makeConfigBroker(t);
-  try {
-    const userTok = () => signIdentity(claims(), SECRET); // no isAdmin claim
-
-    const mode = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: userTok(), isAdmin: true } as any);
-    assert.equal(mode.status, 403);
-
-    const tools = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: false, identityToken: userTok(), isAdmin: true } as any);
-    assert.equal(tools.status, 403);
-
-    const cfg = await getConfig(port, userTok());
-    assert.equal(cfg.status, 403);
-
-    // A refused write changed nothing.
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
-  } finally {
-    server.close();
-  }
-});
-
 test('admin mode and tools reject assertions issued before the acting admin was offboarded', async (t) => {
   const { server, port, db, channelConfig, channelTools } = await makeConfigBroker(t);
   const actor = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -477,6 +456,27 @@ test('admin/mode: `shared` on an ineligible channel is refused (eligibility pari
   }
 });
 
+// A member of an externally shared channel must not govern its tool allowlist from the broker any more
+// than from Bolt (whose `/vouchr enable|disable` runs assertChannelEligible): same signed verdict, same door.
+test('admin/tools: an ineligible channel is refused and audited (parity with Bolt and /v1/admin/mode)', async (t) => {
+  const { server, port, db, channelTools } = await makeConfigBroker(t);
+  try {
+    const r = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: admin({ channelEligible: false }) });
+    assert.equal(r.status, 403);
+    assert.deepEqual(r.json, { error: 'channel is ineligible for tool configuration' });
+    assert.equal(await channelTools.isConfigured('T1', 'C1'), false, 'refused: nothing materialized');
+    const denied = (await db.get(`SELECT user_id, channel, meta FROM audit WHERE action='denied'`)) as any;
+    assert.equal(denied.user_id, 'U1');
+    assert.equal(denied.channel, 'C1');
+    assert.deepEqual(JSON.parse(denied.meta), { reason: 'channel-ineligible', owner: 'channel', channel: 'C1' });
+    // Omitted (undefined) fails closed exactly like false.
+    const absent = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: signIdentity(claims({}), SECRET) });
+    assert.equal(absent.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
 // P3(d): a mode write emits a `config` audit row (the non-repudiation claim).
 test('admin/mode: a mode write is audited as `config` with owner:channel (non-repudiation)', async (t) => {
   const { server, port, db } = await makeConfigBroker(t);
@@ -543,7 +543,7 @@ test('admin config routes reject an invalid/expired identity token (401)', async
     assert.equal(badMode.status, 401);
     const badTools = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: 'not.a.token' });
     assert.equal(badTools.status, 401);
-    const expired = signIdentity(claims({ isAdmin: true, exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET);
+    const expired = signIdentity(claims({ exp: Date.now() - IDENTITY_SKEW_MS - 1 }), SECRET);
     const badConfig = await getConfig(port, expired);
     assert.equal(badConfig.status, 401);
   } finally {

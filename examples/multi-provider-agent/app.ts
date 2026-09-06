@@ -24,7 +24,7 @@ import {
  *  1. The agent holds no credential of its own. Vouchr resolves one from the VERIFIED Slack
  *     identity on the event, so Alice's comment is authored by Alice because Alice asked — not
  *     because the model said so. There is no user-id argument to get wrong.
- *  2. The provider list is the CHANNEL's, not the code's. `toolManifest()` returns what an admin
+ *  2. The provider list is the CHANNEL's, not the code's. `toolManifest()` returns what a channel member
  *     enabled here, and that becomes the model's tool enum. Channels are deny-by-default, so an
  *     agent in a channel where nothing is enabled can reach nothing.
  *  3. The model chooses the URL. That is the generic-HTTP-tool shape prompt injection loves, and
@@ -81,7 +81,7 @@ app.event('app_mention', async ({ context, event, client, say }) => {
   const manifest = await vouchr.toolManifest();
   const usable = manifest.filter((t) => t.enabled && t.identity === 'acting_human').map((t) => t.provider);
   if (!usable.length) {
-    await say({ thread_ts: thread, text: 'No providers are enabled in this channel yet — an admin can run `/vouchr enable <provider>`.' });
+    await say({ thread_ts: thread, text: 'No providers are enabled in this channel yet. A member of this channel can run `/vouchr enable <provider>`.' });
     return;
   }
 

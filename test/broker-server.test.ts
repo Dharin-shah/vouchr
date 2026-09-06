@@ -164,12 +164,12 @@ test('#65 loadProviders: invalid mcp shapes are rejected at config load with the
 // enforce human-in-the-loop approval for a declaratively configured provider.
 const APPROVAL_INTERNAL = {
   id: 'internal', credential: 'key', egressAllow: ['api.internal.example'],
-  egressMethods: ['GET', 'POST'], approval: { approver: 'admin' },
+  egressMethods: ['GET', 'POST'], approval: { approver: 'member' },
 };
 
 test('#113 loadProviders: the approval knob loads and reaches the provider', () => {
   const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([APPROVAL_INTERNAL]) } as any);
-  assert.deepEqual(p.approval, { approver: 'admin' });
+  assert.deepEqual(p.approval, { approver: 'member' });
   // every optional field passes through untouched too
   const full = { methods: ['POST'], paths: ['/repos'], approver: 'self', ttlMs: 60_000 };
   const [q] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: full }]) } as any);
@@ -182,6 +182,13 @@ test("#113 loadProviders: invalid approval shapes are rejected at config load wi
   assert.throws(load('yes'), /field "approval" must be an object/);
   assert.throws(load({}), /approval\.approver.*unsupported/);
   assert.throws(load({ approver: 'anyone' }), /approval\.approver.*unsupported/);
+  // #322: the removed value fails closed with a message that names its replacement.
+  assert.throws(load({ approver: 'admin' }), /approval\.approver.*'admin' was removed.*'member'/);
+  // The same guard on the createVouchr path: defineProvider is the one validator both loaders share.
+  assert.throws(
+    () => defineProvider({ ...APPROVAL_INTERNAL, approval: { approver: 'admin' } } as any),
+    /approval\.approver.*'admin' was removed.*'member'/,
+  );
   assert.throws(load({ approver: 'self', methods: [] }), /approval\.methods.*non-empty.*array/);
   assert.throws(load({ approver: 'self', methods: [42] }), /approval\.methods.*strings/);
   assert.throws(load({ approver: 'self', ttlMs: 0 }), /approval\.ttlMs.*positive safe integer/);
@@ -481,7 +488,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
   const token = (over: Record<string, unknown> = {}) => mintIdentity({
     teamId: 'T1', userId: 'U1', channel: 'C1', ...over,
   }, idConfig());
-  const adminToken = () => token({ isAdmin: true, channelEligible: true });
+  const adminToken = () => token({ channelEligible: true });
   const owner = userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' });
   const vault = new Vault(built.db, Buffer.from(KEY_B64, 'base64'));
 
@@ -541,7 +548,6 @@ test('#240 packaged broker shares and enforces channel governance across every d
       // Forgeable body scope has no authority; only the signed T1/C1 claims may be written.
       teamId: 'TEVIL',
       channel: 'CEVIL',
-      isAdmin: false,
     });
     assert.equal(enabled.status, 200);
     assert.equal(await storedTools.isEnabled('T1', 'C1', 'mcp-governed'), true);

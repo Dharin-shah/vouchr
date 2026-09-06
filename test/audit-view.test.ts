@@ -16,18 +16,19 @@ const provider = defineProvider({
 });
 const id = (userId: string): SlackIdentity => ({ enterpriseId: null, teamId: 'T1', userId });
 
-async function harness(t: TestContext, opts: { isAdmin?: boolean } = {}) {
+async function harness(t: TestContext, opts: { member?: boolean } = {}) {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t),
-    ...(opts.isAdmin !== undefined ? { isAdmin: async () => opts.isAdmin! } : {}),
   });
   let handler: any;
   lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
   const audit = new Audit(lan.db);
   const client = {
-    users: { info: async () => ({ user: { is_admin: false } }) },
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_SOMEONE' } }) },
+    conversations: {
+      info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_SOMEONE' } }),
+      members: async () => ({ members: opts.member ? ['U_A'] : ['U_SOMEONE'] }),
+    },
   };
   const run = async (text: string, userId = 'U_A') => {
     const out: any[] = [];
@@ -92,16 +93,16 @@ test('configure: an unknown (e.g. credential-shaped) provider is rejected before
   assert.equal(rows.length, 0);
 });
 
-test('audit channel: a non-admin is refused via the admin gate and the denial is audited', async (t) => {
-  const { audit, run } = await harness(t); // no isAdmin override, users.info is_admin=false, not the creator
+test('audit channel: a non-member is refused via the member gate and the denial is audited', async (t) => {
+  const { audit, run } = await harness(t); // conversations.members does not list U_A
   const res = await run('audit channel', 'U_A');
-  assert.match(String(res), /Only a workspace admin/); // plain admin-gate refusal, no blocks
+  assert.match(String(res), /Only a current member of this channel/); // plain member-gate refusal, no blocks
   const denied = await audit.listByOwnerUser(id('U_A'), 20);
   assert.ok(denied.some((r) => r.action === 'denied' && r.provider === 'audit'));
 });
 
-test('audit channel: an admin sees only THIS channel\'s rows', async (t) => {
-  const { audit, run } = await harness(t, { isAdmin: true });
+test('audit channel: a member sees only THIS channel\'s rows', async (t) => {
+  const { audit, run } = await harness(t, { member: true });
   await audit.record('inject', id('U_A'), 'github', { channel: 'C_FIN' });   // this channel
   await audit.record('inject', id('U_A'), 'stripe', { channel: 'C_OTHER' }); // a different channel
 

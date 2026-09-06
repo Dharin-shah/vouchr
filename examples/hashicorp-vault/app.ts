@@ -5,7 +5,7 @@ import { hashicorpVault } from './resolver';
 // from a supported Vault reference; configuration checks presence without resolving. VAULT_ADDR
 // and VAULT_TOKEN come from the environment.
 //
-// An admin then runs, from inside the channel they want to configure:
+// A member of the channel then runs, from inside the channel to configure:
 //
 //   /vouchr connect-shared github
 //

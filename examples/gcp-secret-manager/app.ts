@@ -4,7 +4,7 @@ import { gcpSecretManager } from './resolver';
 // Wire the GCP Secret Manager resolver into Vouchr. Its 'gcp-sm' key matches the source Vouchr
 // derives from a supported GCP reference; configuration checks presence without resolving.
 //
-// An admin then runs, from inside the channel they want to configure:
+// A member of the channel then runs, from inside the channel to configure:
 //
 //   /vouchr connect-shared github
 //

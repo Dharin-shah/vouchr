@@ -15,9 +15,9 @@ import { offboardUser } from '../src/core/offboard';
 import { ChannelTools } from '../src/core/tools';
 import { channelOwner } from '../src/core/owner';
 
-// The channel-creator config gate is OPT-IN (`allowChannelCreatorConfig`, default off). When off the
-// gate is exactly workspace-admin-only; when on, a channel's CREATOR may also run the config
-// mutations. Mirrors governance.test.ts's harness, plus `creator`/`allowCreator` knobs.
+// The channel is the trust boundary (#322): any CURRENT member of a channel may run its config
+// mutations; non-members and unverifiable membership are refused and audited. Mirrors
+// governance.test.ts's harness, plus `member`/`membersThrow`/`infoThrows` knobs.
 const KEY = randomBytes(32);
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U_ACTOR' };
 
@@ -27,29 +27,30 @@ const provider = defineProvider({
 });
 
 async function ctx(t: TestContext, opts: {
-  slackAdmin?: boolean;      // what the built-in users.info gate reports for ID.userId
-  creator?: string;         // channel creator id from conversations.info
-  allowCreator?: boolean;   // the opt-in flag
+  member?: boolean;         // whether conversations.members lists ID.userId
+  membersThrow?: boolean;   // conversations.members fails (fail-closed surface)
   infoThrows?: boolean;     // conversations.info fails (fail-closed surface)
-  adminCheck?: (client: any, userId: string, teamId: string) => Promise<boolean>;
 } = {}) {
-  const { slackAdmin = false, creator = 'U_SOMEONE_ELSE', allowCreator = false, infoThrows = false, adminCheck } = opts;
+  const { member = false, membersThrow = false, infoThrows = false } = opts;
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const client = {
-    users: { info: async () => ({ user: { is_admin: slackAdmin } }) },
     conversations: {
       info: async () => {
         if (infoThrows) throw new Error('channel_not_found');
-        return { channel: { id: 'C_FIN', is_channel: true, creator } };
+        return { channel: { id: 'C_FIN', is_channel: true, creator: 'U_SOMEONE_ELSE' } };
+      },
+      members: async () => {
+        if (membersThrow) throw new Error('channel_not_found');
+        return { members: member ? [ID.userId, 'U_SOMEONE_ELSE'] : ['U_SOMEONE_ELSE'] };
       },
     },
   } as any;
   const c = new ConnectContext({
     identity: ID, channel: 'C_FIN', client, registry: new ProviderRegistry([provider]), vault, audit,
     consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
-    channelConfig: new ChannelConfig(db), adminCheck, allowChannelCreatorConfig: allowCreator,
+    channelConfig: new ChannelConfig(db),
   });
   return { c, db };
 }
@@ -299,66 +300,45 @@ const mode = async (db: any) =>
   ((await db.get('SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?',
     ['T1', 'C_FIN', 'mcp'])) as any)?.mode ?? null;
 
-// (a) With the flag ON, the channel creator (not a workspace admin) may configure.
-test('flag on: channel creator (non-workspace-admin) can setChannelMode', async (t) => {
-  const { c, db } = await ctx(t, { slackAdmin: false, creator: ID.userId, allowCreator: true });
+// (a) A current member may configure; the mutation is audited 'config'.
+test('member gate: a current channel member can setChannelMode', async (t) => {
+  const { c, db } = await ctx(t, { member: true });
   await c.setChannelMode('mcp', 'per-user');
   assert.equal(await mode(db), 'per-user');
   assert.deepEqual(await auditActions(db), ['config']);
 });
 
-// DEFAULT (flag OFF): workspace-admin-only — the creator is NOT allowed, exactly as pre-PR.
-test('flag off (default): channel creator is denied — workspace-admin-only', async (t) => {
-  const { c, db } = await ctx(t, { slackAdmin: false, creator: ID.userId, allowCreator: false });
-  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /Only a workspace admin can/);
+// (b) A non-member is denied + audited 'not-member' (default-deny intact).
+test('member gate: a non-member is denied and audited not-member', async (t) => {
+  const { c, db } = await ctx(t, { member: false });
+  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /Only a current member of this channel/);
+  assert.equal(await mode(db), null);
+  const rows = (await db.all('SELECT action, meta FROM audit')) as any[];
+  assert.deepEqual(rows.map((r) => r.action), ['denied']);
+  assert.match(rows[0].meta, /not-member/);
+});
+
+// (c) Fail-closed: when membership cannot be read (conversations.members throws), refuse + audit.
+test('member gate: a membership read error fails closed → denied', async (t) => {
+  const { c, db } = await ctx(t, { member: true, membersThrow: true });
+  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /member of this channel/);
   assert.equal(await mode(db), null);
   assert.deepEqual(await auditActions(db), ['denied']);
 });
 
-// (b) Neither workspace admin nor creator → denied + audited (default-deny intact), flag irrelevant.
-test('non-admin non-creator is denied and audited', async (t) => {
-  const { c, db } = await ctx(t, { slackAdmin: false, creator: 'U_SOMEONE_ELSE', allowCreator: true });
-  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /admin/);
+// (d) Membership is necessary, not sufficient: the channel-class rule still applies after it.
+test('member gate: a member is still refused on an unreadable channel class (fail closed)', async (t) => {
+  const { c, db } = await ctx(t, { member: true, infoThrows: true });
+  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'));
   assert.equal(await mode(db), null);
-  assert.deepEqual(await auditActions(db), ['denied']);
-});
-
-// (c) A workspace admin is still allowed, even without the flag and without creating the channel.
-test('workspace admin (not creator) is still allowed, flag off', async (t) => {
-  const { c, db } = await ctx(t, { slackAdmin: true, creator: 'U_SOMEONE_ELSE', allowCreator: false });
-  await c.setChannelMode('mcp', 'per-user');
-  assert.equal(await mode(db), 'per-user');
-  assert.deepEqual(await auditActions(db), ['config']);
-});
-
-// (d) A custom adminCheck override fully replaces the default: false blocks even the channel creator.
-test('adminCheck override false blocks even the channel creator', async (t) => {
-  const { c, db } = await ctx(t, { slackAdmin: false, creator: ID.userId, allowCreator: true, adminCheck: async () => false });
-  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /admin/);
-  assert.equal(await mode(db), null);
-  assert.deepEqual(await auditActions(db), ['denied']);
-});
-
-// Fail-closed on the new API surface: flag on, not a workspace admin, conversations.info throws →
-// isChannelAdmin can't confirm the creator → DENIED + audited.
-test('flag on: conversations.info error fails closed → denied', async (t) => {
-  const { c, db } = await ctx(t, { slackAdmin: false, creator: ID.userId, allowCreator: true, infoThrows: true });
-  await assert.rejects(() => c.setChannelMode('mcp', 'per-user'), /admin/);
-  assert.equal(await mode(db), null);
-  assert.deepEqual(await auditActions(db), ['denied']);
 });
 
 // The COMMAND paths (enable/disable tool allowlist + the configure pre-modal gate) route through
-// commandAdmin, not requireAdmin — assert they honor the same opt-in creator rule.
-async function commandHarness(t: TestContext, opts: {
-  creator: string;
-  allowCreator?: boolean;
-  isAdmin?: (client: any, userId: string, teamId: string) => Promise<boolean>;
-}) {
+// channelMember, not requireMember — assert they honor the same membership rule.
+async function commandHarness(t: TestContext, opts: { member: boolean }) {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [provider], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t),
-    allowChannelCreatorConfig: opts.allowCreator ?? false, isAdmin: opts.isAdmin,
   });
   let handler: any;
   lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
@@ -366,8 +346,10 @@ async function commandHarness(t: TestContext, opts: {
   let opened: any = null;
   const updates: any[] = [];
   const client = {
-    users: { info: async () => ({ user: { is_admin: false } }) }, // never a workspace admin
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: opts.creator } }) },
+    conversations: {
+      info: async () => ({ channel: { id: 'C_FIN', is_channel: true, creator: 'U_SOMEONE_ELSE' } }),
+      members: async () => ({ members: opts.member ? [ID.userId] : ['U_SOMEONE_ELSE'] }),
+    },
     views: {
       open: async (a: any) => {
         opened = a;
@@ -389,9 +371,9 @@ async function commandHarness(t: TestContext, opts: {
   };
 }
 
-// Flag on: channel creator can enable/disable tools and open the configure modal.
-test('flag on: channel creator can run enable/disable and pass the configure gate', async (t) => {
-  const h = await commandHarness(t, { creator: ID.userId, allowCreator: true });
+// A current member can enable/disable tools and open the configure modal.
+test('member gate: a channel member can run enable/disable and pass the configure gate', async (t) => {
+  const h = await commandHarness(t, { member: true });
 
   // The configure gate is asserted FIRST, on purpose. `enable`/`disable` write a channel-interaction
   // tombstone (core/tools.ts → purgeChannelInteractionState), and the provisioning fence
@@ -400,7 +382,7 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
   // SAME fence-clock instant as a preceding config mutation is refused with "Review current status"
   // and h.hydrated() stays null. Since #290 the fence clock is microseconds, so back-to-back slash
   // commands no longer tie in practice — but the ordering here still deliberately leaves the fence
-  // nothing to tie against, keeping this test about the admin gates rather than fence timing. The
+  // nothing to tie against, keeping this test about the member gates rather than fence timing. The
   // aged-tombstone test below covers the non-blocking fence direction explicitly. Do NOT add
   // sleeps; for post-disable ordering use a second commandHarness (fresh schema, no tombstone).
   await h.run('connect-shared mcp');
@@ -423,8 +405,8 @@ test('flag on: channel creator can run enable/disable and pass the configure gat
 // aging it by 10s (µs) makes the outcome deterministic at any clock resolution — no sleeps — so
 // this pins the fence comparison itself, not scheduler timing. Blocking-direction coverage lives
 // in test/safe-error.test.ts; without this test an always-block regression would pass the suite.
-test('flag on: a channel tombstone older than the setup receipt does not block connect-shared', async (t) => {
-  const h = await commandHarness(t, { creator: ID.userId, allowCreator: true });
+test('member gate: a channel tombstone older than the setup receipt does not block connect-shared', async (t) => {
+  const h = await commandHarness(t, { member: true });
   await h.run('enable mcp');
   assert.match(h.out[0], /Enabled/);
   await h.lan.db.run(
@@ -440,47 +422,26 @@ test('flag on: a channel tombstone older than the setup receipt does not block c
   );
 });
 
-// Flag off (default): the creator is denied on the same command paths — workspace-admin-only.
-test('flag off (default): channel creator is denied on enable/configure', async (t) => {
-  const h = await commandHarness(t, { creator: ID.userId, allowCreator: false });
+// A non-member is denied on the same command paths; every attempt is audited 'denied'.
+test('member gate: a non-member is denied on enable/configure', async (t) => {
+  const h = await commandHarness(t, { member: false });
   await h.run('enable mcp');
-  assert.match(h.out[0], /Only a workspace admin can/);
+  assert.match(h.out[0], /Only a current member of this channel/);
   await h.run('connect-shared mcp');
-  assert.ok(h.opened());
-  assert.equal(h.hydrated(), null);
+  assert.match(h.out[1], /Only a current member of this channel/);
+  assert.ok(h.opened()); // the trigger is consumed into a loading view before the gate
+  assert.equal(h.hydrated(), null); // but no credential form authority
+  const rows = (await h.lan.db.all('SELECT action, meta FROM audit')) as any[];
+  assert.ok(rows.length >= 2 && rows.every((r) => r.action === 'denied' && r.meta.includes('not-member')));
 });
 
-// A non-creator non-admin is denied on the command paths even with the flag on.
-test('flag on: non-creator non-admin is denied on enable/configure', async (t) => {
-  const h = await commandHarness(t, { creator: 'U_SOMEONE_ELSE', allowCreator: true });
-  await h.run('enable mcp');
-  assert.match(h.out[0], /admin or the channel creator/);
-  await h.run('connect-shared mcp');
-  assert.match(h.out[1], /admin or the channel creator/);
-  assert.ok(h.opened());
-  assert.equal(h.hydrated(), null);
-  assert.ok((await h.lan.db.all('SELECT action FROM audit') as any[]).every((r) => r.action === 'denied'));
-});
-
-// commandAdmin override precedence: flag on + a creator, but an isAdmin override returning false
-// still blocks the enable/disable path (override fully replaces the built-in gate).
-test('flag on: isAdmin override false blocks the creator on the command path', async (t) => {
-  const h = await commandHarness(t, { creator: ID.userId, allowCreator: true, isAdmin: async () => false });
-  await h.run('enable mcp');
-  assert.doesNotMatch(h.out[0], /Enabled/);
-  const row = await h.lan.db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
-  assert.equal(row, undefined); // never written
-});
-
-// #196: `union` was removed. It must be rejected at the config boundary BEFORE any persist/audit
-// (SEC-4), both at the guard the slash command routes through and at the true sink (ChannelConfig).
 test('union mode is rejected at the config boundary, writing nothing (SEC-4)', async (t) => {
   // The single-source-of-truth guard no longer admits it; the surviving three still pass.
   assert.equal(isChannelMode('union'), false);
   for (const m of ['shared', 'per-user', 'session']) assert.equal(isChannelMode(m), true);
 
   // Slash command: an admin creator runs `mode mcp union` → the usage message, and NO row is written.
-  const h = await commandHarness(t, { creator: ID.userId, allowCreator: true });
+  const h = await commandHarness(t, { member: true });
   await h.run('mode mcp union');
   assert.match(h.out[0], /Usage: `\/vouchr mode/);
   const cfgRow = await h.lan.db.get(

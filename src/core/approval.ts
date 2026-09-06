@@ -29,7 +29,7 @@ import {
 } from './interaction';
 import { channelOwner, userOwner, type Owner } from './owner';
 import type { Policy } from './policy';
-import { isBrokeredProvider, type ProviderRegistry } from './providers';
+import { APPROVERS, isBrokeredProvider, type Approver, type ProviderRegistry } from './providers';
 import { SessionGrants } from './session';
 import { ChannelTools } from './tools';
 import type { Vault } from './vault';
@@ -83,21 +83,21 @@ export function approvalActionFingerprint(key: ApprovalKey): string {
   return `hmac-sha256:${approvalActionKey(key)}`;
 }
 
-/** Opaque, row-specific digest of the exact recipient class/set whose current prompt delivery may
- * be reused. Slack membership/admin reads stay in Bolt, but only this bounded digest is persisted;
- * a self→admin rule change or admin-roster change therefore cannot inherit another audience's
- * delivered marker. */
+/** Opaque, row-specific digest of the exact recipient class/surface whose current prompt delivery
+ * may be reused: the requester for `self`, the owning channel for `member`. Only this bounded digest
+ * is persisted; a self→member rule change therefore cannot inherit the other surface's delivered
+ * marker. */
 export function approvalDeliveryAudienceKey(
   approvalId: string,
-  approver: 'self' | 'admin',
+  approver: Approver,
   recipients: readonly string[],
 ): string {
-  if (!isInteractionId(approvalId) || (approver !== 'self' && approver !== 'admin')) {
+  if (!isInteractionId(approvalId) || !APPROVERS.includes(approver)) {
     throw new Error('invalid approval delivery audience');
   }
   const normalized = [...new Set(recipients)].sort();
   if (
-    (approver === 'self' && normalized.length !== 1)
+    normalized.length !== 1
     || normalized.some((recipient) => (
       typeof recipient !== 'string' || recipient.length === 0 || recipient.length > 255
     ))
@@ -111,6 +111,14 @@ export function approvalDeliveryAudienceKey(
     hash.update(value);
   }
   return hash.digest('hex');
+}
+
+/** The approver rule that actually applies to ONE request (#322): `member` means "another member of
+ * the channel that governs this action", so where no channel governs it (a DM or group DM, whose
+ * governance scope is null) it degrades to `self`. One helper for the injector, both Bolt delivery
+ * paths, and the click, so no site can disagree about who may decide. */
+export function effectiveApprover(approver: Approver, governableChannel: string | null): Approver {
+  return approver === 'member' && governableChannel === null ? 'self' : approver;
 }
 
 /** Default validity of an approval once granted (#113): 5 minutes, unless the provider sets ttlMs. */
@@ -158,8 +166,9 @@ export class ApprovalRequiredError extends Error {
 
   constructor(
     public provider: string,
-    /** Who may decide: 'self' = the acting user; 'admin' = an eligible channel admin. */
-    public approver: 'self' | 'admin',
+    /** Who may decide, already resolved for this request's conversation (effectiveApprover):
+     * 'self' = the acting user; 'member' = any other current member of the owning channel. */
+    public approver: Approver,
     public method: string,
     public host: string,
     /** Bounded keyed digest only. Raw caller-controlled action fields never reach errors/Slack. */

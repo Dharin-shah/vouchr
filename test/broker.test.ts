@@ -1646,7 +1646,7 @@ test('#194 a delayed assertion cannot retarget disconnect onto a later reconnect
   }
 });
 
-test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user', async (t) => {
+test('#54 /v1/admin/offboard with the signed offboard target clears the target user', async (t) => {
   const { server, port, vault, db } = await makeBroker(t);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -1660,7 +1660,7 @@ test('#54 /v1/admin/offboard with a signed isAdmin claim clears the target user'
     await vault.userProvisioningIssuedAt(),
   ));
   try {
-    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET), targetUserId: 'U2' });
+    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ userId: 'ADMIN', offboardTargetUserId: 'U2' }), SECRET), targetUserId: 'U2' });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.revoked, ['acme']);
     assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), null);
@@ -1691,7 +1691,7 @@ test('#194 team admin offboard reports incomplete when upstream revocation fails
   }) as any;
   try {
     const response = await post(port, '/v1/admin/offboard', {
-      identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET),
+      identityToken: signIdentity(claims({ userId: 'ADMIN', offboardTargetUserId: target.userId }), SECRET),
       targetUserId: target.userId,
     });
     assert.equal(response.status, 200);
@@ -1726,7 +1726,7 @@ test('#194 team admin offboard reports incomplete when its audit row cannot be r
   });
   try {
     const response = await post(port, '/v1/admin/offboard', {
-      identityToken: signIdentity(claims({ userId: 'ADMIN', isAdmin: true }), SECRET),
+      identityToken: signIdentity(claims({ userId: 'ADMIN', offboardTargetUserId: target.userId }), SECRET),
       targetUserId: target.userId,
     });
     assert.equal(response.status, 200);
@@ -1739,29 +1739,33 @@ test('#194 team admin offboard reports incomplete when its audit row cannot be r
   }
 });
 
-test('#54 /v1/admin/offboard without the signed isAdmin claim -> 403 (forged body can\'t assert admin)', async (t) => {
+test('#54 /v1/admin/offboard without the signed offboard target -> 403 (the body cannot nominate the subject)', async (t) => {
   const { server, port, vault } = await makeBroker(t);
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   try {
-    // A plain user token, plus a forged body isAdmin flag (ignored — authority is the signed claim only).
-    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims(), SECRET), targetUserId: 'U2', isAdmin: true } as any);
+    // A plain user token (no offboardTargetUserId) plus a body target: refused before any mutation.
+    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims(), SECRET), targetUserId: 'U2' });
     assert.equal(r.status, 403);
+    assert.deepEqual(r.json, { error: 'signed offboard target required' });
+    // A signed target that names a DIFFERENT user than the body is refused the same way.
+    const mismatch = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ offboardTargetUserId: 'U3' }), SECRET), targetUserId: 'U2' });
+    assert.equal(mismatch.status, 403);
     assert.ok(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U2' }), 'acme'), 'a refused offboard must not remove anything');
   } finally {
     server.close();
   }
 });
 
-test('#194 /v1/admin/offboard rejects an assertion issued before the acting admin was offboarded', async (t) => {
+test('#194 /v1/admin/offboard rejects an assertion issued before the acting user was offboarded', async (t) => {
   const { server, port, vault, db } = await makeBroker(t);
   const actor = { enterpriseId: null, teamId: 'T1', userId: 'ADMIN' };
   const target = { enterpriseId: null, teamId: 'T1', userId: 'U2' };
   await vault.upsert(userOwner(target), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const stale = signIdentity(claims({ userId: actor.userId, isAdmin: true }), SECRET);
+  const stale = signIdentity(claims({ userId: actor.userId, offboardTargetUserId: target.userId }), SECRET);
   await new Consent(db).markOffboarded(actor);
   try {
     const response = await post(port, '/v1/admin/offboard', {
@@ -1771,7 +1775,7 @@ test('#194 /v1/admin/offboard rejects an assertion issued before the acting admi
     assert.equal(response.status, 409);
     assert.equal(response.json.code, 'interaction_state_changed');
     assert.equal(response.json.recovery, 'resolve_again');
-    assert.ok(await vault.get(userOwner(target), 'acme'), 'the stale admin cannot remove the target');
+    assert.ok(await vault.get(userOwner(target), 'acme'), 'the stale actor cannot remove the target');
     assert.equal(
       (await db.get<{ n: number }>(
         `SELECT COUNT(*)::int AS n FROM offboard_tombstone WHERE team_id=? AND user_id=?`,
@@ -1788,14 +1792,14 @@ test('#194 /v1/admin/offboard rejects an assertion issued before the acting admi
 test('#54 /v1/admin/offboard requires a targetUserId', async (t) => {
   const { server, port } = await makeBroker(t);
   try {
-    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ isAdmin: true }), SECRET) });
+    const r = await post(port, '/v1/admin/offboard', { identityToken: signIdentity(claims({ offboardTargetUserId: 'U2' }), SECRET) });
     assert.equal(r.status, 400);
   } finally {
     server.close();
   }
 });
 
-test('#194 enterprise offboard binds the target in the signed admin assertion', async (t) => {
+test('#194 enterprise offboard binds the target in the signed assertion', async (t) => {
   const { server, port, vault, db } = await makeBroker(t);
   const foreign = { enterpriseId: null, teamId: 'T_FOREIGN', userId: 'U_FOREIGN' };
   await vault.upsert(userOwner(foreign), 'acme', {
@@ -1805,7 +1809,6 @@ test('#194 enterprise offboard binds the target in the signed admin assertion', 
     const forged = await post(port, '/v1/admin/offboard', {
       identityToken: signIdentity(claims({
         userId: 'ADMIN',
-        isAdmin: true,
         enterpriseId: 'E1',
         offboardTargetUserId: 'U_E1_MEMBER',
       }), SECRET),
@@ -1839,7 +1842,6 @@ test('#194 enterprise offboard accepts the exact signed target', async (t) => {
         teamId: 'T1',
         userId: 'ADMIN',
         channel: 'C1',
-        isAdmin: true,
         enterpriseId: target.enterpriseId,
         offboardTargetUserId: target.userId,
       }, SECRET),
@@ -1871,7 +1873,6 @@ test('#194 enterprise admin offboard includes a team with upstream debt in incom
         teamId: 'T1',
         userId: 'ADMIN',
         channel: 'C1',
-        isAdmin: true,
         enterpriseId: target.enterpriseId,
         offboardTargetUserId: target.userId,
       }, SECRET),
@@ -2049,7 +2050,7 @@ async function makeAdminBroker(t: TestContext, extra: Partial<Parameters<typeof 
 }
 
 function adminToken(over: Partial<IdentityClaims> = {}): string {
-  return signIdentity(claims({ userId: 'ADMIN', isAdmin: true, channelEligible: true, ...over }), SECRET);
+  return signIdentity(claims({ userId: 'ADMIN', channelEligible: true, ...over }), SECRET);
 }
 
 test('#53 admin reference stores a channel ref, flips to shared; a member fetch resolves it at egress', async (t) => {
@@ -2082,32 +2083,6 @@ test('#53 admin reference stores a channel ref, flips to shared; a member fetch 
     assert.ok(!r.raw.includes(SECRET_TOKEN) && !f.raw.includes(SECRET_TOKEN));
   } finally {
     up.restore();
-    server.close();
-  }
-});
-
-test('#53 non-admin signed token -> refused (nothing configured)', async (t) => {
-  const { server, port, channelConfig } = await makeAdminBroker(t);
-  try {
-    const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
-    });
-    assert.equal(r.status, 403);
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
-  } finally {
-    server.close();
-  }
-});
-
-test('#53 forged body admin flag (no signed isAdmin claim) -> refused', async (t) => {
-  const { server, port } = await makeAdminBroker(t);
-  try {
-    const r = await post(port, '/v1/admin/reference', {
-      handle: { provider: 'acme' }, identityToken: signIdentity(claims({ channelEligible: true }), SECRET),
-      source: 'aws-sm', secretRef: AWS_ADMIN_REF, isAdmin: true,
-    } as any);
-    assert.equal(r.status, 403);
-  } finally {
     server.close();
   }
 });
@@ -2315,7 +2290,7 @@ test('#194 stale assertions reach no mutation-route probe, denial audit, or stat
     channelTools: new ChannelTools(sharedDb),
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
   }));
-  const staleClaims = { isAdmin: false, channelEligible: false };
+  const staleClaims = { channelEligible: false };
   const routes = [
     {
       name: 'disconnect',

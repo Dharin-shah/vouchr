@@ -14,7 +14,7 @@ product boundaries remain in [`vision.md`](../vision.md); the security model rem
 | Shape | Choose it when | Slack experience | Credential-use path |
 | --- | --- | --- | --- |
 | Embedded Bolt | The agent and Vouchr run in the same Node/Bolt process. | Built in | `context.vouchr.connect()` then `handle.fetch()` |
-| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Admin, connect, session, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
+| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Channel configuration, connect, session, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
 | Pure headless | There is no Slack control plane, or the host intentionally owns every UI. | Host-built | Private broker API |
 
 If the agent already runs in the same Bolt process, embedded Bolt is simpler. Hybrid is not a
@@ -25,7 +25,7 @@ handle.
 
 ```mermaid
 flowchart LR
-    U["Slack user or admin"] --> S["Slack"]
+    U["Slack user"] --> S["Slack"]
     S -->|"events, /vouchr, interactivity"| C["Public Bolt control service"]
     O["Provider OAuth"] -->|"/vouchr/oauth/callback"| C
     C -->|"connections, channel config, audit"| P[("PostgreSQL")]
@@ -48,16 +48,16 @@ no second credential database. The two planes form one Vouchr deployment through
 
 | Component | Owns | Must not own |
 | --- | --- | --- |
-| Bolt control service | Slack signature verification, `/vouchr`, App Home, modals, provider OAuth callback, Slack-derived identity/admin/channel facts | Provider egress for remote workers; a public broker route |
+| Bolt control service | Slack signature verification, `/vouchr`, App Home, modals, provider OAuth callback, Slack-derived identity/membership/channel facts | Provider egress for remote workers; a public broker route |
 | Trusted request router/minter | Map the verified Slack event to a provider and owner, preflight Slack UX, mint one assertion for one broker call, and add it out of band after tool planning | Let the model choose identity claims; expose the assertion as a tool argument; expose the signing key to a generic worker |
-| Headless broker | Replay protection, credential lookup/decryption/refresh, policy and egress checks, HTTP/MCP call, audit | Slack UI, Slack admin discovery, arbitrary identity minting |
+| Headless broker | Replay protection, credential lookup/decryption/refresh, policy and egress checks, HTTP/MCP call, audit | Slack UI, Slack membership discovery, arbitrary identity minting |
 | PostgreSQL | Authoritative connections, config, sessions, replay records, and audit | Encryption-key storage |
 | Host/operator | Provider scopes, network perimeter, IAM, response handling/DLP, semantic write confirmation | Passing credentials through prompts, tools, logs, or Slack |
 
 ## 1. Reuse or create the Slack app
 
 Install Vouchr in the agent's existing Slack app for the complete hybrid flow. A separate Vouchr app
-can own App Home and `/vouchr` administration, but it does not automatically receive the agent app's
+can own App Home and `/vouchr` configuration, but it does not automatically receive the agent app's
 verified event or request-bound `context.vouchr`; on-demand per-user/session preflight then needs a
 trusted cross-app handoff that remains host-owned under #194. Slack sends one command/event URL to one
 receiver, so when reusing an app, install Vouchr in that app's existing Bolt ingress process or route
@@ -159,7 +159,6 @@ async function main() {
     baseUrl: process.env.PUBLIC_URL!,
     databaseUrl: process.env.VOUCHR_DATABASE_URL!,
     policy,
-    allowChannelCreatorConfig: false,
     requireChannelMembership: true,
   });
 
@@ -192,7 +191,7 @@ void main().catch(() => { process.exitCode = 1; });
 `install()` registers Vouchr's middleware, provider OAuth callback, `/vouchr`, App Home/actions and
 modals, `user_change` offboarding, and (unless disabled above) the TTL sweep. The control service
 writes connections and configuration directly to PostgreSQL. Its built-in Slack configuration path
-does **not** call `/v1/admin/*` and does not need an `isAdmin` identity claim.
+does **not** call `/v1/admin/*`.
 
 The provider uses Vouchr's default bearer injection. The packaged broker's JSON format cannot encode
 an `inject` function, so stock hybrid configuration is bearer-only. A non-Bearer header or custom
@@ -399,8 +398,8 @@ Use a schema-owner role only for `vouchr migrate`; both runtimes use DML-only cr
 
 The trusted Slack service or a narrow internal gateway mints a fresh, single-use assertion for each
 broker request. Never let a model, untrusted MCP client, or generic worker supply `teamId`, `userId`,
-`channel`, `threadTs`, `isAdmin`, `enterpriseId`, `offboardTargetUserId`, `ownerKind`, or
-`channelEligible` — or `channelType`.
+`channel`, `threadTs`, `enterpriseId`, `offboardTargetUserId`, `ownerKind`, or `channelEligible` —
+or `channelType`.
 
 ```ts
 import {
@@ -486,7 +485,10 @@ server-side manifest/config, never accepted from the worker. For a channel-owned
 signed `ownerKind: 'channel'` and `channelEligible: true` must agree with the request handle. The
 broker rejects disagreement.
 
-`channelEligible` proves the **channel class** only; it is not a signed membership claim. When
+`channelEligible` proves the **channel class** only; it is not a signed membership claim. Every
+channel governance write (`/v1/admin/reference`, `/v1/admin/mode` to `shared`, and `/v1/admin/tools`)
+requires it to be `true` unless the broker runs with `requireChannelEligibility: false`, matching
+Bolt's channel-class check on the same mutations. When
 `requireChannelMembership: true`, the Bolt `connect()` preflight below must also run for shared mode,
 because that is where membership is rechecked. A custom minter that skips Bolt preflight must verify
 membership itself before minting channel ownership.
@@ -495,12 +497,11 @@ If the worker is not trusted with the identity signing key, keep minting in the 
 either call the broker on the worker's behalf or expose a narrow internal gateway that accepts only
 the already-authenticated action. Never expose a generic “mint arbitrary claims” endpoint.
 
-`isAdmin: true` is only for custom callers of `/v1/admin/*`. Set it after the same fail-closed Slack
-admin predicate used by the UI; never copy a boolean from request input. The built-in Slack control
-path does not need this claim. For Enterprise Grid `/v1/admin/offboard`, also sign
-`offboardTargetUserId` from the authenticated SCIM/directory subject and require the body
-`targetUserId` to repeat that exact value. Never derive this claim from the generic request body;
-admin status alone does not authorize choosing an arbitrary global user.
+The `/v1/admin/*` configuration routes act on the signed `channel` only: any member of that channel
+may configure it (#322), so mint `channel` from the verified Slack event, never from request input.
+For `/v1/admin/offboard`, sign `offboardTargetUserId` from the authenticated SCIM/directory subject
+and require the body `targetUserId` to repeat that exact value. Never derive that claim from the
+generic request body; an ordinary user assertion cannot nominate a subject.
 
 ## 5. Bridge the Slack experience to the worker
 
@@ -557,7 +558,7 @@ app.event('app_mention', async ({ context, event, client, say }) => {
   if (result.brokerDenial) {
     // The supported #194 bridge: relay the typed broker denial body from this verified context.
     // Vouchr re-resolves everything server-side and takes the correct private action — the
-    // connect/key prompt, the thread session prompt, admin configuration direction, or the
+    // connect/key prompt, the thread session prompt, shared-credential configuration direction, or the
     // Approve/Deny decision surface for the pending approvalId.
     const recovery = await context.vouchr.recoverBrokerDenial('internal-mcp', result.brokerDenial);
     if (recovery.status === 'resolved' || recovery.status === 'stale') {
@@ -638,8 +639,8 @@ There are two honest designs:
 
 1. **Vouchr-enforced channel boundary.** Physically split read and write into different endpoints and
    provider IDs. The read credential/endpoint must be incapable of mutation. Apply default-deny
-   static `Policy` to the write provider, keep the mutable channel enablement as a second admin
-   control, and use a least-privilege write credential. The packaged broker enforces both boundaries;
+   static `Policy` to the write provider, keep the mutable channel enablement as a second control
+   owned by the channel's members, and use a least-privilege write credential. The packaged broker enforces both boundaries;
    the request proceeds only when static policy and mutable channel enablement allow it.
 2. **Host/MCP-server boundary.** Keep one MCP endpoint and let the trusted host/server classify tool
    names, authorize them, perform transaction-specific confirmation, and supply idempotency or
@@ -647,30 +648,30 @@ There are two honest designs:
    and endpoint, but its policy applies to the whole provider endpoint—not an individual JSON-RPC
    tool name or body.
 
-## What an admin and channel member actually do
+## What a channel member actually does
 
-“Admin” means a Slack workspace admin or owner by default. There can be any number of admins; Vouchr
-does not maintain an admin table. `allowChannelCreatorConfig: true` additionally permits the exact
-Slack channel creator, but it is off by default because ordinary members can create public channels.
-A custom `isAdmin(client, userId, teamId)` callback replaces both rules and fails closed on errors.
-It is workspace/user-scoped; it cannot currently express per-channel custom RBAC.
+The channel is the team and the trust boundary (#322). Any CURRENT member of a channel may
+configure it: `enable`/`disable`, `mode`, `connect-shared`/`disconnect-shared`, the config modal,
+and App Home governance. Membership is read from Slack (`conversations.members`) on every mutation
+and fails closed; there is no workspace-admin role, no creator rule, and no custom predicate. In a
+public channel every member can configure and approve, so govern agents from channels whose
+membership you control.
 
-The Bolt predicate also governs channel audit/stats and `approver: 'admin'` recipients. Automatic
-`user_change` offboarding is separate and does not ask for an interactive admin. On the headless
-surface, one signed `isAdmin` boolean gates configuration, channel audit, and the offboard route;
-Enterprise Grid offboarding additionally requires the signed `offboardTargetUserId` to equal the
-body target. Scoped headless roles are not supported.
+The same predicate governs channel audit/stats and who may decide a `member` approval (any member
+other than the requester). Automatic `user_change` offboarding is separate and asks nobody. On the
+headless surface the signed `channel` claim scopes configuration and channel audit, and the offboard
+route requires the signed `offboardTargetUserId` to equal the body target. Scoped headless roles are
+not supported.
 
 Owning the Vouchr service or PostgreSQL grants infrastructure control, not Slack UI authority. An
-operator must still satisfy the Slack/admin predicate to use the built-in control surface.
+operator must still be a member of the channel to use the built-in control surface for it.
 
 ### App Home flow
 
 1. Every user sees **Your connections** and available on-demand providers.
-2. With the default rule, workspace admins/owners see **Channel governance**. When
-   `allowChannelCreatorConfig` is enabled, users may see the channel picker first; controls appear
-   only after selecting a channel they created, and other selections fail closed.
-3. The admin picks an internal public/private channel.
+2. Everyone sees **Channel governance** with a channel picker; controls appear only after selecting
+   a channel they are a member of, and other selections fail closed with a private note.
+3. The member picks an internal public/private channel.
 4. Each brokered provider row shows mode, Enable/Disable, and Connect shared account controls.
 5. Mode and enablement changes persist immediately and the Home view refreshes.
 6. Errors and denials are private.
@@ -679,15 +680,15 @@ An `identity: 'service'` provider shows only Enable/Disable: its authentication 
 An internal MCP that should use a Vouchr-managed bearer/key must therefore be a brokered key provider,
 not a service provider. A service provider is outside Vouchr's credential/egress path, so its
 Enable/Disable bit is manifest metadata that the trusted host—not Vouchr—must enforce. The packaged
-admin route persists that bit in the same table as Bolt, and admin config plus the channel manifest
+`/v1/admin/tools` route persists that bit in the same table as Bolt, and `/v1/admin/config` plus the channel manifest
 report it consistently; Vouchr's fetch/MCP routes still refuse service credentials outright.
 
 Enable/Disable is deny-by-default channel policy. A channel with no `channel_tool` rows enables **no**
-provider; an admin opts each one in per channel (`/vouchr enable <provider>` or the App Home toggle)
+provider; a member opts each one in per channel (`/vouchr enable <provider>` or the App Home toggle)
 before its first use there, and untouched providers stay off. Direct messages are personal, not
 governed, so they never require an enable. Bolt's first toggle still materializes the full provider
 list so changing one provider does not change the others. Static `Policy` is the outer “only these
-channels” boundary; mutable tool state is the inner admin switch.
+channels” boundary; mutable tool state is the inner member-controlled switch.
 
 The equivalent slash-command flow is:
 
@@ -700,8 +701,8 @@ The equivalent slash-command flow is:
 /vouchr stats
 ```
 
-Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-only manifest; admins
-can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
+Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-only manifest; members
+of the channel can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
 prevention belong to the trusted host; Vouchr does not retain provider responses or publish a
 preview-visibility policy. The modal does not contain the shared-credential input; use App Home's
 Connect shared account action or `/vouchr connect-shared <provider>`.
@@ -804,11 +805,11 @@ state; recovery metadata is routing guidance, not authority.
 
 | Signal | Meaning | Safe response |
 | --- | --- | --- |
-| `409`, code `not_connected` | No usable owner credential | Relay to `recoverBrokerDenial`: user ownership gets the private connect/key flow; shared ownership directs an eligible admin to channel configuration. Do not loop broker retries |
-| `403`, code `tool_disabled` | The provider was never enabled in this channel (channels are deny-by-default) | Relay to `recoverBrokerDenial`: it privately tells the asking user an admin must enable it, in the same words the embedded path uses. Returns `notified`; the host adds nothing |
+| `409`, code `not_connected` | No usable owner credential | Relay to `recoverBrokerDenial`: user ownership gets the private connect/key flow; shared ownership directs the asking member to channel configuration. Do not loop broker retries |
+| `403`, code `tool_disabled` | The provider was never enabled in this channel (channels are deny-by-default) | Relay to `recoverBrokerDenial`: it privately tells the asking user a channel member must enable it, in the same words the embedded path uses. Returns `notified`; the host adds nothing |
 | `403`, code `policy_denied` | Provider policy denies this channel | Relay to `recoverBrokerDenial`: same private-notice path, returns `notified` |
 | `403`, code `session_approval_required` | No live thread grant | Relay to `recoverBrokerDenial` from the verified thread context: it creates/reuses the one thread-scoped approval prompt, and the click re-validates everything at the mutation. Retry only after the grant, with a fresh assertion |
-| `403`, code `approval_required` | A write needs a human grant | Relay to `recoverBrokerDenial`: the opaque `approvalId` is a lookup handle, never authority — the bridge re-reads the pending row, re-derives the self/admin rule from the registry, and delivers the decision surface. Retry only after one live grant, with a fresh assertion |
+| `403`, code `approval_required` | A write needs a human grant | Relay to `recoverBrokerDenial`: the opaque `approvalId` is a lookup handle, never authority — the bridge re-reads the pending row, re-derives the self/member rule from the registry, and delivers the decision surface. Retry only after one live grant, with a fresh assertion |
 | `policy_denied` or `tool_disabled` | Provider is not authorized here | Non-retryable `contact_admin`; never silently widen scope or loop retries. If you run the Slack control plane, relay to `recoverBrokerDenial` instead of rendering your own copy — it posts the notice and returns `notified` (see the denial table above). |
 | `429` code `rate_limited` or `503` code `overloaded` | Bounded back-pressure | Only `retry_later` outcomes are retryable; honor `Retry-After`, mint a fresh assertion, and retry only when the operation is safe |
 | `504`, code `upstream_timeout`, `retryable: false` | Provider outcome may be unknown | `retry_later` describes the operator/user action, not replay permission. Retry only a known-idempotent operation; never auto-replay an uncertain write |
@@ -836,10 +837,10 @@ provider+audit atomicity.
 
 ### Component outages
 
-- When Slack or the Slack API is unavailable, admin/channel verification and new prompts fail closed.
+- When Slack or the Slack API is unavailable, membership/channel verification and new prompts fail closed.
   The minter must never replace missing Slack facts with worker-supplied values.
 - When the control service is unavailable, App Home, `/vouchr`, provider OAuth callback, and new
-  assertions from a colocated minter are unavailable. The broker must not become a fallback admin UI.
+  assertions from a colocated minter are unavailable. The broker must not become a fallback configuration UI.
 - When the broker is unavailable or overloaded, agent use fails without weakening policy. Honor
   bounded back-pressure only for retry-safe operations and mint a fresh assertion per attempt.
 - When PostgreSQL, the schema, or the replay store is unavailable, `/readyz` returns 503 and the
@@ -941,8 +942,8 @@ vision and the open blocker set above.
   another component is not publishing the app's Home tab.
 - **Private channel cannot use shared credentials:** invite the app, then verify
   `conversations.info` succeeds and the channel is internal and active.
-- **Admin is refused:** default checks Slack `is_admin`/`is_owner`; a custom `isAdmin` replaces that
-  behavior entirely and fails closed on errors.
+- **A member is refused:** the gate reads `conversations.members` and fails closed; for a private
+  channel the app must be a member of it to read the roster (invite it), and the roster read is bounded.
 - **Slack configuration changes but broker still permits use:** verify both planes use the same
   PostgreSQL database/schema and provider id, the assertion carries the intended signed team/channel,
   and every broker runs the current release. There is no channel-allowlist cache to wait out.

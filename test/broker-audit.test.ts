@@ -29,7 +29,8 @@ function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
   return { teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID(), ...over };
 }
 const userToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims(over), SECRET);
-const adminToken = (over: Partial<IdentityClaims> = {}) => signIdentity(claims({ isAdmin: true, ...over }), SECRET);
+// #322: the signed channel claim IS the authority for `/v1/admin/audit` (any member of the channel).
+const adminToken = userToken;
 const STALE_ACTOR_ERROR = {
   error: 'authorization changed; resolve and retry',
   code: 'interaction_state_changed',
@@ -131,16 +132,18 @@ test('POST /v1/admin/audit: signed admin sees only THIS channel\'s rows', async 
   } finally { server.close(); }
 });
 
-test('POST /v1/admin/audit: a non-admin token is refused (authority is the signed claim, not the body)', async (t) => {
-  const { server, port } = await harness(t);
+test('POST /v1/admin/audit: any channel-scoped member token reads its own channel (#322); body flags are ignored', async (t) => {
+  const { audit, server, port } = await harness(t);
   try {
-    // A forged body isAdmin must be ignored — only the signed claim counts.
-    const res = await request(port, 'POST', '/v1/admin/audit', { identityToken: userToken(), isAdmin: true } as any);
-    assert.equal(res.status, 403);
+    await audit.record('inject', uid('U2'), 'gh-in-c1', { channel: 'C1' });
+    // Forged body fields carry no authority either way — the signed channel claim decides scope.
+    const res = await request(port, 'POST', '/v1/admin/audit', { identityToken: userToken(), channel: 'C2', isAdmin: true } as any);
+    assert.equal(res.status, 200);
+    assert.deepEqual(res.json.events.map((e: any) => e.provider), ['gh-in-c1']);
   } finally { server.close(); }
 });
 
-test('POST /v1/admin/audit rejects stale admin and non-admin assertions before reads or denial audit', async (t) => {
+test('POST /v1/admin/audit rejects stale assertions before reads', async (t) => {
   const { audit, db, server, port } = await harness(t);
   try {
     await audit.record('inject', uid('U2'), 'gh-visible-only-to-current-admin', { channel: 'C1' });
@@ -157,7 +160,7 @@ test('POST /v1/admin/audit rejects stale admin and non-admin assertions before r
     assert.equal(
       (await db.get<{ n: number }>('SELECT COUNT(*)::int AS n FROM audit'))?.n,
       before?.n,
-      'stale admin reads are refused before requireAdmin can append a denial row',
+      'stale reads are refused before any row could be appended',
     );
   } finally { server.close(); }
 });

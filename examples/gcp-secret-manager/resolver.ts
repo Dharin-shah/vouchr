@@ -1,7 +1,7 @@
 // GCP Secret Manager resolver for Vouchr.
 //
 // Resolves a secret JIT: when the injector needs the credential it calls this
-// resolver with the reference the admin configured, fetches the live secret payload
+// resolver with the reference a channel member configured, fetches the live secret payload
 // from GCP Secret Manager, and hands it straight to the outbound request. Vouchr
 // stores only the non-secret reference and never caches the value here. Rotation
 // stays entirely in GCP SM, so a rotated secret is picked up on the next call.

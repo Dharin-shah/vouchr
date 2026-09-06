@@ -4,7 +4,7 @@ import { awsSecretsManager } from './resolver';
 // Wire the AWS Secrets Manager resolver into Vouchr. Its 'aws-sm' key matches the source Vouchr
 // derives from a supported Secrets Manager ARN; configuration checks presence without resolving.
 //
-// An admin then runs, from inside the channel they want to configure:
+// A member of the channel then runs, from inside the channel to configure:
 //
 //   /vouchr connect-shared github
 //

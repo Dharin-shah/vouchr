@@ -21,73 +21,46 @@ const provider = defineProvider({
   egressAllow: ['api.test'], refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
 });
 
-// Mirrors channel.test.ts's ctx() but exposes the two governance knobs. `members` shapes the
-// mocked conversations.members: a member-id list, or 'throw' to fail the membership check.
+// Mirrors channel.test.ts's ctx() but exposes the governance knobs. `slack.members` shapes the
+// mocked conversations.members LIVE (mutate it between calls): a member-id list, or 'throw' to fail
+// the membership read. Configuration is member-gated (#322) and reads the same fake.
 async function ctx(t: TestContext, opts: {
-  adminCheck?: (client: any, userId: string, teamId: string) => Promise<boolean>;
   requireMembership?: boolean;
   members?: string[] | 'throw';
-  slackAdmin?: boolean; // what the built-in users.info gate reports
   clientToken?: string;
   slackClientOptions?: any;
 } = {}) {
-  const {
-    adminCheck, requireMembership = false, members = [ID.userId], slackAdmin = true,
-    clientToken, slackClientOptions,
-  } = opts;
+  const { requireMembership = false, clientToken, slackClientOptions } = opts;
+  const slack = { members: opts.members ?? [ID.userId] };
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const client = {
     ...(clientToken ? { token: clientToken } : {}),
-    users: { info: async () => ({ user: { is_admin: slackAdmin } }) },
     conversations: {
       info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }),
       members: async () => {
-        if (members === 'throw') throw new Error('channel_not_found');
-        return { members };
+        if (slack.members === 'throw') throw new Error('channel_not_found');
+        return { members: slack.members };
       },
     },
   } as any;
   const c = new ConnectContext({
     identity: ID, channel: 'C_FIN', client, registry: new ProviderRegistry([provider]), vault, audit,
     consent: new Consent(db), policy: new Policy(), redirectUri: 'http://x',
-    channelConfig: new ChannelConfig(db), adminCheck, requireMembership, slackClientOptions,
+    channelConfig: new ChannelConfig(db), requireMembership, slackClientOptions,
   });
-  return { c, db, vault, audit };
+  return { c, db, vault, audit, slack };
 }
 
 const auditRows = async (db: any) => await db.all('SELECT action, meta FROM audit') as any[];
 
-// isAdmin override: a custom check overrides the built-in Slack gate. slackAdmin:false proves the
-// override (not users.info) decides: a non-Slack-admin can configure when the override says yes.
-test('isAdmin override: custom true lets a non-Slack-admin configure', async (t) => {
-  const { c, vault, db } = await ctx(t, { adminCheck: async () => true, slackAdmin: false });
-  await c.setChannelSecret('mcp', SECRET);
-  assert.equal((await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
-  assert.deepEqual((await auditRows(db)).map((r) => r.action), ['config']);
-});
-
-// Override false blocks even a real Slack admin. Default-deny + audited denial stays intact.
-test('isAdmin override: custom false blocks and audits denied', async (t) => {
-  const { c, vault, db } = await ctx(t, { adminCheck: async () => false, slackAdmin: true });
-  await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /admin/);
-  assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-  assert.deepEqual((await auditRows(db)).map((r) => r.action), ['denied']);
-});
-
-// A throwing override fails closed (treated as not-admin), denial still audited.
-test('isAdmin override: a throwing override fails closed', async (t) => {
-  const { c, db } = await ctx(t, { adminCheck: async () => { throw new Error('rbac down'); } });
-  await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /admin/);
-  assert.deepEqual((await auditRows(db)).map((r) => r.action), ['denied']);
-});
-
 // requireChannelMembership ON: a configured shared cred is refused for a non-member, audited
-// 'not-member', and allowed for a member.
+// 'not-member', and allowed for a member. (A member configures it; the roster then changes.)
 test('requireChannelMembership: non-member refused + audited, member allowed', async (t) => {
-  const deny = await ctx(t, { requireMembership: true, members: ['U_OTHER'] });
-  await deny.c.setChannelSecret('mcp', SECRET); // admin config is not membership-gated
+  const deny = await ctx(t, { requireMembership: true });
+  await deny.c.setChannelSecret('mcp', SECRET);
+  deny.slack.members = ['U_OTHER']; // the actor left (or was removed) after configuring
   await assert.rejects(() => deny.c.connectChannel('mcp'), /member of this channel/);
   assert.ok((await auditRows(deny.db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
 
@@ -96,18 +69,20 @@ test('requireChannelMembership: non-member refused + audited, member allowed', a
   assert.ok(await ok.c.connectChannel('mcp')); // member → handle
 });
 
-// requireChannelMembership OFF (default): membership is never checked, a non-member still gets the
-// shared cred, exactly as before this feature.
-test('requireChannelMembership: off → membership not checked', async (t) => {
-  const { c } = await ctx(t, { requireMembership: false, members: 'throw' });
+// requireChannelMembership OFF (default): membership is never checked at USE, a non-member still gets
+// the shared cred, exactly as before this feature. (Configuration itself is always member-gated.)
+test('requireChannelMembership: off → membership not checked at use', async (t) => {
+  const { c, slack } = await ctx(t, { requireMembership: false });
   await c.setChannelSecret('mcp', SECRET);
+  slack.members = 'throw';
   assert.ok(await c.connectChannel('mcp')); // would throw if membership were consulted
 });
 
 // Fail-closed: when membership can't be verified (conversations.members throws), refuse.
 test('requireChannelMembership: membership check errors → refused', async (t) => {
-  const { c, db } = await ctx(t, { requireMembership: true, members: 'throw' });
+  const { c, db, slack } = await ctx(t, { requireMembership: true });
   await c.setChannelSecret('mcp', SECRET);
+  slack.members = 'throw';
   await assert.rejects(() => c.connectChannel('mcp'), /member of this channel/);
   assert.ok((await auditRows(db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
 });
@@ -131,26 +106,26 @@ test('requireChannelMembership: token-bearing clients use the bounded zero-retry
       clientToken: 'xoxb-membership-test',
       slackClientOptions: { slackApiUrl: 'https://slack-proxy.internal/api/' },
     });
-    await c.setChannelSecret('mcp', SECRET);
+    await c.setChannelSecret('mcp', SECRET); // the member gate reads membership through the same bound
     assert.ok(await c.connectChannel('mcp'));
-    assert.deepEqual(seen, [{
+    const bounded = {
       method: 'conversations.members',
       retries: 0,
       rejectRateLimited: true,
       apiUrl: 'https://slack-proxy.internal/api/',
-    }]);
+    };
+    assert.deepEqual(seen, [bounded, bounded]);
   } finally {
     prototype.apiCall = realApiCall;
   }
 });
 
-test('/vouchr commands honor the custom isAdmin override', async (t) => {
+test('/vouchr commands pass the member gate for a current channel member', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const lan = await createVouchr({
     providers: [provider],
     baseUrl: 'http://127.0.0.1:1',
     db: await openTestDb(t),
-    isAdmin: async () => true, // overrides the mocked Slack users.info=false below
   });
   let handler: any;
   lan.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
@@ -159,10 +134,13 @@ test('/vouchr commands honor the custom isAdmin override', async (t) => {
   let opened: any = null;
   let hydrated: any = null;
   const client = {
-    users: { info: async () => ({ user: { is_admin: false } }) },
     // enable/connect-shared now assert channel eligibility at the mutation (like mode always did),
-    // so the fake must serve conversations.info for an ordinary eligible channel.
-    conversations: { info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }) },
+    // so the fake must serve conversations.info for an ordinary eligible channel, and the member
+    // gate (#322) reads conversations.members.
+    conversations: {
+      info: async () => ({ channel: { id: 'C_FIN', is_channel: true } }),
+      members: async () => ({ members: [ID.userId] }),
+    },
     views: {
       open: async (a: any) => {
         opened = a;
