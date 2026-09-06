@@ -350,10 +350,14 @@ into many actions, or to skip the approval entirely.
 
 - **Mitigated.** The gate runs in the injector strictly AFTER every egress gate (an
   egress-denied target never even prompts — approval can widen nothing) and BEFORE the
-  secret is read. A grant is SINGLE-USE — consumed with atomic `DELETE ... RETURNING`,
-  so two concurrent retries cannot both spend it — TTL-bound (default 5 minutes), and matches ONLY the exact
-  (method, origin, path, query) it was minted for: not a prefix, not a pattern, never a
-  class of actions. The query is bound BYTE-EXACT, as a digest of the exact query string
+  secret is read. A grant has one of two scopes, both TTL-bound (`approval.ttlMs`, default 5
+  minutes, capped at the shared timer ceiling so no grant outlives the sweep). `once` (the default) is
+  SINGLE-USE — consumed with atomic `DELETE ... RETURNING`, so two concurrent retries cannot both
+  spend it — and matches ONLY the exact (method, origin, path, query) it was minted for: not a
+  prefix, not a pattern, never a class of actions. `thread` covers every call of that provider that
+  needs approval in the approving thread until the TTL, is matched on its full scope (team, channel,
+  thread, requester, provider, credential owner), is not deleted on consume, and never leaves that
+  thread; the prompt says which scope it grants. The query is bound BYTE-EXACT, as a digest of the exact query string
   sent upstream — no sorting or normalization, since upstream parsers legitimately treat
   reordered or duplicated parameters differently — so a replanning or prompt-injected
   agent cannot spend an approval of `POST /transfer?to=alice&amount=10` on
@@ -361,10 +365,13 @@ into many actions, or to skip the approval entirely.
   Query parameter names and values are BOTH caller-controlled and may carry tokens,
   signed-URL material, or PII, so neither is ever persisted, audited, logged, or rendered.
   Origin binds scheme, hostname, and effective port, so a loopback approval on one development port
-  cannot authorize another. Raw paths can carry sensitive material, so Slack, public errors, and audit show a fixed-size action
-  fingerprint instead. It includes the random, non-output credential generation and every exact
-  action field, preventing dictionary reversal of a low-entropy path; the prompt shows only that
-  fingerprint and the parameter count. When `approval.paths` is set it
+  cannot authorize another. The prompt shows the human what they are deciding: the requester, the
+  provider, the method, host, and plain path (rendered as plain text so a crafted path cannot
+  impersonate Vouchr's copy), the grant scope, and the agent's `reason` and `link` when given. It
+  never shows the query string or the body. The audit row carries host, method, grant, and reason
+  but not the path: a fixed-size action fingerprint stands in for it, computed over the random,
+  non-output credential generation and every exact action field, so a low-entropy path cannot be
+  dictionary-reversed from the audit. When `approval.paths` is set it
   inherits the egress path lock's fail-closed
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential

@@ -14,7 +14,10 @@ prompt carries the agent's reason. This is a breaking configuration and schema c
 with `/vouchr connect-shared <provider>` (or `/vouchr identity <provider> channel`) and `per-user` with
 `person`. A provider that used `session` mode declares `approval: { grant: 'thread' }` instead. Every
 non-GET/HEAD call now asks the channel unless the provider sets `approval: false`; a provider that
-declared `approval: { approver: 'member' }` keeps its behavior with the knob removed. Rename
+declared `approval: { approver: 'member' }` keeps its behavior with the knob removed. Approval gates
+on the HTTP method and every MCP hop is a POST, so a provider on `/v1/mcp` now asks a human for
+`initialize`, `tools/list`, `ping`, and notifications too: set `approval: false` on the MCP provider
+(and gate mutating tools in the host) or narrow `approval.paths` to its non-MCP endpoints. Rename
 `bindingMessage` to `reason` on `POST /v1/authorization`; it is optional now. Drop
 `VOUCHR_CHANNEL_MODES` from the broker environment.
 
@@ -45,8 +48,8 @@ declared `approval: { approver: 'member' }` keeps its behavior with the knob rem
 - **Approval is on by default (#350).** Every call other than GET/HEAD needs a live grant unless the
   provider declares `approval: false`. The knob's fields are all optional: `approver` (`member`
   default, `self`), `methods`, `paths`, `grant` (`once` default, `thread`), `ttlMs` (5 minutes
-  default). `null`, unknown keys, and invalid shapes fail at config load. The README example and
-  `examples/demo` configure nothing for `github()`.
+  default, at most `MAX_TIMER_MS`). `null`, unknown keys, and invalid shapes fail at config load. The
+  README example and `examples/demo` configure nothing for `github()`.
 - **Thread-scoped approval is `grant: 'thread'` on the approval table (#350).** One approval covers
   every matching call in the approving thread until `ttlMs`; the row is matched on its scope and is
   not deleted on consume. `approval_request.grant_scope` holds `once` or `thread`; the approval prompt
@@ -54,10 +57,18 @@ declared `approval: { approver: 'member' }` keeps its behavior with the knob rem
   every <provider> call that needs approval in this thread for 30 minutes.`).
 - **Re-asking while a prompt is pending posts nothing (#350).** The requester gets one private line,
   `Still waiting for another member of this channel to approve the <provider> action.`, instead of a
-  second prompt. Offboarding deletes the person's pending approval rows, so a leftover Approve click
-  gets the fixed stale copy and grants nothing.
+  second prompt. A `reason` or `link` on the re-ask is kept only while the prompt is undelivered; a
+  delivered prompt and its audit row never change. Offboarding deletes the person's pending approval
+  rows, so a leftover Approve click gets the fixed stale copy and grants nothing.
+- **`POST /v1/admin/identity`, `/v1/admin/tools`, and `/v1/admin/reference` reject an empty `channel`
+  claim with `400 channel-scoped identity token required`**, the rule `/v1/admin/audit` already applied.
 - **`SCHEMA_VERSION` is 2.** `vouchr migrate` installs the new baseline on an empty schema and refuses
   a version-1 schema, as the greenfield contract requires.
+- **Broker perimeter refusals carry the machine fields (#348).** `401`, `404`, `413`, and the
+  lockdown `503` bodies now include `code` / `retryable` / `recovery` like typed failures, with
+  `identity_replayed` distinct from `invalid_identity`. Additive for JSON readers; the wire goldens
+  and `guides/HEADLESS.md` list the new codes (`unauthorized`, `invalid_identity`,
+  `identity_replayed`, `request_too_large`, `not_found`, `locked_down`).
 
 ### Added
 
@@ -67,14 +78,13 @@ declared `approval: { approver: 'member' }` keeps its behavior with the knob rem
   `bindingMessage`; both are optional). `reason` is at most 500 bytes of plain text (`MAX_REASON_BYTES`,
   `assertReason`); `link` is an `https://` URL of at most 2,048 bytes with no credentials
   (`MAX_LINK_BYTES`, `assertLink`). Every prompt renders the method, host, and plain path, then
-  `Reason:` and `Link:` lines when given, and says they are the agent's own claim. The reason is stored
-  on the `approval_requested` audit row under `meta.reason`; the link is not audited.
-- **`guides/DEMO.md` scenarios (a) to (m) run as `test/demo.test.ts` on the production path**, asserting
-  the exact Slack copy the guide quotes, including the thread grant, the stale-click fence after
-  offboarding, and the Slack Connect refusals.
-
-### Added
-
+  `Reason:` and `Link:` lines when given, and says they are the agent's own claim. The link is posted
+  with `unfurl_links` and `unfurl_media` off, so it never renders a preview beside the buttons. The
+  reason is stored on the `approval_requested` audit row under `meta.reason`; the link is not audited.
+- **`guides/DEMO.md` scenarios (a) to (m) run on the production path**: (a) to (i) and (k) to (m) in
+  `test/demo.test.ts`, asserting the exact Slack copy the guide quotes, including the thread grant, the
+  stale-click fence after offboarding, and the Slack Connect refusals; (j), the autonomous worker, in
+  `test/authorization.test.ts`.
 - **Connect prompts replace themselves in Slack when clicked (#347).** The private Connect button
   now carries its own opaque state as the button value beside the `url`, so the click's
   `response_url` can address the prompt. A live in-channel prompt is replaced with one line
@@ -113,14 +123,6 @@ declared `approval: { approver: 'member' }` keeps its behavior with the knob rem
   `replace_original` write that could overwrite the installed "Send a new link" prompt, and a
   cancelled Slack sign-in says "Go back to Slack. If the connection prompt is still there, use it;
   if not, ask the agent again." (true for channel ephemerals and durable DM prompts alike).
-
-### Changed
-
-- **Broker perimeter refusals carry the machine fields (#348).** `401`, `404`, `413`, and the
-  lockdown `503` bodies now include `code` / `retryable` / `recovery` like typed failures, with
-  `identity_replayed` distinct from `invalid_identity`. Additive for JSON readers; the wire goldens
-  and `guides/HEADLESS.md` list the new codes (`unauthorized`, `invalid_identity`,
-  `identity_replayed`, `request_too_large`, `not_found`, `locked_down`).
 
 ## [1.1.0] — 2026-09-06
 

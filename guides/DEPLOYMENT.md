@@ -639,10 +639,16 @@ on top of the write gating above, and locks the reachable endpoint + response me
     "credential": "key",
     "egressAllow": ["mcp.internal.example"],
     "egressMethods": ["POST"],
-    "mcp": { "paths": ["/mcp"] }
+    "mcp": { "paths": ["/mcp"] },
+    "approval": false
   }
 ]
 ```
+
+Approval (next paragraph) gates on the HTTP method, and every MCP hop is a POST: with the default
+`approval` a human is asked for `initialize`, `tools/list`, `ping`, and notifications too, not only
+`tools/call`. Set `"approval": false` on the MCP provider and gate mutating tools in the host, or
+narrow `"approval": { "paths": [...] }` to the provider's non-MCP endpoints.
 
 **Human-in-the-loop approval is on by default** (#113, #350): every non-GET/HEAD call needs a live
 grant. The optional `approval` knob adjusts it. `false` turns it off for the provider. Otherwise an

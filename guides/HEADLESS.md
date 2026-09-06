@@ -113,12 +113,15 @@ The worker then calls `POST /v1/fetch`:
   "handle": { "provider": "github", "owner": "user" },
   "identityToken": "<signed by your Slack-facing service>",
   "method": "GET",
-  "path": "/user"
+  "path": "/user",
+  "reason": "Show the user their own profile",
+  "link": "https://tracker.example/T-1"
 }
 ```
 
 The broker resolves the user from the signed token, performs the provider request inside Vouchr, and
-returns only the provider response.
+returns only the provider response. `reason` and `link` are optional on every call; when the call needs
+approval, the human reads them on the prompt (see [Approvals](#human-in-the-loop-approvals-113)).
 
 ### Typed errors: exported classes
 
@@ -500,7 +503,9 @@ JSON-RPC message) and the JSON-RPC payload in `body`:
   "identityToken": "<signed; mint a FRESH one per JSON-RPC call — tokens are single-use>",
   "path": "/mcp",
   "headers": { "accept": "application/json, text/event-stream", "content-type": "application/json", "mcp-session-id": "…" },
-  "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\", …}"
+  "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\", …}",
+  "reason": "Create the release issue",
+  "link": "https://tracker.example/REL-14"
 }
 ```
 
@@ -519,6 +524,7 @@ Rules and limits:
     // …
     egressMethods: ['POST'],  // JSON-RPC rides POST (write gating below)
     mcp: { paths: ['/mcp'] }, // REQUIRED to be reachable via /v1/mcp
+    approval: false,          // or a human is asked on EVERY hop (approval bullet below)
     // mcp.allowContentTypes defaults to ['application/json', 'text/event-stream']
   });
   ```
@@ -537,6 +543,12 @@ Rules and limits:
 - **Writes gating.** MCP `callTool` can mutate, so the route also requires the same double opt-in
   as a `/v1/fetch` POST: `allowWrites: true` on the broker **and** the provider's `egressMethods`
   including `'POST'`. Without either, the request is refused before any credential lookup.
+- **Approval gates on the HTTP method, and every MCP hop is a POST.** With the default
+  `approval` (on for every non-GET/HEAD call, #350) the broker answers `403 approval_required` for
+  `initialize`, `tools/list`, `ping`, and notifications too, not only `tools/call`: Vouchr never reads
+  the JSON-RPC method inside the body. Set `approval: false` on the MCP provider and gate mutating
+  tools in the host, or narrow `approval.paths` to the provider's non-MCP endpoints so only those
+  prompt. Keeping the default means a human decides every hop.
 - **The session header is NOT auth — and treat it as sensitive.** `Mcp-Session-Id` is opaque
   transport plumbing the MCP server issues and expects back, and per MCP security guidance it is
   potentially hijackable: Vouchr relays it verbatim and never stores, logs, or audits it — and
@@ -629,7 +641,7 @@ recall it. Under
 the documented ±30-second minter, broker, and PostgreSQL clock bounds, wait the conservative
 90-second cluster-skew horizon before minting the replacement assertion. `/v1/admin/reference`
 applies the same age-preserving fence to the acting member while it atomically writes the channel
-reference, shared mode, and config audit; an assertion minted before that member's offboarding cannot
+reference, channel identity, and config audit; an assertion minted before that member's offboarding cannot
 gain fresh channel-setup authority by being replayed later. Enterprise/global offboarding writes its
 scope
 before artifact discovery, so this also holds for a Grid workspace with no existing Vouchr row.
