@@ -1,7 +1,7 @@
 # Vouchr Vision
 
 **Status:** Adopted product direction, 2026-07-11
-**Current product stage:** Beta (`1.0.0-beta.1`)
+**Current product stage:** Production (`1.0.0`)
 
 This document is the canonical product and scope direction for Vouchr. When an older design,
 assessment, example, or guide conflicts with it, this document wins for product direction.
@@ -60,6 +60,9 @@ experience.
 The headless HTTP broker remains a supported data plane for agent workers in other processes or
 languages. It must receive short-lived, single-use, deployment-bound identity assertions from a
 trusted minter. It is not a generic OAuth or MCP gateway product.
+
+Other chat surfaces (Discord, #323; Microsoft Teams, #324) are planned as adapters on the same core,
+after Slack has real users. Core is not refactored ahead of them.
 
 ### Credential modes
 
