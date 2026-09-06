@@ -119,12 +119,6 @@ const DEFAULT_AUTHORIZATION_DELIVERY_INTERVAL_MS = 15_000;
 /** #296: rows one delivery pass may post. Bounds Slack work per interval; the rest wait a pass. */
 const MAX_AUTHORIZATION_DELIVERIES_PER_PASS = 50;
 
-// One-release tombstones for preview controls issued by a drained v7 replica. These handlers retain
-// no provider response, perform no share, and are deliberately not exported as a supported surface.
-const RETIRED_PREVIEW_ACTIONS = ['vouchr_preview_share', 'vouchr_preview_dismiss'] as const;
-const RETIRED_PREVIEW_MESSAGE =
-  'This preview expired because private previews were removed. Ask the agent again.';
-
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
 const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 };
 
@@ -156,10 +150,7 @@ function parseConfigMetadata(value: unknown): { channel: string; open: ConfigOpe
       !entry || typeof entry !== 'object' ||
       typeof entry.p !== 'string' || !isValidProviderId(entry.p) || seen.has(entry.p) ||
       !(entry.m === null || isChannelMode(entry.m)) ||
-      typeof entry.e !== 'boolean' ||
-      // A pre-removal modal carries `v`. Reject it as stale so rolling-version overlap cannot
-      // silently confirm mode/tool changes from a form that also contained a removed preview toggle.
-      Object.hasOwn(entry, 'v')
+      typeof entry.e !== 'boolean'
     ) return null;
     seen.add(entry.p);
   }
@@ -4426,16 +4417,6 @@ export async function createVouchr(opts: VouchrOptions) {
     };
     app.action(APPROVAL_APPROVE_ACTION, (a: any) => handleApprovalDecision(a, 'approve'));
     app.action(APPROVAL_DENY_ACTION, (a: any) => handleApprovalDecision(a, 'deny'));
-
-    // A pre-cutover ephemeral message can outlive the v7 process that created it. Ack its old
-    // controls before doing anything else, then replace the private message with fixed guidance.
-    // Never inspect/repost the old message body: v8 owns no preview data or share capability.
-    const expireRetiredPreview = async ({ ack, respond }: any) => {
-      await ack();
-      if (respond) await respond({ replace_original: true, text: RETIRED_PREVIEW_MESSAGE });
-    };
-    for (const action of RETIRED_PREVIEW_ACTIONS) app.action(action, expireRetiredPreview);
-
   }
 
   /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).

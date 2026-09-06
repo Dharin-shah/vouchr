@@ -62,8 +62,7 @@ export class NotificationState {
    * Atomically claim the 24h window for (owner, provider, type): true only for the ONE caller that
    * wins it. A single conditional upsert — INSERT wins a missing row; the DO UPDATE fires only when
    * the stored timestamp is older than the window, so a concurrent/duplicate claimer reports 0 rows
-   * changed and loses. Same statement on both backends (SQLite `changes` / Postgres `rowCount`,
-   * already normalized by Db.run).
+   * changed and loses. Db.run normalizes the changed-row count to `changes`.
    */
   async claim(owner: Owner, provider: string, type: NotificationKind, now = Date.now()): Promise<boolean> {
     const { changes } = await this.db.run(

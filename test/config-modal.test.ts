@@ -421,26 +421,6 @@ test('wrong-typed config metadata returns fixed recovery before membership looku
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
-test('a pre-removal modal carrying preview state is rejected as stale before any mutation', async (t) => {
-  let adminLookups = 0;
-  const h = await harness(t, {
-    member: true,
-    members: async () => { adminLookups++; return { members: [ID.userId] }; },
-  });
-  let acked: any = null;
-  await h.submit(
-    { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
-    async (value: any) => { acked = value; },
-    JSON.stringify({ channel: 'C_FIN', open: [{ p: 'mcp', m: null, e: true, v: 'private' }] }),
-  );
-
-  assert.equal(acked.response_action, 'update');
-  assert.match(JSON.stringify(acked.view), /stale or malformed/);
-  assert.equal(adminLookups, 0);
-  assert.equal(await modeRow(h.lan.db), null);
-  assert.deepEqual(await auditActions(h.lan.db), []);
-});
-
 test('forged invalid mode value is ignored server-side, never persisted', async (t) => {
   const h = await harness(t, { member: true });
   let acked: any = null;
