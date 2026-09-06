@@ -116,6 +116,9 @@ Workers in another process or language call a private HTTP broker. The token sti
 Vouchr. A background agent with no Slack turn asks for approval with `POST /v1/authorization` and
 polls for the answer. The prompt lands in the same channel. See the
 [headless guide](./guides/HEADLESS.md).
+A job with no human requester, such as a ticket-driven worker or a cron, runs as the app's bot user
+and any channel member approves; see
+[Autonomous workers](./guides/HEADLESS.md#autonomous-workers).
 
 ## Quickstart
 

@@ -14,7 +14,8 @@ import { listen } from './support/http';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider, type Provider } from '../src/core/providers';
-import { userOwner } from '../src/core/owner';
+import { channelOwner, userOwner } from '../src/core/owner';
+import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { MAX_BINDING_MESSAGE_BYTES } from '../src/core/approval';
 import { createBroker } from '../src/adapters/http/broker';
@@ -117,14 +118,22 @@ function stubUpstream(t: TestContext): { url: string; init?: RequestInit }[] {
   return calls;
 }
 
-async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Provider; members?: string[] } = {}) {
+async function harness(t: TestContext, o: {
+  allowWrites?: boolean; provider?: Provider; members?: string[];
+  /** `channel`: C1 is in `shared` mode and owns the only credential (the autonomous-worker shape);
+   * `requester` is then the signed `userId` (a bot user), carried by every token the harness mints. */
+  owner?: 'user' | 'channel'; requester?: string;
+} = {}) {
   const provider = o.provider ?? acme;
+  const owner = o.owner ?? 'user';
   const db = await openTestDb(t);
   const key = randomBytes(32);
   process.env.VOUCHR_MASTER_KEY = key.toString('base64'); // createVouchr's keyring == the broker's vault key
   const vault = new Vault(db, key);
   const audit = new Audit(db);
-  await vault.upsert(userOwner(ID), 'acme', {
+  const channelConfig = new ChannelConfig(db);
+  if (owner === 'channel') await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'shared');
+  await vault.upsert(owner === 'channel' ? channelOwner('T1', 'C1') : userOwner(ID), 'acme', {
     accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   // Deny-by-default on the Bolt side: the control plane only delivers for an enabled provider.
@@ -132,6 +141,7 @@ async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Pr
   const server = createBroker({
     providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET),
     allowWrites: o.allowWrites ?? true,
+    ...(owner === 'channel' ? { channelConfig } : {}),
   });
   await listen(t, server);
   const port = (server.address() as any).port;
@@ -168,13 +178,21 @@ async function harness(t: TestContext, o: { allowWrites?: boolean; provider?: Pr
   const prompts = () => slack.calls.filter((c) => c.method === 'chat.postEphemeral' || c.method === 'chat.postMessage');
   const audits = async (action: string) =>
     (await db.all(`SELECT user_id, actor, meta FROM audit WHERE action=? ORDER BY at`, [action])) as any[];
+  // The signed facts a trusted minter asserts for this harness's requester; a channel-owned request
+  // carries ownerKind/channelEligible/channelType exactly as HYBRID.md's minter does.
+  const base: Partial<IdentityClaims> = {
+    ...(o.requester ? { userId: o.requester } : {}),
+    ...(owner === 'channel' ? { ownerKind: 'channel' as const, channelEligible: true, channelType: 'channel' as const } : {}),
+  };
+  const mint = (over: Partial<IdentityClaims> = {}) => tok({ ...base, ...over });
+  const handle = { provider: 'acme', owner };
   const authorize = (over: Record<string, unknown> = {}) => request(port, 'POST', '/v1/authorization', {
-    handle: { provider: 'acme', owner: 'user' }, identityToken: tok(),
+    handle, identityToken: mint(),
     method: 'POST', path: '/repos', bindingMessage: 'Create repository "demo" in org acme', ...over,
   });
-  const status = (id: string, token = tok()) => request(port, 'GET', `/v1/authorization/${id}`, undefined, { 'x-vouchr-identity': token });
+  const status = (id: string, token = mint()) => request(port, 'GET', `/v1/authorization/${id}`, undefined, { 'x-vouchr-identity': token });
   const fetchAction = (over: Record<string, unknown> = {}) => request(port, 'POST', '/v1/fetch', {
-    handle: { provider: 'acme', owner: 'user' }, identityToken: tok(), method: 'POST', path: '/repos', body: '{}', ...over,
+    handle, identityToken: mint(), method: 'POST', path: '/repos', body: '{}', ...over,
   });
   return { db, port, vouchr, slack, prompts, click, audits, authorize, status, fetchAction };
 }
@@ -273,6 +291,73 @@ test('#322 member approver: the backchannel prompt is a channel message; the req
   assert.equal(consumed.length, 1);
   assert.equal(consumed[0].actor, 'U2', 'the approver rides the actor column');
   assert.equal(consumed[0].user_id, 'U1', 'the requester stays the acting user');
+});
+
+// An autonomous worker (ticket job, cron, platform agent) has no human requester: the token is
+// minted for the app's bot user, bound to the owning channel's shared credential, and any human
+// member approves (guides/HEADLESS.md "Autonomous workers").
+const BOT = 'UBOT1';
+
+test('autonomous worker: a bot-user requester on a shared channel credential is delivered once, approved by a human member, spent once; audit shows bot requester + member approver', async (t) => {
+  const upstream = stubUpstream(t);
+  const member = defineProvider({ ...acme, approval: { approver: 'member' } } as any);
+  const h = await harness(t, { provider: member, owner: 'channel', requester: BOT, members: [BOT, 'U2'] });
+  const created = await h.authorize({ bindingMessage: 'TICKET-42: rotate the deploy key' });
+  assert.equal(created.status, 200, JSON.stringify(created.json));
+  assert.equal(created.json.status, 'pending');
+  assert.equal(upstream.length, 0, 'initiation never reaches the provider');
+  const requested = await h.audits('approval_requested');
+  assert.equal(requested.length, 1);
+  assert.equal(requested[0].user_id, BOT, 'the bot user is the requester on the audit row');
+  assert.equal(JSON.parse(requested[0].meta).channel, 'C1', 'audited against the owning channel');
+
+  await h.vouchr.sweepExpired();
+  const posted = h.prompts();
+  assert.equal(posted.length, 1, 'exactly one prompt');
+  assert.equal(posted[0].method, 'chat.postMessage', 'one channel message any member can act on');
+  assert.equal(posted[0].args.channel, 'C1');
+  assert.equal(posted[0].args.user, undefined);
+  const rendered = JSON.stringify(posted[0].args.blocks);
+  assert.ok(rendered.includes(`<@${BOT}>`), 'the prompt names the bot as requester');
+  assert.ok(rendered.includes('TICKET-42: rotate the deploy key'), 'the ticket reference rides the binding message');
+  assert.ok(!rendered.includes(TOKEN), 'SEC-1');
+  await h.vouchr.sweepExpired();
+  assert.equal(h.prompts().length, 1, 'the channel message is not re-posted');
+
+  await h.click(APPROVAL_APPROVE_ACTION, created.json.authorizationId, 'U2');
+  assert.equal((await h.status(created.json.authorizationId)).json.status, 'approved');
+  const done = await h.fetchAction();
+  assert.equal(done.status, 200, JSON.stringify(done.json));
+  assert.equal(upstream.length, 1, 'the approved action ran exactly once');
+  assert.equal(new Headers(upstream[0].init?.headers).get('authorization'), `Bearer ${TOKEN}`, 'the channel credential was injected');
+  assert.equal((await h.fetchAction()).json.code, 'approval_required', 'single-use');
+  assert.equal(upstream.length, 1);
+  const consumed = await h.audits('approval_consumed');
+  assert.equal(consumed.length, 1);
+  assert.equal(consumed[0].user_id, BOT, 'requester');
+  assert.equal(consumed[0].actor, 'U2', 'approver');
+});
+
+test('autonomous worker with approver self: the ephemeral prompt is addressed to the bot user, a member click is refused, and the request expires at TTL', async (t) => {
+  stubUpstream(t);
+  const h = await harness(t, { owner: 'channel', requester: BOT, members: [BOT, 'U2'] }); // acme is approver 'self'
+  const created = await h.authorize();
+  assert.equal(created.status, 200, JSON.stringify(created.json));
+  await h.vouchr.sweepExpired();
+  const posted = h.prompts();
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0].method, 'chat.postEphemeral');
+  assert.equal(posted[0].args.user, BOT, 'addressed to the bot user: no human sees it');
+  const refused = await h.click(APPROVAL_APPROVE_ACTION, created.json.authorizationId, 'U2');
+  assert.match(String(refused[0]?.text), /not eligible/i, 'a human member cannot stand in for self');
+  assert.equal((await h.status(created.json.authorizationId)).json.status, 'pending');
+  await h.db.run(`UPDATE approval_request SET expires_at=0 WHERE id=?`, [created.json.authorizationId]);
+  assert.equal((await h.status(created.json.authorizationId)).json.status, 'expired');
+  await h.vouchr.sweepExpired();
+  const expiry = (await h.audits('denied')).filter((r) => JSON.parse(r.meta).reason === 'approval-expired');
+  assert.equal(expiry.length, 1);
+  assert.equal(expiry[0].actor, 'system');
+  assert.equal(expiry[0].user_id, BOT);
 });
 
 test('#296 deny persists the outcome for the poller, audits once, and a new request is a new decision', async (t) => {

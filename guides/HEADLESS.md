@@ -430,6 +430,36 @@ enforcement only: requests expire undelivered, as with in-turn approvals.
 Not in scope: OIDC CIBA wire conformance (`bc-authorize`), callbacks/webhooks (poll), and any
 widening of standing grants — an approved request authorizes exactly one action, once.
 
+## Autonomous workers
+
+A ticket-driven job, a cron, or a platform agent has no human requester. Vouchr still needs a
+requester identity and a human approver. Use the Slack app's own bot user (or a dedicated service
+user) as the requester, and let the channel's members approve.
+
+- **Requester.** Mint the identity token with the bot user id as `userId`. The bot must be a member
+  of the owning channel. Vouchr rechecks that membership when it delivers the prompt and again at
+  the click.
+- **Credential.** Put the owning channel in `shared` mode so the channel owns the credential. Mint
+  with `ownerKind: 'channel'`, `channelEligible: true`, `channel`, and `channelType`, exactly as the
+  [hybrid guide's minter](./HYBRID.md#4-mint-identity-only-from-verified-slack-facts) does. Send
+  `handle: { provider, owner: 'channel' }`.
+- **Approver.** Set the provider's `approval` to `approver: 'member'`. The bot is the requester, so
+  any human member of the channel can approve. Put the ticket reference in `bindingMessage`.
+- **Flow.** `POST /v1/authorization`, poll `GET /v1/authorization/{id}`, then `/v1/fetch` with the
+  same claims. This is the backchannel flow above, unchanged.
+
+The team sees one channel message. It names the bot as the requester and shows the provider, method,
+host, and binding message. In the audit, `approval_requested` and `approval_consumed` carry the bot
+id as `user_id`; `approval_consumed` carries the approving member in `actor`.
+
+Do not use `approver: 'self'` for a worker. `self` sends an ephemeral prompt to the requester. For a
+bot user nobody sees it, a member who clicks is refused as not eligible, and the request expires at
+the pending TTL (10 minutes) with a `system` expiry audit. The broker cannot refuse `self` here: it
+has no Slack client, and a bot user id is an ordinary Slack user id, so it cannot tell a bot from a
+person. The provider's `approval` knob is where this is decided.
+
+`test/authorization.test.ts` ("autonomous worker") runs both cases on the production path.
+
 ## MCP servers (Streamable HTTP): `POST /v1/mcp`
 
 Many tools ship as MCP servers over Streamable HTTP — which is just HTTP with a bearer. `/v1/mcp`

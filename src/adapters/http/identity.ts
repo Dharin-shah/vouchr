@@ -12,7 +12,7 @@ import {
  */
 export interface IdentityClaims {
   teamId: string;
-  userId: string; // the acting human, from the verified Slack event upstream
+  userId: string; // the acting user: a human, or the app's bot user for an autonomous worker (verified Slack facts upstream)
   channel: string;
   threadTs?: string;
   /** Absolute expiry, epoch milliseconds (Date.now()), to match the rest of the codebase. */
