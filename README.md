@@ -82,11 +82,12 @@ provider's own hosts.
 This is how an agent does most of a task alone and still stops at the steps that matter. It drafts
 and reviews on its own, pauses to merge or to publish, and a teammate approves in Slack.
 
-A private channel works as the approval group. Enable the provider there, connect one shared
-credential with `/vouchr connect-shared`, and any member can approve the agent's sensitive calls
-with it. The credential belongs to that channel: an agent in another channel cannot use it, and
-the prompt never leaves the channel. Agents outside Slack point their requests at that channel and
-the prompt lands there.
+A channel is the control point for a credential, not the place the work has to happen. Make a
+private channel the approval group: enable the provider there and connect one shared credential
+with `/vouchr connect-shared`. The channel now owns that credential and every approval for it. An
+agent uses it from that channel, or from anywhere else through the broker with an identity bound
+to the channel, for example a workflow that calls an AWS API to change a database cluster. Its
+approval prompts appear only in that channel, and other channels cannot use the credential.
 
 ## Audit
 
