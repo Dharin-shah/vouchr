@@ -27,6 +27,7 @@ import { createVouchr, github, ConsentRequiredError, safeUserMessage } from '@vo
 const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET! });
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 
+// Needs VOUCHR_DATABASE_URL and VOUCHR_MASTER_KEY in the environment, and a one-time `npx vouchr migrate`.
 const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
 vouchr.install(app, receiver);
 
@@ -52,8 +53,9 @@ privately. After one browser OAuth, the agent works.
 
 ## Quickstart
 
-[QUICKSTART.md](./QUICKSTART.md) goes from nothing to a bot acting as you on GitHub in about five
-minutes. It needs Node 22 or newer and PostgreSQL.
+[QUICKSTART.md](./QUICKSTART.md) goes from nothing to a bot acting as you on GitHub. Plan on about
+ten minutes of Slack and GitHub app setup, then a few minutes to run. It needs Node 22 or newer and
+PostgreSQL.
 
 ## Credential modes
 
@@ -81,7 +83,7 @@ release and to merge the pull request. The team approves each in Slack. The agen
 `approver: 'self'` asks the person driving the agent instead. In a direct message there is no
 team, so `member` behaves like `self`. This also works for agents outside Slack. They call the
 broker, and the same prompt lands in the same channel. See the
-[headless guide](./guides/HEADLESS.md#human-in-the-loop-approvals-113).
+[headless guide](./guides/HEADLESS.md#backchannel-authorization-for-background-agents-296).
 
 ## Providers
 
@@ -103,7 +105,7 @@ the [headless guide](./guides/HEADLESS.md) and the [hybrid guide](./guides/HYBRI
 | | |
 | --- | --- |
 | [Quickstart](./QUICKSTART.md) | Zero to a working demo |
-| [Examples](./examples) | Google, Databricks, API keys, secret managers, broker client, MCP, Prometheus, SCIM, dry-run |
+| [Examples](./examples/README.md) | Google, Databricks, API keys, secret managers, broker client, MCP, Prometheus, SCIM, dry-run |
 | [Architecture](./guides/ARCHITECTURE.md) | How consent, injection, and audit fit together |
 | [Threat model](./guides/THREAT-MODEL.md) | What Vouchr defends against, and its limits |
 | [Deployment](./guides/DEPLOYMENT.md) | PostgreSQL, KMS, Kubernetes, runbooks |
