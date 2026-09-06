@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  approvalBlocks,
   auditBlocks,
   blocksFallbackText,
   configModal,
@@ -105,9 +106,25 @@ test('connectedDmText: the post-OAuth confirmation DM escapes the account label 
   assert.ok(!t.includes('<!channel>'));
   assert.ok(!t.includes('<https://evil|click>'));
   assert.match(t, /&lt;!channel&gt;/); // escaped, inert
-  assert.equal(connectedDmText('github', null), '✅ github connected.'); // no-account shape unchanged
+  assert.equal(connectedDmText('github', null), '✅ github connected. Ask the agent again.'); // #348 names the next step
 });
 
+
+// #348: every prompt states its own lifetime from the constant that enforces it, so a person who
+// finds a stale prompt knows why it stopped working.
+test('every prompt states its ten-minute lifetime', () => {
+  const requestId = '123e4567-e89b-42d3-a456-426614174000';
+  assert.match(j(connectBlocks('github', 'https://auth')), /This link expires in 10 minutes\./);
+  assert.match(j(keySetupBlocks('github', requestId)), /This prompt expires in 10 minutes\./);
+  assert.match(j(sessionApprovalBlocks('github', requestId)), /This prompt expires in 10 minutes\./);
+  assert.match(
+    j(approvalBlocks({
+      provider: 'github', method: 'POST', host: 'api.github.com', actionFingerprint: 'hmac-sha256:aa',
+      queryParamCount: 0, requester: 'U1', id: requestId, approver: 'member',
+    })),
+    /expires in 10 minutes if unused/,
+  );
+});
 
 test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
   const b = connectBlocks('github', 'https://auth') as any[];

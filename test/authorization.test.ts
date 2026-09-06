@@ -350,7 +350,7 @@ test('autonomous worker with approver self: the ephemeral prompt is addressed to
   assert.equal(posted[0].method, 'chat.postEphemeral');
   assert.equal(posted[0].args.user, BOT, 'addressed to the bot user: no human sees it');
   const refused = await h.click(APPROVAL_APPROVE_ACTION, created.json.authorizationId, 'U2');
-  assert.match(String(refused[0]?.text), /not eligible/i, 'a human member cannot stand in for self');
+  assert.match(String(refused[0]?.text), /not eligible to decide this approval; only the requester can\./i, 'a human member cannot stand in for self');
   assert.equal((await h.status(created.json.authorizationId)).json.status, 'pending');
   await h.db.run(`UPDATE approval_request SET expires_at=0 WHERE id=?`, [created.json.authorizationId]);
   assert.equal((await h.status(created.json.authorizationId)).json.status, 'expired');

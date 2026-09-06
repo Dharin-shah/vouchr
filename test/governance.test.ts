@@ -8,7 +8,7 @@ import { Consent } from '../src/core/consent';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
-import { ConnectContext, createVouchr } from '../src/adapters/bolt';
+import { ConnectContext, createVouchr, safeUserMessage, UserFacingError } from '../src/adapters/bolt';
 import { CONFIGURE_CALLBACK } from '../src/adapters/blocks';
 import { WebClient } from '@slack/web-api';
 
@@ -61,12 +61,37 @@ test('requireChannelMembership: non-member refused + audited, member allowed', a
   const deny = await ctx(t, { requireMembership: true });
   await deny.c.setChannelSecret('mcp', SECRET);
   deny.slack.members = ['U_OTHER']; // the actor left (or was removed) after configuring
-  await assert.rejects(() => deny.c.connectChannel('mcp'), /member of this channel/);
+  await assert.rejects(() => deny.c.connectChannel('mcp'), (error: unknown) => {
+    // #348: a typed refusal that names the next step, not a bare Error the host collapses.
+    assert.ok(error instanceof UserFacingError);
+    assert.equal(error.recovery, 'resolve_again');
+    assert.equal(
+      safeUserMessage(error),
+      'You must be a member of this channel to use its shared "mcp" credential. Join the channel, then ask the agent again.',
+    );
+    return true;
+  });
   assert.ok((await auditRows(deny.db)).some((r) => r.action === 'denied' && r.meta.includes('not-member')));
 
   const ok = await ctx(t, { requireMembership: true, members: [ID.userId] });
   await ok.c.setChannelSecret('mcp', SECRET);
   assert.ok(await ok.c.connectChannel('mcp')); // member → handle
+});
+
+// #348: a host calling connectChannel() where the channel uses user-owned credentials gets a typed
+// refusal that says to ask the agent again, not "use connect()" (a method the person cannot call).
+test('connectChannel: a user-owned mode refuses with copy that names the next step', async (t) => {
+  const { c } = await ctx(t);
+  await c.setChannelMode('mcp', 'per-user');
+  await assert.rejects(() => c.connectChannel('mcp'), (error: unknown) => {
+    assert.ok(error instanceof UserFacingError);
+    assert.equal(error.recovery, 'resolve_again');
+    assert.equal(
+      safeUserMessage(error),
+      'This channel does not share a "mcp" credential. Ask the agent again to use your own connection.',
+    );
+    return true;
+  });
 });
 
 // requireChannelMembership OFF (default): membership is never checked at USE, a non-member still gets

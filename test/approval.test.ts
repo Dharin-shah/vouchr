@@ -177,6 +177,7 @@ async function harness(t: TestContext, o: {
   });
   const ephemerals: any[] = [];
   const dms: any[] = [];
+  const updates: any[] = [];
   const members = o.members ?? ['U1'];
   const client = {
     conversations: {
@@ -195,6 +196,7 @@ async function harness(t: TestContext, o: {
         dms.push(p);
         return o.postMessage ? o.postMessage(p) : {};
       },
+      update: async (p: any) => { updates.push(p); return {}; },
     },
   } as any;
   const channel = o.channel === undefined ? 'C1' : o.channel;
@@ -252,7 +254,7 @@ async function harness(t: TestContext, o: {
     (await vouchr.db.all(`SELECT action, user_id, actor, meta FROM audit ORDER BY at`)) as any[];
   const approvalRows = async () =>
     (await vouchr.db.all(`SELECT * FROM approval_request`)) as any[];
-  return { vouchr, ctx, ephemerals, dms, click, auditRows, approvalRows, provider, members, client };
+  return { vouchr, ctx, ephemerals, dms, updates, click, auditRows, approvalRows, provider, members, client };
 }
 
 // The OAuth "Connect" button is a url button, but Slack still delivers a block_actions interaction for
@@ -1499,7 +1501,7 @@ test('member approver (#322): one channel message; the requester and a non-membe
     // re-checked server-side, rejected, and audited; the prompt stays pending.
     const own: any[] = [];
     await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId, own);
-    assert.match(String(own[0]?.text), /not eligible/i);
+    assert.match(String(own[0]?.text), /not eligible to decide this approval; another channel member must\./i);
     assert.equal(own[0]?.replace_original, false, 'the channel prompt is left in place for a teammate');
     await click(APPROVAL_APPROVE_ACTION, 'U_OUTSIDER', e.approvalId);
     const rejected = (await auditRows()).filter((r) => r.action === 'denied' && r.meta.includes('not-approver'));
@@ -2808,6 +2810,42 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
 });
 
 // ── sweep ─────────────────────────────────────────────────────────────────────────────────────────
+
+// #348: a never-clicked channel prompt must not keep live-looking Approve/Deny buttons after its row
+// expires. No column stores the message ts, so the posting process remembers it and the sweep edits
+// the message (best-effort) once the database row is gone; a locally decided prompt is left alone.
+test('sweep: an expired, unclicked member prompt loses its buttons; a decided one is not overwritten', async (t) => {
+  const { vouchr, ctx, dms, updates, click } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_MEMBER'],
+    postMessage: async () => ({ ok: true, channel: 'C1', ts: `${1_700_000_000 + dms.length}.000100` }),
+  });
+  await withFetch(async () => {
+    const handle = await ctx.connect('acme');
+    const expired = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    const decided = await expectApprovalRequired(handle.fetch('https://api.acme.test/other', { method: 'POST', body: BODY_SENTINEL }));
+    assert.equal(dms.length, 2, 'one channel message per pending action');
+    assert.equal(updates.length, 0);
+
+    // Still pending: the sweep leaves both prompts untouched.
+    await vouchr.sweepExpired();
+    assert.equal(updates.length, 0, 'a live prompt is never edited');
+
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', decided.approvalId);
+    await vouchr.db.run(`UPDATE approval_request SET expires_at=0 WHERE id=?`, [expired.approvalId]);
+    await vouchr.sweepExpired();
+    assert.equal(updates.length, 1, 'only the expired prompt is edited; the decided one was replaced by its click');
+    assert.deepEqual(updates[0], {
+      channel: 'C1',
+      ts: '1700000001.000100',
+      text: 'This approval expired or was already decided. Ask the agent again.',
+      blocks: [],
+    });
+    // Idempotent: the entry is dropped after one edit.
+    await vouchr.sweepExpired();
+    assert.equal(updates.length, 1);
+  });
+});
 
 test('sweep: expired prompts and unspent grants are deleted and audited (actor: system)', async (t) => {
   const db = await openTestDb(t);

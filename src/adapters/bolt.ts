@@ -39,7 +39,7 @@ import {
   type ChannelProvisioningIssuance,
 } from '../core/channelCredential';
 import { ChannelTools, configureChannelTools, type ToolManifestEntry } from '../core/tools';
-import { handleOAuthCallback, type CallbackResult } from '../core/oauthCallback';
+import { handleOAuthCallback, OAUTH_CONNECTION_FAILED, type CallbackResult } from '../core/oauthCallback';
 import {
   offboardUser,
   disconnectProvider,
@@ -778,8 +778,12 @@ export const DELIBERATELY_UNBRIDGED: readonly VouchrErrorCode[] = Object.freeze(
   // Transient/infrastructural: the host's safeText path already reports these.
   'token_endpoint_failed', 'upstream_timeout', 'overloaded', 'rate_limited',
   'internal_error', 'interaction_state_changed',
-  // Identity/assertion problems on the broker door: the worker's, not the human's, to fix.
-  'source_mismatch',
+  // Identity/assertion problems on the broker door: the worker's, not the human's, to fix (#348
+  // added the perimeter codes; the worker mints a fresh assertion or fixes its request).
+  'source_mismatch', 'unauthorized', 'invalid_identity', 'identity_replayed', 'request_too_large',
+  'not_found',
+  // Containment (#239): the control plane shares the deployment flag and refuses to post prompts.
+  'locked_down',
   // Host-authored copy; Vouchr has no fixed sentence to show.
   'user_facing',
 ] as VouchrErrorCode[]);
@@ -790,6 +794,46 @@ export const DELIBERATELY_UNBRIDGED: readonly VouchrErrorCode[] = Object.freeze(
 const INTERNAL_PROVISIONING_RECEIVED_AT = Symbol('vouchr.provisioning-received-at');
 const INTERNAL_CHANNEL_PROVISIONING_ISSUANCE = Symbol('vouchr.channel-provisioning-issuance');
 const INTERNAL_GOVERNANCE_CHANNEL_RESOLVER = Symbol('vouchr.governance-channel-resolver');
+const INTERNAL_POSTED_APPROVAL_PROMPTS = Symbol('vouchr.posted-approval-prompts');
+
+/** Fixed reply for a click on a prompt whose pending row is gone; also what the sweep writes over an
+ *  unclicked prompt's buttons (#348). One constant, both surfaces. */
+const APPROVAL_STALE_TEXT = 'This approval expired or was already decided. Ask the agent again.';
+
+/** Approve/Deny messages this process posted and can still edit: `chat.update` needs the channel and
+ *  ts, and no approval_request column stores them (#348). Best-effort by design: a restart or another
+ *  replica's sweep loses the entry, and the untouched buttons then answer APPROVAL_STALE_TEXT on
+ *  click. Bounded; an in-channel 'self' prompt is an ephemeral and cannot be updated, so it is never
+ *  remembered. */
+const MAX_POSTED_APPROVAL_PROMPTS = 256;
+class PostedApprovalPrompts {
+  private readonly entries = new Map<string, { client: WebClient; channel: string; ts: string }>();
+
+  remember(id: string, client: WebClient, posted: { channel?: unknown; ts?: unknown }): void {
+    if (typeof posted.channel !== 'string' || typeof posted.ts !== 'string') return;
+    if (this.entries.size >= MAX_POSTED_APPROVAL_PROMPTS) {
+      this.entries.delete(this.entries.keys().next().value as string);
+    }
+    this.entries.set(id, { client, channel: posted.channel, ts: posted.ts });
+  }
+
+  /** A decision replaced the message through its response_url; the sweep must not overwrite it. */
+  forget(id: string): void {
+    this.entries.delete(id);
+  }
+
+  /** Strip the buttons from every prompt whose pending row is gone (expired, decided on another
+   *  replica, or removed by offboarding). Slack failures are swallowed: the row is already gone. */
+  async expire(stillPending: (id: string) => Promise<boolean>): Promise<void> {
+    for (const [id, p] of this.entries) {
+      if (await stillPending(id)) continue;
+      this.entries.delete(id);
+      await p.client.chat.update({ channel: p.channel, ts: p.ts, text: APPROVAL_STALE_TEXT, blocks: [] })
+        .catch(() => undefined);
+    }
+  }
+}
+
 type InternalConnectContextDeps = ConnectContextDeps & {
   /** REQUIRED here, though optional on the public `ConnectContextDeps`. `allowWrites` is a security
    *  gate whose default is permissive, so a construction site that omits it fails OPEN silently —
@@ -800,6 +844,7 @@ type InternalConnectContextDeps = ConnectContextDeps & {
   [INTERNAL_PROVISIONING_RECEIVED_AT]?: bigint;
   [INTERNAL_CHANNEL_PROVISIONING_ISSUANCE]?: ChannelProvisioningIssuance;
   [INTERNAL_GOVERNANCE_CHANNEL_RESOLVER]?: () => Promise<string | null>;
+  [INTERNAL_POSTED_APPROVAL_PROMPTS]?: PostedApprovalPrompts;
 };
 
 /** Map a verified handler's monotonic receipt instant into PostgreSQL's clock domain. Query latency
@@ -941,6 +986,7 @@ export class ConnectContext {
    * first uses Vouchr, so global middleware never delays the host's acknowledgement path. */
   private governanceChannelResolver?: () => Promise<string | null>;
   private governanceChannelResolution?: Promise<string | null>;
+  private postedApprovalPrompts?: PostedApprovalPrompts;
 
   constructor(deps: ConnectContextDeps) {
     this.identity = deps.identity;
@@ -986,6 +1032,7 @@ export class ConnectContext {
       (deps as InternalConnectContextDeps)[INTERNAL_CHANNEL_PROVISIONING_ISSUANCE];
     this.governanceChannelResolver =
       (deps as InternalConnectContextDeps)[INTERNAL_GOVERNANCE_CHANNEL_RESOLVER];
+    this.postedApprovalPrompts = (deps as InternalConnectContextDeps)[INTERNAL_POSTED_APPROVAL_PROMPTS];
     // Declared-but-unassigned would be created enumerable on first write, escaping hideInternals.
     this.governanceChannelResolution = undefined;
     // SEC-1: this object is attached to Bolt's per-request `context.vouchr` — the thing a handler
@@ -1344,11 +1391,13 @@ export class ConnectContext {
       throw new ApprovalPromptNotStartedError('approval delivery budget elapsed before posting');
     }
     if (spec.approver === 'member') {
-      await client.chat.postMessage({ channel: this.channel!, ...threadArg, blocks, ...fallback });
+      const posted = await client.chat.postMessage({ channel: this.channel!, ...threadArg, blocks, ...fallback });
+      this.postedApprovalPrompts?.remember(spec.approvalId, client, posted);
     } else if (this.channel) {
       await client.chat.postEphemeral({ channel: this.channel, user: this.identity.userId, ...threadArg, blocks, ...fallback });
     } else {
-      await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
+      const posted = await client.chat.postMessage({ channel: this.identity.userId, blocks, ...fallback });
+      this.postedApprovalPrompts?.remember(spec.approvalId, client, posted);
     }
     // Preserve false (state drift) separately from rejection (database outcome unknown) so
     // recovery copy stays truthful.
@@ -1462,10 +1511,13 @@ export class ConnectContext {
       if (r.status === 'needs_session') {
         if (r.reason === 'no-thread') {
           await this.audit.record('denied', this.identity, providerId, { channel: this.channel, reason: 'no-thread' });
-          throw new Error(`"${providerId}" needs a thread-scoped session; ask me inside a thread.`);
+          throw new UserFacingError(
+            `"${providerId}" needs a thread-scoped session; ask me inside a thread.`,
+            'resolve_again',
+          );
         }
         if (!this.sessions || !this.channel) {
-          throw new Error('Session approval state is not available. Ask an admin to check Vouchr.');
+          throw new UserFacingError('Session approval state is not available. Ask an admin to check Vouchr.', 'contact_admin');
         }
         const pending = await this.sessions.requestAudited({
           identity: this.identity,
@@ -1531,7 +1583,9 @@ export class ConnectContext {
               'resolve_again',
             );
           }
-          throw new SessionApprovalRequiredError(providerId);
+          // 'delivered' (inside the redelivery debounce) reuses the live in-thread ephemeral, which a
+          // Slack reload may have removed: the typed 'reused' state drives fixed truthful copy (#348).
+          throw new SessionApprovalRequiredError(providerId, delivery.status === 'delivered' ? 'reused' : 'posted');
         }
         // The click committed while this connect() was waiting for the lifecycle locks. Continue
         // with the newly-live exact grant; do not mint, audit, or deliver a redundant request.
@@ -1782,7 +1836,10 @@ export class ConnectContext {
     await this.requireProviderAuthorized(providerId, governableChannel, { owner: 'channel' });
     const m = await cfg.getMode(owner.teamId, channel, providerId);
     if (m != null && m !== 'shared') {
-      throw new Error(`Channel "${channel}" uses ${m} credentials for "${providerId}"; use connect() instead.`);
+      throw new UserFacingError(
+        `This channel does not share a "${providerId}" credential. Ask the agent again to use your own connection.`,
+        'resolve_again',
+      );
     }
     const credentialId = await this.vault.liveId(owner, providerId);
     if (!credentialId || !(await this.vault.getAccount(owner, providerId, credentialId))) { // exact row, no decrypt
@@ -1800,7 +1857,10 @@ export class ConnectContext {
       this.slackClientOptions,
     ))) {
       await this.audit.record('denied', this.identity, providerId, { channel, owner: 'channel', reason: 'not-member' });
-      throw new Error(`You must be a member of this channel to use its shared "${providerId}" credential.`);
+      throw new UserFacingError(
+        `You must be a member of this channel to use its shared "${providerId}" credential. Join the channel, then ask the agent again.`,
+        'resolve_again',
+      );
     }
     // Defense in depth: re-verify class at use time (a channel can change class after config).
     // This is one conversations.info per use; cache the class with a short TTL if a hot channel
@@ -2332,6 +2392,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
   const approvals = new Approvals(db); // #113 per-action approval requests/grants (provider.approval)
+  const postedApprovalPrompts = new PostedApprovalPrompts(); // #348 editable Approve/Deny messages
   const provisioning = new UserProvisioningRequests(db, vault);
   const channelProvisioning = new ChannelProvisioningRequests(db, vault);
   // The 'session' channel mode drives whether a thread grant is required; this is just the TTL ceiling.
@@ -2810,6 +2871,7 @@ export async function createVouchr(opts: VouchrOptions) {
         dryRun,
         allowWrites: opts.allowWrites ?? true,
         slackClientOptions: opts.slackClientOptions,
+        [INTERNAL_POSTED_APPROVAL_PROMPTS]: postedApprovalPrompts,
       };
       // Slash commands and block actions have no event.channel_type. A G… id can mean either a
       // private channel (governed) or an MPIM (personal), so attach a LAZY authenticated lookup.
@@ -2897,7 +2959,7 @@ export async function createVouchr(opts: VouchrOptions) {
           if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
           return sendPlain(res, r.status, r.error);
         } catch {
-          sendPlain(res, 500, 'Connection failed. Please try again.');
+          sendPlain(res, 500, OAUTH_CONNECTION_FAILED);
         }
       });
       // #302 hop 2: Slack's redirect back. A verified match continues to the provider authorize URL.
@@ -2911,7 +2973,7 @@ export async function createVouchr(opts: VouchrOptions) {
           if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
           return sendPlain(res, r.status, r.error);
         } catch {
-          sendPlain(res, 500, 'Connection failed. Please try again.');
+          sendPlain(res, 500, OAUTH_CONNECTION_FAILED);
         }
       });
     }
@@ -2948,7 +3010,7 @@ export async function createVouchr(opts: VouchrOptions) {
         res
           .status(500)
           .set({ 'content-type': 'text/plain; charset=utf-8', 'x-content-type-options': 'nosniff' })
-          .send('Connection failed. Please try again.');
+          .send(OAUTH_CONNECTION_FAILED);
       }
     });
   }
@@ -2971,6 +3033,7 @@ export async function createVouchr(opts: VouchrOptions) {
       thread, sessions, approvals, auditSink, health, notifications: notifyState, dryRun,
       allowWrites: opts.allowWrites ?? true,
       slackClientOptions: opts.slackClientOptions,
+      [INTERNAL_POSTED_APPROVAL_PROMPTS]: postedApprovalPrompts,
     };
     if (governableChannel !== undefined) deps.governableChannel = governableChannel;
     if (provisioningReceivedAt != null) {
@@ -4316,7 +4379,7 @@ export async function createVouchr(opts: VouchrOptions) {
       const location = interactionLocation(body);
       const id = body.actions?.[0]?.value;
       const reply = replyToActor(respond, client, identity);
-      const stale = 'This approval expired or was already decided. Ask the agent again.';
+      const stale = APPROVAL_STALE_TEXT;
       if (!identity || typeof id !== 'string') return reply(stale);
       const pending = await approvals.get(id);
       // Team + conversation binding: a control copied from another workspace/channel/thread cannot
@@ -4355,11 +4418,11 @@ export async function createVouchr(opts: VouchrOptions) {
         }
       };
       const ttlMs = approval.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
+      // Resolved for the request's own conversation (a DM degrades 'member' to 'self'), from the
+      // persisted governance scope — never from the payload.
+      const approverRule = effectiveApprover(approval.approver, pending.governableChannel);
       let decided: ApprovalDecisionResult;
       try {
-        // Resolved for the request's own conversation (a DM degrades 'member' to 'self'), from the
-        // persisted governance scope — never from the payload.
-        const approverRule = effectiveApprover(approval.approver, pending.governableChannel);
         // Slack facts cannot be queried through PostgreSQL. Resolve them before taking lifecycle
         // locks, fail closed on any read error, then carry only the verdict into the row-locked
         // validation. The channel is the trust boundary for a channel-owned approval AND for a
@@ -4470,8 +4533,16 @@ export async function createVouchr(opts: VouchrOptions) {
         return reply('Your authority changed while Vouchr was checking this approval. Reopen the current request before deciding it.', false);
       }
       if (decided.status === 'ineligible') {
-        return reply('You are not eligible to decide this approval.', false);
+        return reply(
+          approverRule === 'member'
+            ? 'You are not eligible to decide this approval; another channel member must.'
+            : 'You are not eligible to decide this approval; only the requester can.',
+          false,
+        );
       }
+      // The decision replaces the prompt through its response_url below; the sweep must not
+      // overwrite that outcome with the expired copy.
+      postedApprovalPrompts.forget(id);
       if (decision === 'approve') {
         emit({ type: 'approval_approved', provider: pending.provider, host: pending.host });
         await reply(`✅ Approved the *${p}* action. The approval is single-use and expires in ${Math.round(ttlMs / 1000)}s — have the agent retry now.`);
@@ -4570,6 +4641,9 @@ export async function createVouchr(opts: VouchrOptions) {
    *  backchannel decision surfaces (#296). Run on a timer. */
   async function sweep(): Promise<number> {
     const count = await sweepLifecycle({ db, vault, audit, sink, health, dryRun });
+    // #348: an unclicked prompt whose row the sweep (or offboarding) removed must not keep
+    // live-looking buttons. Database first, Slack second; only rows that are gone are edited.
+    await postedApprovalPrompts.expire(async (id) => (await approvals.get(id)) !== null);
     await deliverPendingAuthorizations();
     return count;
   }

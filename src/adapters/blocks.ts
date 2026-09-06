@@ -4,6 +4,13 @@ import { isBrokeredProvider, type Approver } from '../core/providers';
 import { SECRET_REFERENCE_SOURCES, type SecretReferenceSource } from '../core/reference';
 import type { VouchrRecovery } from '../core/errors';
 import type { AttributedOAuthCallbackOutcome } from '../core/oauthCallback';
+import { STATE_TTL_US } from '../core/consent';
+import { PENDING_INTERACTION_TTL_US } from '../core/interaction';
+
+/** Every prompt states its own lifetime from the constant that enforces it (STR-2, #348). */
+const minutes = (us: number): string => `${Math.round(us / 60_000_000)} minutes`;
+const CONNECT_PROMPT_LIFETIME = minutes(STATE_TTL_US);
+const PENDING_PROMPT_LIFETIME = minutes(PENDING_INTERACTION_TTL_US);
 
 /** Escape the three chars Slack mrkdwn treats specially, so a value that reached the audit table can
  *  never render as a link/mention/broadcast. The `provider` column is attacker-controllable (e.g. an
@@ -177,7 +184,8 @@ export function connectBlocks(
         text:
           `:link: *Connect your ${p} account*\n` +
           `I need to act as you on ${p} for this. Your token is stored ` +
-          `encrypted on this server and is never shown to the agent or posted in Slack.`,
+          `encrypted on this server and is never shown to the agent or posted in Slack. ` +
+          `This link expires in ${CONNECT_PROMPT_LIFETIME}.`,
       },
     },
   ];
@@ -411,7 +419,8 @@ export function keySetupBlocks(provider: string, requestId: string): unknown[] {
         text:
           `:key: *Set up your ${p} access*\n` +
           `I need a ${p} key to act for you. Add yours. It is stored encrypted on this ` +
-          `server and is never shown to the agent or posted in Slack.`,
+          `server and is never shown to the agent or posted in Slack. ` +
+          `This prompt expires in ${PENDING_PROMPT_LIFETIME}.`,
       },
     },
     {
@@ -441,7 +450,8 @@ export function sessionApprovalBlocks(provider: string, requestId: string): unkn
         text:
           `:lock: *Allow ${p} in this thread?*\n` +
           `The agent will be able to act as you on ${p} only inside this thread, until the ` +
-          `session expires. This approval does not apply to any other thread or channel.`,
+          `session expires. This approval does not apply to any other thread or channel. ` +
+          `This prompt expires in ${PENDING_PROMPT_LIFETIME}.`,
       },
     },
     {
@@ -532,7 +542,7 @@ export function approvalBlocks(o: {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `${query ? `${query}. ` : ''}The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires if unused.${bound} The raw path and request body are not displayed or inspected.${o.bindingMessage ? ' The agent’s statement is its own claim, not verified by Vouchr.' : ''}`,
+        text: `${query ? `${query}. ` : ''}The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires in ${PENDING_PROMPT_LIFETIME} if unused.${bound} The raw path and request body are not displayed or inspected.${o.bindingMessage ? ' The agent’s statement is its own claim, not verified by Vouchr.' : ''}`,
       },
     },
     {
@@ -761,7 +771,7 @@ export function connectedBlocks(
  *  connectionLine: the account label is provider-reported (accountProbe), so `<!channel>` or
  *  `<https://evil|click>` must render inert. One renderer, one escape site, testable. */
 export function connectedDmText(provider: string, account: string | null): string {
-  return `✅ ${escapeMrkdwn(provider)} connected${account ? ` as ${escapeMrkdwn(account)}` : ''}.`;
+  return `✅ ${escapeMrkdwn(provider)} connected${account ? ` as ${escapeMrkdwn(account)}` : ''}. Ask the agent again.`;
 }
 
 /** Message shown when a user declines consent (or consent is required and not granted). */
