@@ -479,10 +479,18 @@ of them authorizes with their own account. No standing team credential is involv
 - **The thread is the session.** The member who authorizes the worker's first action in a thread
   becomes that thread's human for that worker and provider. Every further approval-needing action the
   worker takes there is minted for that member and asks them privately, in the thread, each time;
-  nothing runs unasked. A request in another thread (or a worker token without `threadTs`, whose
-  session is the channel) starts a new any-member authorization. The session ends after 30 minutes
-  without a request or spend, or when the member disconnects the provider or is offboarded; both
-  fence the session's pending grants and the next request goes back to any member.
+  nothing runs unasked. A worker's grant is always `once`, whatever `approval.grant` the provider
+  declares: a `thread` grant never covers a worker's later calls, so each one asks the member again.
+  A request in another thread starts a new any-member authorization. The session ends after 30
+  minutes without a decision or spend by the bound member (the worker's own requests do not extend
+  it, so a looping worker cannot keep an absent member as its authorizer), at the latest 8 hours
+  after the authorizing click, or when the member disconnects the provider or is offboarded; each
+  fences the session's pending grants and the next request goes back to any member.
+- **A worker token without `threadTs`** makes the channel itself the session: the first member to
+  authorize becomes the channel-wide authorizer for that worker and provider until the idle TTL or
+  the cap ends it. That is the deliberate trade-off for jobs that do not work in a thread (each
+  action still asks that member, nothing runs unasked); mint `threadTs` when the job has a thread so
+  the session stays as narrow as the conversation.
 - **Refused.** A worker token for a DM (no channel members), a channel the signed `channelEligible`
   verdict does not clear (Slack Connect, externally shared, archived) or that Slack reports as such
   at delivery or click, and a channel whose identity for the provider is `channel` (mint

@@ -1201,12 +1201,13 @@ export class Approvals {
               }
               bound = { ...row, ownerKind: 'user', ownerId: input.delegate.ownerId, credentialId: input.delegate.credentialId };
               const actionKey = approvalActionKey(bound);
-              // An older unspent grant for this exact action under the member's credential is
-              // superseded by this decision, never spent twice.
-              await tx.run(`DELETE FROM approval_request WHERE action_key=? AND id<>?`, [actionKey, row.id]);
+              // Bind first: a stale decision (the session was already bound, replaced, or expired)
+              // writes nothing. Then an older unspent grant for this exact action under the member's
+              // credential is superseded by this decision, never spent twice.
               if (!(await bindWorkerSession(tx, row.credentialId, bound.ownerId, bound.credentialId))) {
                 return { status: 'stale' } as const;
               }
+              await tx.run(`DELETE FROM approval_request WHERE action_key=? AND id<>?`, [actionKey, row.id]);
               await tx.run(
                 `UPDATE approval_request SET owner_kind='user', owner_id=?, credential_id=?, action_key=? WHERE id=?`,
                 [bound.ownerId, bound.credentialId, actionKey, row.id],

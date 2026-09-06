@@ -1,3 +1,4 @@
+import type { ChannelIdentity } from './channelConfig';
 import type { Db } from './db';
 import type { SlackIdentity } from './identity';
 import {
@@ -5,7 +6,9 @@ import {
   newInteractionId,
   POSTGRES_NOW_US_SQL,
   WORKER_SESSION_IDLE_TTL_US,
+  WORKER_SESSION_MAX_TTL_US,
 } from './interaction';
+import { userOwner, type Owner } from './owner';
 
 /**
  * A worker's session in one conversation for one provider (#360). Whoever the agent acts as is the
@@ -19,9 +22,11 @@ import {
  * decision rewrites the pending row to that member's credential; every later request of the worker
  * in the same conversation asks that member privately and runs as them once they confirm.
  *
- * Fences: `expiresAt` is the idle lifetime (touched on every request and spend); a disconnect or
- * reconnect changes the member's live credential id; offboarding tombstones the member after
- * `boundAt`. Any of them ends the session, and the next request goes back to any member.
+ * Fences: `expiresAt` is the idle lifetime, extended only by the bound member's own activity (a
+ * decision, a spend of a grant they made) and never past `boundAt` + the absolute cap; the worker's
+ * own requests do not extend it. A disconnect or reconnect changes the member's live credential id;
+ * offboarding tombstones the member after `boundAt`. Any of them ends the session, and the next
+ * request goes back to any member.
  */
 export interface WorkerSession {
   id: string;
@@ -63,9 +68,10 @@ export async function workerSessionFor(db: Db, scope: WorkerSessionScope): Promi
 
 /**
  * The session a worker's request runs under: the live bound session when the bound member still
- * holds exactly the credential generation it was bound to (touched, so activity extends it), else a
- * fresh unbound session (a dead, expired, or absent one is replaced in place). `liveCredential`
- * reads the member's current generation without decrypting anything.
+ * holds exactly the credential generation it was bound to, else a fresh unbound session (a dead,
+ * expired, or absent one is replaced in place). Reading it does not extend it: only the member's
+ * decisions and spends do (touchWorkerSession). `liveCredential` reads the member's current
+ * generation without decrypting anything.
  */
 export async function beginWorkerSession(
   db: Db,
@@ -78,10 +84,7 @@ export async function beginWorkerSession(
       const member: SlackIdentity | null = current.memberUserId
         ? { enterpriseId: null, teamId: scope.teamId, userId: current.memberUserId }
         : null;
-      if (!member || (await liveCredential(member, scope.provider)) === current.credentialId) {
-        await touchWorkerSession(db, current.id);
-        return current;
-      }
+      if (!member || (await liveCredential(member, scope.provider)) === current.credentialId) return current;
     }
     // Absent, idled out, or bound to a credential generation that no longer exists: start over with
     // a fresh unbound generation. The conditional conflict update only replaces the exact row read
@@ -123,13 +126,58 @@ export async function bindWorkerSession(db: Db, id: string, memberUserId: string
   )).changes === 1;
 }
 
-/** Activity extends the idle lifetime. */
+/** The bound member's activity (their decision, their grant spent) extends the idle lifetime, never
+ * past the absolute cap from the binding click. Called only after a member decision, never for the
+ * worker's own request. */
 export async function touchWorkerSession(db: Db, id: string): Promise<void> {
   if (!isInteractionId(id)) return;
   await db.run(
-    `UPDATE worker_session SET expires_at=${POSTGRES_NOW_US_SQL}+? WHERE id=? AND expires_at>${POSTGRES_NOW_US_SQL}`,
-    [WORKER_SESSION_IDLE_TTL_US, id],
+    `UPDATE worker_session SET expires_at=LEAST(${POSTGRES_NOW_US_SQL}+?, COALESCE(bound_at,${POSTGRES_NOW_US_SQL})+?)
+     WHERE id=? AND expires_at>${POSTGRES_NOW_US_SQL}`,
+    [WORKER_SESSION_IDLE_TTL_US, WORKER_SESSION_MAX_TTL_US, id],
   );
+}
+
+/** The outcome of a worker's owner resolution: whose credential its request runs under, or why no
+ * member can authorize it. Transport-agnostic; the broker maps codes to HTTP statuses. */
+export type WorkerResolution =
+  | { status: 'resolved'; owner: Owner; credentialId: string }
+  | { status: 'refused'; code: 'no_channel' | 'ineligible' | 'shared_identity' };
+
+/**
+ * The ONE decision for a worker's request (#360): the worker has no credential of its own and none
+ * is looked up. Refused fail-closed where no member can authorize: a personal conversation (no
+ * governed channel), a channel the eligibility verdict does not clear, or a channel whose identity
+ * for the provider is the shared credential. Otherwise the request runs under the worker's session
+ * in the conversation: the bound member's credential generation when a member has bound it, else
+ * the unbound session's id as the placeholder generation (the exact action deduplicates to one
+ * prompt any member may answer, and the click decides the owner).
+ */
+export async function resolveWorkerOwner(
+  db: Db,
+  i: {
+    acting: SlackIdentity;
+    provider: string;
+    governableChannel: string | null;
+    thread: string | null;
+    eligible: boolean;
+    identity: ChannelIdentity;
+    liveCredential: (member: SlackIdentity, provider: string) => Promise<string | null>;
+  },
+): Promise<WorkerResolution> {
+  if (!i.governableChannel) return { status: 'refused', code: 'no_channel' };
+  if (!i.eligible) return { status: 'refused', code: 'ineligible' };
+  if (i.identity !== 'person') return { status: 'refused', code: 'shared_identity' };
+  const session = await beginWorkerSession(
+    db,
+    { teamId: i.acting.teamId, channel: i.governableChannel, thread: i.thread, workerUserId: i.acting.userId, provider: i.provider },
+    i.liveCredential,
+  );
+  if (session.memberUserId && session.credentialId) {
+    const member: SlackIdentity = { enterpriseId: i.acting.enterpriseId ?? null, teamId: i.acting.teamId, userId: session.memberUserId };
+    return { status: 'resolved', owner: userOwner(member), credentialId: session.credentialId };
+  }
+  return { status: 'resolved', owner: userOwner(i.acting), credentialId: session.id };
 }
 
 /** Offboarding a member ends every session bound to them; their pending grants are purged with

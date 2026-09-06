@@ -671,8 +671,10 @@ export class ConnectionHandle {
       // the human's approval.
       method, origin: url.origin, host: url.hostname, path: url.pathname,
       queryHash: queryDigest(url.search),
-      // A thread grant needs a thread to bind to; outside one it is a once grant (#350).
-      grant: rule.grant === 'thread' && this.thread ? 'thread' : 'once',
+      // A thread grant needs a thread to bind to; outside one it is a once grant (#350). A worker's
+      // request is always a once grant whatever the provider declares (#360): the member authorizes
+      // exactly one action, and every later call in the thread asks them again.
+      grant: !this.worker && rule.grant === 'thread' && this.thread ? 'thread' : 'once',
       channel: this.auditChannel(), thread: this.thread,
       // The governance scope stored for the DECISION revalidation. Prefer the channel_type-aware
       // value the adapter passed; fall back to the id heuristic for a directly-constructed handle.

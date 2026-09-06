@@ -18,7 +18,9 @@ All notable changes to this project are documented here. This project adheres to
   actor and `owner`, the thread, and the reason. The thread (the channel when the token names none)
   becomes that member's session for the worker and provider: every later approval-needing action there
   asks the same member privately, each time, and a request in another thread starts a new any-member
-  authorization. A session ends after 30 minutes without a request or spend, or when the member
+  authorization. A worker's grant is always `once`, whatever `approval.grant` the provider declares.
+  A session ends after 30 minutes without a decision or spend by the bound member (the worker's own
+  requests do not extend it), at the latest 8 hours after the authorizing click, or when the member
   disconnects the provider or is offboarded; that fences its pending grants and the next request goes
   back to any member. A DM token, a channel the signed eligibility verdict does not clear (Slack
   Connect, externally shared), and a channel whose identity is the shared credential are refused.

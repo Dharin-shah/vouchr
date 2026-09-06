@@ -425,9 +425,12 @@ into many actions, or to skip the approval entirely.
   credential from the grant, never from the worker's identity, and never from another member. A
   member without a credential is sent Connect and grants nothing. The thread session binds one member
   to one worker, one provider, and one conversation; every action still asks them, nothing runs
-  unasked, and the session is fenced by its idle lifetime, by the member's live credential generation
-  (disconnect, reconnect), by the member's offboard tombstone taken after the binding instant, and by
-  the channel's identity staying `person`. A token for a DM has no member to authorize it and is
+  unasked (a worker's grant is always `once`, whatever `approval.grant` the provider declares), and
+  the session is fenced by its idle lifetime, which only the member's own decisions and spends extend
+  (never the worker's requests, so a looping worker cannot keep an absent member as its authorizer),
+  by an absolute cap after the binding click, by the member's live credential generation (disconnect,
+  reconnect), by the member's offboard tombstone taken after the binding instant, and by the
+  channel's identity staying `person`. A token for a DM has no member to authorize it and is
   refused; a channel the signed eligibility verdict does not clear (Slack Connect, externally shared,
   archived) is refused at the broker and again at delivery and click. The worker cannot authorize
   itself, and the standing shared credential remains an explicit opt-in that this path never uses.

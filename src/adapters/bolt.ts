@@ -55,6 +55,7 @@ import {
   PENDING_INTERACTION_TTL_US,
   PROMPT_DELIVERY_LEASE_US,
   WORKER_SESSION_IDLE_TTL_US,
+  WORKER_SESSION_MAX_TTL_US,
 } from '../core/interaction';
 import {
   abandonUserProvisioningDelivery,
@@ -802,6 +803,7 @@ const APPROVAL_STALE_TEXT = 'This approval expired or was already decided. Ask t
 /** Whole minutes of the pending-request and worker-session lifetimes, for click receipts (#360). */
 const PENDING_APPROVAL_MINUTES = Math.round(PENDING_INTERACTION_TTL_US / 60_000_000);
 const WORKER_SESSION_IDLE_MINUTES = Math.round(WORKER_SESSION_IDLE_TTL_US / 60_000_000);
+const WORKER_SESSION_MAX_HOURS = Math.round(WORKER_SESSION_MAX_TTL_US / 3_600_000_000);
 
 /** Approve/Deny messages this process posted and can still edit: `chat.update` needs the channel and
  *  ts, and no approval_request column stores them (#348). Best-effort by design: a restart or another
@@ -4451,7 +4453,8 @@ export async function createVouchr(opts: VouchrOptions) {
           await reply(
             `✅ Authorized the *${p}* action with your account. It runs as you, once. Further *${p}* actions this worker takes `
             + `${pending.thread ? 'in this thread' : 'in this channel'} will ask you privately, each time, until `
-            + `${WORKER_SESSION_IDLE_MINUTES} minutes pass without one. The worker can retry now.`,
+            + `${WORKER_SESSION_IDLE_MINUTES} minutes pass without a decision from you, or ${WORKER_SESSION_MAX_HOURS} hours from now. `
+            + 'The worker can retry now.',
           );
         } else if (delegation === 'bound') {
           await reply(`✅ Approved the *${p}* action. It runs as you, once. The worker can retry now.`);

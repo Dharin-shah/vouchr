@@ -12,7 +12,9 @@ import { openTestDb } from './support/pg';
 import { listen } from './support/http';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
-import { defineProvider, type Provider } from '../src/core/providers';
+import { defineProvider, type Provider, type ProviderSpec } from '../src/core/providers';
+import { Approvals } from '../src/core/approval';
+import { WORKER_SESSION_MAX_TTL_US } from '../src/core/interaction';
 import { userOwner } from '../src/core/owner';
 import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
@@ -27,11 +29,12 @@ const BOT = 'UBOT1';
 const TOKEN_U1 = 'tok_u1_secret_never_rendered';
 const TOKEN_U2 = 'tok_u2_secret_never_rendered';
 
-const acme = defineProvider({
+const acmeSpec: ProviderSpec = {
   id: 'acme', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
   egressAllow: ['api.acme.test'], egressMethods: ['GET', 'POST'],
   refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
-});
+};
+const acme = defineProvider(acmeSpec);
 
 function request(
   port: number, method: string, path: string, body?: unknown, headers: Record<string, string> = {},
@@ -444,12 +447,16 @@ test('#360 an idle session expires: the sweep reclaims it and the next request a
 // An ephemeral is not a reply: posted under a top-level message it shows no reply indicator and is
 // never seen. So a request from a top-level message gets its private prompt at channel level, and a
 // request from inside a thread gets it in that thread. The grant still binds to the root either way.
-async function boltContext(t: TestContext, event: Record<string, unknown>, connected: boolean) {
+async function boltContext(t: TestContext, request: { event?: Record<string, unknown>; body?: Record<string, unknown> }, connected: boolean) {
   process.env.VOUCHR_MASTER_KEY = randomBytes(32).toString('base64');
   const vouchr = await createVouchr({ providers: [acme], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   const ephemerals: any[] = [];
   const client = { chat: { postEphemeral: async (p: any) => { ephemerals.push(p); return {}; }, postMessage: async () => ({}) } } as any;
-  const args: any = { context: {}, client, event: { user: 'U1', team: 'T1', channel: 'C1', ...event }, next: async () => {} };
+  const args: any = {
+    context: {}, client, next: async () => {},
+    ...(request.event ? { event: { user: 'U1', team: 'T1', channel: 'C1', ...request.event } } : {}),
+    ...(request.body ? { body: { team: { id: 'T1' }, user: { id: 'U1' }, channel: { id: 'C1' }, ...request.body } } : {}),
+  };
   await vouchr.middleware(args);
   await setChannelToolEnabled(new ChannelTools(vouchr.db), 'T1', 'C1', 'acme', true);
   if (connected) {
@@ -460,19 +467,23 @@ async function boltContext(t: TestContext, event: Record<string, unknown>, conne
   return { ctx: args.context.vouchr, ephemerals, db: vouchr.db };
 }
 
-test('thread placement: a top-level mention gets its Connect and approval prompts at channel level; a mention inside a thread gets them in that thread; the grant binds to the root either way', async (t) => {
+test('thread placement: a top-level mention or a click on an unreplied message gets its Connect and approval prompts at channel level; a mention inside a thread or a click on a replied root gets them in that thread; the grant binds to the root either way', async (t) => {
   stubUpstream(t);
-  for (const [event, expectedThread, label] of [
-    [{ ts: 'ROOT' }, undefined, 'top-level'],
-    [{ ts: 'REPLY', thread_ts: 'ROOT' }, 'ROOT', 'in-thread'],
+  for (const [request, expectedThread, label] of [
+    [{ event: { ts: 'ROOT' } }, undefined, 'top-level'],
+    [{ event: { ts: 'REPLY', thread_ts: 'ROOT' } }, 'ROOT', 'in-thread'],
+    // block_actions: Slack sends container.thread_ts only for a message that is in a thread. A root
+    // with replies carries its own ts as thread_ts; a top-level message without replies carries none.
+    [{ body: { container: { channel_id: 'C1', message_ts: 'ROOT' } } }, undefined, 'block_actions top-level'],
+    [{ body: { container: { channel_id: 'C1', message_ts: 'ROOT', thread_ts: 'ROOT' } } }, 'ROOT', 'block_actions replied root'],
   ] as const) {
-    const unconnected = await boltContext(t, event, false);
+    const unconnected = await boltContext(t, request, false);
     await assert.rejects(unconnected.ctx.connect('acme'), /Consent required/);
     assert.equal(unconnected.ephemerals.length, 1, `${label}: one Connect prompt`);
     assert.equal(unconnected.ephemerals[0].user, 'U1');
     assert.equal(unconnected.ephemerals[0].thread_ts, expectedThread, `${label}: Connect prompt placement`);
 
-    const connected = await boltContext(t, event, true);
+    const connected = await boltContext(t, request, true);
     const handle = await connected.ctx.connect('acme');
     await assert.rejects(handle.fetch('https://api.acme.test/repos', { method: 'POST' }), /Approval required/);
     assert.equal(connected.ephemerals.length, 1, `${label}: one approval prompt`);
@@ -480,4 +491,159 @@ test('thread placement: a top-level mention gets its Connect and approval prompt
     const row = await connected.db.get<any>(`SELECT thread FROM approval_request`);
     assert.equal(row.thread, 'ROOT', `${label}: the grant binds to the root`);
   }
+});
+
+test('#360 a worker\'s grant is once even when the provider declares grant thread: the prompt says one call once, and the second call in the thread asks the bound member again', async (t) => {
+  const upstream = stubUpstream(t);
+  const threadAcme = defineProvider({ ...acmeSpec, approval: { grant: 'thread', ttlMs: 60_000 } });
+  const h = await harness(t, { provider: threadAcme });
+  const created = await h.authorize();
+  assert.equal(created.status, 200, JSON.stringify(created.json));
+  assert.equal((await h.db.get<any>(`SELECT grant_scope FROM approval_request WHERE id=?`, [created.json.authorizationId])).grant_scope, 'once');
+  await h.vouchr.sweepExpired();
+  const rendered = JSON.stringify(h.prompts()[0].args.blocks);
+  assert.match(rendered, /This covers one call, once/);
+  assert.doesNotMatch(rendered, /covers every/);
+  await h.click(created.json.authorizationId, 'U1');
+  assert.equal((await h.fetchAction()).status, 200);
+  assert.equal(bearer(upstream[0]), `Bearer ${TOKEN_U1}`);
+
+  // The identical call, in the same thread, under the same member's session: asks again.
+  const again = await h.fetchAction();
+  assert.equal(again.status, 403);
+  assert.equal(again.json.code, 'approval_required');
+  assert.equal(upstream.length, 1, 'nothing ran unasked');
+  const row = await h.db.get<any>(`SELECT owner_id, grant_scope, delegated FROM approval_request WHERE id=?`, [again.json.approvalId]);
+  assert.deepEqual(row, { owner_id: 'U1', grant_scope: 'once', delegated: 1 }, 'a fresh once grant for the bound member');
+  await h.vouchr.sweepExpired();
+  const bound = JSON.stringify(h.prompts().at(-1)!.args.blocks);
+  assert.match(bound, /It runs as you, once/);
+  assert.match(bound, /This covers one call, once/);
+  assert.doesNotMatch(bound, /covers every/);
+});
+
+test('#360 the worker\'s own requests never extend its session; the bound member\'s decision does, and never past the absolute cap', async (t) => {
+  stubUpstream(t);
+  const h = await harness(t, { connected: { U1: TOKEN_U1, U2: TOKEN_U2 } });
+  const expiresAt = async () => Number((await h.db.get<any>(`SELECT expires_at FROM worker_session WHERE thread='TH1'`)).expires_at);
+  const first = await h.authorize();
+  await h.vouchr.sweepExpired();
+  await h.click(first.json.authorizationId, 'U1');
+  // Pin the idle expiry to a known instant, then let the worker poll, request, and spend.
+  await h.db.run(`UPDATE worker_session SET expires_at=expires_at-1000000`);
+  const pinned = await expiresAt();
+  assert.equal((await h.fetchAction()).status, 200, 'the spend of the member\'s own grant');
+  const spent = await expiresAt();
+  assert.ok(spent >= pinned, 'a spend the member decided may extend the session');
+  const second = await h.fetchAction({ path: '/repos/two' });
+  assert.equal(second.json.code, 'approval_required');
+  await h.authorize({ path: '/repos/three' });
+  assert.equal((await h.status(second.json.approvalId)).json.status, 'pending');
+  assert.equal((await h.fetchAction({ path: '/repos/two' })).json.code, 'approval_required', 'polling the pending action');
+  assert.equal(await expiresAt(), spent, 'none of the worker\'s own requests moved the idle expiry');
+  await h.vouchr.sweepExpired();
+  await h.click(second.json.approvalId, 'U1');
+  assert.ok((await expiresAt()) > spent, 'the member\'s decision extends it');
+
+  // Idle expiry despite a polling worker: once the idle window lapses, the next request is unbound.
+  await h.db.run(`UPDATE worker_session SET expires_at=0`);
+  const idled = await h.authorize({ path: '/repos/four' });
+  assert.equal((await h.db.get<any>(`SELECT owner_id FROM approval_request WHERE id=?`, [idled.json.authorizationId])).owner_id, BOT, 'back to any member');
+  await h.vouchr.sweepExpired();
+  await h.click(idled.json.authorizationId, 'U1', {});
+  assert.equal((await h.sessions()).find((s) => s.thread === 'TH1')!.member_user_id, 'U1', 'U1 binds a fresh session');
+
+  // Absolute cap: however active the member is, a decision cannot extend the session past bound_at + cap.
+  await h.db.run(`UPDATE worker_session SET bound_at=bound_at-?`, [WORKER_SESSION_MAX_TTL_US]);
+  const capped = await h.fetchAction({ path: '/repos/five' });
+  assert.equal(capped.json.code, 'approval_required');
+  await h.vouchr.sweepExpired();
+  await h.click(capped.json.approvalId, 'U1');
+  assert.equal((await h.status(capped.json.approvalId)).json.status, 'approved', 'the decision itself stands');
+  const afterCap = await h.authorize({ path: '/repos/six' });
+  assert.equal((await h.db.get<any>(`SELECT owner_id FROM approval_request WHERE id=?`, [afterCap.json.authorizationId])).owner_id, BOT, 'the capped session ended; any member is asked');
+  assert.equal((await h.sessions()).find((s) => s.thread === 'TH1')!.member_user_id, null, 'replaced by an unbound session');
+});
+
+test('#360 /v1/mcp spends a worker\'s grant with the bound member\'s token, and the next MCP call in the session asks that member again', async (t) => {
+  const upstream = stubUpstream(t);
+  const h = await harness(t, { provider: defineProvider({ ...acmeSpec, mcp: { paths: ['/mcp'] } }) });
+  const rpc = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'echo' } });
+  const mcp = () => request(h.port, 'POST', '/v1/mcp', {
+    handle: h.handle, identityToken: h.mint(), path: '/mcp', body: rpc,
+    headers: { accept: 'application/json, text/event-stream', 'content-type': 'application/json' },
+  });
+  const unasked = await mcp();
+  assert.equal(unasked.status, 403, JSON.stringify(unasked.json));
+  assert.equal(unasked.json.code, 'approval_required');
+  await h.vouchr.sweepExpired();
+  await h.click(unasked.json.approvalId, 'U1');
+  const done = await mcp();
+  assert.equal(done.status, 200, JSON.stringify(done.json));
+  assert.equal(upstream.length, 1);
+  assert.equal(bearer(upstream[0]), `Bearer ${TOKEN_U1}`);
+  assert.equal(upstream[0].url, 'https://api.acme.test/mcp');
+  const consumed = await h.audits('approval_consumed');
+  assert.equal(consumed.length, 1);
+  assert.equal(consumed[0].user_id, BOT);
+  assert.equal(consumed[0].actor, 'U1');
+  assert.equal(JSON.parse(consumed[0].meta).thread, 'TH1');
+  const again = await mcp();
+  assert.equal(again.json.code, 'approval_required');
+  assert.equal((await h.db.get<any>(`SELECT owner_id FROM approval_request WHERE id=?`, [again.json.approvalId])).owner_id, 'U1', 'asks the bound member');
+  assert.equal(upstream.length, 1);
+});
+
+test('#360 a channel turned Slack Connect after the prompt refuses the click on a delegated row, unbound and bound alike', async (t) => {
+  stubUpstream(t);
+  const info: Record<string, unknown> = {};
+  const h = await harness(t, { channelInfo: info, connected: { U1: TOKEN_U1, U2: TOKEN_U2 } });
+  const created = await h.authorize();
+  await h.vouchr.sweepExpired();
+  assert.equal(h.prompts().length, 1, 'delivered while the channel was eligible');
+  info.is_ext_shared = true;
+  assert.match(await h.click(created.json.authorizationId, 'U1'), /no longer valid because provider or channel access changed/);
+  assert.equal((await h.status(created.json.authorizationId)).status, 404, 'the impossible request is discarded');
+  assert.equal((await h.sessions())[0].member_user_id, null, 'nothing bound');
+
+  delete info.is_ext_shared;
+  const bind = await h.authorize({ path: '/repos/two' });
+  await h.vouchr.sweepExpired();
+  await h.click(bind.json.authorizationId, 'U1');
+  const later = await h.fetchAction({ path: '/repos/three' });
+  assert.equal(later.json.code, 'approval_required');
+  await h.vouchr.sweepExpired();
+  info.is_ext_shared = true;
+  assert.match(await h.click(later.json.approvalId, 'U1'), /no longer valid because provider or channel access changed/);
+  assert.equal((await h.status(later.json.approvalId)).status, 404);
+  assert.equal((await h.audits('approved')).length, 1, 'only the pre-conversion authorization');
+});
+
+test('#360 decideAudited refuses a delegate that does not match the row: none for an unbound row, one for a bound row, one naming another member', async (t) => {
+  stubUpstream(t);
+  const h = await harness(t, { connected: { U1: TOKEN_U1, U2: TOKEN_U2 } });
+  const approvals = new Approvals(h.db);
+  const audit = new Audit(h.db);
+  const actor = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
+  const credentialId = (await h.vault.liveId(userOwner(actor), 'acme'))!;
+  const base = { decision: 'approve' as const, approvedBy: 'U1', actor, issuance: await h.vault.userProvisioningIssuedAt(), ttlMs: 60_000, audit, validate: async () => 'valid' as const };
+
+  const unbound = await h.authorize();
+  await assert.rejects(approvals.decideAudited({ ...base, id: unbound.json.authorizationId }), /delegate does not match the request/);
+  await assert.rejects(
+    approvals.decideAudited({ ...base, id: unbound.json.authorizationId, delegate: { ownerId: 'U2', credentialId } }),
+    /must be the deciding member/,
+  );
+  assert.equal((await h.status(unbound.json.authorizationId)).json.status, 'pending', 'the unbound row is untouched');
+
+  await h.vouchr.sweepExpired();
+  await h.click(unbound.json.authorizationId, 'U1');
+  const bound = await h.fetchAction({ path: '/repos/two' });
+  assert.equal(bound.json.code, 'approval_required');
+  await assert.rejects(
+    approvals.decideAudited({ ...base, id: bound.json.approvalId, delegate: { ownerId: 'U1', credentialId } }),
+    /delegate does not match the request/,
+  );
+  assert.equal((await h.status(bound.json.approvalId)).json.status, 'pending', 'the bound row is untouched');
+  assert.equal((await h.audits('approved')).length, 1, 'only the click\'s authorization was audited');
 });
