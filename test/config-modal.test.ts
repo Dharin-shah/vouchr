@@ -6,7 +6,7 @@ import { defineProvider, type Provider } from '../src/core/providers';
 import { createVouchr } from '../src/adapters/bolt';
 import { Policy } from '../src/core/policy';
 import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
-import { ChannelTools } from '../src/core/tools';
+import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { CONFIG_CALLBACK, DISCONNECT_ACTION } from '../src/adapters/blocks';
 import { userOwner } from '../src/core/owner';
 import type { Db } from '../src/core/db';
@@ -116,6 +116,7 @@ test('no-arg /vouchr opens the modal; non-member sees NO channel controls (no su
 
 test('no-arg /vouchr opens the modal; member sees per-provider identity + enable controls', async (t) => {
   const h = await harness(t, { member: true });
+  await setChannelToolEnabled(new ChannelTools(h.lan.db), 'T1', 'C_FIN', 'mcp', true);
   const view = await h.openModal();
   assert.equal(view.submit?.text?.text ?? view.submit?.text, 'Save');
   assert.ok(view.blocks.some((b: any) => b.block_id === 'identity:mcp'));
@@ -268,6 +269,9 @@ test('no-arg /vouchr consumes the trigger with a loading view before its Slack m
 test('no-arg gives the same recovery when a supported registry exceeds the modal block limit', async (t) => {
   const providers = Array.from({ length: 47 }, (_, i) => mkProvider(`provider-${i}`));
   const h = await harness(t, { member: true, providers });
+  // Enabled providers render two controls each (identity + toggle); disabled ones only the toggle (#356).
+  const tools = new ChannelTools(h.lan.db);
+  for (const p of providers) await setChannelToolEnabled(tools, 'T1', 'C_FIN', p.id, true);
   let responded = '';
   await h.runCommand('', async (m: string) => { responded = m; });
   assertLoadingViewRecovered(h, responded);
@@ -471,6 +475,39 @@ test('untouched save with a policy-denied provider writes no channel_tool row', 
   await h.submit({ 'tool:mcp': unchecked() }, async () => {}, pm); // checkbox untouched (allowlist-disabled by default)
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false); // no allowlist row written
   assert.deepEqual(await auditActions(h.lan.db), []);
+});
+
+// #356: the identity select shows the EFFECTIVE identity (`person` when nothing is stored), so a member
+// who saves the modal untouched re-submits exactly what was rendered and nothing is written (UX-4).
+test('an unchanged settings save writes no channel_config, channel_tool, or audit row', async (t) => {
+  const h = await harness(t, { member: true });
+  await setChannelToolEnabled(new ChannelTools(h.lan.db), 'T1', 'C_FIN', 'mcp', true);
+  const view = await h.openModal();
+  const identity = view.blocks.find((b: any) => b.block_id === 'identity:mcp');
+  assert.equal(identity.optional, undefined); // no "(optional)" hint: the value is always set
+  assert.equal(identity.element.initial_option.value, 'person'); // nothing stored → the default, shown
+  // Re-submit every control at its rendered initial value, exactly as Slack does for an untouched form.
+  const state: Record<string, unknown> = {};
+  for (const b of view.blocks) {
+    if (String(b.block_id ?? '').startsWith('identity:')) state[b.block_id] = { identity: { selected_option: b.element.initial_option } };
+    if (String(b.block_id ?? '').startsWith('tool:')) state[b.block_id] = { enabled: { selected_options: b.element.initial_options ?? [] } };
+  }
+  await h.submit(state, async () => {}, view.private_metadata);
+  assert.equal(await identityRow(h.lan.db), null);
+  assert.deepEqual(
+    await h.lan.db.all('SELECT provider, enabled FROM channel_tool WHERE team_id=? AND channel=?', ['T1', 'C_FIN']),
+    [{ provider: 'mcp', enabled: 1 }], // only the row the test seeded
+  );
+  assert.deepEqual(await auditActions(h.lan.db), []);
+});
+
+test('disabled providers list after enabled ones with only the enable toggle', async (t) => {
+  const h = await harness(t, { member: true, providers: [mkProvider('off'), mkProvider('on')] });
+  await setChannelToolEnabled(new ChannelTools(h.lan.db), 'T1', 'C_FIN', 'on', true);
+  const view = await h.openModal();
+  const controls = view.blocks.map((b: any) => b.block_id).filter((id: unknown) => typeof id === 'string');
+  assert.deepEqual(controls, ['identity:on', 'tool:on', 'tool:off']);
+  assert.equal(view.blocks.find((b: any) => b.block_id === 'tool:off').label.text, 'off: enable to configure');
 });
 
 test('the Disconnect button carries a confirm dialog (no accidental one-click revoke)', async (t) => {

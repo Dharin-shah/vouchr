@@ -243,7 +243,15 @@ Alex repeats the mention: `Opened https://github.com/alex/vouchr-demo/issues/2 a
 Audit: `config` for the credential, then the approval rows with `grant: 'thread'` in `meta`.
 `vouchr inventory` now has a second row with `owner_kind` channel and `owner_id` the channel id.
 
-Shots: the modal (blur the field), the saved message, the prompt, the issue opened by the token owner.
+Sam, in `#demo-team`: `/vouchr` with no arguments opens the **Vouchr** settings modal
+(`src/adapters/blocks.ts`, `configModal`). Under **Channel settings** the enabled providers come first,
+each with a select labelled `github-team: who does the agent act as here?` showing the current value,
+`Each member, as themselves` or `This channel, with one shared credential`, and the
+**Enabled in this channel** checkbox. Disabled providers follow with only the checkbox, labelled
+`<provider>: enable to configure`. Saving without touching anything writes nothing.
+
+Shots: the credential modal (blur the field), the saved message, the settings modal with the
+`github-team` line, the prompt, the issue opened by the token owner.
 
 ### (h) One approval covers the thread
 
