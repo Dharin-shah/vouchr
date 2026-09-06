@@ -81,7 +81,9 @@ export {
   assertReason,
   assertLink,
 } from './core/approval';
-export type { AuthorizationStatus } from './core/approval';
+export type { AuthorizationStatus, ApprovalDecision } from './core/approval';
+// #363 the host's wait cadence for a decision (context.vouchr.waitForApproval / Approvals.waitForDecision).
+export { APPROVAL_WAIT_POLL_MIN_MS, APPROVAL_WAIT_POLL_JITTER_MS } from './core/approval';
 export { sweepExpired } from './core/sweep';
 
 // ── signed identity minting/verification (the headless auth contract) ──

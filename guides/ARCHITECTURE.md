@@ -333,6 +333,13 @@ are removed by `sweepExpired()`. The agent's optional `reason` (500 bytes) and `
 (2,048 bytes) are validated in core (`assertReason`, `assertLink`), rendered on the prompt as plain
 text, and the reason is written to the `approval_requested` audit row under `meta.reason`.
 
+**Hosts wait, people do not re-ask (#363).** An in-process host that catches `ApprovalRequiredError`
+calls `context.vouchr.waitForApproval(approvalId, { timeoutMs })`: `Approvals.waitForDecision`
+re-reads the requester-bound status query every 1 to 2 seconds (jittered), bounded by the smaller of
+`timeoutMs` and the pending request's 10-minute TTL, and resolves `approved`, `denied`, or `expired`
+(an unknown or lapsed id, or the wait's own bound, reads as `expired`). The wait reads only; the
+host's retried call spends the grant. Headless workers poll `GET /v1/authorization/{id}` instead.
+
 See [SECURITY.md](../SECURITY.md) for the security model and limits, and
 [THREAT-MODEL.md](./THREAT-MODEL.md) for trust boundaries, the attacker model, and the
 enforced invariants.

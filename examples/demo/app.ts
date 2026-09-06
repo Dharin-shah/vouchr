@@ -42,7 +42,9 @@ app.event('app_mention', async ({ context, event, client }) => {
   const reply = async (t: string): Promise<void> => {
     await client.chat.postMessage({ channel: event.channel, thread_ts: (event as { thread_ts?: string }).thread_ts ?? event.ts, text: t });
   };
-  try {
+  // The whole turn as one function: when a write needs approval, the same turn runs again once the
+  // person decides, so nobody repeats their request.
+  const act = async (): Promise<void> => {
     const issue = /open an? (team )?issue titled (.+?) in repo (\S+\/\S+)/i.exec(text);
     if (issue) {
       const [, team, title, repo] = issue;
@@ -68,9 +70,21 @@ app.event('app_mention', async ({ context, event, client }) => {
     return reply(
       'I know two things: `who am I` (reads GitHub as you) and `open an issue titled <title> in repo <owner>/<repo>` (a write, so you confirm it first). Add `team` before `issue` to use the channel credential, which a teammate approves.',
     );
+  };
+  try {
+    try {
+      await act();
+    } catch (e) {
+      if (!(e instanceof ApprovalRequiredError)) throw e;
+      // Vouchr posted the Approve/Deny prompt. Wait for the decision (a bounded poll of the stored
+      // request), then run the same turn once; the retried write spends the grant.
+      const decision = await context.vouchr.waitForApproval(e.approvalId);
+      if (decision === 'approved') return await act();
+      return reply(decision === 'denied' ? 'The action was denied. Nothing was sent.' : 'The approval expired before a decision. Nothing was sent.');
+    }
   } catch (e) {
-    // Vouchr already posted the Connect prompt or the Approve/Deny prompt.
-    if (e instanceof ConsentRequiredError || e instanceof ApprovalRequiredError) return;
+    // Vouchr already posted the Connect prompt.
+    if (e instanceof ConsentRequiredError) return;
     if (event.user) await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(e) });
     throw e;
   }
