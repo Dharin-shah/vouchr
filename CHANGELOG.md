@@ -21,6 +21,33 @@ All notable changes to this project are documented here. This project adheres to
   exports, and `connectExpiredBlocks`, `CONNECT_PROMPT_STALE_TEXT`, and
   `CONNECT_PROMPT_OPENING_TEXT` are exported from `src/adapters/blocks`.
 
+### Fixed
+
+- **Every terminal state names the next action, and no stale prompt survives (#348).** Found by a
+  code-walk audit after a live demo. Slack: session mode outside a thread, a non-member using a
+  shared credential, and a channel without a shared credential now raise `UserFacingError` with the
+  next step instead of collapsing to "check the Vouchr logs"; an ineligible Approve/Deny click says
+  who can decide; every prompt states its ten-minute lifetime; a re-asked session prompt inside the
+  redelivery window reports `promptState: 'reused'` like consent does; `CredentialLockdownError` maps
+  to fixed `locked_down` copy. Browser: a consumed or replayed callback link, a failed exchange, and
+  the post-connect landing page all say to go back to Slack and ask the agent again; the broker's
+  hop and callback paths render that page under lockdown instead of raw JSON. Core copy:
+  `not_connected` (user), `upstream_timeout`, `approval_required` for a `member` approver, and the
+  channel-ineligible reasons now name what to do. Expired, never-clicked Approve/Deny channel
+  messages lose their buttons on the next sweep (best-effort `chat.update` from the posting process;
+  no schema change). The README, `examples/bolt-github`, and `examples/demo` hosts post the fixed
+  "already posted, ask again in 30 seconds" copy privately for a reused prompt instead of going silent.
+
+### Changed
+
+- **Broker perimeter refusals carry the machine fields (#348).** `401`, `404`, `413`, and the
+  lockdown `503` bodies now include `code` / `retryable` / `recovery` like typed failures, with
+  `identity_replayed` distinct from `invalid_identity`. Additive for JSON readers; the wire goldens
+  and `guides/HEADLESS.md` list the new codes (`unauthorized`, `invalid_identity`,
+  `identity_replayed`, `request_too_large`, `not_found`, `locked_down`).
+- **`SessionApprovalRequiredError` requires `promptState`.** Constructing it directly now takes the
+  same second argument as `ConsentRequiredError`.
+
 ## [1.1.0] — 2026-09-06
 
 The Slack OpenID Connect browser-identity check is the only consent path, and the schema is one

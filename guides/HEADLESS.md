@@ -143,8 +143,8 @@ automatic replay of an uncertain or non-idempotent write.
 | Exported error | Stable code | Recovery | Meaning |
 | --- | --- | --- | --- |
 | `ConsentRequiredError` | `consent_required` | `connect` | A private connection prompt was posted; stop the turn. |
-| `SessionApprovalRequiredError` | `session_approval_required` | `request_approval` | A thread-scoped session prompt was posted; stop the turn. |
-| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. |
+| `SessionApprovalRequiredError` | `session_approval_required` | `request_approval` | A thread-scoped session prompt was posted (or, `promptState: 'reused'`, a still-live one was reused and may no longer be visible); stop the turn. |
+| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. For a `member` approver the copy tells the requester to wait for another channel member. |
 | `ApprovalPathTooLongError` | `approval_path_too_large` | `fix_configuration` | The approval endpoint exceeds the bounded exact-action path; narrow it before retrying. |
 | `InteractionStateChangedError` | `interaction_state_changed` | `resolve_again` | The credential generation or current authorization changed; discard the stale handle and resolve current access before retrying. |
 | `PolicyDeniedError` | `policy_denied` | `contact_admin` | Provider/channel policy denied the request; retrying cannot change governance. |
@@ -159,6 +159,7 @@ automatic replay of an uncertain or non-idempotent write.
 | `SecretReferenceError` | `invalid_reference`, `source_mismatch`, `invalid_scopes`, or `resolver_unavailable` | `fix_configuration` | Reference input/configuration failed before persistence. Existing codes are unchanged. |
 | `TokenEndpointError` | `token_endpoint_failed` | `connect` for `credential`; `fix_configuration` for `configuration`; `retry_later` for `transient` | Distinguishes `invalid_grant`, OAuth client/configuration rejection, and RFC transient codes plus 408/429/5xx/network/timeout failures. The legacy `definitive` boolean remains true only for `credential`. |
 | `UserFacingError` | `user_facing` | chosen at construction (default `fix_configuration`) | Explicit opt-in for fixed Vouchr-authored refusal/validation copy. |
+| `CredentialLockdownError` | `locked_down` | `contact_admin` | The deployment is locked down (#239); no credential is served, minted, or prompted for until an administrator lifts it. |
 
 The broker maps the same codes and recovery fields onto its HTTP responses — the wire view follows.
 
@@ -169,6 +170,12 @@ only `{ "ok": false }`). Failures a worker should handle explicitly include:
 
 | HTTP | Body | Caller action |
 | --- | --- | --- |
+| `401` | `{ "error": "unauthorized", "code": "unauthorized", "retryable": false, "recovery": "fix_configuration" }` | The perimeter (broker token or `authorize` hook) refused the request. Fix the worker's broker credential. |
+| `401` | `{ "error": "invalid identity token", "code": "invalid_identity", "retryable": false, "recovery": "resolve_again" }` | The identity assertion is missing, malformed, wrongly signed, or expired. Mint a fresh one from the trusted minter. |
+| `401` | `{ "error": "invalid identity token", "code": "identity_replayed", "retryable": false, "recovery": "resolve_again" }` | The assertion was already spent (single-use `jti`). Same prose as the previous row so an unsigned caller learns nothing; the code tells a worker to mint a new assertion rather than treat it as expiry. |
+| `404` | `{ "error": "unknown provider", "code": "not_found", "retryable": false, "recovery": "fix_configuration" }` | The provider is not registered on this broker (also `unknown authorization` for a consumed/unknown authorization id, and `not found` for an unmounted route). |
+| `413` | `{ "error": "request body too large", "code": "request_too_large", "retryable": false, "recovery": "fix_configuration" }` | The JSON body crossed the read/write cap; the connection is closed. Shrink the request. |
+| `503` | `{ "ok": false, "error": "locked_down", "code": "locked_down", "retryable": false, "recovery": "contact_admin" }` | The deployment is locked down (#239); every functional route refuses. Browser hop/callback paths get an HTML page with the same next step. |
 | `400` | `{ "error": "…", "code": "invalid_reference", "retryable": false, "recovery": "fix_configuration" }` (also `source_mismatch`, `invalid_scopes`, or `resolver_unavailable`) | Correct the submitted reference/configuration. Branch on `code`, not message text. |
 | `403` | `{ "error": "egress blocked", "code": "egress_blocked", "retryable": false, "recovery": "fix_configuration" }` | Correct the provider/egress configuration; unchanged retries remain denied. |
 | `403` | `{ "error": "approval_required", "approvalId": "…", "code": "approval_required", "retryable": false, "recovery": "request_approval" }` | Stop the turn and relay the body to the trusted control plane's `recoverBrokerDenial`, which delivers the decision surface. The opaque id is a lookup handle, never authority. |
@@ -190,8 +197,8 @@ only `{ "ok": false }`). Failures a worker should handle explicitly include:
 Typed `/v1/fetch` and `/v1/mcp` failures use the same `code`, `retryable`, `recovery`, and
 `retryAfterMs` policy. Authenticated reads and mutations also use the exact typed `409
 interaction_state_changed` / `resolve_again` response when the verified actor assertion predates
-offboarding; replaying that consumed assertion returns `401`. Other validation/authentication
-failures retain established prose where no exported typed outcome exists, so `BrokerError` fields
+offboarding; replaying that consumed assertion returns `401 identity_replayed`. Other
+validation failures retain established prose where no exported typed outcome exists, so `BrokerError` fields
 remain optional.
 `retryAfterMs` is explicitly milliseconds; the HTTP `Retry-After` header remains whole seconds.
 
@@ -247,7 +254,7 @@ upstream/audit confirmation:
 `revoked` therefore means “removed from Vouchr”, not “every possible provider-side credential was
 invalidated”. Error text never includes the submitted provider value, a credential reference, or a
 raw dependency error. The identity assertion is consumed on the first authenticated attempt, so its
-replay returns `401` even after a `409`.
+replay returns `401 identity_replayed` even after a `409`.
 For backward compatibility, a provider-only handle is still accepted when PostgreSQL can prove the
 row predates the assertion's conservative issuance boundary. A recently connected row can be
 clock-ambiguous across the minter and broker, so that legacy form returns the same `409`; resolve the
@@ -605,7 +612,8 @@ current-actor check covers `/v1/resolve`, `/v1/status`, `/v1/audit`, `/v1/admin/
 disconnect mutations. `/v1/fetch` and `/v1/mcp` make the same early check, then the retained handle
 checks again before secret access and at provider send; every credential/governance mutation retains
 its final under-lock fence. A newly presented pre-offboard assertion receives exact `409
-interaction_state_changed` with `recovery: "resolve_again"`, and its replay receives `401`. It cannot
+interaction_state_changed` with `recovery: "resolve_again"`, and its replay receives `401
+identity_replayed`. It cannot
 use a surviving shared channel credential; that credential remains available to another current
 actor with fresh authority. Pending or granted approvals requested by the offboarded user are
 removed, while tombstone checks at decision and consumption keep them unusable if cleanup fails.

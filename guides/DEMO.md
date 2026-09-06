@@ -126,7 +126,7 @@ Alex, in `#demo-team`: `@vouchr who am I`.
 Expected, private to Alex (`src/adapters/blocks.ts`, `connectBlocks`):
 
 > :link: *Connect your github account*
-> I need to act as you on github for this. Your token is stored encrypted on this server and is never shown to the agent or posted in Slack.
+> I need to act as you on github for this. Your token is stored encrypted on this server and is never shown to the agent or posted in Slack. This link expires in 10 minutes.
 > Connecting grants the agent, acting as you:
 > • Read your profile
 > • Read and write your repositories
@@ -137,10 +137,10 @@ with a **Connect github** button. Alex clicks it. The browser goes to Slack's si
 
 > ✅ github connected as alex
 > This connection is now linked to this Slack user (`U…` in workspace `T…`). The agent will act as that Slack user with: `<granted scopes>`.
-> You can close this tab.
+> Now go back to Slack and ask the agent again. You can close this tab.
 
 Back in Slack, Alex gets a DM and a private note in the channel, both
-`✅ github connected as alex.` (`src/adapters/blocks.ts`, `connectedDmText`). The prompt itself was
+`✅ github connected as alex. Ask the agent again.` (`src/adapters/blocks.ts`, `connectedDmText`). The prompt itself was
 replaced on click with `Opening the sign-in page. If it says the request is no longer current, mention me again.`
 
 If a prompt is left for more than ten minutes, clicking it opens a plain
@@ -173,13 +173,13 @@ Nothing is sent. The channel gets one message (`src/adapters/blocks.ts`, `approv
 > The agent wants to run an action on github for <@alex>. Another member of this channel must approve it.
 > POST api.github.com
 > Action fingerprint: <hash>
-> The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires if unused. The raw path and request body are not displayed or inspected.
+> The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires in 10 minutes if unused. The raw path and request body are not displayed or inspected.
 
 with **Approve** and **Deny** buttons.
 
 Alex clicks **Approve**. Private reply, the prompt stays (`src/adapters/bolt.ts`):
 
-> You are not eligible to decide this approval.
+> You are not eligible to decide this approval; another channel member must.
 
 Sam clicks **Approve**. The prompt is replaced by:
 
@@ -224,7 +224,7 @@ Alex replies in any thread: `@vouchr who am I`. Private prompt in the thread
 (`src/adapters/blocks.ts`, `sessionApprovalBlocks`):
 
 > :lock: *Allow github in this thread?*
-> The agent will be able to act as you on github only inside this thread, until the session expires. This approval does not apply to any other thread or channel.
+> The agent will be able to act as you on github only inside this thread, until the session expires. This approval does not apply to any other thread or channel. This prompt expires in 10 minutes.
 
 with an **Allow github here** button. Alex clicks it: `Approved *github* for this thread. Ask the agent again.`
 
@@ -353,7 +353,7 @@ Shots: the inventory before and after, Sam's refusal.
 Vouchr refuses channel credentials in externally shared channels
 (`src/core/channelConfig.ts`, `channelIneligibleReason`):
 
-> Channel credentials are not allowed in externally shared channels.
+> Channel credentials are not allowed in externally shared channels. Use your own connection here, or configure in an internal channel.
 
 Showing it needs a second workspace and a Slack Connect channel. If you have one, run
 `/vouchr connect-shared github-team` there and screenshot the refusal. Otherwise say so on camera

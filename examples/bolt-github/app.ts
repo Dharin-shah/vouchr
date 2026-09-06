@@ -18,7 +18,14 @@ app.event('app_mention', async ({ context, event, client }) => {
       text: `You are *${me.login}* on GitHub, ${me.public_repos} public repos.`,
     });
   } catch (e) {
-    if (e instanceof ConsentRequiredError) return; // Connect prompt already posted.
+    if (e instanceof ConsentRequiredError) {
+      // 'posted': the private Connect prompt is on screen. 'reused': an earlier prompt is still live
+      // but a Slack reload may have removed the ephemeral, so repeat Vouchr's fixed copy privately.
+      if (e.promptState === 'reused' && event.user) {
+        await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(e) });
+      }
+      return;
+    }
     // Any other refusal (provider not enabled in this channel, egress blocked, …): tell the user
     // privately in Vouchr's fixed, secret-free copy, then let Bolt log the error.
     if (event.user) await client.chat.postEphemeral({ channel: event.channel, user: event.user, text: safeUserMessage(e) });
