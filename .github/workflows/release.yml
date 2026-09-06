@@ -197,6 +197,8 @@ jobs:
           ignore-unfixed: true
           exit-code: '1'
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: 'v2.6.0' # the version that signed v1.0.0; unpinned floats to main (#337)
       - uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: ${{ env.IMAGE_REF }}
@@ -214,9 +216,21 @@ jobs:
           cosign sign --yes "$IMAGE_REF"
           cosign attest --yes --type cyclonedx --predicate sbom-image.cdx.json "$IMAGE_REF"
           CERT_ID="^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v"
-          cosign verify --certificate-identity-regexp "$CERT_ID" \
+          # cosign prints its verification block only after a successful verification, then has stayed
+          # alive for 24 to 44 minutes before exiting on both tag releases so far (#337). Bound the exit:
+          # a kill after the block is printed counts as verified; every other non-zero exit stays fatal.
+          verified() {
+            local out rc=0
+            out="$(timeout 300 cosign "$@" 2>&1)" || rc=$?
+            printf '%s\n' "$out"
+            if [ "$rc" -eq 124 ] && printf '%s' "$out" | grep -q 'The following checks were performed'; then
+              echo "::warning::cosign $1 verified but did not exit within 300s (#337)"; rc=0
+            fi
+            return "$rc"
+          }
+          verified verify --certificate-identity-regexp "$CERT_ID" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
-          cosign verify-attestation --type cyclonedx --certificate-identity-regexp "$CERT_ID" \
+          verified verify-attestation --type cyclonedx --certificate-identity-regexp "$CERT_ID" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
 
   # After the artifacts publish, cut the GitHub Release from the CHANGELOG so the notes match exactly
