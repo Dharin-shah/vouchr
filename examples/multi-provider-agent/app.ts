@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk';
 import { betaTool } from '@anthropic-ai/sdk/helpers/beta/json-schema';
 import { App, ExpressReceiver } from '@slack/bolt';
 import {
+  ApprovalRequiredError,
   ConsentRequiredError,
   createVouchr,
   defineProvider,
@@ -109,10 +110,23 @@ app.event('app_mention', async ({ context, event, client, say }) => {
       // tools, and approvals. It throws ConsentRequiredError if this person has not connected —
       // which is per-person: one participant connecting does nothing for the others.
       const handle = await vouchr.connect(provider);
-      const res = await handle.fetch(url, {
+      const send = () => handle.fetch(url, {
         method,
         ...(body ? { headers: { 'content-type': 'application/json' }, body } : {}),
       });
+      let res: Response;
+      try {
+        res = await send();
+      } catch (e) {
+        // A write needs the person: Vouchr posted them the Approve/Deny prompt. Wait for the decision
+        // inside the tool call, then send the same request once. Denied or expired becomes a fixed
+        // tool result the model relays; nothing was sent either way.
+        if (!(e instanceof ApprovalRequiredError)) throw e;
+        const decision = await vouchr.waitForApproval(e.approvalId);
+        if (decision === 'denied') return 'The person denied this action. Nothing was sent.';
+        if (decision === 'expired') return 'The approval expired before a decision. Nothing was sent.';
+        res = await send();
+      }
       const text = await res.text();
       // Return the status too: the model needs to know a 4xx happened rather than assume success.
       return `HTTP ${res.status}\n${text.slice(0, 4000)}`;

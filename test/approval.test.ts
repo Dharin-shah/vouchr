@@ -10,6 +10,7 @@ import { Audit } from '../src/core/audit';
 import { Consent, withUserInteractionFence } from '../src/core/consent';
 import {
   Approvals,
+  APPROVAL_WAIT_POLL_MIN_MS,
   approvalDeliveryAudienceKey,
   approvalOwnerStillCurrent,
   ApprovalPathTooLongError,
@@ -3068,5 +3069,82 @@ test('#4 MPIM approval flow through Bolt: prompt → approve → retry executes 
     const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL });
     assert.equal(res.status, 200, 'the approved retry executed instead of being invalidated');
     assert.equal(calls.length, 1, 'exactly one upstream call — the approved retry');
+  });
+});
+
+// #363 an in-process host waits for the decision and continues; the person never re-asks.
+test('#363 waitForApproval: approve resolves the wait and the same fetch then runs once with no new prompt', async (t) => {
+  const { ctx, ephemerals, click, auditRows } = await harness(t);
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const write = () => handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL });
+    const e = await expectApprovalRequired(write());
+    assert.equal(ephemerals.length, 1);
+    const started = Date.now();
+    const waiting = ctx.waitForApproval(e.approvalId);
+    const responds: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId, responds);
+    assert.match(responds[0].text, /The agent will continue\.$/);
+    assert.equal(await waiting, 'approved');
+    assert.ok(Date.now() - started < 5_000, 'the wait resolved within a few polls');
+    // The wait read only: the grant is still unspent until the host's own retry consumes it.
+    assert.equal(calls.length, 0);
+    assert.equal((await write()).status, 200);
+    assert.equal(calls.length, 1, 'the continued fetch executed exactly once');
+    assert.equal(ephemerals.length, 1, 'no second prompt, no re-ask');
+    const actions = (await auditRows()).map((r) => r.action);
+    assert.deepEqual(actions.filter((a) => a.startsWith('approv')), ['approval_requested', 'approved', 'approval_consumed']);
+  });
+});
+
+test('#363 waitForApproval: deny resolves denied and nothing is sent', async (t) => {
+  const { ctx, click, approvalRows } = await harness(t);
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    const waiting = ctx.waitForApproval(e.approvalId);
+    await click(APPROVAL_DENY_ACTION, 'U1', e.approvalId);
+    assert.equal(await waiting, 'denied');
+    assert.equal(calls.length, 0);
+    assert.equal((await approvalRows())[0].status, 'denied', 'the wait mutated nothing');
+  });
+});
+
+test('#363 waitForApproval: a request that lapses by PostgreSQL time resolves expired', async (t) => {
+  const { vouchr, ctx } = await harness(t);
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    // Shorten the pending request to well under one poll interval; the wait sees pending, then expired.
+    await vouchr.db.run(`UPDATE approval_request SET expires_at=${POSTGRES_NOW_US_SQL}+? WHERE id=?`, [usFromMs(300), e.approvalId]);
+    assert.equal(await ctx.waitForApproval(e.approvalId), 'expired');
+    assert.equal(calls.length, 0);
+  });
+});
+
+test('#363 waitForApproval: an unknown, malformed, or foreign id resolves expired at once', async (t) => {
+  const { vouchr, ctx } = await harness(t);
+  const started = Date.now();
+  assert.equal(await ctx.waitForApproval(randomUUID()), 'expired');
+  assert.equal(await ctx.waitForApproval('not-an-id'), 'expired');
+  // Another team's requester cannot observe this row: the id reads as unknown across the tenant boundary.
+  const handle = await ctx.connect('acme');
+  const e = await withFetch(() => expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' })));
+  assert.equal(await new Approvals(vouchr.db).waitForDecision(e.approvalId, { teamId: 'T_OTHER', userId: 'U1' }), 'expired');
+  assert.ok(Date.now() - started < APPROVAL_WAIT_POLL_MIN_MS, 'no poll interval was waited for an absent row');
+});
+
+test('#363 waitForApproval: a wait that outlives its timeout resolves expired and leaves the request pending', async (t) => {
+  const { ctx, approvalRows } = await harness(t);
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    const started = Date.now();
+    assert.equal(await ctx.waitForApproval(e.approvalId, { timeoutMs: 50 }), 'expired');
+    assert.ok(Date.now() - started < APPROVAL_WAIT_POLL_MIN_MS, 'the sleep is capped by the remaining timeout');
+    assert.equal((await approvalRows())[0].status, 'pending', 'the wait decided nothing on the row');
+    assert.equal(calls.length, 0);
+    await assert.rejects(ctx.waitForApproval(e.approvalId, { timeoutMs: Number.NaN }), /timeoutMs/);
+    await assert.rejects(ctx.waitForApproval(e.approvalId, { timeoutMs: -1 }), /timeoutMs/);
   });
 });

@@ -185,7 +185,8 @@ test('(e) a write as Alex waits for Alex with no approval configuration, (f) den
   await d.slash(SAM, 'enable github');
   await d.vouchr.vault.upsert(userOwner(id(ALEX)), 'github', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'alex' });
   await withFetch(async (calls) => {
-    const gh = await (await d.context(ALEX)).connect('github');
+    const alex = await d.context(ALEX);
+    const gh = await alex.connect('github');
     const write = (init: Record<string, unknown> = {}) => gh.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Demo issue' }), ...init,
     });
@@ -214,12 +215,16 @@ test('(e) a write as Alex waits for Alex with no approval configuration, (f) den
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, SAM, first.approvalId), [
       { replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval; only the requester can.' },
     ]);
-    // Alex approves: the prompt is replaced, the retry runs once, the next write asks again.
+    // The host waits for the decision (#363). Alex approves: the prompt is replaced, the wait
+    // resolves, the same write runs once with no new mention, and the next write asks again.
+    const waiting = alex.waitForApproval(first.approvalId);
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, ALEX, first.approvalId), [
-      { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.' },
+      { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github* action. This covers one call, once, within 5 minutes. The agent will continue.' },
     ]);
+    assert.equal(await waiting, 'approved');
     assert.equal((await write()).status, 200);
     assert.equal(calls.length, 1);
+    assert.equal(d.ephemerals.length, 2, 'the continued write posted no new prompt');
     const second = await d.approvalRequired(write({ reason: 'Filing the demo issue Alex asked for', link: 'https://github.com/alex/vouchr-demo' }));
     assert.notEqual(second.approvalId, first.approvalId);
     assert.deepEqual(texts(d.ephemerals.at(-1).blocks), APPROVE_GITHUB_BLOCKS('Filing the demo issue Alex asked for', 'https://github.com/alex/vouchr-demo'));
@@ -296,9 +301,9 @@ test('(g) a shared credential the channel owns, (h) one approval covers the thre
       { replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval; another channel member must.' },
     ]);
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, SAM, first.approvalId), [
-      { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.' },
+      { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. The agent will continue.' },
     ]);
-    assert.equal(d.ephemerals.at(-1).text, `✅ <@${SAM}> approved your *github-team* action. Ask the agent to retry.`);
+    assert.equal(d.ephemerals.at(-1).text, `✅ <@${SAM}> approved your *github-team* action. The agent will continue.`);
     // (h) The same thread proceeds, call after call, with the channel's token and the requester audited.
     assert.equal((await write('/repos/alex/vouchr-demo/issues')).status, 200);
     assert.equal((await write('/repos/alex/vouchr-demo/issues/1/comments')).status, 200);
@@ -350,7 +355,7 @@ test('(i) an outsider, two approvers at once, (k) offboarding fences a pending p
     const outcomes = [a[0].text, b[0].text].sort();
     assert.deepEqual(outcomes, [
       'This approval expired or was already decided. Ask the agent again.',
-      '✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.',
+      '✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. The agent will continue.',
     ]);
     assert.equal((await d.audit()).filter((r) => r.action === 'approved').length, 1);
     assert.equal((await teamWrite()).status, 200);
@@ -380,7 +385,7 @@ test('edge: a direct message needs no enable, the approver becomes the person, a
     assert.equal(d.ephemerals[0].channel, 'D_ALEX');
     assert.deepEqual(texts(d.ephemerals[0].blocks)[0], { type: 'mrkdwn', text: ':lock: *Approve this github action?*\nThe agent wants to run an action as you on github.' });
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, ALEX, pending.approvalId, { channel: 'D_ALEX', thread: 'TH1' }), [
-      { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.' },
+      { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github* action. This covers one call, once, within 5 minutes. The agent will continue.' },
     ]);
     assert.equal((await gh.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', { method: 'POST', body: '{}' })).status, 200);
     assert.equal(calls.length, 1);
