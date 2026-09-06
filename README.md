@@ -78,6 +78,12 @@ provider's own hosts.
 This is how an agent does most of a task alone and still stops at the steps that matter. It drafts
 and reviews on its own, pauses to merge or to publish, and a teammate approves in Slack.
 
+A private channel works as the approval group. Enable the provider there, connect one shared
+credential with `/vouchr connect-shared`, and any member can approve the agent's sensitive calls
+with it. The credential belongs to that channel: an agent in another channel cannot use it, and
+the prompt never leaves the channel. Agents outside Slack point their requests at that channel and
+the prompt lands there.
+
 ## Audit
 
 Every connect, call, approval, denial, and disconnect is written to an audit table: time, person,
