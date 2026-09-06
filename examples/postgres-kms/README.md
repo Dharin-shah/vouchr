@@ -72,6 +72,8 @@ SLACK_STATE_SECRET=...  # random secret used by Bolt's OAuth installer
 PUBLIC_URL=https://your.domain
 VOUCHR_DATABASE_URL=postgres://user:pass@host:5432/vouchr
 VOUCHR_MASTER_KEY=$(openssl rand -base64 32)   # 32 bytes, base64
+VOUCHR_SLACK_CLIENT_ID=...      # the same app credentials as SLACK_CLIENT_ID/SECRET above; Vouchr's sign-in check reads these
+VOUCHR_SLACK_CLIENT_SECRET=...
 VOUCHR_KMS_KEY_ID=arn:aws:kms:us-east-1:123456789012:key/...
 VOUCHR_LOCKDOWN=0  # switch to 1 during incident containment; store reads/writes then fail closed
 ```

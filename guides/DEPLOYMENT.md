@@ -72,99 +72,18 @@ npm run pg:down # tear it down
 The schema is owned by the `vouchr migrate` command, and the runtime is DML-only — a deliberate
 split so the long-running process holds no DDL privileges.
 
-### Supported migration starting points
+### One schema version
 
-<!-- migratable-schema-versions: 12,13,14,15 -->
+Vouchr is greenfield. There is one schema version today, `1`, created by one DDL. `vouchr migrate`
+on an empty database creates it and stamps the marker. On a database already at version 1 it is a
+no-op. On any other recorded version it refuses with the "recreate the database fresh" error, and
+the runtime refuses to open that database at boot. A `1.0.0` database (schema 15) is not carried
+forward: recreate it fresh and re-connect accounts. Future schema changes add steps from version 1
+and bump the number. The marker stays monotonic, and the exact-version boot check keeps a
+mismatched binary off the data.
 
-`vouchr migrate` accepts a fresh (empty) database or a schema at version 12, 13, 14, or 15 — v12 is
-the schema both published betas (v1.0.0-beta and v1.0.0-beta.1) stamp. Development schemas v6–v11
-never shipped in any release and are refused before any DDL runs. To keep data on one, run
-v1.0.0-beta.1's `vouchr migrate` first (it carries v6–v11 to v12), then upgrade; anything older
-must be recreated fresh.
-
-### Required v12 → v13 drained cutover
-
-Schema v13 (#290) moves every PostgreSQL-clock lifecycle-fence timestamp — the offboard,
-break-glass, and channel-interaction tombstones, `connection.generation_at`, and all pending
-consent/provisioning/session/approval state — from millisecond to microsecond resolution, so
-unrelated sequential operations no longer tie inside the clock's truncation window while every
-`>=` fence still fails a genuine tie closed. It is a pure data conversion (each stored value
-×1000), not a table-shape change; application-clock columns (`audit.at`, connection
-created/updated/last-used/expiry, `broker_jti.exp`) stay epoch-milliseconds.
-
-1. Back up PostgreSQL and verify that the backup can be restored.
-2. Quiesce Slack and broker traffic, drain in-flight interactions, and stop **every** pre-v13
-   replica. A v12 binary reads and writes millisecond fences and must never share the database
-   with v13 data; the exact-version runtime check refuses it at boot, and this drain is what keeps
-   one from staying live across the conversion.
-3. Run this build's `vouchr migrate` with the schema-owner role. From v12 it multiplies every
-   stored fence timestamp by exactly 1000, atomically with the version stamp. The
-   conversion is gated on the recorded predecessor version, so re-running migrate (or racing a
-   concurrent run — the advisory lock serializes them) never multiplies twice.
-4. Start only v13 replicas, confirm readiness, and restore traffic. This step drains no
-   user-visible state: pending prompts, grants, and durable tombstones carry over at the new
-   resolution.
-
-Rollback from v13 requires stopping **every** v13 replica, restoring the matching pre-v13 backup,
-and only then starting the older binary that created that backup. The order matters: the
-exact-version startup check refuses a mismatched binary only at boot, so a v13 process left live
-across the restore would read the restored millisecond fences as microseconds — the mixed-unit
-condition this drained sequence exists to prevent.
-
-### v13 → v14 (browser Slack-identity verification, #302)
-
-Schema v14 adds two nullable/defaulted columns to `consent_request` (`slack_verified_at`,
-`slack_verify_required`); no data conversion. Pre-v14 consent rows carry
-`slack_verify_required = 0`, which is exact: their prompt URL never offered the verify hop. A
-v12 database reaches v14 through the drained v13 sequence above in the same `vouchr migrate`
-run — the ms→µs conversion still applies exactly once on the way through.
-
-The DDL is additive, but the **rollout order is load-bearing**: a v13 process that was already
-running when migrate stamps v14 keeps serving (the exact-version check runs only at boot) and
-predates `slack_verify_required` — its callback would complete an *enforced* consent unstamped,
-which is precisely the bypass the flag exists to prevent. An enforced (`slack_verify_required=1`)
-state must therefore never coexist with a live v13 process. Two safe sequences:
-
-- **Drained cutover (simplest):** stop every v13 replica, run `vouchr migrate`, start only v14
-  replicas (flag on or off). Same shape as the v13 sequence above.
-- **Staged, no drain — flag off until v13 is gone:**
-  1. Run `vouchr migrate` (stamps v14). Already-running v13 replicas keep serving; any v13
-     restart/scale-up is refused at boot by the exact-version check.
-  2. Roll every replica to v14 with `requireBrowserSlackIdentity` **off**. Both binaries treat the
-     resulting `slack_verify_required=0` states identically, so this phase is safe to overlap.
-  3. Only when **zero** v13 processes remain, enable the flag everywhere. Enforced states now only
-     ever meet v14 callbacks, which honor the row unconditionally (regression:
-     `test/browser-identity.test.ts`, two-instance shared-database tests). A still-pending
-     unenforced prompt is superseded on the user's next connect — the persisted mode is part of the
-     consent generation's identity, so a mode flip mints a fresh generation instead of reusing the
-     old row (off→on and on→off regressions in the same file).
-
-### v14 → v15 (backchannel authorization, #296)
-
-Schema v15 adds one nullable column, `approval_request.binding_message`; no data conversion. It is
-non-NULL only on rows minted by `POST /v1/authorization` (an agent-initiated request), which the
-Bolt control plane delivers to Slack on its own timer; every pre-v15 row stays NULL and keeps its
-relayed-denial delivery path. The DDL itself is additive and a v14 process never reads the column.
-
-What is **not** additive is the new `approval_request.status` value: a v15 process retains a
-denied approval as `status='denied'` for one pending-TTL window (so a poller can read the
-outcome), and a v14 process does not know that value. A v14 replica sharing the database with a
-v15 deny therefore misbehaves in two ways: its request dedup treats the denied row as the live
-request, so an in-turn ask for the same action re-prompts against a control whose delivery it then
-reports stale for up to 10 minutes instead of minting a fresh request; and its sweep audits the
-already-audited denial a second time as `approval-expired`. Neither grants access — a denied row
-is never spendable on any version — but both are wrong outcomes.
-
-Required order, therefore: **drain every v14 replica (Bolt control planes and brokers) before any
-v15 process can handle a deny.** Run `vouchr migrate`, stop every v14 process, start only v15
-processes, then point background agents at `POST /v1/authorization`. A v14 process that is merely
-still running when migrate stamps v15 keeps serving (the exact-version check runs only at boot),
-so "migrate, then roll" is not sufficient here — stop v14 first. A v14 Bolt process also runs no
-delivery timer, so a backchannel request created while only v14 control planes are live expires
-undelivered (the agent polls `expired`).
-
-- **`vouchr migrate`** creates/converges the schema to this build's version. Run it **once per
-  deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
+- **`vouchr migrate`** creates the schema, or verifies an existing one is at this build's version.
+  Run it **once per deploy/upgrade**, with a **schema-owner** DB role (may `CREATE`/`ALTER` tables). It is idempotent
   and advisory-locked, so re-running it or racing concurrent runs across replicas is safe.
 
   ```bash
@@ -176,9 +95,8 @@ undelivered (the agent polls `expired`).
 
 - **The runtime** (`createVouchr`, the broker) connects with a **DML-only** role that has no
   `CREATE`. It never creates tables — `openDb()` only verifies the schema version and fails closed
-  if the database isn't migrated. For ordinary schema-compatible upgrades, run the migrate step (a
-  Job / initContainer) to completion before new runtime replicas start. For v12 → v13, use the
-  drained maintenance sequence above instead.
+  if the database isn't migrated. Run the migrate step (a Job / initContainer) to completion before
+  new runtime replicas start.
 
 Example roles and grants (adjust names to taste):
 
@@ -203,8 +121,8 @@ Point the migrate step at `vouchr_owner` and the runtime at `vouchr_app`. The `/
 reflects schema readiness: it returns `503` until the database has been migrated to the current
 version, and `200` once the runtime can reach a current schema.
 
-Upgrading from `0.2.0` (pre-PostgreSQL): there is no SQLite importer and no data migration — start
-from a fresh PostgreSQL database (`vouchr migrate`) and re-connect accounts.
+Upgrading from any earlier release, `1.0.0` included: there is no data migration. Start from a
+fresh PostgreSQL database (`vouchr migrate`) and re-connect accounts.
 
 Multi-instance notes:
 - All instances share one Postgres; credentials are isolated by `team_id`, so multiple workspaces
@@ -383,19 +301,20 @@ When a `/v1/resolve` returns `needs_consent`, drive the user through `POST /v1/c
 `/v1/fetch` for that user then succeeds. The broker never handles a raw token itself — it is only ever
 written to the vault inside the callback.
 
-#### Browser Slack-identity verification (`requireBrowserSlackIdentity`, #302)
+#### Browser Slack-identity verification (#302)
 
-Opt-in hardening for the "Forwarded consent link" hand-off (see `guides/THREAT-MODEL.md`): require
-the browser completing provider OAuth to prove, via Slack OpenID Connect, that it is signed in as
-the Slack user the consent `state` was bound to. Set `VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY=1`
-plus `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` (the Slack app's OIDC credentials —
-the same app that owns your bot). On `createVouchr`/`createBroker` directly, the options are
-`requireBrowserSlackIdentity: true` and `slackOidc: { clientId, clientSecret }`.
+Every Connect link goes through a Slack OpenID Connect hop. The browser completing provider OAuth
+must prove it is signed in as the Slack user the consent `state` was bound to. This closes the
+"Forwarded consent link" hand-off in `guides/THREAT-MODEL.md`. It needs `VOUCHR_BASE_URL` plus
+`VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` (the Slack app's OIDC credentials, the
+same app that owns your bot). On `createVouchr`/`createBroker` directly the option is
+`slackOidc: { clientId, clientSecret }`; `createVouchr` also reads the two variables. Startup fails
+closed, naming the missing variable, without them.
 
-With the flag on, the flow gains one redirect hop and two routes mounted beside `callbackPath`
-(broker defaults shown; on Bolt they sit beside `/vouchr/oauth/callback`):
+The flow has one redirect hop and two routes mounted beside `callbackPath` (broker defaults shown;
+on Bolt they sit beside `/vouchr/oauth/callback`):
 
-1. `authorizeUrl` from `POST /v1/connect` (or the Bolt Connect button) now points at
+1. `authorizeUrl` from `POST /v1/connect` (or the Bolt Connect button) points at
    `GET <baseUrl>/oauth/verify?state=…`, which 302s to Slack's OIDC authorize (`scope=openid`).
 2. Slack authenticates the browser's real Slack session and redirects to
    `GET <baseUrl>/oauth/slack`. Vouchr exchanges the code at `openid.connect.token` server-side
@@ -406,28 +325,19 @@ With the flag on, the flow gains one redirect hop and two routes mounted beside 
    the single-use state is spent, the outcome is audited against the **bound** user (reason
    `browser_identity_mismatch`; the completer's identity is compared and discarded), and a fixed
    non-reflecting error page is shown.
-3. The provider callback additionally refuses any consent the hop never stamped, so `GET
-   <callbackPath>` can never be used to bypass the hop — a direct hit only burns the state.
+3. The provider callback refuses any consent the hop never stamped, so `GET <callbackPath>` can
+   never be used to bypass the hop — a direct hit only burns the state.
 
-The requirement is **persisted with the consent at mint time** (`slack_verify_required`, schema
-v14) and every callback enforces the row's value — never the completing replica's own flag. In a
-multi-replica fleet, a state minted by an enforcing replica therefore fails closed even when the
-provider redirect lands on a v14 replica whose flag is off (rollout, config drift). The persisted
-mode is also part of the consent generation's identity: a connect handled under the other mode
-supersedes a still-pending prompt and mints a fresh generation, so a flag flip never leaves a
-verify-hop URL over an unenforced row or an un-completable direct URL over an enforced one. Do not
-enable the flag while any pre-v14 process is still live — see
-[v13 → v14](#v13--v14-browser-slack-identity-verification-302) for the required order. Slack's
-OIDC endpoints are fixed and not
-configurable: the id_token is accepted from Slack's token endpoint over TLS without signature
-verification, so a configurable endpoint would be an identity-forging seam.
+The stamp lives on the shared consent row, so in a multi-replica fleet any replica's callback
+enforces it (regression: `test/browser-identity.test.ts`, the two-replica row). Slack's OIDC
+endpoints are fixed and not configurable: the id_token is accepted from Slack's token endpoint over
+TLS without signature verification, so a configurable endpoint would be an identity-forging seam.
 
 Slack app configuration: add `"$VOUCHR_BASE_URL/oauth/slack"` (Bolt:
 `"$baseUrl/vouchr/oauth/slack"`) to the app's **OAuth redirect URLs**; no extra bot scope is
-needed (`openid` is a user-consented sign-in scope requested at the hop). Startup fails closed
-when the flag is set without both OIDC credentials or without `VOUCHR_BASE_URL`, and the flag is
-incompatible with `VOUCHR_DRY_RUN` (the synthetic authorize URL never passes the hop). The flag is
-opt-in and recommended for production (#302).
+needed (`openid` is a user-consented sign-in scope requested at the hop). Dry-run
+(`VOUCHR_DRY_RUN`) keeps its synthetic local authorize URL: it stands in for the Slack hop as it
+does for the provider, and can only mint a synthetic credential row.
 
 ### Convenience: batch status + manifest (#55)
 
@@ -590,10 +500,9 @@ POST /v1/admin/reference
 | `VOUCHR_BROKER_TOKEN` | no | static bearer for the coarse perimeter gate on `/v1/*`. |
 | `VOUCHR_TTL_IDLE_MS` / `VOUCHR_TTL_MAX_AGE_MS` | no | credential idle / max-age TTL (#54). Default 7d / 30d (matches the Bolt path); `0` disables that dimension. |
 | `VOUCHR_SWEEP_INTERVAL_MS` | no | TTL sweep interval (#54). Default hourly; `0` defers to an external scheduler. |
-| `VOUCHR_BASE_URL` | for OAuth | public HTTPS origin of this broker; setting it mounts `POST /v1/connect` + the OAuth callback (#52). |
+| `VOUCHR_BASE_URL` | yes | public HTTPS origin of this broker; `POST /v1/connect`, the Slack verify routes, and the OAuth callback mount under it (#52, #302). |
 | `VOUCHR_CALLBACK_PATH` | no | OAuth redirect path under `VOUCHR_BASE_URL` (default `/oauth/callback`). |
-| `VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY` | no | `1`/`true` requires the browser completing provider OAuth to prove the bound Slack identity via Slack OIDC before the provider authorize URL is revealed (#302); `0`/`false` disables it, and any other value refuses boot. Needs `VOUCHR_BASE_URL` plus both Slack OIDC credentials below; incompatible with `VOUCHR_DRY_RUN`. See [Browser Slack-identity verification](#browser-slack-identity-verification-requirebrowserslackidentity-302). |
-| `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` | with #302 | the Slack app's OIDC client credentials for the verify hop. The secret must be distinct from every other configured secret (purpose separation). |
+| `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` | yes | the Slack app's OIDC client credentials for the browser identity check on every Connect link (#302). The secret must be distinct from every other configured secret (purpose separation). See [Browser Slack-identity verification](#browser-slack-identity-verification-302). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
 | `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
@@ -1195,7 +1104,7 @@ Wire the four hooks (see the README example):
 
 ```ts
 app.use(vouchr.middleware);
-vouchr.mountRoutes(receiver.router);  // OAuth callback at $baseUrl/vouchr/oauth/callback
+vouchr.mountRoutes(receiver.router);  // Slack verify hop + OAuth callback under $baseUrl/vouchr/oauth/
 vouchr.registerCommands(app);         // /vouchr + the modals (mandatory for key/connect-shared flows)
 vouchr.registerOffboarding(app);      // user_change → revoke a deactivated user's connections
 setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
@@ -1204,11 +1113,11 @@ setInterval(() => vouchr.sweepExpired(), 3_600_000); // hourly TTL sweep
 Single-workspace: set `botToken` (or `SLACK_BOT_TOKEN`). Multi-workspace: use a `DbInstallationStore`
 in both Bolt's OAuth config and `createVouchr` (see *Multi-workspace install* above).
 
-With `requireBrowserSlackIdentity: true` (#302), also add `"$baseUrl/vouchr/oauth/slack"` to the
-app's **OAuth redirect URLs** (App settings → OAuth & Permissions) and pass the app's client
-credentials as `slackOidc: { clientId, clientSecret }` (or `SLACK_CLIENT_ID` /
-`SLACK_CLIENT_SECRET`). The Connect button then routes through Slack sign-in before provider OAuth
-— see [Browser Slack-identity verification](#browser-slack-identity-verification-requirebrowserslackidentity-302).
+Add `"$baseUrl/vouchr/oauth/slack"` to the app's **OAuth redirect URLs** (App settings → OAuth &
+Permissions) and pass the app's client credentials as `slackOidc: { clientId, clientSecret }` (or
+`VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET`). The Connect button routes through Slack
+sign-in before provider OAuth (#302) — see
+[Browser Slack-identity verification](#browser-slack-identity-verification-302).
 
 ## Production readiness checklist
 
@@ -1272,7 +1181,7 @@ broker code in-process).
    `name@digest` in both the migrate Job and the Deployment.
 2. Run the migrate Job to completion with the schema-owner role. It is idempotent and
    advisory-locked. A version that changes the schema in a way old replicas cannot serve says so in
-   [Migrations](#migrations) (v12 → v13 is drained; v13 → v14 is a staged flag rollout).
+   [Migrations](#migrations).
 3. Roll the Deployment. With `replicas: 2` the default `RollingUpdate` (`maxUnavailable` rounds to
    0, `maxSurge` to 1) starts a new pod, waits for its `/readyz`, then terminates an old one:
    the fleet never drops below two ready pods. Endpoint removal and SIGTERM race on the old pod, so
@@ -1282,8 +1191,7 @@ broker code in-process).
 4. Rollback = roll the Deployment back to the previous digest. The runtime is DML-only and the
    schema marker is exact-version, so an older build against a newer schema fails `openDb` at boot:
    the process exits `1` and the pod goes `CrashLoopBackOff` (it never reaches `/readyz`) — restore
-   the matching backup instead, as [Migrations](#migrations) describes per version. Rollback never
-   runs `vouchr migrate`.
+   the matching backup instead. Rollback never runs `vouchr migrate`.
 
 ### Graceful shutdown
 

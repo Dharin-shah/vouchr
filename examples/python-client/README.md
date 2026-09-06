@@ -15,7 +15,8 @@ not reimplemented here.
 ## Run it
 
 Start the broker as `examples/broker-client/client.ts` describes (same `VOUCHR_IDENTITY_SECRET`,
-`VOUCHR_DEPLOYMENT_ID`, `VOUCHR_MASTER_KEY`, and `VOUCHR_DATABASE_URL` as the control plane). Mint a
+`VOUCHR_DEPLOYMENT_ID`, `VOUCHR_MASTER_KEY`, `VOUCHR_DATABASE_URL`, and Slack OIDC pair as the
+control plane, plus `VOUCHR_BASE_URL`). Mint a
 token on the TypeScript side and pipe it in:
 
 ```sh

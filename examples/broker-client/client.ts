@@ -24,6 +24,8 @@
  *   export VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
  *   export VOUCHR_IDENTITY_SECRET=$(openssl rand -base64 32)   # >= 32 bytes, not the master key
  *   export VOUCHR_DEPLOYMENT_ID=local-dev                       # binds assertions to this deployment
+ *   export VOUCHR_BASE_URL=https://broker.example              # public origin; the connect/verify/callback routes mount here
+ *   export VOUCHR_SLACK_CLIENT_ID=... VOUCHR_SLACK_CLIENT_SECRET=...   # the Slack app's OIDC credentials (#302)
  *
  *   # terminal A — after provisioning T1/U1, start the broker:
  *   VOUCHR_PROVIDERS='[{"id":"github","credential":"key","egressAllow":["api.github.com"]}]' npm run broker

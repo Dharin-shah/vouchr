@@ -22,10 +22,11 @@ Only the current release line is supported with fixes.
 
 | Version | Supported |
 | --- | --- |
-| `1.0.0` | ✅ current release — PostgreSQL-only, deny-by-default |
-| `1.0.0-beta.1` | ❌ superseded — upgrade to `1.0.0` (schema v15: run `vouchr migrate`; the workspace-admin role is removed, see CHANGELOG) |
-| `1.0.0-beta` | ❌ superseded — upgrade to `1.0.0` |
-| `< 1.0` | ❌ superseded — upgrade to `1.0.0` (breaking; greenfield, no data migration) |
+| `1.1.0` | ✅ current release — PostgreSQL-only, deny-by-default, Slack sign-in on every Connect link |
+| `1.0.0` | ❌ superseded — upgrade to `1.1.0` (breaking configuration: set `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` and, on the broker, `VOUCHR_BASE_URL`; recreate the database with `vouchr migrate`, schema version 1, no data migration; see CHANGELOG) |
+| `1.0.0-beta.1` | ❌ superseded — upgrade to `1.1.0` |
+| `1.0.0-beta` | ❌ superseded — upgrade to `1.1.0` |
+| `< 1.0` | ❌ superseded — upgrade to `1.1.0` (breaking; greenfield, no data migration) |
 
 ## Scope
 

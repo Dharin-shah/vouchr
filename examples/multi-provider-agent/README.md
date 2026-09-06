@@ -74,7 +74,7 @@ node --import tsx examples/multi-provider-agent/app.ts
 ```
 
 Plus the usual `SLACK_SIGNING_SECRET`, `SLACK_BOT_TOKEN`, `PUBLIC_URL`, `VOUCHR_DATABASE_URL`,
-`VOUCHR_MASTER_KEY`.
+`VOUCHR_MASTER_KEY`, `VOUCHR_SLACK_CLIENT_ID`, and `VOUCHR_SLACK_CLIENT_SECRET`.
 
 Configure two providers if you can — watching the model pick between them from plain English is most
 of the point.

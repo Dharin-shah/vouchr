@@ -35,7 +35,8 @@ import { createVouchr, github, ConsentRequiredError, safeUserMessage } from '@vo
 const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET! });
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 
-// Needs VOUCHR_DATABASE_URL and VOUCHR_MASTER_KEY in the environment, and a one-time `npx vouchr migrate`.
+// Needs VOUCHR_DATABASE_URL, VOUCHR_MASTER_KEY, and the Slack app's VOUCHR_SLACK_CLIENT_ID /
+// VOUCHR_SLACK_CLIENT_SECRET in the environment, and a one-time `npx vouchr migrate`.
 const vouchr = await createVouchr({
   providers: [
     // Reads go through. Writes under /repos/ wait for a teammate's approval.
