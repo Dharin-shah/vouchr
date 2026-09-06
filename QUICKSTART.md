@@ -214,7 +214,9 @@ In your Slack workspace, in the `#demo` channel:
 4. Click **Connect**. Your browser first passes through a Slack sign-in check (Slack confirms you
    are the person who asked, then sends you on), then opens GitHub's authorize screen. Click
    **Authorize**. You land on a plain *"github connected"* page that names the Slack user it is
-   linked to.
+   linked to. Back in Slack the prompt has replaced itself with a one-line note. A prompt is valid
+   for ten minutes; clicking an older one replaces it with a **Send a new link** button, so you
+   never have to mention the bot again just to get a fresh link.
 5. Mention the bot again: `@vouchr who am I on github?` The in-thread reply is
    **`You are *yourlogin* on GitHub, N public repos.`**
 6. This is the point of Vouchr. The bot code ran `gh.fetch('https://api.github.com/user')` and never

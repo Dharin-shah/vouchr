@@ -14,6 +14,7 @@ import {
   readResponseJsonCapped,
 } from '../core/httpBounds';
 import { safeEmit } from '../core/safe-emit';
+import { CONNECT_PROMPT_STALE_TEXT } from './blocks';
 
 // Slack's published endpoints, deliberately NOT configurable: the id_token is accepted without
 // signature verification because it arrives directly from this token endpoint over TLS — a
@@ -52,15 +53,18 @@ export type BrowserVerifyResult =
 
 // Fixed, non-reflecting outcomes. No Slack id, provider detail, or upstream error text ever appears
 // here (SEC-1/SEC-5); the pages render these strings verbatim.
+// #347: the Slack click that opened this page replaced the prompt with a "Send a new link" button.
 const STALE: BrowserVerifyResult = {
   ok: false,
   status: 400,
-  error: 'This connection request is no longer current. Ask the agent for a new connection prompt.',
+  error: `${CONNECT_PROMPT_STALE_TEXT} The prompt in Slack now offers a new link.`,
 };
+// An in-channel prompt was replaced on click (#347) while its state stays live, so point at the
+// agent (a re-ask reposts the same generation) rather than at a prompt that may be gone.
 const INCOMPLETE: BrowserVerifyResult = {
   ok: false,
   status: 400,
-  error: 'Slack sign-in did not complete. Use the connection prompt to try again.',
+  error: 'Slack sign-in did not complete. Ask the agent again to get the connection prompt back.',
 };
 const EXCHANGE_FAILED: BrowserVerifyResult = {
   ok: false,
