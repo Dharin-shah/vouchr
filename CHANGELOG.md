@@ -5,6 +5,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Docs
+
+- HEADLESS.md gained "Autonomous workers": a bot-user requester on a shared channel credential with
+  `approver: 'member'`, the `approver: 'self'` caveat, and a production-path test in
+  `test/authorization.test.ts`.
+
 ## [1.0.0] — 2026-09-06
 
 First production release. Approvals go to the team that owns the channel, background agents can

@@ -89,6 +89,9 @@ release and to merge the pull request. The team approves each in Slack. The agen
 team, so `member` behaves like `self`. This also works for agents outside Slack. They call the
 broker, and the same prompt lands in the same channel. See the
 [headless guide](./guides/HEADLESS.md#backchannel-authorization-for-background-agents-296).
+A job with no human requester, such as a ticket-driven worker or a cron, runs as the app's bot user
+and any channel member approves; see
+[Autonomous workers](./guides/HEADLESS.md#autonomous-workers).
 
 ## Providers
 
