@@ -742,6 +742,7 @@ export class Vault {
     provider: string,
     issuance: UserProvisioningIssuance,
     write: (tx: Db) => Promise<void>,
+    synthetic = false,
   ): Promise<Exclude<UserProvisioningResult, 'conflict'>> {
     if (owner.kind !== 'user') throw new Error('user provisioning requires a user owner');
     const identity: SlackIdentity = {
@@ -769,12 +770,15 @@ export class Vault {
         // would let the stale write win the tie. A stalled OAuth/key/reference request therefore
         // loses. Legitimate replacements are not ties: each real re-key/re-reference/re-auth arrives
         // on a fresh interaction receipt strictly later than the prior write's generation.
+        // A synthetic (#116 dry-run) row is never a generation a REAL write must respect: production
+        // re-marks it real on overwrite, so it fences only other synthetic writes (#327).
         const existing = await fencedTx.get<{
           created_at: number;
           last_used_at: number | null;
           generation_at: number;
+          dry_run: number;
         }>(
-          `SELECT created_at, last_used_at, generation_at FROM connection
+          `SELECT created_at, last_used_at, generation_at, dry_run FROM connection
            WHERE team_id=? AND owner_kind='user' AND owner_id=? AND provider=?`,
           [owner.teamId, owner.id, provider],
         );
@@ -782,6 +786,7 @@ export class Vault {
           existing
           && !this.isExpired(existing.created_at, existing.last_used_at ?? existing.created_at)
           && existing.generation_at >= issuedAt
+          && (synthetic || existing.dry_run !== 1)
         ) {
           return 'stale';
         }
@@ -982,7 +987,7 @@ export class Vault {
     let written = false;
     const fenced = await this.withUserProvisioningFence(owner, provider, issuance, async (tx) => {
       written = await this.writeDryRunCredential(tx, owner, provider, t, prepared, afterWrite);
-    });
+    }, true);
     return fenced === 'stored' && !written ? 'conflict' : fenced;
   }
 

@@ -274,7 +274,11 @@ test('tryDecryptDirect attributes each blob to the scheme + key that decrypted i
   assert.deepEqual(tryDecryptDirect(env, r), { ok: false, reason: 'maybe-envelope' });
 
   // garbage under no configured key
-  const und = tryDecryptDirect(encrypt('f', randomBytes(32)), r);
+  // A scheme-0 blob starts with a random IV byte; pin it off the 0x01/0x02 scheme markers so the
+  // classifier answers 'undecryptable' every run instead of 'maybe-envelope' one run in 256.
+  const garbage = encrypt('f', randomBytes(32));
+  garbage[0] = 0x00;
+  const und = tryDecryptDirect(garbage, r);
   assert.deepEqual(und, { ok: false, reason: 'undecryptable' });
 });
 
