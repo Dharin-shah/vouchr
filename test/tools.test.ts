@@ -6,7 +6,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
 import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
-import { applyChannelToolsEnabled, ChannelTools, setChannelToolEnabled } from '../src/core/tools';
+import { applyChannelToolsEnabled, ChannelTools, configureChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
@@ -448,4 +448,31 @@ test('governanceChannelOf: exhaustive C/D/G classification fails contradictory t
       `${String(channel)} + ${String(type)} must map to ${String(expected)}`,
     );
   }
+});
+
+// #352: under deny-by-default a Disable on a channel with no rows changes nothing, so the shared
+// governance helper writes neither the materialized allowlist nor a `config` audit row (UX-4); a
+// real flip still does both.
+test('configureChannelTools: a no-op disable on a fresh channel writes no rows and no audit', async (t) => {
+  const { db, tools } = await freshTools(t);
+  const vault = new Vault(db, KEY);
+  const audit = new Audit(db);
+  const configure = async (enabled: boolean) => configureChannelTools({
+    channelTools: tools, vault, audit, identity: ID, channel: 'C1',
+    changes: [['mcp', enabled]], allProviders: ALL3,
+    authorize: async () => true, assertEligible: async () => undefined,
+    issuance: await vault.userProvisioningIssuedAt(),
+  });
+  const rows = async (table: string) => Number(((await db.get(`SELECT COUNT(*) AS n FROM ${table}`)) as any).n);
+
+  assert.equal(await configure(false), 'unchanged');
+  assert.equal(await rows('channel_tool'), 0, 'a no-op disable must not materialize the allowlist');
+  assert.equal(await rows('audit'), 0, 'a no-op disable must not audit');
+
+  assert.equal(await configure(true), 'configured');
+  assert.equal(await rows('channel_tool'), ALL3.length, 'the first real change materializes the allowlist');
+  assert.equal(await rows('audit'), 1);
+
+  assert.equal(await configure(false), 'configured');
+  assert.equal(await rows('audit'), 2, 'a real disable after enable still audits');
 });
