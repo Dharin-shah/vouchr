@@ -570,8 +570,8 @@ export type ConfigMemberRow = {
 
 /** The two answers to "Who does the agent act as here?", in the order every picker lists them. */
 const IDENTITY_OPTIONS: { text: { type: 'plain_text'; text: string }; value: ChannelIdentity }[] = [
-  { text: { type: 'plain_text', text: 'Each person, with their own account' }, value: 'person' },
-  { text: { type: 'plain_text', text: 'The channel, with one shared account' }, value: 'channel' },
+  { text: { type: 'plain_text', text: 'Each member, as themselves' }, value: 'person' },
+  { text: { type: 'plain_text', text: 'This channel, with one shared credential' }, value: 'channel' },
 ];
 const identityOption = (identity: unknown) => IDENTITY_OPTIONS.find((o) => isChannelIdentity(identity) && o.value === identity);
 // Both pickers list exactly the core enum, so a value the guard refuses can never be offered.
@@ -584,9 +584,10 @@ const CONFIG_CONNECTION_ROWS_MAX = 10;
  *  - "Your connections" (EVERYONE): a bounded first set with Disconnect buttons, plus explicit
  *    `/vouchr status [page]` guidance when more rows exist.
  *  - "Tools in this channel" (EVERYONE): the read-only manifest (which providers are usable here).
- *  - "Channel settings" (CHANNEL MEMBERS ONLY, `admin` rows present): per-provider "Who does the
- *    agent act as here?" select + Enabled checkbox, whose submit routes to the SAME identity/enable/
- *    disable mutations as the slash commands.
+ *  - "Channel settings" (CHANNEL MEMBERS ONLY, `admin` rows present): enabled providers first, each
+ *    with a "who does the agent act as here?" select showing the effective identity plus the Enabled
+ *    checkbox; disabled providers after, with the checkbox only ("enable to configure"). The submit
+ *    routes to the SAME identity/enable/disable mutations as the slash commands.
  *
  * The channel rides in `private_metadata` so the submit binds to the right channel. The governance
  * controls' mere presence is NOT the authorization — the submit handler re-checks membership
@@ -625,16 +626,18 @@ export function configModal(o: {
   if (o.admin && o.admin.length) {
     blocks.push({ type: 'divider' });
     blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel settings', emoji: true } });
-    for (const p of o.admin) {
-      // Identity select, block_id `identity:<provider>` so the submit maps it back, initial set to the
-      // current identity. The submit diffs against the OPEN-TIME value carried in private_metadata
-      // (not a re-read of the store), so an untouched select never mutates and never reverts a
-      // concurrent change. A service tool has no identity to pick.
-      const initialIdentity = identityOption(p.identity);
+    // Enabled providers first, each with its identity line; disabled ones after, with only the enable
+    // toggle (#356). The identity select's initial is the EFFECTIVE identity (`person` unless the channel
+    // stored `channel`), never blank, so the input is not `optional`.
+    const enabledOption = { text: { type: 'plain_text', text: 'Enabled in this channel' }, value: 'enabled' };
+    for (const p of [...o.admin.filter((r) => r.enabled), ...o.admin.filter((r) => !r.enabled)]) {
+      // block_id `identity:<provider>` so the submit maps it back. The submit diffs against the OPEN-TIME
+      // value carried in private_metadata (not a re-read of the store), so an untouched select never
+      // mutates and never reverts a concurrent change. A service tool has no identity to pick.
+      const initialIdentity = p.enabled ? identityOption(p.identity) : undefined;
       if (initialIdentity) {
         blocks.push({
           type: 'input',
-          optional: true,
           block_id: `identity:${p.provider}`,
           label: { type: 'plain_text', text: `${p.provider}: who does the agent act as here?` },
           element: {
@@ -645,12 +648,11 @@ export function configModal(o: {
           },
         });
       }
-      const enabledOption = { text: { type: 'plain_text', text: 'Enabled in this channel' }, value: 'enabled' };
       blocks.push({
         type: 'input',
         optional: true,
         block_id: `tool:${p.provider}`,
-        label: { type: 'plain_text', text: `${p.provider} — availability` },
+        label: { type: 'plain_text', text: p.enabled ? `${p.provider}: available in this channel` : `${p.provider}: enable to configure` },
         element: {
           type: 'checkboxes',
           action_id: 'enabled',

@@ -592,3 +592,34 @@ test('blocksFallbackText accepts exactly 40000 chars and rejects truncation-pron
   assert.throws(() => blocksFallbackText(blocksForLength(40_001)), /top-level message limit/);
   assert.throws(() => blocksFallbackText([{ type: 'divider' }]), /no visible block copy/);
 });
+
+// #356: the settings modal's identity line reads without the docs. Three shapes: nothing stored (the
+// `person` default is SHOWN as the selection, not left blank), `channel` stored, and a disabled provider
+// (no identity line, "enable to configure"). Enabled providers come first.
+test('configModal identity line shows the effective identity and orders enabled providers first', () => {
+  const modal = configModal({
+    channel: 'C1',
+    connections: [],
+    tools: [],
+    admin: [
+      { provider: 'off', identity: 'person', enabled: false },
+      { provider: 'own', identity: 'person', enabled: true },
+      { provider: 'shared', identity: 'channel', enabled: true },
+    ],
+  }) as any;
+  const byId = (id: string) => modal.blocks.find((b: any) => b.block_id === id);
+  assert.deepEqual(
+    modal.blocks.map((b: any) => b.block_id).filter((id: unknown) => typeof id === 'string'),
+    ['identity:own', 'tool:own', 'identity:shared', 'tool:shared', 'tool:off'],
+  );
+  assert.equal(byId('identity:own').optional, undefined);
+  assert.equal(byId('identity:own').label.text, 'own: who does the agent act as here?');
+  assert.deepEqual(byId('identity:own').element.initial_option, { text: { type: 'plain_text', text: 'Each member, as themselves' }, value: 'person' });
+  assert.deepEqual(byId('identity:shared').element.initial_option, { text: { type: 'plain_text', text: 'This channel, with one shared credential' }, value: 'channel' });
+  assert.deepEqual(byId('identity:own').element.options.map((o: any) => o.text.text), ['Each member, as themselves', 'This channel, with one shared credential']);
+  assert.equal(byId('tool:own').label.text, 'own: available in this channel');
+  assert.equal(byId('tool:own').element.initial_options.length, 1);
+  assert.equal(byId('tool:off').label.text, 'off: enable to configure');
+  assert.equal(byId('tool:off').element.initial_options, undefined);
+  assert.equal(modal.submit.text, 'Save');
+});

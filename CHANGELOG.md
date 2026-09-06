@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- The settings modal (`/vouchr` with no arguments) shows who the agent acts as for each enabled
+  provider as the current value, `person` unless the channel stored `channel`, with no "(optional)"
+  hint. Options read "Each member, as themselves" and "This channel, with one shared credential".
+  Enabled providers are listed first; disabled ones show "enable to configure" with only the enable
+  toggle (#356).
+
 ## [1.2.0] — 2026-09-06
 
 One setting says who the agent acts as, writes wait for a human unless a provider opts out, and every
