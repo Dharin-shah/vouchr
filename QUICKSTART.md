@@ -222,8 +222,9 @@ In your Slack workspace, in the `#demo` channel:
 6. This is the point of Vouchr. The bot code ran `gh.fetch('https://api.github.com/user')` and never
    saw the token. Look at the terminal: there is no token in the logs. You can also run
    `/vouchr status` to see the managed connection, and `/vouchr disconnect github` to revoke it.
-7. Writes ask by default. Any call other than GET or HEAD posts an Approve/Deny prompt in the
-   channel, and another member approves it before the call goes out. Reads go straight through.
+7. Writes ask by default. Any call other than GET or HEAD posts an Approve/Deny prompt before the
+   call goes out: to you privately when the agent acts as you, to the channel for a teammate when it
+   acts as the channel. Reads go straight through.
 
 ## Troubleshooting
 

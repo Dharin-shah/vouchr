@@ -365,7 +365,13 @@ into many actions, or to skip the approval entirely.
   Query parameter names and values are BOTH caller-controlled and may carry tokens,
   signed-URL material, or PII, so neither is ever persisted, audited, logged, or rendered.
   Origin binds scheme, hostname, and effective port, so a loopback approval on one development port
-  cannot authorize another. The prompt shows the human what they are deciding: the requester, the
+  cannot authorize another. Who decides is resolved server-side from the persisted request's
+  credential owner and the provider definition, at delivery and again at the click, never from the
+  interaction payload: by default the requester confirms a write with their own credential (identity
+  `person`) and another channel member approves a write with the channel's credential (identity
+  `channel`); an explicit `approval.approver` overrides that. A request minted under one owner is
+  purged when the identity flips, so it cannot become decidable under the other rule. The prompt
+  shows the human what they are deciding: the requester, the
   provider, the method, host, and plain path (rendered as plain text so a crafted path cannot
   impersonate Vouchr's copy), the grant scope, and the agent's `reason` and `link` when given. It
   never shows the query string or the body. The audit row carries host, method, grant, and reason

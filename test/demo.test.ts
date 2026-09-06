@@ -11,14 +11,15 @@ import { ApprovalRequiredError } from '../src/core/approval';
 import { ConsentRequiredError, createVouchr, safeUserMessage } from '../src/adapters/bolt';
 import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION, CONFIGURE_CALLBACK } from '../src/adapters/blocks';
 import { POSTGRES_NOW_US_SQL } from '../src/core/interaction';
-import { userOwner } from '../src/core/owner';
+import { channelOwner, userOwner } from '../src/core/owner';
 
 // guides/DEMO.md, scenarios (a) to (m) except (j) (the autonomous worker, test/authorization.test.ts)
 // plus the #350 edge rows, on the production path with the
 // exact Slack copy: a real createVouchr, its middleware, its registered slash command, view, and
 // action handlers, a faked Slack client, a stubbed provider egress, and a throwaway PostgreSQL
 // schema. The demo app's two providers are registered exactly as examples/demo/app.ts does:
-// `github()` with NO approval configuration (the default asks another member once per write) and a
+// `github()` with NO approval configuration (the default follows the identity (#359): acting as the
+// person, the requester confirms each write; acting as the channel, another member approves) and a
 // key provider for the channel's shared token with a thread grant.
 
 const TEAM = 'T1';
@@ -132,7 +133,7 @@ async function demo(t: TestContext, o: { db?: Db; members?: string[]; channelInf
 }
 
 const APPROVE_GITHUB_BLOCKS = (reason?: string, link?: string) => [
-  { type: 'mrkdwn', text: `:lock: *Approve this github action?*\nThe agent wants to run an action on github for <@${ALEX}>. Another member of this channel must approve it.` },
+  { type: 'mrkdwn', text: ':lock: *Approve this github action?*\nThe agent wants to run an action as you on github.' },
   { type: 'plain_text', text: 'POST api.github.com/repos/alex/vouchr-demo/issues' },
   ...(reason ? [{ type: 'plain_text', text: `Reason: ${reason}` }] : []),
   ...(link ? [{ type: 'mrkdwn', text: `Link: <${link}>` }] : []),
@@ -179,7 +180,7 @@ test('(a) deny by default, (b) a member enables, (c) the connect prompt, (d) a r
   assert.ok(!JSON.stringify(await d.audit()).includes(TOKEN));
 });
 
-test('(e) a write waits for the team with no approval configuration, (f) deny, and re-asking while pending', async (t) => {
+test('(e) a write as Alex waits for Alex with no approval configuration, (f) deny, and re-asking while pending', async (t) => {
   const d = await demo(t);
   await d.slash(SAM, 'enable github');
   await d.vouchr.vault.upsert(userOwner(id(ALEX)), 'github', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'alex' });
@@ -189,55 +190,59 @@ test('(e) a write waits for the team with no approval configuration, (f) deny, a
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ title: 'Demo issue' }), ...init,
     });
 
-    // Nothing is sent. The channel gets one message, in the thread, that says who, what, and why.
+    // Nothing is sent. The agent acts as Alex, so Alex gets one private prompt, in the thread, that
+    // says what and why (#359). The channel sees nothing.
     const first = await d.approvalRequired(write());
+    assert.equal(first.approver, 'self');
+    assert.equal(safeUserMessage(first), 'Human approval is required. Approve the prompt Vouchr posted to you, then retry.');
     assert.equal(calls.length, 0);
-    assert.equal(d.messages.length, 1);
-    assert.equal(d.messages[0].channel, CHANNEL);
-    assert.equal(d.messages[0].thread_ts, 'TH1');
-    assert.deepEqual(texts(d.messages[0].blocks), APPROVE_GITHUB_BLOCKS());
-    assert.ok(!JSON.stringify(d.messages[0]).includes('Demo issue'), 'the request body is never rendered');
+    assert.equal(d.messages.length, 0, 'no channel message for a personal write');
+    assert.equal(d.ephemerals.length, 1);
+    assert.equal(d.ephemerals[0].channel, CHANNEL);
+    assert.equal(d.ephemerals[0].user, ALEX);
+    assert.equal(d.ephemerals[0].thread_ts, 'TH1');
+    assert.deepEqual(texts(d.ephemerals[0].blocks), APPROVE_GITHUB_BLOCKS());
+    assert.ok(!JSON.stringify(d.ephemerals[0]).includes('Demo issue'), 'the request body is never rendered');
 
     // Re-asking while the prompt is pending: one private line, no second prompt.
     const again = await d.approvalRequired(write());
     assert.equal(again.approvalId, first.approvalId);
-    assert.equal(d.messages.length, 1);
-    assert.deepEqual(d.ephemerals.map((e) => e.text), ['Still waiting for another member of this channel to approve the github action.']);
+    assert.equal(d.ephemerals.length, 2);
+    assert.equal(d.ephemerals[1].text, 'Still waiting for you to decide the github action above.');
 
-    // Alex cannot approve Alex; the prompt stays.
-    assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, ALEX, first.approvalId), [
-      { replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval; another channel member must.' },
-    ]);
-    // Sam approves: the prompt is replaced, Alex is told, the retry runs once, the next write asks again.
+    // Sam cannot approve for Alex: the credential is Alex's own; the prompt stays.
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, SAM, first.approvalId), [
+      { replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval; only the requester can.' },
+    ]);
+    // Alex approves: the prompt is replaced, the retry runs once, the next write asks again.
+    assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, ALEX, first.approvalId), [
       { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.' },
     ]);
-    assert.equal(d.ephemerals.at(-1).text, `✅ <@${SAM}> approved your *github* action. Ask the agent to retry.`);
     assert.equal((await write()).status, 200);
     assert.equal(calls.length, 1);
     const second = await d.approvalRequired(write({ reason: 'Filing the demo issue Alex asked for', link: 'https://github.com/alex/vouchr-demo' }));
     assert.notEqual(second.approvalId, first.approvalId);
-    assert.deepEqual(texts(d.messages[1].blocks), APPROVE_GITHUB_BLOCKS('Filing the demo issue Alex asked for', 'https://github.com/alex/vouchr-demo'));
+    assert.deepEqual(texts(d.ephemerals.at(-1).blocks), APPROVE_GITHUB_BLOCKS('Filing the demo issue Alex asked for', 'https://github.com/alex/vouchr-demo'));
     assert.deepEqual(
       (await d.audit()).filter((r) => r.action === 'approval_requested').map((r) => JSON.parse(r.meta).reason),
       [undefined, 'Filing the demo issue Alex asked for'],
       'the reason rides the audit row under one fixed key',
     );
 
-    // (f) Deny: nothing is sent, Alex is told, and asking again is a new decision.
-    assert.deepEqual(await d.click(APPROVAL_DENY_ACTION, SAM, second.approvalId), [
+    // (f) Deny: nothing is sent, and asking again is a new decision.
+    assert.deepEqual(await d.click(APPROVAL_DENY_ACTION, ALEX, second.approvalId), [
       { replace_original: true, response_type: 'ephemeral', text: '🚫 Denied the *github* action. Nothing was sent.' },
     ]);
-    assert.equal(d.ephemerals.at(-1).text, `🚫 <@${SAM}> denied your *github* action. Nothing was sent.`);
     assert.equal(calls.length, 1);
     const third = await d.approvalRequired(write());
     assert.notEqual(third.approvalId, second.approvalId);
+    assert.equal(d.messages.length, 0, 'the channel never saw a personal write');
   });
   assert.deepEqual(
     (await d.audit()).map((r) => `${r.action}${r.actor ? `:${r.actor}` : ''}${JSON.parse(r.meta).reason ? `(${JSON.parse(r.meta).reason})` : ''}`),
     [
-      'config', 'approval_requested', 'denied(not-approver)', `approved:${SAM}`, `approval_consumed:${SAM}`, 'inject',
-      'approval_requested(Filing the demo issue Alex asked for)', `denied:${SAM}(approval-denied)`, 'approval_requested',
+      'config', 'approval_requested', 'denied(not-approver)', `approved:${ALEX}`, `approval_consumed:${ALEX}`, 'inject',
+      'approval_requested(Filing the demo issue Alex asked for)', `denied:${ALEX}(approval-denied)`, 'approval_requested',
     ],
   );
 });
@@ -276,15 +281,24 @@ test('(g) a shared credential the channel owns, (h) one approval covers the thre
       .fetch(`https://api.github.com${path}`, { method: 'POST', body: '{}' });
     const first = await d.approvalRequired(write('/repos/alex/vouchr-demo/issues'));
     assert.equal(first.grant, 'thread');
+    // The credential belongs to the channel, so with no approver configured a teammate decides (#359).
+    assert.equal(first.approver, 'member');
+    assert.equal(safeUserMessage(first), 'Waiting for another channel member to approve the prompt; retry after they do.');
+    assert.equal(d.ephemerals.length, 0, 'the team prompt is a channel message, not a private one');
     assert.deepEqual(texts(d.messages[0].blocks), [
       { type: 'mrkdwn', text: `:lock: *Approve this github-team action?*\nThe agent wants to run an action on github-team for <@${ALEX}>. Another member of this channel must approve it.` },
       { type: 'plain_text', text: 'POST api.github.com/repos/alex/vouchr-demo/issues' },
       { type: 'mrkdwn', text: 'This covers every github-team call that needs approval in this thread for 30 minutes. This prompt expires in 10 minutes if unused. The request body is not shown or inspected.' },
       { type: 'actions', buttons: ['Approve', 'Deny'] },
     ]);
+    // Alex cannot approve Alex's use of the team credential; the prompt stays for a teammate.
+    assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, ALEX, first.approvalId), [
+      { replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval; another channel member must.' },
+    ]);
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, SAM, first.approvalId), [
       { replace_original: true, response_type: 'ephemeral', text: '✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.' },
     ]);
+    assert.equal(d.ephemerals.at(-1).text, `✅ <@${SAM}> approved your *github-team* action. Ask the agent to retry.`);
     // (h) The same thread proceeds, call after call, with the channel's token and the requester audited.
     assert.equal((await write('/repos/alex/vouchr-demo/issues')).status, 200);
     assert.equal((await write('/repos/alex/vouchr-demo/issues/1/comments')).status, 200);
@@ -313,12 +327,17 @@ test('(g) a shared credential the channel owns, (h) one approval covers the thre
 test('(i) an outsider, two approvers at once, (k) offboarding fences a pending prompt', async (t) => {
   const d = await demo(t, { members: [ALEX, SAM, 'U_SAM2'] });
   await d.slash(SAM, 'enable github');
+  await d.slash(SAM, 'enable github-team');
+  await d.slash(SAM, 'identity github-team channel');
+  await d.vouchr.vault.upsert(channelOwner(TEAM, CHANNEL), 'github-team', { accessToken: TEAM_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await d.vouchr.vault.upsert(userOwner(id(ALEX)), 'github', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'alex' });
   await withFetch(async () => {
-    const gh = await (await d.context(ALEX)).connect('github');
-    const write = () => gh.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', { method: 'POST', body: '{}' });
-    const pending = await d.approvalRequired(write());
-    // (i) Jo is not a member: refused and audited, the prompt stays.
+    // (i) The team credential: a teammate decides, so an outsider and the requester are refused.
+    const team = await (await d.context(ALEX)).connect('github-team');
+    const teamWrite = () => team.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', { method: 'POST', body: '{}' });
+    const pending = await d.approvalRequired(teamWrite());
+    assert.equal(pending.approver, 'member');
+    // Jo is not a member: refused and audited, the prompt stays.
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, JO, pending.approvalId), [
       { replace_original: false, response_type: 'ephemeral', text: 'You are not eligible to decide this approval; another channel member must.' },
     ]);
@@ -331,14 +350,17 @@ test('(i) an outsider, two approvers at once, (k) offboarding fences a pending p
     const outcomes = [a[0].text, b[0].text].sort();
     assert.deepEqual(outcomes, [
       'This approval expired or was already decided. Ask the agent again.',
-      '✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.',
+      '✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.',
     ]);
     assert.equal((await d.audit()).filter((r) => r.action === 'approved').length, 1);
-    assert.equal((await write()).status, 200);
+    assert.equal((await teamWrite()).status, 200);
 
-    // (k) Alex asks, is deactivated, and Sam's click grants nothing: offboarding removed the
+    // (k) Alex asks as Alex, is deactivated, and a click grants nothing: offboarding removed the
     // pending request with the credential, so the leftover prompt answers as stale.
+    const gh = await (await d.context(ALEX)).connect('github');
+    const write = () => gh.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', { method: 'POST', body: '{}' });
     const stranded = await d.approvalRequired(write());
+    assert.equal(stranded.approver, 'self');
     await d.vouchr.offboard(id(ALEX));
     assert.deepEqual(await d.click(APPROVAL_APPROVE_ACTION, SAM, stranded.approvalId), [
       { replace_original: true, response_type: 'ephemeral', text: 'This approval expired or was already decided. Ask the agent again.' },
@@ -378,18 +400,18 @@ test('(l) Slack Connect is refused everywhere with one message', async (t) => {
   assert.match(d.modals.at(-1).view.blocks[0].text.text, refusal);
   assert.match(await d.slash(SAM, 'identity github-team channel'), refusal);
   assert.match(await d.slash(SAM, 'enable github'), refusal, 'governance writes are refused there too');
-  // A provider enabled before the channel became shared still cannot deliver a channel prompt there.
+  // A provider enabled before the channel became shared: a write as Alex still prompts Alex privately
+  // (the credential and the decision are Alex's own); a teammate prompt there is refused
+  // (test/approval.test.ts, "member approver: no prompt is posted into an externally shared channel").
   await setChannelToolEnabled(new ChannelTools(d.db), TEAM, CHANNEL, 'github', true);
   await d.vouchr.vault.upsert(userOwner(id(ALEX)), 'github', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: 'alex' });
   await withFetch(async (calls) => {
     const gh = await (await d.context(ALEX)).connect('github');
-    await assert.rejects(
-      gh.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', { method: 'POST', body: '{}' }),
-      (e: unknown) => refusal.test(safeUserMessage(e)),
-    );
-    assert.equal(d.messages.length, 0, 'no approval prompt lands in a Slack Connect channel');
+    const pending = await d.approvalRequired(gh.fetch('https://api.github.com/repos/alex/vouchr-demo/issues', { method: 'POST', body: '{}' }));
+    assert.equal(pending.approver, 'self');
+    assert.deepEqual(d.ephemerals.map((e) => e.user), [ALEX]);
+    assert.equal(d.messages.length, 0, 'no channel message lands in a Slack Connect channel');
     assert.equal(calls.length, 0);
-    assert.equal((await d.db.all(`SELECT 1 FROM approval_request`)).length, 0, 'the impossible request is removed, not parked');
   });
 });
 

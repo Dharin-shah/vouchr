@@ -43,7 +43,7 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 // VOUCHR_SLACK_CLIENT_SECRET in the environment, and a one-time `npx vouchr migrate`.
 const vouchr = await createVouchr({
   providers: [
-    // Reads go through. Every write waits for a teammate's approval. Nothing to configure.
+    // Reads go through. Every write waits for a human: you, acting as yourself. Nothing to configure.
     github(),
   ],
   baseUrl: process.env.PUBLIC_URL!,
@@ -78,19 +78,22 @@ After one browser sign-in, the agent works as them.
 
 ## Writes and sensitive paths
 
-Writes wait for a human by default. Every call other than GET or HEAD posts a prompt in the channel
-with who asked, the provider, the method, the path, and the agent's reason. Another member of the
-channel approves. One click covers exactly that call, once, for five minutes. Then the agent
-continues to the next step and asks again when it has to. A credential only ever goes to the
-provider's own hosts.
+Writes wait for a human by default. Every call other than GET or HEAD posts a prompt with who asked,
+the provider, the method, the path, and the agent's reason. Who decides follows who the agent acts
+as: acting as yourself, you confirm each write privately, since the credential and the request are
+both yours; acting as the channel, a teammate approves the team credential's use, in the channel.
+One click covers exactly that call, once, for five minutes. Then the agent continues to the next
+step and asks again when it has to. A credential only ever goes to the provider's own hosts.
 
 The `approval` setting on a provider narrows or widens that.
 
 - `approval: false`: nothing waits. Use it for a provider whose writes are harmless.
 - `methods`: which HTTP methods wait. Default: every method except GET and HEAD.
 - `paths`: which paths wait. A prefix ending in `/` matches everything under it. Default: all.
-- `approver`: `member` (default) asks the channel that owns the credential; any member other than
-  the requester can approve. `self` asks the person driving the agent.
+- `approver`: unset follows the identity: `self` when the agent acts as the person, `member` when it
+  acts as the channel. Set `member` to make a personal provider wait for a teammate anyway, for
+  example on sensitive paths; any member other than the requester can approve. Set `self` to let the
+  requester confirm even for the channel's credential. In a DM, `member` behaves like `self`.
 - `grant`: `once` (default) covers one call. `thread` covers every matching call in the approving
   thread until `ttlMs` runs out, for a task with many writes in one conversation.
 - `ttlMs`: how long an approval stays usable. Default five minutes.
@@ -100,7 +103,7 @@ puts the reason (up to 500 bytes) and an `https://` link on the prompt and the r
 row. Both are the agent's own claim, and the prompt says so.
 
 This is how an agent does most of a task alone and still stops at the steps that matter. It drafts
-and reviews on its own, pauses to merge or to publish, and a teammate approves in Slack.
+and reviews on its own, pauses to merge or to publish, and a human confirms in Slack.
 
 A channel is the control point for a credential, not the place the work has to happen. Make a
 private channel the approval group: enable the provider there and connect one shared credential

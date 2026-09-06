@@ -84,11 +84,12 @@ Record one take per scenario with the app's terminal beside Slack. Screenshots a
 None of the shipped examples has both a read and a governed write, so
 [`examples/demo/app.ts`](../examples/demo/app.ts) adds them on top of `examples/bolt-github`:
 
-- `github()` with no approval configuration at all. The default asks another member of the channel
-  once per write (every method except GET and HEAD); reads go through.
+- `github()` with no approval configuration at all. The agent acts as the person, so by default the
+  requester confirms each write (every method except GET and HEAD) privately; reads go through.
 - `github-team`, a key provider in the style of `examples/internal-api-key`, for the channel's
-  shared token, with `approval: { grant: 'thread', ttlMs: 30 * 60 * 1000 }`: one approval covers
-  every write in the approving thread for thirty minutes. The default injection is
+  shared token, with `approval: { grant: 'thread', ttlMs: 30 * 60 * 1000 }`: the credential is the
+  channel's, so by default a teammate approves, and one approval covers every write in the approving
+  thread for thirty minutes. The default injection is
   `Authorization: Bearer <key>`.
 - `@vouchr who am I` runs `GET /user`. Any other text does the same.
 - `@vouchr open an issue titled <title> in repo <owner>/<name>` runs `POST /repos/<owner>/<name>/issues`
@@ -163,14 +164,15 @@ The terminal shows no token. `/vouchr audit` from Alex shows `• *github* · in
 
 Shots: the reply and the terminal side by side.
 
-### (e) A write waits for the team
+### (e) A write as Alex waits for Alex
 
 Alex: `@vouchr open an issue titled Demo issue in repo alex/vouchr-demo`.
 
-Nothing is sent. The channel gets one message, in the thread (`src/adapters/blocks.ts`, `approvalBlocks`):
+Nothing is sent. The agent acts as Alex with Alex's own token, so Alex gets one private prompt, in
+the thread (`src/adapters/blocks.ts`, `approvalBlocks`). The channel sees nothing:
 
 > :lock: *Approve this github action?*
-> The agent wants to run an action on github for <@alex>. Another member of this channel must approve it.
+> The agent wants to run an action as you on github.
 > POST api.github.com/repos/alex/vouchr-demo/issues
 > Reason: Open an issue titled "Demo issue" in alex/vouchr-demo, asked for in Slack
 > Link: https://github.com/alex/vouchr-demo
@@ -180,41 +182,37 @@ with **Approve** and **Deny** buttons. The reason and link are what the demo app
 call; an agent that gives none gets the same prompt without those two lines.
 
 Alex repeats the same mention while the prompt is up. Nothing new is posted; Alex gets one private
-line: `Still waiting for another member of this channel to approve the github action.`
+line: `Still waiting for you to decide the github action above.`
 
-Alex clicks **Approve**. Private reply, the prompt stays (`src/adapters/bolt.ts`):
-
-> You are not eligible to decide this approval; another channel member must.
-
-Sam clicks **Approve**. The prompt is replaced by:
+Alex clicks **Approve**. The prompt is replaced by:
 
 > ✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.
-
-Alex gets a private note: `✅ <@sam> approved your *github* action. Ask the agent to retry.`
 
 Alex repeats the exact same mention. Reply: `Opened https://github.com/alex/vouchr-demo/issues/1 as *alex*.`
 
 Alex repeats it once more. A new approval prompt appears. Approvals are single use
-(`test/demo.test.ts`, "(e) a write waits for the team").
+(`test/demo.test.ts`, "(e) a write as Alex waits for Alex").
 
-Audit, in order: `approval_requested` (with the reason under `meta.reason`), `denied` with
-`reason: 'not-approver'` for Alex's click, `approved` with Sam as `actor`, `approval_consumed` with Sam
-as `actor`, `inject`. `/vouchr audit channel` shows the same rows with `by <@sam>` on the approval rows.
+Why Alex and not a teammate: the credential is Alex's and the request is Alex's, so Alex is already
+the human in the loop; a second person would add a step without adding a check. The teammate gate is
+the team credential's, scenario (g). To make a personal provider wait for a teammate anyway, set
+`approval: { approver: 'member' }` on it.
 
-Shots: the prompt, Alex's refusal, the approved message, the issue on GitHub, the second prompt.
+Audit, in order: `approval_requested` (with the reason under `meta.reason`), `approved` with Alex as
+`actor`, `approval_consumed` with Alex as `actor`, `inject`.
+
+Shots: the prompt, the approved message, the issue on GitHub, the second prompt.
 
 ### (f) Deny
 
-Sam clicks **Deny** on the prompt left over from (e). The prompt is replaced by:
+Alex clicks **Deny** on the prompt left over from (e). The prompt is replaced by:
 
 > 🚫 Denied the *github* action. Nothing was sent.
-
-Alex gets `🚫 <@sam> denied your *github* action. Nothing was sent.`
 
 The denial is kept in the table with `status = 'denied'` for ten minutes so a headless poller can
 read it. It does not block: if Alex asks again, a new prompt appears.
 
-Audit: `denied` with `reason: 'approval-denied'`. Shots: the denied message, Alex's note.
+Audit: `denied` with `reason: 'approval-denied'`. Shots: the denied message.
 
 ### (g) A shared credential the channel owns
 
@@ -232,16 +230,33 @@ If Sam had set the identity first (`/vouchr identity github-team channel`, reply
 \`/vouchr connect-shared github-team\`.`) and Alex asked before the token was connected, Alex would
 see one line: `No shared channel credential is configured. Any member can run \`/vouchr connect-shared\` there.`
 
-Alex: `@vouchr open a team issue titled Team issue in repo alex/vouchr-demo`. The prompt appears as
-in (e), for `github-team`, with one different sentence:
+Alex: `@vouchr open a team issue titled Team issue in repo alex/vouchr-demo`. The credential is the
+channel's, so this time the channel gets one message, in the thread, and a teammate decides:
 
-> This covers every github-team call that needs approval in this thread for 30 minutes. This prompt expires in 10 minutes if unused. The request body is not shown or inspected.
+> :lock: *Approve this github-team action?*
+> The agent wants to run an action on github-team for <@alex>. Another member of this channel must approve it.
+> POST api.github.com/repos/alex/vouchr-demo/issues
+> Reason: Open an issue titled "Team issue" in alex/vouchr-demo, asked for in Slack
+> Link: https://github.com/alex/vouchr-demo
+> This covers every github-team call that needs approval in this thread for 30 minutes. This prompt expires in 10 minutes if unused. The request body is not shown or inspected. The reason and link are the agent's own claim, not verified by Vouchr.
+
+Alex repeats the mention while the prompt is up: one private line,
+`Still waiting for another member of this channel to approve the github-team action.`
+
+Alex clicks **Approve**. Private reply, the prompt stays (`src/adapters/bolt.ts`):
+
+> You are not eligible to decide this approval; another channel member must.
 
 Sam approves: `✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.`
+Alex gets a private note: `✅ <@sam> approved your *github-team* action. Ask the agent to retry.`
 Alex repeats the mention: `Opened https://github.com/alex/vouchr-demo/issues/2 as *<token owner>*.`
 
+Audit: `denied` with `reason: 'not-approver'` for Alex's click, `approved` and `approval_consumed`
+with Sam as `actor`. `/vouchr audit channel` shows `by <@sam>` on the approval rows.
+
 Audit: `config` for the credential, then the approval rows with `grant: 'thread'` in `meta`.
-`vouchr inventory` now has a second row with `owner_kind` channel and `owner_id` the channel id.
+Sam denying instead reads `🚫 Denied the *github-team* action. Nothing was sent.` and Alex gets
+`🚫 <@sam> denied your *github-team* action. Nothing was sent.` `vouchr inventory` now has a second row with `owner_kind` channel and `owner_id` the channel id.
 
 Sam, in `#demo-team`: `/vouchr` with no arguments opens the **Vouchr** settings modal
 (`src/adapters/blocks.ts`, `configModal`). Under **Channel settings** the enabled providers come first,
@@ -273,8 +288,8 @@ Jo is not in `#demo-team`. Slack itself keeps the channel and every prompt in it
 so there is nothing for Jo to click. Screenshot Jo's sidebar without the channel.
 
 The server-side gate is the same in every channel: only a current member may enable, set who the
-agent acts as, connect a shared credential, or approve, and the requester may never approve their
-own request (`test/demo.test.ts`, "(i) an outsider"). The refusal copy for a non-member on the
+agent acts as, connect a shared credential, or approve the team credential's use, and the requester
+may never approve their own use of it (`test/demo.test.ts`, "(i) an outsider"). The refusal copy for a non-member on the
 configure commands is (`src/adapters/bolt.ts`):
 
 > Only a current member of this channel can change channel tools. If you are one, make sure Vouchr is in the channel and try again.
@@ -344,8 +359,8 @@ Show: `vouchr inventory` no longer lists Alex's `github` row. The channel's `git
 stays: it belongs to the channel. `psql -d vouchr -c "select action, provider, meta from audit order by at desc limit 3"`
 shows a `revoke` row with `"reason":"offboarded"`.
 
-The fence: if Alex asked for a write just before being deactivated, the prompt is still in the
-channel, but the request went with the credential. Sam clicks **Approve**. Reply (`src/adapters/bolt.ts`):
+The fence: if Alex asked for a write just before being deactivated, the request went with the
+credential. Any click on the leftover prompt, say Sam's, answers (`src/adapters/bolt.ts`):
 
 > This approval expired or was already decided. Ask the agent again.
 
@@ -366,7 +381,9 @@ Vouchr refuses channel credentials in externally shared channels, with one messa
 Showing it needs a second workspace and a Slack Connect channel. If you have one, run
 `/vouchr connect-shared github-team` there and screenshot the refusal in the modal; `/vouchr identity`
 and `/vouchr enable` answer the same line, and a write that needs a teammate's approval is refused
-with it instead of posting a prompt (`test/demo.test.ts`, "(l) Slack Connect"). Otherwise say so on camera.
+with it instead of posting a prompt. A write as Alex with Alex's own token still prompts Alex
+privately there: nothing of it reaches the channel (`test/demo.test.ts`, "(l) Slack Connect").
+Otherwise say so on camera.
 
 ### (m) The operator CLI
 
@@ -388,16 +405,17 @@ failed, unresolved, and skipped counts. `doctor` prints `PASS`/`FAIL`/`INFO` lin
 ## 4. Talk track
 
 Vouchr is a self-hosted identity broker for agents: per-person credentials injected at egress,
-human-in-the-loop approvals scoped to the team's channel, and an audit trail for every call. The
-agent acts as the person who asked, with that person's own access. Writes wait for the team by
-default: the channel that owns the credential approves. Every prompt says who asked, what, and why.
+human-in-the-loop approvals, and an audit trail for every call. The agent acts as the person who
+asked, with that person's own access, or as the channel with a credential the team owns. Writes wait
+for a human by default: acting as you, you confirm each one; acting as the channel, a teammate
+approves. Every prompt says who asked, what, and why.
 Every action is on record: who, what, where, and who approved.
 
 Here is the order. A channel starts closed: the agent is refused. Sam opens it. Alex connects once,
-through Slack sign-in and GitHub consent. A read runs as Alex. A write stops: the team sees who
-asked, the provider, the method, the path, and the agent's reason. Alex cannot approve Alex. Sam
-approves, the write runs once, and the next one asks again. Sam denies one. Then a shared team token
-the channel owns, with one approval covering a whole thread. Jo is outside and sees nothing; a
+through Slack sign-in and GitHub consent. A read runs as Alex. A write stops: Alex sees the
+provider, the method, the path, and the agent's reason, confirms, the write runs once, and the next
+one asks again. Alex denies one. Then a shared team token the channel owns: the team sees who asked
+and what, Alex cannot approve Alex, Sam approves, and one approval covers a whole thread. Jo is outside and sees nothing; a
 public channel is the tradeoff. A worker with no human asks the same channel the same way. Alex
 leaves and the credential goes with them. The CLI shows every live credential and can revoke any of
 them.

@@ -323,7 +323,8 @@ do not advance the marker. Envelope/KMS wrapping is prepared before any credenti
 actor-offboard lock is acquired.
 
 **Approval is on by default.** Every call other than GET/HEAD needs a live grant unless the provider
-sets `approval: false`; `methods`, `paths`, `approver` (`member` default, `self`), `grant` (`once`
+sets `approval: false`; `methods`, `paths`, `approver` (`self`, `member`; unset follows the request's
+identity via `effectiveApprover`: `self` for a person-owned credential, `member` for a channel-owned one), `grant` (`once`
 default, `thread`), and `ttlMs` (5 minutes default) narrow or widen that. A `once` grant is spent
 by one exact call; a `thread` grant is matched on its scope (team, channel, thread, requester,
 provider) and covers every matching call there until it expires, so it is not deleted on consume.

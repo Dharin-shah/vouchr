@@ -9,11 +9,15 @@ import {
 } from '../../src';
 
 // The demo app behind guides/DEMO.md: examples/bolt-github plus one write and one shared credential.
-// `github()` needs no approval config: reads go through, every write waits for another member.
+// `github()` needs no approval config: reads go through, every write waits for a human. Who decides
+// follows who the agent acts as (#359): as the person, the requester confirms privately; as the
+// channel (github-team below), another member approves. `approval: { approver: 'member' }` would make
+// the personal provider wait for a teammate too.
 
 // The channel's shared credential: a GitHub token pasted once with `/vouchr connect-shared github-team`.
 // No OAuth. The default injection is `Authorization: Bearer <key>`, which GitHub accepts for a token.
-// One approval covers every write in the approving thread for 30 minutes.
+// A teammate approves (the channel owns it) and one approval covers every write in the approving
+// thread for 30 minutes.
 const githubTeam = defineProvider({
   id: 'github-team',
   credential: 'key',
@@ -62,7 +66,7 @@ app.event('app_mention', async ({ context, event, client }) => {
     }
     // No model behind this demo: two fixed phrases. A real agent decides which provider to call.
     return reply(
-      'I know two things: `who am I` (reads GitHub as you) and `open an issue titled <title> in repo <owner>/<repo>` (a write, so a teammate approves first). Add `team` before `issue` to use the channel credential.',
+      'I know two things: `who am I` (reads GitHub as you) and `open an issue titled <title> in repo <owner>/<repo>` (a write, so you confirm it first). Add `team` before `issue` to use the channel credential, which a teammate approves.',
     );
   } catch (e) {
     // Vouchr already posted the Connect prompt or the Approve/Deny prompt.
