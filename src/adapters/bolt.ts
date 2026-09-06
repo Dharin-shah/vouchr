@@ -10,7 +10,7 @@ import { loadKeyring, type EnvelopeProvider } from '../core/crypto';
 import { ProviderRegistry, isBrokeredProvider, isValidProviderId, buildCallbackUrl, readOnlyEgress, type Approver, type Provider } from '../core/providers';
 import { CredentialLockdownError, Vault, type TtlPolicy } from '../core/vault';
 import { Audit, type AuditSink } from '../core/audit';
-import { Consent } from '../core/consent';
+import { Consent, browserHopUrls } from '../core/consent';
 import { Policy } from '../core/policy';
 import type { SlackIdentity } from '../core/identity';
 import { resolveIdentity, isChannelMember } from './slack-identity';
@@ -616,18 +616,13 @@ export interface VouchrOptions {
    */
   allowWrites?: boolean;
   /**
-   * #302: require the browser completing provider OAuth to prove, via Slack OpenID Connect, that it
-   * is signed in as the Slack user the consent `state` was bound to. Connect prompts then point at
-   * a Vouchr verify route (mounted beside `callbackPath`) that routes through Slack sign-in before
-   * revealing the provider authorize URL, and the callback refuses any consent the hop never
-   * stamped. Closes the "Forwarded consent link" hand-off (guides/THREAT-MODEL.md). Requires
-   * `slackOidc` credentials and is incompatible with `dryRun`. Default false.
-   */
-  requireBrowserSlackIdentity?: boolean;
-  /**
-   * Slack app OIDC credentials for `requireBrowserSlackIdentity` (the same Slack app that owns the
-   * bot). Falls back to `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`. The Slack app must list the
-   * `…/slack` route beside `callbackPath` as an OAuth redirect URL (see guides/DEPLOYMENT.md).
+   * #302: Slack app OIDC credentials (the same Slack app that owns the bot). Required: every Connect
+   * prompt points at a Vouchr verify route (mounted beside `callbackPath`) that routes the browser
+   * through Slack sign-in before revealing the provider authorize URL, and the callback refuses any
+   * consent the hop never stamped — the "Forwarded consent link" hand-off in guides/THREAT-MODEL.md.
+   * Falls back to `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET`; startup fails closed
+   * without them. The Slack app must list the `…/slack` route beside `callbackPath` as an OAuth
+   * redirect URL (see guides/DEPLOYMENT.md).
    */
   slackOidc?: SlackOidcOptions;
 }
@@ -2280,32 +2275,20 @@ export async function createVouchr(opts: VouchrOptions) {
   const redirectUri = buildCallbackUrl(opts.baseUrl, callbackPath);
   // #302: validate the browser Slack-identity hop config BEFORE the pool opens, like every other
   // no-db check above. The verify/slack routes mount beside callbackPath (same directory).
-  if (opts.requireBrowserSlackIdentity !== undefined && typeof opts.requireBrowserSlackIdentity !== 'boolean') {
-    throw new Error('createVouchr: requireBrowserSlackIdentity must be a boolean'); // SEC-4: fail closed, never coerce
+  const slackOidc = assertSlackOidcOptions(
+    opts.slackOidc ?? {
+      clientId: process.env.VOUCHR_SLACK_CLIENT_ID ?? '',
+      clientSecret: process.env.VOUCHR_SLACK_CLIENT_SECRET ?? '',
+    },
+    'createVouchr',
+  );
+  const hops = browserHopUrls(redirectUri);
+  const browserVerifyPath = hops.verify.pathname;
+  const slackRedirectPath = hops.slack.pathname;
+  if (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath) {
+    throw new Error('createVouchr: callbackPath must not end in /verify or /slack (the Slack verify routes mount there)');
   }
-  const requireBrowserSlackIdentity = opts.requireBrowserSlackIdentity === true;
-  if (requireBrowserSlackIdentity && dryRun) {
-    throw new Error('createVouchr: requireBrowserSlackIdentity is incompatible with dryRun (the synthetic authorize URL never passes the Slack hop)');
-  }
-  const slackOidc = requireBrowserSlackIdentity
-    ? assertSlackOidcOptions(
-        opts.slackOidc ?? {
-          clientId: process.env.SLACK_CLIENT_ID ?? '',
-          clientSecret: process.env.SLACK_CLIENT_SECRET ?? '',
-        },
-        'createVouchr',
-      )
-    : undefined;
-  // Plain string slicing (not a regex): callbackPath was proven canonical above, and CodeQL flags
-  // an end-anchored [^/]+ replace as polynomial-time on adversarial input.
-  const callbackDir = callbackPath.slice(0, callbackPath.lastIndexOf('/') + 1);
-  const browserVerifyPath = `${callbackDir}verify`;
-  const slackRedirectPath = `${callbackDir}slack`;
-  if (slackOidc && (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath)) {
-    throw new Error('createVouchr: callbackPath must not end in /verify or /slack when requireBrowserSlackIdentity is on');
-  }
-  const browserVerifyUri = slackOidc ? buildCallbackUrl(opts.baseUrl, browserVerifyPath) : undefined;
-  const oidcRedirectUri = slackOidc ? buildCallbackUrl(opts.baseUrl, slackRedirectPath) : undefined;
+  const oidcRedirectUri = hops.slack.toString();
   // Inject a pre-opened store to share one pool across workspaces/tests; else open (and own) our own.
   const ownsDb = !opts.db;
   const db = opts.db ?? (await openDb({ databaseUrl: opts.databaseUrl }));
@@ -2323,7 +2306,7 @@ export async function createVouchr(opts: VouchrOptions) {
   const vault = new Vault(db, key, opts.ttl ?? DEFAULT_TTL, opts.envelope, lockdown);
   // #116: in dry-run EVERY audit row (connect, inject, denied, config, …) carries meta.dry_run.
   const audit = dryRun ? dryRunAudit(new Audit(db)) : new Audit(db);
-  const consent = new Consent(db, dryRun, browserVerifyUri);
+  const consent = new Consent(db, dryRun);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
   const sessions = new SessionGrants(db);
@@ -2816,13 +2799,10 @@ export async function createVouchr(opts: VouchrOptions) {
     await args.next();
   };
 
-  // #302: no flag here — the callback enforces the ROW's minted-time slack_verify_required.
   const callbackDeps = { registry, vault, audit, consent, redirectUri, auditSink, dryRun };
 
   // #302: one shared verifier owns the OIDC exchange + compare + stamp/spend sequence.
-  const browserVerifier = slackOidc
-    ? new BrowserIdentityVerifier({ consent, registry, redirectUri, oidcRedirectUri: oidcRedirectUri!, audit, auditSink, oidc: slackOidc })
-    : null;
+  const browserVerifier = new BrowserIdentityVerifier({ consent, registry, redirectUri, oidcRedirectUri, audit, auditSink, oidc: slackOidc });
 
   /**
    * #116 dry-run test helper: complete the NEWEST pending consent for (user, provider) through the
@@ -2879,9 +2859,11 @@ export async function createVouchr(opts: VouchrOptions) {
       .send(text);
   }
 
-  /** Mount the OAuth callback (and, with #302 on, the Slack verify hop) on the receiver's router. */
+  /** Mount the Slack verify hop (#302) and the OAuth callback on the receiver's router. */
   function mountRoutes(router: any): void {
-    if (browserVerifier) {
+    // #116 dry-run: the hop routes are not mounted (404). Hop 2 is the one place the client secret
+    // would leave the process for slack.com; the dry-run prompt points at the callback, never here.
+    if (!dryRun) {
       // #302 hop 1: the Connect prompt's URL. Redirects the browser to Slack's OIDC authorize.
       router.get(browserVerifyPath, async (req: any, res: any) => {
         try {

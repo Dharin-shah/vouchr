@@ -16,6 +16,7 @@ import { channelOwner, userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import { waitFor, within } from './support/clock';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // #65 POST /v1/mcp — MCP-aware egress proxy: SSE + session-header passthrough, stateless.
@@ -100,7 +101,7 @@ async function makeMcpBroker(
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const resolvedExtra = typeof extra === 'function' ? await extra(db) : extra;
-  const server = createBroker({ providers: [mcpAcme], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true, ...resolvedExtra });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [mcpAcme], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true, ...resolvedExtra });
   await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
@@ -925,7 +926,7 @@ test('#194 typed recovery: pre-handle database failures return fixed internal me
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [mcpAcme], vault, audit, db: failingDb, identitySecret: identityConfig(SECRET), allowWrites: true,
   });
   await listen(t, server);
@@ -963,7 +964,7 @@ test('#194 typed recovery: vault/KMS failures stay secret-free and aligned acros
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [mcpAcme], vault: failingVault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true,
   });
   await listen(t, server);
@@ -1233,10 +1234,10 @@ test('#65 mcp: createBroker rejects NaN/Infinity/zero/negative stream ceilings; 
   const base = { providers: [mcpAcme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET) };
   try {
     for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1]) {
-      assert.throws(() => createBroker({ ...base, maxStreamBytes: bad }), /maxStreamBytes/, `maxStreamBytes: ${bad} must be rejected`);
-      assert.throws(() => createBroker({ ...base, maxStreamMs: bad }), /maxStreamMs/, `maxStreamMs: ${bad} must be rejected`);
+      assert.throws(() => createBroker({ ...BROKER_REQUIRED, ...base, maxStreamBytes: bad }), /maxStreamBytes/, `maxStreamBytes: ${bad} must be rejected`);
+      assert.throws(() => createBroker({ ...BROKER_REQUIRED, ...base, maxStreamMs: bad }), /maxStreamMs/, `maxStreamMs: ${bad} must be rejected`);
     }
-    assert.ok(createBroker({ ...base, maxStreamBytes: 1024, maxStreamMs: 1000 }), 'valid ceilings still construct');
+    assert.ok(createBroker({ ...BROKER_REQUIRED, ...base, maxStreamBytes: 1024, maxStreamMs: 1000 }), 'valid ceilings still construct');
   } finally {
     await db.close();
   }

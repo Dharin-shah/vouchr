@@ -4,6 +4,8 @@
 # created. Create → copy the secrets → start the tunnel + app → then paste the URLs in the UI, where
 # Slack verifies them against a live server. QUICKSTART.md § 3 is the full order.
 #
+# The one redirect URL below is NOT challenged, so it stays: replace YOUR_PUBLIC_URL with your tunnel
+# HOST ONLY (no scheme, no trailing slash).
 # Keep this file in sync with slack-manifest.yml (which stays the reference for the finished app).
 display_information:
   name: Vouchr
@@ -22,6 +24,9 @@ features:
       usage_hint: status | disconnect <provider> | connect-shared <provider>
       should_escape: false
 oauth_config:
+  # Every Connect link passes through a Slack sign-in check (#302); Slack redirects back here.
+  redirect_urls:
+    - https://YOUR_PUBLIC_URL/vouchr/oauth/slack
   scopes:
     bot:
       - app_mentions:read   # receive @-mentions

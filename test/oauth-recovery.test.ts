@@ -30,6 +30,7 @@ import { Policy } from '../src/core/policy';
 import { CredentialLockdownError, Vault } from '../src/core/vault';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { openTestDb, testDbUrl } from './support/pg';
+import { beginVerified, verifyConsent } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -84,7 +85,7 @@ async function openReplicaPair(t: TestContext) {
 test('lockdown refuses an OAuth callback before state consumption or token exchange', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
-  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const pending = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   const deps = {
     registry: new ProviderRegistry([provider]),
     vault: new Vault(db, KEY, {}, undefined, true),
@@ -205,8 +206,8 @@ test('OAuth consent is one owner/provider generation and one delivered prompt ac
   const consentB = new Consent(b);
 
   const [first, second] = await Promise.all([
-    consentA.begin(ID, provider, 'https://vouchr.test/callback', 'C1'),
-    consentB.begin(ID, provider, 'https://vouchr.test/callback', 'C1'),
+    beginVerified(consentA, ID, provider, 'https://vouchr.test/callback', 'C1'),
+    beginVerified(consentB, ID, provider, 'https://vouchr.test/callback', 'C1'),
   ]);
   assert.equal(first.state, second.state);
   assert.equal(
@@ -226,11 +227,11 @@ test('OAuth consent is one owner/provider generation and one delivered prompt ac
   assert.ok(claims.some((claim) => claim.status === 'in-flight'));
   assert.equal(await consentA.confirmDelivery(first.state, winner.token), true);
 
-  const reused = await consentB.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const reused = await beginVerified(consentB, ID, provider, 'https://vouchr.test/callback', 'C1');
   assert.equal(reused.state, first.state);
   assert.deepEqual(await consentB.claimDelivery(reused.state), { status: 'delivered' });
 
-  const replacement = await consentB.begin(ID, provider, 'https://vouchr.test/callback', 'C2');
+  const replacement = await beginVerified(consentB, ID, provider, 'https://vouchr.test/callback', 'C2');
   assert.notEqual(replacement.state, first.state);
   assert.equal((await consentA.consume(first.state)).status, 'superseded');
   assert.equal((await consentA.consume(replacement.state)).status, 'active');
@@ -239,13 +240,13 @@ test('OAuth consent is one owner/provider generation and one delivered prompt ac
 test('OAuth delivery cleanup is exact and ambiguous delivery retains its lease', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
-  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const pending = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   const claim = await consent.claimDelivery(pending.state);
   assert.equal(claim.status, 'claimed');
   if (claim.status !== 'claimed') assert.fail('prompt delivery was not claimable');
   assert.deepEqual(await consent.claimDelivery(pending.state), { status: 'in-flight' });
 
-  const replacement = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C2');
+  const replacement = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C2');
   assert.equal(
     await consent.abandonDelivery(pending.state, claim.token),
     false,
@@ -270,7 +271,7 @@ test('OAuth delivery cleanup is exact and ambiguous delivery retains its lease',
 test('a delivered connect prompt is reclaimed only for a transient delivery surface (#194)', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
-  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const pending = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   const claim = await consent.claimDelivery(pending.state);
   assert.equal(claim.status, 'claimed');
   if (claim.status !== 'claimed') assert.fail('prompt delivery was not claimable');
@@ -302,7 +303,7 @@ test('a delivered connect prompt is reclaimed only for a transient delivery surf
 test('fresh setup supersedes a delivered consent minted before an offboard tombstone', async (t) => {
   const db = await openTestDb(t);
   const consent = new Consent(db);
-  const old = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const old = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   const delivery = await consent.claimDelivery(old.state);
   assert.equal(delivery.status, 'claimed');
   if (delivery.status !== 'claimed') assert.fail('prompt delivery was not claimable');
@@ -310,7 +311,7 @@ test('fresh setup supersedes a delivered consent minted before an offboard tombs
 
   await consent.markOffboarded(ID);
   await new Promise((resolve) => setTimeout(resolve, 5));
-  const fresh = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const fresh = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   assert.notEqual(fresh.state, old.state);
   assert.equal((await consent.consume(old.state)).status, 'superseded');
   assert.equal((await consent.consume(fresh.state)).status, 'active');
@@ -319,7 +320,7 @@ test('fresh setup supersedes a delivered consent minted before an offboard tombs
 test('a Slack rejection cannot invalidate an OAuth URL already returned by another adapter', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   const db = await openTestDb(t);
-  const headless = await new Consent(db).begin(
+  const headless = await beginVerified(new Consent(db), 
     ID,
     provider,
     'https://vouchr.test/vouchr/oauth/callback',
@@ -348,7 +349,7 @@ test('a newer OAuth generation fences an older callback paused in token exchange
   const registry = new ProviderRegistry([provider]);
   const vaultA = new Vault(a, KEY);
   const vaultB = new Vault(b, KEY);
-  const first = await consentA.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const first = await beginVerified(consentA, ID, provider, 'https://vouchr.test/callback', 'C1');
 
   let exchangeStarted!: () => void;
   let releaseExchange!: () => void;
@@ -370,7 +371,7 @@ test('a newer OAuth generation fences an older callback paused in token exchange
       first.state,
     );
     await started;
-    const newer = await consentB.begin(ID, provider, 'https://vouchr.test/callback', 'C2');
+    const newer = await beginVerified(consentB, ID, provider, 'https://vouchr.test/callback', 'C2');
     releaseExchange();
 
     const oldResult = await older;
@@ -401,7 +402,7 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   const deps = { registry, vault, audit, consent, redirectUri: 'https://vouchr.test/callback' };
   const foreign = 'ghp_RAW_PROVIDER_ERROR_MUST_NOT_ESCAPE';
 
-  const deniedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const deniedState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const denied = await handleOAuthCallback(deps, undefined, deniedState.state, 'access_denied');
   assert.equal(!denied.ok && denied.outcome, 'denied');
   assert.equal(!denied.ok && 'context' in denied && denied.context.identity.userId, ID.userId);
@@ -416,19 +417,19 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   // Closed classification: only server_error / temporarily_unavailable are transient (502 +
   // retry_later). Config/request codes and any unknown value are permanent (500 + fix_configuration)
   // — never "retry unchanged". The raw value is never reflected or persisted for either.
-  const transientState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const transientState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const transient = await handleOAuthCallback(deps, undefined, transientState.state, 'temporarily_unavailable');
   assert.equal(!transient.ok && transient.outcome, 'exchange_failed');
   assert.equal(!transient.ok && transient.status, 502);
   assert.equal(!transient.ok && 'recovery' in transient && transient.recovery, 'retry_later');
 
-  const permanentState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const permanentState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const permanent = await handleOAuthCallback(deps, undefined, permanentState.state, 'invalid_scope');
   assert.equal(!permanent.ok && permanent.outcome, 'exchange_failed');
   assert.equal(!permanent.ok && permanent.status, 500);
   assert.equal(!permanent.ok && 'recovery' in permanent && permanent.recovery, 'fix_configuration');
 
-  const providerFailedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const providerFailedState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const providerFailed = await handleOAuthCallback(deps, undefined, providerFailedState.state, foreign);
   assert.equal(!providerFailed.ok && providerFailed.outcome, 'exchange_failed');
   assert.equal(!providerFailed.ok && providerFailed.status, 500, 'an unknown error value defaults to permanent');
@@ -439,7 +440,7 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   );
   assert.deepEqual(JSON.parse(providerFailedAudit?.meta ?? '{}'), { reason: 'exchange_failed' });
 
-  const incompleteState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const incompleteState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const incomplete = await handleOAuthCallback(deps, undefined, incompleteState.state);
   assert.equal(!incomplete.ok && incomplete.outcome, 'incomplete');
   const incompleteAudit = await db.get<{ meta: string }>(
@@ -447,14 +448,14 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   );
   assert.deepEqual(JSON.parse(incompleteAudit?.meta ?? '{}'), { reason: 'consent_incomplete' });
 
-  const expiredState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const expiredState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   await db.run(`UPDATE consent_request SET created_at=${POSTGRES_NOW_US_SQL}-? WHERE state=?`, [STATE_TTL_US + 1_000_000, expiredState.state]);
   assert.equal(await consent.sweepStale(), 0, 'authority expiry must retain bounded recovery context');
   const expired = await handleOAuthCallback(deps, 'code', expiredState.state);
   assert.equal(!expired.ok && expired.outcome, 'state_expired');
   assert.equal((await handleOAuthCallback(deps, 'code', expiredState.state)).outcome, 'state_unavailable');
 
-  const abandoned = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const abandoned = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   await db.run(
     `UPDATE consent_request SET created_at=${POSTGRES_NOW_US_SQL}-? WHERE state IN (?,?)`,
     [
@@ -466,7 +467,7 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
   assert.equal(await consent.sweepStale(), 2, 'expired and superseded recovery rows are eventually removed');
   assert.equal((await consent.consume(abandoned.state)).status, 'unavailable');
 
-  const removedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const removedState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const removed = await handleOAuthCallback(
     { ...deps, registry: new ProviderRegistry([]) },
     'code',
@@ -479,7 +480,7 @@ test('OAuth callback outcomes distinguish attributable recovery without reflecti
     'state_unavailable',
   );
 
-  const failedState = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+  const failedState = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(foreign, { status: 500 })) as typeof fetch;
   try {
@@ -504,7 +505,7 @@ test('OAuth recovery retention prunes in indexed bounded batches', async (t) => 
      SELECT gen_random_uuid()::text,NULL,'T-sweep','U-' || g,'acme',NULL,'verifier',${staleAt},${staleAt}
        FROM generate_series(1, ${MAX_CONSENT_SWEEP_BATCH + 1}) g`,
   );
-  const recent = await new Consent(real).begin(
+  const recent = await beginVerified(new Consent(real), 
     { enterpriseId: null, teamId: 'T-sweep', userId: 'U-recent' },
     provider,
     'https://vouchr.test/callback',
@@ -547,7 +548,7 @@ test('audit failure preserves definitive OAuth denial and lifecycle outcomes', a
     },
   } as any;
 
-  const deniedState = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const deniedState = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   const denied = await handleOAuthCallback(
     {
       registry,
@@ -566,7 +567,7 @@ test('audit failure preserves definitive OAuth denial and lifecycle outcomes', a
   assert.deepEqual(calls, [{ action: 'denied', meta: { reason: 'consent_denied' } }]);
 
   calls.length = 0;
-  const revokedState = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const revokedState = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'provider-token' }), {
     status: 200,
@@ -705,6 +706,7 @@ test('Bolt sends one private recovery DM for an attributable callback and none f
     const state = new URL(
       prompts[0].blocks.find((block: any) => block.type === 'actions').elements[0].url,
     ).searchParams.get('state')!;
+    await verifyConsent(db, state);
 
     let callback: any;
     vouchr.mountRoutes({ get: (_path: string, handler: any) => { callback = handler; } });
@@ -767,6 +769,7 @@ test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the 
     });
     await assert.rejects(() => context.connect('acme'), ConsentRequiredError);
     const state = new URL(prompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    await verifyConsent(db, state);
     const res = fakeResponse();
     await callback({ query: { state, code: 'AUTHCODE' } }, res);
     await until(() => apiCalls.length >= 2);
@@ -788,6 +791,7 @@ test('OAuth success delivers a durable DM + a channel-bound ephemeral, only the 
     });
     await assert.rejects(() => cl.vouchr.connect('acme'), ConsentRequiredError);
     const clState = new URL(clPrompts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    await verifyConsent(db, clState);
     const clRes = fakeResponse();
     await callback({ query: { state: clState, code: 'AUTHCODE' } }, clRes);
     await until(() => count('chat.postMessage', (a) => a.channel === 'U2') >= 1);
@@ -822,7 +826,7 @@ test('a provider-side callback error is not messaged as a user denial and is nev
       db,
       botToken: 'xoxb-test',
     });
-    const pending = await new Consent(db).begin(
+    const pending = await beginVerified(new Consent(db), 
       ID,
       provider,
       'https://vouchr.test/vouchr/oauth/callback',
@@ -850,7 +854,7 @@ test('a provider-side callback error is not messaged as a user denial and is nev
 test('Bolt callback response does not wait for a non-settling Slack recovery DM', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   const db = await openTestDb(t);
-  const pending = await new Consent(db).begin(
+  const pending = await beginVerified(new Consent(db), 
     ID,
     provider,
     'https://vouchr.test/vouchr/oauth/callback',
@@ -898,8 +902,8 @@ test('Bolt bounds and deduplicates a non-settling multi-workspace notification l
   });
   const consent = new Consent(db);
   const [first, second] = await Promise.all([
-    consent.begin(ID, provider, 'https://vouchr.test/vouchr/oauth/callback', null),
-    consent.begin(ID, secondProvider, 'https://vouchr.test/vouchr/oauth/callback', null),
+    beginVerified(consent, ID, provider, 'https://vouchr.test/vouchr/oauth/callback', null),
+    beginVerified(consent, ID, secondProvider, 'https://vouchr.test/vouchr/oauth/callback', null),
   ]);
   let lookups = 0;
   const settleLookups: Array<(installation: object) => void> = [];
@@ -926,7 +930,7 @@ test('Bolt bounds and deduplicates a non-settling multi-workspace notification l
   assert.equal(lookups, 1, 'one workspace lookup is shared across concurrent callback notices');
 
   await new Promise((resolve) => setTimeout(resolve, 3_100));
-  const afterTimeout = await consent.begin(
+  const afterTimeout = await beginVerified(consent, 
     ID,
     provider,
     'https://vouchr.test/vouchr/oauth/callback',
@@ -945,7 +949,7 @@ test('Bolt bounds and deduplicates a non-settling multi-workspace notification l
 
   settleLookups[0]!({});
   await new Promise<void>((resolve) => setImmediate(resolve));
-  const afterSettlement = await consent.begin(
+  const afterSettlement = await beginVerified(consent, 
     ID,
     secondProvider,
     'https://vouchr.test/vouchr/oauth/callback',
@@ -969,7 +973,7 @@ test('Bolt caps hung notification lookups across distinct workspaces', async (t)
     (_, i): SlackIdentity => ({ enterpriseId: null, teamId: `TW${i}`, userId: `UW${i}` }),
   );
   const requests = await Promise.all(
-    identities.map((identity) => consent.begin(
+    identities.map((identity) => beginVerified(consent, 
       identity,
       provider,
       'https://vouchr.test/vouchr/oauth/callback',
@@ -1004,7 +1008,7 @@ test('Bolt caps hung notification lookups across distinct workspaces', async (t)
   );
 
   const refusedIdentity: SlackIdentity = { enterpriseId: null, teamId: 'TW-over-cap', userId: 'UW-over-cap' };
-  const refused = await consent.begin(
+  const refused = await beginVerified(consent, 
     refusedIdentity,
     provider,
     'https://vouchr.test/vouchr/oauth/callback',
@@ -1017,7 +1021,7 @@ test('Bolt caps hung notification lookups across distinct workspaces', async (t)
   settleLookups[0]!({});
   await new Promise<void>((resolve) => setImmediate(resolve));
   const recoveredIdentity: SlackIdentity = { enterpriseId: null, teamId: 'TW-recovered', userId: 'UW-recovered' };
-  const recovered = await consent.begin(
+  const recovered = await beginVerified(consent, 
     recoveredIdentity,
     provider,
     'https://vouchr.test/vouchr/oauth/callback',
@@ -1055,7 +1059,7 @@ test('a direct credential write supersedes an older pending consent so fresh dem
   const vault = new Vault(db, KEY);
   const owner = userOwner(ID);
   // A pending "Connect" exists...
-  const old = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const old = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   await new Promise((resolve) => setTimeout(resolve, 2));
   // ...then a credential commits by another path (e.g. a key set, or a broker connect that landed).
   assert.equal(
@@ -1077,7 +1081,7 @@ test('supersession fails the equal-millisecond consent closed too (matches the >
   const consent = new Consent(db);
   const vault = new Vault(db, KEY);
   const owner = userOwner(ID);
-  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const pending = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   // Read the consent's exact created_at and write a credential issued at THAT same millisecond. The
   // fence would fail this consent's callback closed (`>=`), so cleanup must supersede it too (`<=`);
   // a strict `<` would leave the equal-time consent reusable as a dead URL.
@@ -1108,11 +1112,11 @@ test('re-authorization over a live credential replaces it; a delayed stale callb
     headers: { 'content-type': 'application/json' },
   })) as typeof fetch;
   try {
-    const first = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+    const first = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
     assert.equal((await handleOAuthCallback(deps, 'code-1', first.state)).ok, true);
 
     // A consent generation minted BEFORE the newest credential write can never overwrite it.
-    const stale = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+    const stale = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
     providerToken = 'token-from-stale-callback';
     await new Promise((resolve) => setTimeout(resolve, 2)); // strictly newer PostgreSQL-ms generation
     const direct = {
@@ -1129,7 +1133,7 @@ test('re-authorization over a live credential replaces it; a delayed stale callb
     // Re-auth while connected (provider-side-dead token, scope change) must not dead-end: a
     // generation minted AFTER the live credential replaces it instead of looping on state_stale.
     await new Promise((resolve) => setTimeout(resolve, 2));
-    const reauth = await consent.begin(ID, provider, deps.redirectUri, 'C1');
+    const reauth = await beginVerified(consent, ID, provider, deps.redirectUri, 'C1');
     providerToken = 'token-2';
     const result = await handleOAuthCallback(deps, 'code-3', reauth.state);
     assert.equal(result.ok, true);
@@ -1286,7 +1290,7 @@ test("an offboarded user's surviving expired link is account-inactive, not \"ask
   const consent = new Consent(db);
   // Offboarding tolerates a failed consent-row purge, so the row can outlive STATE_TTL_US with no
   // re-onboarding. Expiry must NOT mask the lifecycle invalidation the user must act on.
-  const pending = await consent.begin(ID, provider, 'https://vouchr.test/callback', 'C1');
+  const pending = await beginVerified(consent, ID, provider, 'https://vouchr.test/callback', 'C1');
   await consent.markOffboarded(ID);
   await new Promise((resolve) => setTimeout(resolve, 2));
   await db.run(`UPDATE consent_request SET created_at=${POSTGRES_NOW_US_SQL}-? WHERE state=?`, [STATE_TTL_US + 1_000_000, pending.state]);

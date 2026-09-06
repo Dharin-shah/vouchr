@@ -11,6 +11,7 @@ import { openDb, Vault, Audit, createBroker, github, Policy, ChannelTools } from
 import type { BrokerServer, Db, TtlPolicy } from '../src/headless';
 import { testDbUrl } from './support/pg';
 import { identityConfig } from './support/identity';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 /**
  * Proves the Bolt-free claim (Product H2): the `./headless` entry's RESOLVED CommonJS module graph must
@@ -53,7 +54,7 @@ test('headless entry: createBroker is constructible end-to-end from ./headless a
     // all from ./headless alone.
     const policy = new Policy({ github: { defaultAllow: false, allowChannels: ['C_canary'] } }, { defaultDeny: true });
     const channelTools = new ChannelTools(db);
-    const server: BrokerServer = createBroker({
+    const server: BrokerServer = createBroker({ ...BROKER_REQUIRED,
       providers: [provider],
       vault,
       audit,

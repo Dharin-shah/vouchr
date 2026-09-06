@@ -625,9 +625,10 @@ Legacy assertions without a verified `iat` fail closed at the production broker 
   signing secret, encryption keys, broker bearer, and provider OAuth client secrets; the equality
   check is enforced, not advisory. See the deployment guide for the required upgrade and rotation
   order.
-- **Browser Slack identity (#302).** `requireBrowserSlackIdentity: true` on `createBroker` (or
-  `createVouchr`) also needs `slackOidc`, a `SlackOidcOptions` `{ clientId, clientSecret }` for the
-  Slack app; construction fails closed without it. The rollout order is in the deployment guide.
+- **Browser Slack identity (#302).** `createBroker` (and `createVouchr`) require `baseUrl` and
+  `slackOidc`, a `SlackOidcOptions` `{ clientId, clientSecret }` for the Slack app; construction
+  fails closed without them. Every `POST /v1/connect` authorize URL is the Vouchr verify hop, and
+  the callback refuses a consent the hop never stamped. Details are in the deployment guide.
 - **Break-glass revocation (#239).** `revokeAllCredentials(db, deps: RevokeAllDeps, { execute })` is
   the primitive behind `vouchr revoke --all`: `RevokeAllDeps` is `{ vault, audit, registry? }`, and
   the returned `RevokeAllReport` holds counts only — `matched: RevokeLocalCounts` per table, and one

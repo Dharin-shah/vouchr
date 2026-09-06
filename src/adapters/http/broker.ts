@@ -35,6 +35,7 @@ import {
 import type { SlackIdentity } from '../../core/identity';
 import {
   Consent,
+  browserHopUrls,
   markUserOffboardedByActor,
   markUserOffboardedEverywhereByActor,
   type ConsentRequest,
@@ -165,13 +166,13 @@ export interface BrokerOptions {
    */
   identitySecret: IdentityConfig;
   /**
-   * #52 public HTTPS origin of THIS broker (e.g. `https://broker.example`). Setting it MOUNTS the OAuth
-   * connect flow: `POST /v1/connect` (mint an authorize URL for the verified user) and
-   * `GET <callbackPath>` (the provider redirect target). Unset → neither route mounts (additive; the
-   * historical use-only broker is unchanged). The `redirectUri` handed to providers is the public
-   * origin plus one validated canonical absolute callback pathname.
+   * #52 public HTTPS origin of THIS broker (e.g. `https://broker.example`). Required: the OAuth
+   * connect flow — `POST /v1/connect` (mint an authorize URL for the verified user), the Slack
+   * verify routes (#302), and `GET <callbackPath>` (the provider redirect target) — mounts under it.
+   * The `redirectUri` handed to providers is the public origin plus one validated canonical
+   * absolute callback pathname.
    */
-  baseUrl?: string;
+  baseUrl: string;
   /** #52 canonical absolute OAuth redirect pathname mounted under `baseUrl`. Default `/oauth/callback`. */
   callbackPath?: string;
   /**
@@ -321,8 +322,8 @@ export interface BrokerOptions {
    * #116 dry-run: identical semantics to `VouchrOptions.dryRun` — every gate runs for real, and NO
    * real network call leaves the process (outbound fetch, token exchange, refresh, and upstream
    * revoke are all stubbed or skipped). `/v1/connect` mints an authorize URL that points at THIS
-   * broker's own callback (requires `baseUrl`), so a test client completes consent by simply
-   * GETting it — the callback consumes the single-use state and writes a synthetic credential
+   * broker's own callback, standing in for the Slack verify hop too (its two routes are not mounted,
+   * 404), so a test client completes consent by simply GETting it — the callback consumes the single-use state and writes a synthetic credential
    * marked `external_account: 'dry-run'`. `/v1/fetch` then runs policy, tool, owner, and egress
    * gates, reads the (synthetic) credential from the vault, and returns a
    * `200 { dryRun, method, url, wouldInjectAs }` echo instead of calling the provider; request-side
@@ -334,16 +335,14 @@ export interface BrokerOptions {
    */
   dryRun?: boolean;
   /**
-   * #302: require the browser completing provider OAuth to prove, via Slack OpenID Connect, that it
-   * is signed in as the Slack user the consent `state` was bound to. `POST /v1/connect` then mints
-   * a Vouchr verify URL (mounted beside `callbackPath`) that routes through Slack sign-in before
-   * revealing the provider authorize URL, and the callback refuses any consent the hop never
-   * stamped. Requires `baseUrl` and `slackOidc`; incompatible with `dryRun`. Default false.
+   * #302: Slack app OIDC credentials. Required: `POST /v1/connect` mints a Vouchr verify URL
+   * (mounted beside `callbackPath`) that routes the browser through Slack sign-in before revealing
+   * the provider authorize URL, and the callback refuses any consent the hop never stamped. The
+   * packaged broker reads `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET`. The Slack app
+   * must list the `…/slack` route beside `callbackPath` as an OAuth redirect URL (see
+   * guides/DEPLOYMENT.md).
    */
-  requireBrowserSlackIdentity?: boolean;
-  /** Slack app OIDC credentials for `requireBrowserSlackIdentity`. The Slack app must list the
-   *  `…/slack` route beside `callbackPath` as an OAuth redirect URL (see guides/DEPLOYMENT.md). */
-  slackOidc?: SlackOidcOptions;
+  slackOidc: SlackOidcOptions;
 }
 
 const DEFAULT_ALLOWED_CT = ['application/json'];
@@ -738,18 +737,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     ...rawOpts.providers.flatMap((provider) => provider.clientSecret ? [provider.clientSecret] : []),
     ...(rawOpts.slackOidc?.clientSecret ? [rawOpts.slackOidc.clientSecret] : []),
   ], (secret) => rawOpts.vault.usesMasterKeyMaterial(secret));
-  // #302: validate the browser Slack-identity hop config fail-closed at construction.
-  if (rawOpts.requireBrowserSlackIdentity !== undefined && typeof rawOpts.requireBrowserSlackIdentity !== 'boolean') {
-    throw new Error('createBroker: requireBrowserSlackIdentity must be a boolean'); // SEC-4: fail closed, never coerce
+  // #302: the browser Slack-identity hop is the only consent path; its config fails closed here.
+  if (typeof rawOpts.baseUrl !== 'string' || rawOpts.baseUrl.trim() === '') {
+    throw new Error('createBroker: baseUrl is required (VOUCHR_BASE_URL) — the connect, Slack verify, and callback routes mount under it');
   }
-  const requireBrowserSlackIdentity = rawOpts.requireBrowserSlackIdentity === true;
-  if (requireBrowserSlackIdentity && dryRun) {
-    throw new Error('createBroker: requireBrowserSlackIdentity is incompatible with dryRun (the synthetic authorize URL never passes the Slack hop)');
-  }
-  if (requireBrowserSlackIdentity && !rawOpts.baseUrl) {
-    throw new Error('createBroker: requireBrowserSlackIdentity requires baseUrl (the verify routes mount under it)');
-  }
-  const slackOidc = requireBrowserSlackIdentity ? assertSlackOidcOptions(rawOpts.slackOidc, 'createBroker') : undefined;
+  const slackOidc = assertSlackOidcOptions(rawOpts.slackOidc, 'createBroker');
   const opts: BrokerOptions = {
     ...rawOpts,
     identitySecret: identityConfig,
@@ -801,48 +793,37 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   const emit = (ev: VouchrEvent) => safeEmit(opts.onEvent, ev);
 
   // #54 lifecycle: consent + session stores for offboarding (purge pending consent + thread grants so
-  // neither can resurrect access after a user is removed). #52 OAuth connect flow (mounted only when
-  // baseUrl is set) reuses the same Consent: it owns the single-use state + PKCE; handleOAuthCallback
-  // owns the code exchange — the broker adds no crypto/state logic itself. Cheap Db wrappers.
+  // neither can resurrect access after a user is removed). #52 OAuth connect flow reuses the same
+  // Consent: it owns the single-use state + PKCE; handleOAuthCallback owns the code exchange — the
+  // broker adds no crypto/state logic itself. Cheap Db wrappers.
   const callbackPath = opts.callbackPath === undefined ? '/oauth/callback' : opts.callbackPath;
   // The same core helper owns origin/path validation for both adapters. A configured callback path
   // must be the exact pathname this server matches, never a relative/URL/query/fragment variant.
-  const redirectUri = opts.baseUrl ? buildCallbackUrl(opts.baseUrl, callbackPath) : undefined;
-  // #302: the verify/slack routes mount beside callbackPath (same directory, fixed basenames).
-  // Derived only AFTER buildCallbackUrl above proved callbackPath canonical (#211 contract intact).
-  let browserVerifyPath: string | undefined;
-  let slackRedirectPath: string | undefined;
-  let browserVerifyUri: string | undefined;
-  let oidcRedirectUri: string | undefined;
-  if (slackOidc) {
-    // Plain string slicing (not a regex): callbackPath was proven canonical above, and CodeQL flags
-    // an end-anchored [^/]+ replace as polynomial-time on adversarial input.
-    const callbackDir = callbackPath.slice(0, callbackPath.lastIndexOf('/') + 1);
-    browserVerifyPath = `${callbackDir}verify`;
-    slackRedirectPath = `${callbackDir}slack`;
-    if (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath) {
-      throw new Error('createBroker: callbackPath must not end in /verify or /slack when requireBrowserSlackIdentity is on');
-    }
-    browserVerifyUri = buildCallbackUrl(opts.baseUrl!, browserVerifyPath);
-    oidcRedirectUri = buildCallbackUrl(opts.baseUrl!, slackRedirectPath);
+  const redirectUri = buildCallbackUrl(opts.baseUrl, callbackPath);
+  // #302: the verify/slack routes mount beside callbackPath (same directory, fixed basenames),
+  // derived only AFTER buildCallbackUrl above proved callbackPath canonical (#211 contract intact).
+  const hops = browserHopUrls(redirectUri);
+  const browserVerifyPath = hops.verify.pathname;
+  const slackRedirectPath = hops.slack.pathname;
+  if (browserVerifyPath === callbackPath || slackRedirectPath === callbackPath) {
+    throw new Error('createBroker: callbackPath must not end in /verify or /slack (the Slack verify routes mount there)');
   }
-  const consent = new Consent(opts.db, dryRun, browserVerifyUri); // #116: dry-run mints local instantly-succeeding authorize URLs
+  const oidcRedirectUri = hops.slack.toString();
+  const consent = new Consent(opts.db, dryRun); // #116: dry-run mints local instantly-succeeding authorize URLs
   const sessions = new SessionGrants(opts.db);
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
   const provisioning = new UserProvisioningRequests(opts.db, opts.vault);
   const channelProvisioning = new ChannelProvisioningRequests(opts.db, opts.vault);
   // #302: one shared verifier owns the OIDC exchange + compare + stamp/spend sequence.
-  const browserVerifier = slackOidc
-    ? new BrowserIdentityVerifier({
-        consent,
-        registry,
-        redirectUri: redirectUri!,
-        oidcRedirectUri: oidcRedirectUri!,
-        audit: opts.audit,
-        auditSink: opts.auditSink,
-        oidc: slackOidc,
-      })
-    : null;
+  const browserVerifier = new BrowserIdentityVerifier({
+    consent,
+    registry,
+    redirectUri,
+    oidcRedirectUri,
+    audit: opts.audit,
+    auditSink: opts.auditSink,
+    oidc: slackOidc,
+  });
 
   // #116 safety rail: dry-run must never serve against a vault holding REAL credential rows.
   // createBroker is sync, so the async check starts here and every request (health probes excepted)
@@ -1794,7 +1775,6 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     const { identity, issuedAt } = await requireCurrentActor(claims);
-    if (!redirectUri) throw new HttpError(404, { error: 'oauth connect is not configured' });
     if (!registry.has(providerId)) throw new HttpError(404, { error: 'unknown provider' });
     const provider = registry.get(providerId);
     if (!isBrokeredProvider(provider)) throw new HttpError(403, { error: 'service-to-service tool; not brokered by Vouchr' });
@@ -1817,9 +1797,8 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   async function handleCallback(url: URL, signal?: AbortSignal): Promise<{ status: number; html: string }> {
     const q = url.searchParams;
     const result = await handleOAuthCallback(
-      // dryRun (#116) stubs only the token-exchange edge inside the shared callback.
-      // #302: no flag here — the callback enforces the ROW's minted-time slack_verify_required.
-      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri: redirectUri!, auditSink: opts.auditSink, dryRun },
+      // dryRun (#116) stubs the token-exchange edge inside the shared callback.
+      { registry, vault: opts.vault, audit: opts.audit, consent, redirectUri, auditSink: opts.auditSink, dryRun },
       q.get('code') ?? undefined,
       q.get('state') ?? undefined,
       q.get('error') ?? undefined,
@@ -2100,14 +2079,16 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         requestSignal.throwIfAborted();
         // #52 OAuth redirect target — a human's browser lands here, so it returns HTML (not JSON) and
         // has NO perimeter gate (the provider redirects the user's browser, which carries no bearer).
-        // Only mounted when baseUrl is configured. Match on the pathname (a callback carries a query).
-        if (req.method === 'GET' && redirectUri && new URL(url, 'http://localhost').pathname === callbackPath) {
+        // Match on the pathname (a callback carries a query).
+        if (req.method === 'GET' && new URL(url, 'http://localhost').pathname === callbackPath) {
           const r = await handleCallback(new URL(url, 'http://localhost'), requestSignal);
           res.writeHead(r.status, { 'content-type': 'text/html; charset=utf-8' });
           return res.end(r.html);
         }
         // #302 browser Slack-identity hop — browser routes like the callback: no perimeter gate.
-        if (req.method === 'GET' && browserVerifier) {
+        // #116 dry-run: not mounted (404). Hop 2 is the one place the client secret would leave the
+        // process for slack.com; the dry-run prompt points at the callback, never at these routes.
+        if (req.method === 'GET' && !dryRun) {
           const hopUrl = new URL(url, 'http://localhost');
           if (hopUrl.pathname === browserVerifyPath) {
             const r = await browserVerifier.begin(hopUrl.searchParams.get('state') ?? undefined);

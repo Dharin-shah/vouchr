@@ -97,19 +97,24 @@ Use the bootstrap manifest.
    **From a manifest**, and pick your new workspace.
 3. Paste the contents of
    [`examples/slack-manifest.bootstrap.yml`](./examples/slack-manifest.bootstrap.yml), not
-   `slack-manifest.yml`. There is nothing to replace. The bootstrap file carries no request URLs on
-   purpose. Slack checks a request URL the moment you submit the manifest, and your app cannot
-   answer until it runs with the signing secret this step gives you. You add the URLs in
+   `slack-manifest.yml`. Replace `YOUR_PUBLIC_URL` in the one redirect URL with your tunnel host
+   from step 3 (host only, no `https://`, no trailing slash). The bootstrap file carries no request
+   URLs on purpose. Slack checks a request URL the moment you submit the manifest, and your app
+   cannot answer until it runs with the signing secret this step gives you. You add the URLs in
    [step 8](#8-finish-the-slack-app-the-three-urls), against a live server.
 4. Click **Create**. On the app's **Install App** page, click **Install to Workspace**, then
    **Allow**.
-5. Copy two secrets:
+5. Copy four values:
    - **Install App** page, **Bot User OAuth Token** (`xoxb-...`). This is `SLACK_BOT_TOKEN`.
    - **Basic Information**, **Signing Secret**. This is `SLACK_SIGNING_SECRET`.
+   - **Basic Information**, **Client ID** and **Client Secret**. These are
+     `VOUCHR_SLACK_CLIENT_ID` and `VOUCHR_SLACK_CLIENT_SECRET`. Vouchr uses them to check, on every
+     Connect link, that the browser is signed in to Slack as the person who asked.
 
 The manifest already sets up the `/vouchr` command, the `app_mention`, `app_home_opened`, and
-`user_change` events, the App Home tab, and the minimal bot scopes. The only things left to do by
-hand are the three URLs in step 8.
+`user_change` events, the App Home tab, the Slack sign-in redirect URL
+(`PUBLIC_URL/vouchr/oauth/slack`), and the minimal bot scopes. The only things left to do by hand
+are the three URLs in step 8.
 
 ## 5. Create a GitHub OAuth App
 
@@ -140,6 +145,8 @@ VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
 
 SLACK_BOT_TOKEN=xoxb-...      # from step 4
 SLACK_SIGNING_SECRET=...      # from step 4
+VOUCHR_SLACK_CLIENT_ID=...    # from step 4
+VOUCHR_SLACK_CLIENT_SECRET=...  # from step 4
 
 PUBLIC_URL=https://your-tunnel-host   # from step 3, no trailing slash
 PORT=3000
@@ -204,8 +211,10 @@ In your Slack workspace, in the `#demo` channel:
 3. Mention the bot: `@vouchr who am I on github?` (any text works, the mention is the trigger).
    Vouchr posts a private *"Connect your GitHub account"* message with a **Connect** button. Only
    you can see it. It is an ephemeral message, not a channel post.
-4. Click **Connect**. Your browser opens GitHub's authorize screen. Click **Authorize**. You land on
-   a plain *"github connected"* page that names the Slack user it is linked to.
+4. Click **Connect**. Your browser first passes through a Slack sign-in check (Slack confirms you
+   are the person who asked, then sends you on), then opens GitHub's authorize screen. Click
+   **Authorize**. You land on a plain *"github connected"* page that names the Slack user it is
+   linked to.
 5. Mention the bot again: `@vouchr who am I on github?` The in-thread reply is
    **`You are *yourlogin* on GitHub, N public repos.`**
 6. This is the point of Vouchr. The bot code ran `gh.fetch('https://api.github.com/user')` and never
@@ -218,6 +227,7 @@ In your Slack workspace, in the `#demo` channel:
 | --- | --- |
 | Slack says "Your URL didn't respond" when saving a Request URL | Slack calls the URL as you save it, so the app must already be up. Check that `npm run example:github` is running and that the tunnel forwards to `:3000`. If you hit this while *creating* the app, you pasted `slack-manifest.yml`. Create the app from `slack-manifest.bootstrap.yml` (step 4) and add the URLs in step 8 instead. Avoid ngrok's interstitial page (use a static domain or cloudflared). |
 | GitHub `redirect_uri mismatch` | The callback must be exactly `PUBLIC_URL/vouchr/oauth/callback`: same scheme and host, no trailing slash. |
+| Slack shows an error before GitHub opens | The app's OAuth redirect URL must be exactly `PUBLIC_URL/vouchr/oauth/slack`, and `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` must be that app's credentials. |
 | Bot ignores your `@mention` | Run `/invite @vouchr` in the channel. Confirm the `app_mention` event is in the manifest and the process is running. |
 | Boot fails on the database | Run the migrate command from step 7 first. Check that `VOUCHR_DATABASE_URL` points at a reachable Postgres. Vouchr fails closed if it is unset or not a `postgres://` URL. |
 | `role "vouchr" does not exist` | Create the role and database (step 2, Homebrew) or point the URL at an existing one. |

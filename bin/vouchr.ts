@@ -631,10 +631,10 @@ function usage(): void {
 Usage: vouchr <command> [options]
 
 Commands:
-  migrate     Create/upgrade the PostgreSQL schema to this build's version. Run
-              ONCE per deploy/upgrade with a role that can create tables; the
-              runtime then connects with a DML-only role. Idempotent and safe to
-              run concurrently. Prefer VOUCHR_DATABASE_URL over --db (keeps the
+  migrate     Create the PostgreSQL schema (version 1); any other recorded
+              version is refused, recreate the database. Run ONCE per deploy
+              with a role that can create tables; the runtime then connects
+              with a DML-only role. Idempotent and safe to run concurrently. Prefer VOUCHR_DATABASE_URL over --db (keeps the
               credential URL out of shell history / process args).
   inventory   List stored connections (metadata only; never tokens).
                 --team <id>      filter by team

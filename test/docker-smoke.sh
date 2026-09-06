@@ -139,6 +139,9 @@ run_replica() { # N PORT [extra docker run flags]
     -e VOUCHR_PROVIDERS="$PROVIDERS" \
     -e VOUCHR_PORT="$port" \
     -e VOUCHR_DATABASE_URL="$APP_URL" \
+    -e VOUCHR_BASE_URL="https://broker.smoke.example" \
+    -e VOUCHR_SLACK_CLIENT_ID="smoke-slack-cid" \
+    -e VOUCHR_SLACK_CLIENT_SECRET="smoke-slack-secret" \
     -p "$port:$port" "$IMAGE" >/dev/null
 }
 echo "==> start two replicas (read-only root; replica 2 as arbitrary uid 12345) on the DML-only role"

@@ -22,6 +22,7 @@ import { SessionGrants } from '../src/core/session';
 import { Vault } from '../src/core/vault';
 import { identityConfig } from './support/identity';
 import { openTestDb } from './support/pg';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const provider = defineProvider({
   id: 'acme',
@@ -52,7 +53,7 @@ test('BrokerServer.sweepExpired owns every lifecycle family and preserves canoni
   const audit = new Audit(db);
   const events: VouchrEvent[] = [];
   const healthEvents: CredentialHealthEvent[] = [];
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [provider],
     vault,
     audit,

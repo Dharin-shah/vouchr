@@ -3,10 +3,54 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] — 2026-09-06
+
+The Slack OpenID Connect browser-identity check is the only consent path, and the schema is one
+version. This is a breaking configuration change from `1.0.0`: every deployment needs two more
+variables and a fresh database. No code path or option keeps the old behavior.
+
+### Removed
+
+- **The `requireBrowserSlackIdentity` option and `VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY` variable
+  (#340).** The Slack sign-in check on every Connect link (#302) was optional in `1.0.0`. It is the
+  identity binding Vouchr promises, so the flag, its flag-off code paths on both surfaces (the direct
+  provider authorize URL in a prompt, a callback that completes an unverified consent, a broker that
+  mounts no connect flow), and their tests are gone.
+- **`consent_request.slack_verify_required` and the "enforcement mode is part of the consent
+  generation" logic.** Both existed only to make a flag flip safe across replicas. With one path the
+  column had no reader. `slack_verified_at` stays: the callback still refuses a consent the hop never
+  stamped.
+- **The `1.0.0` migration ladder.** Schema versions 12 to 15, the v12 → v13 millisecond-to-microsecond
+  conversion, the v13 → v14 and v14 → v15 column steps, the migratable-version set, and the rollout
+  sections in `guides/DEPLOYMENT.md` are deleted. Vouchr is greenfield; there is no database lineage
+  to carry.
+
+### Changed
+
+- **Required configuration.** `createVouchr` and `createBroker` / `vouchr-broker` require
+  `baseUrl` (`VOUCHR_BASE_URL` on the broker) and `slackOidc: { clientId, clientSecret }`
+  (`VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET`; `createVouchr` reads the pair from the
+  environment when the option is absent). Startup fails closed and names the missing variable.
+  `createVouchr` no longer reads `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET`.
+- **Every Connect link is the verify hop.** The prompt URL on both surfaces is `…/verify?state=…`
+  beside the callback path; the provider authorize URL is revealed only after Slack confirms the
+  bound identity. The mismatch denial (`denied` / `browser_identity_mismatch` against the bound
+  user), the fixed non-reflecting error, the single-use state spend, and the bounded server-side
+  code exchange are unchanged. Dry-run keeps its synthetic local authorize URL: it stands in for the
+  Slack hop as it does for the provider, and can only mint a synthetic credential row; the verify and
+  Slack routes are not mounted under dry-run (404), so no request can reach Slack's token endpoint.
+- **Schema version is 1.** One DDL creates the whole current schema, including the consent and
+  approval indexes that `migrate()` used to add separately. `vouchr migrate` on an empty database
+  creates it; on a version-1 database it is a no-op; on any other recorded version it refuses with
+  the "recreate the database fresh" error, and the runtime refuses to open it. A `1.0.0` database
+  must be recreated; there is no data migration. Future schema changes add steps from version 1.
+- **Slack app setup.** The OIDC redirect URL (`$PUBLIC_URL/vouchr/oauth/slack`) and the two
+  variables are part of the standard setup in `QUICKSTART.md`, both Slack manifests, `.env.example`,
+  the examples, `deploy/k8s.yaml`, and the deployment guide.
 
 ### Docs
 
+- `guides/THREAT-MODEL.md` marks "Forwarded consent link" as mitigated on every deployment.
 - HEADLESS.md gained "Autonomous workers": a bot-user requester on a shared channel credential with
   `approver: 'member'`, the `approver: 'self'` caveat, and a production-path test in
   `test/authorization.test.ts`.

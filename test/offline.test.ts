@@ -107,8 +107,7 @@ test('consent: state is single-use and expires', async (t) => {
   const consent = new Consent(db);
   const provider = github({ clientId: 'cid', clientSecret: 'csec' });
   const { state, authorizeUrl } = await consent.begin(ID, provider, 'https://x/cb', 'C1');
-  assert.match(authorizeUrl, /response_type=code/);
-  assert.match(authorizeUrl, /state=/);
+  assert.equal(authorizeUrl, `https://x/verify?state=${state}`); // the Slack verify hop (#302)
 
   const claim = await consent.consume(state);
   assert.equal(claim.status, 'active');
@@ -135,8 +134,10 @@ test('providers: ANY OAuth2 provider works via generic defineProvider', async (t
     clientId: 'id',
     clientSecret: 'sec',
   });
-  const { authorizeUrl } = await consent.begin(ID, acme, 'https://x/cb', 'C1');
-  const u = new URL(authorizeUrl);
+  const { authorizeUrl: prompt, state } = await consent.begin(ID, acme, 'https://x/cb', 'C1');
+  assert.equal(prompt, `https://x/verify?state=${state}`, 'the prompt carries the Slack verify hop (#302)');
+  const row = (await consent.activeRow(state))!;
+  const u = new URL(consent.providerAuthorizeUrl(acme, 'https://x/cb', state, row.pkceVerifier));
   assert.equal(u.origin + u.pathname, 'https://acme.example/oauth/authorize');
   assert.equal(u.searchParams.get('client_id'), 'id');
   assert.equal(u.searchParams.get('scope'), 'read write');

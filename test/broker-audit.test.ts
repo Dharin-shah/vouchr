@@ -13,6 +13,7 @@ import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import type { SlackIdentity } from '../src/core/identity';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // Headless /v1/audit parity (#150). Same invariants as the Slack /vouchr audit (#104): a caller only
 // ever reads their OWN rows, `audit channel` is channel-gated on the SIGNED claim, and `meta` is never
@@ -42,7 +43,7 @@ const STALE_ACTOR_ERROR = {
 async function harness(t: TestContext) {
   const db = await openTestDb(t);
   const audit = new Audit(db);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme], vault: new Vault(db, KEY), audit, db, identitySecret: identityConfig(SECRET),
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',

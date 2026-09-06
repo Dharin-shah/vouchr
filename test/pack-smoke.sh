@@ -174,6 +174,8 @@ echo "==> require() every published entrypoint (CJS exports map)"
     audit: new headless.Audit(inertDb),
     db: inertDb,
     identitySecret: identity,
+    baseUrl: 'https://packed.example',
+    slackOidc: { clientId: 'packed-slack-cid', clientSecret: 'packed-slack-secret' },
   });
   if (typeof directBroker.sweepExpired !== 'function') {
     throw new Error('packed createBroker return is missing the safe lifecycle sweep');

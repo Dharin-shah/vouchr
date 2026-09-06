@@ -55,6 +55,7 @@ import {
 import { Policy } from '../src/core/policy';
 import { SessionGrants } from '../src/core/session';
 import { mapSafeError, type VouchrRecovery } from '../src/core/errors';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // #113 human-in-the-loop approval for sensitive writes: the full state machine (prompt → approve →
 // consume → re-prompt; deny; TTL expiry; the double-consume race), gate ordering (egress beats
@@ -2576,7 +2577,7 @@ test('broker: unapproved write → 403 { error: "approval_required", approvalId 
   const audit = new Audit(db);
   const provider = approvalProvider();
   await vault.upsert(userOwner(ID), 'acme', { accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET), allowWrites: true });
   await listen(t, server);
   const port = (server.address() as any).port;
   const tok = () => signIdentity({ teamId: 'T1', userId: 'U1', channel: 'C1', exp: Date.now() + 60_000, jti: randomUUID() }, SECRET);
@@ -2658,6 +2659,7 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
 
   let resolverCalls = 0;
   const brokerOptions = {
+    ...BROKER_REQUIRED,
     providers: [provider], vault: vaultA, audit: auditA, db: dbA,
     identitySecret: identityConfig(SECRET),
     resolvers: { test: async () => { resolverCalls++; return TOKEN; } },
@@ -2676,7 +2678,7 @@ test('broker revalidates concurrent governance/reconnect and preserves omitted-s
     return originalLocks(keys, fn);
   };
 
-  const withTools = createBroker({ ...brokerOptions, channelTools: new ChannelTools(dbA) });
+  const withTools = createBroker({ ...BROKER_REQUIRED, ...brokerOptions, channelTools: new ChannelTools(dbA) });
   await listen(t, withTools);
   const toolsPort = (withTools.address() as any).port;
   try {

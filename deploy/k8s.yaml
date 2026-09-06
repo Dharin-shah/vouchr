@@ -93,7 +93,8 @@ spec:
           # `sleep` is in the runtime image and needs no writable filesystem.
           lifecycle: { preStop: { exec: { command: ["sleep", "5"] } } }
           # Secrets (VOUCHR_IDENTITY_SECRET, optional VOUCHR_IDENTITY_SECRET_PREVIOUS,
-          # VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, provider client secrets, optional
+          # VOUCHR_MASTER_KEY, VOUCHR_DATABASE_URL, VOUCHR_SLACK_CLIENT_ID + VOUCHR_SLACK_CLIENT_SECRET
+          # (the Slack app's OIDC credentials, required), provider client secrets, optional
           # VOUCHR_BROKER_TOKEN) come from a Secret your secret manager syncs (e.g.
           # externalSecrets → this Secret). Keep identity keys distinct from every other secret.
           # Non-secret deployment identity/issuer can come from a ConfigMap or explicit env below.
@@ -110,6 +111,10 @@ spec:
             # REQUIRED on every broker replica and trusted minter; replace with one stable id for this
             # deployment. Changing it invalidates every in-flight assertion from the previous id.
             - { name: VOUCHR_DEPLOYMENT_ID, value: "" } # intentionally fails closed until set
+            # REQUIRED: this broker's public HTTPS origin. The connect, Slack verify, and OAuth
+            # callback routes mount under it; register "$VOUCHR_BASE_URL/oauth/slack" as the Slack
+            # app's OAuth redirect URL (#302).
+            - { name: VOUCHR_BASE_URL, value: "" } # intentionally fails closed until set
             # Optional; defaults to "vouchr" and must match every trusted minter.
             # - { name: VOUCHR_IDENTITY_ISSUER, value: "vouchr" }
             # Recommended for multi-instance / production: Postgres (VOUCHR_DATABASE_URL) AND a KMS

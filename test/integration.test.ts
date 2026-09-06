@@ -18,6 +18,7 @@ import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
+import { verifyConsent } from './support/slackOidc';
 
 // A real local OAuth provider + API, so the flow is exercised over HTTP end to end.
 function startMockProvider(): Promise<{
@@ -121,7 +122,9 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
     const actions = posts[0].blocks.find((b: any) => b.type === 'actions');
     const url = new URL(actions.elements[0].url);
     const state = url.searchParams.get('state')!;
-    assert.ok(state && url.searchParams.get('code_challenge')); // PKCE present
+    assert.ok(state);
+    assert.equal(url.pathname, '/vouchr/oauth/verify'); // the Slack verify hop, never the provider (#302)
+    await verifyConsent(lan.db, state); // the hop passed (browser-identity.test.ts drives it for real)
 
     // 2. Drive the OAuth callback (as the browser redirect would).
     const res = fakeRes();
@@ -190,6 +193,7 @@ test('integration: a per-user provider in a DM works end to end with no channel 
     // connect() reaches consent (a Connect prompt), not a tool-disabled refusal.
     await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
     const state = new URL(posts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    await verifyConsent(lan.db, state);
 
     // Complete OAuth, then the FIRST fetch on the retained handle must succeed (the reproduced bug threw).
     const res = fakeRes();
@@ -460,6 +464,7 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
     await lan.middleware({ context: ctx, client, event: { channel: 'C1', user: 'U1', team: 'T1' }, next: async () => {} });
     await assert.rejects(() => ctx.vouchr.connect('mock'), ConsentRequiredError);
     const state = new URL(posts[0].blocks.find((b: any) => b.type === 'actions').elements[0].url).searchParams.get('state')!;
+    await verifyConsent(lan.db, state);
 
     const evil = '<img src=x onerror=alert(1)>';
     const res = fakeRes();

@@ -466,17 +466,20 @@ export interface ConsentRow {
   /** When the consent state was minted — the callback write-gate compares it to the tombstone. */
   createdAt: number;
   /** When the browser completing this consent proved the bound Slack identity via the Slack OIDC
-   * hop (#302). NULL until then. */
+   * hop (#302). NULL until then; the callback refuses an unstamped row. */
   slackVerifiedAt: number | null;
-  /** Whether this consent was MINTED under `requireBrowserSlackIdentity` (#302). Enforcement
-   * authority travels with the row: every callback on every replica honors this value, so a
-   * replica whose own flag is off can never complete an enforced consent unverified. */
-  slackVerifyRequired: boolean;
 }
 
 export interface ConsentRequest {
   authorizeUrl: string;
   state: string;
+}
+
+/** The two browser-hop URLs mounted beside the provider callback (#302): `…/verify`, the URL every
+ *  Connect prompt carries, and `…/slack`, Slack's OIDC redirect back. Derived from the canonical
+ *  redirect URI so the prompt URL, the mounted routes, and the OIDC `redirect_uri` cannot disagree. */
+export function browserHopUrls(redirectUri: string): { verify: URL; slack: URL } {
+  return { verify: new URL('verify', redirectUri), slack: new URL('slack', redirectUri) };
 }
 
 type ConsentCallbackClaim =
@@ -498,7 +501,6 @@ function consentRow(row: any): ConsentRow {
     pkceVerifier: row.pkce_verifier,
     createdAt: row.created_at,
     slackVerifiedAt: row.slack_verified_at ?? null,
-    slackVerifyRequired: Number(row.slack_verify_required) === 1,
   };
 }
 
@@ -506,14 +508,10 @@ function consentRow(row: any): ConsentRow {
 export class Consent {
   /** `dryRun` (#116): begin() then returns a LOCAL authorize URL — the redirect target itself with
    *  a synthetic code — instead of the provider's, so clicking Connect completes instantly and
-   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery.
-   *  `browserVerifyUri` (#302): when set, every minted authorize URL is the Vouchr browser-verify
-   *  hop (`<verifyUri>?state=S`) instead of the provider's, so the ONE URL swap covers every
-   *  prompt surface; {@link providerAuthorizeUrl} rebuilds the real URL after Slack verification. */
+   *  offline. The state row, single-use consume, and TTL stay exactly the real machinery. */
   constructor(
     private db: Db,
     private dryRun = false,
-    private browserVerifyUri?: string,
   ) {}
 
   /** Create a single-use consent request and return the provider authorize URL. */
@@ -592,26 +590,14 @@ export class Consent {
       [i.teamId, i.userId, provider.id],
     );
     if (existing) {
-      // #302: the persisted verification mode is part of the generation's identity. Reusing across
-      // a mode flip would either hand out a verify-hop URL for a row the callback never enforces
-      // (off→on: the old direct provider URL could still bypass the hop) or a direct provider URL
-      // for a row the callback refuses unstamped (on→off: a dead-end prompt). A mismatch
-      // supersedes the old generation and mints one that matches the minting replica's mode.
-      const sameMode = Number(existing.slack_verify_required) === (this.browserVerifyUri ? 1 : 0);
       const sameContext = existing.enterprise_id === i.enterpriseId
-        && existing.channel === channel
-        && sameMode;
+        && existing.channel === channel;
       const live = existing.consumed_at == null
         && existing.observed_at - existing.created_at <= STATE_TTL_US;
       const lifecycleCurrent = !tombstoneBlocks(offboardedAt, existing.created_at)
         && !tombstoneBlocks(revokedAt, existing.created_at);
       if (sameContext && live && lifecycleCurrent) {
-        return this.requestFor(
-          provider,
-          redirectUri,
-          existing.state,
-          existing.pkce_verifier,
-        );
+        return this.requestFor(redirectUri, existing.state);
       }
       // A delayed older request may reuse an already-visible prompt in the same context, but it may
       // not replace a newer generation or move that prompt to another channel.
@@ -639,24 +625,15 @@ export class Consent {
 
     await db.run(
       `INSERT INTO consent_request
-         (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at,
-          slack_verify_required)
-       VALUES (?,?,?,?,?,?,?,?,?)`,
-      // #302: the requirement is PERSISTED at mint time — the callback enforces the row's value,
-      // never a completing replica's process-local flag, so a mixed-config fleet stays fail-closed.
-      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt,
-        this.browserVerifyUri ? 1 : 0],
+         (state, enterprise_id, team_id, user_id, provider, channel, pkce_verifier, created_at)
+       VALUES (?,?,?,?,?,?,?,?)`,
+      [state, i.enterpriseId, i.teamId, i.userId, provider.id, channel, pkceVerifier, issuedAt],
     );
 
-    return this.requestFor(provider, redirectUri, state, pkceVerifier);
+    return this.requestFor(redirectUri, state);
   }
 
-  private requestFor(
-    provider: Provider,
-    redirectUri: string,
-    state: string,
-    pkceVerifier: string,
-  ): ConsentRequest {
+  private requestFor(redirectUri: string, state: string): ConsentRequest {
     // #116 dry-run: the authorize URL is the ONLY thing replaced — an instantly-succeeding local
     // redirect into the real callback. The code is synthetic; the single-use `state` above is what
     // the callback verifies, exactly as in production.
@@ -667,20 +644,16 @@ export class Consent {
       return { authorizeUrl: u.toString(), state };
     }
 
-    // #302: with browser verification on, the ONLY URL a prompt ever carries is the Vouchr verify
-    // hop. The provider authorize URL is rebuilt by providerAuthorizeUrl() strictly after the Slack
-    // OIDC hop proves the bound identity, so no surface can hand out a direct provider URL.
-    if (this.browserVerifyUri) {
-      const u = new URL(this.browserVerifyUri);
-      u.searchParams.set('state', state);
-      return { authorizeUrl: u.toString(), state };
-    }
-
-    return { authorizeUrl: this.providerAuthorizeUrl(provider, redirectUri, state, pkceVerifier), state };
+    // #302: the ONLY URL a prompt ever carries is the Vouchr browser-verify hop. The provider
+    // authorize URL is rebuilt by providerAuthorizeUrl() strictly after the Slack OIDC hop proves
+    // the bound identity, so no surface can hand out a direct provider URL.
+    const u = browserHopUrls(redirectUri).verify;
+    u.searchParams.set('state', state);
+    return { authorizeUrl: u.toString(), state };
   }
 
-  /** The real provider authorize URL for an already-minted state. Called by requestFor when browser
-   *  verification is off, and by the verify hop's post-verification redirect when it is on. */
+  /** The real provider authorize URL for an already-minted state: the verify hop's
+   *  post-verification redirect target. */
   providerAuthorizeUrl(
     provider: Provider,
     redirectUri: string,

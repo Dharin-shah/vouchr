@@ -424,36 +424,32 @@ browser OAuth. The `state` binds the *initiating* Slack identity, so the colleag
 account is stored under the initiator's Slack user — and the agent then uses it on the
 initiator's turns.
 
-- **Mitigated when `requireBrowserSlackIdentity` is enabled (#302); otherwise not prevented,
-  impact and detection reduced.** This is a real credential-confusion attack by
-  a malicious workspace user — the same actor the "Malicious user" section models as an attacker,
-  so it is **not** inside the trusted boundary. Without the flag, the browser session completing
-  OAuth has no Slack authentication, so Vouchr cannot prove the person clicking is the person who
-  asked — the structural limit of every start-in-chat, finish-in-browser flow (cf. RFC 8628 §5.4).
+- **Mitigated (#302).** This is a real credential-confusion attack by a malicious workspace user —
+  the same actor the "Malicious user" section models as an attacker, so it is **not** inside the
+  trusted boundary. A browser session completing OAuth carries no Slack authentication of its own,
+  the structural limit of every start-in-chat, finish-in-browser flow (cf. RFC 8628 §5.4), so
+  Vouchr adds one.
 
-  **Prevention (`requireBrowserSlackIdentity`, opt-in, both surfaces):** the Connect prompt's URL
-  becomes a Vouchr verify route that sends the browser through Slack OpenID Connect
-  (`scope=openid`) before the provider's consent screen ever appears. Vouchr exchanges the OIDC
-  code server-side (bounded fetch, redirects refused), compares the id_token's `sub`/team claim to
-  the identity bound in `state`, and only on a byte-exact match stamps
-  `consent_request.slack_verified_at` and redirects to the real provider authorize URL. A mismatch
-  spends the single-use state, writes an audit row (`denied`, reason
+  **Prevention (always on, both surfaces):** the Connect prompt's URL is a Vouchr verify route
+  that sends the browser through Slack OpenID Connect (`scope=openid`) before the provider's
+  consent screen ever appears. Vouchr exchanges the OIDC code server-side (bounded fetch, redirects
+  refused), compares the id_token's `sub`/team claim to the identity bound in `state`, and only on
+  a byte-exact match stamps `consent_request.slack_verified_at` and redirects to the real provider
+  authorize URL. A mismatch spends the single-use state, writes an audit row (`denied`, reason
   `browser_identity_mismatch`, attributed to the *bound* user — the completer's identity is
   compared and discarded, never persisted or rendered), and shows a fixed non-reflecting error. The
   provider callback refuses any consent the hop never stamped, so hitting it directly only burns
-  the state (regression: `test/browser-identity.test.ts`). The requirement is persisted with the
-  consent at mint time (`slack_verify_required`) and every callback enforces the row's value, so in
-  a multi-replica fleet an enforced state fails closed even on a replica whose own flag is off
-  (rollout, config drift) — enforcement authority travels with the state, not the process. Slack's
-  OIDC endpoints are fixed, not configurable: the id_token is accepted from Slack's token endpoint
-  over TLS without signature verification, so a configurable endpoint would be an identity-forging
+  the state (regression: `test/browser-identity.test.ts`). The stamp lives on the shared consent
+  row, so in a multi-replica fleet any replica's callback enforces it. Slack's OIDC endpoints are
+  fixed, not configurable: the id_token is accepted from Slack's token endpoint over TLS without
+  signature verification, so a configurable endpoint would be an identity-forging
   seam. Residual: an initiator who completes
   Slack sign-in *themselves* and then extracts the mid-flow provider redirect out of their own
   browser can still hand that URL off within the state TTL — that requires deliberately exfiltrating
   an in-flight URL, not merely forwarding a chat message, and the success page still names the bound
   identity.
 
-  **Without the flag, delivery of the link differs by adapter, and only Bolt keeps it private:**
+  **Delivery of the link differs by adapter, and only Bolt keeps it private:**
   - **Bolt** posts the Connect link as a private ephemeral (or DM), single-use, with a 10-minute
     TTL, one active generation per workspace/user/provider. Forwarding is a deliberate act by the
     initiator.
@@ -463,12 +459,12 @@ initiator's turns.
     logs, public channels, and any surface a third party can reach, and is responsible for showing
     it only to the identity the `state` is bound to.
 
-  Detection (both surfaces, flag on or off): the callback landing page (`connectedHtml`) names the
+  Detection (both surfaces): the callback landing page (`connectedHtml`) names the
   bound Slack user
   and workspace AND links to that user's Slack profile (a `slack://user` deep link, so the completer
   can recognize *who* it is, not just an opaque id), and — when a provider account label is known
   (it can be null) — names that account. On Bolt, the initiator also receives the success DM. The
-  provider's own consent screen names the app. The flag is opt-in and recommended for production (#302); it is not required for a supervised single-workspace pilot.
+  provider's own consent screen names the app.
 
 ### Deactivated user
 

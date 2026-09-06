@@ -42,4 +42,6 @@ GITHUB_CLIENT_SECRET=...
 PUBLIC_URL=https://abc.ngrok.io
 VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr
 VOUCHR_MASTER_KEY=$(openssl rand -base64 32)
+VOUCHR_SLACK_CLIENT_ID=...      # the Slack app's client id/secret: the sign-in check on every Connect link
+VOUCHR_SLACK_CLIENT_SECRET=...  # and add $PUBLIC_URL/vouchr/oauth/slack to the app's OAuth redirect URLs
 ```

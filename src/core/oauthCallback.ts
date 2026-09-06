@@ -225,14 +225,14 @@ export async function handleOAuthCallback(
   }
 
   const provider = deps.registry.get(row.provider);
-  // #302: this consent was MINTED requiring browser Slack-identity verification, and the hop never
-  // stamped it. The requirement is read from the ROW, never a process-local option, so a replica
-  // with the flag off (rollout, config drift) still enforces a state minted by an enforcing
-  // replica. Refuse BEFORE any denial classification or token exchange — a forwarded or replayed
-  // link must not mint a provider token, and a provider-side "Deny" on an unverified flow must not
-  // be recorded as the bound user's decision. The state is already spent (consume() above), so a
-  // direct callback burns it instead of bypassing the hop.
-  if (row.slackVerifyRequired && row.slackVerifiedAt == null) {
+  // #302: the browser Slack-identity hop never stamped this consent. Refuse BEFORE any denial
+  // classification or token exchange — a forwarded or replayed link must not mint a provider token,
+  // and a provider-side "Deny" on an unverified flow must not be recorded as the bound user's
+  // decision. The state is already spent (consume() above), so a direct callback burns it instead
+  // of bypassing the hop. Dry-run (#116) is the one exception: its synthetic local authorize URL
+  // stands in for the Slack hop exactly as it stands in for the provider, and it can only ever mint
+  // a synthetic credential row.
+  if (row.slackVerifiedAt == null && !deps.dryRun) {
     const recorded = await recordDenied(deps, row.identity, provider.id, 'browser_unverified');
     emitConsent(
       deps,

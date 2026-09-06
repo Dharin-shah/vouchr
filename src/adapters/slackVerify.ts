@@ -1,5 +1,5 @@
-// #302 requireBrowserSlackIdentity: the Slack OpenID Connect hop that proves the browser completing
-// provider OAuth is signed in to Slack as the user the consent `state` was bound to. Slack-semantic
+// #302: the Slack OpenID Connect hop that proves the browser completing provider OAuth is signed
+// in to Slack as the user the consent `state` was bound to. Every Connect link goes through it. Slack-semantic
 // (endpoint URLs, the `ok` envelope, id_token claim names) → adapter layer, like slack-identity.ts.
 // ONE verifier shared by the Bolt routes and the headless broker owns the compare + spend + audit
 // sequence (STR-3), so the two surfaces cannot drift.
@@ -32,13 +32,15 @@ export interface SlackOidcOptions {
   clientSecret: string;
 }
 
-/** Validate OIDC config at startup (fail closed, before any listener/pool opens). */
+/** Validate the required OIDC config at startup (fail closed, before any listener/pool opens). The
+ *  message names the env pair both surfaces read so a bare boot log says what to set. */
 export function assertSlackOidcOptions(oidc: SlackOidcOptions | undefined, label: string): SlackOidcOptions {
-  if (!oidc || typeof oidc.clientId !== 'string' || oidc.clientId.length === 0
-    || typeof oidc.clientSecret !== 'string' || oidc.clientSecret.length === 0) {
+  if (!oidc || typeof oidc.clientId !== 'string' || oidc.clientId.trim() === ''
+    || typeof oidc.clientSecret !== 'string' || oidc.clientSecret.trim() === '') {
     throw new Error(
-      `${label}: requireBrowserSlackIdentity needs slackOidc.clientId and slackOidc.clientSecret ` +
-        '(the Slack app OIDC credentials). Refusing to start without them.',
+      `${label}: slackOidc.clientId and slackOidc.clientSecret are required ` +
+        '(VOUCHR_SLACK_CLIENT_ID / VOUCHR_SLACK_CLIENT_SECRET, the Slack app OIDC credentials for the ' +
+        'browser identity check on every Connect link). Refusing to start without them.',
     );
   }
   return oidc;
@@ -91,7 +93,7 @@ export interface BrowserIdentityVerifierDeps {
 }
 
 /**
- * The two-route state machine in front of provider OAuth when `requireBrowserSlackIdentity` is on:
+ * The two-route state machine in front of provider OAuth:
  * `begin` (GET …/verify?state=S) redirects the browser to Slack's OIDC authorize, and `complete`
  * (GET …/slack?code&state) exchanges the code at Slack's token endpoint, compares the id_token
  * identity to the one bound in S, stamps `consent_request.slack_verified_at` on match, and only then
@@ -101,11 +103,6 @@ export interface BrowserIdentityVerifierDeps {
  */
 export class BrowserIdentityVerifier {
   constructor(private deps: BrowserIdentityVerifierDeps) {}
-
-  /** Where the connect prompt sends the browser first. Adapters pass this to `new Consent(...)`. */
-  static verifyUri(baseUrl: string, verifyPath: string): string {
-    return new URL(verifyPath, baseUrl).toString();
-  }
 
   async begin(state: unknown): Promise<BrowserVerifyResult> {
     const row = typeof state === 'string' ? await this.deps.consent.activeRow(state) : null;

@@ -327,9 +327,35 @@ async function baseEnv(t: TestContext, extra: Record<string, string> = {}): Prom
     VOUCHR_MASTER_KEY: KEY_B64,
     VOUCHR_DATABASE_URL: await testDbUrl(t), // PostgreSQL-only; a fresh isolated schema per broker
     VOUCHR_PROVIDERS: JSON.stringify([{ id: 'internal', credential: 'key', egressAllow: ['api.internal.example'] }]),
+    // #340: the OAuth connect flow and its Slack verify hop are the only consent path, so all three are required.
+    VOUCHR_BASE_URL: 'https://broker.example',
+    VOUCHR_SLACK_CLIENT_ID: 'slack-app-cid',
+    VOUCHR_SLACK_CLIENT_SECRET: 'slack-app-csec',
     ...extra,
   };
 }
+
+test('#340 buildBrokerServer fails closed without VOUCHR_BASE_URL or the Slack OIDC pair, naming the variable', async (t) => {
+  const without = async (name: string) => {
+    const env = await baseEnv(t);
+    delete env[name];
+    return env;
+  };
+  await assert.rejects(buildBrokerServer(await without('VOUCHR_BASE_URL')), /baseUrl is required \(VOUCHR_BASE_URL\)/);
+  await assert.rejects(buildBrokerServer(await without('VOUCHR_SLACK_CLIENT_ID')), /VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/);
+  await assert.rejects(buildBrokerServer(await without('VOUCHR_SLACK_CLIENT_SECRET')), /VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/);
+  await assert.rejects(buildBrokerServer(await baseEnv(t, { VOUCHR_SLACK_CLIENT_SECRET: '' })), /slackOidc\.clientSecret/);
+  await assert.rejects(buildBrokerServer(await baseEnv(t, { VOUCHR_BASE_URL: ' ' })), /VOUCHR_BASE_URL/); // IMP-3: blank
+  // Pure config errors precede infrastructure: with a variable missing, an unreachable database is
+  // never contacted — the rejection names the variable, not the connection.
+  const unreachable = await baseEnv(t, { VOUCHR_DATABASE_URL: 'postgres://vouchr:x@127.0.0.1:1/vouchr' });
+  await assert.rejects(buildBrokerServer({ ...unreachable }), /ECONNREFUSED/); // proves the fixture is unreachable
+  for (const name of ['VOUCHR_BASE_URL', 'VOUCHR_SLACK_CLIENT_ID', 'VOUCHR_SLACK_CLIENT_SECRET']) {
+    const env = { ...unreachable };
+    delete env[name];
+    await assert.rejects(buildBrokerServer(env), new RegExp(name));
+  }
+});
 
 test('buildBrokerServer: boots on PostgreSQL and serves /healthz + /health + /readyz', async (t) => {
   const built = await buildBrokerServer(await baseEnv(t, { VOUCHR_PORT: '0' }));
