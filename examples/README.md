@@ -3,6 +3,7 @@
 Each directory is a runnable or copyable example. Each one has its own README.
 
 - [`bolt-github/`](./bolt-github): the main demo. A Bolt app answers `@vouchr who am I on github?` as the person who asked.
+- [`demo/`](./demo): the app behind [the demo run-through](../guides/DEMO.md). A read, a write that waits for a teammate, a shared credential, and a headless worker.
 - [`dry-run/`](./dry-run): run your real Vouchr wiring with no network calls. Needs only a local PostgreSQL.
 - [`google-user/`](./google-user): the agent acts as the person who asked on a Google API.
 - [`databricks/`](./databricks): per-user Databricks OAuth, with the token locked to the SQL Statement Execution API.

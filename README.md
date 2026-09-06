@@ -139,6 +139,7 @@ PostgreSQL.
 
 | | |
 | --- | --- |
+| [Demo run-through](./guides/DEMO.md) | Every scenario in one Slack workspace with two friends, with the expected copy and a shot list |
 | [Examples](./examples/README.md) | Google, Databricks, API keys, secret managers, broker client, MCP, Prometheus, SCIM, dry-run |
 | [Architecture](./guides/ARCHITECTURE.md) | How consent, injection, and audit fit together |
 | [Threat model](./guides/THREAT-MODEL.md) | What Vouchr defends against, and its limits |
