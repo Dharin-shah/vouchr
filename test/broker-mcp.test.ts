@@ -36,6 +36,7 @@ const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK'; // the vaulted token 
 // An MCP-serving provider: POST is how JSON-RPC rides Streamable HTTP (so the provider opts into
 // it), and the /v1/mcp route itself is a second, declarative opt-in via the `mcp` knob.
 const mcpAcme = defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',

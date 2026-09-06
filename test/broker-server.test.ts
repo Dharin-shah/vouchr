@@ -139,7 +139,7 @@ test('loadProviders: a provider without egressAllow is rejected', () => {
 // an MCP provider (the knob would only exist for custom createBroker wrappers).
 const MCP_INTERNAL = {
   id: 'internal', credential: 'key', egressAllow: ['mcp.internal.example'],
-  egressMethods: ['POST'], mcp: { paths: ['/mcp'] },
+  egressMethods: ['POST'], mcp: { paths: ['/mcp'] }, approval: false,
 };
 
 test('#65 loadProviders: the mcp knob loads and reaches the provider', () => {
@@ -168,21 +168,28 @@ const APPROVAL_INTERNAL = {
   egressMethods: ['GET', 'POST'], approval: { approver: 'member' },
 };
 
-test('#113 loadProviders: the approval knob loads and reaches the provider', () => {
+test('#113 loadProviders: the approval knob loads and reaches the provider with its defaults', () => {
   const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([APPROVAL_INTERNAL]) } as any);
-  assert.deepEqual(p.approval, { approver: 'member' });
+  assert.deepEqual(p.approval, { approver: 'member', grant: 'once', ttlMs: 300_000 });
   // every optional field passes through untouched too
-  const full = { methods: ['POST'], paths: ['/repos'], approver: 'self', ttlMs: 60_000 };
+  const full = { methods: ['POST'], paths: ['/repos'], approver: 'self', grant: 'thread', ttlMs: 60_000 };
   const [q] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: full }]) } as any);
   assert.deepEqual(q.approval, full);
+  // #350: an omitted rule is the default (writes ask another member once); false switches it off.
+  const { approval: _omit, ...bare } = APPROVAL_INTERNAL;
+  const [d] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([bare]) } as any);
+  assert.deepEqual(d.approval, { approver: 'member', grant: 'once', ttlMs: 300_000 });
+  const [off] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...bare, approval: false }]) } as any);
+  assert.equal(off.approval, false);
 });
 
 test("#113 loadProviders: invalid approval shapes are rejected at config load with the loader's message", () => {
   const load = (approval: unknown) => () =>
     loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval }]) } as any);
-  assert.throws(load('yes'), /field "approval" must be an object/);
-  assert.throws(load({}), /approval\.approver.*unsupported/);
-  assert.throws(load({ approver: 'anyone' }), /approval\.approver.*unsupported/);
+  assert.throws(load('yes'), /field "approval" must be an object or false/);
+  assert.throws(load(null), /field "approval" must be an object or false/);
+  assert.throws(load({ approver: 'anyone' }), /approval\.approver.*supported values/);
+  assert.throws(load({ grant: 'forever' }), /approval\.grant.*supported values/);
   // #322: the removed value fails closed with a message that names its replacement.
   assert.throws(load({ approver: 'admin' }), /approval\.approver.*'admin' was removed.*'member'/);
   // The same guard on the createVouchr path: defineProvider is the one validator both loaders share.
@@ -491,7 +498,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
     { id: 'fetcher', credential: 'key', egressAllow: ['api.fetcher.example'] },
     {
       id: 'mcp-governed', credential: 'key', egressAllow: ['mcp.governed.example'],
-      egressMethods: ['POST'], mcp: { paths: ['/mcp'] },
+      egressMethods: ['POST'], mcp: { paths: ['/mcp'] }, approval: false,
     },
     { id: 'service-tool', identity: 'service', credential: 'key', egressAllow: ['service.example'] },
   ];
@@ -603,9 +610,9 @@ test('#240 packaged broker shares and enforces channel governance across every d
     );
     assert.equal(config.status, 200);
     assert.deepEqual(config.json.providers, [
-      { provider: 'fetcher', mode: null, enabled: false },
-      { provider: 'mcp-governed', mode: null, enabled: true },
-      { provider: 'service-tool', mode: null, enabled: true },
+      { provider: 'fetcher', identity: 'person', enabled: false },
+      { provider: 'mcp-governed', identity: 'person', enabled: true },
+      { provider: 'service-tool', identity: 'service', enabled: true },
     ]);
 
     let manifest = await requestJson(port, 'POST', '/v1/manifest', { identityToken: token() });
@@ -613,7 +620,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
     assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'fetcher').enabled, false);
     assert.equal(manifest.json.tools.find((tool: any) => tool.provider === 'mcp-governed').enabled, true);
     assert.deepEqual(manifest.json.tools.find((tool: any) => tool.provider === 'service-tool'), {
-      provider: 'service-tool', mode: null, enabled: true, identity: 'service',
+      provider: 'service-tool', enabled: true, identity: 'service',
     });
 
     const fetchDenied = await requestJson(port, 'POST', '/v1/fetch', {
@@ -814,7 +821,6 @@ test('#209 resource config is canonical, secret-safe, and rejected before Postgr
     'VOUCHR_PORT',
     'VOUCHR_ALLOW_WRITES',
     'VOUCHR_DRY_RUN',
-    'VOUCHR_CHANNEL_IDENTITIES',
   ]) {
     await assert.rejects(
       buildBrokerServer({ ...base, [name]: sentinel }),

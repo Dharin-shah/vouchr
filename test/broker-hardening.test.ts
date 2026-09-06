@@ -21,14 +21,17 @@ const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK';
 const U1 = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 
 const acme = defineProvider({
+  approval: false,
   id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
   scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
 });
 const beta = defineProvider({
+  approval: false,
   id: 'beta', authorizeUrl: 'https://beta.example/auth', tokenUrl: 'https://beta.example/token',
   scopesDefault: ['x'], egressAllow: ['api.beta.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
 });
 const svc = defineProvider({
+  approval: false,
   id: 'svc', identity: 'service', credential: 'key',
   authorizeUrl: 'https://svc.example/auth', tokenUrl: 'https://svc.example/token',
   scopesDefault: ['x'], egressAllow: ['api.svc.example'], refresh: 'none', pkce: false,

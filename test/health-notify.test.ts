@@ -467,7 +467,7 @@ test('channel-owned credential: the expiring-soon DM goes to the configuring mem
   // C9: configured by UADMIN (an audit 'config' row exists) → DM the member, mentioning the channel.
   await vault.upsert(channelOwner('T1', 'C9'), 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db, 'C9', 'channel', 'acme', now - 30 * H, now - 30 * H);
-  await audit.record('config', { enterpriseId: null, teamId: 'T1', userId: 'UADMIN' }, 'acme', { owner: 'channel', channel: 'C9', mode: 'shared' });
+  await audit.record('config', { enterpriseId: null, teamId: 'T1', userId: 'UADMIN' }, 'acme', { owner: 'channel', channel: 'C9', identity: 'channel' });
   // C8: nobody ever configured it → skip (never spam the channel), and no state row is written.
   await vault.upsert(channelOwner('T1', 'C8'), 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db, 'C8', 'channel', 'acme', now - 30 * H, now - 30 * H);
@@ -515,11 +515,11 @@ test('transaction isolation: an unrelated concurrent write is isolated from a ro
   // hazard the old SQLite backend had). Assert the real invariant: A's row is gone, B's SURVIVES.
   const db = await openTestDb(t);
   const a = db.transaction!(async (tx) => {
-    await tx.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T','CA','p','shared')`);
+    await tx.run(`INSERT INTO channel_config (team_id, channel, provider, identity) VALUES ('T','CA','p','channel')`);
     await new Promise((r) => setTimeout(r, 20)); // hold the transaction open across a real concurrent write
     throw new Error('boom');
   }).catch((e: Error) => e);
-  const b = db.run(`INSERT INTO channel_config (team_id, channel, provider, mode) VALUES ('T','CB','p','shared')`);
+  const b = db.run(`INSERT INTO channel_config (team_id, channel, provider, identity) VALUES ('T','CB','p','channel')`);
   const [aErr, bResult] = await Promise.all([a, b]);
   assert.match((aErr as Error).message, /boom/);
   assert.equal(bResult.changes, 1); // B committed on its own connection

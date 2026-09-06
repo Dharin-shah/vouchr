@@ -215,7 +215,8 @@ test('#296 initiate → deliver on the control plane → approve → poll → th
   const stored = await h.db.get<any>(`SELECT reason, status FROM approval_request WHERE id=?`, [first.json.authorizationId]);
   assert.equal(stored.reason, 'Create repository "demo" in org acme', 'the first statement is what the human will read');
   assert.equal(stored.status, 'pending');
-  assert.ok(!JSON.stringify(await h.db.all(`SELECT meta FROM audit`)).includes('Create repository'), 'the statement is never audited');
+  // #350: the agent's reason rides the approval_requested audit row under the fixed `reason` key.
+  assert.equal(JSON.parse((await h.audits('approval_requested'))[0].meta).reason, 'Create repository "demo" in org acme');
 
   // ── Poll: bound to the requester. ───────────────────────────────────────────────────────────
   assert.equal((await h.status(first.json.authorizationId)).json.status, 'pending');
@@ -238,7 +239,7 @@ test('#296 initiate → deliver on the control plane → approve → poll → th
   assert.ok(rendered.includes(APPROVAL_APPROVE_ACTION) && rendered.includes(APPROVAL_DENY_ACTION));
   assert.ok(rendered.includes('Create repository \\"demo\\" in org acme'), 'the binding message is on the prompt');
   assert.ok(!rendered.includes(TOKEN), 'SEC-1');
-  assert.ok(!rendered.includes('/repos'), 'raw path never rendered');
+  assert.ok(rendered.includes('POST api.acme.test/repos'), 'the plain path is on the prompt (#350)');
   await h.vouchr.sweepExpired();
   assert.equal(h.prompts().length, 1, 'a delivered prompt is not re-posted by the next pass');
 
@@ -518,7 +519,7 @@ test('#296 input grammar and gates: reason bounds, non-approval actions, writes,
   stubUpstream(t);
   const h = await harness(t);
   for (const bad of [
-    undefined, '', '   ', '\n\t', 42, null, { text: 'x' },
+    '', '   ', '\n\t', 42, null, { text: 'x' },
     'x'.repeat(MAX_REASON_BYTES + 1), 'é'.repeat(MAX_REASON_BYTES),
     'a\u0000b', 'a\u0007b', 'a\u001bb', 'a\u007fb', // NUL (PostgreSQL refuses it), BEL, ESC, DEL
   ]) {
@@ -532,6 +533,13 @@ test('#296 input grammar and gates: reason bounds, non-approval actions, writes,
   assert.equal((await h.authorize({ identityToken: spare, reason: 'a\u0000b' })).status, 400);
   assert.equal((await h.authorize({ identityToken: spare, reason: 'line one\nline two\ttabbed' })).status, 200, 'newline and tab are allowed');
   assert.equal((await h.authorize({ path: '/bounded', reason: 'x'.repeat(MAX_REASON_BYTES) })).status, 200, 'exactly the bound is accepted');
+  assert.equal((await h.authorize({ path: '/no-reason', reason: undefined })).status, 200, 'the reason is optional (#350)');
+  for (const badLink of ['', 'http://insecure.example/x', 'https://user:pw@example.com/x', 'ftp://x', ' https://example.com', 'https://' + 'a'.repeat(2100)]) {
+    const r = await h.authorize({ path: '/linked', link: badLink });
+    assert.equal(r.status, 400, `link ${JSON.stringify(badLink).slice(0, 30)} → 400`);
+    assert.match(r.json.error, /link/);
+  }
+  assert.equal((await h.authorize({ path: '/linked', link: 'https://tracker.example/T-42' })).status, 200, 'an https link is accepted');
 
   const noApproval = await h.authorize({ method: 'GET', path: '/me' });
   assert.equal(noApproval.status, 400);

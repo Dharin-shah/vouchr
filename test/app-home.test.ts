@@ -115,8 +115,8 @@ async function harness(t: TestContext, opts: {
       ack: async () => {}, respond: respond ?? (async () => {}), client,
     }),
     selectChannel: (channel: string) => act(HOME_CHANNEL_ACTION, { action_id: HOME_CHANNEL_ACTION, selected_conversation: channel }),
-    setMode: (p: string, mode: string, metaChannel: string | null = 'C_FIN') =>
-      act(HOME_IDENTITY_ACTION, { block_id: `home_identity:${p}`, selected_option: { value: mode } }, metaChannel),
+    setIdentity: (p: string, identity: string, metaChannel: string | null = 'C_FIN') =>
+      act(HOME_IDENTITY_ACTION, { block_id: `home_identity:${p}`, selected_option: { value: identity } }, metaChannel),
     toggleTool: (value: string, metaChannel: string | null = 'C_FIN') => act(HOME_TOOL_ACTION, { value }, metaChannel),
     configure: (p: string, metaChannel: string | null = 'C_FIN') => act(HOME_CONFIGURE_ACTION, { value: p }, metaChannel),
     disconnect: async (p: string) => act(DISCONNECT_ACTION, {
@@ -128,8 +128,8 @@ async function harness(t: TestContext, opts: {
 const auditRows = async (db: any) =>
   (await db.all('SELECT action, provider, channel, meta FROM audit ORDER BY at')) as any[];
 const auditActions = async (db: any) => (await auditRows(db)).map((r) => r.action);
-const modeRow = async (db: any, channel = 'C_FIN') =>
-  ((await db.get('SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', channel, 'mcp'])) as any)?.mode ?? null;
+const identityRow = async (db: any, channel = 'C_FIN') =>
+  ((await db.get('SELECT identity FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', channel, 'mcp'])) as any)?.identity ?? null;
 const toolBit = async (db: any) =>
   ((await db.get('SELECT enabled FROM channel_tool WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp'])) as any)?.enabled;
 
@@ -207,33 +207,33 @@ test('selecting a channel re-renders rows reflecting the stored identity + enabl
   assert.ok(toolBlock.elements.some((e: any) => e.action_id === HOME_CONFIGURE_ACTION));
 });
 
-test('home mode select == /vouchr mode: identical channel_config row and audit row', async (t) => {
+test('home identity select == /vouchr identity: identical channel_config row and audit row', async (t) => {
   const viaCommand = await harness(t, { member: true });
-  await viaCommand.runCommand('mode mcp session');
+  await viaCommand.runCommand('identity mcp channel');
   const viaHome = await harness(t, { member: true });
-  await viaHome.setMode('mcp', 'session');
-  assert.equal(await modeRow(viaHome.lan.db), 'session');
+  await viaHome.setIdentity('mcp', 'channel');
+  assert.equal(await identityRow(viaHome.lan.db), 'channel');
   assert.deepEqual(await auditRows(viaHome.lan.db), await auditRows(viaCommand.lan.db)); // STR-4 parity
   assert.ok(viaHome.published()); // re-published after the mutation
 });
 
-test('forged home mode action from a non-member: no write, audited denied', async (t) => {
+test('forged home identity action from a non-member: no write, audited denied', async (t) => {
   const h = await harness(t, { member: false });
-  await h.setMode('mcp', 'shared');
-  assert.equal(await modeRow(h.lan.db), null);
+  await h.setIdentity('mcp', 'channel');
+  assert.equal(await identityRow(h.lan.db), null);
   const rows = await auditRows(h.lan.db);
   assert.deepEqual(rows.map((r) => r.action), ['denied']);
   assert.match(rows[0].meta, /not-member/);
 });
 
-test('forged invalid mode value never reaches state: shared cred survives, nothing audited', async (t) => {
+test('forged invalid identity value never reaches state: shared cred survives, nothing audited', async (t) => {
   const h = await harness(t, { member: true });
   const owner = channelOwner('T1', 'C_FIN');
   await writeChannelIdentity(new ChannelConfig(h.lan.db), 'T1', 'C_FIN', 'mcp', 'channel');
   await h.lan.vault.upsert(owner, 'mcp', CRED);
-  await h.setMode('mcp', 'evil-mode');
-  assert.equal(await modeRow(h.lan.db), 'shared');
-  assert.ok(await h.lan.vault.get(owner, 'mcp')); // setChannelMode's shared-cred cleanup never ran
+  await h.setIdentity('mcp', 'session');
+  assert.equal(await identityRow(h.lan.db), 'channel');
+  assert.ok(await h.lan.vault.get(owner, 'mcp')); // setChannelIdentity's credential cleanup never ran
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
@@ -283,12 +283,12 @@ test('home Configure opens the existing configureModal for a member; a forged no
 
 test('forged nonexistent channel in view metadata: fail-closed, nothing written or audited', async (t) => {
   const h = await harness(t, { member: true });
-  await h.setMode('mcp', 'shared', 'C_GHOST');
+  await h.setIdentity('mcp', 'channel', 'C_GHOST');
   await h.toggleTool('disable:mcp', 'C_GHOST');
   await h.configure('mcp', 'C_GHOST');
   assert.ok(h.opened());
   assert.equal(h.hydrated(), null);
-  assert.equal(await modeRow(h.lan.db, 'C_GHOST'), null);
+  assert.equal(await identityRow(h.lan.db, 'C_GHOST'), null);
   assert.deepEqual(await auditActions(h.lan.db), []); // SEC-4: the unverified channel never reached audit
 });
 
@@ -476,7 +476,7 @@ test('deny-by-default: enabling one provider turns ONLY it on; the rest stay dis
 
 test('a stale/deleted metadata channel on a click DMs the actor and resets the view', async (t) => {
   const h = await harness(t, { member: true });
-  await h.setMode('mcp', 'shared', 'C_GHOST');
+  await h.setIdentity('mcp', 'channel', 'C_GHOST');
   assert.ok(h.dms.some((t) => /no longer available/.test(t))); // feedback, not a silent no-op
   assert.ok(h.published()); // view reset to a selection-less state
   assert.deepEqual(await auditActions(h.lan.db), []); // still nothing persisted or audited
@@ -587,7 +587,7 @@ test('forged tool action on an archived or ext-shared channel: no write, refused
     const h = await harness(t, { member: true, channelInfo });
     await h.toggleTool('disable:mcp'); // render never showed the button; the payload is forged
     assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false); // nothing written
-    assert.deepEqual(await auditActions(h.lan.db), []); // mirrors setChannelMode: eligibility refusals aren't authz denials
+    assert.deepEqual(await auditActions(h.lan.db), []); // mirrors setChannelIdentity: eligibility refusals aren't authz denials
     assert.ok(h.dms.some((t) => /archived|externally shared/.test(t))); // the core reason reaches the actor
     await h.configure('mcp'); // same wall in front of the credential modal
     assert.ok(h.opened());

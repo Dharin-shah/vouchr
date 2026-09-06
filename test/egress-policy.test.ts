@@ -15,6 +15,7 @@ const O1 = userOwner(ID);
 
 // A provider that exercises every optional egress control on top of the hostname allowlist.
 const guarded = defineProvider({
+  approval: false,
   id: 'guarded',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',
@@ -175,6 +176,7 @@ test('egress: provider WITHOUT the new fields is unchanged (hostname-only baseli
   globalThis.fetch = (async () => new Response('{}', { status: 200 })) as any;
   try {
     const plain = defineProvider({
+      approval: false,
       id: 'plain',
       authorizeUrl: 'https://acme.example/auth',
       tokenUrl: 'https://acme.example/token',

@@ -33,6 +33,7 @@ const U1: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const O1 = userOwner(U1);
 
 const acme = defineProvider({
+  approval: false,
   id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
   scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
 });
@@ -516,6 +517,7 @@ test('401 refresh-retry replays an idempotent GET but NOT a non-idempotent POST 
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const p = defineProvider({
+    approval: false,
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
     scopesDefault: ['x'], egressAllow: ['api.acme.example'], egressMethods: ['GET', 'POST'], refresh: 'rotating', pkce: true, clientId: 'id', clientSecret: 'sec',
   });

@@ -117,11 +117,10 @@ test('every prompt states its ten-minute lifetime', () => {
   const requestId = '123e4567-e89b-42d3-a456-426614174000';
   assert.match(j(connectBlocks('github', 'https://auth', undefined, STATE)), /This link expires in 10 minutes\./);
   assert.match(j(keySetupBlocks('github', requestId)), /This prompt expires in 10 minutes\./);
-  assert.match(j(sessionApprovalBlocks('github', requestId)), /This prompt expires in 10 minutes\./);
   assert.match(
     j(approvalBlocks({
-      provider: 'github', method: 'POST', host: 'api.github.com', actionFingerprint: 'hmac-sha256:aa',
-      queryParamCount: 0, requester: 'U1', id: requestId, approver: 'member',
+      provider: 'github', method: 'POST', host: 'api.github.com', path: '/repos/acme/demo/issues',
+      requester: 'U1', id: requestId, approver: 'member', grant: 'once', ttlMs: 300_000,
     })),
     /expires in 10 minutes if unused/,
   );
@@ -411,7 +410,6 @@ test('max registry tables stay section-bounded and preserve all rows in order', 
   const status = statusBlocks(statusProviders.map((provider) => ({
     provider,
     channel: null,
-    mode: 'per-user',
     account: '&'.repeat(512), // supported stored-label maximum; escaping expands this fivefold
   })), { page: 1, totalPages: 10 });
   assertPackedRows(status, statusProviders);
@@ -420,7 +418,7 @@ test('max registry tables stay section-bounded and preserve all rows in order', 
   const modal = configModal({
     channel: 'C1',
     connections: [],
-    tools: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
+    tools: providers.map((provider) => ({ provider, enabled: true, identity: 'person' as const })),
   }) as any;
   assertPackedRows(modal.blocks, providers);
   assert.ok(modal.blocks.length <= 100);

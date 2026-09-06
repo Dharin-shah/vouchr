@@ -78,6 +78,7 @@ test('integration: middleware → connect prompt → OAuth callback → vault �
   const mock = await startMockProvider();
   try {
     const provider = defineProvider({
+      approval: false,
       id: 'mock',
       authorizeUrl: `${mock.base}/authorize`,
       tokenUrl: `${mock.base}/token`,
@@ -161,6 +162,7 @@ test('integration: a per-user provider in a DM works end to end with no channel 
   const mock = await startMockProvider();
   try {
     const provider = defineProvider({
+      approval: false,
       id: 'mock', authorizeUrl: `${mock.base}/authorize`, tokenUrl: `${mock.base}/token`,
       scopesDefault: ['read'], egressAllow: ['127.0.0.1'], refresh: 'none', pkce: true,
       clientId: 'cid', clientSecret: 'csec',
@@ -212,6 +214,7 @@ test('integration: static Policy still denies a DM that mutable channel governan
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const db = await openTestDb(t);
   const provider = defineProvider({
+    approval: false,
     id: 'dm-policy', authorizeUrl: 'https://provider.test/authorize',
     tokenUrl: 'https://provider.test/token', scopesDefault: [],
     egressAllow: ['api.provider.test'], refresh: 'none', pkce: false,
@@ -395,6 +398,7 @@ test('integration: maximum-valid OAuth scopes still produce one bounded connect 
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const scopes = Array.from({ length: 48 }, (_, i) => `scope-${i}`);
   const provider = defineProvider({
+    approval: false,
     id: 'max-scopes',
     authorizeUrl: 'https://provider.test/authorize',
     tokenUrl: 'https://provider.test/token',
@@ -447,6 +451,7 @@ test('integration: OAuth callback error is served as inert text/plain, not text/
   const mock = await startMockProvider();
   try {
     const provider = defineProvider({
+      approval: false,
       id: 'mock', authorizeUrl: `${mock.base}/authorize`, tokenUrl: `${mock.base}/token`,
       scopesDefault: ['read'], egressAllow: ['127.0.0.1'], refresh: 'none', pkce: true,
       clientId: 'cid', clientSecret: 'csec',
@@ -498,6 +503,7 @@ test('integration: handle.fetch does not follow a redirect off the allowlisted p
       externalAccount: null,
     });
     const provider = defineProvider({
+      approval: false,
       id: 'mock',
       authorizeUrl: `${mock.base}/a`,
       tokenUrl: `${mock.base}/t`,

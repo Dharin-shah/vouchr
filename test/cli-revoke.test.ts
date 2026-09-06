@@ -241,8 +241,6 @@ test('--user does not treat the admin actor as owner of a channel setup request'
     await purgePendingForProvider(db, { provider: 'revocable', userId: identity.userId }),
     {
       consents: 0,
-      requests: 0,
-      grants: 0,
       provisioning: 0,
       channelProvisioning: 0,
     },
@@ -412,9 +410,6 @@ test('channel-scoped revoke fences a delayed shared write without blocking a sib
     await resume;
     return realLock(...args);
   }) as Vault['withCredentialLock'];
-  const modeConflict = (mode: 'per-user' | 'session'): never => {
-    throw new Error(`unexpected mode ${mode}`);
-  };
   const delayed = configureChannelCredential({
     vault: vaultA,
     audit: new Audit(dbA),

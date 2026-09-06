@@ -80,9 +80,9 @@ test('requireChannelMembership: non-member refused + audited, member allowed', a
 
 // #348: a host calling connectChannel() where the channel uses user-owned credentials gets a typed
 // refusal that says to ask the agent again, not "use connect()" (a method the person cannot call).
-test('connectChannel: a user-owned mode refuses with copy that names the next step', async (t) => {
+test('connectChannel: a person identity refuses with copy that names the next step', async (t) => {
   const { c } = await ctx(t);
-  await c.setChannelMode('mcp', 'per-user');
+  await c.setChannelIdentity('mcp', 'person');
   await assert.rejects(() => c.connectChannel('mcp'), (error: unknown) => {
     assert.ok(error instanceof UserFacingError);
     assert.equal(error.recovery, 'resolve_again');

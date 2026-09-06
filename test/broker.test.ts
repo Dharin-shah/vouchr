@@ -39,6 +39,7 @@ const AWS_USER_REF = 'arn:aws:secretsmanager:us-east-1:123456789012:secret:vouch
 const VAULT_USER_REF = 'vault://secret/vouchr/user#token';
 
 const acme = defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',
@@ -52,6 +53,7 @@ const acme = defineProvider({
 
 // A service-to-service tool the broker must refuse (no human credential to broker).
 const svc = defineProvider({
+  approval: false,
   id: 'svc', identity: 'service', credential: 'key',
   authorizeUrl: 'https://svc.example/auth', tokenUrl: 'https://svc.example/token',
   scopesDefault: ['x'], egressAllow: ['api.svc.example'], refresh: 'none', pkce: false,
@@ -168,6 +170,7 @@ test('#212 createBroker rejects identity-key reuse with direct broker/provider s
   const identity = identityConfig('purpose-reuse');
   const reused = identity.keys[0].secret;
   const provider = defineProvider({
+    approval: false,
     id: 'reused',
     authorizeUrl: 'https://reused.example/auth',
     tokenUrl: 'https://reused.example/token',
@@ -1128,7 +1131,7 @@ test('#51 ineligible signed claim -> refused (fail closed, cred never read)', as
   }
 });
 
-test('#51 a per-user channel is not reachable via owner:"channel"', async (t) => {
+test('#51 a person-identity channel is not reachable via owner:"channel"', async (t) => {
   const { server, port } = await makeChannelBroker(t, 'person');
   try {
     const r = await post(port, '/v1/fetch', {
@@ -1224,6 +1227,7 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const refreshing = defineProvider({
+    approval: false,
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
     scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: false, clientId: 'id', clientSecret: 'sec',
   });
@@ -2033,7 +2037,7 @@ test('#53 admin reference stores a channel ref, flips to shared; a member fetch 
     assert.equal(stored?.accessToken, null);
     const configAudit = await db.get<any>(`SELECT meta FROM audit WHERE action='config'`);
     assert.deepEqual(JSON.parse(configAudit.meta), {
-      owner: 'channel', channel: 'C1', mode: 'shared', kind: 'ref', source: 'aws-sm',
+      owner: 'channel', channel: 'C1', identity: 'channel', kind: 'ref', source: 'aws-sm',
     });
     // A channel member's fetch now injects the JIT-resolved secret (never stored raw).
     const f = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x' });
@@ -2054,7 +2058,7 @@ test('#53 ineligible channel (signed eligibility false) -> refused', async (t) =
       handle: { provider: 'acme' }, identityToken: adminToken({ channelEligible: false }), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
     assert.equal(r.status, 403);
-    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), 'person');
   } finally {
     server.close();
   }
@@ -2097,7 +2101,7 @@ test('#53 both reference routes reject non-object JSON with a fixed 400 and no s
       }
     }
     assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
-    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), 'person');
     assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
   } finally {
     server.close();
@@ -2131,7 +2135,7 @@ test('#53 admin reference rejects invalid input before connection, mode, or audi
       assert.equal(r.json.code, entry.code);
       assert.ok(!r.raw.includes(sentinel), 'fixed validation response must not reflect caller input');
       assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
-      assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
+      assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), 'person');
       assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
     } finally {
       server.close();
@@ -2139,14 +2143,15 @@ test('#53 admin reference rejects invalid input before connection, mode, or audi
   }
 });
 
-test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async (t) => {
+test('#53 a channel reference makes the agent act as the channel there (#350: no separate lock to flip first)', async (t) => {
   const { server, port, channelConfig } = await makeAdminBroker(t);
   await writeChannelIdentity(channelConfig, 'T1', 'C1', 'acme', 'person');
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
-    assert.equal(r.status, 409);
+    assert.equal(r.status, 200);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), 'channel');
   } finally {
     server.close();
   }
@@ -2155,6 +2160,7 @@ test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async (t
 // ── #55 batch status + tool manifest (POST /v1/status, GET /v1/manifest) ──────
 
 const other = defineProvider({
+  approval: false,
   id: 'other', authorizeUrl: 'https://other.example/auth', tokenUrl: 'https://other.example/token',
   scopesDefault: ['x'], egressAllow: ['api.other.example'], refresh: 'none', pkce: false, clientId: 'id', clientSecret: 'sec',
 });
@@ -2277,10 +2283,10 @@ test('#194 stale assertions reach no mutation-route probe, denial audit, or stat
       }),
     },
     {
-      name: 'admin mode',
-      path: '/v1/admin/mode',
+      name: 'admin identity',
+      path: '/v1/admin/identity',
       body: (identityToken: string) => ({
-        provider: 'not-registered', mode: 'shared', identityToken,
+        provider: 'not-registered', identity: 'channel', identityToken,
       }),
     },
     {
@@ -2369,8 +2375,8 @@ test('#55 /v1/manifest lists providers with their acting_human/service identity'
     const r = await get(port, '/v1/manifest');
     assert.equal(r.status, 200);
     const byId = Object.fromEntries(r.json.providers.map((p: any) => [p.provider, p.identity]));
-    assert.equal(byId.acme, 'person');
-    assert.equal(byId.other, 'person');
+    assert.equal(byId.acme, 'acting_human');
+    assert.equal(byId.other, 'acting_human');
     assert.equal(byId.svc, 'service');
   } finally {
     server.close();

@@ -46,6 +46,7 @@ const enableC1 = async (db: Db, ...providerIds: string[]) => {
 
 // Dummy client credentials: the whole point of dry-run is that no REAL OAuth app exists.
 const acme = () => defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/oauth/authorize',
   tokenUrl: 'https://acme.example/oauth/token',
@@ -141,8 +142,6 @@ const contaminatedLifecycleCounts = {
   audit: 0,
   consent_request: 1,
   approval_request: 1,
-  session_request: 1,
-  session_grant: 1,
   user_provisioning_request: 1,
   channel_provisioning_request: 1,
 };
@@ -267,6 +266,7 @@ test('dry-run: the echo never contains the stored token, and honors a custom inj
   try {
     const KNOWN = randomBytes(24).toString('hex'); // a seeded, known-random secret
     const custom = defineProvider({
+      approval: false,
       id: 'custom',
       authorizeUrl: 'https://c.example/a',
       tokenUrl: 'https://c.example/t',
@@ -446,6 +446,7 @@ test('dry-run: disconnecting a dry-run credential skips the upstream revoke call
   }) as any;
   try {
     const revocable = defineProvider({
+      approval: false,
       id: 'rev', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'dry', clientSecret: 'run',
@@ -549,6 +550,7 @@ test('dry-run: provider response constraints never false-deny the synthetic echo
     // A production-passing config that would REJECT the echo if the response gate ran on it:
     // csv-only content types and a byte cap far below the echo size.
     const csv = defineProvider({
+      approval: false,
       id: 'csv', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'dry', clientSecret: 'run',
@@ -578,6 +580,7 @@ test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream norm
   }) as any;
   try {
     const revocable = defineProvider({
+      approval: false,
       id: 'rev', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'c', clientSecret: 's', revokeUrl: 'https://acme.example/oauth/revoke',
@@ -598,6 +601,7 @@ test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream norm
 
 // A revocable provider for the offboard/bulk revoke coverage (a real revokeUrl → a real POST).
 const revProvider = () => defineProvider({
+  approval: false,
   id: 'rev', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
   scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
   clientId: 'c', clientSecret: 's', revokeUrl: 'https://acme.example/oauth/revoke',
@@ -704,6 +708,7 @@ test('P2-C: the provider inject hook runs exactly once, with a redacted placehol
   try {
     const seen: string[] = [];
     const counting = defineProvider({
+      approval: false,
       id: 'ct', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'c', clientSecret: 's',

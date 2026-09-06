@@ -118,11 +118,9 @@ async function seed(t: TestContext): Promise<{ db: Db; vault: Vault }> {
   const later = now + 600_000;
   await db.run(`INSERT INTO consent_request (state, team_id, user_id, provider, pkce_verifier, created_at) VALUES (?, 'T1', 'U1', 'revok_ok', 'v', ?)`, [randomUUID(), now]);
   await db.run(`INSERT INTO consent_request (state, team_id, user_id, provider, pkce_verifier, created_at) VALUES (?, 'T1', 'U9', 'gone_provider', 'v', ?)`, [randomUUID(), now]); // pending for a provider with NO connection
-  await db.run(`INSERT INTO session_request (id, team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at) VALUES (?, 'T1', 'C1', 'th', 'U1', 'revok_ok', ?, ?, ?)`, [randomUUID(), randomUUID(), now, later]);
-  await db.run(`INSERT INTO session_grant (team_id, channel, thread, user_id, provider, credential_id, created_at, expires_at) VALUES ('T1', 'C1', 'th', 'U1', 'revok_ok', ?, ?, ?)`, [randomUUID(), now, later]);
   await db.run(
-    `INSERT INTO approval_request (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, channel, thread, governable_channel, status, created_at, expires_at)
-     VALUES (?, 'k', 'T1', 'U1', 'user', 'U1', ?, 'revok_ok', 'POST', 'https://api.ok.example', 'api.ok.example', '/x', 'C1', 'th', 'C1', 'pending', ?, ?)`,
+    `INSERT INTO approval_request (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, grant_scope, channel, thread, governable_channel, status, created_at, expires_at)
+     VALUES (?, 'k', 'T1', 'U1', 'user', 'U1', ?, 'revok_ok', 'POST', 'https://api.ok.example', 'api.ok.example', '/x', 'once', 'C1', 'th', 'C1', 'pending', ?, ?)`,
     [randomUUID(), randomUUID(), now, later],
   );
   await db.run(`INSERT INTO user_provisioning_request (id, team_id, user_id, provider, created_at, expires_at) VALUES (?, 'T1', 'U1', 'revok_ok', ?, ?)`, [randomUUID(), now, later]);
@@ -169,12 +167,12 @@ test('dry-run mutates nothing and emits no secret', async (t) => {
   assert.equal(report.matched.connections, 10);
   assert.equal(report.matched.installations, 2);
   assert.deepEqual(report.cleared, {
-    connections: 0, consents: 0, sessionRequests: 0, sessionGrants: 0, approvals: 0,
+    connections: 0, consents: 0, approvals: 0,
     userProvisioning: 0, channelProvisioning: 0, notifications: 0, installations: 0,
   }, 'dry-run must never describe matched rows as cleared');
   assert.deepEqual(report.remaining, {
     credentials: 10,
-    authorizations: 8,
+    authorizations: 6,
     installations: 2,
   }, 'dry-run remaining counts describe the rows that still exist');
   // Metadata-only preview cannot predict the upstream OUTCOME — every revocable vault row counts as
@@ -448,7 +446,7 @@ test('schema has no secret-bearing table that revoke --all silently omits', asyn
     'meta', // schema version
     'audit', // incident evidence
     'broker_jti', // single-use identity replay guard (deleting it would ALLOW replay)
-    'channel_config', 'channel_tool', // channel policy (mode/enabled), not a credential
+    'channel_config', 'channel_tool', // channel policy (identity/enabled), not a credential
     'channel_interaction_tombstone', 'user_offboard_scope_tombstone',
     'provisioning_revocation_tombstone', 'offboard_tombstone', // anti-resurrection fences — must survive
   ]);

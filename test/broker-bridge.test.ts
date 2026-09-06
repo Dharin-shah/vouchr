@@ -275,7 +275,7 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
 
   const approvalRecovery = await (await context({ thread: 'TH1' })).recoverBrokerDenial('writer', needsApproval.json);
   assert.deepEqual(approvalRecovery, { status: 'approval_prompted', provider: 'writer', approver: 'self' });
-  const approvalPrompts = ephemerals.filter((p) => JSON.stringify(p.blocks ?? '').includes(APPROVAL_APPROVE_ACTION));
+  const approvalPrompts = ephemerals.filter((p) => JSON.stringify(p.blocks ?? '').includes(needsApproval.json.approvalId));
   assert.equal(approvalPrompts.length, 1);
   assert.equal(approvalPrompts[0].user, 'U1', 'self approval goes to the requester');
 

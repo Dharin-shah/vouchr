@@ -98,7 +98,7 @@ test('setChannelSecret rolls back connection, mode, and audit on a mode-write fa
 
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /mode unavailable/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), 'person');
   assert.deepEqual(await auditRows(db), []);
 });
 
@@ -108,11 +108,11 @@ test('setChannelSecret rolls back connection and mode on an audit failure', asyn
 
   await assert.rejects(() => c.setChannelSecret('mcp', SECRET), /audit unavailable/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), 'person');
   assert.deepEqual(await auditRows(db), []);
 });
 
-test('setChannelMode preserves the shared credential and mode when its audit fails', async (t) => {
+test('setChannelIdentity preserves the channel credential and identity when its audit fails', async (t) => {
   const { c, vault, audit, channelConfig } = await ctx(t, true);
   await c.setChannelSecret('mcp', SECRET);
   audit.record = async () => { throw new Error('audit unavailable'); };
@@ -120,17 +120,6 @@ test('setChannelMode preserves the shared credential and mode when its audit fai
   await assert.rejects(() => c.setChannelIdentity('mcp', 'person'), /audit unavailable/);
   assert.equal(await channelConfig.getIdentity('T1', 'C_FIN', 'mcp'), 'channel');
   assert.equal((await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'))?.accessToken, SECRET);
-});
-
-// invariant 7: a per-user-locked channel refuses static keys and references.
-test('per-user lock refuses shared creds (invariant 7)', async (t) => {
-  const { c, freshContext } = await ctx(t, true);
-  await c.setChannelIdentity('mcp', 'person');
-  await assert.rejects(() => freshContext().setChannelSecret('mcp', SECRET), /per-user/);
-  await assert.rejects(
-    () => freshContext().referenceChannelSecret('mcp', { secretRef: AWS_REF }),
-    /per-user/,
-  );
 });
 
 // referenceChannelSecret stores only the non-secret ref + source; rotation stays external.
@@ -145,7 +134,7 @@ test('referenceChannelSecret stores the ARN pointer, not a secret', async (t) =>
   const row = await db.get('SELECT access_token_enc FROM connection') as any;
   assert.equal(row.access_token_enc, null);
   assert.deepEqual(JSON.parse((await auditRows(db))[0].meta), {
-    owner: 'channel', channel: 'C_FIN', mode: 'shared', kind: 'ref', source: 'aws-sm',
+    owner: 'channel', channel: 'C_FIN', identity: 'channel', kind: 'ref', source: 'aws-sm',
   });
 });
 
@@ -156,7 +145,7 @@ test('referenceChannelSecret rolls back connection, mode, and audit on a mode-wr
 
   await assert.rejects(() => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }), /mode unavailable/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), 'person');
   assert.deepEqual(await auditRows(db), []);
 });
 
@@ -166,7 +155,7 @@ test('referenceChannelSecret rolls back connection and mode on an audit failure'
 
   await assert.rejects(() => c.referenceChannelSecret('mcp', { secretRef: AWS_REF }), /audit unavailable/);
   assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), null);
+  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), 'person');
   assert.deepEqual(await auditRows(db), []);
 });
 
@@ -188,19 +177,20 @@ test('referenceChannelSecret rejects invalid input before connection, mode, or a
       (error: Error) => !error.message.includes(sentinel),
     );
     assert.equal(await vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
-    assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), null);
+    assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'mcp'), 'person');
     assert.deepEqual(await auditRows(db), []);
   }
 });
 
-// connectChannel returns a handle for the shared cred; per-user lock & missing cred both refuse.
-test('connectChannel: handle on shared cred, refuses per-user and unconfigured', async (t) => {
+// connectChannel returns a handle for the channel cred; a person identity and a missing cred both refuse.
+test('connectChannel: handle on channel cred, refuses person identity and unconfigured', async (t) => {
   const ok = await ctx(t, true);
-  await assert.rejects(async () => ok.c.connectChannel('mcp'), /No channel credential/); // unconfigured
+  // Unconfigured: the agent acts as each person, so a channel handle is refused with the person copy.
+  await assert.rejects(async () => ok.c.connectChannel('mcp'), /does not share a "mcp" credential\. Ask the agent again/);
   await ok.c.setChannelSecret('mcp', SECRET);
   assert.ok(await ok.c.connectChannel('mcp')); // shared cred → handle
 
-  // Flip to per-user: the shared cred is removed and connectChannel refuses.
+  // Flip to person: the channel cred is removed and connectChannel refuses.
   await ok.c.setChannelIdentity('mcp', 'person');
   assert.equal(await ok.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN' }, 'mcp'), null);
   await assert.rejects(async () => ok.c.connectChannel('mcp'), /does not share a "mcp" credential\. Ask the agent again/);

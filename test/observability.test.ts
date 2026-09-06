@@ -157,6 +157,7 @@ test('observability: refreshed carries a refresh-latency ms on a 401-triggered r
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const acme = defineProvider({
+    approval: false,
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
     scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
     clientId: 'c', clientSecret: 's',
@@ -189,6 +190,7 @@ test('observability: a throwing refresh cancels the discarded 401 body and still
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const acme = defineProvider({
+    approval: false,
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
     scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
     clientId: 'c', clientSecret: 's',
@@ -224,6 +226,7 @@ test('observability: the discarded 401 body is cancelled on a successful refresh
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const acme = defineProvider({
+    approval: false,
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
     scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
     clientId: 'c', clientSecret: 's',
@@ -262,6 +265,7 @@ test('observability: kms_decrypt also counts the refresh-path reads on a 401-tri
   const vault = new Vault(db, KEY, {}, envelope);
   const audit = new Audit(db);
   const acme = defineProvider({
+    approval: false,
     id: 'acme', authorizeUrl: 'https://acme.example/auth', tokenUrl: 'https://acme.example/token',
     scopesDefault: ['x'], egressAllow: ['api.acme.example'], refresh: 'rotating', pkce: true,
     clientId: 'c', clientSecret: 's',

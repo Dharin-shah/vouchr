@@ -25,6 +25,7 @@ const SECRET = 'owner-binding-secret';
 const TOKEN = 'tok_channel_secret_DO_NOT_LEAK';
 
 const acme = defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',

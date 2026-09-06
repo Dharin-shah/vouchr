@@ -26,6 +26,7 @@ const SECRET = 'browser-identity-signing-secret';
 const OIDC = TEST_SLACK_OIDC;
 
 const acme = defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',

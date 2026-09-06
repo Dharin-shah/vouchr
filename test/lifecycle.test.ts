@@ -24,6 +24,7 @@ import { openTestDb } from './support/pg';
 import { BROKER_REQUIRED } from './support/slackOidc';
 
 const provider = defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.test/oauth/authorize',
   tokenUrl: 'https://acme.test/oauth/token',

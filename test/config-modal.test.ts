@@ -93,8 +93,8 @@ async function harness(t: TestContext, opts: {
   };
 }
 
-const modeRow = async (db: any) =>
-  ((await db.get('SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp'])) as any)?.mode ?? null;
+const identityRow = async (db: any) =>
+  ((await db.get('SELECT identity FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp'])) as any)?.identity ?? null;
 const auditActions = async (db: any) => ((await db.all('SELECT action FROM audit')) as any[]).map((r) => r.action);
 const checked = (v = 'enabled') => ({ enabled: { selected_options: [{ value: v }] } });
 const unchecked = () => ({ enabled: { selected_options: [] } });
@@ -111,14 +111,14 @@ test('no-arg /vouchr opens the modal; non-member sees NO channel controls (no su
   const view = await h.openModal();
   assert.equal(view?.callback_id, CONFIG_CALLBACK);
   assert.equal(view.submit, undefined); // nothing to submit → no mutating controls shown
-  assert.ok(!view.blocks.some((b: any) => typeof b.block_id === 'string' && b.block_id.startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => typeof b.block_id === 'string' && b.block_id.startsWith('identity:')));
 });
 
-test('no-arg /vouchr opens the modal; member sees per-provider mode + enable controls', async (t) => {
+test('no-arg /vouchr opens the modal; member sees per-provider identity + enable controls', async (t) => {
   const h = await harness(t, { member: true });
   const view = await h.openModal();
   assert.equal(view.submit?.text?.text ?? view.submit?.text, 'Save');
-  assert.ok(view.blocks.some((b: any) => b.block_id === 'mode:mcp'));
+  assert.ok(view.blocks.some((b: any) => b.block_id === 'identity:mcp'));
   assert.ok(view.blocks.some((b: any) => b.block_id === 'tool:mcp'));
   assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('preview:')));
   assert.equal(Object.hasOwn(JSON.parse(view.private_metadata).open[0], 'v'), false);
@@ -137,7 +137,7 @@ test('no-arg /vouchr in a DM shows personal tools without channel controls', asy
   const view = await h.openModal('D_PERSONAL');
   assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
   assert.equal(view.submit, undefined);
-  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('identity:')));
   assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('tool:')));
   assert.equal(conversationReads, 0);
 });
@@ -155,7 +155,7 @@ test('no-arg /vouchr resolves a G-prefixed MPIM and suppresses channel governanc
   const view = await h.openModal('G_MPIM');
   assert.match(JSON.stringify(view.blocks), /\*mcp\*: enabled/);
   assert.equal(view.submit, undefined);
-  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('mode:')));
+  assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('identity:')));
   assert.ok(!view.blocks.some((b: any) => String(b.block_id ?? '').startsWith('tool:')));
   assert.equal(conversationReads, 1);
 });
@@ -295,10 +295,10 @@ test('no-arg gives recovery when valid provider ids exceed Slack private_metadat
 test('forged non-member submission is rejected by the same authz path (no mutation, audited denied)', async (t) => {
   const h = await harness(t, { member: false }); // NOT a member, but forges a mode-change submission
   let acked = false;
-  await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } }, async () => { acked = true; });
+  await h.submit({ 'identity:mcp': { identity: { selected_option: { value: 'channel' } } } }, async () => { acked = true; });
   assert.equal(acked, true);
   assert.match(h.dms[0], /Only a current member of this channel/);
-  assert.equal(await modeRow(h.lan.db), null); // nothing written
+  assert.equal(await identityRow(h.lan.db), null); // nothing written
   assert.deepEqual(await auditActions(h.lan.db), ['denied']);
 });
 
@@ -311,14 +311,14 @@ test('config modal acknowledges before its Slack membership lookup', async (t) =
     },
   });
   await h.submit(
-    { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
+    { 'identity:mcp': { identity: { selected_option: { value: 'channel' } } } },
     async () => { acknowledged = true; },
   );
   assert.equal(acknowledged, true);
-  assert.equal(await modeRow(h.lan.db), null);
+  assert.equal(await identityRow(h.lan.db), null);
 });
 
-test('a member offboarded during modal verification cannot change mode or tools', async (t) => {
+test('a member offboarded during modal verification cannot change identity or tools', async (t) => {
   let enteredAdminLookup!: () => void;
   const adminLookupStarted = new Promise<void>((resolve) => { enteredAdminLookup = resolve; });
   let releaseAdminLookup!: () => void;
@@ -336,7 +336,7 @@ test('a member offboarded during modal verification cannot change mode or tools'
   });
 
   const submitting = h.submit({
-    'mode:mcp': { mode: { selected_option: { value: 'per-user' } } },
+    'identity:mcp': { identity: { selected_option: { value: 'person' } } },
     'tool:mcp': unchecked(),
   }, async () => {});
   await adminLookupStarted;
@@ -344,25 +344,25 @@ test('a member offboarded during modal verification cannot change mode or tools'
   releaseAdminLookup();
   await submitting;
 
-  assert.equal(await modeRow(h.lan.db), null);
+  assert.equal(await identityRow(h.lan.db), null);
   assert.equal(await new ChannelTools(h.lan.db).isConfigured('T1', 'C_FIN'), false);
   assert.deepEqual(await auditActions(h.lan.db), []);
   assert.match(h.dms[0], /1 setting could not be confirmed/); // the tool is already deny-by-default → the disable is a no-op; only the mode change is attempted (and blocked)
   assert.match(h.dms[0], /Reopen Vouchr settings/);
 });
 
-test('member mode change via the modal == /vouchr mode: same channel_config + audit', async (t) => {
+test('member identity change via the modal == /vouchr identity: same channel_config + audit', async (t) => {
   const viaCommand = await harness(t, { member: true });
-  await viaCommand.runCommand('mode mcp per-user');
-  assert.equal(await modeRow(viaCommand.lan.db), 'per-user');
+  await viaCommand.runCommand('identity mcp channel');
+  assert.equal(await identityRow(viaCommand.lan.db), 'channel');
   assert.deepEqual(await auditActions(viaCommand.lan.db), ['config']);
 
   const viaModal = await harness(t, { member: true });
   let acked: any = null;
-  await viaModal.submit({ 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } }, async (r?: any) => (acked = r ?? 'ack'));
+  await viaModal.submit({ 'identity:mcp': { identity: { selected_option: { value: 'channel' } } } }, async (r?: any) => (acked = r ?? 'ack'));
   assert.equal(acked.response_action, 'update');
   assert.match(JSON.stringify(acked.view), /Updating settings/);
-  assert.equal(await modeRow(viaModal.lan.db), 'per-user');
+  assert.equal(await identityRow(viaModal.lan.db), 'channel');
   assert.deepEqual(await auditActions(viaModal.lan.db), ['config']);
 });
 
@@ -375,8 +375,8 @@ test('a partially applied config batch reports confirmed and unconfirmed counts 
   };
 
   await h.submit({
-    'mode:a': { mode: { selected_option: { value: 'per-user' } } },
-    'mode:b': { mode: { selected_option: { value: 'per-user' } } },
+    'identity:a': { identity: { selected_option: { value: 'person' } } },
+    'identity:b': { identity: { selected_option: { value: 'person' } } },
   }, async () => {});
 
   assert.match(h.dms[0], /Updated 1 channel setting/);
@@ -388,13 +388,13 @@ test('config submit leaves private unknown-state recovery when result update and
   const h = await harness(t, { member: true, updateThrows: true, dmThrows: true });
   let acked: any = null;
   await h.submit(
-    { 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } },
+    { 'identity:mcp': { identity: { selected_option: { value: 'channel' } } } },
     async (value: any) => { acked = value; },
     undefined,
     'V_RESULT',
   );
 
-  assert.equal(await modeRow(h.lan.db), 'per-user', 'the database mutation committed');
+  assert.equal(await identityRow(h.lan.db), 'channel', 'the database mutation committed');
   assert.equal(acked.response_action, 'update');
   assert.match(JSON.stringify(acked.view), /If no result appears here/);
   assert.deepEqual(h.dms, []);
@@ -409,7 +409,7 @@ test('wrong-typed config metadata returns fixed recovery before membership looku
   });
   let acked: any = null;
   await h.submit(
-    { 'mode:mcp': { mode: { selected_option: { value: 'shared' } } } },
+    { 'identity:mcp': { identity: { selected_option: { value: 'channel' } } } },
     async (value: any) => { acked = value; },
     JSON.stringify({ channel: 'C_FIN', open: null }),
   );
@@ -417,16 +417,16 @@ test('wrong-typed config metadata returns fixed recovery before membership looku
   assert.equal(acked.response_action, 'update');
   assert.match(JSON.stringify(acked.view), /stale or malformed/);
   assert.equal(adminLookups, 0);
-  assert.equal(await modeRow(h.lan.db), null);
+  assert.equal(await identityRow(h.lan.db), null);
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
-test('forged invalid mode value is ignored server-side, never persisted', async (t) => {
+test('forged invalid identity value is ignored server-side, never persisted', async (t) => {
   const h = await harness(t, { member: true });
   let acked: any = null;
-  await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'evil-mode' } } } }, async (r?: any) => (acked = r ?? 'ack'));
+  await h.submit({ 'identity:mcp': { identity: { selected_option: { value: 'session' } } } }, async (r?: any) => (acked = r ?? 'ack'));
   assert.equal(acked.response_action, 'update');
-  assert.equal(await modeRow(h.lan.db), null);
+  assert.equal(await identityRow(h.lan.db), null);
   assert.deepEqual(await auditActions(h.lan.db), []);
 });
 
@@ -445,19 +445,19 @@ test('enabling one provider materializes the full allowlist; the others stay dis
 });
 
 // Finding 2: a stale save (untouched select re-submitting its open value) must not revert a change
-// another member made in between, nor delete the shared credential leaving 'shared' mode.
-test('untouched mode select does not revert a concurrent change or delete the shared credential', async (t) => {
+// another member made in between, nor delete the shared credential leaving the channel identity.
+test('untouched identity select does not revert a concurrent change or delete the shared credential', async (t) => {
   const h = await harness(t, { member: true });
   const cfg = new ChannelConfig(h.lan.db);
   await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'person');
-  const view = await h.openModal(); // opens with mode 'per-user' as the select's initial
+  const view = await h.openModal(); // opens with identity 'person' as the select's initial
   const pm = view.private_metadata;
   // Between open and save, another member flips to shared and connects a shared credential.
   await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'channel');
   await h.lan.vault.upsert({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp', { accessToken: 'SHARED', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  // A saves the modal without touching the mode select (it re-submits its open value 'per-user').
-  await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } }, async () => {}, pm);
-  assert.equal(await modeRow(h.lan.db), 'shared'); // NOT reverted to per-user
+  // A saves the modal without touching the identity select (it re-submits its open value 'person').
+  await h.submit({ 'identity:mcp': { identity: { selected_option: { value: 'person' } } } }, async () => {}, pm);
+  assert.equal(await identityRow(h.lan.db), 'channel'); // NOT reverted to person
   assert.ok(await h.lan.vault.get({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp')); // cred survived
 });
 

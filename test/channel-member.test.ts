@@ -70,7 +70,7 @@ test('disconnectChannelShared removes shared and leaves every non-shared mode un
     identity: ID, channel: 'C_SHARED', providerId: 'mcp', issuance: await vault.userProvisioningIssuedAt(),
   });
   assert.equal(removed.status, 'removed');
-  assert.equal(await cfg.getIdentity('T1', 'C_SHARED', 'mcp'), 'person'); // returned to per-user
+  assert.equal(await cfg.getIdentity('T1', 'C_SHARED', 'mcp'), 'person'); // returned to person
   assert.ok(!(await vault.get(shared, 'mcp'))); // the shared credential is gone
 
   // Every `person` state is a no-op: an explicit person row stays put, and an unconfigured
@@ -297,14 +297,14 @@ test('#2: a directly-constructed ConnectContext for a DM is ungoverned — toolM
 const auditActions = async (db: any) =>
   ((await db.all('SELECT action FROM audit')) as any[]).map((r) => r.action);
 const mode = async (db: any) =>
-  ((await db.get('SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?',
-    ['T1', 'C_FIN', 'mcp'])) as any)?.mode ?? null;
+  ((await db.get('SELECT identity FROM channel_config WHERE team_id=? AND channel=? AND provider=?',
+    ['T1', 'C_FIN', 'mcp'])) as any)?.identity ?? null;
 
 // (a) A current member may configure; the mutation is audited 'config'.
-test('member gate: a current channel member can setChannelMode', async (t) => {
+test('member gate: a current channel member can setChannelIdentity', async (t) => {
   const { c, db } = await ctx(t, { member: true });
   await c.setChannelIdentity('mcp', 'person');
-  assert.equal(await mode(db), 'per-user');
+  assert.equal(await mode(db), 'person');
   assert.deepEqual(await auditActions(db), ['config']);
 });
 
@@ -435,17 +435,17 @@ test('member gate: a non-member is denied on enable/configure', async (t) => {
   assert.ok(rows.length >= 2 && rows.every((r) => r.action === 'denied' && r.meta.includes('not-member')));
 });
 
-test('union mode is rejected at the config boundary, writing nothing (SEC-4)', async (t) => {
-  // The single-source-of-truth guard no longer admits it; the surviving three still pass.
-  assert.equal(isChannelIdentity('union'), false);
-  for (const m of ['shared', 'per-user', 'session']) assert.equal(isChannelIdentity(m), true);
+test('removed identities are rejected at the config boundary, writing nothing (SEC-4)', async (t) => {
+  // The single-source-of-truth guard admits exactly the two identities (#350).
+  for (const m of ['union', 'shared', 'per-user', 'session']) assert.equal(isChannelIdentity(m), false);
+  for (const m of ['person', 'channel']) assert.equal(isChannelIdentity(m), true);
 
-  // Slash command: a channel member runs `mode mcp union` → the usage message, and NO row is written.
+  // Slash command: a channel member runs `identity mcp session` → the usage message, and NO row is written.
   const h = await commandHarness(t, { member: true });
-  await h.run('mode mcp union');
-  assert.match(h.out[0], /Usage: `\/vouchr mode/);
+  await h.run('identity mcp session');
+  assert.match(h.out[0], /Usage: `\/vouchr identity <provider> <person\|channel>`/);
   const cfgRow = await h.lan.db.get(
-    'SELECT mode FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
+    'SELECT identity FROM channel_config WHERE team_id=? AND channel=? AND provider=?', ['T1', 'C_FIN', 'mcp']) as any;
   assert.equal(cfgRow, undefined); // never persisted
   assert.equal((await h.lan.db.all('SELECT 1 FROM audit') as any[]).length, 0); // never audited
 
@@ -453,10 +453,10 @@ test('union mode is rejected at the config boundary, writing nothing (SEC-4)', a
   const db = await openTestDb(t);
   const cfg = new ChannelConfig(db);
   await assert.rejects(
-    () => writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'union' as any),
-    /invalid channel mode/,
+    () => writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'session' as any),
+    /invalid channel identity/,
   );
-  assert.equal(await cfg.getIdentity('T1', 'C_FIN', 'mcp'), null);
+  assert.equal(await cfg.getIdentity('T1', 'C_FIN', 'mcp'), 'person');
 });
 
 // #2 atomicity: the 'config' (mode-flip) audit runs INSIDE the locked transaction, so an audit-store

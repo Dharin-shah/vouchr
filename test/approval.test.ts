@@ -327,7 +327,7 @@ test('defineProvider: non-canonical approval paths/methods are rejected; methods
 
 test('P2-C: the approval knob threads through built-in provider configs (github) and enforces', async (t) => {
   const gh = github({ clientId: 'c', clientSecret: 's', approval: { approver: 'self' } });
-  assert.deepEqual(gh.approval, { approver: 'self' }, 'ProviderConfig → egressOptions → defineProvider');
+  assert.deepEqual(gh.approval, { approver: 'self', grant: 'once', ttlMs: DEFAULT_APPROVAL_TTL_MS }, 'ProviderConfig → egressOptions → defineProvider');
   const { ctx } = await harness(t, { provider: gh });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('github');
@@ -538,16 +538,11 @@ test('state machine: prompt → approve → consume exactly once → re-prompt',
     const rendered = JSON.stringify(ephemerals[0].blocks);
     assert.match(rendered, /POST/);
     assert.match(rendered, /api\.acme\.test/);
-    assert.match(rendered, /Action fingerprint: hmac-sha256:[0-9a-f]{64}/);
-    assert.ok(!rendered.includes('/repos'));
-    assert.match(ephemerals[0].text, /POST/);
-    assert.match(ephemerals[0].text, /api\.acme\.test/);
-    assert.ok(!ephemerals[0].text.includes('/repos'));
+    assert.match(rendered, /"type":"plain_text","text":"POST api\.acme\.test\/repos"/);
+    assert.match(rendered, /This covers one call, once, within 5 minutes\./);
+    assert.match(ephemerals[0].text, /POST api\.acme\.test\/repos/, 'the plain path is in the accessibility text too');
     assert.match(ephemerals[0].text, /once/);
-    assert.match(
-      ephemerals[0].text,
-      /raw path and request body are not displayed or inspected/i,
-    );
+    assert.match(ephemerals[0].text, /The request body is not shown or inspected\./);
     // SEC-1: prompt shows method + host + salted fingerprint, never raw path/body/token.
     assert.ok(!rendered.includes(BODY_SENTINEL));
     assert.ok(!rendered.includes(TOKEN));
@@ -1506,7 +1501,7 @@ test('member approver (#322): one channel message; the requester and a non-membe
     assert.match(rendered, /<@U1>/);
     assert.ok(!rendered.includes(BODY_SENTINEL), 'SEC-1: no body in the channel prompt');
     assert.ok(!rendered.includes(TOKEN), 'SEC-1: no credential in the channel prompt');
-    assert.ok(!rendered.includes('/repos'), 'raw path never rendered');
+    assert.match(rendered, /POST api\.acme\.test\/repos/, 'the plain path is on the prompt (#350)');
 
     // SEC-3: the requester's own click, and a click from someone who is not a member, are
     // re-checked server-side, rejected, and audited; the prompt stays pending.
@@ -1769,9 +1764,9 @@ test('forged approval id / cross-team id decides nothing', async (t) => {
 
 // ── zero behavior change without the knob ─────────────────────────────────────────────────────────
 
-test('providers without the approval knob: writes pass untouched, no approval rows anywhere', async (t) => {
+test('approval: false switches the gate off: writes pass untouched, no approval rows anywhere', async (t) => {
   const { ctx, ephemerals, auditRows, approvalRows } = await harness(t, {
-    provider: approvalProvider({ approval: undefined }),
+    provider: approvalProvider({ approval: false }),
   });
   await withFetch(async (calls) => {
     const handle = await ctx.connect('acme');
@@ -1823,7 +1818,9 @@ test('identical pending actions converge on one opaque id, prompt, and requested
     assert.equal(second.approvalId, first.approvalId);
     assert.equal(first.newRequest, true);
     assert.equal(second.newRequest, false);
-    assert.equal(ephemerals.length, 1);
+    // One prompt; the re-ask gets the one private "still waiting" line instead of a second prompt (#350).
+    assert.equal(ephemerals.filter((e) => e.blocks).length, 1);
+    assert.deepEqual(ephemerals.filter((e) => !e.blocks).map((e) => e.text), ['Still waiting for you to decide the acme action above.']);
     assert.equal((await approvalRows()).length, 1);
     assert.equal((await auditRows()).filter((r) => r.action === 'approval_requested').length, 1);
     assert.ok(!JSON.stringify(await auditRows()).includes(first.approvalId));
@@ -2044,7 +2041,7 @@ test('approval prompts render the plain path, keep it out of audit, and deduplic
     assert.equal(sensitive.path, encodeURI(sensitivePath));
     assert.match(rendered, /"type":"plain_text","text":"POST api\.acme\.test\/hook\//);
     assert.ok(!audit.includes('/hook/'));
-    assert.match(audit, /"actionFingerprint":"hmac-sha256:[0-9a-f]{64}"/);
+    assert.match(audit, /hmac-sha256:[0-9a-f]{64}/);
 
     const first = await expectApprovalRequired(
       handle.fetch(`https://api.acme.test${maxPath}`, { method: 'POST' }),
@@ -2053,7 +2050,7 @@ test('approval prompts render the plain path, keep it out of audit, and deduplic
       handle.fetch(`https://api.acme.test${maxPath}`, { method: 'POST' }),
     );
     assert.equal(second.approvalId, first.approvalId);
-    assert.equal(ephemerals.length, 2, 'one sensitive action plus one deduplicated maximum action');
+    assert.equal(ephemerals.filter((e) => e.blocks).length, 2, 'one sensitive action plus one deduplicated maximum action');
     const rows = await approvalRows();
     assert.equal(rows.length, 2);
     assert.equal(rows.find((row: any) => row.id === first.approvalId)?.path, maxPath);

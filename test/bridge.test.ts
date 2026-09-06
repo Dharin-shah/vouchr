@@ -702,7 +702,8 @@ test('bridge: broker approval denial delivers ONE self decision surface; approve
 
   const first = await (await h.context()).recoverBrokerDenial('acme', denial);
   assert.deepEqual(first, { status: 'approval_prompted', provider: 'acme', approver: 'self' });
-  assert.equal(h.ephemerals.length, 1);
+  const prompts = () => h.ephemerals.filter((e: any) => e.blocks);
+  assert.equal(prompts().length, 1);
   assert.equal(h.ephemerals[0].user, 'U1', 'self approval goes to the requester');
   assert.equal(h.ephemerals[0].thread_ts, 'TH1', 'delivered into the thread the action is bound to');
   const rendered = JSON.stringify(h.ephemerals[0].blocks);
@@ -710,10 +711,12 @@ test('bridge: broker approval denial delivers ONE self decision surface; approve
   assert.ok(rendered.includes(denial.approvalId), 'button carries only the opaque id');
   assert.ok(!rendered.includes(TOKEN), 'no secret in the prompt (SEC-1)');
 
-  // A repeated relay converges: the delivery lease reports delivered, nothing re-posts.
+  // A repeated relay converges: the delivery lease reports delivered, nothing re-posts; the
+  // requester gets the one private "still waiting" line instead (#350).
   const again = await (await h.context()).recoverBrokerDenial('acme', denial);
   assert.deepEqual(again, { status: 'approval_prompted', provider: 'acme', approver: 'self' });
-  assert.equal(h.ephemerals.length, 1, 'no duplicate prompt');
+  assert.equal(prompts().length, 1, 'no duplicate prompt');
+  assert.equal(h.ephemerals.at(-1)?.text, 'Still waiting for you to decide the acme action above.');
 
   await h.db.run(
     `UPDATE approval_request SET delivered_at=${POSTGRES_NOW_US_SQL}-? WHERE id=?`,
@@ -723,7 +726,7 @@ test('bridge: broker approval denial delivers ONE self decision surface; approve
   assert.deepEqual(recovered, {
     status: 'approval_prompted', provider: 'acme', approver: 'self',
   });
-  assert.equal(h.ephemerals.length, 2, 'the vanished approval ephemeral is re-posted');
+  assert.equal(prompts().length, 2, 'the vanished approval ephemeral is re-posted');
 
   // The existing click handler re-decides everything at the mutation; the grant is single-use.
   await h.click(APPROVAL_APPROVE_ACTION, { value: denial.approvalId });
@@ -926,11 +929,11 @@ test('bridge: the approver rule is re-derived from the registry, not the wire or
     accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const { denial } = await brokerApprovalDenial(t, h.db, h.key, provider);
-  // A redeploy dropped the approval knob: the pending row is moot and the retry re-evaluates.
+  // A redeploy switched approval off: the pending row is moot and the retry re-evaluates.
   const without = await createVouchr({
     providers: [defineProvider({
       id: 'acme', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
-      egressAllow: ['api.acme.test'], egressMethods: ['GET', 'POST'],
+      egressAllow: ['api.acme.test'], egressMethods: ['GET', 'POST'], approval: false,
       refresh: 'none', pkce: false, clientId: 'c', clientSecret: 's',
     })],
     baseUrl: 'http://127.0.0.1:1',

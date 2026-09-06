@@ -32,6 +32,7 @@ const SECRET = 'tok-MUST-NOT-REACH-A-FOREIGN-ORIGIN';
 
 function provider() {
   return defineProvider({
+    approval: false,
     id: 'acme',
     authorizeUrl: 'https://acme.example/a',
     tokenUrl: 'https://acme.example/t',

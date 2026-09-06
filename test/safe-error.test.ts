@@ -111,7 +111,6 @@ test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe co
     /no longer visible, ask again in 30 seconds\./,
   );
   assert.equal(
-  assert.equal(
     safeUserMessage(new EgressBlockedError('Egress blocked: host not allowed')),
     'The request was blocked by Vouchr egress policy. Check the provider configuration.',
   );
