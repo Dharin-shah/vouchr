@@ -6,7 +6,11 @@ import {
   configModal,
   configureModal,
   connectBlocks,
+  connectExpiredBlocks,
+  CONNECT_PROMPT_OPENING_TEXT,
+  CONNECT_PROMPT_STALE_TEXT,
   OAUTH_CONNECT_ACTION,
+  OAUTH_RENEW_ACTION,
   connectedBlocks,
   connectedDmText,
   connectionLine,
@@ -118,6 +122,33 @@ test('connectBlocks: the OAuth button carries both the url and an action_id so S
   const button = b.find((x: any) => x.type === 'actions').elements[0];
   assert.equal(button.url, 'https://auth'); // one-click OAuth preserved
   assert.equal(button.action_id, OAUTH_CONNECT_ACTION); // so the host's no-op ack can match it
+  assert.equal('value' in button, false); // host-rendered prompt: no state, the click stays a bare ack
+});
+
+test('connectBlocks: the button value is exactly the given state, so the click can replace the prompt (#347)', () => {
+  const b = connectBlocks('github', 'https://auth?state=S', undefined, 'S') as any[];
+  const button = b.find((x: any) => x.type === 'actions').elements[0];
+  assert.deepEqual(
+    { url: button.url, action_id: button.action_id, value: button.value },
+    { url: 'https://auth?state=S', action_id: OAUTH_CONNECT_ACTION, value: 'S' },
+  );
+  assert.equal(b.length, 2);
+});
+
+test('connectExpiredBlocks: expiry copy + one Send a new link button carrying only the state; provider escaped (SEC-5)', () => {
+  const b = connectExpiredBlocks('<https://evil|gh>', 'S') as any[];
+  assert.equal(b.length, 2);
+  const mrkdwn = mrkdwnTexts(b).join('\n');
+  assert.ok(!mrkdwn.includes('<https://evil|gh>'));
+  assert.match(mrkdwn, /&lt;https:\/\/evil\|gh&gt;/);
+  assert.match(mrkdwn, /no longer current\. Get a new link to continue\./);
+  const button = b.find((x: any) => x.type === 'actions').elements[0];
+  assert.deepEqual(
+    { action_id: button.action_id, value: button.value, text: button.text.text, url: button.url },
+    { action_id: OAUTH_RENEW_ACTION, value: 'S', text: 'Send a new link', url: undefined },
+  );
+  assert.match(blocksFallbackText(b), /Send a new link/); // readable top-level fallback
+  assert.doesNotMatch(j([CONNECT_PROMPT_OPENING_TEXT, CONNECT_PROMPT_STALE_TEXT, mrkdwn]), /[—–]/); // plain copy, no dashes
 });
 
 test('connectBlocks: escapes the provider id in mrkdwn (SEC-5, #178)', () => {

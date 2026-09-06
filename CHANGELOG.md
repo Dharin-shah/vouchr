@@ -3,6 +3,24 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Connect prompts replace themselves in Slack when clicked (#347).** The private Connect button
+  now carries its own opaque state as the button value beside the `url`, so the click's
+  `response_url` can address the prompt. A live in-channel prompt is replaced with one line
+  (`Opening the sign-in page. If it says the request is no longer current, mention me again.`);
+  an expired, superseded, or spent prompt is replaced with its expiry copy and a **Send a new
+  link** button (`OAUTH_RENEW_ACTION`) that mints the next generation through the same delivery
+  lease as an agent turn and swaps the fresh prompt in place. The browser stale page keeps its
+  fixed copy and adds `The prompt in Slack now offers a new link.` The click never spends the
+  state; a tampered or another user's value gets the fixed stale copy and writes nothing.
+  `connectBlocks` gains an optional fourth `state` argument (host-rendered prompts without it keep
+  the bare-ack behavior); `OAUTH_RENEW_ACTION` joins `OAUTH_CONNECT_ACTION` in the package
+  exports, and `connectExpiredBlocks`, `CONNECT_PROMPT_STALE_TEXT`, and
+  `CONNECT_PROMPT_OPENING_TEXT` are exported from `src/adapters/blocks`.
+
 ## [1.1.0] — 2026-09-06
 
 The Slack OpenID Connect browser-identity check is the only consent path, and the schema is one

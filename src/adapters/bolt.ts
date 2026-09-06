@@ -101,6 +101,7 @@ import { connectedHtml } from './landing';
 import {
   connectBlocks, configureModal, CONFIGURE_CALLBACK,
   userKeyModal, keySetupBlocks, USER_KEY_CALLBACK, SETUP_KEY_ACTION, OAUTH_CONNECT_ACTION, RECONNECT_ACTION,
+  OAUTH_RENEW_ACTION, connectExpiredBlocks, CONNECT_PROMPT_OPENING_TEXT, CONNECT_PROMPT_STALE_TEXT,
   privateStatusModal,
   sessionApprovalBlocks, APPROVE_SESSION_ACTION, auditBlocks, statsBlocks, statusBlocks,
   approvalBlocks, APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION,
@@ -815,6 +816,85 @@ async function provisioningIssuedAtFromReceipt(vault: Vault, receivedAt: bigint)
   return issuedAt;
 }
 
+type ConnectPrompt = { blocks: unknown[]; fallback: { text: string } | Record<string, never> };
+
+/**
+ * Mint (or reuse) the acting user's consent generation for one OAuth provider and deliver its
+ * private Connect prompt under the cross-replica delivery lease. Resolves only after a confirmed
+ * post; every other outcome throws the fixed user-facing recovery (a still-delivered generation
+ * throws `ConsentRequiredError('reused')`). ONE sequence for the agent turn and the "Send a new
+ * link" button (#347), so the two surfaces cannot drift on lease handling.
+ */
+async function deliverConnectPrompt(o: {
+  consent: Consent;
+  identity: SlackIdentity;
+  provider: Provider;
+  redirectUri: string;
+  channel: string | null;
+  issuedAt: number;
+  post: (prompt: ConnectPrompt) => Promise<void>;
+}): Promise<void> {
+  const pendingConsent = await o.consent.beginFenced(
+    o.identity,
+    o.provider,
+    o.redirectUri,
+    o.channel,
+    o.issuedAt,
+  );
+  if (!pendingConsent) {
+    throw new UserFacingError(
+      'Connection setup changed while Vouchr was preparing it. Ask the agent again.',
+      'resolve_again',
+    );
+  }
+  // Render before claiming delivery. A local registry/render failure is a known no-send and must
+  // not park this reusable consent generation behind an ambiguous Slack lease.
+  const blocks = connectBlocks(
+    o.provider.id,
+    pendingConsent.authorizeUrl,
+    { list: o.provider.scopesDefault, describe: o.provider.scopeDescriptions },
+    pendingConsent.state,
+  );
+  const prompt: ConnectPrompt = { blocks, fallback: optionalBlockFallback(blocks) };
+  const delivery = await o.consent.claimDelivery(pendingConsent.state, {
+    redeliverDelivered: !!o.channel,
+  });
+  if (delivery.status !== 'claimed') {
+    // 'delivered' reuses the live prompt instead of re-posting — but an in-channel prompt is an
+    // ephemeral, which vanishes on reload/device switch. The typed 'reused' state drives fixed
+    // copy (here and in the safe mapper) instead of claiming a fresh post.
+    if (delivery.status === 'delivered') throw new ConsentRequiredError(o.provider.id, 'reused');
+    if (delivery.status === 'in-flight') {
+      throw new UserFacingError(
+        'A private connection prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
+        'retry_later',
+      );
+    }
+    throw new UserFacingError(
+      'The connection request changed before its prompt could be delivered. Ask the agent again.',
+      'resolve_again',
+    );
+  }
+  try {
+    await o.post(prompt);
+  } catch (deliveryError) {
+    const outcome = classifySlackPromptDeliveryFailure(deliveryError);
+    if (outcome !== 'ambiguous') {
+      await abandonKnownUndeliveredPrompt(
+        () => o.consent.abandonDelivery(pendingConsent.state, delivery.token),
+        'connection',
+      );
+    }
+    throw slackPromptDeliveryRecovery(outcome, 'connection');
+  }
+  requirePromptConfirmation(
+    await promptConfirmationOutcome(
+      () => o.consent.confirmDelivery(pendingConsent.state, delivery.token),
+    ),
+    'private connection',
+  );
+}
+
 class ChannelProvisioningStaleError extends UserFacingError {
   constructor() {
     super(
@@ -1497,59 +1577,15 @@ export class ConnectContext {
       throw new ConsentRequiredError(providerId, promptState);
     }
 
-    const pendingConsent = await this.consent.beginFenced(
-      this.identity,
+    await deliverConnectPrompt({
+      consent: this.consent,
+      identity: this.identity,
       provider,
-      this.redirectUri,
-      this.channel,
-      connectIssuedAt,
-    );
-    if (!pendingConsent) {
-      throw new UserFacingError(
-        'Connection setup changed while Vouchr was preparing it. Ask the agent again.',
-        'resolve_again',
-      );
-    }
-    // Render before claiming delivery. A local registry/render failure is a known no-send and must
-    // not park this reusable consent generation behind an ambiguous Slack lease.
-    const prompt = this.connectPrompt(providerId, pendingConsent.authorizeUrl);
-    const delivery = await this.consent.claimDelivery(pendingConsent.state, {
-      redeliverDelivered: !!this.channel,
+      redirectUri: this.redirectUri,
+      channel: this.channel,
+      issuedAt: connectIssuedAt,
+      post: (prompt) => this.postConnectPrompt(prompt),
     });
-    if (delivery.status !== 'claimed') {
-      // 'delivered' reuses the live prompt instead of re-posting — but an in-channel prompt is an
-      // ephemeral, which vanishes on reload/device switch. The typed 'reused' state drives fixed
-      // copy (here and in the safe mapper) instead of claiming a fresh post.
-      if (delivery.status === 'delivered') throw new ConsentRequiredError(providerId, 'reused');
-      if (delivery.status === 'in-flight') {
-        throw new UserFacingError(
-          'A private connection prompt is already being delivered. If it appears, use it; otherwise ask the agent to retry shortly.',
-          'retry_later',
-        );
-      }
-      throw new UserFacingError(
-        'The connection request changed before its prompt could be delivered. Ask the agent again.',
-        'resolve_again',
-      );
-    }
-    try {
-      await this.postConnectPrompt(prompt);
-    } catch (deliveryError) {
-      const outcome = classifySlackPromptDeliveryFailure(deliveryError);
-      if (outcome !== 'ambiguous') {
-        await abandonKnownUndeliveredPrompt(
-          () => this.consent.abandonDelivery(pendingConsent.state, delivery.token),
-          'connection',
-        );
-      }
-      throw slackPromptDeliveryRecovery(outcome, 'connection');
-    }
-    requirePromptConfirmation(
-      await promptConfirmationOutcome(
-        () => this.consent.confirmDelivery(pendingConsent.state, delivery.token),
-      ),
-      'private connection',
-    );
     this.emit({ type: 'connect_prompted', provider: providerId });
     throw new ConsentRequiredError(providerId, 'posted');
   }
@@ -2151,22 +2187,7 @@ export class ConnectContext {
     return 'posted';
   }
 
-  private connectPrompt(providerId: string, url: string): {
-    blocks: unknown[];
-    fallback: { text: string } | Record<string, never>;
-  } {
-    const provider = this.registry.get(providerId);
-    const blocks = connectBlocks(providerId, url, {
-      list: provider.scopesDefault,
-      describe: provider.scopeDescriptions,
-    });
-    return { blocks, fallback: optionalBlockFallback(blocks) };
-  }
-
-  private async postConnectPrompt(prompt: {
-    blocks: unknown[];
-    fallback: { text: string } | Record<string, never>;
-  }): Promise<void> {
+  private async postConnectPrompt(prompt: ConnectPrompt): Promise<void> {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
     if (this.channel) {
@@ -2358,6 +2379,11 @@ export async function createVouchr(opts: VouchrOptions) {
   const dmActor = async (client: WebClient, identity: SlackIdentity, text: string): Promise<void> => {
     await client.chat.postMessage({ channel: identity.userId, text }).catch(() => undefined);
   };
+
+  /** A stored consent row belongs to the Slack-signed clicker (the same team/user binding
+   *  `SessionGrants.getRequest` applies to session controls). */
+  const sameActor = (row: SlackIdentity, actor: SlackIdentity): boolean =>
+    row.teamId === actor.teamId && row.userId === actor.userId;
 
   /** Button feedback: an ephemeral through the interaction's `respond`, falling back to a DM. */
   const replyToActor = (respond: any, client: WebClient, identity: SlackIdentity | null) =>
@@ -4137,11 +4163,74 @@ export async function createVouchr(opts: VouchrOptions) {
       if (identity) await dmActor(client, identity, text);
     });
 
-    // The OAuth "Connect <provider>" button carries a `url`, so Slack opens the authorize page in the
-    // browser on click AND delivers a block_actions interaction that must be acknowledged. There is
-    // nothing else to do here (the OAuth `state` in the url drives the whole flow) — a bare ack is the
-    // entire handler, and without it Slack shows "Operation timed out. Apps need to respond within 3s."
-    app.action(OAUTH_CONNECT_ACTION, async ({ ack }: any) => { await ack(); });
+    // The OAuth "Connect <provider>" button carries a `url`, so Slack opens the sign-in page in the
+    // browser on click AND delivers a block_actions interaction whose response_url addresses the
+    // prompt itself (#347). The value is the prompt's own opaque state: it is read, never spent, and
+    // only the Slack-signed clicker matching the row's owner gets anything but the fixed stale copy.
+    // Prompts rendered before #347 carry no value; their click stays the bare ack it always was.
+    app.action(OAUTH_CONNECT_ACTION, async ({ ack, body, respond, client }: any) => {
+      await ack();
+      const state = body.actions?.[0]?.value;
+      if (state === undefined) return;
+      const identity = resolveIdentity({ body });
+      const reply = replyToActor(respond, client, identity);
+      const found = identity ? await consent.inspect(state) : null;
+      if (!found || !identity || !sameActor(found.row.identity, identity)) {
+        return reply(CONNECT_PROMPT_STALE_TEXT);
+      }
+      if (found.live) {
+        // A DM prompt is a durable message and the only retry surface after a cancelled Slack
+        // sign-in (DM generations are never redelivered), so it stays; the channel ephemeral is
+        // replaced with the one line the browser hop's copy points back at.
+        if (found.row.channel === null) return;
+        return reply(CONNECT_PROMPT_OPENING_TEXT);
+      }
+      const blocks = connectExpiredBlocks(found.row.provider, found.row.state);
+      try {
+        await respond({ replace_original: true, response_type: 'ephemeral', blocks, ...optionalBlockFallback(blocks) });
+      } catch {
+        await reply(CONNECT_PROMPT_STALE_TEXT);
+      }
+    });
+
+    // "Send a new link" on a replaced stale prompt (#347): the same mint + lease + confirm sequence
+    // as the agent turn, posted through the click's response_url so the fresh prompt takes the old
+    // one's place. Owner, provider, and channel come from the stored row; identity from the signed
+    // click. With two replicas racing, beginFenced yields one generation and the lease lets exactly
+    // one replace the message; the loser stays quiet because the winner's replacement is the
+    // feedback and a second response_url write would clobber it.
+    app.action(OAUTH_RENEW_ACTION, async ({ ack, body, respond, client }: any) => {
+      const provisioningReceivedAt = process.hrtime.bigint();
+      await ack();
+      const identity = resolveIdentity({ body });
+      const reply = replyToActor(respond, client, identity);
+      const found = identity ? await consent.inspect(body.actions?.[0]?.value) : null;
+      if (!found || !identity || !sameActor(found.row.identity, identity)) {
+        return reply(CONNECT_PROMPT_STALE_TEXT);
+      }
+      if (vault.lockdownEnabled) return reply(CREDENTIAL_SETUP_LOCKED, false);
+      const providerId = found.row.provider;
+      if (!registry.has(providerId) || !isBrokeredProvider(registry.get(providerId))
+        || registry.get(providerId).credential === 'key') {
+        return reply(CONNECT_PROMPT_STALE_TEXT);
+      }
+      try {
+        await deliverConnectPrompt({
+          consent,
+          identity,
+          provider: registry.get(providerId),
+          redirectUri,
+          channel: found.row.channel,
+          issuedAt: await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
+          post: async ({ blocks, fallback }) => {
+            await respond({ replace_original: true, response_type: 'ephemeral', blocks, ...fallback });
+          },
+        });
+      } catch (error) {
+        if (error instanceof ConsentRequiredError) return; // the other replica's click replaced it
+        await reply(safeUserMessage(error), false);
+      }
+    });
 
     // Thread-scoped session approval. The control contains one opaque request id; provider and every
     // binding come from PostgreSQL, while identity/channel/thread come from the Slack-signed click.

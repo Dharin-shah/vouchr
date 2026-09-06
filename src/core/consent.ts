@@ -694,6 +694,20 @@ export class Consent {
     return raw ? consentRow(raw) : null;
   }
 
+  /** Read, never spend, one consent row for a Slack-side Connect click (#347): the row plus whether
+   * it is still live under the same predicate as {@link activeRow}. Null for an unknown, finalized,
+   * or swept state, which a click must treat exactly like a forged value. */
+  async inspect(state: string): Promise<{ row: ConsentRow; live: boolean } | null> {
+    if (!isConsentState(state)) return null;
+    const raw = await this.db.get<any>(
+      `SELECT *, (superseded_at IS NULL AND consumed_at IS NULL
+         AND created_at >= ${POSTGRES_NOW_US_SQL} - ?) AS live
+       FROM consent_request WHERE state=?`,
+      [STATE_TTL_US, state],
+    );
+    return raw ? { row: consentRow(raw), live: raw.live === true } : null;
+  }
+
   /** Stamp a still-active consent as browser-verified (#302). Atomic against consume/supersede/TTL:
    * false means the state was spent, replaced, or expired since the hop began — the caller fails
    * closed rather than resurrecting authority. */

@@ -117,6 +117,9 @@ export {
   // register a no-op `ack()` for this id, or Slack shows "Operation timed out" — url buttons still
   // deliver a block_actions interaction. Single source of truth so hosts never hard-code the string.
   OAUTH_CONNECT_ACTION,
+  // #347: the "Send a new link" button on a replaced stale prompt; hosts wiring granular listeners
+  // instead of install()/registerCommands() need its id for the same reason.
+  OAUTH_RENEW_ACTION,
   configureModal,
   userKeyModal,
   CONFIGURE_CALLBACK,

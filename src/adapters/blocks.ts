@@ -156,11 +156,14 @@ export function statsBlocks(enabled: string[], stats: StatsRow[], windowDays: nu
 
 /** Block Kit for the in-Slack "connect your account" prompt (ephemeral).
  *  `scopes` (optional) lists what the agent will be able to do as you; unknown scope ids
- *  render as their raw string so nothing granted is ever hidden. */
+ *  render as their raw string so nothing granted is ever hidden. `state` (optional, #347) rides in
+ *  the button value so the click handler can replace the prompt in place; it carries no authority
+ *  (the handler re-reads the row and never spends it). Omitted for host-rendered prompts. */
 export function connectBlocks(
   provider: string,
   authorizeUrl: string,
   scopes?: { list: string[]; describe?: Record<string, string> },
+  state?: string,
 ): unknown[] {
   const MAX_SCOPE_SECTIONS = 48; // intro + scope sections + actions must stay within 50 message blocks
   // SEC-5 (#178): escape the provider id like every other mrkdwn renderer — no exception for a
@@ -204,11 +207,51 @@ export function connectBlocks(
           // Slack sends a block_actions payload for url buttons too; without an action_id + registered
           // ack the client shows "Operation timed out". The action carries no authority (SEC-3).
           action_id: OAUTH_CONNECT_ACTION,
+          ...(state === undefined ? {} : { value: state }),
           style: 'primary',
         },
       ],
   });
   return blocks;
+}
+
+/** The fixed Slack-side copy for a Connect click Vouchr cannot map to the clicker's own row (#347):
+ *  unknown, finalized, swept, tampered, or another user's state. The browser verify hop renders the
+ *  same sentence (`src/adapters/slackVerify.ts`), so both surfaces agree. */
+export const CONNECT_PROMPT_STALE_TEXT =
+  'This connection request is no longer current. Ask the agent for a new connection prompt.';
+/** Replaces an in-channel Connect ephemeral once its live link has been opened (#347). */
+export const CONNECT_PROMPT_OPENING_TEXT =
+  'Opening the sign-in page. If it says the request is no longer current, mention me again.';
+
+/** In-place replacement for a Connect prompt whose state expired, was superseded, or was spent
+ *  (#347). The button carries only the old opaque state: the handler re-resolves owner, provider,
+ *  and channel from that row and mints the next generation under the delivery lease. */
+export function connectExpiredBlocks(provider: string, state: string): unknown[] {
+  const p = escapeMrkdwn(provider);
+  return [
+    {
+      type: 'section',
+      text: {
+        type: 'mrkdwn',
+        text:
+          `:link: *Connect your ${p} account*\n` +
+          'This connection prompt is no longer current. Get a new link to continue.',
+      },
+    },
+    {
+      type: 'actions',
+      elements: [
+        {
+          type: 'button',
+          text: { type: 'plain_text', text: 'Send a new link', emoji: true },
+          action_id: OAUTH_RENEW_ACTION,
+          value: state,
+          style: 'primary',
+        },
+      ],
+    },
+  ];
 }
 
 export const CONFIGURE_CALLBACK = 'vouchr_configure';
@@ -220,6 +263,8 @@ export const SETUP_KEY_ACTION = 'vouchr_setup_key';
  *  Apps need to respond within 3 seconds." No id/authority rides in the button; the OAuth `state` in
  *  the url is the only carrier. */
 export const OAUTH_CONNECT_ACTION = 'vouchr_oauth_connect';
+/** "Send a new link" on a replaced stale Connect prompt (#347). Value: the old opaque state. */
+export const OAUTH_RENEW_ACTION = 'vouchr_oauth_renew';
 export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
 /** Legacy #117 action id. New health DMs render no long-lived reconnect control; the registered
  * handler only acknowledges already-delivered buttons with fixed stale guidance. */

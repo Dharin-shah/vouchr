@@ -140,7 +140,14 @@ with a **Connect github** button. Alex clicks it. The browser goes to Slack's si
 > You can close this tab.
 
 Back in Slack, Alex gets a DM and a private note in the channel, both
-`✅ github connected as alex.` (`src/adapters/blocks.ts`, `connectedDmText`).
+`✅ github connected as alex.` (`src/adapters/blocks.ts`, `connectedDmText`). The prompt itself was
+replaced on click with `Opening the sign-in page. If it says the request is no longer current, mention me again.`
+
+If a prompt is left for more than ten minutes, clicking it opens a plain
+`This connection request is no longer current. Ask the agent for a new connection prompt. The prompt in Slack now offers a new link.`
+page, and in Slack the prompt is replaced by `This connection prompt is no longer current. Get a new link to continue.`
+with a **Send a new link** button (`connectExpiredBlocks`). Clicking that swaps in a fresh Connect
+prompt in place; no new mention is needed.
 
 `/vouchr status` from Alex lists the github connection with the account name. Audit: a `connect` row. `vouchr inventory` shows one row, `owner_kind` user.
 
