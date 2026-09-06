@@ -28,6 +28,10 @@ never see it.
 npm install @vouchr/core
 ```
 
+A Bolt app gets `@slack/bolt` and `@slack/web-api` as peer dependencies, which npm installs for you.
+The headless entry (`@vouchr/core/headless`) and `vouchr-broker` need only `pg`: install with
+`npm install --omit=peer @vouchr/core` to skip Bolt.
+
 ```ts
 import { App, ExpressReceiver } from '@slack/bolt';
 import { createVouchr, github, ConsentRequiredError, safeUserMessage } from '@vouchr/core';

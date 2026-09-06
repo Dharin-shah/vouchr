@@ -47,6 +47,12 @@ variables and a fresh database. No code path or option keeps the old behavior.
 - **Slack app setup.** The OIDC redirect URL (`$PUBLIC_URL/vouchr/oauth/slack`) and the two
   variables are part of the standard setup in `QUICKSTART.md`, both Slack manifests, `.env.example`,
   the examples, `deploy/k8s.yaml`, and the deployment guide.
+- `@slack/bolt` and `@slack/web-api` are now `peerDependencies` of `@vouchr/core` (same ranges;
+  `pg` stays a dependency). A Bolt app installs the same tree as before because npm 7+ installs
+  required peers. A headless host installs with `npm install --omit=peer @vouchr/core` and gets
+  `pg`'s tree alone: the published dependency tree drops from about 130 packages to 15, so
+  supply-chain scanners stop attributing Bolt's express tree to Vouchr. `test/pack-smoke.sh` now
+  proves both consumers (#342).
 
 ### Docs
 
