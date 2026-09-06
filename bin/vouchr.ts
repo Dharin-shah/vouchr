@@ -395,7 +395,7 @@ function printRevokeAllReport(report: RevokeAllReport): void {
     console.log(
       `Would also clear ${m.consents} pending consent + ${m.approvals} approval(s) + ` +
       `${m.userProvisioning} user setup + ${m.channelProvisioning} channel setup request(s) + ` +
-      `${m.notifications} notification state row(s), and invalidate ${m.installations} Slack installation(s).`,
+      `${m.notifications} notification state row(s) + ${m.workerSessions} worker session(s), and invalidate ${m.installations} Slack installation(s).`,
     );
     console.log(`\nNo changes made. Re-run with --confirm ${REVOKE_ALL_CONFIRMATION} to revoke every credential.`);
     return;
@@ -436,7 +436,7 @@ function printRevokeAllReport(report: RevokeAllReport): void {
   console.log(
     `Purged locally: ${bad(c.connections)} connection(s), ${bad(c.consents)} consent(s), ` +
     `${bad(c.approvals)} approval(s), ${bad(c.userProvisioning)} user setup, ` +
-    `${bad(c.channelProvisioning)} channel setup, ${bad(c.notifications)} notification state, ${bad(c.installations)} Slack installation(s).`,
+    `${bad(c.channelProvisioning)} channel setup, ${bad(c.notifications)} notification state, ${bad(c.workerSessions)} worker session(s), ${bad(c.installations)} Slack installation(s).`,
   );
   console.log(
     `\nLocal invalidation is complete when 0 remain: ${report.remaining.credentials} credential(s), ` +

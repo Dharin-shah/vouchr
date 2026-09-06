@@ -180,7 +180,7 @@ class PgClientDb implements Db {
  * binary off the data: `openDb` requires exactly this version, so rolling versions can never
  * interpret stored controls differently.
  */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -414,10 +414,34 @@ function schema(): string {
       -- #296 backchannel authorization: 1 marks an agent-initiated request the Bolt control plane
       -- delivers on its own timer (no Slack turn can relay it); 0 is a fetch-minted row.
       backchannel ${int} NOT NULL DEFAULT 0,
+      -- #360 a worker's request that a channel member authorizes as themselves: 1 marks the row as
+      -- delegated. Its owner/credential are the worker's placeholder session generation until the
+      -- authorizing click rewrites them to that member's credential; 0 is an ordinary row.
+      delegated ${int} NOT NULL DEFAULT 0,
       CHECK (grant_scope IN ('once', 'thread'))
     );
     -- Exact-action approval deduplication depends on this uniqueness.
     CREATE UNIQUE INDEX IF NOT EXISTS uq_approval_request_action ON approval_request (action_key);
+
+    -- #360 one worker's session in one conversation for one provider. Unbound (member NULL): the
+    -- row's id is the placeholder credential generation the worker's pending requests carry, so the
+    -- same action deduplicates and any member may authorize. Bound: the member who clicked, the exact
+    -- credential generation they held, and when; every later request of the worker there asks that
+    -- member and runs as them. expires_at is the idle fence; disconnect/offboard fence via the
+    -- credential generation and the member's tombstone.
+    CREATE TABLE IF NOT EXISTS worker_session (
+      id TEXT PRIMARY KEY,
+      team_id TEXT NOT NULL,
+      channel TEXT NOT NULL,
+      thread TEXT NOT NULL,
+      worker_user_id TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      member_user_id TEXT,
+      credential_id TEXT,
+      bound_at ${int},
+      expires_at ${int} NOT NULL,
+      UNIQUE (team_id, channel, thread, worker_user_id, provider)
+    );
 
     CREATE TABLE IF NOT EXISTS notification_state (
       team_id TEXT NOT NULL,

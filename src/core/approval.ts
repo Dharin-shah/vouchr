@@ -13,6 +13,14 @@ import {
   withUserInteractionFences,
 } from './consent';
 import type { Db } from './db';
+import {
+  bindWorkerSession,
+  endWorkerSessionsForUser,
+  sweepWorkerSessions,
+  touchWorkerSession,
+  unboundWorkerSessionLive,
+  workerSessionFor,
+} from './delegation';
 import type { SlackIdentity } from './identity';
 import {
   approvalActionKey,
@@ -135,6 +143,30 @@ export function effectiveApprover(
 ): Approver {
   const rule = approver ?? (ownerKind === 'channel' ? 'member' : 'self');
   return rule === 'member' && governableChannel === null ? 'self' : rule;
+}
+
+/** How a worker's request is delegated (#360), read from the persisted fields only: `unbound` while
+ * no member has authorized (the worker is its own owner and the credential is the session's
+ * placeholder generation); `bound` once the click rewrote the row to the authorizing member's
+ * credential. Ordinary rows are `none`. */
+export type Delegation = 'none' | 'unbound' | 'bound';
+export function delegationOf(k: Pick<ApprovalKey, 'delegated' | 'ownerKind' | 'ownerId' | 'userId'>): Delegation {
+  if (!k.delegated) return 'none';
+  return k.ownerKind === 'user' && k.ownerId === k.userId ? 'unbound' : 'bound';
+}
+
+/** Who decides ONE request, and who receives a private prompt for it: the requester for an ordinary
+ * `self` rule; any member for an unbound worker request; the bound member, privately, for a worker's
+ * later request in their session. One helper for the injector, both Bolt delivery paths, and the
+ * click (STR-3). */
+export function approvalDecider(
+  approver: Approver | undefined,
+  k: Pick<ApprovalKey, 'delegated' | 'ownerKind' | 'ownerId' | 'userId' | 'governableChannel'>,
+): { approver: Approver; decider: string } {
+  const delegation = delegationOf(k);
+  if (delegation === 'unbound') return { approver: 'member', decider: k.userId };
+  if (delegation === 'bound') return { approver: 'self', decider: k.ownerId };
+  return { approver: effectiveApprover(approver, k.ownerKind, k.governableChannel), decider: k.userId };
 }
 
 /** Finite bound for the agent's `reason` (#350). It is rendered verbatim (escaped) on the decision
@@ -290,6 +322,9 @@ export interface ApprovalKey {
    * cannot silently lose the Slack `channel_type` fact before persistence.
    */
   governableChannel: string | null;
+  /** #360 a worker's request a channel member authorizes as themselves (see {@link delegationOf}).
+   * Only the injector mints it, from the handle's worker flag; absent reads as an ordinary row. */
+  delegated?: boolean;
 }
 
 /** One pending request / unspent grant / persisted denial, as the approve/deny surface and the
@@ -327,7 +362,7 @@ export type ApprovalDecisionResult =
 export interface CredentialUseValidationInput {
   binding: Pick<
     ApprovalKey,
-    'teamId' | 'userId' | 'ownerKind' | 'ownerId' | 'credentialId' | 'provider' | 'channel' | 'thread'
+    'teamId' | 'userId' | 'ownerKind' | 'ownerId' | 'credentialId' | 'provider' | 'channel' | 'thread' | 'delegated'
   >;
   db: Db;
   registry: ProviderRegistry;
@@ -374,6 +409,28 @@ async function credentialUseStateForCurrentActor(
   const identity: ChannelIdentity = governableChannel && channelConfig
     ? await channelConfig.getIdentity(row.teamId, governableChannel, row.provider, db)
     : 'person';
+  // #360 a delegated row's owner is decided by the authorizing member, never resolved from the
+  // worker: it needs a governed `person` channel and a live session. Unbound: the placeholder
+  // generation must still be the live unbound session. Bound: the session must still name this
+  // member and generation, the member must not have been offboarded since binding, and they must
+  // still hold exactly that credential.
+  const delegation = delegationOf(row);
+  if (delegation !== 'none') {
+    if (!governableChannel || identity !== 'person') return 'authorization';
+    const session = await workerSessionFor(db, {
+      teamId: row.teamId, channel: governableChannel, thread: row.thread, workerUserId: row.userId, provider: row.provider,
+    });
+    if (delegation === 'unbound') {
+      return session && !session.memberUserId && session.id === row.credentialId ? 'current' : 'credential';
+    }
+    if (
+      !session || session.memberUserId !== row.ownerId || session.credentialId !== row.credentialId
+      || session.boundAt === null
+    ) return 'authorization';
+    const member: SlackIdentity = { enterpriseId: input.enterpriseId ?? null, teamId: row.teamId, userId: row.ownerId };
+    if (!(await userInteractionIsCurrent(db, member, session.boundAt))) return 'authorization';
+    return (await input.vault.liveId(userOwner(member), row.provider)) === row.credentialId ? 'current' : 'credential';
+  }
   const resolved = identity === 'channel'
     ? resolveCredentialOwner({
         path: 'channel', identity, principal, channel: governableChannel, eligible: governableChannel !== null,
@@ -510,6 +567,7 @@ function toRow(r: any): ApprovalRow {
     reason: r.reason ?? null,
     link: r.link ?? null,
     backchannel: r.backchannel === 1 || r.backchannel === true,
+    delegated: r.delegated === 1 || r.delegated === true,
   };
 }
 
@@ -568,6 +626,7 @@ export class Approvals {
       k.channel ?? '',
       k.thread ?? '',
       this.governanceParam(k),
+      k.delegated ? 1 : 0,
     ];
   }
 
@@ -582,13 +641,25 @@ export class Approvals {
     };
   }
 
+  /** The extra meta a bound worker row carries on `approved` and `approval_consumed` (#360): the
+   * member whose credential runs the call (the row's `user_id` stays the worker), the thread that is
+   * their session, and the agent's reason. Values are already validated at request time. */
+  private delegationMeta(k: ApprovalKey, reason: string | null): AuditMeta {
+    return {
+      delegated: true,
+      owner: k.ownerId,
+      ...(k.thread ? { thread: k.thread } : {}),
+      ...(reason === null ? {} : { reason }),
+    };
+  }
+
   /** The raw-field match for one key after the `action_key` selector: every scope field always, and
    *  the exact action fields only for a `once` grant (a `thread` row records the call that asked,
    *  which a later matching call in the thread need not repeat). One fragment for insert-conflict,
    *  live lookup, and consume, so the three cannot drift. */
   private static readonly MATCH_SQL = `team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
            AND (grant_scope='thread' OR (method=? AND origin=? AND host=? AND path=? AND query_hash=?))
-           AND grant_scope=? AND channel=? AND thread=? AND governable_channel=?`;
+           AND grant_scope=? AND channel=? AND thread=? AND governable_channel=? AND delegated=?`;
 
   /** Insert or reuse the one live row for an action. The unique action index linearizes two
    *  replicas; an expired or denied row is atomically replaced (a denial is a terminal outcome the
@@ -616,8 +687,8 @@ export class Approvals {
       const row = await db.get<{ id: string }>(
         `INSERT INTO approval_request
            (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, query_hash,
-            grant_scope, channel, thread, governable_channel, status, approved_by, created_at, expires_at, reason, link, backchannel)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?,?,?,?)
+            grant_scope, channel, thread, governable_channel, delegated, status, approved_by, created_at, expires_at, reason, link, backchannel)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?,?,?,?)
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
@@ -707,9 +778,11 @@ export class Approvals {
         ...(k.channel ? [{ owner: channelOwner(k.teamId, k.channel), provider: k.provider }] : []),
       ];
       return vault.withCredentialLocks(scopes, async (locked, tx) => {
-        if ((await locked.liveId(owner, k.provider)) !== k.credentialId) {
-          throw new InteractionStateChangedError('approval', 'credential');
-        }
+        // An unbound worker request carries the session's placeholder generation, not a credential.
+        const generationLive = delegationOf(k) === 'unbound'
+          ? await unboundWorkerSessionLive(tx, k.credentialId)
+          : (await locked.liveId(owner, k.provider)) === k.credentialId;
+        if (!generationLive) throw new InteractionStateChangedError('approval', 'credential');
         if ((!validate && k.channel) || (validate && !(await validate(k, tx, locked)))) {
           throw new InteractionStateChangedError('approval', 'authorization');
         }
@@ -950,23 +1023,24 @@ export class Approvals {
     db: Db,
     id: string,
     grant: ApprovalGrant,
-  ): Promise<{ approvedBy: string | null } | null> {
+  ): Promise<{ approvedBy: string | null; reason: string | null } | null> {
     const live = `id=? AND status='granted' AND grant_scope=? AND expires_at>${POSTGRES_NOW_US_SQL}`;
     const row = grant === 'once'
-      ? await db.get<{ approved_by: string | null }>(
-        `DELETE FROM approval_request WHERE ${live} RETURNING approved_by`,
+      ? await db.get<{ approved_by: string | null; reason: string | null }>(
+        `DELETE FROM approval_request WHERE ${live} RETURNING approved_by, reason`,
         [id, grant],
       )
-      : await db.get<{ approved_by: string | null }>(
-        `SELECT approved_by FROM approval_request WHERE ${live}`,
+      : await db.get<{ approved_by: string | null; reason: string | null }>(
+        `SELECT approved_by, reason FROM approval_request WHERE ${live}`,
         [id, grant],
       );
-    return row ? { approvedBy: row.approved_by ?? null } : null;
+    return row ? { approvedBy: row.approved_by ?? null, reason: row.reason ?? null } : null;
   }
 
   private async consumeOn(db: Db, k: ApprovalKey): Promise<{ approvedBy: string | null } | null> {
     const candidate = await this.liveGrantOn(db, k);
-    return candidate ? this.consumeIdOn(db, candidate.id, k.grant) : null;
+    const grant = candidate ? await this.consumeIdOn(db, candidate.id, k.grant) : null;
+    return grant ? { approvedBy: grant.approvedBy } : null;
   }
 
   /** Spend one exact grant and write `approval_consumed` atomically. If audit insertion fails the
@@ -987,10 +1061,16 @@ export class Approvals {
     const consume = async (tx: Db, locked?: Pick<Vault, 'liveId'>) => {
       const candidate = await this.liveGrantOn(tx, k);
       if (!candidate) return null;
-      const fenced = await withUserInteractionFence(
+      // A bound worker grant runs as the authorizing member: their offboard scope is fenced beside
+      // the worker's, and the spend audits them as actor and credential owner with the thread (#360).
+      const delegated = delegationOf(k) === 'bound';
+      const member: SlackIdentity = { enterpriseId: acting.enterpriseId ?? null, teamId: k.teamId, userId: k.ownerId };
+      const fenced = await withUserInteractionFences(
         tx,
-        acting,
-        candidate.createdAt,
+        [
+          { identity: acting, issuedAt: candidate.createdAt },
+          ...(delegated ? [{ identity: member, issuedAt: candidate.createdAt }] : []),
+        ],
         async (fencedTx) => {
           if (locked && ((!validate && k.channel) || (validate && !(await validate(k, fencedTx, locked))))) {
             throw new InteractionStateChangedError('approval', 'authorization');
@@ -1001,12 +1081,18 @@ export class Approvals {
               'approval_consumed',
               acting,
               k.provider,
-              this.auditMeta(k),
+              this.auditMeta(k, delegated ? this.delegationMeta(k, grant.reason) : {}),
               grant.approvedBy ?? undefined,
               fencedTx,
             );
+            if (delegated && k.channel) {
+              const session = await workerSessionFor(fencedTx, {
+                teamId: k.teamId, channel: k.channel, thread: k.thread, workerUserId: k.userId, provider: k.provider,
+              });
+              if (session) await touchWorkerSession(fencedTx, session.id);
+            }
           }
-          return grant;
+          return grant ? { approvedBy: grant.approvedBy } : null;
         },
       );
       if (fenced.status === 'offboarded') {
@@ -1024,6 +1110,8 @@ export class Approvals {
         ...(k.channel ? [{ owner: channelOwner(k.teamId, k.channel), provider: k.provider }] : []),
       ];
       return vault.withCredentialLocks(scopes, async (locked, tx) => {
+        // An unbound worker request has no credential and can hold no grant: nothing to spend.
+        if (delegationOf(k) === 'unbound') return null;
         if ((await locked.liveId(owner, k.provider)) !== k.credentialId) {
           throw new InteractionStateChangedError('approval', 'credential');
         }
@@ -1047,6 +1135,9 @@ export class Approvals {
     audit: Audit;
     enterpriseId?: string | null;
     validate: (row: ApprovalRow, tx: Db) => Promise<'valid' | 'invalidated' | 'ineligible'>;
+    /** #360 an unbound worker request is authorized AS the clicking member: bind the row (owner,
+     * credential generation, action key) and the session to them in the same locked decision. */
+    delegate?: { ownerId: string; credentialId: string };
   }): Promise<ApprovalDecisionResult> {
     if (!isInteractionId(input.id)) return { status: 'stale' };
     if (input.decision !== 'approve' && input.decision !== 'deny') {
@@ -1099,6 +1190,28 @@ export class Approvals {
             userId: row.userId,
           };
           if (input.decision === 'approve') {
+            const delegation = delegationOf(row);
+            if ((delegation === 'unbound') !== (input.delegate !== undefined)) {
+              throw new Error('approval decision delegate does not match the request');
+            }
+            let bound = row;
+            if (input.delegate) {
+              if (input.delegate.ownerId !== input.approvedBy || !isInteractionId(input.delegate.credentialId)) {
+                throw new Error('approval delegate must be the deciding member and a credential generation');
+              }
+              bound = { ...row, ownerKind: 'user', ownerId: input.delegate.ownerId, credentialId: input.delegate.credentialId };
+              const actionKey = approvalActionKey(bound);
+              // An older unspent grant for this exact action under the member's credential is
+              // superseded by this decision, never spent twice.
+              await tx.run(`DELETE FROM approval_request WHERE action_key=? AND id<>?`, [actionKey, row.id]);
+              if (!(await bindWorkerSession(tx, row.credentialId, bound.ownerId, bound.credentialId))) {
+                return { status: 'stale' } as const;
+              }
+              await tx.run(
+                `UPDATE approval_request SET owner_kind='user', owner_id=?, credential_id=?, action_key=? WHERE id=?`,
+                [bound.ownerId, bound.credentialId, actionKey, row.id],
+              );
+            }
             const updated = await tx.get<{ expires_at: number }>(
               `UPDATE approval_request SET status='granted', approved_by=?,
                  expires_at=${POSTGRES_NOW_US_SQL}+? WHERE id=? RETURNING expires_at`,
@@ -1106,17 +1219,23 @@ export class Approvals {
             );
             if (!updated) return { status: 'stale' } as const;
             const expiresAt = updated.expires_at;
+            if (delegation === 'bound' && bound.channel) {
+              const session = await workerSessionFor(tx, {
+                teamId: bound.teamId, channel: bound.channel, thread: bound.thread, workerUserId: bound.userId, provider: bound.provider,
+              });
+              if (session) await touchWorkerSession(tx, session.id);
+            }
             await input.audit.record(
               'approved',
               lockedRequester,
               row.provider,
-              this.auditMeta(row),
+              this.auditMeta(bound, delegation === 'none' ? {} : this.delegationMeta(bound, bound.reason)),
               input.approvedBy,
               tx,
             );
             return {
               status: 'decided',
-              row: { ...row, status: 'granted', approvedBy: input.approvedBy, expiresAt },
+              row: { ...bound, status: 'granted', approvedBy: input.approvedBy, expiresAt },
             } as const;
           }
           const denied = await this.denyOn(tx, row.id, input.approvedBy);
@@ -1150,6 +1269,7 @@ export class Approvals {
       `DELETE FROM approval_request WHERE team_id=? AND user_id=?`,
       [identity.teamId, identity.userId],
     );
+    await endWorkerSessionsForUser(this.db, identity);
   }
 
   /** Delete expired rows (unanswered prompts, unspent grants, AND retained denials), returning them
@@ -1159,6 +1279,7 @@ export class Approvals {
     const rows = await this.db.all<any>(
       `DELETE FROM approval_request WHERE expires_at<${POSTGRES_NOW_US_SQL} RETURNING *`,
     );
+    await sweepWorkerSessions(this.db);
     return rows.map(toRow);
   }
 }

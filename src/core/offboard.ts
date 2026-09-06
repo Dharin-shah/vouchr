@@ -774,6 +774,7 @@ export const RESURRECTION_TABLES = [
   'user_provisioning_request',
   'channel_provisioning_request',
   'notification_state',
+  'worker_session',
 ] as const;
 
 /** Per-connection disposition of the local delete + upstream revoke attempt. Reported in aggregate,
@@ -819,6 +820,8 @@ export interface RevokeLocalCounts {
   userProvisioning: number;
   channelProvisioning: number;
   notifications: number;
+  /** #360 worker thread sessions: a bound one lets a worker's next request ask one member directly. */
+  workerSessions: number;
   installations: number;
 }
 
@@ -914,6 +917,7 @@ const zeroLocalCounts = (): RevokeLocalCounts => ({
   userProvisioning: 0,
   channelProvisioning: 0,
   notifications: 0,
+  workerSessions: 0,
   installations: 0,
 });
 
@@ -925,12 +929,13 @@ async function localCounts(db: Db): Promise<RevokeLocalCounts> {
     userProvisioning: await countRows(db, 'user_provisioning_request'),
     channelProvisioning: await countRows(db, 'channel_provisioning_request'),
     notifications: await countRows(db, 'notification_state'),
+    workerSessions: await countRows(db, 'worker_session'),
     installations: await countRows(db, 'installation'),
   };
 }
 
 function authorizationCount(c: RevokeLocalCounts): number {
-  return c.consents + c.approvals + c.userProvisioning + c.channelProvisioning + c.notifications;
+  return c.consents + c.approvals + c.userProvisioning + c.channelProvisioning + c.notifications + c.workerSessions;
 }
 
 /**
@@ -1068,6 +1073,7 @@ export async function revokeAllCredentials(
     userProvisioning: await del('user_provisioning_request'),
     channelProvisioning: await del('channel_provisioning_request'),
     notifications: await del('notification_state'),
+    workerSessions: await del('worker_session'),
     installations: await del('installation'),
   };
 

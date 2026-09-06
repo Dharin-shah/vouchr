@@ -20,6 +20,12 @@ export const PROMPT_DELIVERY_LEASE_US = 30_000_000;
  */
 export const PROMPT_REDELIVERY_DEBOUNCE_US = 30_000_000;
 
+/** Idle lifetime of a worker's thread session (#360): the member who authorized a worker's first
+ * action in a thread keeps deciding its later actions there until this long passes with no request
+ * or spend. Bounded like every other interaction lifetime; the sweep reclaims expired sessions.
+ * Microseconds. */
+export const WORKER_SESSION_IDLE_TTL_US = 30 * 60 * 1_000_000;
+
 /** Delivery policy supplied by the adapter that owns the actual prompt surface. Defaulting to
  * false preserves durable-message deduplication for direct core callers. */
 export interface PromptDeliveryOptions {
