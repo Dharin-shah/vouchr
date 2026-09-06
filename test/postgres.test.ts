@@ -9,13 +9,13 @@ import {
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig, writeChannelMode, type ChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity, type ChannelIdentity } from '../src/core/channelConfig';
 import { applyChannelToolsEnabled, ChannelTools } from '../src/core/tools';
 import { sweepExpired } from '../src/core/sweep';
 import { userOwner, channelOwner } from '../src/core/owner';
 import { github, defineProvider } from '../src/core/providers';
 import { ConnectionHandle } from '../src/core/injector';
-import { configureChannelCredential, setChannelCredentialMode } from '../src/core/channelCredential';
+import { configureChannelCredential, setChannelCredentialIdentity } from '../src/core/channelCredential';
 import { openTestDb, testDbUrl, pgReachable } from './support/pg';
 
 // Runs the security-critical invariants against a REAL Postgres (not a mock).
@@ -59,44 +59,43 @@ test('postgres backend: channel setup and mode changes serialize in both race di
   const vaultB = new Vault(dbB, KEY);
   const auditA = new Audit(dbA);
   const auditB = new Audit(dbB);
-  const conflict = (mode: 'per-user' | 'session'): never => { throw new Error(`mode conflict: ${mode}`); };
 
   // Mode wins the lock: it deletes the old shared row and pauses before writing per-user. A setup
   // on the other pool must wait, then observe per-user and refuse instead of resurrecting a row.
   const modeFirst = 'mode-first';
-  let beforeModeWrite: ((provider: string, mode: ChannelMode) => Promise<void>) | undefined;
+  let beforeModeWrite: ((provider: string, identity: ChannelIdentity) => Promise<void>) | undefined;
   const configA = new ChannelConfig(dbA, async (provider, mode) => beforeModeWrite?.(provider, mode));
   const configB = new ChannelConfig(dbB);
   await configureChannelCredential({
     vault: vaultA, audit: auditA, channelConfig: configA, identity, channel, providerId: modeFirst,
     issuance: await vaultA.userProvisioningIssuedAt(),
-    credential: { kind: 'secret', token: tok('old-shared') }, modeConflict: conflict,
+    credential: { kind: 'secret', token: tok('old-shared') },
   });
   let modeEntered!: () => void;
   let releaseMode!: () => void;
   const atModeWrite = new Promise<void>((resolve) => { modeEntered = resolve; });
   const modeGate = new Promise<void>((resolve) => { releaseMode = resolve; });
   beforeModeWrite = async (provider, mode) => {
-    if (provider === modeFirst && mode === 'per-user') { modeEntered(); await modeGate; }
+    if (provider === modeFirst && mode === 'person') { modeEntered(); await modeGate; }
   };
   const modeChangeIssuance = await vaultA.userProvisioningIssuedAt();
-  const modeChange = setChannelCredentialMode({
+  const modeChange = setChannelCredentialIdentity({
     vault: vaultA, audit: auditA, channelConfig: configA, identity, channel,
-    providerId: modeFirst, mode: 'per-user', issuance: modeChangeIssuance,
+    providerId: modeFirst, actAs: 'person', issuance: modeChangeIssuance,
   });
   await atModeWrite;
   let setupSettled = false;
   const lateSetup = configureChannelCredential({
     vault: vaultB, audit: auditB, channelConfig: configB, identity, channel, providerId: modeFirst,
     issuance: await vaultB.userProvisioningIssuedAt(),
-    credential: { kind: 'secret', token: tok('late-shared') }, modeConflict: conflict,
+    credential: { kind: 'secret', token: tok('late-shared') },
   }).finally(() => { setupSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(setupSettled, false, 'setup did not wait for the in-flight mode transaction');
   releaseMode();
   await modeChange;
   assert.equal(await lateSetup, false, 'the winning mode change invalidates the older setup receipt');
-  assert.equal(await configB.getMode(identity.teamId, channel, modeFirst), 'per-user');
+  assert.equal(await configB.getIdentity(identity.teamId, channel, modeFirst), 'person');
   assert.equal(await vaultB.get(channelOwner(identity.teamId, channel), modeFirst), null);
 
   // Setup wins the lock: mode waits until the shared row+mode commit, then atomically deletes that
@@ -107,25 +106,25 @@ test('postgres backend: channel setup and mode changes serialize in both race di
   const atSetupModeWrite = new Promise<void>((resolve) => { setupEntered = resolve; });
   const setupGate = new Promise<void>((resolve) => { releaseSetup = resolve; });
   beforeModeWrite = async (provider, mode) => {
-    if (provider === setupFirst && mode === 'shared') { setupEntered(); await setupGate; }
+    if (provider === setupFirst && mode === 'channel') { setupEntered(); await setupGate; }
   };
   const lateModeIssuance = await vaultB.userProvisioningIssuedAt();
   const setup = configureChannelCredential({
     vault: vaultA, audit: auditA, channelConfig: configA, identity, channel, providerId: setupFirst,
     issuance: await vaultA.userProvisioningIssuedAt(),
-    credential: { kind: 'secret', token: tok('new-shared') }, modeConflict: conflict,
+    credential: { kind: 'secret', token: tok('new-shared') },
   });
   await atSetupModeWrite;
   let modeSettled = false;
-  const lateMode = setChannelCredentialMode({
+  const lateMode = setChannelCredentialIdentity({
     vault: vaultB, audit: auditB, channelConfig: configB, identity, channel,
-    providerId: setupFirst, mode: 'per-user', issuance: lateModeIssuance,
+    providerId: setupFirst, actAs: 'person', issuance: lateModeIssuance,
   }).finally(() => { modeSettled = true; });
   await new Promise((resolve) => setTimeout(resolve, 40));
   assert.equal(modeSettled, false, 'mode change did not wait for the in-flight setup transaction');
   releaseSetup();
   await Promise.all([setup, lateMode]);
-  assert.equal(await configB.getMode(identity.teamId, channel, setupFirst), 'per-user');
+  assert.equal(await configB.getIdentity(identity.teamId, channel, setupFirst), 'person');
   assert.equal(await vaultB.get(channelOwner(identity.teamId, channel), setupFirst), null);
 });
 
@@ -184,8 +183,8 @@ test('postgres backend: isolation · crypto-at-rest · reference · ttl · conse
 
   // Channel config mode persists.
   const cfg = new ChannelConfig(db);
-  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'per-user');
-  assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), 'per-user');
+  await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'person');
+  assert.equal(await cfg.getIdentity('T1', 'C_FIN', 'mcp'), 'person');
 
   // #107 stats rollup on the REAL engine. Postgres returns COUNT/BIGINT as strings and lowercases
   // unquoted aliases, so this is what actually verifies statsByChannel's Number() coercion + lowercase

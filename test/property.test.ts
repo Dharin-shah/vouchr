@@ -54,6 +54,7 @@ const randStr = (len: number, alphabet = ALNUM) =>
 // =====================================================================================
 const EG_HOST = 'api.acme.example';
 const egProvider = defineProvider({
+  approval: false,
   id: 'eg',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',
@@ -71,6 +72,7 @@ const egProvider = defineProvider({
 // GitLab-style ids (`group%2Fproject`) stay usable. Used to pin BOTH halves of the encoded-separator
 // rule below (refused under a path lock, allowed without one).
 const egOpenPathProvider = defineProvider({
+  approval: false,
   id: 'eg-open',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',
@@ -352,6 +354,7 @@ test('property: policy check() never throws and honors its invariants', async ()
 // 4. OAuth state single-use, begin() then consume() once; second/unknown are unavailable.
 // =====================================================================================
 const consentProvider = defineProvider({
+  approval: false,
   id: 'cp',
   authorizeUrl: 'https://idp.example/authorize',
   tokenUrl: 'https://idp.example/token',
@@ -429,6 +432,7 @@ test('property: authorize URL always carries the required params; code_challenge
     } else {
       // a synthetic provider with random pkce / scopes to cover both branches densely
       provider = defineProvider({
+        approval: false,
         id: `syn-${randStr(5)}`,
         authorizeUrl: `https://idp${rint(5)}.example/authorize`,
         tokenUrl: 'https://idp.example/token',

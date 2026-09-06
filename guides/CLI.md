@@ -51,7 +51,7 @@ vouchr inventory --team T123 --provider github
 
 ### `channels`
 Per-channel policy at a glance from `channel_config` + `channel_tool`: team, channel,
-provider, mode (`shared` | `per-user` | `session`), enabled (`yes` | `no` | `-`).
+provider, identity (`person` | `channel`), enabled (`yes` | `no` | `-`).
 
 ```bash
 vouchr channels --team T123
@@ -97,7 +97,7 @@ vouchr revoke --all --confirm ALL-CREDENTIALS    # execute: wipe every stored cr
 uses the stronger `--confirm ALL-CREDENTIALS` token instead of `--yes`. It enumerates every stored
 provider id from PostgreSQL — **including removed/unregistered ones** — then per provider attempts
 best-effort upstream revocation, and finally blanket-deletes every `connection`, external reference,
-pending consent, session grant/request, action approval, notification-state row, and **Slack
+pending consent, action approval (thread grants included), notification-state row, and **Slack
 installation** credential. Local deletion needs no master key, KMS, provider config, or upstream
 availability, so it completes even when those are broken. Dry-run reports `would_attempt` without
 claiming success. Execution reports, per registered provider, attempted rows plus `revoked`, `failed`

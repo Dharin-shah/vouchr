@@ -9,11 +9,39 @@ import { MAX_TIMER_MS } from './options';
 export type RefreshStrategy = 'rotating' | 'static' | 'none';
 export type RevokeTarget = 'access' | 'refresh' | 'both' | 'grant';
 
-/** Who may decide a #113 approval: the acting user, or any other current member of the owning
- * channel (#322). The one source for the enum: the provider validator, the core approval store, the
- * Bolt renderer/handlers, and the declarative config all import it. */
+/** Who may decide an approval: the acting user, or any other current member of the owning channel
+ * (#322). The one source for the enum: the provider validator, the core approval store, the Bolt
+ * renderer/handlers, and the declarative config all import it. */
 export const APPROVERS = ['self', 'member'] as const;
 export type Approver = (typeof APPROVERS)[number];
+
+/** What one approval covers (#350): `once` spends on exactly one matching call; `thread` covers
+ * every matching call in the approving Slack thread until `ttlMs`. */
+export const APPROVAL_GRANTS = ['once', 'thread'] as const;
+export type ApprovalGrant = (typeof APPROVAL_GRANTS)[number];
+
+/** How long a granted approval stays usable unless the provider sets `approval.ttlMs`. */
+export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * The provider's approval rule after normalization (#350). Every provider carries one unless it
+ * declares `approval: false`: the default asks another channel member once per non-read call.
+ *  - `methods`: which HTTP methods ask. Unset = every method except GET and HEAD (the one place that
+ *    default lives is `approvalNeeded` in the injector).
+ *  - `paths`: narrow to these paths (same matcher semantics as `egressPaths`). Unset = every path.
+ *  - `approver`: `member` (any OTHER current member of the owning channel; in a DM, where no channel
+ *    governs the action, it degrades to `self` via `effectiveApprover`) or `self`.
+ *  - `grant`: `once` (single use, exact action) or `thread` (one approval covers every matching call
+ *    in the approving thread until `ttlMs`; outside a thread it behaves as `once`).
+ *  - `ttlMs`: how long a grant stays usable. Default 5 minutes.
+ */
+export interface ApprovalRule {
+  methods?: string[];
+  paths?: string[];
+  approver: Approver;
+  grant: ApprovalGrant;
+  ttlMs: number;
+}
 
 /** A provider is declarative OAuth2 + a refresh strategy + an egress allowlist. */
 export interface Provider {
@@ -90,23 +118,15 @@ export interface Provider {
    */
   rateLimit?: { perMinute: number; burst?: number };
   /**
-   * OPT-IN human-in-the-loop approval for sensitive writes (#113), enforced in the injector AFTER
-   * every egress gate (an ADDITIONAL gate, never a bypass — an egress-denied target never prompts)
-   * and BEFORE the secret is read or anything goes out on the wire. A matching request with no
-   * live grant throws `ApprovalRequiredError` (the Bolt adapter posts Approve/Deny buttons; the
-   * headless broker returns 403 `approval_required`). A grant is SINGLE-USE, TTL-bound, and matches
-   * ONLY the exact (method, host, path) it was minted for — never the request body (see the threat
-   * model: approval covers the endpoint + method, not the payload bytes).
-   *  - `methods`: which HTTP methods require approval. Default: every non-read method (anything
-   *    but GET/HEAD) — see `approvalNeeded` in the injector, the one place that default lives.
-   *  - `paths`: narrow the requirement to these paths (same matcher semantics as `egressPaths`).
-   *    Default: every path.
-   *  - `approver`: REQUIRED — 'self' (the acting user confirms their own action) or 'member' (any
-   *    OTHER current member of the owning channel confirms, #322; in a DM/group DM, where no channel
-   *    governs the action, `member` degrades to `self` — see `effectiveApprover`).
-   *  - `ttlMs`: how long a granted approval stays spendable. Default 5 minutes.
+   * Human-in-the-loop approval for writes, ON BY DEFAULT (#350), enforced in the injector AFTER every
+   * egress gate (an additional gate, never a bypass) and BEFORE the secret is read or anything goes
+   * out on the wire. A matching request with no live grant throws `ApprovalRequiredError` (the Bolt
+   * adapter posts Approve/Deny buttons; the headless broker returns 403 `approval_required`). A grant
+   * matches the exact (method, origin, path, query) it was minted for, never the request body (see
+   * the threat model). `false` switches the gate off for this provider. See {@link ApprovalRule}.
+   * `defineProvider` normalizes an omitted or partial rule to its defaults.
    */
-  approval?: { methods?: string[]; paths?: string[]; approver: Approver; ttlMs?: number };
+  approval?: ApprovalRule | false;
   /**
    * How the secret is attached to the outbound request. Mutate `headers` in place.
    * Default (unset): `Authorization: Bearer <secret>`. Use for non-Bearer APIs/MCPs,
@@ -175,7 +195,11 @@ export interface Provider {
  * tools run on the host's own service auth — never a Vouchr connection, never a Connect prompt,
  * never advertised as connectable. Accepts anything carrying the manifest `identity` field too.
  */
-export const isBrokeredProvider = (p: Pick<Provider, 'identity'>): boolean => p.identity !== 'service';
+export const isBrokeredProvider = (p: { identity?: string }): boolean => p.identity !== 'service';
+
+/** What a host registers: a {@link Provider} whose approval rule may be partial (or absent) before
+ * `defineProvider` fills in the defaults. */
+export type ProviderSpec = Omit<Provider, 'approval'> & { approval?: Partial<ApprovalRule> | false };
 
 export interface ProviderConfig {
   clientId?: string;
@@ -189,14 +213,15 @@ export interface ProviderConfig {
   egressResponse?: Provider['egressResponse'];
   /** Optional per-(owner, provider) throttle at the injection boundary (see Provider). */
   rateLimit?: { perMinute: number; burst?: number };
-  /** Optional human-in-the-loop approval for sensitive writes (see Provider). */
-  approval?: Provider['approval'];
+  /** Which calls wait for a human (see {@link ApprovalRule}); `false` switches approval off. Every
+   *  field is optional here: the defaults ask another channel member once per non-read call. */
+  approval?: Partial<ApprovalRule> | false;
   /** Shared token/revoke/account-probe deadline (default 10 seconds). */
   oauthTimeoutMs?: number;
 }
 
 /** The common per-config controls passed through to every built-in provider. */
-function egressOptions(cfg: ProviderConfig): Pick<Provider, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit' | 'approval' | 'oauthTimeoutMs'> {
+function egressOptions(cfg: ProviderConfig): Pick<ProviderSpec, 'egressPaths' | 'egressMethods' | 'egressValidate' | 'egressResponse' | 'rateLimit' | 'approval' | 'oauthTimeoutMs'> {
   return {
     egressPaths: cfg.egressPaths,
     egressMethods: cfg.egressMethods,
@@ -636,7 +661,7 @@ function freezeProvider(provider: Provider): Provider {
     if (provider[key]) Object.freeze(provider[key]);
   }
   for (const key of ['egressResponse', 'mcp', 'rateLimit', 'approval'] as const) {
-    const nested = provider[key] as Record<string, unknown> | undefined;
+    const nested = provider[key] as Record<string, unknown> | false | undefined;
     if (!nested) continue;
     for (const value of Object.values(nested)) if (Array.isArray(value)) Object.freeze(value);
     Object.freeze(nested);
@@ -645,7 +670,7 @@ function freezeProvider(provider: Provider): Provider {
 }
 
 /** Normalize, validate, defensively copy, and freeze every provider registration path. */
-export function defineProvider(spec: Provider): Provider {
+export function defineProvider(spec: ProviderSpec): Provider {
   if (!isPlainRecord(spec)) providerError('provider', 'must be an object');
   if (Object.keys(spec).some((key) => !PROVIDER_FIELDS.has(key))) providerError('provider', 'contains an unknown field');
   if (!isValidProviderId(spec.id)) providerError('id', 'is invalid; use a conservative identifier of at most 63 characters');
@@ -752,18 +777,24 @@ export function defineProvider(spec: Provider): Provider {
     rateLimit = { perMinute, ...(burst === undefined ? {} : { burst }) };
   }
 
-  let approval: Provider['approval'];
-  if (spec.approval !== undefined) {
-    if (!isPlainRecord(spec.approval)) providerError('approval', 'must be an object');
-    assertKnownKeys(spec.approval, ['methods', 'paths', 'approver', 'ttlMs'], 'approval');
+  // #350: approval is on unless the provider opts out. An omitted or partial rule takes the defaults
+  // (member approver, once, five minutes); `false` is the only way to switch the gate off.
+  let approval: Provider['approval'] = false;
+  if (spec.approval !== false) {
+    const rule: unknown = spec.approval === undefined ? {} : spec.approval;
+    if (!isPlainRecord(rule)) providerError('approval', 'must be an object or false');
+    assertKnownKeys(rule, ['methods', 'paths', 'approver', 'grant', 'ttlMs'], 'approval');
     // Declarative config is raw JSON, so the removed value is compared as unknown (#322).
-    if ((spec.approval.approver as unknown) === 'admin') providerError('approval.approver', "'admin' was removed: workspace admins are not a Vouchr role. Use 'member' (any other member of the owning channel) or 'self'");
-    if (!(APPROVERS as readonly unknown[]).includes(spec.approval.approver)) providerError('approval.approver', 'has an unsupported value');
-    const methods = canonicalMethods(spec.approval.methods, 'approval.methods');
-    const paths = canonicalPaths(spec.approval.paths, 'approval.paths');
-    const ttlMs = spec.approval.ttlMs;
-    if (ttlMs !== undefined && (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0)) providerError('approval.ttlMs', 'must be a positive safe integer');
-    approval = { approver: spec.approval.approver, ...(methods ? { methods } : {}), ...(paths ? { paths } : {}), ...(ttlMs === undefined ? {} : { ttlMs: ttlMs as number }) };
+    if ((rule.approver as unknown) === 'admin') providerError('approval.approver', "'admin' was removed: workspace admins are not a Vouchr role. Use 'member' (any other member of the owning channel) or 'self'");
+    const approver = optionalEnum(rule.approver, 'approval.approver', APPROVERS, 'member') as Approver;
+    const grant = optionalEnum(rule.grant, 'approval.grant', APPROVAL_GRANTS, 'once') as ApprovalGrant;
+    const methods = canonicalMethods(rule.methods, 'approval.methods');
+    const paths = canonicalPaths(rule.paths, 'approval.paths');
+    const ttlMs = rule.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
+    if (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0 || (ttlMs as number) > MAX_TIMER_MS) {
+      providerError('approval.ttlMs', `must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
+    }
+    approval = { approver, grant, ttlMs: ttlMs as number, ...(methods ? { methods } : {}), ...(paths ? { paths } : {}) };
   }
 
   for (const field of ['egressValidate', 'inject', 'revoke', 'accountProbe'] as const) {
@@ -805,7 +836,7 @@ export function defineProvider(spec: Provider): Provider {
   if (revokeAuth === 'body' && (!spec.clientId || !spec.clientSecret)) providerError('revokeAuth', 'requires clientId and clientSecret');
 
   return freezeProvider({
-    ...spec,
+    ...(spec as Provider),
     credential,
     identity,
     authorizeUrl,
@@ -1101,7 +1132,7 @@ export function databricks(cfg: DatabricksConfig): Provider {
 
 export class ProviderRegistry {
   private map = new Map<string, Provider>();
-  constructor(providers: Provider[]) {
+  constructor(providers: ProviderSpec[]) {
     // The registry is a public registration path, so it must not trust callers to have used the
     // factory. Re-normalize every input, then retain only frozen defensive copies: mutating either
     // the original object or a nested allowlist after registration cannot widen live egress.

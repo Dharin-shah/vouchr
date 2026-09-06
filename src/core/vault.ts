@@ -4,7 +4,6 @@ import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
 import { purgeApprovalsForOwner } from './approval';
 import { hideInternals } from './redact';
-import { purgeSessionsForOwner } from './session';
 import {
   InteractionStateChangedError,
   isInteractionId,
@@ -243,13 +242,13 @@ export class Vault {
   }
 
   /** Metadata-only live existence check for control-flow gates that must run before any credential
-   *  decrypt (for example session approval). Uses the same TTL predicate as get(). */
+   *  decrypt (for example an approval request). Uses the same TTL predicate as get(). */
   async hasLive(owner: Owner, provider: string): Promise<boolean> {
     return (await this.liveId(owner, provider)) !== null;
   }
 
   /** Metadata-only current credential generation. Reconnect/reconfiguration writes a fresh row id;
-   * approvals, sessions, and handles bind to it so authority for generation A can never read B. */
+   * approvals and handles bind to it so authority for generation A can never read B. */
   async liveId(owner: Owner, provider: string): Promise<string | null> {
     const row = await this.db.get<{ id: string; created_at: number; last_used_at: number | null }>(
       `SELECT id, created_at, last_used_at FROM connection
@@ -332,7 +331,6 @@ export class Vault {
       [owner.teamId, owner.kind, owner.id, provider],
     );
     await purgeApprovalsForOwner(db, owner, provider);
-    await purgeSessionsForOwner(db, owner, provider);
     if (owner.kind === 'user') {
       await db.run(
         `DELETE FROM user_provisioning_request WHERE team_id=? AND user_id=? AND provider=?`,
@@ -697,7 +695,7 @@ export class Vault {
    * Claim-delete the EXACT credential generation inside a transaction the caller already holds (its
    * credential lock + governance fence), returning decoded token material for a post-commit upstream
    * revoke. The exact-id match plus the held credential lock make the delete atomic with the caller's
-   * own mode flip and satellite purge — a concurrent reconnect cannot slip a newer credential between
+   * own identity flip and satellite purge; a concurrent reconnect cannot slip a newer credential between
    * the caller's generation snapshot and this delete. No provisioning-revocation marker is written:
    * the caller's channel-interaction tombstone already fences a stalled setup request, and a durable
    * marker would wedge a later legitimate re-configure. `decrypt=false` (unregistered provider) keeps
@@ -1143,7 +1141,7 @@ export class Vault {
 
   /**
    * Serialize one credential's lifecycle across replicas and run `fn` in the same transaction as
-   * the advisory lock. Channel mode changes and credential setup use this boundary so neither can
+   * the advisory lock. Channel identity changes and credential setup use this boundary so neither can
    * commit against a stale view of the other; refresh delegates to the same owner/provider key.
    * A transaction-bound Vault has no lock method and simply reuses its current transaction.
    */
@@ -1157,7 +1155,7 @@ export class Vault {
 
   /** Serialize several credential/governance keys in canonical order inside one transaction. The
    *  owner/provider → advisory-key representation lives only here (STR-2); callers supply typed
-   *  scopes and cannot accidentally choose a lock that disagrees with refresh/mode writers. */
+   *  scopes and cannot accidentally choose a lock that disagrees with refresh/identity writers. */
   async withCredentialLocks<T>(
     scopes: readonly { owner: Owner; provider: string }[],
     fn: (locked: Vault, tx: Db) => Promise<T>,

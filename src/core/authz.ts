@@ -1,16 +1,15 @@
 import { userOwner, channelOwner, type Owner } from './owner';
 import type { SlackIdentity } from './identity';
-import { ChannelConfig, type ChannelMode } from './channelConfig';
+import { ChannelConfig, type ChannelIdentity } from './channelConfig';
 import type { Policy } from './policy';
 import { ChannelTools, type ToolManifestEntry } from './tools';
-import type { ProviderRegistry } from './providers';
+import { isBrokeredProvider, type ProviderRegistry } from './providers';
 import type { Db } from './db';
 
 /**
  * The two SECURITY-CRITICAL decisions — credential-owner resolution and provider authorization —
  * as ONE transport-agnostic source of truth both adapters (Bolt + the headless HTTP broker) call.
- * They used to be duplicated across the two adapters and DRIFTED (that drift is how the session-mode
- * fail-closed rule went missing on the broker). Keeping the DECISION here means the Bolt path, the
+ * They used to be duplicated across the two adapters and DRIFTED. Keeping the DECISION here means the
  * Bolt adapter and packaged broker enforce the identical rule; each adapter keeps only its own
  * transport I/O (Slack client / HTTP status / audit meta / Block Kit prompts) and maps the result.
  *
@@ -91,28 +90,28 @@ export async function snapshotToolAllowlist(
   return (provider) => values.get(provider) ?? false;
 }
 
-/** Batched mode resolver with the same compatibility rule as {@link snapshotToolAllowlist}. */
-export async function snapshotChannelModes(
+/** Batched identity resolver with the same compatibility rule as {@link snapshotToolAllowlist}. */
+export async function snapshotChannelIdentities(
   store: ChannelConfig,
   teamId: string,
   channel: string,
   providerIds: readonly string[],
-): Promise<(provider: string) => ChannelMode | null> {
-  if (providerIds.length === 0) return () => null;
-  const batch = (store as Partial<ChannelConfig>).modeSnapshot;
-  const single = (store as Partial<ChannelConfig>).getMode;
-  if (usableBatchMethod(batch, ChannelConfig.prototype.modeSnapshot, single === ChannelConfig.prototype.getMode)) {
+): Promise<(provider: string) => ChannelIdentity> {
+  if (providerIds.length === 0) return () => 'person';
+  const batch = (store as Partial<ChannelConfig>).identitySnapshot;
+  const single = (store as Partial<ChannelConfig>).getIdentity;
+  if (usableBatchMethod(batch, ChannelConfig.prototype.identitySnapshot, single === ChannelConfig.prototype.getIdentity)) {
     return batch.call(store, teamId, channel);
   }
-  if (typeof single !== 'function') throw new Error('channel config store must implement getMode');
-  const values = new Map<string, ChannelMode | null>();
+  if (typeof single !== 'function') throw new Error('channel config store must implement getIdentity');
+  const values = new Map<string, ChannelIdentity>();
   for (const provider of new Set(providerIds)) values.set(provider, await single.call(store, teamId, channel, provider));
-  return (provider) => values.get(provider) ?? null;
+  return (provider) => values.get(provider) ?? 'person';
 }
 
 /**
  * A DM or group-DM is a PERSONAL conversation that per-channel governance (the mutable tool
- * allowlist + credential mode) does not reach: there is no channel roster to enable a provider, so
+ * allowlist + channel identity) does not reach: there is no channel roster to enable a provider, so
  * deny-by-default must NOT lock it out. Map a VERIFIED delivery channel to its mutable-governance
  * scope — null for a personal conversation, else the channel itself. Static Policy is a DIFFERENT
  * axis (deployment config, not channel-mutable) and keeps evaluating against the real delivery channel,
@@ -197,11 +196,11 @@ export async function authorizeProvider(
 /**
  * The channel-scoped tool manifest an agent reads before planning: for every registered provider,
  * whether it's usable here (`enabled` = exactly "authorizeProvider would allow it", so the manifest
- * can never disagree with what connect()/fetch would do), the channel's credential mode, who the
- * agent acts as. ONE builder for both adapters — Bolt's
+ * can never disagree with what connect()/fetch would do) and who the agent acts as there. ONE
+ * builder for both adapters — Bolt's
  * `toolManifest()` and the broker's `POST /v1/manifest` — so the two transports can't drift (the
  * broker shipped without ANY channel-scoped manifest at first, which is this file's failure mode).
- * With no channel (or no store opted in): mode null, no allowlist restriction.
+ * With no channel (or no store opted in): identity 'person', no allowlist restriction.
  */
 export interface ToolManifestBuildOptions {
   providerIds: string[];
@@ -212,8 +211,8 @@ export interface ToolManifestBuildOptions {
   principal: SlackIdentity;
   /** The real delivery channel static Policy evaluates against (a DM included). */
   channel: string | null;
-  /** The mutable-governance scope (tool allowlist + mode); null in a personal conversation so a DM
-   *  reports personal providers enabled. Defaults to `channel` when omitted (a governed channel). */
+  /** The mutable-governance scope (tool allowlist + identity); null in a personal conversation so a
+   *  DM reports personal providers enabled. Defaults to `channel` when omitted (a governed channel). */
   governanceChannel?: string | null;
 }
 
@@ -225,36 +224,32 @@ export async function buildToolManifestSnapshot(o: ToolManifestBuildOptions): Pr
   toolAllowed: (provider: string) => boolean;
 }> {
   if (o.providerIds.length === 0) return { tools: [], toolAllowed: () => true };
-  // Governance (tool allowlist + mode) is scoped to the mutable-governance channel — null in a DM, so
-  // the manifest reports personal providers enabled there; static Policy still evaluates against the
-  // real delivery channel below, so a policy-denied provider is still reported disabled in a DM.
+  // Governance (tool allowlist + identity) is scoped to the mutable-governance channel: null in a DM,
+  // so the manifest reports personal providers enabled there; static Policy still evaluates against
+  // the real delivery channel below, so a policy-denied provider is still reported disabled in a DM.
   const governanceChannel = o.governanceChannel === undefined ? o.channel : o.governanceChannel;
-  // Two channel-scoped batch reads (tool allowlist and mode) — a fixed query count regardless of
-  // provider count, replacing the per-provider isEnabled/getMode fan-out (#209). With no governance
-  // channel (or no store) there is nothing channel-scoped to read: tools unrestricted and mode null.
-  // These facts are independent. Dispatch their reads together so a slow database costs one
-  // round-trip window, not two serial windows (important before Slack trigger_id expiry).
-  const [toolAllowed, modeOf] = await Promise.all([
+  // Two channel-scoped batch reads (tool allowlist and identity), a fixed query count regardless of
+  // provider count (#209). With no governance channel (or no store) there is nothing channel-scoped
+  // to read: tools unrestricted and everyone acts as themselves. Dispatch the two reads together so
+  // a slow database costs one round-trip window (important before Slack trigger_id expiry).
+  const [toolAllowed, identityOf] = await Promise.all([
     governanceChannel && o.channelTools
       ? snapshotToolAllowlist(o.channelTools, o.principal.teamId, governanceChannel, o.providerIds)
       : Promise.resolve((_provider: string) => true),
     governanceChannel && o.channelConfig
-      ? snapshotChannelModes(o.channelConfig, o.principal.teamId, governanceChannel, o.providerIds)
-      : Promise.resolve((_provider: string): ChannelMode | null => null),
+      ? snapshotChannelIdentities(o.channelConfig, o.principal.teamId, governanceChannel, o.providerIds)
+      : Promise.resolve((_provider: string): ChannelIdentity => 'person'),
   ]);
-  const tools = o.providerIds.map((provider) => {
+  const tools = o.providerIds.map((provider): ToolManifestEntry => {
     const policyAllows = !o.policy || o.policy.check(provider, o.channel);
-    const identity = o.registry.get(provider).identity ?? 'acting_human';
     return {
       provider,
-      // Service tools have no Vouchr-owned credential, so even a stale legacy config row cannot
-      // advertise a credential mode that the runtime will never honor.
-      mode: identity === 'service' ? null : modeOf(provider),
       // `enabled` = exactly authorizeProvider's verdict (via the shared authorizeVerdict), so the manifest
       // can never disagree with what connect()/fetch enforce in this channel.
       enabled: authorizeVerdict(policyAllows, toolAllowed(provider)) === null,
-      // 'acting_human' (default) → Vouchr brokers it via connect(); 'service' → host's own service auth.
-      identity,
+      // A service tool has no Vouchr-owned credential, so even a stale config row cannot advertise a
+      // channel identity the runtime will never honor.
+      identity: isBrokeredProvider(o.registry.get(provider)) ? identityOf(provider) : 'service',
     };
   });
   return { tools, toolAllowed };
@@ -272,66 +267,55 @@ export type OwnerResolution =
   | { status: 'resolved'; owner: Owner; acting: SlackIdentity }
   /** No credential to serve: the caller is not connected. */
   | { status: 'needs_consent' }
-  /** Session mode, fail-closed: no thread to scope a grant, or no live grant for it. */
-  | { status: 'needs_session'; reason: 'no-thread' | 'no-session-grant' }
-  /** Channel-borrow refused: an ineligible channel class, or a channel not configured for a channel cred. */
+  /** Channel credential refused: an ineligible channel class, or a channel whose identity is 'person'. */
   | { status: 'refused'; code: 'ineligible' | 'not_configured' };
 
 export interface OwnerInputs {
   /**
-   * Which credential family the caller is on. The Bolt path derives this from the mode (`connect()` for
-   * user-owned, `connectChannel()` for shared); the broker derives it from the SIGNED `ownerKind`.
-   * 'user' → the caller's own credential (+ the session gate); 'channel' → the channel's shared credential.
+   * Which credential family the caller is on. The Bolt path derives this from the channel identity
+   * (`connect()` for the person's own credential, `connectChannel()` for the channel's); the broker
+   * derives it from the SIGNED `ownerKind`.
    */
   path: 'user' | 'channel';
-  /** The channel's configured mode for this provider; null = unconfigured (treated as per-user). */
-  mode: ChannelMode | null;
+  /** Who the agent acts as for this provider in the channel ('person' where nothing is configured). */
+  identity: ChannelIdentity;
   /** The acting human. Owner + audit derive from this + verified facts, NEVER a request body. */
   principal: SlackIdentity;
   /** The VERIFIED channel this request is in (Slack event / signed claim), or null off-channel. */
   channel: string | null;
   /**
-   * Channel-borrow eligibility verdict, already computed by the adapter from the channel class via the
-   * core `channelIneligibleReason` rule. Fail-closed: only an explicit `true` is eligible; undefined/false
-   * refuses. (Only consulted on the channel path.)
+   * Channel-credential eligibility verdict, already computed by the adapter from the channel class via
+   * the core `channelIneligibleReason` rule. Fail-closed: only an explicit `true` is eligible;
+   * undefined/false refuses. (Only consulted on the channel path.)
    */
   eligible?: boolean;
-  /** session: the thread to scope the grant to (null off-thread), and whether a live grant exists. */
-  thread?: string | null;
-  hasSessionGrant?: boolean;
   /**
-   * user path: whether the caller already has a stored credential. Explicit `false` → needs_consent
-   * (the Bolt path uses this to prompt). Undefined → resolve and let the injector 409 on a missing cred
-   * (the broker relies on this — it never pre-reads the vault).
+   * user path: whether the caller already has a stored credential. Explicit `false` -> needs_consent
+   * (the Bolt path uses this to prompt). Undefined -> resolve and let the injector 409 on a missing cred
+   * (the broker relies on this; it never pre-reads the vault).
    */
   hasUserCredential?: boolean;
 }
 
 /**
- * Resolve which credential owner serves a request, or WHY it can't — the single source of truth both
- * adapters call. It folds in the session-mode fail-closed rule (a `session` channel is usable only inside
- * a thread with a live grant) and the channel-borrow eligibility + mode→owner mapping, so neither can
- * drift between the two transports. Pure: no I/O, no Slack/HTTP; the caller supplies verified facts.
+ * Resolve which credential owner serves a request, or WHY it can't: the single source of truth both
+ * adapters call. It folds in the channel-credential eligibility + identity -> owner mapping, so
+ * neither can drift between the two transports. Pure: no I/O, no Slack/HTTP; the caller supplies
+ * verified facts.
  */
 export function resolveCredentialOwner(i: OwnerInputs): OwnerResolution {
   if (i.path === 'user') {
-    // 'session' is the one user-owned mode with a fail-closed gate: a live grant for THIS thread. Checked
-    // before the stored-credential shortcut, so "connected once" still needs per-thread approval.
-    if (i.mode === 'session') {
-      if (!i.thread) return { status: 'needs_session', reason: 'no-thread' };
-      if (!i.hasSessionGrant) return { status: 'needs_session', reason: 'no-session-grant' };
-    }
     if (i.hasUserCredential === false) return { status: 'needs_consent' };
     return { status: 'resolved', owner: userOwner(i.principal), acting: i.principal };
   }
 
-  // channel-borrow (shared). Eligibility is fail-closed for a channel-owned credential (invariant 6):
-  // an externally-shared / Slack-Connect / DM / archived channel would leak cross-org.
+  // Channel credential. Eligibility is fail-closed (invariant 6): an externally-shared /
+  // Slack-Connect / DM / archived channel would leak cross-org.
   if (i.eligible !== true) return { status: 'refused', code: 'ineligible' };
-  if (i.mode === 'shared' && i.channel) {
+  if (i.identity === 'channel' && i.channel) {
     // The channel OWNS the credential; the audited actor stays the acting human (invariant 9).
     return { status: 'resolved', owner: channelOwner(i.principal.teamId, i.channel), acting: i.principal };
   }
-  // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
+  // 'person' is user-owned; a channel handle can't reach it.
   return { status: 'refused', code: 'not_configured' };
 }

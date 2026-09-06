@@ -7,7 +7,6 @@ export type { SlackOidcOptions } from './adapters/slackVerify';
 // Unknown/foreign messages never cross this boundary.
 export {
   ConsentRequiredError,
-  SessionApprovalRequiredError,
   UpstreamTimeoutError,
   UserFacingError,
   VOUCHR_ERROR_CODES,
@@ -43,8 +42,10 @@ export { InteractionStateChangedError } from './core/interaction';
 export {
   ApprovalPathTooLongError,
   ApprovalRequiredError,
-  MAX_BINDING_MESSAGE_BYTES,
-  assertBindingMessage,
+  MAX_REASON_BYTES,
+  MAX_LINK_BYTES,
+  assertReason,
+  assertLink,
   effectiveApprover,
 } from './core/approval';
 export type { AuthorizationStatus } from './core/approval';
@@ -100,8 +101,8 @@ export { DbInstallationStore } from './adapters/installationStore';
 export type { DbInstallationStoreOptions } from './adapters/installationStore';
 // Re-export Bolt's installation types so consumers can wire the store without importing @slack/bolt directly.
 export type { Installation, InstallationQuery, InstallationStore } from '@slack/bolt';
-export type { ChannelMode } from './core/channelConfig';
-export { CHANNEL_MODES, isChannelMode } from './core/channelConfig';
+export type { ChannelIdentity } from './core/channelConfig';
+export { CHANNEL_IDENTITIES, isChannelIdentity } from './core/channelConfig';
 export { ChannelTools } from './core/tools';
 export type { ToolManifestEntry } from './core/tools';
 // #64 pure Block Kit builders (strings in, Block Kit JSON out — no chat SDK). Exported so a headless

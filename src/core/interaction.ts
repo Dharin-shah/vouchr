@@ -43,7 +43,7 @@ export type PromptDeliveryClaim =
   | { status: 'claimed'; token: string }
   | { status: 'delivered' | 'in-flight' | 'stale' };
 
-export const INTERACTION_KINDS = Object.freeze(['connection', 'session', 'approval'] as const);
+export const INTERACTION_KINDS = Object.freeze(['connection', 'approval'] as const);
 export type InteractionKind = (typeof INTERACTION_KINDS)[number];
 
 export const INTERACTION_STATE_REASONS = Object.freeze([
@@ -107,6 +107,9 @@ export interface ApprovalActionFields {
   ownerKind: string;
   ownerId: string;
   credentialId: string;
+  /** `once` binds the exact action below; `thread` binds only the conversation, so every matching
+   *  call in that thread selects the same row (#350). */
+  grant: 'once' | 'thread';
   method: string;
   origin: string;
   host: string;
@@ -127,17 +130,19 @@ export interface ApprovalActionFields {
  * fails closed instead of reusing or consuming another action).
  */
 export function approvalActionKey(k: ApprovalActionFields): string {
+  const exact = k.grant === 'once';
   const fields = [
     k.teamId,
     k.userId,
     k.ownerKind,
     k.ownerId,
     k.credentialId,
-    k.method,
-    k.origin,
-    k.host,
-    k.path,
-    k.queryHash,
+    k.grant,
+    exact ? k.method : '',
+    exact ? k.origin : '',
+    exact ? k.host : '',
+    exact ? k.path : '',
+    exact ? k.queryHash : '',
     k.channel ?? '',
     k.thread ?? '',
   ];
@@ -172,10 +177,10 @@ export async function latestChannelInteractionTombstone(
 
 /**
  * Invalidate every pending control and live grant whose authority depends on one channel/provider
- * governance tuple. Mode and tool changes call this inside their already-locked mutation
- * transaction, so an enabled→disabled→enabled or session→per-user→session ABA cannot resurrect an
- * old decision. This is intentionally broader than credential-owner satellite cleanup: it covers
- * both user- and channel-owned approvals, every user's thread session, and every outstanding
+ * governance tuple. Identity and tool changes call this inside their already-locked mutation
+ * transaction, so an enabled -> disabled -> enabled or channel -> person -> channel ABA cannot
+ * resurrect an old decision. This is intentionally broader than credential-owner satellite cleanup:
+ * it covers both user- and channel-owned approvals (thread grants included) and every outstanding
  * channel-credential setup request for the tuple.
  */
 export async function purgeChannelInteractionState(
@@ -198,14 +203,6 @@ export async function purgeChannelInteractionState(
        excluded.created_at
      )`,
     [teamId, channel, provider, clock!.created_at],
-  );
-  await db.run(
-    `DELETE FROM session_request WHERE team_id=? AND channel=? AND provider=?`,
-    [teamId, channel, provider],
-  );
-  await db.run(
-    `DELETE FROM session_grant WHERE team_id=? AND channel=? AND provider=?`,
-    [teamId, channel, provider],
   );
   await db.run(
     `DELETE FROM approval_request WHERE team_id=? AND channel=? AND provider=?`,

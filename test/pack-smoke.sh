@@ -38,7 +38,7 @@ echo "==> require() every published entrypoint (CJS exports map)"
   }
   for (const surface of [root, headless]) {
     for (const name of ['loadIdentityConfig', 'mintIdentity', 'verifyIdentity',
-      'ConsentRequiredError', 'SessionApprovalRequiredError', 'ApprovalRequiredError',
+      'ConsentRequiredError', 'ApprovalRequiredError',
       'ApprovalPathTooLongError', 'InteractionStateChangedError',
       'EgressBlockedError', 'NoConnectionError', 'PolicyDeniedError', 'ToolDisabledError',
       'ResolverConfigurationError', 'ResolverFailedError',
@@ -66,10 +66,9 @@ echo "==> require() every published entrypoint (CJS exports map)"
     }
     const errors = [
       new surface.ConsentRequiredError('github', 'posted'),
-      new surface.SessionApprovalRequiredError('github'),
       new surface.ApprovalRequiredError(
-        'github', 'self', 'POST', 'api.github.com', 'hmac-sha256:' + 'a'.repeat(64),
-        '00000000-0000-4000-8000-000000000001', 0, true,
+        'github', 'self', 'POST', 'api.github.com', '/repos/acme/demo/issues',
+        '00000000-0000-4000-8000-000000000001', 'once', true,
       ),
       new surface.ApprovalPathTooLongError(),
       new surface.InteractionStateChangedError('connection', 'credential'),
@@ -108,7 +107,7 @@ echo "==> require() every published entrypoint (CJS exports map)"
     if (invalidRecovery.code !== 'internal_error' || JSON.stringify(invalidRecovery).includes(sentinel)) {
       throw new Error('packed safe mapper accepted an invalid runtime recovery value');
     }
-    for (const name of ['SessionGrants', 'Approvals']) {
+    for (const name of ['Approvals']) {
       if (name in surface) throw new Error('unsafe interaction store leaked into public API: ' + name);
     }
     if (!surface.VOUCHR_RECOVERY_ACTIONS.includes('resolve_again')) {
@@ -122,12 +121,16 @@ echo "==> require() every published entrypoint (CJS exports map)"
     }
   }
   const approval = new root.ApprovalRequiredError(
-    'acme', 'self', 'POST', 'api.acme.test', 'hmac-sha256:' + 'a'.repeat(64),
-    '00000000-0000-4000-8000-000000000001', 0, true,
+    'acme', 'self', 'POST', 'api.acme.test', '/repos/acme/demo/issues',
+    '00000000-0000-4000-8000-000000000001', 'once', true, 'Close INC-42', 'https://tracker.example/INC-42',
   );
-  if ('path' in approval) throw new Error('raw approval path leaked into packed error');
-  if (!/^hmac-sha256:[0-9a-f]{64}$/.test(approval.actionFingerprint)) {
-    throw new Error('packed approval action fingerprint is missing');
+  // #350: the plain path, reason, and link ride on the error for the prompt; the fixed public
+  // message the agent may echo never carries them.
+  if (approval.path !== '/repos/acme/demo/issues' || approval.grant !== 'once') {
+    throw new Error('packed approval error lost its plain path or grant');
+  }
+  for (const leak of ['/repos/', 'INC-42', 'tracker.example']) {
+    if (root.safeUserMessage(approval).includes(leak)) throw new Error('approval detail leaked into the fixed user message');
   }
   if (typeof root.ConnectContext?.prototype?.recoverBrokerDenial !== 'function') {
     throw new Error('packed root ConnectContext is missing recoverBrokerDenial');
@@ -209,7 +212,7 @@ import {
 import {
   ChannelConfig, ChannelTools, Vault, createBroker, loadIdentityConfig, mintIdentity, verifyIdentity,
   revokeAllCredentials,
-  ConsentRequiredError, SessionApprovalRequiredError, ApprovalRequiredError,
+  ConsentRequiredError, ApprovalRequiredError,
   ApprovalPathTooLongError, InteractionStateChangedError,
   EgressBlockedError, NoConnectionError, PolicyDeniedError, ToolDisabledError,
   ResolverConfigurationError, ResolverFailedError,
@@ -279,7 +282,6 @@ type BrokerRecoveryStatus = BrokerDenialRecovery['status'];
 type ExpectedBrokerRecoveryStatus =
   | 'resolved'
   | 'connect_prompted'
-  | 'session_prompted'
   | 'approval_prompted'
   | 'configuration_required'
   | 'stale'
@@ -287,9 +289,7 @@ type ExpectedBrokerRecoveryStatus =
   | 'not_bridgeable';
 type RootSurface = typeof import('@vouchr/core');
 type HeadlessSurface = typeof import('@vouchr/core/headless');
-type RootHasSessions = 'SessionGrants' extends keyof RootSurface ? true : false;
 type RootHasApprovals = 'Approvals' extends keyof RootSurface ? true : false;
-type HeadlessHasSessions = 'SessionGrants' extends keyof HeadlessSurface ? true : false;
 type HeadlessHasApprovals = 'Approvals' extends keyof HeadlessSurface ? true : false;
 type HeadlessHasRawProviderEnumeration = 'enumerateStoredProviders' extends keyof HeadlessSurface ? true : false;
 type DirectBroker = ReturnType<typeof createBroker>;
@@ -301,6 +301,7 @@ type ToolsHaveRawSet = 'setEnabled' extends keyof ChannelTools ? true : false;
 type ToolsHaveRawApply = 'applyEnabled' extends keyof ChannelTools ? true : false;
 type ApprovalErrorHasPath = 'path' extends keyof ApprovalRequiredError ? true : false;
 type ApprovalErrorHasFingerprint = 'actionFingerprint' extends keyof ApprovalRequiredError ? true : false;
+type ApprovalErrorHasGrant = 'grant' extends keyof ApprovalRequiredError ? true : false;
 type DisconnectArity = Parameters<typeof disconnectProvider>['length'];
 type VaultListExpiredArity = Parameters<Vault['listExpired']>['length'];
 type VaultDeleteExpiredArity = Parameters<Vault['deleteExpired']>['length'];
@@ -312,9 +313,7 @@ const exactBrokerRecoveryStatuses: [true, true] = null as unknown as [
   BrokerRecoveryStatus extends ExpectedBrokerRecoveryStatus ? true : false,
   ExpectedBrokerRecoveryStatus extends BrokerRecoveryStatus ? true : false,
 ];
-const noUnsafeInteractionExports: [false, false, false, false] = null as unknown as [
-  RootHasSessions, RootHasApprovals, HeadlessHasSessions, HeadlessHasApprovals,
-];
+const noUnsafeInteractionExports: [false, false] = null as unknown as [RootHasApprovals, HeadlessHasApprovals];
 const noRawProviderEnumeration: false = null as unknown as HeadlessHasRawProviderEnumeration;
 const safeBrokerLifecycle: [true, true, true] = null as unknown as [
   DirectBrokerHasSweep, DirectBrokerMatchesExport, RootDirectBrokerHasSweep,
@@ -322,8 +321,9 @@ const safeBrokerLifecycle: [true, true, true] = null as unknown as [
 const noRawGovernanceWrites: [false, false, false] = null as unknown as [
   ConfigHasRawWrite, ToolsHaveRawSet, ToolsHaveRawApply,
 ];
-const noRawApprovalPath: false = null as unknown as ApprovalErrorHasPath;
-const hasApprovalFingerprint: true = null as unknown as ApprovalErrorHasFingerprint;
+const hasApprovalPath: true = null as unknown as ApprovalErrorHasPath;
+const noApprovalFingerprint: false = null as unknown as ApprovalErrorHasFingerprint;
+const hasApprovalGrant: true = null as unknown as ApprovalErrorHasGrant;
 const disconnectArity: 5 = null as unknown as DisconnectArity;
 const noVaultDbHandleEscape: [0, 2, 1] = null as unknown as [
   VaultListExpiredArity, VaultDeleteExpiredArity, VaultListExpiringSoonArity,
@@ -340,8 +340,9 @@ void revokeAllCredentials;
 void (null as unknown as RevokeAllReport);
 void safeBrokerLifecycle;
 void noRawGovernanceWrites;
-void noRawApprovalPath;
-void hasApprovalFingerprint;
+void hasApprovalPath;
+void noApprovalFingerprint;
+void hasApprovalGrant;
 void disconnectArity;
 void noVaultDbHandleEscape;
 const changed = new InteractionStateChangedError('connection', 'credential');
@@ -368,10 +369,9 @@ if (!safeUserMessage(new ConsentRequiredError('github', 'reused')).includes('no 
 void promptStates;
 const documentedErrors = [
   new ConsentRequiredError('github', 'posted'),
-  new SessionApprovalRequiredError('github', 'posted'),
   new ApprovalRequiredError(
-    'github', 'self', 'POST', 'api.github.com', 'hmac-sha256:' + 'a'.repeat(64),
-    '00000000-0000-4000-8000-000000000001', 0, true,
+    'github', 'self', 'POST', 'api.github.com', '/repos/acme/demo/issues',
+    '00000000-0000-4000-8000-000000000001', 'once', true,
   ),
   new ApprovalPathTooLongError(),
   new InteractionStateChangedError('approval', 'authorization'),

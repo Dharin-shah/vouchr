@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { applyChannelToolsEnabled, ChannelTools, configureChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { Policy } from '../src/core/policy';
 import { ProviderRegistry, defineProvider } from '../src/core/providers';
@@ -125,17 +125,17 @@ test('toolManifest returns the expected shape', async (t) => {
   // Unconfigured channel → deny-by-default: every provider disabled, mode null.
   let m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: false, identity: 'acting_human' },
-    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' },
+    { provider: 'mcp', enabled: false, identity: 'person' },
+    { provider: 'other', enabled: false, identity: 'person' },
   ]);
 
   // After configuring: mcp enabled + shared, other implicitly disabled.
   await setChannelToolEnabled(tools, 'T1', 'C_FIN', 'mcp', true);
-  await c.setChannelMode('mcp', 'per-user');
+  await c.setChannelIdentity('mcp', 'person');
   m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human' },
-    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' },
+    { provider: 'mcp', enabled: true, identity: 'person' },
+    { provider: 'other', enabled: false, identity: 'person' },
   ]);
 });
 
@@ -151,8 +151,8 @@ test('toolManifest reflects a Policy deny (intersects channel tools and policy)'
 
   const m = await c.toolManifest();
   assert.deepEqual(m, [
-    { provider: 'mcp', mode: null, enabled: true, identity: 'acting_human' },
-    { provider: 'other', mode: null, enabled: false, identity: 'acting_human' }, // tool-enabled but policy-denied
+    { provider: 'mcp', enabled: true, identity: 'person' },
+    { provider: 'other', enabled: false, identity: 'person' }, // tool-enabled but policy-denied
   ]);
 
   // Consistency: connect() actually refuses the provider the manifest marks disabled.
@@ -167,7 +167,7 @@ test('null channel → no tool restriction; manifest all enabled', async (t) => 
   const { c } = await ctx(t, true, null);
   const m = await c.toolManifest();
   assert.deepEqual(m.map((e) => e.enabled), [true, true]);
-  assert.deepEqual(m.map((e) => e.mode), [null, null]);
+  assert.deepEqual(m.map((e) => e.identity), ['person', 'person']);
 });
 
 // ── #111 ChannelTools.applyEnabled: atomic first-write allowlist materialization ─────────────────
@@ -270,7 +270,7 @@ test('buildToolManifest issues a fixed 2 reads regardless of provider count (#20
   const base = await openTestDb(t);
   // Configure the channel so both tables have rows — exercises the real batched read paths.
   await setChannelToolEnabled(new ChannelTools(base), 'T1', 'C_FIN', 'mcp', true); // allowlist: mcp on, rest off
-  await writeChannelMode(new ChannelConfig(base), 'T1', 'C_FIN', 'mcp', 'per-user');
+  await writeChannelIdentity(new ChannelConfig(base), 'T1', 'C_FIN', 'mcp', 'person');
 
   const build = async (extra: number) => {
     const { db, counts } = countingDb(base);
@@ -291,18 +291,18 @@ test('buildToolManifest issues a fixed 2 reads regardless of provider count (#20
   assert.deepEqual(few.counts, { get: 0, all: 2 });
   assert.deepEqual(many.counts, { get: 0, all: 2 });
 
-  // Batching preserved semantics: 'mcp' enabled+per-user; every unlisted provider disabled with
-  // the unconfigured mode default (null from modeSnapshot).
+  // Batching preserved semantics: 'mcp' enabled, acting as each person; every unlisted provider
+  // disabled with the unconfigured identity default ('person' from identitySnapshot).
   assert.deepEqual(
     many.manifest.find((e) => e.provider === 'mcp'),
-    { provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human' },
+    { provider: 'mcp', enabled: true, identity: 'person' },
   );
   assert.ok(many.manifest
     .filter((e) => e.provider !== 'mcp')
-    .every((e) => e.enabled === false && e.mode === null));
+    .every((e) => e.enabled === false && e.identity === 'person'));
 
   // Off-channel (channel null): every snapshot short-circuits to its in-memory fallback — ZERO reads,
-  // every provider enabled with the null mode default. Pins that a manifest with no channel queries nothing.
+  // every provider enabled with the person default. Pins that a manifest with no channel queries nothing.
   const off = countingDb(base);
   const offManifest = await buildToolManifest({
     providerIds: ['mcp', 'other'], registry: new ProviderRegistry(['mcp', 'other'].map(mkProvider)),
@@ -310,8 +310,8 @@ test('buildToolManifest issues a fixed 2 reads regardless of provider count (#20
   });
   assert.deepEqual(off.counts, { get: 0, all: 0 });
   assert.deepEqual(
-    offManifest.map((e) => [e.enabled, e.mode]),
-    [[true, null], [true, null]],
+    offManifest.map((e) => [e.enabled, e.identity]),
+    [[true, 'person'], [true, 'person']],
   );
 
   // No registered providers means no channel facts can be consumed, so do not touch Postgres.
@@ -333,7 +333,7 @@ test('buildToolManifest dispatches its two independent channel reads together', 
   } as unknown as ChannelTools;
   const channelConfig = {
     getMode: async () => null,
-    modeSnapshot: async () => { started++; await gate; return () => null; },
+    identitySnapshot: async () => { started++; await gate; return () => null; },
   } as unknown as ChannelConfig;
 
   const pending = buildToolManifest({
@@ -354,7 +354,7 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
     override async isEnabled(): Promise<boolean> { return false; }
   }
   class CustomConfig extends ChannelConfig {
-    override async getMode(): Promise<'session'> { return 'session'; }
+    override async getIdentity(): Promise<'channel'> { return 'channel'; }
   }
   const tools = new CustomTools(db);
   const config = new CustomConfig(db);
@@ -364,7 +364,7 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
   });
   assert.equal(await authorizeProvider(undefined, tools, ID, 'C_FIN', 'C_FIN', 'mcp'), 'tool-disabled');
   assert.deepEqual(manifest[0], {
-    provider: 'mcp', mode: 'session', enabled: false, identity: 'acting_human',
+    provider: 'mcp', enabled: false, identity: 'channel',
   });
 
   // isEnabled also delegates to the older public isConfigured hook. Overriding only that hook must
@@ -387,14 +387,14 @@ test('batched manifests preserve legacy/custom store overrides and runtime parit
   // Existing JavaScript wrappers may implement only the pre-batch public methods. They remain valid.
   const legacyTools = { isEnabled: async () => true } as unknown as ChannelTools;
   const legacyConfig = {
-    getMode: async () => 'per-user' as const,
+    getIdentity: async () => 'person' as const,
   } as unknown as ChannelConfig;
   const legacy = await buildToolManifest({
     providerIds: ['mcp'], registry: new ProviderRegistry([mcp]), channelTools: legacyTools,
     channelConfig: legacyConfig, principal: ID, channel: 'C_FIN',
   });
   assert.deepEqual(legacy[0], {
-    provider: 'mcp', mode: 'per-user', enabled: true, identity: 'acting_human',
+    provider: 'mcp', enabled: true, identity: 'person',
   });
 });
 

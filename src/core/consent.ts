@@ -48,7 +48,7 @@ export function tombstoneBlocks(tombCreatedAt: number | null | undefined, minted
 }
 
 /** Serialize the durable offboard fence with mutations that can recreate user authority. The key
- *  representation lives here once; session grants and markOffboarded share it so either the grant
+ *  representation lives here once; approval grants and markOffboarded share it so either the grant
  *  commits first and cleanup removes it, or the tombstone commits first and the grant refuses. */
 export function offboardLockKey(teamId: string, userId: string): string {
   return `offboard:${teamId}:${userId}`;

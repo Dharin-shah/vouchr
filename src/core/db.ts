@@ -174,14 +174,13 @@ class PgClientDb implements Db {
 
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
- * Version 1 is the whole current schema in one DDL (#340): Vouchr is greenfield, so the 1.0.0
- * migration ladder (v12-v15 and its data conversions) was deleted rather than carried, and a
- * database stamped with any other version is recreated fresh. Future schema changes add steps from
- * v1 and bump this number; the lineage stays MONOTONIC from here. The `meta` marker keeps a
- * mismatched binary off the data: `openDb` requires exactly this version, so rolling versions can
- * never interpret stored controls differently.
+ * Version 2 is the whole current schema in one DDL (#340, #350): Vouchr is greenfield, so a database
+ * stamped with any other version (1.0.0's ladder, or 1.1.0's version 1 with its session tables and
+ * channel modes) is recreated fresh rather than migrated. The `meta` marker keeps a mismatched
+ * binary off the data: `openDb` requires exactly this version, so rolling versions can never
+ * interpret stored controls differently.
  */
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
@@ -228,8 +227,8 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
   if (found !== SCHEMA_VERSION) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`. ` +
-        'There is no data migration from a 1.0.0 (schema 15) or earlier database.',
+        `version ${SCHEMA_VERSION}, can be migrated; recreate the database fresh and run \`vouchr migrate\`. ` +
+        'There is no data migration from a 1.1.0 (schema 1) or earlier database.',
     );
   }
   return found;
@@ -360,12 +359,14 @@ function schema(): string {
       CHECK (scope_kind IN ('global', 'team', 'user', 'team-user', 'channel', 'team-channel')),
       CHECK (scope_key ~ '^[A-Za-z0-9_-]{43}$')
     );
+    -- Who the agent acts as for a provider in a channel (#350): 'person' or 'channel'. No row is 'person'.
     CREATE TABLE IF NOT EXISTS channel_config (
       team_id TEXT NOT NULL,
       channel TEXT NOT NULL,
       provider TEXT NOT NULL,
-      mode TEXT NOT NULL,
-      PRIMARY KEY (team_id, channel, provider)
+      identity TEXT NOT NULL,
+      PRIMARY KEY (team_id, channel, provider),
+      CHECK (identity IN ('person', 'channel'))
     );
 
     CREATE TABLE IF NOT EXISTS channel_tool (
@@ -374,34 +375,6 @@ function schema(): string {
       provider TEXT NOT NULL,
       enabled ${int} NOT NULL,
       PRIMARY KEY (team_id, channel, provider)
-    );
-
-    CREATE TABLE IF NOT EXISTS session_grant (
-      team_id TEXT NOT NULL,
-      channel TEXT NOT NULL,
-      thread TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      credential_id TEXT NOT NULL,
-      created_at ${int} NOT NULL,
-      expires_at ${int} NOT NULL,
-      PRIMARY KEY (team_id, channel, thread, user_id, provider)
-    );
-
-    CREATE TABLE IF NOT EXISTS session_request (
-      id TEXT PRIMARY KEY,
-      team_id TEXT NOT NULL,
-      channel TEXT NOT NULL,
-      thread TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      provider TEXT NOT NULL,
-      credential_id TEXT NOT NULL,
-      created_at ${int} NOT NULL,
-      expires_at ${int} NOT NULL,
-      delivery_token TEXT,
-      delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
-      delivered_at ${int},
-      UNIQUE (team_id, channel, thread, user_id, provider)
     );
 
     CREATE TABLE IF NOT EXISTS approval_request (
@@ -418,6 +391,9 @@ function schema(): string {
       host TEXT NOT NULL,
       path TEXT NOT NULL,
       query_hash TEXT NOT NULL DEFAULT '',
+      -- What the decision covers (#350): 'once' (this exact action, single use) or 'thread' (every
+      -- matching call in the thread until expiry; the action columns record the call that asked).
+      grant_scope TEXT NOT NULL,
       channel TEXT NOT NULL,
       thread TEXT NOT NULL,
       -- The mutable-GOVERNANCE scope for this action's channel at request time. Empty string is an
@@ -432,10 +408,13 @@ function schema(): string {
       delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
       delivered_at ${int},
       delivery_audience TEXT,
-      -- #296 backchannel authorization: the host-supplied plain transaction statement rendered on
-      -- the decision surface. Non-NULL marks an agent-initiated request the Bolt control plane
-      -- delivers on its own timer (no relayed denial); NULL is an in-process/fetch-minted row.
-      binding_message TEXT
+      -- The agent's reason and link (#350), rendered plain on the decision surface.
+      reason TEXT,
+      link TEXT,
+      -- #296 backchannel authorization: 1 marks an agent-initiated request the Bolt control plane
+      -- delivers on its own timer (no Slack turn can relay it); 0 is a fetch-minted row.
+      backchannel ${int} NOT NULL DEFAULT 0,
+      CHECK (grant_scope IN ('once', 'thread'))
     );
     -- Exact-action approval deduplication depends on this uniqueness.
     CREATE UNIQUE INDEX IF NOT EXISTS uq_approval_request_action ON approval_request (action_key);
@@ -583,7 +562,7 @@ export async function assertSchemaCurrent(db: Db): Promise<void> {
     throw new Error(
       `vouchr: this database is at schema version ${found}, but this build needs ${SCHEMA_VERSION}. ` +
         'Refusing to open it. Recreate the database fresh and run `vouchr migrate` (there is no data ' +
-        'migration from a 1.0.0 or earlier schema), or run the vouchr build that matches it.',
+        'migration from a 1.1.0 or earlier schema), or run the vouchr build that matches it.',
     );
   }
 }

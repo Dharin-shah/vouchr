@@ -40,7 +40,7 @@ model, and the low-level building blocks (`openDb`/`migrate` and their `DbOption
 `BrokerAuditResponse`, `BrokerAuthorizationResponse`, `BrokerError`, and the `BrokerConsentState`
 union — `connected` | `needs_consent` — the resolve/status bodies use), typed operational errors, and
 the Bolt-free `mapSafeError` recovery mapper. The root `@vouchr/core` entry exports the same error contract plus the
-Bolt adapter; neither entry exports the internal session/approval mutation stores.
+Bolt adapter; neither entry exports the internal approval mutation store.
 
 A directly constructed broker owns those private stores. Schedule the safe method on the returned
 server, not a separately constructed interaction store:
@@ -54,8 +54,8 @@ const sweepTimer = setInterval(
 sweepTimer.unref();
 ```
 
-`broker.sweepExpired()` reclaims expired credentials and stale consent, approval, session, and
-provisioning state through one idempotent lifecycle facade. It does not expose interaction mutators.
+`broker.sweepExpired()` reclaims expired credentials and stale consent, approval, and provisioning
+state through one idempotent lifecycle facade. It does not expose interaction mutators.
 Configured `onEvent` and `onCredentialHealth` hooks receive the sweep's `expired` events only after
 the cleanup commits.
 The lower-level core `sweepExpired(vault, audit, consent, …)` export remains for non-broker lifecycle
@@ -113,12 +113,15 @@ The worker then calls `POST /v1/fetch`:
   "handle": { "provider": "github", "owner": "user" },
   "identityToken": "<signed by your Slack-facing service>",
   "method": "GET",
-  "path": "/user"
+  "path": "/user",
+  "reason": "Show the user their own profile",
+  "link": "https://tracker.example/T-1"
 }
 ```
 
 The broker resolves the user from the signed token, performs the provider request inside Vouchr, and
-returns only the provider response.
+returns only the provider response. `reason` and `link` are optional on every call; when the call needs
+approval, the human reads them on the prompt (see [Approvals](#human-in-the-loop-approvals-113)).
 
 ### Typed errors: exported classes
 
@@ -143,7 +146,6 @@ automatic replay of an uncertain or non-idempotent write.
 | Exported error | Stable code | Recovery | Meaning |
 | --- | --- | --- | --- |
 | `ConsentRequiredError` | `consent_required` | `connect` | A private connection prompt was posted; stop the turn. |
-| `SessionApprovalRequiredError` | `session_approval_required` | `request_approval` | A thread-scoped session prompt was posted (or, `promptState: 'reused'`, a still-live one was reused and may no longer be visible); stop the turn. |
 | `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. For a `member` approver the copy tells the requester to wait for another channel member. |
 | `ApprovalPathTooLongError` | `approval_path_too_large` | `fix_configuration` | The approval endpoint exceeds the bounded exact-action path; narrow it before retrying. |
 | `InteractionStateChangedError` | `interaction_state_changed` | `resolve_again` | The credential generation or current authorization changed; discard the stale handle and resolve current access before retrying. |
@@ -215,8 +217,7 @@ import {
 const safe: VouchrSafeError = mapSafeError(caught);
 ```
 
-Every exported typed error (`ConsentRequiredError`, `SessionApprovalRequiredError`,
-`ApprovalRequiredError`, `ApprovalPathTooLongError`, `InteractionStateChangedError`,
+Every exported typed error (`ConsentRequiredError`, `ApprovalRequiredError`, `ApprovalPathTooLongError`, `InteractionStateChangedError`,
 `PolicyDeniedError`, `ToolDisabledError`, `NoConnectionError`,
 `EgressBlockedError`, `ResponseBlockedError`,
 `ResolverConfigurationError`, `ResolverFailedError`, `RateLimitedError`, `SecretReferenceError`,
@@ -278,11 +279,11 @@ One core, two front doors — both reach the same credential boundary.
 | Capability | Bolt (`/vouchr`) | Headless broker |
 | --- | --- | --- |
 | Use a user's own credential | ✅ `connect()` | ✅ `POST /v1/fetch` (`owner:"user"`) |
-| Use a `shared` channel credential | ✅ | ✅ `owner:"channel"`, opt-in `VOUCHR_CHANNEL_MODES=1` + signed channel-fact claims (#51) |
-| Set the channel mode (`shared`/`per-user`/`session`) | ✅ `/vouchr mode` (any channel member) | ✅ `POST /v1/admin/mode` (signed channel) |
+| Use the channel's credential | ✅ | ✅ `owner:"channel"` + signed channel-fact claims (#51) |
+| Set who the agent acts as (`person`/`channel`) | ✅ `/vouchr identity` (any channel member) | ✅ `POST /v1/admin/identity` (signed channel) |
 | Toggle a channel's tool allowlist | ✅ `/vouchr enable`/`disable` (any channel member) | ✅ `POST /v1/admin/tools` (signed channel; packaged broker or injected `ChannelTools`) |
 | Apply static provider-by-channel policy | ✅ `Policy` option | ✅ `Policy` option; packaged broker loads `VOUCHR_POLICY` or `VOUCHR_POLICY_FILE` |
-| Read the channel's modes + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` · channel-scoped `POST /v1/manifest` |
+| Read the channel's identities + tool allowlist | ✅ (implicit) | ✅ `GET /v1/admin/config` · channel-scoped `POST /v1/manifest` |
 | See where a credential was used (audit) | ✅ `/vouchr audit` · `/vouchr audit channel` (any channel member) | ✅ `POST /v1/audit` (self) · `POST /v1/admin/audit` (signed channel) |
 | Call an MCP server (Streamable HTTP, SSE + session headers) | ✅ in-process via the `connect()` handle's `fetch` | ✅ `POST /v1/mcp` (streamed passthrough; opt-in `mcp` provider knob) |
 | Ingest a **raw** key/secret | ✅ private modal (`connect-shared` / key setup) | ❌ rejected; reference routes never accept raw values |
@@ -373,7 +374,8 @@ approver are decoupled; the credential boundary is not — an approved request p
 same `/v1/fetch` (or `/v1/mcp`) spend path, bound to the same exact action fingerprint, single-use.
 
 `POST /v1/authorization` takes the `/v1/fetch` target envelope without a body or headers, plus the
-plain statement the human will read:
+optional `reason` and `link` the human will read (the same two fields `/v1/fetch` and `/v1/mcp`
+accept):
 
 ```json
 {
@@ -381,7 +383,8 @@ plain statement the human will read:
   "identityToken": "<fresh, single-use>",
   "method": "POST",
   "path": "/repos/acme/demo/merges",
-  "bindingMessage": "Merge release-1.4 into main for the nightly deploy"
+  "reason": "Merge release-1.4 into main for the nightly deploy",
+  "link": "https://tracker.example/REL-14"
 }
 ```
 
@@ -399,7 +402,7 @@ fresh single-use assertion per poll) returns the same shape:
 | `status` | Meaning | Agent action |
 | --- | --- | --- |
 | `pending` | Awaiting the human. Pending requests live 10 minutes. | Poll with back-off; never re-initiate while pending (the exact action deduplicates to the same id anyway). |
-| `approved` | One live, single-use grant exists, valid for the provider's `ttlMs` (default 5 minutes). | Call `/v1/fetch` with the **identical** method, host, path, and query, under an identity token carrying the **identical `channel`, `threadTs`, and `channelType` claims** as the initiating token (see below). The grant is spent once; a second identical call re-denies with `approval_required`. |
+| `approved` | One live grant exists, valid for the provider's `ttlMs` (default 5 minutes). | Call `/v1/fetch` with the **identical** method, host, path, and query, under an identity token carrying the **identical `channel`, `threadTs`, and `channelType` claims** as the initiating token (see below). A `once` grant (the default) is spent by that call; a second identical call re-denies with `approval_required`. A `thread` grant covers every matching call in the approving thread until it expires. |
 | `denied` | The human refused. Retained for one pending-TTL window so this outcome is readable. | Stop. A new `POST /v1/authorization` is a new decision — never loop. |
 | `expired` | Nobody decided in time, or the grant went unspent. | Stop; a new request is a new decision. |
 | `404 { "error": "unknown authorization" }` | The id was never this requester's, the grant was spent, or the row was reclaimed by the sweep. | Treat as terminal for that id. |
@@ -409,22 +412,25 @@ the initiating token's `channel`, `threadTs`, and governance scope (from `channe
 an in-turn approval does. The spend call must therefore be minted with the **same** `channel`,
 `threadTs`, and `channelType` as the initiating call: a spend token that omits `threadTs` (or names
 a different channel) does not match the grant — it gets `403 approval_required` and mints a
-*second*, ordinary pending request for that other conversation, which has no binding message and
-which the delivery timer therefore never posts. Keep the claim set fixed for the lifetime of one
+*second*, ordinary pending request for that other conversation, which is not marked as
+agent-initiated and which the delivery timer therefore never posts. Keep the claim set fixed for the lifetime of one
 authorization; if the agent has no conversation, omit all three consistently on both calls.
 
-Other outcomes mirror `/v1/fetch`: `400` for a missing/empty/whitespace/over-long `bindingMessage`
-or one carrying control characters other than newline and tab (`MAX_BINDING_MESSAGE_BYTES` and
-`assertBindingMessage` are exported so a client can reject before the wire; a `400` here is
-returned before identity verification, so the assertion is not spent), `400` for an action the
+Other outcomes mirror `/v1/fetch`: `400` for a `reason` that is empty, whitespace, over 500 bytes,
+or carries control characters other than newline and tab, or a `link` that is not an `https://` URL
+of at most 2,048 bytes (`MAX_REASON_BYTES`, `MAX_LINK_BYTES`, `assertReason`, and `assertLink` are
+exported so a client can reject before the wire; a `400` here is returned before identity
+verification, so the assertion is not spent), `400` for an action the
 provider's `approval` rule does not cover (call `/v1/fetch` directly — there is nothing to decide);
 `405` when the broker refuses writes; `403 egress_blocked`; `409 not_connected`; `401` on a
 replayed assertion; and `429 rate_limited` — the provider's `rateLimit` budget is spent by an
 authorization request exactly as by the action itself, so a background agent cannot queue prompts
-past the budget its eventual calls are held to. The `bindingMessage` is bounded, stored for the
-prompt, rendered as plain text (no mrkdwn, so it cannot impersonate Vouchr's copy or render links),
-and **never audited** — the audit trail correlates on the salted action fingerprint, exactly like an
-in-turn approval: `approval_requested` → `approved`/`denied` → `approval_consumed`.
+past the budget its eventual calls are held to. The `reason` is bounded, stored for the prompt,
+rendered as plain text (no mrkdwn, so it cannot impersonate Vouchr's copy), and written to the
+`approval_requested` audit row as `meta.reason`; the `link` is rendered as a plain URL and is not
+audited. The prompt states that both are the agent's own claim. The audit trail correlates on the
+salted action fingerprint, exactly like an in-turn approval: `approval_requested` →
+`approved`/`denied` → `approval_consumed`.
 
 **Delivery is the Slack control plane's job.** The broker cannot post the decision surface. A Bolt
 process on the same PostgreSQL delivers it: `install()` runs a bounded delivery pass every
@@ -450,17 +456,20 @@ user) as the requester, and let the channel's members approve.
 - **Requester.** Mint the identity token with the bot user id as `userId`. The bot must be a member
   of the owning channel. Vouchr rechecks that membership when it delivers the prompt and again at
   the click.
-- **Credential.** Put the owning channel in `shared` mode so the channel owns the credential. Mint
+- **Credential.** Set the channel's identity for the provider to `channel` (`/vouchr connect-shared`
+  does this) so the channel owns the credential. Mint
   with `ownerKind: 'channel'`, `channelEligible: true`, `channel`, and `channelType`, exactly as the
   [hybrid guide's minter](./HYBRID.md#4-mint-identity-only-from-verified-slack-facts) does. Send
   `handle: { provider, owner: 'channel' }`.
-- **Approver.** Set the provider's `approval` to `approver: 'member'`. The bot is the requester, so
-  any human member of the channel can approve. Put the ticket reference in `bindingMessage`.
+- **Approver.** Leave the provider's `approval` at its default (`approver: 'member'`). The bot is the
+  requester, so any human member of the channel can approve. Put the ticket reference in `reason`
+  and its URL in `link`; `grant: 'thread'` lets one approval cover a job's later writes in the same
+  thread.
 - **Flow.** `POST /v1/authorization`, poll `GET /v1/authorization/{id}`, then `/v1/fetch` with the
   same claims. This is the backchannel flow above, unchanged.
 
 The team sees one channel message. It names the bot as the requester and shows the provider, method,
-host, and binding message. In the audit, `approval_requested` and `approval_consumed` carry the bot
+host, path, reason, and link. In the audit, `approval_requested` and `approval_consumed` carry the bot
 id as `user_id`; `approval_consumed` carries the approving member in `actor`.
 
 Do not use `approver: 'self'` for a worker. `self` sends an ephemeral prompt to the requester. For a
@@ -494,7 +503,9 @@ JSON-RPC message) and the JSON-RPC payload in `body`:
   "identityToken": "<signed; mint a FRESH one per JSON-RPC call — tokens are single-use>",
   "path": "/mcp",
   "headers": { "accept": "application/json, text/event-stream", "content-type": "application/json", "mcp-session-id": "…" },
-  "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\", …}"
+  "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\", …}",
+  "reason": "Create the release issue",
+  "link": "https://tracker.example/REL-14"
 }
 ```
 
@@ -513,6 +524,7 @@ Rules and limits:
     // …
     egressMethods: ['POST'],  // JSON-RPC rides POST (write gating below)
     mcp: { paths: ['/mcp'] }, // REQUIRED to be reachable via /v1/mcp
+    approval: false,          // or a human is asked on EVERY hop (approval bullet below)
     // mcp.allowContentTypes defaults to ['application/json', 'text/event-stream']
   });
   ```
@@ -531,6 +543,12 @@ Rules and limits:
 - **Writes gating.** MCP `callTool` can mutate, so the route also requires the same double opt-in
   as a `/v1/fetch` POST: `allowWrites: true` on the broker **and** the provider's `egressMethods`
   including `'POST'`. Without either, the request is refused before any credential lookup.
+- **Approval gates on the HTTP method, and every MCP hop is a POST.** With the default
+  `approval` (on for every non-GET/HEAD call, #350) the broker answers `403 approval_required` for
+  `initialize`, `tools/list`, `ping`, and notifications too, not only `tools/call`: Vouchr never reads
+  the JSON-RPC method inside the body. Set `approval: false` on the MCP provider and gate mutating
+  tools in the host, or narrow `approval.paths` to the provider's non-MCP endpoints so only those
+  prompt. Keeping the default means a human decides every hop.
 - **The session header is NOT auth — and treat it as sensitive.** `Mcp-Session-Id` is opaque
   transport plumbing the MCP server issues and expects back, and per MCP security guidance it is
   potentially hijackable: Vouchr relays it verbatim and never stores, logs, or audits it — and
@@ -553,11 +571,12 @@ Rules and limits:
 
 ## Channel governance over HTTP
 
-Channel governance mirrors the Bolt `/vouchr` commands: `POST /v1/admin/mode` sets a provider's
-channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool allowlist, and
+Channel governance mirrors the Bolt `/vouchr` commands: `POST /v1/admin/identity` (body
+`{ provider, identity }`, `person` or `channel`) sets who the agent acts as for a provider in the
+channel, `POST /v1/admin/tools` toggles a provider in the channel's tool allowlist, and
 `GET /v1/admin/config` reads both back. All three act on the SIGNED `channel` claim only — the
 channel is the trust boundary (#322), so any member the minter asserts in that channel may configure
-it; the request body carries no authority. The writes (`tools`, and `mode` to `shared`) also need the
+it; the request body carries no authority. The writes (`tools`, and `identity` to `channel`) also need the
 signed `channelEligible: true` channel-class verdict (see DEPLOYMENT.md), so an externally shared
 channel cannot be governed from the broker any more than from Bolt.
 
@@ -580,10 +599,10 @@ takes a provider-keyed map of `PolicyRule` (`{ defaultAllow, allowChannels?, den
 typed form of that JSON contract.
 
 `ChannelConfig` and `ChannelTools` are public read stores with no raw write methods — a direct
-write could bypass interaction invalidation and audit. Use `POST /v1/admin/mode` and
-`POST /v1/admin/tools` (or packaged Bolt/App Home) for writes. A channel mode is the `ChannelMode`
-union (`shared` | `per-user` | `session`); `CHANNEL_MODES` is its runtime list and `isChannelMode`
-the guard, so a host rendering its own mode picker never hard-codes them.
+write could bypass interaction invalidation and audit. Use `POST /v1/admin/identity` and
+`POST /v1/admin/tools` (or packaged Bolt/App Home) for writes. A channel identity is the
+`ChannelIdentity` union (`person` | `channel`); `CHANNEL_IDENTITIES` is its runtime list and
+`isChannelIdentity` the guard, so a host rendering its own picker never hard-codes them.
 
 The enforced boundary keeps raw-key ingest in Bolt's private modal and lets headless accept only
 secret-manager references (`/v1/admin/reference` for channels, `/v1/user/reference` for self-service).
@@ -622,7 +641,7 @@ recall it. Under
 the documented ±30-second minter, broker, and PostgreSQL clock bounds, wait the conservative
 90-second cluster-skew horizon before minting the replacement assertion. `/v1/admin/reference`
 applies the same age-preserving fence to the acting member while it atomically writes the channel
-reference, shared mode, and config audit; an assertion minted before that member's offboarding cannot
+reference, channel identity, and config audit; an assertion minted before that member's offboarding cannot
 gain fresh channel-setup authority by being replayed later. Enterprise/global offboarding writes its
 scope
 before artifact discovery, so this also holds for a Grid workspace with no existing Vouchr row.
@@ -742,7 +761,7 @@ never a query string, which access logs keep); `GET /v1/manifest` and the probes
 | `POST /v1/user/reference` | Point the caller's credential at a secret-manager reference | `{ ok }` |
 | `GET /v1/manifest` | Provider ids and identity kind, channel-independent | `BrokerManifestResponse` |
 | `POST /v1/manifest` | Channel-scoped tool manifest for the signed channel | `BrokerChannelManifestResponse` |
-| `GET /v1/admin/config` | Channel modes and tool allowlist (signed `channel`) | `BrokerAdminConfigResponse` |
-| `POST /v1/admin/mode` · `/v1/admin/tools` · `/v1/admin/reference` | Channel governance writes (signed `channel`; any member of it, #322) | `BrokerAdminOkResponse` |
+| `GET /v1/admin/config` | Channel identities and tool allowlist (signed `channel`) | `BrokerAdminConfigResponse` |
+| `POST /v1/admin/identity` · `/v1/admin/tools` · `/v1/admin/reference` | Channel governance writes (signed `channel`; any member of it, #322) | `BrokerAdminOkResponse` |
 | `POST /v1/admin/audit` · `/v1/admin/offboard` | Channel audit read (signed `channel`) · offboard a user (signed `offboardTargetUserId`) | `BrokerAuditResponse` · `{ ok, revoked }` |
 | `GET /healthz` · `GET /readyz` | Liveness · readiness; unauthenticated | `{ ok }` |

@@ -1,6 +1,6 @@
 import type { Db } from './db';
 import type { Audit } from './audit';
-import type { ChannelMode } from './channelConfig';
+import type { ChannelIdentity } from './channelConfig';
 import type { SlackIdentity } from './identity';
 import { withUserInteractionFence } from './consent';
 import { purgeChannelInteractionState } from './interaction';
@@ -12,23 +12,21 @@ import type { Vault } from './vault';
 const SET_CHANNEL_TOOL_ENABLED = Symbol('set-channel-tool-enabled');
 const APPLY_CHANNEL_TOOLS_ENABLED = Symbol('apply-channel-tools-enabled');
 
-/** One row of a channel's tool manifest: a provider, its channel credential mode, and whether
- *  it's usable in this channel. This is the shape an agent / MCP gateway reads before planning. */
+/** One row of a channel's tool manifest: a provider, whether it's usable in this channel, and who
+ *  the agent acts as when it calls it. This is the shape an agent / MCP gateway reads before planning. */
 export interface ToolManifestEntry {
   provider: string;
-  mode: ChannelMode | null;
   enabled: boolean;
   /**
    * Who the agent acts AS when it calls this tool, and therefore whether Vouchr is in the path:
-   *  - 'acting_human' (default): the tool acts as the human in the channel against a third-party
-   *     provider with that human's credential + consent. THIS is what Vouchr brokers — connect()
-   *     resolves it through the vault and the consent flow.
+   *  - 'person': the asking human, with their own connected credential (the default).
+   *  - 'channel': the channel's one connected credential, audited as the asking human.
    *  - 'service': a service-to-service tool the agent calls as ITSELF (its own service identity, an
    *     internal egress allowlist). There is no human credential to broker, so Vouchr is deliberately
    *     NOT in this path: connect() refuses it and the host wires its own service auth. It appears in
    *     the manifest only so the host can see the full tool set in one place.
    */
-  identity: 'service' | 'acting_human';
+  identity: ChannelIdentity | 'service';
 }
 
 /**

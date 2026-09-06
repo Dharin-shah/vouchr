@@ -6,7 +6,7 @@ import {
   isGovernanceChannelScope,
   resolveCredentialOwner,
 } from './authz';
-import { ChannelConfig } from './channelConfig';
+import { ChannelConfig, type ChannelIdentity } from './channelConfig';
 import {
   userInteractionIsCurrent,
   withUserInteractionFence,
@@ -29,8 +29,14 @@ import {
 } from './interaction';
 import { channelOwner, userOwner, type Owner } from './owner';
 import type { Policy } from './policy';
-import { APPROVERS, isBrokeredProvider, type Approver, type ProviderRegistry } from './providers';
-import { SessionGrants } from './session';
+import {
+  APPROVERS,
+  APPROVAL_GRANTS,
+  isBrokeredProvider,
+  type ApprovalGrant,
+  type Approver,
+  type ProviderRegistry,
+} from './providers';
 import { ChannelTools } from './tools';
 import type { Vault } from './vault';
 
@@ -121,33 +127,69 @@ export function effectiveApprover(approver: Approver, governableChannel: string 
   return approver === 'member' && governableChannel === null ? 'self' : approver;
 }
 
-/** Default validity of an approval once granted (#113): 5 minutes, unless the provider sets ttlMs. */
-export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
+/** Finite bound for the agent's `reason` (#350). It is rendered verbatim (escaped) on the decision
+ * surface, so it stays far under Slack's section-text limit and never becomes a payload. */
+export const MAX_REASON_BYTES = 500;
+/** Finite bound for the optional `link` rendered beside the reason. */
+export const MAX_LINK_BYTES = 2048;
 
-/** Finite bound for a backchannel binding message (#296). It is rendered verbatim (escaped) on the
- * decision surface, so it stays far under Slack's section-text limit and never becomes a payload. */
-export const MAX_BINDING_MESSAGE_BYTES = 500;
-
-/** Validate the host-supplied binding message at the lowest reusable layer (IMP-3): a non-empty,
- * non-whitespace string within the bound. Returns the RAW value — never trimmed or normalized, so
- * what the human reads is byte-exact what the agent stated. Throws a plain fixed-text Error; the
- * broker maps it to 400. */
-export function assertBindingMessage(value: unknown): string {
+/** Validate the agent's reason at the lowest reusable layer (IMP-3): a non-empty, non-whitespace
+ * string within the bound. Returns the RAW value, never trimmed or normalized, so what the human
+ * reads is byte-exact what the agent stated. Throws a plain fixed-text Error; the broker maps it
+ * to 400. */
+export function assertReason(value: unknown): string {
   if (typeof value !== 'string' || value.trim() === '') {
-    throw new Error('bindingMessage must be a non-empty string');
+    throw new Error('reason must be a non-empty string');
   }
-  if (Buffer.byteLength(value, 'utf8') > MAX_BINDING_MESSAGE_BYTES) {
-    throw new Error(`bindingMessage must be at most ${MAX_BINDING_MESSAGE_BYTES} bytes`);
+  if (Buffer.byteLength(value, 'utf8') > MAX_REASON_BYTES) {
+    throw new Error(`reason must be at most ${MAX_REASON_BYTES} bytes`);
   }
   // C0 controls (except newline/tab) and DEL: PostgreSQL TEXT refuses NUL outright (an internal
   // error after the assertion is spent), and the rest have no place in a statement a human reads.
   for (const ch of value) {
     const code = ch.codePointAt(0)!;
     if ((code < 0x20 && code !== 0x0a && code !== 0x09) || code === 0x7f) {
-      throw new Error('bindingMessage must not contain control characters');
+      throw new Error('reason must not contain control characters');
     }
   }
   return value;
+}
+
+/** Validate the optional link (#350): one bounded https URL with no credentials, returned in its
+ * WHATWG-canonical spelling so the prompt renders exactly what a click would open. */
+export function assertLink(value: unknown): string {
+  if (typeof value !== 'string' || value.trim() !== value || value === '') {
+    throw new Error('link must be an https URL');
+  }
+  if (Buffer.byteLength(value, 'utf8') > MAX_LINK_BYTES) {
+    throw new Error(`link must be at most ${MAX_LINK_BYTES} bytes`);
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error('link must be an https URL');
+  }
+  if (url.protocol !== 'https:' || url.username || url.password) {
+    throw new Error('link must be an https URL');
+  }
+  return url.href;
+}
+
+/** The agent's own account of an action, rendered on every prompt it produces (#350). Free text is
+ * plain (never mrkdwn); the link is a validated https URL. Both optional, neither is authority. */
+export interface ApprovalStatement {
+  reason: string | null;
+  link: string | null;
+}
+
+/** Validate a caller-supplied statement once, at the door that received it. Absent fields stay
+ * null; present ones must pass their validator. */
+export function approvalStatement(input: { reason?: unknown; link?: unknown }): ApprovalStatement {
+  return {
+    reason: input.reason === undefined ? null : assertReason(input.reason),
+    link: input.link === undefined ? null : assertLink(input.link),
+  };
 }
 
 /** Wire status of one backchannel authorization request (#296): the row's lifecycle as the polling
@@ -155,11 +197,10 @@ export function assertBindingMessage(value: unknown): string {
 export type AuthorizationStatus = 'pending' | 'approved' | 'denied' | 'expired';
 
 /**
- * Thrown by the injector when a request matches a provider's `approval` predicate and no live,
- * matching, unconsumed grant exists (#113). Control flow, exactly like ConsentRequiredError: the
- * Bolt adapter posts Approve/Deny buttons and the caller stops the turn; the headless broker maps
- * it to 403 `{ error: 'approval_required', approvalId }`. The message is Vouchr-authored and
- * secret-free (method/host/salted action fingerprint only — never the raw path, body, token, or query string).
+ * Thrown by the injector when a request matches the provider's approval rule and no live matching
+ * grant exists (#113). Control flow, exactly like ConsentRequiredError: the Bolt adapter posts the
+ * Approve/Deny prompt and the caller stops the turn; the headless broker maps it to 403
+ * `{ error: 'approval_required', approvalId }`. The message is Vouchr-authored and secret-free.
  */
 export class ApprovalRequiredError extends Error {
   readonly code = 'approval_required' as const;
@@ -171,26 +212,20 @@ export class ApprovalRequiredError extends Error {
     public approver: Approver,
     public method: string,
     public host: string,
-    /** Bounded keyed digest only. Raw caller-controlled action fields never reach errors/Slack. */
-    public actionFingerprint: string,
+    /** The exact request path, rendered plain on the prompt (#350). Never the query string. */
+    public path: string,
     /** The pending approval-request id the Approve/Deny surface decides on. */
     public approvalId: string,
-    /**
-     * How many query parameters the request carries — the ONLY query-derived thing the error (and
-     * thus the Slack prompt and any error serializer) exposes. Parameter names are as
-     * caller-controlled as values (`?ghp_token…=`, `?john@example.com=`), so neither may reach
-     * Slack, logs, storage, or audit (SEC-1); the store binds the byte-exact digest instead (see
-     * queryDigest). A provider-declared safe action renderer is the future shape if humans must
-     * inspect action-defining fields.
-     */
-    public queryParamCount: number = 0,
+    /** What the decision would cover: this one call, or every matching call in the thread. */
+    public grant: ApprovalGrant,
     /** True only when this fetch created the deduplicated pending row. Bolt posts one prompt for
      *  that creator; repeated turns reuse the opaque id without posting or auditing duplicates. */
     public newRequest: boolean = true,
+    /** The agent's stated reason and link, as stored on the pending row. */
+    public reason: string | null = null,
+    public link: string | null = null,
   ) {
-    // Structured fields feed the bounded Block Kit renderer. The public message stays fixed-size:
-    // safeUserMessage returns it verbatim, so embedding a valid multi-block path here would recreate
-    // Slack's 40k overflow outside the renderer.
+    // The public message stays fixed-size: safeUserMessage returns it verbatim.
     super(`Approval required for provider "${provider}". Use the approval prompt before retrying.`);
     this.name = 'ApprovalRequiredError';
   }
@@ -201,15 +236,17 @@ export class ApprovalRequiredError extends Error {
  * the human approved one action, not a class of actions. `origin` binds scheme + host + effective
  * port, while `host` remains the hostname-only observability field. `queryHash` binds the exact
  * (canonical) query parameters (GHSA-pg84, see queryDigest) — as a digest, never raw values. The
- * request BODY remains outside the key; see the threat model — for body-parameterized APIs approval
- * covers the origin + endpoint + method + query, NOT the payload bytes. `channel`/`thread` bind the grant to the
- * conversation context it was requested from (null = none, stored as '').
+ * request BODY remains outside the key; see the threat model: for body-parameterized APIs approval
+ * covers the origin + endpoint + method + query, NOT the payload bytes. `channel`/`thread` bind the
+ * grant to the conversation context it was requested from (null = none, stored as ''). A `thread`
+ * grant (#350) binds only that conversation: its method/origin/host/path/query record the call that
+ * asked, and every later matching call in the thread selects the same row.
  *
  * Two identities are carried SEPARATELY (never conflated):
  *  - `userId`: the REQUESTER (the human driving the agent — the caller). Who is prompted, and who
  *    self-approval matches.
  *  - `ownerKind`/`ownerId`: the CREDENTIAL OWNER the grant is bound to. consume() matches it too, so
- *    if resolution later picks a different owner (a per-user→shared mode change), the grant no longer
+ *    if resolution later picks a different owner (a person -> channel identity change), the grant no longer
  *    matches and re-prompts — the write can never run against a different credential than the human
  *    approved. It is also the purge key (purgeApprovalsForOwner).
  */
@@ -229,6 +266,8 @@ export interface ApprovalKey {
   path: string;
   /** queryDigest(url.search): canonical query digest, '' when the request has no parameters. */
   queryHash: string;
+  /** `once` (exact action, single use) or `thread` (every matching call in `thread` until expiry). */
+  grant: ApprovalGrant;
   channel: string | null;
   thread: string | null;
   /**
@@ -253,8 +292,12 @@ export interface ApprovalRow extends ApprovalKey {
   approvedBy: string | null;
   createdAt: number;
   expiresAt: number;
-  /** #296: non-null only for an agent-initiated backchannel request; rendered on the prompt. */
-  bindingMessage: string | null;
+  /** The agent's reason and link (#350), rendered on the prompt and kept on the audit row. */
+  reason: string | null;
+  link: string | null;
+  /** #296: true for an agent-initiated backchannel request, which the Bolt control plane delivers on
+   * its own timer because no Slack turn can relay it. */
+  backchannel: boolean;
 }
 
 /** Result of one persisted approval-button decision. `invalidated` means the stored action no
@@ -266,7 +309,7 @@ export type ApprovalDecisionResult =
 
 /**
  * Re-resolve every database-backed fact that determines which credential a pending action would
- * use. This runs inside the same locked transaction as the decision: a mode/tool writer cannot
+ * use. This runs inside the same locked transaction as the decision: an identity/tool writer cannot
  * change the answer between this check and the grant. Provider definitions and Policy are immutable
  * for one process; the caller separately rechecks the current provider approval rule and Slack-side
  * approver eligibility in the decision callback.
@@ -285,10 +328,10 @@ export interface CredentialUseValidationInput {
   actorIssuedAt: number;
   /** `undefined` = core/Bolt default store; `null` = this adapter deliberately did not opt in. */
   channelTools?: ChannelTools | null;
-  /** `undefined` = core/Bolt default store; `null` = historical per-user/no-mode semantics. */
+  /** `undefined` = core/Bolt default store; `null` = every channel identity is 'person'. */
   channelConfig?: ChannelConfig | null;
   /**
-   * The mutable-governance scope for the tool-allowlist + mode re-check; null in a personal
+   * The mutable-governance scope for the tool-allowlist + identity re-check; null in a personal
    * conversation so a retained handle / approval in a DM is not invalidated by deny-by-default.
    * Static Policy still evaluates against `binding.channel` (the real delivery channel). Omitted →
    * derived from `binding.channel` (governanceChannelOf), so a 1:1 DM is exempt even for a caller
@@ -306,9 +349,9 @@ async function credentialUseStateForCurrentActor(
     return 'authorization';
   }
 
-  // Governance (tool allowlist + mode + owner resolution) is scoped to the mutable-governance channel
-  // — null in a DM so a personal retained handle survives; static Policy keeps the real delivery
-  // channel (row.channel) so a policy-deny of a DM still denies. Where non-null it equals row.channel.
+  // Governance (tool allowlist + identity + owner resolution) is scoped to the mutable-governance
+  // channel, null in a DM so a personal retained handle survives; static Policy keeps the real
+  // delivery channel (row.channel) so a policy-deny of a DM still denies. Where non-null it equals row.channel.
   const governableChannel = input.governableChannel !== undefined
     ? input.governableChannel
     : governanceChannelOf(row.channel);
@@ -318,23 +361,14 @@ async function credentialUseStateForCurrentActor(
   }
 
   const channelConfig = input.channelConfig === undefined ? new ChannelConfig(db) : input.channelConfig;
-  const mode = governableChannel && channelConfig
-    ? await channelConfig.getMode(row.teamId, governableChannel, row.provider, db)
-    : null;
-  let resolved: ReturnType<typeof resolveCredentialOwner>;
-  if (mode === 'shared') {
-    resolved = resolveCredentialOwner({
-      path: 'channel', mode, principal, channel: governableChannel, eligible: governableChannel !== null,
-    });
-  } else {
-    const sessionCredentialId = mode === 'session' && governableChannel && row.thread
-      ? await new SessionGrants(db).grantedCredentialId(principal, governableChannel, row.thread, row.provider)
-      : null;
-    resolved = resolveCredentialOwner({
-      path: 'user', mode, principal, channel: governableChannel, thread: row.thread,
-      hasSessionGrant: sessionCredentialId === row.credentialId,
-    });
-  }
+  const identity: ChannelIdentity = governableChannel && channelConfig
+    ? await channelConfig.getIdentity(row.teamId, governableChannel, row.provider, db)
+    : 'person';
+  const resolved = identity === 'channel'
+    ? resolveCredentialOwner({
+        path: 'channel', identity, principal, channel: governableChannel, eligible: governableChannel !== null,
+      })
+    : resolveCredentialOwner({ path: 'user', identity, principal, channel: governableChannel });
   if (
     resolved.status !== 'resolved' ||
     resolved.owner.kind !== row.ownerKind ||
@@ -346,7 +380,7 @@ async function credentialUseStateForCurrentActor(
 }
 
 /** Classify a retained handle's binding under its lifecycle locks. Governance is checked before the
- * exact live credential generation so a mode/tool/session change remains an authorization failure
+ * exact live credential generation so an identity/tool change remains an authorization failure
  * even when that writer also removed the formerly selected credential. */
 export async function credentialUseState(
   input: CredentialUseValidationInput,
@@ -417,17 +451,17 @@ export async function approvalOwnerStillCurrent(input: {
 }
 
 /** Owners whose lifecycle locks fence an approval decision. The channel owner is always included
- * for channel-bound actions because mode/tool governance writers use that lock; the stored owner
- * fences reconnect/disconnect, and the projected current owner covers the pre-lock mode snapshot.
- * Vault canonicalizes and de-duplicates the returned keys. */
+ * for channel-bound actions because identity/tool governance writers use that lock; the stored
+ * owner fences reconnect/disconnect, and the projected current owner covers the pre-lock identity
+ * snapshot. Vault canonicalizes and de-duplicates the returned keys. */
 export function approvalDecisionLockOwners(
   row: ApprovalRow,
-  currentMode: 'per-user' | 'shared' | 'session' | null,
+  currentIdentity: ChannelIdentity,
 ): Owner[] {
   const stored: Owner = { teamId: row.teamId, kind: row.ownerKind, id: row.ownerId };
   if (!row.channel) return [stored];
   const governance = channelOwner(row.teamId, row.channel);
-  const projected = currentMode === 'shared'
+  const projected = currentIdentity === 'channel'
     ? governance
     : userOwner({ enterpriseId: null, teamId: row.teamId, userId: row.userId });
   return [governance, stored, projected];
@@ -455,6 +489,7 @@ function toRow(r: any): ApprovalRow {
     host: r.host,
     path: r.path,
     queryHash: r.query_hash ?? '',
+    grant: r.grant_scope,
     channel,
     thread: r.thread || null,
     governableChannel,
@@ -462,16 +497,20 @@ function toRow(r: any): ApprovalRow {
     approvedBy: r.approved_by ?? null,
     createdAt: r.created_at,
     expiresAt: r.expires_at,
-    bindingMessage: r.binding_message ?? null,
+    reason: r.reason ?? null,
+    link: r.link ?? null,
+    backchannel: r.backchannel === 1 || r.backchannel === true,
   };
 }
 
 /**
  * Human-in-the-loop approval requests/grants for sensitive writes (#113). Lifecycle: the injector
  * `request()`s a pending row and throws ApprovalRequiredError; a human decision `approve()`s it into
- * a TTL-bound grant (or `deny()`s it); the retried fetch `consume()`s the grant — SINGLE-USE, via
- * atomic `DELETE ... RETURNING`, so two concurrent retries can never both spend one approval.
- * Expired rows (unanswered prompts and unspent grants) are reclaimed by `sweepExpired()`.
+ * a TTL-bound grant (or `deny()`s it); the retried fetch `consume()`s the grant. A `once` grant is
+ * SINGLE-USE, via atomic `DELETE ... RETURNING`, so two concurrent retries can never both spend one
+ * approval; a `thread` grant (#350) stays until its TTL and every matching call in the thread
+ * spends it without deleting it. Expired rows (unanswered prompts and unspent grants) are reclaimed
+ * by `sweepExpired()`.
  */
 export class Approvals {
   constructor(private db: Db) {}
@@ -492,7 +531,7 @@ export class Approvals {
 
   /** Re-resolve the database-backed authority for a row through the canonical approval validator.
    * The recovery bridge has an Approvals instance but deliberately has no raw Db handle; keeping
-   * this adapter on the store prevents it from copying the mode/session/offboard/credential checks.
+   * this adapter on the store prevents it from copying the identity/offboard/credential checks.
    * This is a delivery-time fail-closed snapshot only. The decision mutation still repeats the
    * validation while holding its lifecycle locks. */
   async ownerStillCurrent(
@@ -515,6 +554,7 @@ export class Approvals {
       k.host,
       k.path,
       k.queryHash,
+      k.grant,
       k.channel ?? '',
       k.thread ?? '',
       this.governanceParam(k),
@@ -526,27 +566,39 @@ export class Approvals {
       host: k.host,
       method: k.method,
       actionFingerprint: approvalActionFingerprint(k),
+      grant: k.grant,
       ...(k.channel ? { channel: k.channel } : {}),
       ...extra,
     };
   }
 
-  /** Insert or reuse the one live row for an exact action. The unique action index linearizes two
+  /** The raw-field match for one key after the `action_key` selector: every scope field always, and
+   *  the exact action fields only for a `once` grant (a `thread` row records the call that asked,
+   *  which a later matching call in the thread need not repeat). One fragment for insert-conflict,
+   *  live lookup, and consume, so the three cannot drift. */
+  private static readonly MATCH_SQL = `team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
+           AND (grant_scope='thread' OR (method=? AND origin=? AND host=? AND path=? AND query_hash=?))
+           AND grant_scope=? AND channel=? AND thread=? AND governable_channel=?`;
+
+  /** Insert or reuse the one live row for an action. The unique action index linearizes two
    *  replicas; an expired or denied row is atomically replaced (a denial is a terminal outcome the
-   *  poller may still be reading, but a new request IS a new decision — #296). A live granted row
-   *  may win the consume→request race, in which case its id is returned without a duplicate prompt
-   *  and the caller retries. A reused pending row adopts the binding message only if it had none,
-   *  so the human never reads a statement that changed under an already-delivered prompt. */
+   *  poller may still be reading, but a new request IS a new decision, #296). A live granted row
+   *  may win the consume -> request race, in which case its id is returned without a duplicate prompt
+   *  and the caller retries. A reused pending row adopts the reason/link only if it had none, so the
+   *  human never reads a statement that changed under an already-delivered prompt. */
   private async requestOn(
     db: Db,
     k: ApprovalKey,
-    bindingMessage: string | null = null,
+    statement: ApprovalStatement = { reason: null, link: null },
+    backchannel = false,
   ): Promise<{ id: string; created: boolean }> {
     if (!isInteractionId(k.credentialId)) {
       throw new Error('approval request requires a valid credential generation id');
     }
+    if (!(APPROVAL_GRANTS as readonly string[]).includes(k.grant)) throw new Error('invalid approval grant');
     assertApprovalPathBounded(k.path);
-    const message = bindingMessage === null ? null : assertBindingMessage(bindingMessage);
+    const reason = statement.reason === null ? null : assertReason(statement.reason);
+    const link = statement.link === null ? null : assertLink(statement.link);
     const params = this.keyParams(k);
     const actionKey = approvalActionKey(k);
     for (let attempt = 0; attempt < 3; attempt++) {
@@ -554,46 +606,49 @@ export class Approvals {
       const row = await db.get<{ id: string }>(
         `INSERT INTO approval_request
            (id, action_key, team_id, user_id, owner_kind, owner_id, credential_id, provider, method, origin, host, path, query_hash,
-            channel, thread, governable_channel, status, approved_by, created_at, expires_at, binding_message)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?,?)
+            grant_scope, channel, thread, governable_channel, status, approved_by, created_at, expires_at, reason, link, backchannel)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'pending',NULL,${POSTGRES_NOW_US_SQL},${POSTGRES_NOW_US_SQL}+?,?,?,?)
          ON CONFLICT(action_key) DO UPDATE SET
            id=excluded.id, status='pending', approved_by=NULL,
            created_at=excluded.created_at, expires_at=excluded.expires_at,
-           governable_channel=excluded.governable_channel,
+           method=excluded.method, origin=excluded.origin, host=excluded.host, path=excluded.path,
+           query_hash=excluded.query_hash, governable_channel=excluded.governable_channel,
            delivery_token=NULL, delivery_lease_expires_at=0, delivered_at=NULL,
-           delivery_audience=NULL, binding_message=excluded.binding_message
+           delivery_audience=NULL, reason=excluded.reason, link=excluded.link, backchannel=excluded.backchannel
          WHERE approval_request.team_id=excluded.team_id
            AND approval_request.user_id=excluded.user_id
            AND approval_request.owner_kind=excluded.owner_kind
            AND approval_request.owner_id=excluded.owner_id
            AND approval_request.credential_id=excluded.credential_id
            AND approval_request.provider=excluded.provider
-           AND approval_request.method=excluded.method
-           AND approval_request.origin=excluded.origin
-           AND approval_request.host=excluded.host
-           AND approval_request.path=excluded.path
-           AND approval_request.query_hash=excluded.query_hash
+           AND approval_request.grant_scope=excluded.grant_scope
+           AND (approval_request.grant_scope='thread' OR (
+             approval_request.method=excluded.method
+             AND approval_request.origin=excluded.origin
+             AND approval_request.host=excluded.host
+             AND approval_request.path=excluded.path
+             AND approval_request.query_hash=excluded.query_hash))
            AND approval_request.channel=excluded.channel
            AND approval_request.thread=excluded.thread
            AND (approval_request.expires_at<=${POSTGRES_NOW_US_SQL} OR approval_request.status='denied')
          RETURNING id`,
-        [id, actionKey, ...params, PENDING_INTERACTION_TTL_US, message],
+        [id, actionKey, ...params, PENDING_INTERACTION_TTL_US, reason, link, backchannel ? 1 : 0],
       );
       if (row) return { id: row.id, created: true };
       const live = await db.get<{ id: string }>(
         `SELECT id FROM approval_request
-         WHERE action_key=?
-           AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=?
-           AND method=? AND origin=? AND host=? AND path=? AND query_hash=? AND channel=? AND thread=?
-           AND governable_channel=?
+         WHERE action_key=? AND ${Approvals.MATCH_SQL}
            AND status<>'denied' AND expires_at>${POSTGRES_NOW_US_SQL}`,
         [actionKey, ...params],
       );
       if (live) {
-        if (message !== null) {
+        // A later reason/link is adopted only while the prompt is undelivered: a delivered prompt and
+        // its approval_requested audit row were rendered without it and never change afterwards.
+        if (reason !== null || link !== null) {
           await db.run(
-            `UPDATE approval_request SET binding_message=? WHERE id=? AND status='pending' AND binding_message IS NULL`,
-            [message, live.id],
+            `UPDATE approval_request SET reason=COALESCE(reason, ?), link=COALESCE(link, ?)
+             WHERE id=? AND status='pending' AND delivered_at IS NULL`,
+            [reason, link, live.id],
           );
         }
         return { id: live.id, created: false };
@@ -609,20 +664,29 @@ export class Approvals {
   }
 
   /** Deduplicated request plus `approval_requested` audit in one transaction. Reuse writes no
-   *  duplicate audit row and tells Bolt not to post another prompt. `bindingMessage` (#296) marks
-   *  an agent-initiated backchannel request; it is stored for the prompt and never audited. */
+   *  duplicate audit row and tells Bolt not to post another prompt. The agent's reason rides on the
+   *  audit row under the fixed `reason` key (#350); `backchannel` marks an agent-initiated request
+   *  the control plane delivers on its own timer (#296). */
   async requestAudited(
     k: ApprovalKey,
     audit: Audit,
     acting: SlackIdentity,
     vault?: Pick<Vault, 'withCredentialLocks'>,
     validate?: (key: ApprovalKey, tx: Db, locked: Pick<Vault, 'liveId'>) => Promise<boolean>,
-    bindingMessage: string | null = null,
+    statement: ApprovalStatement = { reason: null, link: null },
+    backchannel = false,
   ): Promise<{ id: string; created: boolean }> {
     const write = async (tx: Db) => {
-      const result = await this.requestOn(tx, k, bindingMessage);
+      const result = await this.requestOn(tx, k, statement, backchannel);
       if (result.created) {
-        await audit.record('approval_requested', acting, k.provider, this.auditMeta(k), undefined, tx);
+        await audit.record(
+          'approval_requested',
+          acting,
+          k.provider,
+          this.auditMeta(k, statement.reason === null ? {} : { reason: statement.reason }),
+          undefined,
+          tx,
+        );
       }
       return result;
     };
@@ -831,7 +895,7 @@ export class Approvals {
     if (!Number.isSafeInteger(limit) || limit < 1) throw new Error('listUndeliveredBackchannel requires a positive limit');
     const rows = await this.db.all<any>(
       `SELECT * FROM approval_request
-       WHERE status='pending' AND binding_message IS NOT NULL AND delivered_at IS NULL
+       WHERE status='pending' AND backchannel=1 AND delivered_at IS NULL
          AND (delivery_token IS NULL OR delivery_lease_expires_at<=${POSTGRES_NOW_US_SQL})
          AND expires_at>${POSTGRES_NOW_US_SQL}
        ORDER BY created_at LIMIT ?`,
@@ -841,10 +905,11 @@ export class Approvals {
   }
 
   /**
-   * Consume (single-use) one live grant matching the EXACT action key. The atomic
-   * `DELETE ... RETURNING` (see Consent.consume) is what makes a grant spend-once even for two
-   * concurrent identical fetches — a get-then-delete would let both pass on multi-instance Postgres.
-   * Returns the approver for audit attribution, or null when no live grant matches.
+   * Consume one live grant matching the action key: a `once` grant is spent by the atomic
+   * `DELETE ... RETURNING` (see Consent.consume), which makes it spend-once even for two concurrent
+   * identical fetches (a get-then-delete would let both pass on multi-instance Postgres); a
+   * `thread` grant is matched and left in place until its TTL. Returns the approver for audit
+   * attribution, or null when no live grant matches.
    */
   async consume(k: ApprovalKey): Promise<{ approvedBy: string | null } | null> {
     return this.consumeOn(this.db, k);
@@ -861,9 +926,7 @@ export class Approvals {
     // that already holds the actor lock and is waiting to update the same approval row.
     const row = await db.get<{ id: string; created_at: number }>(
       `SELECT id, created_at FROM approval_request
-        WHERE action_key=?
-          AND team_id=? AND user_id=? AND owner_kind=? AND owner_id=? AND credential_id=? AND provider=? AND method=? AND origin=? AND host=? AND path=? AND query_hash=?
-          AND channel=? AND thread=? AND governable_channel=?
+        WHERE action_key=? AND ${Approvals.MATCH_SQL}
           AND status='granted' AND expires_at>${POSTGRES_NOW_US_SQL}
         LIMIT 1`,
       [approvalActionKey(k), ...this.keyParams(k)],
@@ -871,22 +934,29 @@ export class Approvals {
     return row ? { id: row.id, createdAt: row.created_at } : null;
   }
 
+  /** Spend one live grant by id: a `once` row is deleted atomically; a `thread` row is read and
+   *  kept. Both re-check liveness in the same statement. */
   private async consumeIdOn(
     db: Db,
     id: string,
+    grant: ApprovalGrant,
   ): Promise<{ approvedBy: string | null } | null> {
-    const row = await db.get<{ approved_by: string | null }>(
-      `DELETE FROM approval_request
-        WHERE id=? AND status='granted' AND expires_at>${POSTGRES_NOW_US_SQL}
-        RETURNING approved_by`,
-      [id],
-    );
+    const live = `id=? AND status='granted' AND grant_scope=? AND expires_at>${POSTGRES_NOW_US_SQL}`;
+    const row = grant === 'once'
+      ? await db.get<{ approved_by: string | null }>(
+        `DELETE FROM approval_request WHERE ${live} RETURNING approved_by`,
+        [id, grant],
+      )
+      : await db.get<{ approved_by: string | null }>(
+        `SELECT approved_by FROM approval_request WHERE ${live}`,
+        [id, grant],
+      );
     return row ? { approvedBy: row.approved_by ?? null } : null;
   }
 
   private async consumeOn(db: Db, k: ApprovalKey): Promise<{ approvedBy: string | null } | null> {
     const candidate = await this.liveGrantOn(db, k);
-    return candidate ? this.consumeIdOn(db, candidate.id) : null;
+    return candidate ? this.consumeIdOn(db, candidate.id, k.grant) : null;
   }
 
   /** Spend one exact grant and write `approval_consumed` atomically. If audit insertion fails the
@@ -915,7 +985,7 @@ export class Approvals {
           if (locked && ((!validate && k.channel) || (validate && !(await validate(k, fencedTx, locked))))) {
             throw new InteractionStateChangedError('approval', 'authorization');
           }
-          const grant = await this.consumeIdOn(fencedTx, candidate.id);
+          const grant = await this.consumeIdOn(fencedTx, candidate.id, k.grant);
           if (grant) {
             await audit.record(
               'approval_consumed',

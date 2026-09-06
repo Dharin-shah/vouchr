@@ -15,9 +15,9 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { channelOwner, userOwner } from '../src/core/owner';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
-import { MAX_BINDING_MESSAGE_BYTES } from '../src/core/approval';
+import { MAX_REASON_BYTES } from '../src/core/approval';
 import { createBroker } from '../src/adapters/http/broker';
 import { createVouchr } from '../src/adapters/bolt';
 import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION } from '../src/adapters/blocks';
@@ -133,7 +133,7 @@ async function harness(t: TestContext, o: {
   const vault = new Vault(db, key);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  if (owner === 'channel') await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'shared');
+  if (owner === 'channel') await writeChannelIdentity(channelConfig, 'T1', 'C1', 'acme', 'channel');
   await vault.upsert(owner === 'channel' ? channelOwner('T1', 'C1') : userOwner(ID), 'acme', {
     accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
@@ -189,7 +189,7 @@ async function harness(t: TestContext, o: {
   const handle = { provider: 'acme', owner };
   const authorize = (over: Record<string, unknown> = {}) => request(port, 'POST', '/v1/authorization', {
     handle, identityToken: mint(),
-    method: 'POST', path: '/repos', bindingMessage: 'Create repository "demo" in org acme', ...over,
+    method: 'POST', path: '/repos', reason: 'Create repository "demo" in org acme', ...over,
   });
   const status = (id: string, token = mint()) => request(port, 'GET', `/v1/authorization/${id}`, undefined, { 'x-vouchr-identity': token });
   const fetchAction = (over: Record<string, unknown> = {}) => request(port, 'POST', '/v1/fetch', {
@@ -209,13 +209,14 @@ test('#296 initiate → deliver on the control plane → approve → poll → th
   assert.equal(first.json.status, 'pending');
   assert.ok(first.json.expiresAt > Date.now(), 'expiresAt is a future epoch-ms instant');
   assert.equal(upstream.length, 0, 'initiation never reaches the provider');
-  const again = await h.authorize({ bindingMessage: 'a different statement for the same action' });
+  const again = await h.authorize({ reason: 'a different statement for the same action' });
   assert.equal(again.json.authorizationId, first.json.authorizationId, 'the exact action deduplicates to one request');
   assert.equal((await h.audits('approval_requested')).length, 1, 'a reused request writes no second audit row');
-  const stored = await h.db.get<any>(`SELECT binding_message, status FROM approval_request WHERE id=?`, [first.json.authorizationId]);
-  assert.equal(stored.binding_message, 'Create repository "demo" in org acme', 'the first statement is what the human will read');
+  const stored = await h.db.get<any>(`SELECT reason, status FROM approval_request WHERE id=?`, [first.json.authorizationId]);
+  assert.equal(stored.reason, 'Create repository "demo" in org acme', 'the first statement is what the human will read');
   assert.equal(stored.status, 'pending');
-  assert.ok(!JSON.stringify(await h.db.all(`SELECT meta FROM audit`)).includes('Create repository'), 'the statement is never audited');
+  // #350: the agent's reason rides the approval_requested audit row under the fixed `reason` key.
+  assert.equal(JSON.parse((await h.audits('approval_requested'))[0].meta).reason, 'Create repository "demo" in org acme');
 
   // ── Poll: bound to the requester. ───────────────────────────────────────────────────────────
   assert.equal((await h.status(first.json.authorizationId)).json.status, 'pending');
@@ -238,7 +239,7 @@ test('#296 initiate → deliver on the control plane → approve → poll → th
   assert.ok(rendered.includes(APPROVAL_APPROVE_ACTION) && rendered.includes(APPROVAL_DENY_ACTION));
   assert.ok(rendered.includes('Create repository \\"demo\\" in org acme'), 'the binding message is on the prompt');
   assert.ok(!rendered.includes(TOKEN), 'SEC-1');
-  assert.ok(!rendered.includes('/repos'), 'raw path never rendered');
+  assert.ok(rendered.includes('POST api.acme.test/repos'), 'the plain path is on the prompt (#350)');
   await h.vouchr.sweepExpired();
   assert.equal(h.prompts().length, 1, 'a delivered prompt is not re-posted by the next pass');
 
@@ -303,7 +304,7 @@ test('autonomous worker: a bot-user requester on a shared channel credential is 
   const upstream = stubUpstream(t);
   const member = defineProvider({ ...acme, approval: { approver: 'member' } } as any);
   const h = await harness(t, { provider: member, owner: 'channel', requester: BOT, members: [BOT, 'U2'] });
-  const created = await h.authorize({ bindingMessage: 'TICKET-42: rotate the deploy key' });
+  const created = await h.authorize({ reason: 'TICKET-42: rotate the deploy key' });
   assert.equal(created.status, 200, JSON.stringify(created.json));
   assert.equal(created.json.status, 'pending');
   assert.equal(upstream.length, 0, 'initiation never reaches the provider');
@@ -460,8 +461,8 @@ test('#296 a spend must carry the initiating conversation claims; a mismatch min
   assert.notEqual(mismatch.json.approvalId, created.json.authorizationId, 'a second, ordinary pending request');
   assert.equal(upstream.length, 0, 'nothing executed');
   assert.equal((await h.status(created.json.authorizationId)).json.status, 'approved', 'the real grant is untouched');
-  const other = await h.db.get<any>(`SELECT binding_message, thread FROM approval_request WHERE id=?`, [mismatch.json.approvalId]);
-  assert.deepEqual(other, { binding_message: null, thread: '' }, 'the mismatch row is not a backchannel request');
+  const other = await h.db.get<any>(`SELECT reason, thread FROM approval_request WHERE id=?`, [mismatch.json.approvalId]);
+  assert.deepEqual(other, { reason: null, thread: '' }, 'the mismatch row is not a backchannel request');
   await h.vouchr.sweepExpired();
   assert.equal(h.prompts().length, 1, 'the delivery timer never posts the mismatch row');
 
@@ -514,24 +515,31 @@ test('#296 an ambiguous Slack failure keeps the delivery lease: no second post u
   assert.ok((await h.db.get<any>(`SELECT delivered_at FROM approval_request WHERE id=?`, [created.json.authorizationId])).delivered_at);
 });
 
-test('#296 input grammar and gates: bindingMessage bounds, non-approval actions, writes, provider, egress', async (t) => {
+test('#296 input grammar and gates: reason bounds, non-approval actions, writes, provider, egress', async (t) => {
   stubUpstream(t);
   const h = await harness(t);
   for (const bad of [
-    undefined, '', '   ', '\n\t', 42, null, { text: 'x' },
-    'x'.repeat(MAX_BINDING_MESSAGE_BYTES + 1), 'é'.repeat(MAX_BINDING_MESSAGE_BYTES),
+    '', '   ', '\n\t', 42, null, { text: 'x' },
+    'x'.repeat(MAX_REASON_BYTES + 1), 'é'.repeat(MAX_REASON_BYTES),
     'a\u0000b', 'a\u0007b', 'a\u001bb', 'a\u007fb', // NUL (PostgreSQL refuses it), BEL, ESC, DEL
   ]) {
-    const r = await h.authorize({ bindingMessage: bad });
-    assert.equal(r.status, 400, `bindingMessage ${JSON.stringify(bad)?.slice(0, 20)} → 400`);
-    assert.match(r.json.error, /bindingMessage/);
+    const r = await h.authorize({ reason: bad });
+    assert.equal(r.status, 400, `reason ${JSON.stringify(bad)?.slice(0, 20)} → 400`);
+    assert.match(r.json.error, /reason/);
   }
   assert.equal((await h.db.all(`SELECT 1 FROM approval_request`)).length, 0, 'rejected input persists nothing');
   // A 400 is decided before identity verification, so the assertion is not spent by it.
   const spare = tok();
-  assert.equal((await h.authorize({ identityToken: spare, bindingMessage: 'a\u0000b' })).status, 400);
-  assert.equal((await h.authorize({ identityToken: spare, bindingMessage: 'line one\nline two\ttabbed' })).status, 200, 'newline and tab are allowed');
-  assert.equal((await h.authorize({ path: '/bounded', bindingMessage: 'x'.repeat(MAX_BINDING_MESSAGE_BYTES) })).status, 200, 'exactly the bound is accepted');
+  assert.equal((await h.authorize({ identityToken: spare, reason: 'a\u0000b' })).status, 400);
+  assert.equal((await h.authorize({ identityToken: spare, reason: 'line one\nline two\ttabbed' })).status, 200, 'newline and tab are allowed');
+  assert.equal((await h.authorize({ path: '/bounded', reason: 'x'.repeat(MAX_REASON_BYTES) })).status, 200, 'exactly the bound is accepted');
+  assert.equal((await h.authorize({ path: '/no-reason', reason: undefined })).status, 200, 'the reason is optional (#350)');
+  for (const badLink of ['', 'http://insecure.example/x', 'https://user:pw@example.com/x', 'ftp://x', ' https://example.com', 'https://' + 'a'.repeat(2100)]) {
+    const r = await h.authorize({ path: '/linked', link: badLink });
+    assert.equal(r.status, 400, `link ${JSON.stringify(badLink).slice(0, 30)} → 400`);
+    assert.match(r.json.error, /link/);
+  }
+  assert.equal((await h.authorize({ path: '/linked', link: 'https://tracker.example/T-42' })).status, 200, 'an https link is accepted');
 
   const noApproval = await h.authorize({ method: 'GET', path: '/me' });
   assert.equal(noApproval.status, 400);

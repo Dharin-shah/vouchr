@@ -40,7 +40,7 @@ async function post(route: string, body: object): Promise<{ status: number; json
 }
 
 (async () => {
-  const created = await post('/v1/authorization', { ...action, bindingMessage: 'TICKET-42: open the release checklist issue' });
+  const created = await post('/v1/authorization', { ...action, reason: 'TICKET-42: open the release checklist issue', link: 'https://tracker.example/TICKET-42' });
   console.log('authorization', created.status, created.json);
   let status = created.json.status;
   while (status === 'pending') {

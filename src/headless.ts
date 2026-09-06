@@ -60,7 +60,6 @@ export type {
 // so the headless graph stays independent of Bolt/Slack packages.
 export {
   ConsentRequiredError,
-  SessionApprovalRequiredError,
   UpstreamTimeoutError,
   UserFacingError,
   VOUCHR_ERROR_CODES,
@@ -73,12 +72,14 @@ export type { ConsentPromptState, VouchrErrorCode, VouchrRecovery, VouchrSafeErr
 // The broker maps this typed control-flow error to 403. Interaction stores are not exported: the
 // shipped hybrid bridge reaches their safe mutations only through the trusted Bolt
 // ConnectContext.recoverBrokerDenial surface; a pure-headless host gets no raw mutation API.
-// #296: the backchannel binding-message bound + validator, so a client can reject before the wire.
+// #350: the reason/link bounds + validators, so a client can reject before the wire.
 export {
   ApprovalPathTooLongError,
   ApprovalRequiredError,
-  MAX_BINDING_MESSAGE_BYTES,
-  assertBindingMessage,
+  MAX_REASON_BYTES,
+  MAX_LINK_BYTES,
+  assertReason,
+  assertLink,
 } from './core/approval';
 export type { AuthorizationStatus } from './core/approval';
 export { sweepExpired } from './core/sweep';
@@ -116,8 +117,8 @@ export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';
 
 // ── opt-in channel gate ──
-export { ChannelConfig, channelIneligibleReason } from './core/channelConfig';
-export type { ChannelMode } from './core/channelConfig';
+export { CHANNEL_IDENTITIES, ChannelConfig, channelIneligibleReason, isChannelIdentity } from './core/channelConfig';
+export type { ChannelIdentity } from './core/channelConfig';
 
 // ── operator authorization surface: Policy scopes the broker to a channel (canary rollout), the tool
 // allowlist gates per-channel providers, and Resolvers/EventSink wire the `resolvers`/`onEvent`

@@ -69,6 +69,7 @@ test('databricks: an unsafe host is rejected — the token exchange is not behin
 test('defineProvider: a public client cannot use Basic token auth (Basic carries a secret it lacks)', () => {
   assert.throws(
     () => defineProvider({
+      approval: false,
       id: 'x', authorizeUrl: 'https://h/a', tokenUrl: 'https://h/t', scopesDefault: [],
       egressAllow: ['h'], refresh: 'none', pkce: true, clientId: 'cid', publicClient: true, tokenAuth: 'basic',
     }),
@@ -84,6 +85,7 @@ test('databricks: callers can widen egress explicitly (jobs), overriding the sta
 test('defineProvider: a public client with PKCE disabled is refused (no client authentication at all)', () => {
   assert.throws(
     () => defineProvider({
+      approval: false,
       id: 'x', authorizeUrl: 'https://h/a', tokenUrl: 'https://h/t', scopesDefault: [],
       egressAllow: ['h'], refresh: 'none', pkce: false, clientId: 'cid', publicClient: true,
     }),
@@ -157,7 +159,7 @@ test('databricks: confidential-client token exchange includes the client_secret'
 async function makeHandle(t: TestContext) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
-  const p = databricks({ host: HOST, clientId: 'cid' });
+  const p = databricks({ host: HOST, clientId: 'cid', approval: false });
   let calls = 0;
   // Referenced credential: the ONLY way to read the secret is the resolver, so calls===0 proves a
   // denied request never even read the token (fail-closed before injection).

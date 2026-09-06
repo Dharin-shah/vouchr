@@ -87,7 +87,7 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
 - **Disconnect and shared-channel changes fence older setup authority.** Ordinary credential
   deletion commits an exact provider/owner provisioning marker before removal; a failed bounded-row
   cleanup therefore cannot let an already-exposed key form or OAuth callback recreate access after
-  Disconnect reports completion. For shared credentials, every effective credential, mode, or tool
+  Disconnect reports completion. For shared credentials, every effective credential, identity, or tool
   mutation advances a channel/provider tombstone atomically with dependent-state cleanup. Setup
   received before that marker cannot hydrate or commit afterward, including when Slack modal or
   membership checks delayed request persistence. Same-value governance retries leave current forms valid.
@@ -105,7 +105,7 @@ Vouchr is a credential *boundary*, not a complete authorization system. Know its
   revocation is a risk decision, not automatically required. A **database dump *plus* a decryption
   path** (leaked master key, compromised KMS/workload role, or a compromised live replica) must be
   treated as full credential exposure. For that case, `vouchr revoke --all --confirm ALL-CREDENTIALS`
-  locally deletes every stored credential, external reference, pending consent, session grant/request,
+  locally deletes every stored credential, external reference, pending consent,
   action approval, notification-state row, and Slack installation, then attempts best-effort upstream
   revocation per provider and reports real attempted counts separately from success/failure. A
   refresh-capable revocable provider must declare whether invalidation targets the access token,

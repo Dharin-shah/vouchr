@@ -7,7 +7,7 @@ exactly like examples/broker-client/client.ts. Tokens are never logged or printe
 
     python3 vouchr_client.py BROKER_URL status
     python3 vouchr_client.py BROKER_URL fetch PROVIDER METHOD PATH [HOST]
-    python3 vouchr_client.py BROKER_URL authorize PROVIDER METHOD PATH "statement"   # #296 backchannel
+    python3 vouchr_client.py BROKER_URL authorize PROVIDER METHOD PATH ["reason" [link]]   # #296 backchannel
     python3 vouchr_client.py BROKER_URL authorization ID                             # #296 poll
 
 The CLI reads one identity token per line from stdin (pipe them from the minter) and honours
@@ -54,10 +54,11 @@ class Vouchr:
         """POST /v1/status -> {providers: [{provider, connected, consentState}]} for the acting user."""
         return self._post("/v1/status")
 
-    def request_authorization(self, handle, method, path, binding_message, host=None, query=None):
-        """POST /v1/authorization (#296) -> {authorizationId, status, expiresAt}. Nothing executes."""
+    def request_authorization(self, handle, method, path, reason=None, link=None, host=None, query=None):
+        """POST /v1/authorization (#296) -> {authorizationId, status, expiresAt}. Nothing executes.
+        `reason` (<= 500 bytes) and `link` (https URL) are shown to the approver as the agent's own claim."""
         return self._post("/v1/authorization", handle=handle, method=method, path=path, host=host,
-                          query=query, bindingMessage=binding_message)
+                          query=query, reason=reason, link=link)
 
     def authorization(self, authorization_id):
         """GET /v1/authorization/{id} (#296) -> pending | approved | denied | expired; 404 is terminal."""
@@ -107,7 +108,7 @@ if __name__ == "__main__":
         elif cmd == "fetch":
             out = client.fetch(handle, args[1], args[2], *args[3:4])
         elif cmd == "authorize":
-            out = client.request_authorization(handle, args[1], args[2], args[3])
+            out = client.request_authorization(handle, args[1], args[2], *args[3:5])
         elif cmd == "authorization":
             out = client.authorization(args[0])
         else:

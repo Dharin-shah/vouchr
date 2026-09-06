@@ -47,7 +47,7 @@ except VouchrError as e:
 Every broker denial raises `VouchrError` with `status`, `code`, `retryable`, `recovery`,
 `retry_after_ms`, `approval_id`, and the raw `body`. Branch on `code`; the meanings are in
 HEADLESS.md's typed error table. Codes a worker sees: `not_connected`, `consent_required`,
-`session_approval_required`, `approval_required`, `approval_path_too_large`,
+`approval_required`, `approval_path_too_large`,
 `interaction_state_changed`, `policy_denied`, `tool_disabled`, `egress_blocked`, `response_blocked`,
 `resolver_configuration_error`, `resolver_failed`, `rate_limited`, `overloaded`,
 `token_endpoint_failed`, `upstream_timeout`, `internal_error`, and the `invalid_reference` family.

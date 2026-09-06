@@ -43,8 +43,8 @@ const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 // VOUCHR_SLACK_CLIENT_SECRET in the environment, and a one-time `npx vouchr migrate`.
 const vouchr = await createVouchr({
   providers: [
-    // Reads go through. Writes under /repos/ wait for a teammate's approval.
-    github({ approval: { approver: 'member', methods: ['POST', 'PUT', 'PATCH', 'DELETE'], paths: ['/repos/'] } }),
+    // Reads go through. Every write waits for a teammate's approval. Nothing to configure.
+    github(),
   ],
   baseUrl: process.env.PUBLIC_URL!,
 });
@@ -78,18 +78,26 @@ After one browser sign-in, the agent works as them.
 
 ## Writes and sensitive paths
 
-The `approval` setting on a provider says which calls need a human.
-
-- `methods`: which HTTP methods wait. Leave it out and every method except GET and HEAD waits.
-- `paths`: which paths wait. A prefix ending in `/` matches everything under it. Leave it out and
-  every path waits.
-- `approver`: `member` asks the channel that owns the credential. Any member other than the
-  requester can approve. `self` asks the person driving the agent.
-
-When the agent reaches one of these calls, Vouchr posts a prompt in the channel with who asked,
-the provider, the method, and the host. One click approves exactly that call, once. Then the agent
+Writes wait for a human by default. Every call other than GET or HEAD posts a prompt in the channel
+with who asked, the provider, the method, the path, and the agent's reason. Another member of the
+channel approves. One click covers exactly that call, once, for five minutes. Then the agent
 continues to the next step and asks again when it has to. A credential only ever goes to the
 provider's own hosts.
+
+The `approval` setting on a provider narrows or widens that.
+
+- `approval: false`: nothing waits. Use it for a provider whose writes are harmless.
+- `methods`: which HTTP methods wait. Default: every method except GET and HEAD.
+- `paths`: which paths wait. A prefix ending in `/` matches everything under it. Default: all.
+- `approver`: `member` (default) asks the channel that owns the credential; any member other than
+  the requester can approve. `self` asks the person driving the agent.
+- `grant`: `once` (default) covers one call. `thread` covers every matching call in the approving
+  thread until `ttlMs` runs out, for a task with many writes in one conversation.
+- `ttlMs`: how long an approval stays usable. Default five minutes.
+
+The agent can say why. `handle.fetch(url, { method: 'POST', body, reason: 'Close INC-42 as resolved', link: 'https://tracker.example/INC-42' })`
+puts the reason (up to 500 bytes) and an `https://` link on the prompt and the reason in the audit
+row. Both are the agent's own claim, and the prompt says so.
 
 This is how an agent does most of a task alone and still stops at the steps that matter. It drafts
 and reviews on its own, pauses to merge or to publish, and a teammate approves in Slack.
@@ -111,15 +119,16 @@ channel, provider, method, host, and outcome, and for approvals who approved. Se
 - `vouchr inventory` on the command line lists every live credential.
 - The table is plain PostgreSQL. The [Prometheus example](./examples/prometheus) exports it.
 
-## Credential modes
+## Who the agent acts as
 
-Each channel picks how a provider is authorized. Your handler code does not change.
+One setting per channel per provider. Your handler code does not change.
 
-| Mode | What it means | Typical use |
+| Identity | What it means | Typical use |
 | --- | --- | --- |
-| `per-user` | Each person uses their own connected account. | GitHub, Google, Jira |
-| `session` | Usable only inside the approving thread, for a limited time. | Sensitive writes |
-| `shared` | The channel uses one credential a channel member configures. | Team tools, internal APIs |
+| `person` | Each person uses their own connected account. The default. | GitHub, Google, Jira |
+| `channel` | The channel uses one credential a member connects with `/vouchr connect-shared`. | Team tools, internal APIs |
+
+`/vouchr identity <provider> <person|channel>` switches it; `connect-shared` sets `channel` for you.
 
 ## Providers
 

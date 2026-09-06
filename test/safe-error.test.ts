@@ -6,7 +6,6 @@ import {
   safeUserMessage,
   createVouchr,
   ConsentRequiredError,
-  SessionApprovalRequiredError,
 } from '../src/adapters/bolt';
 import { EgressBlockedError, NoConnectionError, ResolverFailedError, ResponseBlockedError } from '../src/core/injector';
 import { SecretReferenceError } from '../src/core/reference';
@@ -110,14 +109,6 @@ test("safeUserMessage: Vouchr's typed errors use the core mapper's fixed safe co
   assert.match(
     safeUserMessage(new ConsentRequiredError('github', 'reused')),
     /no longer visible, ask again in 30 seconds\./,
-  );
-  assert.equal(
-    safeUserMessage(new SessionApprovalRequiredError('github', 'posted')),
-    'Thread-scoped session approval is required. Approve the private prompt, then retry.',
-  );
-  assert.match(
-    safeUserMessage(new SessionApprovalRequiredError('github', 'reused')),
-    /already posted in the thread; if it is no longer visible, ask again in 30 seconds\./,
   );
   assert.equal(
     safeUserMessage(new EgressBlockedError('Egress blocked: host not allowed')),
@@ -1151,7 +1142,7 @@ test('channel setup request, credential, and config audit roll back together on 
 // Regression (#97 issue #132): the deliberate member-denial for `/vouchr mode` is thrown as a plain
 // refusal, NOT one of the 4 whitelisted classes. It must still reach the user verbatim — before the
 // UserFacingError marker it collapsed to "Something went wrong (Error)...".
-test('command: a non-member /vouchr mode gets the real member-denied message, not the generic mask', async (t) => {
+test('command: a non-member /vouchr identity gets the real member-denied message, not the generic mask', async (t) => {
   process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
   const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
   let cmd: any;
@@ -1163,52 +1154,13 @@ test('command: a non-member /vouchr mode gets the real member-denied message, no
   const nonMember = { conversations: { members: async () => ({ members: ['U_SOMEONE_ELSE'] }) } };
   let said = '';
   await cmd({
-    command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'mode acme per-user', trigger_id: 'x' },
+    command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'identity acme channel', trigger_id: 'x' },
     ack: async () => {}, respond: async (m: any) => { said = m; }, client: nonMember,
   });
   assert.equal(
     said,
     'Only a current member of this channel can configure channel credentials. If you are one, make sure Vouchr is in the channel and try again.',
   );
-});
-
-// Regression: a mode-locked channel rejecting a STATIC key after Slack has acknowledged the modal.
-// The safe refusal moves to the private recovery DM and must survive masking.
-test('modal submit: a mode-locked channel keeps the real "static keys are not allowed" message', async (t) => {
-  process.env.VOUCHR_MASTER_KEY = Buffer.from(randomBytes(32)).toString('base64');
-  const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'http://127.0.0.1:1', db: await openTestDb(t) });
-  let cmd: any, configureView: any;
-  vouchr.registerCommands({
-    command: (_n: string, h: any) => { cmd = h; },
-    view: (id: string, h: any) => { if (id === CONFIGURE_CALLBACK) configureView = h; },
-    action: () => undefined,
-  });
-  // Member + a normal (eligible) channel: both mutations pass the membership gate + eligibility check.
-  const dms: string[] = [];
-  const admin = {
-    conversations: { info: async () => ({ channel: {} }), members: async () => ({ members: ['U1'] }) },
-    chat: { postMessage: async ({ text }: any) => { dms.push(text); return {}; } },
-  };
-  // 1) The member locks the channel to per-user.
-  await cmd({
-    command: { team_id: 'T1', user_id: 'U1', channel_id: 'C1', text: 'mode acme per-user', trigger_id: 'x' },
-    ack: async () => {}, respond: async () => {}, client: admin,
-  });
-  const requestId = await issueChannelRequest(vouchr.db, vouchr);
-  // 2) The member then tries to save a STATIC key → refused by the mode lock; message must reach the modal.
-  let acked = false;
-  await configureView({
-    ack: async () => { acked = true; },
-    body: { team: { id: 'T1' }, user: { id: 'U1' } },
-    view: {
-      private_metadata: JSON.stringify({ requestId }),
-      state: { values: { raw: { v: { value: 'my-real-key' } }, ref: { v: { value: '' } } } },
-    },
-    client: admin,
-  });
-  assert.equal(acked, true);
-  assert.equal(dms.length, 1);
-  assert.match(dms[0], /Channel is set to per-user for "acme"; static keys are not allowed\./);
 });
 
 // Regression: the ConsentRequiredError path is unaffected — its user-facing message is preserved

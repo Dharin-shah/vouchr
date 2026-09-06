@@ -74,7 +74,8 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
   assert.equal(await tableExists('connection'), true, 'migrate must create the baseline tables');
   assert.equal(await tableExists('audit'), true);
   assert.equal(await tableExists('broker_jti'), true);
-  assert.equal(await tableExists('session_request'), true);
+  assert.equal(await tableExists('session_request'), false, 'the session tables are gone (#350)');
+  assert.equal(await tableExists('session_grant'), false);
   assert.equal(await tableExists('user_provisioning_request'), true);
   assert.equal(await tableExists('channel_provisioning_request'), true);
   assert.equal(await tableExists('channel_interaction_tombstone'), true);
@@ -105,11 +106,11 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
     () => raw.run(
       `INSERT INTO approval_request
          (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,
-          origin,host,path,channel,thread,governable_channel,status,created_at,expires_at)
+          origin,host,path,grant_scope,channel,thread,governable_channel,status,created_at,expires_at)
        VALUES
          ('00000000-0000-4000-8000-000000000099','action','T1','U1','user','U1',
           '00000000-0000-4000-8000-000000000098','acme','POST','https://api.acme.test',
-          'api.acme.test','/write','C1','TH1',NULL,'pending',1,9999999999999)`,
+          'api.acme.test','/write','once','C1','TH1',NULL,'pending',1,9999999999999)`,
     ),
     /null value.*governable_channel/i,
     'fresh schemas reject approval rows without an explicit governance scope',
@@ -118,14 +119,31 @@ test('migrate() creates the tables and stamps SCHEMA_VERSION on a fresh schema, 
     () => raw.run(
       `INSERT INTO approval_request
          (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,
-          origin,host,path,channel,thread,status,created_at,expires_at)
+          origin,host,path,grant_scope,channel,thread,status,created_at,expires_at)
        VALUES
          ('00000000-0000-4000-8000-000000000097','action','T1','U1','user','U1',
           '00000000-0000-4000-8000-000000000096','acme','POST','https://api.acme.test',
-          'api.acme.test','/write','C1','TH1','pending',1,9999999999999)`,
+          'api.acme.test','/write','once','C1','TH1','pending',1,9999999999999)`,
     ),
     /null value.*governable_channel/i,
     'fresh schemas reject approval writers that omit the governance classification',
+  );
+  // #350: the grant scope and the channel identity are closed sets at the schema, not just in code.
+  await assert.rejects(
+    () => raw.run(
+      `INSERT INTO approval_request
+         (id,action_key,team_id,user_id,owner_kind,owner_id,credential_id,provider,method,
+          origin,host,path,grant_scope,channel,thread,governable_channel,status,created_at,expires_at)
+       VALUES
+         ('00000000-0000-4000-8000-000000000095','action','T1','U1','user','U1',
+          '00000000-0000-4000-8000-000000000094','acme','POST','https://api.acme.test',
+          'api.acme.test','/write','forever','C1','TH1','C1','pending',1,9999999999999)`,
+    ),
+    /grant_scope/i,
+  );
+  await assert.rejects(
+    () => raw.run(`INSERT INTO channel_config (team_id, channel, provider, identity) VALUES ('T1','C1','acme','session')`),
+    /identity/i,
   );
 
   // A second migrate on the same schema must be a no-op (idempotent), not error, same version.
@@ -165,7 +183,7 @@ test('migrate() and openDb() refuse any recorded schema version other than the c
   const { url, tableExists } = await emptySchema(t);
   const raw = rawDb(t, url);
   await raw.exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
-  for (const version of ['0', '3', '15', String(SCHEMA_VERSION + 1)]) {
+  for (const version of ['0', '1', '15', String(SCHEMA_VERSION + 1)]) {
     await raw.run(
       `INSERT INTO meta (key, value) VALUES ('schema_version', $1)
        ON CONFLICT (key) DO UPDATE SET value=excluded.value`,

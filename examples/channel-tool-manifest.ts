@@ -5,15 +5,15 @@ import { defineProvider, github, type ToolManifestEntry } from '../src';
 // need different mechanisms (see README → "When to use Vouchr vs a service-to-
 // service MCP"). The boundary is whose identity the tool acts as:
 //
-//   • acting_human  → acts AS the human, with their credential + consent → Vouchr
+//   • person / channel → acts AS the human (or the channel's account), with a Vouchr credential
 //   • service       → acts AS the agent itself, with the host's service auth → NOT
 //                     Vouchr (there is no human credential to broker)
 //
 // Both live in one manifest so the host sees the whole tool set in one place, but
-// only the acting_human entries route through `context.vouchr.connect(...)`.
+// only the person/channel entries route through `context.vouchr.connect(...)`.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// A Vouchr-brokered, per-human provider. `identity` defaults to 'acting_human'.
+// A Vouchr-brokered, per-human provider. `identity` defaults to 'person'.
 const jira = defineProvider({
   id: 'jira',
   authorizeUrl: 'https://auth.atlassian.com/authorize',
@@ -45,19 +45,19 @@ const payments = defineProvider({
 
 export const providers = [github(), jira, payments];
 
-// What `context.vouchr.toolManifest()` returns for a channel where Jira is set to
-// 'session' (per-user, thread-scoped) — the shape an agent reads before planning. The
+// What `context.vouchr.toolManifest()` returns for a channel where the agent acts as the channel
+// for Jira — the shape an agent reads before planning. The
 // host filters on `identity` to decide who runs the tool:
 //
-//   entry.identity === 'acting_human'  → await context.vouchr.connect(entry.provider)
+//   entry.identity !== 'service'  → await context.vouchr.connect(entry.provider)
 //   entry.identity === 'service'       → host's own service-to-service call
 //
 // Provider responses are deliberately absent from this policy shape: the trusted host owns
 // redaction, audience, data-loss prevention, and rendering for both identity classes.
 export const exampleManifest: ToolManifestEntry[] = [
-  { provider: 'github', mode: 'per-user', enabled: true, identity: 'acting_human' },
-  { provider: 'jira', mode: 'session', enabled: true, identity: 'acting_human' },
-  { provider: 'payments', mode: null, enabled: true, identity: 'service' },
+  { provider: 'github', enabled: true, identity: 'person' },
+  { provider: 'jira', enabled: true, identity: 'person' },
+  { provider: 'payments', enabled: true, identity: 'service' },
 ];
 
 // Route each tool by its identity: Vouchr brokers the humans, the host runs services.
@@ -66,7 +66,7 @@ export async function dispatch(
   vouchr: { connect: (id: string) => Promise<unknown> },
   callService: (id: string) => Promise<unknown>,
 ): Promise<unknown> {
-  return entry.identity === 'acting_human'
+  return entry.identity !== 'service'
     ? vouchr.connect(entry.provider) // resolves the human's credential + consent
     : callService(entry.provider); // service-to-service: Vouchr is deliberately not in this path
 }

@@ -25,7 +25,6 @@ import { isValidProviderId, ProviderRegistry } from '../src/core/providers';
 import { Vault } from '../src/core/vault';
 import { Audit, MAX_AUDIT_PRUNE_BATCH } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { SessionGrants } from '../src/core/session';
 import { SECRET_REFERENCE_SOURCES } from '../src/core/reference';
 import {
   selectRevocations,
@@ -220,7 +219,7 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
     `SELECT COALESCE(c.team_id, t.team_id)   AS team_id,
             COALESCE(c.channel, t.channel)   AS channel,
             COALESCE(c.provider, t.provider) AS provider,
-            c.mode    AS mode,
+            c.identity AS identity,
             t.enabled AS enabled
      FROM channel_config c
      FULL OUTER JOIN channel_tool t
@@ -230,10 +229,10 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
     params,
   );
   printTable(
-    ['team', 'channel', 'provider', 'mode', 'enabled'],
+    ['team', 'channel', 'provider', 'identity', 'enabled'],
     rows.map((r) => [
       r.team_id, r.channel, r.provider,
-      r.mode ?? '-',
+      r.identity ?? 'person',
       r.enabled == null ? '-' : r.enabled ? 'yes' : 'no',
     ]),
   );
@@ -248,7 +247,7 @@ async function cmdChannels(db: Db, f: Flags): Promise<void> {
  * master key (needed only for the best-effort UPSTREAM revoke + token decrypt) are loaded defensively,
  * so a malformed provider config or an unavailable master key disables upstream revoke but never blocks
  * the local kill. It never PRINTS a secret; the only decryption is the just-read access token handed to
- * the upstream revoke, never to stdout. Pending consent/session/key-setup authority is cleared too.
+ * the upstream revoke, never to stdout. Pending consent/key-setup authority is cleared too.
  */
 async function cmdRevoke(db: Db, plan: Extract<RevokePlan, { mode: 'provider' }>): Promise<number> {
   const { filter, dryRun } = plan;
@@ -263,27 +262,13 @@ async function cmdRevoke(db: Db, plan: Extract<RevokePlan, { mode: 'provider' }>
   );
   if (dryRun) {
     const pending = await countPendingForProvider(db, filter);
-    if (
-      pending.consents ||
-      pending.requests ||
-      pending.grants ||
-      pending.provisioning ||
-      pending.channelProvisioning
-    ) {
+    if (pending.consents || pending.provisioning || pending.channelProvisioning) {
       console.log(
-        `Would also clear ${pending.consents} pending consent + ${pending.requests} session request(s) + ` +
-        `${pending.grants} session grant(s) + ${pending.provisioning} user setup request(s) + ` +
+        `Would also clear ${pending.consents} pending consent + ${pending.provisioning} user setup request(s) + ` +
         `${pending.channelProvisioning} channel setup request(s).`,
       );
     }
-    if (
-      rows.length ||
-      pending.consents ||
-      pending.requests ||
-      pending.grants ||
-      pending.provisioning ||
-      pending.channelProvisioning
-    ) {
+    if (rows.length || pending.consents || pending.provisioning || pending.channelProvisioning) {
       console.log('\nNo changes made. Re-run with --yes to revoke.');
     }
     return 0;
@@ -316,7 +301,6 @@ async function cmdRevoke(db: Db, plan: Extract<RevokePlan, { mode: 'provider' }>
   const vault = new Vault(db, key, {}, await loadRevokeEnvelope());
   const audit = new Audit(db);
   const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
 
   let localRemoved = 0;
   let upstreamAttempted = 0;
@@ -328,7 +312,7 @@ async function cmdRevoke(db: Db, plan: Extract<RevokePlan, { mode: 'provider' }>
       // revokeConnection is best-effort internally, but keep a backstop so an unexpected throw on
       // one row never strands the rest of a break-glass sweep.
       try {
-        const r = await revokeConnection(vault, audit, consent, sessions, registry, row, filter.provider);
+        const r = await revokeConnection(vault, audit, consent, registry, row, filter.provider);
         if (r.removed) {
           localRemoved++;
           if (r.upstreamAttempted) {
@@ -361,8 +345,7 @@ async function cmdRevoke(db: Db, plan: Extract<RevokePlan, { mode: 'provider' }>
     '(unsupported provider, external reference, or synthetic row).',
   );
   console.log(
-    `Cleared ${purged.consents} pending consent + ${purged.requests} session request(s) + ` +
-    `${purged.grants} session grant(s) + ${purged.provisioning} user setup request(s) + ` +
+    `Cleared ${purged.consents} pending consent + ${purged.provisioning} user setup request(s) + ` +
     `${purged.channelProvisioning} channel setup request(s).`,
   );
   // Non-zero only when local access remains; upstream failures do not fail the local kill.
@@ -410,8 +393,7 @@ function printRevokeAllReport(report: RevokeAllReport): void {
     }
     const m = report.matched;
     console.log(
-      `Would also clear ${m.consents} pending consent + ${m.sessionRequests} session request(s) + ` +
-      `${m.sessionGrants} session grant(s) + ${m.approvals} approval(s) + ` +
+      `Would also clear ${m.consents} pending consent + ${m.approvals} approval(s) + ` +
       `${m.userProvisioning} user setup + ${m.channelProvisioning} channel setup request(s) + ` +
       `${m.notifications} notification state row(s), and invalidate ${m.installations} Slack installation(s).`,
     );
@@ -452,8 +434,8 @@ function printRevokeAllReport(report: RevokeAllReport): void {
   const c = report.cleared;
   const bad = (n: number) => (n < 0 ? 'FAILED' : String(n));
   console.log(
-    `Purged locally: ${bad(c.connections)} connection(s), ${bad(c.consents)} consent(s), ${bad(c.sessionRequests)} session request(s), ` +
-    `${bad(c.sessionGrants)} session grant(s), ${bad(c.approvals)} approval(s), ${bad(c.userProvisioning)} user setup, ` +
+    `Purged locally: ${bad(c.connections)} connection(s), ${bad(c.consents)} consent(s), ` +
+    `${bad(c.approvals)} approval(s), ${bad(c.userProvisioning)} user setup, ` +
     `${bad(c.channelProvisioning)} channel setup, ${bad(c.notifications)} notification state, ${bad(c.installations)} Slack installation(s).`,
   );
   console.log(
@@ -639,7 +621,7 @@ Commands:
   inventory   List stored connections (metadata only; never tokens).
                 --team <id>      filter by team
                 --provider <id>  filter by provider
-  channels    List per-channel config: team, channel, provider, mode, enabled.
+  channels    List per-channel config: team, channel, provider, identity, enabled.
                 --team <id>      filter by team
   revoke      Break-glass bulk revocation for an incident (delete locally, then
               best-effort upstream revoke; audited, no secrets printed).

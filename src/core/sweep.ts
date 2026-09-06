@@ -5,7 +5,6 @@ import type { Db } from './db';
 import type { EventSink, VouchrEvent } from './injector';
 import type { CredentialHealthEvent, CredentialHealthHook } from './health';
 import { approvalActionFingerprint, Approvals } from './approval';
-import { SessionGrants } from './session';
 import { ChannelProvisioningRequests, UserProvisioningRequests } from './provisioning';
 import { assertDryRunVault } from './dryRun';
 import { safeEmit } from './safe-emit';
@@ -133,7 +132,6 @@ export async function sweepLifecycle({
       new Approvals(storeDb),
       transaction,
     );
-    await new SessionGrants(storeDb).sweepExpired();
     await new UserProvisioningRequests(storeDb, vault).sweepExpired();
     await new ChannelProvisioningRequests(storeDb, vault).sweepExpired();
     return count;
@@ -157,7 +155,7 @@ export async function sweepLifecycle({
     // owns any later table, fail/retry without waiting while holding a partial lock prefix.
     // Once acquired, the locks exclude every writer until provenance validation and cleanup commit.
     await tx.exec(
-      `LOCK TABLE connection, consent_request, approval_request, session_request, session_grant,
+      `LOCK TABLE connection, consent_request, approval_request,
         user_provisioning_request, channel_provisioning_request, channel_interaction_tombstone
         IN SHARE ROW EXCLUSIVE MODE NOWAIT`,
     );

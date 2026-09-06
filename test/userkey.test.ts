@@ -170,10 +170,10 @@ function delayedModeRead() {
     waiting,
     release,
     store: {
-      getMode: async () => {
+      getIdentity: async () => {
         entered();
         await resume;
-        return null;
+        return 'person';
       },
     } as unknown as ChannelConfig,
   };

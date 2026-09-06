@@ -8,7 +8,6 @@ import { NotificationState } from '../src/core/health';
 import { POSTGRES_NOW_US_SQL } from '../src/core/interaction';
 import type { SlackIdentity } from '../src/core/identity';
 import { userOwner } from '../src/core/owner';
-import { SessionGrants } from '../src/core/session';
 import { sweepLifecycle } from '../src/core/sweep';
 import { Vault } from '../src/core/vault';
 import { testDbUrl } from './support/pg';
@@ -139,28 +138,12 @@ test('lifecycle stale snapshot cannot purge a reconnect generation or its fresh 
       host: 'api.acme.test',
       path: '/fresh-action',
       queryHash: '',
+      grant: 'once',
       channel: 'C_APPROVAL',
       thread: 'TH_APPROVAL',
       governableChannel: 'C_APPROVAL',
     };
     await new Approvals(writerDb).request(approvalKey);
-
-    const sessions = new SessionGrants(writerDb);
-    await sessions.request(
-      IDENTITY,
-      'C_SESSION',
-      'TH_REQUEST',
-      PROVIDER,
-      freshCredentialId,
-    );
-    await sessions.grant(
-      IDENTITY,
-      'C_SESSION',
-      'TH_GRANT',
-      PROVIDER,
-      60_000,
-      freshCredentialId,
-    );
 
     await writerDb.run(
       `INSERT INTO user_provisioning_request
@@ -176,8 +159,6 @@ test('lifecycle stale snapshot cannot purge a reconnect generation or its fresh 
     for (const table of [
       'connection',
       'approval_request',
-      'session_request',
-      'session_grant',
       'user_provisioning_request',
       'notification_state',
     ]) {
@@ -197,8 +178,6 @@ test('lifecycle stale snapshot cannot purge a reconnect generation or its fresh 
   for (const table of [
     'connection',
     'approval_request',
-    'session_request',
-    'session_grant',
     'user_provisioning_request',
     'notification_state',
   ]) {

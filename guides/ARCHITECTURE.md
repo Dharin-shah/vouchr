@@ -6,7 +6,7 @@ an in-Slack button; Vouchr stores the token encrypted, keyed to the Slack identi
 to a channel, for shared service accounts), and injects it **only at the outbound HTTP
 boundary**, after an egress-allowlist check, so the token never reaches the agent code,
 the LLM, the chat transcript, logs, or the audit table. Credentials are owner-scoped
-(per-user by default, per-channel when a channel member configures it) and isolated per Slack
+(the person's own by default, the channel's when a member connects a shared credential) and isolated per Slack
 tenant.
 
 For the split-process version of this architecture—public Slack control plane plus a private
@@ -109,10 +109,8 @@ The error carries a `promptState`:
 | `'posted'` | A fresh prompt was just posted. |
 | `'reused'` | A still-live prompt from moments ago was reused rather than re-posted. An in-channel prompt is an ephemeral, so it may no longer be visible; a re-ask 30 seconds or more after the last delivery re-posts it. An off-channel DM prompt is durable and is never re-posted. |
 
-`SessionApprovalRequiredError` carries the same `promptState` for the in-thread session prompt,
-which is also an ephemeral. A host that goes silent on `'reused'` leaves a person who reloaded
-Slack with nothing on screen; post `safeUserMessage(error)` privately in that state (see the
-README snippet).
+A host that goes silent on `'reused'` leaves a person who reloaded Slack with nothing on screen;
+post `safeUserMessage(error)` privately in that state (see the README snippet).
 
 Branch on the error class or its `code`, **never on message text** — `mapSafeError` copy differs by
 state and is not a stable contract.
@@ -154,11 +152,9 @@ Tables (`schema()` in `db.ts`):
 | `channel_interaction_tombstone` | Latest channel/provider credential or effective-governance mutation; fences older setup receipts | PK `(team_id, channel, provider)` |
 | `provisioning_revocation_tombstone` | Provider-scoped break-glass fence; scope identifiers are one-way selectors | PK `(provider, scope_key)` |
 | `user_offboard_scope_tombstone` | Enterprise/unscoped/global user-authority fence | PK `(scope_kind, scope_id, user_id)` |
-| `channel_config` | Per-channel auth mode (`shared` / `per-user` / `session`) | PK `(team_id, channel, provider)` |
+| `channel_config` | Who the agent acts as per channel and provider (`person` / `channel`) | PK `(team_id, channel, provider)` |
 | `channel_tool` | Per-channel tool allowlist (which providers an agent may use) | PK `(team_id, channel, provider)` |
-| `session_grant` | Opt-in thread-scoped authorization (who may use a provider in which thread) | PK `(team_id, channel, thread, user_id, provider)` |
-| `session_request` | Opaque pending thread-session control | PK `id`; UNIQUE exact thread context |
-| `approval_request` | Opaque pending/granted exact-action approval | PK `id`; UNIQUE bounded `action_key` |
+| `approval_request` | Opaque pending/granted approval; `grant_scope` is `once` (one exact call) or `thread` (every matching call in the approving thread) | PK `id`; UNIQUE bounded `action_key` |
 | `notification_state` | Credential-health DM debounce | PK `(team_id, owner_kind, owner_id, provider, type)` |
 | `offboard_tombstone` | Team/user authority fence | PK `(team_id, user_id)` |
 | `audit` | Append-only action log | PK `id` |
@@ -265,7 +261,7 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    credential transaction consumes that request with `DELETE ... RETURNING`, so duplicate submit,
    write, mode/satellite cleanup, and config audit are one atomic outcome.
 4. **Inject** (`src/core/injector.ts`). `handle.fetch()` enforces egress allowlist +
-   HTTPS and revalidates the retained acting-user receipt plus current governance, session, and
+   HTTPS and revalidates the retained acting-user receipt plus current governance and
    credential generation before stateful gates. It reads/resolves the secret only after those gates,
    revalidates again at the provider-send boundary, attaches it (`redirect: 'manual'`), touches the
    idle timer, and audits as the acting human. A request already handed to the provider cannot be
@@ -285,8 +281,7 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    Slack deactivation and SCIM offboarding first commit a monotonic team or enterprise/global scope
    tombstone before cleanup/artifact discovery, including an otherwise-empty workspace. The local
    credential is deleted first (the security-meaningful cleanup); pending consent, setup requests,
-   requester-bound approvals, and
-   thread session grants are purged best-effort, and an upstream revoke is attempted best-effort
+   and requester-bound approvals (thread grants included) are purged best-effort, and an upstream revoke is attempted best-effort
    only for a real row when the provider
    supports it and the claim supplies a usable vaulted token. A real revocable external reference
    or unreadable token is still removed locally but leaves upstream revocation unconfirmed;
@@ -302,7 +297,7 @@ consent → callback → vault → inject → refresh → TTL/sweep → offboard
    that marker and are found by the post-fence scan, or refuse afterward. Scope ids are stored only
    as fixed hashes, and a genuinely new setup after the marker remains possible.
 
-**Prompt delivery and idempotency.** Session and approval prompts are persisted, opaque, single-use
+**Prompt delivery and idempotency.** Approval prompts are persisted, opaque, single-use
 controls: repeated agent turns reuse one durable request row, and a short cross-replica delivery
 lease suppresses immediate duplicate prompts. A click is bound to the exact signed thread and
 rechecks current access at the mutation; duplicate or stale clicks get fixed recovery copy instead
@@ -313,22 +308,29 @@ known pre-delivery render/no-recipient failure removes the request. Definite ver
 failures are classified separately, so the user is never told nothing was sent while a delivered
 button may still be visible.
 
-**Per-channel auth mode.** `channel_config.mode` is the single source of truth for which credential
-model `connect()` uses for a provider in a channel: `per-user` (the default), `shared` (route to the
-channel credential), or `session`. `connect()` resolves the mode and routes accordingly, so the
-model is configured in Slack (`/vouchr mode <provider> <mode>`), not hardcoded in the agent. In
-PostgreSQL, shared-credential setup and mode changes take the same owner/provider advisory lock and
-commit the credential row, mode, satellite cleanup, and audit together. A mode change to `per-user`
-or `session` therefore cannot race setup into leaving a dormant shared credential. In addition,
-every effective credential/mode/tool mutation advances a PostgreSQL-clock channel
-interaction tombstone in that transaction. A setup handler compares it with the original verified
-Slack receipt before hydrating or consuming the form, closing the window while `views.open` or
-membership checks are pending. Same-value governance retries do not advance the marker. Envelope/KMS
-wrapping is prepared before any credential, revocation, or actor-offboard lock is acquired. In
-`session` mode `connect()` adds an authorization gate before the credential is resolved: the
-provider is usable only inside the Slack thread the user approved it in (a grant keyed
-`(team_id, channel, thread, user_id, provider)`), with a TTL ceiling. Grants live in `session_grant`,
-are cleared on offboarding, and are removed by `sweepExpired()`.
+**Who the agent acts as.** `channel_config.identity` is the single source of truth for whose
+credential `connect()` uses for a provider in a channel: `person` (the default, the asking human's
+own connection) or `channel` (the channel's one connected credential). `connect()` resolves it and
+routes accordingly, so it is configured in Slack (`/vouchr identity <provider> <person|channel>`, or
+`/vouchr connect-shared`, which sets `channel`), not hardcoded in the agent. In PostgreSQL,
+channel-credential setup and identity changes take the same owner/provider advisory lock and commit
+the credential row, identity, satellite cleanup, and audit together, so a switch back to `person`
+cannot race setup into leaving a dormant channel credential. Every effective credential/identity/tool
+mutation advances a PostgreSQL-clock channel interaction tombstone in that transaction. A setup
+handler compares it with the original verified Slack receipt before hydrating or consuming the form,
+closing the window while `views.open` or membership checks are pending. Same-value governance retries
+do not advance the marker. Envelope/KMS wrapping is prepared before any credential, revocation, or
+actor-offboard lock is acquired.
+
+**Approval is on by default.** Every call other than GET/HEAD needs a live grant unless the provider
+sets `approval: false`; `methods`, `paths`, `approver` (`member` default, `self`), `grant` (`once`
+default, `thread`), and `ttlMs` (5 minutes default) narrow or widen that. A `once` grant is spent
+by one exact call; a `thread` grant is matched on its scope (team, channel, thread, requester,
+provider) and covers every matching call there until it expires, so it is not deleted on consume.
+Both live in `approval_request.grant_scope`, are cleared on offboarding and credential change, and
+are removed by `sweepExpired()`. The agent's optional `reason` (500 bytes) and `https` `link`
+(2,048 bytes) are validated in core (`assertReason`, `assertLink`), rendered on the prompt as plain
+text, and the reason is written to the `approval_requested` audit row under `meta.reason`.
 
 See [SECURITY.md](../SECURITY.md) for the security model and limits, and
 [THREAT-MODEL.md](./THREAT-MODEL.md) for trust boundaries, the attacker model, and the

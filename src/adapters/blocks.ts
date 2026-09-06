@@ -1,6 +1,6 @@
 import type { AuditRow, StatsRow } from '../core/audit';
-import { CHANNEL_MODES, isChannelMode } from '../core/channelConfig';
-import { isBrokeredProvider, type Approver } from '../core/providers';
+import { CHANNEL_IDENTITIES, isChannelIdentity, type ChannelIdentity } from '../core/channelConfig';
+import { isBrokeredProvider, type ApprovalGrant, type Approver } from '../core/providers';
 import { SECRET_REFERENCE_SOURCES, type SecretReferenceSource } from '../core/reference';
 import type { VouchrRecovery } from '../core/errors';
 import type { AttributedOAuthCallbackOutcome } from '../core/oauthCallback';
@@ -274,7 +274,6 @@ export const SETUP_KEY_ACTION = 'vouchr_setup_key';
 export const OAUTH_CONNECT_ACTION = 'vouchr_oauth_connect';
 /** "Send a new link" on a replaced stale Connect prompt (#347). Value: the old opaque state. */
 export const OAUTH_RENEW_ACTION = 'vouchr_oauth_renew';
-export const APPROVE_SESSION_ACTION = 'vouchr_approve_session';
 /** Legacy #117 action id. New health DMs render no long-lived reconnect control; the registered
  * handler only acknowledges already-delivered buttons with fixed stale guidance. */
 export const RECONNECT_ACTION = 'vouchr_reconnect';
@@ -439,83 +438,58 @@ export function keySetupBlocks(provider: string, requestId: string): unknown[] {
   ];
 }
 
-/** Ephemeral in-thread prompt. The button carries only an opaque pending-request id; provider,
- *  identity, channel, and thread are reloaded and revalidated at the mutation. */
-export function sessionApprovalBlocks(provider: string, requestId: string): unknown[] {
-  const p = escapeMrkdwn(provider);
-  return [
-    {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text:
-          `:lock: *Allow ${p} in this thread?*\n` +
-          `The agent will be able to act as you on ${p} only inside this thread, until the ` +
-          `session expires. This approval does not apply to any other thread or channel. ` +
-          `This prompt expires in ${PENDING_PROMPT_LIFETIME}.`,
-      },
-    },
-    {
-      type: 'actions',
-      elements: [
-        {
-          type: 'button',
-          text: { type: 'plain_text', text: `Allow ${provider} here`, emoji: true },
-          action_id: APPROVE_SESSION_ACTION,
-          value: requestId,
-          style: 'primary',
-        },
-      ],
-    },
-  ];
-}
-
 export const APPROVAL_APPROVE_ACTION = 'vouchr_approval_approve';
 export const APPROVAL_DENY_ACTION = 'vouchr_approval_deny';
 
+/** Percent-encode the one byte Slack reads as a label separator inside `<url>`, then escape like
+ *  every other mrkdwn value. The result is what a click opens; the link was validated as https. */
+function mrkdwnLink(href: string): string {
+  return `<${escapeMrkdwn(href.replace(/\|/g, '%7C'))}>`;
+}
+
+/** Plain human copy for a grant's lifetime: whole minutes when it divides, else seconds. */
+export function grantLifetime(ttlMs: number): string {
+  const seconds = Math.round(ttlMs / 1000);
+  if (seconds >= 60 && seconds % 60 === 0) {
+    const minutes = seconds / 60;
+    return `${minutes} minute${minutes === 1 ? '' : 's'}`;
+  }
+  return `${seconds} second${seconds === 1 ? '' : 's'}`;
+}
+
+/** One-line summary of what approving covers (#350). Shared by the prompt and the approve receipt
+ *  so the two can never describe the same grant differently. */
+export function grantCovers(provider: string, grant: ApprovalGrant, ttlMs: number): string {
+  const p = escapeMrkdwn(provider);
+  return grant === 'thread'
+    ? `This covers every ${p} call that needs approval in this thread for ${grantLifetime(ttlMs)}.`
+    : `This covers one call, once, within ${grantLifetime(ttlMs)}.`;
+}
+
 /**
- * Approve/Deny prompt for ONE sensitive write (#113), the per-action sibling of
- * sessionApprovalBlocks. Shows provider, method, host, a bounded salted action fingerprint and — for a
- * query-bearing request —
- * only the COUNT of query parameters (GHSA-pg84). Parameter names and values are BOTH
- * caller-controlled and can carry tokens, signed-URL material, or PII, so neither is ever
- * rendered (SEC-1); the copy tells the human the exact query is bound byte-for-byte. The request
- * body is likewise never shown. The buttons carry ONLY the pending-approval id: content or
- * authority in a button value would be forgeable (SEC-3) — the click handler re-validates the
- * provider against the registry and re-checks approver eligibility server-side. Every
- * interpolated value is escaped at render (SEC-5); `requester` is an authenticated Slack user id,
- * rendered as a mention.
+ * Approve/Deny prompt for ONE action (#113, #350). It says who asked, the provider, the method and
+ * path (plain), the agent's reason and link when given, and what approving covers. The query string
+ * is never shown (its names and values are caller-controlled and can carry tokens or PII, SEC-1);
+ * it is bound byte-for-byte in the stored digest. The request body is likewise never shown. The
+ * buttons carry ONLY the pending-approval id: content or authority in a button value would be
+ * forgeable (SEC-3); the click handler re-validates the provider against the registry and re-checks
+ * approver eligibility server-side. Every interpolated value is escaped at render (SEC-5); the path,
+ * reason, and link render as `plain_text`/an escaped link, never as mrkdwn markup.
  */
 export function approvalBlocks(o: {
   provider: string;
   method: string;
   host: string;
-  actionFingerprint: string;
-  /** How many query parameters the request carries (0 = none). Names/values are never shown.
-   * `null` = the request HAS query parameters but the exact count is not retained (a pending row
-   * hydrated from storage keeps only the byte-exact digest) — rendered as "parameters present",
-   * never a fabricated number. */
-  queryParamCount: number | null;
+  path: string;
   requester: string;
   id: string;
   approver: Approver;
-  /** #296: the agent's plain transaction statement for a backchannel request; absent (null) for an
-   * in-process/fetch-minted approval. Host-supplied free text — rendered as `plain_text`, never
-   * interpolated into mrkdwn (SEC-5 by construction). */
-  bindingMessage?: string | null;
+  grant: ApprovalGrant;
+  ttlMs: number;
+  reason?: string | null;
+  link?: string | null;
 }): unknown[] {
   const p = escapeMrkdwn(o.provider);
-  const n = o.queryParamCount;
-  const query = n == null
-    ? '?… (query parameters present)'
-    : n ? `?… (${n} parameter${n === 1 ? '' : 's'})` : '';
-  // Raw paths are never rendered: they are caller-controlled and can embed tokens, signed webhook
-  // material, or PII. The fixed-size fingerprint is the same value recorded in audit, while the
-  // short-lived internal row retains the raw bytes solely for exact grant matching.
-  const action = `${o.method} ${o.host}\nAction fingerprint: ${o.actionFingerprint}`;
-  const bound = n !== 0
-    ? ' The exact query string is bound byte-for-byte (its parameters are not displayed); any change re-prompts.'
-    : '';
   const intro = o.approver === 'member'
     ? `The agent wants to run an action on ${p} for <@${escapeMrkdwn(o.requester)}>. Another member of this channel must approve it.`
     : `The agent wants to run an action as you on ${p}.`;
@@ -527,23 +501,23 @@ export function approvalBlocks(o: {
         text: `:lock: *Approve this ${p} action?*\n${intro}`,
       },
     },
+    // The action, plain: method, host, and the exact path. Plain text (never mrkdwn) so a crafted
+    // path cannot render links, mentions, or formatting that impersonates Vouchr's copy.
     {
       type: 'section',
-      text: { type: 'plain_text', text: action, emoji: false },
+      text: { type: 'plain_text', text: `${o.method} ${o.host}${o.path}`, emoji: false },
     },
-    // The agent's own statement of what it is doing (#296). Plain text (never mrkdwn) so a crafted
-    // message cannot render links, mentions, or formatting that impersonates Vouchr's copy.
-    ...(o.bindingMessage
-      ? [{
-          type: 'section',
-          text: { type: 'plain_text', text: `Agent's statement: ${o.bindingMessage}`, emoji: false },
-        }]
+    ...(o.reason
+      ? [{ type: 'section', text: { type: 'plain_text', text: `Reason: ${o.reason}`, emoji: false } }]
+      : []),
+    ...(o.link
+      ? [{ type: 'section', text: { type: 'mrkdwn', text: `Link: ${mrkdwnLink(o.link)}` } }]
       : []),
     {
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: `${query ? `${query}. ` : ''}The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires in ${PENDING_PROMPT_LIFETIME} if unused.${bound} The raw path and request body are not displayed or inspected.${o.bindingMessage ? ' The agent’s statement is its own claim, not verified by Vouchr.' : ''}`,
+        text: `${grantCovers(o.provider, o.grant, o.ttlMs)} This prompt expires in ${PENDING_PROMPT_LIFETIME} if unused. The request body is not shown or inspected.${o.reason || o.link ? ' The reason and link are the agent\u2019s own claim, not verified by Vouchr.' : ''}`,
       },
     },
     {
@@ -571,31 +545,37 @@ export function approvalBlocks(o: {
 export const DISCONNECT_ACTION = 'vouchr_disconnect';
 export const CONFIG_CALLBACK = 'vouchr_config';
 
-/** The four per-channel auth modes, in the order the config modal lists them. */
 /** One connection row for the status / home views. `channel` null = a personal (DM) credential.
- *  `account` is the provider-reported external account (escaped at render — provider-influenced).
+ *  `account` is the provider-reported external account (escaped at render, provider-influenced).
  *  Vouchr-owned interactive views add the opaque `credentialId`; keeping it optional preserves the
  *  existing exported renderer input shape, while the built-in action handler refuses that fallback. */
 export type Connection = {
   provider: string;
   channel: string | null;
-  mode?: string;
   account?: string | null;
   credentialId?: string;
 };
 
-/** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list. */
-export type ToolRow = { provider: string; enabled: boolean; mode?: string | null };
+/** One provider's read-only channel tool state, for the config modal's "Tools in this channel" list:
+ *  usable here or not, and who the agent acts as (see ToolManifestEntry.identity). */
+export type ToolRow = { provider: string; enabled: boolean; identity?: ChannelIdentity | 'service' };
 
-/** One provider's governance control row: channel mode (null = unconfigured) + tool-enabled. */
+/** One provider's governance control row: who the agent acts as + tool-enabled. A 'service' row
+ *  gets only the Enable/Disable control (identity/credential mutations are refused by core for it). */
 export type ConfigMemberRow = {
   provider: string;
-  mode: string | null;
+  identity: ChannelIdentity | 'service';
   enabled: boolean;
-  /** Manifest identity (see ToolManifestEntry). 'service' rows get only the tool Enable/Disable
-   *  control — mode/credential mutations are refused by core for them. Absent = 'acting_human'. */
-  identity?: 'service' | 'acting_human';
 };
+
+/** The two answers to "Who does the agent act as here?", in the order every picker lists them. */
+const IDENTITY_OPTIONS: { text: { type: 'plain_text'; text: string }; value: ChannelIdentity }[] = [
+  { text: { type: 'plain_text', text: 'Each person, with their own account' }, value: 'person' },
+  { text: { type: 'plain_text', text: 'The channel, with one shared account' }, value: 'channel' },
+];
+const identityOption = (identity: unknown) => IDENTITY_OPTIONS.find((o) => isChannelIdentity(identity) && o.value === identity);
+// Both pickers list exactly the core enum, so a value the guard refuses can never be offered.
+if (IDENTITY_OPTIONS.length !== CHANNEL_IDENTITIES.length) throw new Error('identity picker drifted from CHANNEL_IDENTITIES');
 
 const CONFIG_CONNECTION_ROWS_MAX = 10;
 
@@ -604,8 +584,9 @@ const CONFIG_CONNECTION_ROWS_MAX = 10;
  *  - "Your connections" (EVERYONE): a bounded first set with Disconnect buttons, plus explicit
  *    `/vouchr status [page]` guidance when more rows exist.
  *  - "Tools in this channel" (EVERYONE): the read-only manifest (which providers are usable here).
- *  - "Channel settings" (CHANNEL MEMBERS ONLY, `admin` rows present): per-provider mode select +
- *    Enabled checkbox, whose submit routes to the SAME mode/enable/disable mutations as the slash commands.
+ *  - "Channel settings" (CHANNEL MEMBERS ONLY, `admin` rows present): per-provider "Who does the
+ *    agent act as here?" select + Enabled checkbox, whose submit routes to the SAME identity/enable/
+ *    disable mutations as the slash commands.
  *
  * The channel rides in `private_metadata` so the submit binds to the right channel. The governance
  * controls' mere presence is NOT the authorization — the submit handler re-checks membership
@@ -638,30 +619,32 @@ export function configModal(o: {
   } else if (!o.tools.length) {
     blocks.push(contextBlock('No providers are registered.'));
   } else {
-    blocks.push(...mrkdwnSections(o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.mode ? ` (${escapeMrkdwn(t.mode)})` : ''}`), { maxSections: 96 }));
+    blocks.push(...mrkdwnSections(o.tools.map((t) => `• *${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'}${t.identity ? ` (${escapeMrkdwn(t.identity)})` : ''}`), { maxSections: 96 }));
   }
 
   if (o.admin && o.admin.length) {
     blocks.push({ type: 'divider' });
     blocks.push({ type: 'header', text: { type: 'plain_text', text: 'Channel settings', emoji: true } });
     for (const p of o.admin) {
-      // Mode select — block_id `mode:<provider>` so the submit maps it back. Optional + initial set to
-      // the current mode. The submit diffs against the OPEN-TIME value carried in private_metadata (not a
-      // re-read of the store), so an untouched select never mutates and never reverts a concurrent change.
-      const modeOptions = CHANNEL_MODES.map((m) => ({ text: { type: 'plain_text', text: m }, value: m }));
-      const initialMode = isChannelMode(p.mode) ? modeOptions.find((x) => x.value === p.mode) : undefined;
-      blocks.push({
-        type: 'input',
-        optional: true,
-        block_id: `mode:${p.provider}`,
-        label: { type: 'plain_text', text: `${p.provider} — mode` },
-        element: {
-          type: 'static_select',
-          action_id: 'mode',
-          options: modeOptions,
-          ...(initialMode ? { initial_option: initialMode } : {}),
-        },
-      });
+      // Identity select, block_id `identity:<provider>` so the submit maps it back, initial set to the
+      // current identity. The submit diffs against the OPEN-TIME value carried in private_metadata
+      // (not a re-read of the store), so an untouched select never mutates and never reverts a
+      // concurrent change. A service tool has no identity to pick.
+      const initialIdentity = identityOption(p.identity);
+      if (initialIdentity) {
+        blocks.push({
+          type: 'input',
+          optional: true,
+          block_id: `identity:${p.provider}`,
+          label: { type: 'plain_text', text: `${p.provider}: who does the agent act as here?` },
+          element: {
+            type: 'static_select',
+            action_id: 'identity',
+            options: IDENTITY_OPTIONS,
+            initial_option: initialIdentity,
+          },
+        });
+      }
       const enabledOption = { text: { type: 'plain_text', text: 'Enabled in this channel' }, value: 'enabled' };
       blocks.push({
         type: 'input',
@@ -678,10 +661,10 @@ export function configModal(o: {
     }
   }
 
-  // Carry the channel AND the OPEN-TIME governance state (compact keys: p/m/e) so the submit can tell a
-  // deliberately-changed control from an untouched one that merely re-submits its initial value — the
+  // Carry the channel AND the OPEN-TIME governance state (compact keys: p/i/e) so the submit can tell a
+  // deliberately-changed control from an untouched one that merely re-submits its initial value, the
   // basis for not reverting a concurrent member's change and not writing spurious rows. Non-secret.
-  const open = (o.admin ?? []).map((p) => ({ p: p.provider, m: p.mode, e: p.enabled }));
+  const open = (o.admin ?? []).map((p) => ({ p: p.provider, i: p.identity, e: p.enabled }));
   if (blocks.length > 100) throw new Error('Vouchr configuration exceeds the Slack modal block limit.');
   const privateMetadata = JSON.stringify({ channel: o.channel, open });
   if (privateMetadata.length > SLACK_VIEW_PRIVATE_METADATA_MAX) {
@@ -703,13 +686,12 @@ export function configModal(o: {
  *  escape site (SEC-5): the provider id and the provider-reported account label must never hit
  *  mrkdwn raw anywhere. */
 export function connectionLine(c: Connection): string {
-  // Escape provider/account/channel/mode before they hit mrkdwn: a stored provider id is attacker-
+  // Escape provider/account/channel before they hit mrkdwn: a stored provider id is attacker-
   // influenceable (see escapeMrkdwn's note) and the external account is provider-reported, so no value
   // here may render as a forged `<…|link>` or `<@user>` mention.
   const account = c.account ? ` (${escapeMrkdwn(c.account)})` : '';
   const where = c.channel ? `<#${escapeMrkdwn(c.channel)}>` : 'your DMs';
-  const mode = c.mode ? ` — _${escapeMrkdwn(c.mode)}_` : '';
-  return `• *${escapeMrkdwn(c.provider)}*${account} in ${where}${mode}`;
+  return `• *${escapeMrkdwn(c.provider)}*${account} in ${where}`;
 }
 
 /** One connection row with its Disconnect button — the SAME row (and the same DISCONNECT_ACTION flow,
@@ -841,7 +823,7 @@ export function oauthRecoveryBlocks(
   ];
 }
 
-/** `/vouchr status`: a user's current connections and per-channel modes. */
+/** `/vouchr status`: a user's current connections. */
 export function statusBlocks(
   connections: Connection[],
   pagination?: { page: number; totalPages: number },
@@ -896,7 +878,7 @@ export function disconnectConfirmBlocks(provider: string): unknown[] {
 
 export const HOME_CALLBACK = 'vouchr_home';
 export const HOME_CHANNEL_ACTION = 'vouchr_home_channel';
-export const HOME_MODE_ACTION = 'vouchr_home_mode';
+export const HOME_IDENTITY_ACTION = 'vouchr_home_identity';
 export const HOME_TOOL_ACTION = 'vouchr_home_tool';
 export const HOME_CONFIGURE_ACTION = 'vouchr_home_configure';
 
@@ -908,7 +890,7 @@ const HOME_MAX_ROWS = 20;
  * App Home tab (#111): the config console. Everyone sees their own connections — with the SAME
  * Disconnect row/flow as the config modal — plus the providers available to connect. `governance`
  * (passed only for viewers the adapter authorized server-side) adds the per-channel console: a
- * channel picker + one control row per provider (mode select, Enable/Disable, Configure). Its mere
+ * channel picker + one control row per provider (identity select, Enable/Disable, Configure). Its mere
  * presence is UX, never the security boundary — every block action re-checks membership at the mutation
  * (SEC-3). `note` replaces the control rows when the selected channel is ineligible/archived/deleted
  * or not this viewer's to configure. Omitting `governance` keeps the pre-#111 connections-only view.
@@ -986,30 +968,27 @@ export function homeView(o: {
       if (!tools.length) blocks.push(contextBlock('No providers are registered.'));
       for (const t of tools.slice(0, HOME_MAX_ROWS)) {
         // One row per REGISTERED provider (#111): brokered tools get the full set; a 'service' tool
-        // keeps ONLY Enable/Disable — its allowlist bit is a valid channel control, while mode and
-        // channel credentials are refused by core for it (no human credential to broker).
+        // keeps ONLY Enable/Disable (its allowlist bit is a valid channel control, while identity and
+        // channel credentials are refused by core for it: no human credential to broker).
         const brokered = isBrokeredProvider(t);
-        // Same options + initial contract as the config modal's mode select: the modes list is the
-        // core-exported CHANNEL_MODES (STR-2), initial only when a mode is actually configured.
-        const modeOptions = CHANNEL_MODES.map((m) => ({ text: { type: 'plain_text', text: m }, value: m }));
-        const initialMode = isChannelMode(t.mode) ? modeOptions.find((x) => x.value === t.mode) : undefined;
+        // Same options + initial contract as the config modal's identity select (STR-2).
+        const initialIdentity = identityOption(t.identity);
         blocks.push({
           type: 'section',
-          block_id: `home_mode:${t.provider}`,
+          block_id: `home_identity:${t.provider}`,
           text: {
             type: 'mrkdwn',
-            text: `*${escapeMrkdwn(t.provider)}* — ${t.enabled ? 'enabled' : 'disabled'} · ${
-              brokered ? `_${escapeMrkdwn(t.mode ?? 'per-user')}_` : '_service tool (host auth)_'
+            text: `*${escapeMrkdwn(t.provider)}*: ${t.enabled ? 'enabled' : 'disabled'} · ${
+              brokered ? `acts as _${escapeMrkdwn(t.identity)}_` : '_service tool (host auth)_'
             }`,
           },
-          ...(brokered
+          ...(brokered && initialIdentity
             ? {
                 accessory: {
                   type: 'static_select',
-                  action_id: HOME_MODE_ACTION,
-                  placeholder: { type: 'plain_text', text: 'per-user (default)' },
-                  options: modeOptions,
-                  ...(initialMode ? { initial_option: initialMode } : {}),
+                  action_id: HOME_IDENTITY_ACTION,
+                  options: IDENTITY_OPTIONS,
+                  initial_option: initialIdentity,
                 },
               }
             : {}),

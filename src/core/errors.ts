@@ -34,7 +34,6 @@ import {
  * on these values, never error prose. */
 export const VOUCHR_ERROR_CODES = Object.freeze([
   'consent_required',
-  'session_approval_required',
   'approval_required',
   'approval_path_too_large',
   'interaction_state_changed',
@@ -122,22 +121,6 @@ export class ConsentRequiredError extends Error {
   }
 }
 
-/** Thrown by `connect()` after a thread-scoped session prompt is posted (or a still-live earlier
- * one reused): stop this turn. The prompt is an in-thread ephemeral, so `promptState` is REQUIRED
- * for the same reason as {@link ConsentRequiredError}: a reused prompt may no longer be visible. */
-export class SessionApprovalRequiredError extends Error {
-  readonly code = 'session_approval_required' as const;
-
-  constructor(public provider: string, readonly promptState: ConsentPromptState) {
-    super(
-      promptState === 'reused'
-        ? `Session approval required for "${provider}". An approval prompt was already posted in the thread; if it is no longer visible, ask again in ${PROMPT_REDELIVERY_SECONDS} seconds.`
-        : `Session approval required for "${provider}": an approval button was posted in the thread.`,
-    );
-    this.name = 'SessionApprovalRequiredError';
-  }
-}
-
 /** Marker for deliberate, Vouchr-authored validation/refusal copy. Foreign `Error.message` values
  * never enter this class implicitly; a throw site must explicitly opt in to the text. */
 export class UserFacingError extends Error {
@@ -211,16 +194,6 @@ export function mapSafeError(error: unknown): VouchrSafeError {
           : 'Consent is required. Complete the private Connect prompt, then retry.',
         retryable: false,
         recovery: 'connect',
-      };
-    }
-    if (error instanceof SessionApprovalRequiredError) {
-      return {
-        code: 'session_approval_required',
-        message: error.promptState === 'reused'
-          ? `Thread-scoped session approval is required. An approval prompt was already posted in the thread; if it is no longer visible, ask again in ${PROMPT_REDELIVERY_SECONDS} seconds.`
-          : 'Thread-scoped session approval is required. Approve the private prompt, then retry.',
-        retryable: false,
-        recovery: 'request_approval',
       };
     }
     if (error instanceof ApprovalRequiredError) {

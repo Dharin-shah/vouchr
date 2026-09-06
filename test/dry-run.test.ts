@@ -15,7 +15,6 @@ import {
   ChannelProvisioningRequests,
   UserProvisioningRequests,
 } from '../src/core/provisioning';
-import { SessionGrants } from '../src/core/session';
 import { revokeConnection, selectRevocations } from '../src/core/offboard';
 import { EgressBlockedError } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
@@ -47,6 +46,7 @@ const enableC1 = async (db: Db, ...providerIds: string[]) => {
 
 // Dummy client credentials: the whole point of dry-run is that no REAL OAuth app exists.
 const acme = () => defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/oauth/authorize',
   tokenUrl: 'https://acme.example/oauth/token',
@@ -63,8 +63,6 @@ const LIFECYCLE_TABLES = [
   'audit',
   'consent_request',
   'approval_request',
-  'session_request',
-  'session_grant',
   'user_provisioning_request',
   'channel_provisioning_request',
 ] as const;
@@ -107,28 +105,12 @@ async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provide
     host: 'api.acme.example',
     path: '/write',
     queryHash: '',
+    grant: 'once',
     channel: null,
     thread: null,
     governableChannel: null,
   };
   await new Approvals(db).request(approvalKey);
-
-  const sessions = new SessionGrants(db);
-  await sessions.request(
-    lifecycleIdentity('U_SWEEP_SESSION_REQUEST'),
-    'C_SWEEP',
-    'TH_REQUEST',
-    provider.id,
-    randomUUID(),
-  );
-  await sessions.grant(
-    lifecycleIdentity('U_SWEEP_SESSION_GRANT'),
-    'C_SWEEP',
-    'TH_GRANT',
-    provider.id,
-    60_000,
-    randomUUID(),
-  );
 
   assert.ok(await new UserProvisioningRequests(db, vault).issue(
     lifecycleIdentity('U_SWEEP_USER_SETUP'),
@@ -151,8 +133,6 @@ async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provide
   await db.run(`UPDATE connection SET created_at=0, last_used_at=0`);
   await db.run(`UPDATE consent_request SET created_at=0`);
   await db.run(`UPDATE approval_request SET expires_at=0`);
-  await db.run(`UPDATE session_request SET expires_at=0`);
-  await db.run(`UPDATE session_grant SET expires_at=0`);
   await db.run(`UPDATE user_provisioning_request SET expires_at=0`);
   await db.run(`UPDATE channel_provisioning_request SET expires_at=0`);
 }
@@ -162,8 +142,6 @@ const contaminatedLifecycleCounts = {
   audit: 0,
   consent_request: 1,
   approval_request: 1,
-  session_request: 1,
-  session_grant: 1,
   user_provisioning_request: 1,
   channel_provisioning_request: 1,
 };
@@ -288,6 +266,7 @@ test('dry-run: the echo never contains the stored token, and honors a custom inj
   try {
     const KNOWN = randomBytes(24).toString('hex'); // a seeded, known-random secret
     const custom = defineProvider({
+      approval: false,
       id: 'custom',
       authorizeUrl: 'https://c.example/a',
       tokenUrl: 'https://c.example/t',
@@ -467,6 +446,7 @@ test('dry-run: disconnecting a dry-run credential skips the upstream revoke call
   }) as any;
   try {
     const revocable = defineProvider({
+      approval: false,
       id: 'rev', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'dry', clientSecret: 'run',
@@ -570,6 +550,7 @@ test('dry-run: provider response constraints never false-deny the synthetic echo
     // A production-passing config that would REJECT the echo if the response gate ran on it:
     // csv-only content types and a byte cap far below the echo size.
     const csv = defineProvider({
+      approval: false,
       id: 'csv', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'dry', clientSecret: 'run',
@@ -599,6 +580,7 @@ test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream norm
   }) as any;
   try {
     const revocable = defineProvider({
+      approval: false,
       id: 'rev', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'c', clientSecret: 's', revokeUrl: 'https://acme.example/oauth/revoke',
@@ -619,6 +601,7 @@ test('P1-A: flag OFF, a REAL credential labelled "dry-run" revokes upstream norm
 
 // A revocable provider for the offboard/bulk revoke coverage (a real revokeUrl → a real POST).
 const revProvider = () => defineProvider({
+  approval: false,
   id: 'rev', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
   scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
   clientId: 'c', clientSecret: 's', revokeUrl: 'https://acme.example/oauth/revoke',
@@ -664,11 +647,10 @@ test('P1-A: bulk revokeConnection skips a dry-run row upstream, but revokes a re
   const vault = new Vault(db, randomBytes(32));
   const audit = new Audit(db);
   const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
   const registry = new ProviderRegistry([revProvider()]);
   const revoke = async () => {
     const [row] = await selectRevocations(db, { provider: 'rev', userId: 'U1' });
-    await revokeConnection(vault, audit, consent, sessions, registry, row, 'rev');
+    await revokeConnection(vault, audit, consent, registry, row, 'rev');
   };
   try {
     // A dry-run row (trusted column) → bulk revoke must SKIP the upstream call (synthetic token).
@@ -726,6 +708,7 @@ test('P2-C: the provider inject hook runs exactly once, with a redacted placehol
   try {
     const seen: string[] = [];
     const counting = defineProvider({
+      approval: false,
       id: 'ct', authorizeUrl: 'https://acme.example/oauth/authorize', tokenUrl: 'https://acme.example/oauth/token',
       scopesDefault: ['read'], egressAllow: ['api.acme.example'], refresh: 'none', pkce: false,
       clientId: 'c', clientSecret: 's',

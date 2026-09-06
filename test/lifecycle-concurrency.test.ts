@@ -339,7 +339,7 @@ test('channel-governance tombstone purge cannot deadlock a dry-run channel-expir
     waitForRelationLock(
       observerDb,
       sweepPid,
-      ['connection', 'session_request', 'channel_interaction_tombstone'],
+      ['connection', 'approval_request', 'channel_interaction_tombstone'],
     ),
     sweep.then(() => undefined),
   ]);

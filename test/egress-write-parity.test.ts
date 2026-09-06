@@ -34,6 +34,7 @@ const SECRET_TOKEN = 'tok-parity-must-never-appear';
 /** A provider that declares NO egressMethods — the shape the finding hinged on. */
 function methodless(): Provider {
   return defineProvider({
+    approval: false,
     id: 'acme',
     authorizeUrl: 'https://acme.example/authorize',
     tokenUrl: 'https://acme.example/token',

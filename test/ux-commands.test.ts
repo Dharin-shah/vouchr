@@ -6,7 +6,7 @@ import { createVouchr } from '../src/adapters/bolt';
 import { openDb, type Db } from '../src/core/db';
 import { defineProvider } from '../src/core/providers';
 import { userOwner, channelOwner } from '../src/core/owner';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
@@ -279,7 +279,7 @@ test('help lists the retained commands', async (t) => {
   const { run } = await harness(t);
   const msg = await run('help');
   assert.match(msg, /Vouchr commands/);
-  for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr mode', '/vouchr connect-shared', '/vouchr disconnect-shared', '/vouchr stats']) {
+  for (const c of ['/vouchr help', '/vouchr status', '/vouchr tools', '/vouchr disconnect', '/vouchr audit', '/vouchr enable', '/vouchr disable', '/vouchr identity', '/vouchr connect-shared', '/vouchr disconnect-shared', '/vouchr stats']) {
     assert.ok(msg.includes(c), `help is missing ${c}`);
   }
   assert.ok(!msg.includes('/vouchr preview'), 'help must not promote the removed private-preview surface');
@@ -310,7 +310,7 @@ test('SEC-1: unknown command and provider values are never echoed', async (t) =>
     await run(sentinel),
     await run(`enable ${sentinel}`),
     await run(`disable ${sentinel}`),
-    await run(`mode ${sentinel} shared`),
+    await run(`identity ${sentinel} channel`),
     await run(`preview ${sentinel} public`),
     await run(`connect-shared ${sentinel}`),
     await run(`disconnect ${sentinel}`),
@@ -364,7 +364,7 @@ test('every known command rejects unsupported arguments instead of silently wide
   const { run } = await harness(t);
   for (const input of [
     'help extra', 'status extra', 'tools extra', 'stats extra', 'enable mcp extra',
-    'disable mcp extra', 'mode mcp shared extra',
+    'disable mcp extra', 'identity mcp channel extra',
     'connect-shared mcp extra', 'audit channel extra', 'audit chanel',
   ]) {
     assert.match(await run(input), /Usage:/, input);
@@ -584,22 +584,22 @@ test('disconnect-shared cleans up a RETIRED (unregistered) provider’s lingerin
   };
   const owner = channelOwner('T1', 'C_FIN');
   // 'ghost' is a valid id but NOT in the registry; seed a shared credential + mode for it.
-  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'ghost', 'shared');
+  await writeChannelIdentity(new ChannelConfig(db), 'T1', 'C_FIN', 'ghost', 'channel');
   await vouchr.vault.upsert(owner, 'ghost', { ...cred, accessToken: 'sk-ghost' });
 
   const msg = await run('disconnect-shared ghost');
   assert.match(msg, /Removed the shared \*ghost\*/); // recognized + cleaned up, not "unknown provider"
   assert.equal(await vouchr.vault.has(owner, 'ghost'), false); // the lingering credential is gone
-  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'ghost'), 'per-user'); // returned to per-user
+  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'ghost'), 'person'); // returned to per-user
 
   // A retired provider can also be left in shared mode after its credential was already removed
   // (for example by break-glass revocation). The persisted shared mode is sufficient recognition:
   // recover it to per-user and report the truthful missing outcome, never "unknown provider".
-  await writeChannelMode(new ChannelConfig(db), 'T1', 'C_FIN', 'orphaned', 'shared');
+  await writeChannelIdentity(new ChannelConfig(db), 'T1', 'C_FIN', 'orphaned', 'channel');
   const missing = await run('disconnect-shared orphaned');
   assert.match(missing, /There was no shared \*orphaned\* credential stored/i);
   assert.doesNotMatch(missing, /Unknown provider/i);
-  assert.equal(await new ChannelConfig(db).getMode('T1', 'C_FIN', 'orphaned'), 'per-user');
+  assert.equal(await new ChannelConfig(db).getIdentity('T1', 'C_FIN', 'orphaned'), 'person');
 
   // A truly unknown id (no registry entry AND no stored credential) is still rejected before any mutation.
   assert.match(await run('disconnect-shared neverheardof'), /Unknown provider|not a configured provider|isn't a provider/i);
@@ -620,7 +620,7 @@ test('disconnect-shared reports a committed removal when only its post-commit re
   };
   const cfg = new ChannelConfig(db);
   const owner = channelOwner('T1', 'C_FIN');
-  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'shared');
+  await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'channel');
   await vouchr.vault.upsert(owner, 'mcp', { ...cred, accessToken: 'shared-audit-failure' });
 
   const originalRecord = vouchr.audit.record.bind(vouchr.audit);
@@ -639,7 +639,7 @@ test('disconnect-shared reports a committed removal when only its post-commit re
   assert.match(msg, /admin.*logs/i);
   assert.doesNotMatch(msg, /POST_COMMIT_AUDIT_FAILURE/);
   assert.equal(await vouchr.vault.has(owner, 'mcp'), false);
-  assert.equal(await cfg.getMode('T1', 'C_FIN', 'mcp'), 'per-user');
+  assert.equal(await cfg.getIdentity('T1', 'C_FIN', 'mcp'), 'person');
   assert.deepEqual(attemptedMeta, {
     owner: 'channel', channel: 'C_FIN', ok: true, upstream: 'skipped',
   });
@@ -675,7 +675,7 @@ test('disconnect-shared truthfully warns Slack when upstream revocation fails af
   const cfg = new ChannelConfig(db);
   const owner = channelOwner('T1', 'C_FIN');
   const secret = 'sk-shared-revoke-failure';
-  await writeChannelMode(cfg, 'T1', 'C_FIN', 'rev', 'shared');
+  await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'rev', 'channel');
   await vouchr.vault.upsert(owner, 'rev', { ...cred, accessToken: secret });
 
   const out: string[] = [];
@@ -700,7 +700,7 @@ test('disconnect-shared truthfully warns Slack when upstream revocation fails af
   assert.doesNotMatch(message, /ghp_|sk-shared/);
   assert.equal(revokeCalls, 1);
   assert.equal(await vouchr.vault.has(owner, 'rev'), false);
-  assert.equal(await cfg.getMode('T1', 'C_FIN', 'rev'), 'per-user');
+  assert.equal(await cfg.getIdentity('T1', 'C_FIN', 'rev'), 'person');
   const row = await db.get<{ meta: string }>(
     `SELECT meta FROM audit WHERE action='revoke' AND provider='rev'`,
   );
@@ -714,7 +714,7 @@ test('disconnect-shared truthfully warns Slack when upstream revocation fails af
 // the "run from inside the channel" step (UX-5) instead of "Unknown provider" for a typo.
 test('channel-scoped subcommands in a DM say to run from inside the channel, even with an unknown provider', async (t) => {
   const { run, db } = await harness(t);
-  for (const text of ['enable bogus', 'disable bogus', 'mode bogus shared', 'connect-shared bogus', 'disconnect-shared bogus']) {
+  for (const text of ['enable bogus', 'disable bogus', 'identity bogus channel', 'connect-shared bogus', 'disconnect-shared bogus']) {
     const msg = await run(text, MEMBER_CLIENT, null); // null: a DM has no governable channel
     assert.match(msg, /from inside the channel you want to configure/, text);
     assert.doesNotMatch(msg, /Unknown provider/, text);

@@ -16,7 +16,6 @@ import { MAX_TIMER_MS } from '../../core/options';
 import { awaitWithSignal, disposableDeadline } from '../../core/httpBounds';
 import {
   mapSafeError,
-  SessionApprovalRequiredError,
   UpstreamTimeoutError,
   type VouchrErrorCode,
   type VouchrRecovery,
@@ -26,15 +25,15 @@ import type { CredentialHealthHook } from '../../core/health';
 import { channelOwner, userOwner, type Owner } from '../../core/owner';
 import { connectedHtml, escapeHtml } from '../landing';
 import { BrowserIdentityVerifier, assertSlackOidcOptions, type SlackOidcOptions } from '../slackVerify';
-import { isChannelMode, type ChannelConfig, type ChannelMode } from '../../core/channelConfig';
-import { setChannelCredentialMode } from '../../core/channelCredential';
+import { isChannelIdentity, type ChannelConfig, type ChannelIdentity } from '../../core/channelConfig';
+import { setChannelCredentialIdentity } from '../../core/channelCredential';
 import {
   authorizeProvider,
   governanceChannelOf,
   PolicyDeniedError,
   resolveCredentialOwner,
   buildToolManifest,
-  snapshotChannelModes,
+  snapshotChannelIdentities,
   snapshotToolAllowlist,
   ToolDisabledError,
 } from '../../core/authz';
@@ -47,14 +46,13 @@ import {
   type ConsentRequest,
   userInteractionIsCurrent,
 } from '../../core/consent';
-import { SessionGrants } from '../../core/session';
 import { InteractionStateChangedError, isInteractionId, usFromMs } from '../../core/interaction';
 import { ChannelProvisioningRequests, UserProvisioningRequests } from '../../core/provisioning';
 import {
   Approvals,
   ApprovalPathTooLongError,
   ApprovalRequiredError,
-  assertBindingMessage,
+  approvalStatement,
   credentialUseStateFenced,
   credentialUseStillCurrentFenced,
   type ApprovalKey,
@@ -106,7 +104,7 @@ export interface ConnectionHandleRef {
 
 /**
  * The direct broker server owns its complete lifecycle sweep. Interaction stores deliberately stay
- * private: callers can reclaim their expired rows without gaining raw approval/session/provisioning
+ * private: callers can reclaim their expired rows without gaining raw approval/provisioning
  * mutation authority or accidentally sweeping a store wired to a different broker instance.
  */
 export interface BrokerServer extends http.Server {
@@ -122,6 +120,10 @@ export interface BrokerFetchRequest {
   query?: Record<string, string>;
   headers?: Record<string, string>; // allowlisted; Authorization is dropped (broker injects)
   body?: string; // optional small write payload; capped before forwarding
+  /** The agent's reason for this call and an optional https link (#350), rendered on the approval
+   * prompt and kept on the audit row. Bounded plain text; never authority. */
+  reason?: string;
+  link?: string;
 }
 
 /**
@@ -139,13 +141,17 @@ export interface BrokerMcpRequest {
   host?: string; // optional pick among a multi-host provider; defaults to egressAllow[0]
   headers?: Record<string, string>; // MCP plumbing allowlist only; Authorization is dropped (broker injects)
   body: string; // the JSON-RPC message, forwarded verbatim (capped like /v1/fetch write bodies)
+  /** The agent's reason and optional https link (#350), as on /v1/fetch. */
+  reason?: string;
+  link?: string;
 }
 
 /**
- * #296 `POST /v1/authorization` request: the /v1/fetch target envelope WITHOUT a body or headers —
+ * #296 `POST /v1/authorization` request: the /v1/fetch target envelope WITHOUT a body or headers,
  * only the exact action (method + host + path + query) the agent asks a human to authorize, plus
- * the plain `bindingMessage` the human reads. Nothing is executed; the retried `/v1/fetch` (or
- * `/v1/mcp`) for the identical action spends the single-use grant through the normal injection path.
+ * the plain `reason` (and optional `link`) the human reads. Nothing is executed; the retried
+ * `/v1/fetch` (or `/v1/mcp`) for the identical action spends the grant through the normal injection
+ * path.
  */
 export interface BrokerAuthorizationRequest {
   handle: ConnectionHandleRef;
@@ -154,9 +160,11 @@ export interface BrokerAuthorizationRequest {
   path: string;
   host?: string;
   query?: Record<string, string>;
-  /** The transaction statement rendered on the decision surface as plain text (never mrkdwn, never
-   * audited). Bounded by MAX_BINDING_MESSAGE_BYTES; must be non-empty and non-whitespace. */
-  bindingMessage: string;
+  /** Rendered plain on the decision surface and kept on the audit row (#350). Bounded by
+   * MAX_REASON_BYTES; when present it must be non-empty and non-whitespace. */
+  reason?: string;
+  /** Optional https link rendered beside the reason. Bounded by MAX_LINK_BYTES. */
+  link?: string;
 }
 
 export interface BrokerOptions {
@@ -218,10 +226,10 @@ export interface BrokerOptions {
   channelTools?: ChannelTools;
   /**
    * #51 transport-agnostic channel gate. Setting this ENABLES `owner: 'channel'` handles; unset keeps
-   * the historical user-only broker (any `owner:'channel'` request is refused). The store resolves the
-   * channel's mode (`shared` → the channel credential, audited as the acting human). Owner + eligibility
-   * come ONLY from the signed identity claims, never the request body — so a forged body cannot assert a
-   * channel credential.
+   * a user-only broker (any `owner:'channel'` request is refused). The store resolves who the agent
+   * acts as in the channel (`channel` -> the channel credential, audited as the acting human). Owner +
+   * eligibility come ONLY from the signed identity claims, never the request body, so a forged body
+   * cannot assert a channel credential. The packaged `vouchr-broker` always wires it.
    */
   channelConfig?: ChannelConfig;
   /**
@@ -815,10 +823,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   // safeEmit swallows both failure shapes; the ConnectionHandle pass-through does the same.
   const emit = (ev: VouchrEvent) => safeEmit(opts.onEvent, ev);
 
-  // #54 lifecycle: consent + session stores for offboarding (purge pending consent + thread grants so
-  // neither can resurrect access after a user is removed). #52 OAuth connect flow reuses the same
-  // Consent: it owns the single-use state + PKCE; handleOAuthCallback owns the code exchange — the
-  // broker adds no crypto/state logic itself. Cheap Db wrappers.
+  // #54 lifecycle: the consent store for offboarding (purge pending consent so it cannot resurrect
+  // access after a user is removed). #52 OAuth connect flow reuses the same Consent: it owns the
+  // single-use state + PKCE; handleOAuthCallback owns the code exchange; the broker adds no
+  // crypto/state logic itself. Cheap Db wrappers.
   const callbackPath = opts.callbackPath === undefined ? '/oauth/callback' : opts.callbackPath;
   // The same core helper owns origin/path validation for both adapters. A configured callback path
   // must be the exact pathname this server matches, never a relative/URL/query/fragment variant.
@@ -833,7 +841,6 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   }
   const oidcRedirectUri = hops.slack.toString();
   const consent = new Consent(opts.db, dryRun); // #116: dry-run mints local instantly-succeeding authorize URLs
-  const sessions = new SessionGrants(opts.db);
   const approvals = new Approvals(opts.db); // #113 per-action approval requests/grants (provider.approval)
   const provisioning = new UserProvisioningRequests(opts.db, opts.vault);
   const channelProvisioning = new ChannelProvisioningRequests(opts.db, opts.vault);
@@ -991,9 +998,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   /**
    * #51 owner resolution — the ONLY place the credential owner is chosen. It reads the SIGNED
    * `ownerKind` (never the body): the body handle's `owner` must merely MATCH the signed claim, so a
-   * forged `owner:'channel'` on a plain user token is refused rather than silently downgraded. Channel
-   * mode is fail-closed: refused unless `channelConfig` is set (opt-in) and the signed eligibility
-   * verdict is present. `shared` keys the vault on the channel and audits the acting human.
+   * forged `owner:'channel'` on a plain user token is refused rather than silently downgraded. A
+   * channel credential is fail-closed: refused unless `channelConfig` is set and the signed
+   * eligibility verdict is present. `channel` keys the vault on the channel and audits the acting human.
    */
   async function resolveOwner(
     ref: ConnectionHandleRef,
@@ -1008,36 +1015,14 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const acting: SlackIdentity = { enterpriseId: claims.enterpriseId ?? null, teamId: claims.teamId, userId: claims.userId };
 
     if (ownerKind === 'user') {
-      // SECURITY (#54): `session` mode is a user-owned credential gated behind a per-thread grant. This
-      // gate now lives in ONE core function (resolveCredentialOwner) the Bolt path calls too, so the two
-      // transports can no longer drift (that drift is how this check went missing on the broker). Only
-      // meaningful when channelConfig is opted in; otherwise mode stays null and the gate is inert.
+      // The user path resolves the person's own credential through the ONE core decision the Bolt
+      // path calls too (resolveCredentialOwner), so the two transports cannot drift.
       const owner = userOwner(acting);
       const credentialId = await opts.vault.liveId(owner, ref.provider);
       if (!credentialId) throw notConnected(ref.provider, owner.kind);
-      let mode: ChannelMode | null = null;
-      let hasSessionGrant = false;
-      const thread = claims.threadTs ?? null;
-      if (opts.channelConfig && governableChannel) {
-        mode = await opts.channelConfig.getMode(claims.teamId, governableChannel, ref.provider);
-        if (mode === 'session' && thread) {
-          hasSessionGrant = (await sessions.grantedCredentialId(
-            acting, governableChannel, thread, ref.provider,
-          )) === credentialId;
-        }
-      }
-      const r = resolveCredentialOwner({
-        path: 'user', mode, principal: acting, channel: governableChannel, thread, hasSessionGrant,
-      });
-      if (r.status === 'needs_session') {
-        await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, reason: r.reason });
-        throw new HttpError(403, {
-          error: 'provider requires a thread-scoped session approval',
-          ...safeErrorFields(new SessionApprovalRequiredError(ref.provider, 'posted')),
-        });
-      }
+      const r = resolveCredentialOwner({ path: 'user', identity: 'person', principal: acting, channel: governableChannel });
       // The broker never pre-reads the vault (hasUserCredential unset), so the user path only yields a
-      // resolved owner here — the injector 409s later if the credential is missing.
+      // resolved owner here; the injector 409s later if the credential is missing.
       if (r.status !== 'resolved') throw notConnected(ref.provider, 'user');
       return { owner: r.owner, acting: r.acting, credentialId };
     }
@@ -1053,14 +1038,14 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // true is eligible. When eligibility is enforced entirely upstream, requireChannelEligibility:false
     // treats every channel-owned request as eligible (unchanged).
     const eligible = (opts.requireChannelEligibility ?? true) ? claims.channelEligible === true : true;
-    const mode = await opts.channelConfig.getMode(claims.teamId, governableChannel, ref.provider);
-    const r = resolveCredentialOwner({ path: 'channel', mode, principal: acting, channel: governableChannel, eligible });
+    const identity = await opts.channelConfig.getIdentity(claims.teamId, governableChannel, ref.provider);
+    const r = resolveCredentialOwner({ path: 'channel', identity, principal: acting, channel: governableChannel, eligible });
     if (r.status === 'refused') {
       if (r.code === 'ineligible') {
         await opts.audit.record('denied', acting, ref.provider, { channel: claims.channel, owner: 'channel', reason: 'channel-ineligible' });
         throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
       }
-      // 'per-user' / 'session' / unconfigured are user-owned modes; a channel handle can't reach them.
+      // The agent acts as each person here; a channel handle can't reach a personal credential.
       throw new HttpError(403, { error: 'channel is not configured for a channel-owned credential' });
     }
     // The channel path only ever yields resolved or refused; anything else fails closed (defensive).
@@ -1096,8 +1081,8 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     await authorize(ref.provider, claims, governableChannel);
     const provider = withEgressDefaults(registry.get(ref.provider), opts.allowWrites);
     const { owner, acting, credentialId } = await resolveOwner(ref, claims, governableChannel);
-    // A verified token makes the channel facts trustworthy, not immutable. Governance, session
-    // authority, and the selected connection generation can all change after resolveOwner's reads.
+    // A verified token makes the channel facts trustworthy, not immutable. Governance and the
+    // selected connection generation can both change after resolveOwner's reads.
     // Re-resolve the complete use binding under the same canonical lifecycle locks both before any
     // approval/credential work and at the actual provider-send boundary (ConnectionHandle calls this
     // callback at both points). Channel eligibility remains claim-based because the broker has no
@@ -1161,8 +1146,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       claims.threadTs ?? null, dryRun, routeDeadlineMs, transportResponseMaxBytes, credentialId,
       async (key: ApprovalKey, tx: Db, locked: Pick<Vault, 'liveId'>) => {
         if (!registry.has(key.provider) || !isBrokeredProvider(registry.get(key.provider))) return false;
-        const currentApproval = registry.get(key.provider).approval;
-        if (!currentApproval || !approvalNeeded(currentApproval, key.method, key.path)) return false;
+        if (!approvalNeeded(registry.get(key.provider).approval, key.method, key.path)) return false;
         return credentialUseStillCurrentFenced({
           binding: key,
           db: tx,
@@ -1182,7 +1166,17 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     return { handle, provider, acting };
   }
 
-  /** Canonical method, or 405 under the default fail-closed read-only mode — BEFORE identity, vault,
+  /** The agent's reason and link (#350), bounded before any identity or database work: an invalid
+   *  statement is the caller's 400, never an injector throw after state changed. */
+  function statementOf(body: { reason?: unknown; link?: unknown }) {
+    try {
+      return approvalStatement(body);
+    } catch (e) {
+      throw new HttpError(400, { error: (e as Error).message });
+    }
+  }
+
+  /** Canonical method, or 405 under the default fail-closed read-only mode, BEFORE identity, vault,
    *  or upstream, for `/v1/fetch` and the #296 `/v1/authorization` request alike: a write the broker
    *  would refuse to execute must not be able to mint a human decision for itself. */
   function allowedMethod(raw: unknown): string {
@@ -1204,6 +1198,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if ((method === 'GET' || method === 'HEAD') && outboundBody !== undefined) {
       throw new HttpError(400, { error: 'GET and HEAD requests cannot carry a body' });
     }
+    const statement = statementOf(body);
     const { handle, provider } = await resolveTarget(body, fetchDeadlineMs, maxBytes);
     // The client may have disappeared while identity/replay/authz/owner reads were in flight. The
     // response `close` event is edge-triggered, so check the persistent signal again immediately
@@ -1227,7 +1222,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     try {
       let res: Response;
       try {
-        res = await handle.fetch(url.toString(), { method, headers, body: outboundBody, signal: deadline.signal });
+        res = await handle.fetch(url.toString(), {
+          method, headers, body: outboundBody, signal: deadline.signal,
+          ...(statement.reason === null ? {} : { reason: statement.reason }),
+          ...(statement.link === null ? {} : { link: statement.link }),
+        });
       } catch (e) {
         // Resolver work happens before provider egress. Its own bounded deadline is therefore a
         // retryable resolver failure, never the unknown-provider-outcome timeout used after dispatch.
@@ -1296,17 +1295,12 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
    */
   async function handleBackchannelRequest(body: BrokerAuthorizationRequest): Promise<BrokerAuthorizationResponse> {
     const method = allowedMethod(body.method);
-    let bindingMessage: string;
-    try {
-      bindingMessage = assertBindingMessage(body.bindingMessage); // SEC-4: bounded before any read/write
-    } catch (e) {
-      throw new HttpError(400, { error: (e as Error).message });
-    }
+    const statement = statementOf(body); // SEC-4: bounded before any read/write
     const { handle, provider, acting } = await resolveTarget(body, fetchDeadlineMs);
     const url = buildTargetUrl(provider, body);
     let pending: { id: string; created: boolean } | null;
     try {
-      pending = await handle.requestApproval(url.toString(), method, bindingMessage);
+      pending = await handle.requestApproval(url.toString(), method, statement);
     } catch (e) {
       mapUpstreamError(e);
     }
@@ -1384,6 +1378,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (!opts.allowWrites) throw new HttpError(405, { error: 'writes are disabled; /v1/mcp requires allowWrites' });
     const outboundBody = requestBody(body.body);
     if (outboundBody === undefined) throw new HttpError(400, { error: 'a JSON-RPC request body is required' });
+    const statement = statementOf(body);
     const { handle, provider, acting } = await resolveTarget(body, maxStreamMs);
     requestSignal.throwIfAborted();
     const url = buildTargetUrl(provider, body);
@@ -1431,7 +1426,11 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
         // The injector enforces every egress gate (and provider.egressResponse, incl. the always-on
         // set-cookie strip) before/around this call, and writes the same inject/denied audit rows +
         // events as a /v1/fetch — the audit trail cannot tell the two doors apart (STR-4).
-        upstream = await handle.fetch(url.toString(), { method: 'POST', headers, body: outboundBody, signal: abort.signal });
+        upstream = await handle.fetch(url.toString(), {
+          method: 'POST', headers, body: outboundBody, signal: abort.signal,
+          ...(statement.reason === null ? {} : { reason: statement.reason }),
+          ...(statement.link === null ? {} : { link: statement.link }),
+        });
       } catch (e) {
         if (e instanceof ResolverFailedError || e instanceof ResolverConfigurationError) {
           mapUpstreamError(e);
@@ -1585,7 +1584,6 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       target,
       registry,
       'offboarded',
-      sessions,
       provisioning,
       channelProvisioning,
       approvals,
@@ -1613,6 +1611,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     // Verify identity BEFORE probing the registry so an unauthenticated caller can't enumerate providers.
     const claims = await verify(body.identityToken);
     const { identity: acting, issuedAt } = await requireCurrentActor(claims);
+    const channel = channelClaim(claims);
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     if (!registry.has(providerId)) throw UNKNOWN_PROVIDER();
     const provider = registry.get(providerId);
@@ -1623,18 +1622,20 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
 
     const stored = await referenceChannelCredential({
       vault: opts.vault, audit: opts.audit, channelConfig: opts.channelConfig,
-      identity: acting, channel: claims.channel, providerId, reference, issuance: issuedAt,
+      identity: acting, channel, providerId, reference, issuance: issuedAt,
       // Membership is what the signed channel claim asserts; there is no further gate (#322).
       authorize: async () => undefined,
       assertEligible: () => assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential'),
-      modeConflict: (mode) => {
-        throw new HttpError(409, {
-          error: `channel is ${mode} for this provider; shared references are not allowed`,
-        });
-      },
     });
     if (!stored) throw staleInteraction(409, 'channel credential setup no longer valid; resolve and retry');
     return { ok: true };
+  }
+
+  /** The channel a channel-scoped admin route acts on. The verifier accepts any string claim, so an
+   * empty one would otherwise write or read a channel row keyed on '' (#322). */
+  function channelClaim(claims: IdentityClaims): string {
+    if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
+    return claims.channel;
   }
 
   /** The broker's only channel-class fact is the SIGNED `channelEligible` verdict (it has no Slack
@@ -1678,39 +1679,41 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   }
 
   /**
-   * `POST /v1/admin/mode` — set the channel's credential MODE for a provider (the headless analogue of
-   * `/vouchr mode`). Body `{ provider, mode }`; the channel/team come ONLY from the signed claims (never
-   * the body), and that channel claim is the authority (#322). Config, NOT secret ingest — calls the
+   * `POST /v1/admin/identity` — set who the agent acts as for a provider in the channel (the headless
+   * analogue of `/vouchr identity`). Body `{ provider, identity }`; the channel/team come ONLY from
+   * the signed claims (never the body), and that channel claim is the authority (#322). Config, NOT
+   * secret ingest.
    */
-  async function handleAdminMode(body: { provider?: unknown; mode?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
+  async function handleAdminIdentity(body: { provider?: unknown; identity?: unknown; identityToken: string }): Promise<BrokerAdminOkResponse> {
     const providerId = body.provider;
     if (typeof providerId !== 'string' || !providerId) throw new HttpError(400, { error: 'provider is required' });
-    const mode = body.mode;
-    if (!isChannelMode(mode)) {
-      throw new HttpError(400, { error: 'mode must be one of shared|per-user|session' });
+    const actAs = body.identity;
+    if (!isChannelIdentity(actAs)) {
+      throw new HttpError(400, { error: 'identity must be one of person|channel' });
     }
     const { claims, identity: acting, issuedAt: issuance } = await verifyBrokerableProvider(
       providerId,
       body.identityToken,
     );
+    const channel = channelClaim(claims);
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
-    // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
-    // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
-    // channel from the SIGNED verdict. resolveOwner re-checks at use, so this is defense-in-depth,
-    // but the two config doors must agree.
-    if (mode === 'shared') {
+    // Choosing `channel` must be symmetric with /v1/admin/reference (and Bolt's assertChannelEligible):
+    // refuse a channel credential on an ineligible (Slack-Connect / externally-shared) channel from the
+    // SIGNED verdict. resolveOwner re-checks at use, so this is defense-in-depth, but the two config
+    // doors must agree.
+    if (actAs === 'channel') {
       await assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential');
     }
-    // The shared core lifecycle mutation serializes this mode flip with Bolt/headless credential
-    // setup across replicas. A user-owned mode and a live shared credential cannot both commit.
-    const configured = await setChannelCredentialMode({
+    // The shared core lifecycle mutation serializes this flip with Bolt/headless credential setup
+    // across replicas. A `person` identity and a live channel credential cannot both commit.
+    const configured = await setChannelCredentialIdentity({
       vault: opts.vault,
       audit: opts.audit,
       channelConfig: opts.channelConfig,
       identity: acting,
-      channel: claims.channel,
+      channel,
       providerId,
-      mode,
+      actAs,
       issuance,
     });
     if (!configured) throw staleInteraction(409, 'assertion no longer current; resolve and retry');
@@ -1732,13 +1735,14 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       providerId,
       body.identityToken,
     );
+    const channel = channelClaim(claims);
     if (!opts.channelTools) throw new HttpError(403, { error: 'channel tool allowlist is not enabled' });
     const configured = await configureChannelTools({
       channelTools: opts.channelTools,
       vault: opts.vault,
       audit: opts.audit,
       identity: acting,
-      channel: claims.channel,
+      channel,
       changes: [[providerId, body.enabled]],
       allProviders: providerIds,
       issuance,
@@ -1753,31 +1757,30 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
 
   /**
    * `GET /v1/admin/config` — the read side of the two write routes above: the caller's channel's
-   * per-provider mode + tool-enabled state, so an agent can inspect before changing. Channel-scoped
-   * by the signed claims (identity token in the
-   * `x-vouchr-identity` header — a GET carries no JSON body). Service tools are included because the
-   * same allowlist governs their manifest bit, but their credential `mode` is always null. NO secret:
-   * policy bits only. `mode` is null when channelConfig is unset; `enabled` defaults true when
-   * channelTools is unset (the same backward-compat rule ChannelTools.isEnabled applies).
+   * per-provider identity + tool-enabled state, so an agent can inspect before changing. Channel-scoped
+   * by the signed claims (identity token in the `x-vouchr-identity` header; a GET carries no JSON
+   * body). Service tools are included because the same allowlist governs their manifest bit; their
+   * identity is `service`. NO secret: policy bits only. `enabled` defaults true when channelTools is
+   * unset (the same backward-compat rule ChannelTools.isEnabled applies).
    */
   async function handleAdminConfig(token: string): Promise<BrokerAdminConfigResponse> {
     const claims = await verify(token);
     await requireCurrentActor(claims);
     if (providerIds.length === 0) return { providers: [] };
-    // Two channel-scoped batch reads (mode + tool allowlist) instead of getMode/isEnabled per provider,
+    // Two channel-scoped batch reads (identity + tool allowlist) instead of one query per provider,
     // so the query count is bounded by the channel, not the provider count (#209). `enabled` is the raw
-    // allowlist bit — same backward-compat rule ChannelTools.isEnabled applies — mode null when unset.
-    const [modeOf, toolAllowed] = await Promise.all([
+    // allowlist bit (same backward-compat rule ChannelTools.isEnabled applies).
+    const [identityOf, toolAllowed] = await Promise.all([
       opts.channelConfig && brokeredProviderIds.length
-        ? snapshotChannelModes(opts.channelConfig, claims.teamId, claims.channel, brokeredProviderIds)
-        : Promise.resolve((_provider: string): ChannelMode | null => null),
+        ? snapshotChannelIdentities(opts.channelConfig, claims.teamId, claims.channel, brokeredProviderIds)
+        : Promise.resolve((_provider: string): ChannelIdentity => 'person'),
       opts.channelTools
         ? snapshotToolAllowlist(opts.channelTools, claims.teamId, claims.channel, providerIds)
         : Promise.resolve((_provider: string) => true),
     ]);
     const providers = providerIds.map((provider) => ({
       provider,
-      mode: isBrokeredProvider(registry.get(provider)) ? modeOf(provider) : null,
+      identity: isBrokeredProvider(registry.get(provider)) ? identityOf(provider) : 'service' as const,
       enabled: toolAllowed(provider),
     }));
     return { providers };
@@ -1876,8 +1879,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   async function handleAdminAudit(body: { identityToken: string }): Promise<BrokerAuditResponse> {
     const claims = await verify(body.identityToken);
     await requireCurrentActor(claims);
-    if (typeof claims.channel !== 'string' || !claims.channel) throw new HttpError(400, { error: 'channel-scoped identity token required' });
-    const events = await opts.audit.listByChannel(claims.teamId, claims.channel, 20);
+    const events = await opts.audit.listByChannel(claims.teamId, channelClaim(claims), 20);
     return { events };
   }
 
@@ -1896,7 +1898,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
   /**
    * `POST /v1/manifest` — the CHANNEL-SCOPED tool manifest for the verified identity (the headless
    * analogue of Bolt's `toolManifest()`, via the SAME core builder so the two can't drift): per
-   * provider, whether it's usable in the claims' channel, its credential mode, and who the agent acts
+   * provider, whether it's usable in the claims' channel, and who the agent acts
    * as. Channel/team come ONLY from the signed claims. Self-service — the
    * same non-secret policy bits `/vouchr tools` shows every channel member. The GET above stays: it
    * is the channel-independent provider list; this is "what may I do here". Provider-output
@@ -1908,7 +1910,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     const tools = await buildToolManifest({
       providerIds, registry,
       policy: opts.policy, channelTools: opts.channelTools, channelConfig: opts.channelConfig,
-      // Policy on the signed delivery channel; tool-allowlist + mode on the governance scope (null for
+      // Policy on the signed delivery channel; tool-allowlist + identity on the governance scope (null for
       // a signed DM/group-DM claim, classified by the signed channelType), so the broker manifest reports
       // a personal conversation's providers enabled — matching Bolt. '' (a channel-less token) is a DM context.
       principal, channel: claims.channel || null, governanceChannel: governanceChannelOf(claims.channel || null, claims.channelType),
@@ -2210,9 +2212,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           await perimeter(req, requestSignal);
           return send(200, await handleAdminReference(await readJson(req)));
         }
-        if (req.method === 'POST' && url === '/v1/admin/mode') {
+        if (req.method === 'POST' && url === '/v1/admin/identity') {
           await perimeter(req, requestSignal);
-          return send(200, { ...await handleAdminMode(await readJson(req)) });
+          return send(200, { ...await handleAdminIdentity(await readJson(req)) });
         }
         if (req.method === 'POST' && url === '/v1/admin/tools') {
           await perimeter(req, requestSignal);

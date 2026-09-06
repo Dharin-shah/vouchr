@@ -1,4 +1,4 @@
-import { canonicalMethod, hasAmbiguousPathEncoding, isLoopbackHost, type Provider } from './providers';
+import { canonicalMethod, hasAmbiguousPathEncoding, isLoopbackHost, type ApprovalRule, type Provider } from './providers';
 import { credentialLockKey, type Vault, type StoredCredential } from './vault';
 import type { SlackIdentity } from './identity';
 import type { Owner } from './owner';
@@ -12,11 +12,12 @@ import { hideInternals } from './redact';
 import { governanceChannelOf } from './authz';
 import type { CredentialHealthHook } from './health';
 import {
-  approvalActionFingerprint,
   ApprovalPathTooLongError,
   ApprovalRequiredError,
+  approvalStatement,
   queryDigest,
   type ApprovalKey,
+  type ApprovalStatement,
   type Approvals,
   MAX_APPROVAL_PATH_BYTES,
   effectiveApprover,
@@ -203,12 +204,14 @@ export function pathAllowed(pathname: string, allowed: string): boolean {
  * shared across configuration and request-time enforcement (STR-2).
  */
 /**
- * Whether (method, path) falls under a provider's human-approval requirement (#113): the explicit
- * `approval.methods` list when set, else ANY non-read method (everything but GET/HEAD) — this is
- * the ONE place that default lives. `approval.paths` narrows by the same matcher semantics as
- * `egressPaths` (pathAllowed, STR-2); unset = every path. `method` is already upper-cased by fetch.
+ * Whether (method, path) falls under a provider's approval rule (#113, #350): never when the provider
+ * declared `approval: false`; else the explicit `approval.methods` list when set, else ANY non-read
+ * method (everything but GET/HEAD), which is the ONE place that default lives. `approval.paths`
+ * narrows by the same matcher semantics as `egressPaths` (pathAllowed, STR-2); unset = every path.
+ * `method` is already upper-cased by fetch.
  */
-export function approvalNeeded(a: NonNullable<Provider['approval']>, method: string, pathname: string): boolean {
+export function approvalNeeded(a: ApprovalRule | false | undefined, method: string, pathname: string): boolean {
+  if (!a) return false;
   const methodMatch = a.methods
     ? a.methods.some((m) => m.toUpperCase() === method)
     : method !== 'GET' && method !== 'HEAD';
@@ -300,8 +303,8 @@ export class ConnectionHandle {
     // deliberately actor-free. Default no-op. The authoritative copy is still the audit table.
     private auditSink: AuditSink = () => {},
     // The Slack channel this request originated in. Recorded on the inject audit for EVERY owner kind
-    // (not just channel-owned), so `/vouchr stats` can attribute per-user / session usage to the
-    // channel it happened in — otherwise those (the default modes) all read as "never used". Null when
+    // (not just channel-owned), so `/vouchr stats` can attribute personal usage to the channel it
+    // happened in; otherwise the default identity would read as "never used". Null when
     // there is no channel context (a DM, or a headless call whose token carries no channel).
     private originChannel: string | null = null,
     // Per-(owner, provider) token buckets for provider.rateLimit. Shared across handles (like
@@ -313,8 +316,8 @@ export class ConnectionHandle {
     // deliberately separate from `sink`, whose no-user-ids contract is load-bearing. Default no-op.
     private health: CredentialHealthHook = () => {},
     // #113 human-in-the-loop approval store (provider.approval). Both adapters pass their
-    // db-backed instance; null is fine for providers without the knob (the gate never runs), and
-    // FAIL-CLOSED for providers with it (a declared approval must never be silently skipped).
+    // db-backed instance; null is fine for providers with `approval: false` (the gate never runs),
+    // and FAIL-CLOSED for every other provider (an approval rule must never be silently skipped).
     private approvals: Approvals | null = null,
     // The Slack thread this request runs in, binding an approval grant to its exact conversation
     // context (with originChannel). Null off-thread / headless-without-thread.
@@ -341,7 +344,7 @@ export class ConnectionHandle {
       locked: Pick<Vault, 'liveId'>,
     ) => Promise<boolean>,
     // Bolt handles may outlive the channel governance state that created them. Recheck exact
-    // credential/mode/owner/policy/tool/session state before any authority is spent and again at
+    // credential/identity/owner/policy/tool state before any authority is spent and again at
     // each provider send. Headless requests construct a fresh handle after resolving those facts.
     private useStillValid?: () => Promise<boolean>,
     // The mutable-governance scope of originChannel (null in a personal conversation), captured while
@@ -647,22 +650,24 @@ export class ConnectionHandle {
    *  - userId = the human DRIVING the agent (the caller = the acting user), who the adapter
    *    prompts and who self-approval matches.
    *  - ownerKind/ownerId = the credential this write will actually use. Binding it means a grant
-   *    minted for one credential can't be spent after a per-user→shared mode change: the write can
+   *    minted for one credential can't be spent after a person -> channel identity change: the write can
    *    never run against a different credential than the human approved. It is also the purge key
    *    when the credential is revoked/reconnected (purgeApprovalsForOwner, run inside the vault
    *    mutation).
    * request() + consume() (and the #296 backchannel request) share this one builder, so every site
    * stays consistent by construction. Audit still attributes to `acting` + the approver.
    */
-  private approvalKey(url: URL, method: string, credentialId: string): ApprovalKey {
+  private approvalKey(url: URL, method: string, credentialId: string, rule: ApprovalRule): ApprovalKey {
     return {
       teamId: this.acting.teamId, userId: this.acting.userId,
       ownerKind: this.owner.kind, ownerId: this.owner.id, credentialId, provider: this.provider.id,
       // queryHash (GHSA-pg84): the grant binds the exact query string sent upstream, as a
-      // digest — a retry with ANY textual change to the query re-prompts instead of spending
+      // digest: a retry with ANY textual change to the query re-prompts instead of spending
       // the human's approval.
       method, origin: url.origin, host: url.hostname, path: url.pathname,
       queryHash: queryDigest(url.search),
+      // A thread grant needs a thread to bind to; outside one it is a once grant (#350).
+      grant: rule.grant === 'thread' && this.thread ? 'thread' : 'once',
       channel: this.auditChannel(), thread: this.thread,
       // The governance scope stored for the DECISION revalidation. Prefer the channel_type-aware
       // value the adapter passed; fall back to the id heuristic for a directly-constructed handle.
@@ -678,13 +683,13 @@ export class ConnectionHandle {
    * poll for it. Runs the identical egress gates, path bound, retained-use revalidation, and
    * credential binding as `fetch`, then the same deduplicated `requestAudited` write; it never
    * consumes a grant and never reads the secret. Returns null when the provider's `approval` rule
-   * does not cover this action (nothing to decide — the agent calls the action directly).
-   * `bindingMessage` is the plain transaction statement rendered on the decision surface.
+   * does not cover this action (nothing to decide; the agent calls the action directly).
+   * `statement` is the agent's already-validated reason and link, rendered on the decision surface.
    */
   async requestApproval(
     input: string,
     method: string,
-    bindingMessage: string,
+    statement: ApprovalStatement,
   ): Promise<{ id: string; created: boolean } | null> {
     const canonical = canonicalMethod(method);
     if (!canonical) throw new TypeError('Invalid HTTP method.');
@@ -705,12 +710,13 @@ export class ConnectionHandle {
     await this.takeRateBudget(url.hostname);
     const credentialId = await this.bindCredential();
     const pending = await this.approvals.requestAudited(
-      this.approvalKey(url, canonical, credentialId),
+      this.approvalKey(url, canonical, credentialId, approval),
       this.audit,
       this.acting,
       this.vault,
       this.approvalRequestValid,
-      bindingMessage,
+      statement,
+      true,
     );
     if (pending.created) {
       this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
@@ -718,12 +724,14 @@ export class ConnectionHandle {
     return pending;
   }
 
-  async fetch(input: string, init: RequestInit = {}): Promise<Response> {
-    // Validate the raw caller value before any mutable gate (rate budget, approval/audit rows,
+  async fetch(input: string, init: RequestInit & { reason?: string; link?: string } = {}): Promise<Response> {
+    // Validate the raw caller values before any mutable gate (rate budget, approval/audit rows,
     // credential metadata/read, or Slack prompt). The same canonical spelling drives every policy
-    // decision and is explicitly forwarded at the network edge below.
+    // decision and is explicitly forwarded at the network edge below. The agent's reason and link
+    // (#350) are bounded here too, so an invalid statement never reaches storage or Slack.
     const method = canonicalMethod(init.method ?? 'GET');
     if (!method) throw new TypeError('Invalid HTTP method.');
+    const statement = approvalStatement(init);
     const url = new URL(input);
     // Egress allowlist and every finer control first, before any secret is even read.
     await this.egressGate(url, method, init);
@@ -736,7 +744,7 @@ export class ConnectionHandle {
       throw new ApprovalPathTooLongError();
     }
 
-    // A retained channel handle may outlive its mode/tool/session/credential authority. Revalidate
+    // A retained channel handle may outlive its identity/tool/credential authority. Revalidate
     // before any stateful gate so stale use cannot spend another caller's rate budget or approval.
     if (this.useStillValid && !(await this.useStillValid())) {
       throw new InteractionStateChangedError('connection', 'authorization');
@@ -750,7 +758,7 @@ export class ConnectionHandle {
     // owner kind from the typed Owner.
     await this.takeRateBudget(url.hostname);
 
-    // Bind authority to the exact live row before approval/session state is consulted. This is a
+    // Bind authority to the exact live row before approval state is consulted. This is a
     // metadata-only read; the credential remains encrypted until every gate below has passed.
     const credentialId = await this.bindCredential();
 
@@ -765,16 +773,15 @@ export class ConnectionHandle {
     // against a credential the human didn't approve: consume() runs BEFORE the vault read, so a
     // born-orphan grant just falls through to NoConnectionError below with zero injection, and any
     // (re)connect purges stale grants via the vault upsert before the new credential is usable.
-    const ap = approval;
-    if (ap && requiresApproval) {
+    if (approval && requiresApproval) {
       if (!this.approvals) {
-        // Fail closed (STR-5): a provider that declares `approval` on a deployment that never wired
+        // Fail closed (STR-5): a provider with an approval rule on a deployment that never wired
         // the store must hard-fail, not silently skip the gate. A wiring bug, and it says so.
         throw new Error(`Provider "${this.provider.id}" requires human approval but no approval store is wired.`);
       }
       // One key builder (approvalKey) feeds request, consume, and the backchannel request, so every
       // site stays consistent by construction. Audit still attributes to `acting` + the approver.
-      const key = this.approvalKey(url, method, credentialId);
+      const key = this.approvalKey(url, method, credentialId, approval);
       const grant = await this.approvals.consumeAudited(
         key,
         this.audit,
@@ -789,22 +796,24 @@ export class ConnectionHandle {
           this.acting,
           this.vault,
           this.approvalRequestValid,
+          statement,
         );
         if (pending.created) {
           this.emit({ type: 'approval_requested', provider: this.provider.id, host: url.hostname });
         }
-        // Only the parameter COUNT rides the error for the prompt display (GHSA-pg84): names are
-        // as caller-controlled as values and must not reach Slack or logs (SEC-1). The exact
-        // query is bound via the digest in the key above.
+        // The path rides the error plain for the prompt (#350); the query string never does (its
+        // names and values are caller-controlled, SEC-1) and is bound by the digest in the key.
         throw new ApprovalRequiredError(
           this.provider.id,
-          effectiveApprover(ap.approver, key.governableChannel),
+          effectiveApprover(approval.approver, key.governableChannel),
           method,
           url.hostname,
-          approvalActionFingerprint(key),
+          url.pathname,
           pending.id,
-          [...url.searchParams.keys()].length,
+          key.grant,
           pending.created,
+          statement.reason,
+          statement.link,
         );
       }
       // The grant was spent exactly once together with its audit row above. If audit insertion
@@ -847,8 +856,8 @@ export class ConnectionHandle {
       }
       const send = async (t: string) => {
       // Recheck at the actual egress boundary too. The early check above prevents an invalid
-      // retained handle from consuming a generic approval; this late check prevents governance or
-      // session expiry during credential/approval work from reaching the provider.
+      // retained handle from consuming a generic approval; this late check prevents governance
+      // changes during credential/approval work from reaching the provider.
       if (this.useStillValid && !(await this.useStillValid())) {
         throw new InteractionStateChangedError('connection', 'authorization');
       }
@@ -921,7 +930,7 @@ export class ConnectionHandle {
     // Best-effort: the provider call already happened, so a bookkeeping failure must not surface as a
     // failed fetch (the caller might retry a non-idempotent request).
     // Attribute the injection to the channel it happened in (origin channel, or the owning channel for a
-    // channel-owned cred). Powers per-channel usage analytics across ALL modes, not just shared.
+    // channel-owned cred). Powers per-channel usage analytics for both identities.
     const ch = this.auditChannel();
     const channelMeta = ch ? { channel: ch } : {};
     // Independent writes: overlap the two round trips instead of paying them back to back.

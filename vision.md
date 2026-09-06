@@ -53,7 +53,7 @@ These are product invariants, not optional deployment modes.
 
 ### Slack is the control plane
 
-Slack is where a human connects an account, approves a session, configures a shared credential,
+Slack is where a human connects an account, approves a write, configures a shared credential,
 disconnects, and receives private recovery guidance. The Bolt integration is the primary product
 experience.
 
@@ -66,15 +66,18 @@ after Slack has real users. Core is not refactored ahead of them.
 
 ### Credential modes
 
-Vouchr supports three modes:
+Who the agent acts as is one setting per channel per provider:
 
-| Mode | Meaning |
+| Identity | Meaning |
 | --- | --- |
-| `per-user` | Each person uses their own connected account. This is the default. |
-| `session` | A person's credential is usable only in the approved Slack thread for a bounded time. |
-| `shared` | A member of the channel configures one channel-owned service credential. |
+| `person` | Each person uses their own connected account. This is the default. |
+| `channel` | A member of the channel connects one channel-owned service credential. |
 
-`shared` is for an intentional service account, not for silently borrowing another person's
+Writes wait for a human by default. A provider may narrow that (`methods`, `paths`), pick the
+approver (`member` or `self`), let one approval cover a thread (`grant: 'thread'`), or opt out
+(`approval: false`).
+
+`channel` is for an intentional service account, not for silently borrowing another person's
 account. It remains gated on current channel membership (the channel is the team and the trust
 boundary), attributable to the triggering human, and unavailable where the channel trust boundary
 is unsafe.
@@ -107,7 +110,8 @@ The following are intentionally outside the product:
 
 - **SQLite runtime support.** No single-pod database mode, dual write, or permanent legacy adapter.
 - **`union` credential borrowing.** One human's personal credential will not be delegated to other
-  channel members. `per-user`, `session`, and `shared` cover the supported needs more clearly.
+  channel members. The `person` and `channel` identities plus thread-scoped approvals cover the
+  supported needs more clearly.
 - **Private provider-response previews stored by Vouchr.** Hosts own provider-output rendering and
   data-loss prevention. Vouchr owns the credential boundary.
 - **Transaction-semantic approval for arbitrary bodies.** Generic approval binds the supported
@@ -130,9 +134,9 @@ compatibility layers or hardening beyond what is needed to remove them safely.
 
 1. A person asks a Slack agent to use a provider.
 2. The agent asks Vouchr for a handle, never a token.
-3. If no credential or session grant exists, Vouchr records one durable request and posts a private,
-   best-effort deduplicated prompt.
-4. The person connects through OAuth or approves the thread-scoped session.
+3. If no credential exists, Vouchr records one durable request and posts a private, best-effort
+   deduplicated prompt.
+4. The person connects through OAuth. A write then waits for the channel's approval.
 5. Vouchr stores the credential encrypted and the person retries the request.
 6. Vouchr validates policy and egress, injects the credential, and returns only the provider
    response.
@@ -234,8 +238,8 @@ parallel when it does not create conflicting foundations.
   one cross-replica prompt-delivery lease, transaction-bound callback finalization, fixed browser
   outcomes, and private Bolt recovery. The trusted broker-to-Slack recovery bridge is complete:
   `context.vouchr.recoverBrokerDenial` maps the stable broker denials (`not_connected`,
-  `session_approval_required`, `approval_required`) to the correct private connect/key, thread
-  session, or self/member approval surface from verified Slack state, with a two-process
+  `approval_required`) to the correct private connect/key or self/member approval surface from
+  verified Slack state, with a two-process
   Bolt + packaged-broker integration proof over one PostgreSQL database.
 
 No SQLite importer or runtime dual-write is part of the supported work. Any future compatibility

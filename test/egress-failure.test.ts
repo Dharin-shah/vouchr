@@ -18,6 +18,7 @@ const SECRET = 'broker-signing-secret';
 const SECRET_TOKEN = 'tok_super_secret_value_DO_NOT_LEAK';
 
 const acme = defineProvider({
+  approval: false,
   id: 'acme',
   authorizeUrl: 'https://acme.example/auth',
   tokenUrl: 'https://acme.example/token',

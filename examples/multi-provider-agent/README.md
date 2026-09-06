@@ -18,7 +18,7 @@ enabled here, and that list becomes the model's tool enum:
 
 ```ts
 const manifest = await vouchr.toolManifest();
-const usable = manifest.filter((t) => t.enabled && t.identity === 'acting_human').map((t) => t.provider);
+const usable = manifest.filter((t) => t.enabled && t.identity !== 'service').map((t) => t.provider);
 // → the `provider` enum the model chooses from
 ```
 

@@ -10,7 +10,7 @@ import { openDb } from '../src/core/db';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { SessionGrants } from '../src/core/session';
+import { Approvals } from '../src/core/approval';
 import {
   ChannelProvisioningRequests,
   issueUserProvisioningRequest,
@@ -55,7 +55,7 @@ async function seed(t: TestContext) {
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable', tok('TOK_U1'));
   await vault.upsert(channelOwner('T1', 'C1'), 'revocable', tok('TOK_C1'));
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T2', userId: 'U2' }), 'revocable', tok('TOK_U2'));
-  return { db, vault, audit: new Audit(db), consent: new Consent(db), sessions: new SessionGrants(db), registry: new ProviderRegistry([revocable]) };
+  return { db, vault, audit: new Audit(db), consent: new Consent(db), registry: new ProviderRegistry([revocable]) };
 }
 
 test('dry-run (selectRevocations) matches without mutating; filters compose', async (t) => {
@@ -71,7 +71,7 @@ test('dry-run (selectRevocations) matches without mutating; filters compose', as
 });
 
 test('--team T1 revokes only T1 rows, calls upstream revoke, writes audit; T2 untouched', async (t) => {
-  const { db, vault, audit, consent, sessions, registry } = await seed(t);
+  const { db, vault, audit, consent, registry } = await seed(t);
   const realFetch = globalThis.fetch;
   const revokedTokens: string[] = [];
   globalThis.fetch = (async (_url: any, init: any) => {
@@ -81,7 +81,7 @@ test('--team T1 revokes only T1 rows, calls upstream revoke, writes audit; T2 un
   try {
     const rows = await selectRevocations(db, { provider: 'revocable', teamId: 'T1' });
     for (const r of rows) {
-      const out = await revokeConnection(vault, audit, consent, sessions, registry, r, 'revocable');
+      const out = await revokeConnection(vault, audit, consent, registry, r, 'revocable');
       assert.equal(out.removed, true);
       assert.equal(out.upstreamOk, true);
     }
@@ -101,12 +101,12 @@ test('--team T1 revokes only T1 rows, calls upstream revoke, writes audit; T2 un
 });
 
 test('failing upstream revoke still deletes locally and reports upstreamOk=false', async (t) => {
-  const { db, vault, audit, consent, sessions, registry } = await seed(t);
+  const { db, vault, audit, consent, registry } = await seed(t);
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('nope', { status: 500 })) as any;
   try {
     const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
-    const out = await revokeConnection(vault, audit, consent, sessions, registry, row, 'revocable');
+    const out = await revokeConnection(vault, audit, consent, registry, row, 'revocable');
     assert.equal(out.removed, true); // local delete is the security-meaningful action
     assert.equal(out.upstreamOk, false); // best-effort revoke failed, but did not fail the delete
   } finally {
@@ -120,26 +120,22 @@ test('local delete is guaranteed even with a wrong key and no registry (break-gl
   // P1: if the master key / provider registry are unavailable, the CLI still constructs a Vault with a
   // throwaway key and no registry. revokeConnection must delete locally regardless — the token read
   // fails to decrypt (swallowed) and upstream revoke is skipped, but the credential is gone.
-  const { db, audit, consent, sessions } = await seed(t);
+  const { db, audit, consent } = await seed(t);
   const wrongKeyVault = new Vault(db, randomBytes(32)); // a DIFFERENT key than the data was sealed with
   const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
-  const out = await revokeConnection(wrongKeyVault, audit, consent, sessions, undefined, row, 'revocable');
+  const out = await revokeConnection(wrongKeyVault, audit, consent, undefined, row, 'revocable');
   assert.equal(out.removed, true); // deleted despite being unable to decrypt the token
   assert.equal(out.upstreamOk, true); // no registry → upstream revoke skipped, not failed
   assert.equal(await wrongKeyVault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable'), null);
 });
 
-test('pending consent, sessions, and key setup with NO connection are counted and purged for the scope', async (t) => {
+test('pending consent and key setup with NO connection are counted and purged for the scope', async (t) => {
   // P2: pending authority without a live connection must still be cleared, or it can recreate
   // access after the break-glass run.
   const { db } = await seed(t);
   const id: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U_ORPHAN' }; // no connection row
   const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
   await consent.begin(id, revocable, 'https://broker.example/cb', 'C9');
-  const orphanGeneration = '00000000-0000-4000-8000-000000000001';
-  await sessions.request(id, 'C9', 'THREAD', 'revocable', orphanGeneration);
-  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000, orphanGeneration);
   const vault = new Vault(db, KEY);
   assert.ok(await new UserProvisioningRequests(db, vault).issue(id, 'revocable'));
   assert.ok(await new ChannelProvisioningRequests(db, vault).issue(
@@ -153,30 +149,22 @@ test('pending consent, sessions, and key setup with NO connection are counted an
 
   assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), {
     consents: 1,
-    requests: 1,
-    grants: 1,
     provisioning: 1,
     channelProvisioning: 1,
   });
   const purged = await purgePendingForProvider(db, { provider: 'revocable' });
   assert.deepEqual(purged, {
     consents: 1,
-    requests: 1,
-    grants: 1,
     provisioning: 1,
     channelProvisioning: 1,
   });
   assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable' }), {
     consents: 0,
-    requests: 0,
-    grants: 0,
     provisioning: 0,
     channelProvisioning: 0,
   });
   assert.deepEqual(await countPendingForProvider(db, { provider: 'other' }), {
     consents: 1,
-    requests: 0,
-    grants: 0,
     provisioning: 0,
     channelProvisioning: 0,
   }); // untouched
@@ -195,8 +183,6 @@ test('pending purge respects the team/user scope', async (t) => {
   assert.equal(purged.provisioning, 1); // only T1
   assert.deepEqual(await countPendingForProvider(db, { provider: 'revocable', teamId: 'T2' }), {
     consents: 1,
-    requests: 0,
-    grants: 0,
     provisioning: 1,
     channelProvisioning: 0,
   });
@@ -219,8 +205,6 @@ test('--channel treats a consent channel as origin, not shared-credential owners
     provider: 'revocable', channel: 'C1',
   }), {
     consents: 0,
-    requests: 0,
-    grants: 0,
     provisioning: 0,
     channelProvisioning: 1,
   });
@@ -228,8 +212,6 @@ test('--channel treats a consent channel as origin, not shared-credential owners
     provider: 'revocable', channel: 'C1',
   }), {
     consents: 0,
-    requests: 0,
-    grants: 0,
     provisioning: 0,
     channelProvisioning: 1,
   });
@@ -259,8 +241,6 @@ test('--user does not treat the admin actor as owner of a channel setup request'
     await purgePendingForProvider(db, { provider: 'revocable', userId: identity.userId }),
     {
       consents: 0,
-      requests: 0,
-      grants: 0,
       provisioning: 0,
       channelProvisioning: 0,
     },
@@ -430,9 +410,6 @@ test('channel-scoped revoke fences a delayed shared write without blocking a sib
     await resume;
     return realLock(...args);
   }) as Vault['withCredentialLock'];
-  const modeConflict = (mode: 'per-user' | 'session'): never => {
-    throw new Error(`unexpected mode ${mode}`);
-  };
   const delayed = configureChannelCredential({
     vault: vaultA,
     audit: new Audit(dbA),
@@ -442,7 +419,6 @@ test('channel-scoped revoke fences a delayed shared write without blocking a sib
     providerId: 'revocable',
     issuance: issuedAt,
     credential: { kind: 'secret', token: tok('DELAYED_CHANNEL_TOKEN') },
-    modeConflict,
   });
   await beforeLock;
   await purgePendingForProvider(
@@ -463,7 +439,6 @@ test('channel-scoped revoke fences a delayed shared write without blocking a sib
     providerId: 'revocable',
     issuance: issuedAt,
     credential: { kind: 'secret', token: tok('SIBLING_CHANNEL_TOKEN') },
-    modeConflict,
   }), true);
   assert.equal(await vaultA.has(channelOwner('T1', 'C_SIBLING'), 'revocable'), true);
 });
@@ -564,7 +539,6 @@ test('pending key purge waits for a consumed in-flight ticket so the CLI rescan 
     vaultB,
     new Audit(dbB),
     new Consent(dbB),
-    new SessionGrants(dbB),
     undefined,
     settled[0],
     'revocable',
@@ -612,7 +586,6 @@ test('pending channel-key purge waits for a consumed ticket so the CLI rescan ca
     providerId: 'revocable',
     issuance: requests.issuance(requestId, identity, channel, 'revocable'),
     credential: { kind: 'secret', token: tok('CHANNEL_RACE_TOKEN') },
-    modeConflict: (mode) => { throw new Error(`unexpected mode ${mode}`); },
   });
   await entered;
 
@@ -638,20 +611,24 @@ test('pending channel-key purge waits for a consumed ticket so the CLI rescan ca
   assert.equal(await new Vault(dbB, KEY).has(owner, 'revocable'), true);
 });
 
-test('revoking a user connection clears that user+provider session grants and pending consent', async (t) => {
-  const { db, vault, audit, consent, sessions, registry } = await seed(t);
+test('revoking a user connection clears that user+provider approvals and pending consent', async (t) => {
+  const { db, vault, audit, consent, registry } = await seed(t);
   const id: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
   const credentialId = await vault.liveId(userOwner(id), 'revocable');
   assert.ok(credentialId);
-  await sessions.grant(id, 'C9', 'THREAD', 'revocable', 60_000, credentialId);
+  await new Approvals(db).request({
+    teamId: 'T1', userId: 'U1', ownerKind: 'user', ownerId: 'U1', credentialId, provider: 'revocable',
+    method: 'POST', origin: 'https://api.revocable.example', host: 'api.revocable.example', path: '/x',
+    queryHash: '', grant: 'thread', channel: 'C9', thread: 'THREAD', governableChannel: 'C9',
+  });
   await consent.begin(id, revocable, 'https://broker.example/cb', 'C9');
-  assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable', credentialId), true);
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM approval_request') as any).n, 1);
   assert.equal((await db.get('SELECT COUNT(*) AS n FROM consent_request') as any).n, 1);
 
   const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
-  await revokeConnection(vault, audit, consent, sessions, registry, row, 'revocable');
+  await revokeConnection(vault, audit, consent, registry, row, 'revocable');
 
-  assert.equal(await sessions.isGranted(id, 'C9', 'THREAD', 'revocable', credentialId), false); // grant cleared
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM approval_request') as any).n, 0); // approvals cleared
   assert.equal((await db.get('SELECT COUNT(*) AS n FROM consent_request') as any).n, 0); // consent cleared
 });
 
@@ -664,7 +641,7 @@ test('a provider with no revoke endpoint reports upstream SKIPPED, not success',
   globalThis.fetch = (async () => { called = true; return new Response('', { status: 200 }); }) as any;
   try {
     const [row] = await selectRevocations(db, { provider: 'norevoke', userId: 'U1' });
-    const out = await revokeConnection(vault, new Audit(db), new Consent(db), new SessionGrants(db), new ProviderRegistry([norevoke]), row, 'norevoke');
+    const out = await revokeConnection(vault, new Audit(db), new Consent(db), new ProviderRegistry([norevoke]), row, 'norevoke');
     assert.equal(out.removed, true);
     assert.equal(out.upstreamAttempted, false); // no revoke endpoint → not attempted
     assert.equal(called, false); // fetch never called
@@ -678,11 +655,11 @@ test('a provider with no revoke endpoint reports upstream SKIPPED, not success',
 });
 
 test('revokeConnection swallows a post-delete audit failure (bulk sweep never strands rows)', async (t) => {
-  const { db, vault, consent, sessions, registry } = await seed(t);
+  const { db, vault, consent, registry } = await seed(t);
   const throwingAudit = { record: async () => { throw new Error('db down'); } } as any;
   const [row] = await selectRevocations(db, { provider: 'revocable', userId: 'U1' });
   // Must NOT throw — the local delete already happened and the loop must continue for the other rows.
-  const out = await revokeConnection(vault, throwingAudit, consent, sessions, registry, row, 'revocable');
+  const out = await revokeConnection(vault, throwingAudit, consent, registry, row, 'revocable');
   assert.equal(out.removed, true);
   assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'revocable'), null);
 });

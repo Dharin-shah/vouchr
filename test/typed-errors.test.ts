@@ -14,7 +14,6 @@ import {
   ResolverFailedError,
   ResponseBlockedError,
   SecretReferenceError,
-  SessionApprovalRequiredError,
   TokenEndpointError,
   TOKEN_ENDPOINT_FAILURE_KINDS,
   UpstreamTimeoutError,
@@ -38,7 +37,6 @@ import {
   ResolverFailedError as HeadlessResolverFailedError,
   ResponseBlockedError as HeadlessResponseBlockedError,
   SecretReferenceError as HeadlessSecretReferenceError,
-  SessionApprovalRequiredError as HeadlessSessionApprovalRequiredError,
   TokenEndpointError as HeadlessTokenEndpointError,
   TOKEN_ENDPOINT_FAILURE_KINDS as HEADLESS_TOKEN_ENDPOINT_FAILURE_KINDS,
   UpstreamTimeoutError as HeadlessUpstreamTimeoutError,
@@ -65,7 +63,6 @@ test('typed error classes and mapper are the same exports on root and Bolt-free 
     [ResolverFailedError, HeadlessResolverFailedError, 'ResolverFailedError'],
     [ResponseBlockedError, HeadlessResponseBlockedError, 'ResponseBlockedError'],
     [SecretReferenceError, HeadlessSecretReferenceError, 'SecretReferenceError'],
-    [SessionApprovalRequiredError, HeadlessSessionApprovalRequiredError, 'SessionApprovalRequiredError'],
     [TokenEndpointError, HeadlessTokenEndpointError, 'TokenEndpointError'],
     [UpstreamTimeoutError, HeadlessUpstreamTimeoutError, 'UpstreamTimeoutError'],
     [ToolDisabledError, HeadlessToolDisabledError, 'ToolDisabledError'],
@@ -87,23 +84,19 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
     'self',
     'POST',
     'api.github.com',
-    `hmac-sha256:${'a'.repeat(64)}`,
+    '/repos/acme/demo/issues',
     '00000000-0000-4000-8000-000000000001',
-    0,
+    'once',
     true,
   );
   // #348: the requester cannot decide a 'member' prompt, so the copy names who can.
   const memberApproval = new ApprovalRequiredError(
-    'github', 'member', 'POST', 'api.github.com', `hmac-sha256:${'a'.repeat(64)}`,
-    '00000000-0000-4000-8000-000000000001', 0, true,
+    'github', 'member', 'POST', 'api.github.com', '/repos/acme/demo/issues',
+    '00000000-0000-4000-8000-000000000001', 'once', true,
   );
   const cases = [
     [new ConsentRequiredError('github', 'posted'), 'consent_required', 'connect', false, undefined,
       'Consent is required. Complete the private Connect prompt, then retry.'],
-    [new SessionApprovalRequiredError('github', 'posted'), 'session_approval_required', 'request_approval', false, undefined,
-      'Thread-scoped session approval is required. Approve the private prompt, then retry.'],
-    [new SessionApprovalRequiredError('github', 'reused'), 'session_approval_required', 'request_approval', false, undefined,
-      'Thread-scoped session approval is required. An approval prompt was already posted in the thread; if it is no longer visible, ask again in 30 seconds.'],
     [approval, 'approval_required', 'request_approval', false, undefined,
       'Human approval is required. Approve the prompt Vouchr posted to you, then retry.'],
     [memberApproval, 'approval_required', 'request_approval', false, undefined,
@@ -163,10 +156,9 @@ test('mapSafeError does not trust arbitrary messages merely because they use an 
   const secret = 'ghp_known_class_spoof_must_not_render';
   const errors = [
     new ConsentRequiredError(secret, 'posted'),
-    new SessionApprovalRequiredError(secret, 'posted'),
     new ApprovalRequiredError(
       secret, 'self', secret, secret, secret,
-      '00000000-0000-4000-8000-000000000001', 0, true,
+      '00000000-0000-4000-8000-000000000001', 'once', true, secret, secret,
     ),
     new EgressBlockedError(secret),
     new NoConnectionError(secret, 'user'),

@@ -10,7 +10,6 @@ import type { SlackIdentity } from './identity';
 import { isValidProviderId, type ProviderRegistry } from './providers';
 import { revokeProviderCredential } from './tokens';
 import { channelOwner, userOwner, type Owner } from './owner';
-import { SessionGrants } from './session';
 import { ChannelProvisioningRequests, UserProvisioningRequests } from './provisioning';
 import { Approvals } from './approval';
 import { InteractionStateChangedError, isInteractionId } from './interaction';
@@ -240,7 +239,7 @@ export async function disconnectConnectionGeneration(
  * automatically when Slack deactivates the account (see the Bolt adapter's
  * registerOffboarding), and callable from a SCIM deprovision hook or an admin.
  *
- * Also purges in-flight consent, setup/session state, and requester-bound approvals for the user.
+ * Also purges in-flight consent, setup state, and requester-bound approvals for the user.
  * The tombstone remains the load-bearing barrier: retained credential use and approval
  * decision/consumption compare their trusted receipt times even if bounded-state cleanup fails.
  *
@@ -257,9 +256,6 @@ export async function offboardUser(
   // keep the prior local-only behavior.
   registry?: ProviderRegistry,
   reason = 'offboarded',
-  // Optional: when supplied, also clear the user's thread session grants. Centralized here so
-  // every offboarding path (per-team and the Grid/SCIM sweep) gets the same cleanup.
-  sessions?: SessionGrants,
   // Optional: clear opaque private-modal provisioning requests. The tombstone remains the
   // load-bearing fence; this is bounded-state cleanup and makes stale controls converge promptly.
   provisioning?: UserProvisioningRequests,
@@ -277,7 +273,6 @@ export async function offboardUser(
     identity,
     registry,
     reason,
-    sessions,
     provisioning,
     channelProvisioning,
     approvals,
@@ -299,7 +294,6 @@ export async function offboardUserDetailed(
   identity: SlackIdentity,
   registry?: ProviderRegistry,
   reason = 'offboarded',
-  sessions?: SessionGrants,
   provisioning?: UserProvisioningRequests,
   channelProvisioning?: ChannelProvisioningRequests,
   approvals?: Approvals,
@@ -310,12 +304,10 @@ export async function offboardUserDetailed(
   let gated = true;
   try { await consent.markOffboarded(identity); } catch { gated = false; }
   // Auxiliary cleanup, each isolated (GHSA-25m2 review): a cleanup failure must never prevent the
-  // credential deletes below — they are the security-meaningful action. Session grants are
-  // TTL-bound and swept.
-  // Best-effort: the tombstone above is the fence, so a failed consent-row purge is not fatal —
+  // credential deletes below, which are the security-meaningful action.
+  // Best-effort: the tombstone above is the fence, so a failed consent-row purge is not fatal;
   // the stale rows are reclaimed by the retention sweep (consent.sweepStale).
   try { await consent.deleteForUser(identity); } catch { /* fenced by the tombstone; retention-swept */ }
-  try { await sessions?.revokeForUser(identity); } catch { /* thread grants are TTL-bound */ }
   try { await provisioning?.revokeForUser(identity); } catch { /* provisioning requests are TTL-bound */ }
   try { await channelProvisioning?.revokeForUser(identity); } catch { /* provisioning requests are TTL-bound */ }
   try { await approvals?.revokeForUser(identity); } catch { /* approvals are TTL-bound + tombstone-fenced */ }
@@ -439,11 +431,11 @@ export async function selectRevocations(db: Db, f: RevokeFilter): Promise<Revoke
   }));
 }
 
-/** Scoped predicate for pending consent / session requests / session grants — `provider` plus
- *  whichever of team/user/channel the filter narrows to. All three tables carry these columns. */
+/** Scoped predicate for pending consent: `provider` plus whichever of team/user/channel the filter
+ *  narrows to. */
 function pendingWhere(f: RevokeFilter): { where: string; params: unknown[] } {
-  // --channel selects a channel-owned credential. A consent/session row is USER authority whose
-  // channel column is only request origin, never ownership; do not widen a channel kill into users.
+  // --channel selects a channel-owned credential. A consent row is USER authority whose channel
+  // column is only request origin, never ownership; do not widen a channel kill into users.
   if (f.channel) return { where: 'FALSE', params: [] };
   const where = ['provider=?'];
   const params: unknown[] = [f.provider];
@@ -478,16 +470,14 @@ function channelProvisioningWhere(f: RevokeFilter): { where: string; params: unk
 
 export interface PendingProviderAuthority {
   consents: number;
-  requests: number;
-  grants: number;
   provisioning: number;
   channelProvisioning: number;
 }
 
 /**
- * Pending OAuth consents + thread/session/key-setup authority a {@link RevokeFilter} matches —
- * counted, NOT deleted (for the dry-run). These exist INDEPENDENTLY of a live connection row, so
- * break-glass must report + clear them separately or they can recreate access.
+ * Pending OAuth consents + key-setup authority a {@link RevokeFilter} matches, counted, NOT deleted
+ * (for the dry-run). These exist INDEPENDENTLY of a live connection row, so break-glass must report +
+ * clear them separately or they can recreate access.
  */
 export async function countPendingForProvider(
   db: Db,
@@ -497,8 +487,6 @@ export async function countPendingForProvider(
   const provisioning = provisioningWhere(f);
   const channelProvisioning = channelProvisioningWhere(f);
   const c = (await db.get(`SELECT COUNT(*) AS n FROM consent_request WHERE ${where}`, params)) as { n: number } | undefined;
-  const r = (await db.get(`SELECT COUNT(*) AS n FROM session_request WHERE ${where}`, params)) as { n: number } | undefined;
-  const s = (await db.get(`SELECT COUNT(*) AS n FROM session_grant WHERE ${where}`, params)) as { n: number } | undefined;
   const p = (await db.get(
     `SELECT COUNT(*) AS n FROM user_provisioning_request WHERE ${provisioning.where}`,
     provisioning.params,
@@ -509,8 +497,6 @@ export async function countPendingForProvider(
   )) as { n: number } | undefined;
   return {
     consents: c?.n ?? 0,
-    requests: r?.n ?? 0,
-    grants: s?.n ?? 0,
     provisioning: p?.n ?? 0,
     channelProvisioning: cp?.n ?? 0,
   };
@@ -526,20 +512,18 @@ async function providerKnownToStore(db: Db, provider: string): Promise<boolean> 
        UNION ALL SELECT provider FROM consent_request WHERE provider=?
        UNION ALL SELECT provider FROM user_provisioning_request WHERE provider=?
        UNION ALL SELECT provider FROM channel_provisioning_request WHERE provider=?
-       UNION ALL SELECT provider FROM session_request WHERE provider=?
-       UNION ALL SELECT provider FROM session_grant WHERE provider=?
        UNION ALL SELECT provider FROM approval_request WHERE provider=?
        UNION ALL SELECT provider FROM channel_config WHERE provider=?
        UNION ALL SELECT provider FROM channel_tool WHERE provider=?
        UNION ALL SELECT provider FROM provisioning_revocation_tombstone WHERE provider=?
      ) AS known_provider LIMIT 1`,
-    Array(10).fill(provider),
+    Array(8).fill(provider),
   );
   return row != null;
 }
 
 /**
- * Delete every matching pending OAuth/session/key-setup authority. Key-setup rows are first
+ * Delete every matching pending OAuth/key-setup authority. Key-setup rows are first
  * snapshotted, then their canonical credential locks are acquired in one transaction. If a writer
  * already consumed a ticket but has not committed, PostgreSQL still exposes the old row to the
  * snapshot; this purge waits for that writer before returning. The caller must reselect connections
@@ -571,8 +555,6 @@ export async function purgePendingForProvider(
   )) as { team_id: string; channel: string }[];
   const purge = async (tx: Db): Promise<PendingProviderAuthority> => {
     const consents = (await tx.run(`DELETE FROM consent_request WHERE ${where}`, params)).changes;
-    const requests = (await tx.run(`DELETE FROM session_request WHERE ${where}`, params)).changes;
-    const grants = (await tx.run(`DELETE FROM session_grant WHERE ${where}`, params)).changes;
     const removedProvisioning = (await tx.run(
       `DELETE FROM user_provisioning_request WHERE ${provisioning.where}`,
       provisioning.params,
@@ -583,8 +565,6 @@ export async function purgePendingForProvider(
     )).changes;
     return {
       consents,
-      requests,
-      grants,
       provisioning: removedProvisioning,
       channelProvisioning: removedChannelProvisioning,
     };
@@ -602,16 +582,15 @@ export async function purgePendingForProvider(
 /**
  * Revoke ONE already-selected connection row: local delete FIRST (the security-meaningful action,
  * done even if the token can't be decrypted — e.g. a KMS row with no KMS client wired into the CLI),
- * then best-effort upstream revoke, then audit ('revoke', no token) and — for a USER owner — clear
- * that user's pending consent + thread session grants for the provider so neither can resurrect the
- * credential. Mirrors {@link disconnectProvider}'s order but handles BOTH user- and channel-owned rows
- * and never throws on a decrypt/upstream failure. Channel owners have no user-scoped consent/grants.
+ * then best-effort upstream revoke, then audit ('revoke', no token) and, for a USER owner, clear
+ * that user's pending consent for the provider so it cannot resurrect the credential. Mirrors
+ * {@link disconnectProvider}'s order but handles BOTH user- and channel-owned rows and never throws
+ * on a decrypt/upstream failure. Channel owners have no user-scoped consent.
  */
 export async function revokeConnection(
   vault: Vault,
   audit: Audit,
   consent: Consent,
-  sessions: SessionGrants,
   registry: ProviderRegistry | undefined,
   row: RevokeRow,
   provider: string,
@@ -662,7 +641,7 @@ export async function revokeConnection(
   // A surgical revoke attributes to the owner. The deployment-wide path assumes the database may
   // be attacker-controlled, so it records only fixed system identity plus a registry-trusted
   // provider id (or the constant `unregistered`) — never stored owner/provider text (SEC-1/SEC-4).
-  // Everything after the local delete is BEST-EFFORT and wrapped so one row's audit/consent/session
+  // Everything after the local delete is BEST-EFFORT and wrapped so one row's audit/consent
   // failure (e.g. a transient DB error) can never throw out of the bulk-revoke loop and strand the
   // remaining rows. The security-meaningful delete already happened above.
   const deployment = options.auditScope === 'deployment';
@@ -679,7 +658,6 @@ export async function revokeConnection(
   catch { /* best-effort */ }
   if (row.ownerKind === 'user') {
     try { await consent.deleteForUserProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
-    try { await sessions.clearForProvider(row.teamId, row.ownerId, provider); } catch { /* best-effort */ }
   }
   return {
     ...row,
@@ -697,7 +675,7 @@ export async function revokeConnection(
  *
  * The Vault API is team-scoped (the full owner key is team_id + kind + id). A cross-team tombstone
  * first fences even an artifact-free workspace, then we discover every team with an own connection,
- * in-flight consent, pending session request, thread grant, approval, or setup request and replay
+ * in-flight consent, approval, or setup request and replay
  * {@link offboardUser} once per team. That keeps upstream revoke + audit + bounded-state cleanup in
  * one place, and each delete still uses the FULL owner key (team_id + 'user' + userId).
  *
@@ -720,7 +698,6 @@ export async function offboardUserEverywhere(
   reason = 'offboarded',
 ): Promise<{ teamId: string; providers: string[]; ok: boolean }[]> {
   const ent = user.enterpriseId != null;
-  const sessions = new SessionGrants(db);
   const provisioning = new UserProvisioningRequests(db, vault);
   const channelProvisioning = new ChannelProvisioningRequests(db, vault);
   const approvals = new Approvals(db);
@@ -731,16 +708,12 @@ export async function offboardUserEverywhere(
   // mutation lock order); markUserOffboardedEverywhere commits its own short transaction here.
   await markUserOffboardedEverywhere(db, user);
   // The ONLY query that spans teams. UNION so a team with only a pending "Connect" or only a lingering
-  // thread session artifact (no live connection) is still found and purged. Session tables have no
+  // approval artifact (no live connection) is still found and purged. Interaction tables have no
   // enterprise_id column, so they are always matched by user_id alone (userId is org-unique).
   const rows = (await db.all(
     `SELECT team_id FROM connection WHERE owner_kind='user' AND owner_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
      UNION
      SELECT team_id FROM consent_request WHERE user_id=?${ent ? ' AND (enterprise_id=? OR enterprise_id IS NULL)' : ''}
-     UNION
-     SELECT team_id FROM session_request WHERE user_id=?
-     UNION
-     SELECT team_id FROM session_grant WHERE user_id=?
      UNION
      SELECT team_id FROM user_provisioning_request WHERE user_id=?
      UNION
@@ -748,8 +721,8 @@ export async function offboardUserEverywhere(
      UNION
      SELECT team_id FROM approval_request WHERE user_id=?`,
     ent
-      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId, user.userId, user.userId, user.userId, user.userId]
-      : [user.userId, user.userId, user.userId, user.userId, user.userId, user.userId, user.userId],
+      ? [user.userId, user.enterpriseId, user.userId, user.enterpriseId, user.userId, user.userId, user.userId]
+      : [user.userId, user.userId, user.userId, user.userId, user.userId],
   )) as { team_id: string }[];
 
   const summary: { teamId: string; providers: string[]; ok: boolean }[] = [];
@@ -765,7 +738,6 @@ export async function offboardUserEverywhere(
         identity,
         registry,
         reason,
-        sessions,
         provisioning,
         channelProvisioning,
         approvals,
@@ -798,8 +770,6 @@ export async function offboardUserEverywhere(
  *  out — `test/revoke-all.test.ts` diffs this set against the live schema to catch exactly that. */
 export const RESURRECTION_TABLES = [
   'consent_request',
-  'session_request',
-  'session_grant',
   'approval_request',
   'user_provisioning_request',
   'channel_provisioning_request',
@@ -845,8 +815,6 @@ export interface RevokeAllDeps {
 export interface RevokeLocalCounts {
   connections: number;
   consents: number;
-  sessionRequests: number;
-  sessionGrants: number;
   approvals: number;
   userProvisioning: number;
   channelProvisioning: number;
@@ -897,8 +865,6 @@ export async function enumerateStoredProviders(db: Db): Promise<string[]> {
   const rows = (await db.all(
     `SELECT provider FROM connection
      UNION SELECT provider FROM consent_request
-     UNION SELECT provider FROM session_request
-     UNION SELECT provider FROM session_grant
      UNION SELECT provider FROM approval_request
      UNION SELECT provider FROM user_provisioning_request
      UNION SELECT provider FROM channel_provisioning_request
@@ -944,8 +910,6 @@ async function countRows(db: Db, table: string): Promise<number> {
 const zeroLocalCounts = (): RevokeLocalCounts => ({
   connections: 0,
   consents: 0,
-  sessionRequests: 0,
-  sessionGrants: 0,
   approvals: 0,
   userProvisioning: 0,
   channelProvisioning: 0,
@@ -957,8 +921,6 @@ async function localCounts(db: Db): Promise<RevokeLocalCounts> {
   return {
     connections: await countRows(db, 'connection'),
     consents: await countRows(db, 'consent_request'),
-    sessionRequests: await countRows(db, 'session_request'),
-    sessionGrants: await countRows(db, 'session_grant'),
     approvals: await countRows(db, 'approval_request'),
     userProvisioning: await countRows(db, 'user_provisioning_request'),
     channelProvisioning: await countRows(db, 'channel_provisioning_request'),
@@ -968,15 +930,14 @@ async function localCounts(db: Db): Promise<RevokeLocalCounts> {
 }
 
 function authorizationCount(c: RevokeLocalCounts): number {
-  return c.consents + c.sessionRequests + c.sessionGrants + c.approvals
-    + c.userProvisioning + c.channelProvisioning + c.notifications;
+  return c.consents + c.approvals + c.userProvisioning + c.channelProvisioning + c.notifications;
 }
 
 /**
  * Deployment-wide emergency invalidation. Dry-run (`execute:false`) enumerates and classifies with
  * ZERO mutation and ZERO decryption. Execute:
  *  1. per enumerated provider, runs the shared {@link revokeConnection} (local delete FIRST, then
- *     best-effort bounded upstream revoke, audit, and per-user consent/grant clear) so upstream
+ *     best-effort bounded upstream revoke, audit, and per-user consent clear) so upstream
  *     reporting and the mutation+audit contract are the SAME code the surgical path uses (STR-3);
  *  2. then BLANKET-deletes every authorization/resurrection table + `connection` + `installation`,
  *     which needs no decryption/KMS/provider config and also removes pending authority that has no
@@ -1059,7 +1020,6 @@ export async function revokeAllCredentials(
   }
 
   const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
   // Phase 1: per-provider upstream revoke + attributed local delete, via the shared helper.
   for (const provider of storedProviders) {
     const bucket = bucketFor(provider);
@@ -1072,7 +1032,6 @@ export async function revokeAllCredentials(
           deps.vault,
           deps.audit,
           consent,
-          sessions,
           deps.registry,
           row,
           provider,
@@ -1105,8 +1064,6 @@ export async function revokeAllCredentials(
   const cleared = {
     connections: await del('connection'),
     consents: await del('consent_request'),
-    sessionRequests: await del('session_request'),
-    sessionGrants: await del('session_grant'),
     approvals: await del('approval_request'),
     userProvisioning: await del('user_provisioning_request'),
     channelProvisioning: await del('channel_provisioning_request'),
