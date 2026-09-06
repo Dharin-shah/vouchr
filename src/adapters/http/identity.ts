@@ -65,6 +65,15 @@ export interface IdentityClaims {
    * only widens/narrows the member-mutable allowlist scope, never the deployment policy.
    */
   channelType?: SlackConversationType;
+  /**
+   * #360 the token is minted for an autonomous worker (the app's bot user or a service user), not a
+   * human requester. Signed by the trusted minter, which is the one process that knows who it mints
+   * for; a bot user id is an ordinary Slack user id, so the broker cannot tell otherwise. With a
+   * `user` handle in a `person`-identity channel, a channel member authorizes each approval-needing
+   * action as themselves and the call runs with that member's credential; the worker's own
+   * (non-existent) credential is never consulted. Ignored on a channel-owned request.
+   */
+  worker?: boolean;
 }
 
 /** Hard ceiling on a token's lifetime: a verified token is rejected if exp is further out than this. */
@@ -410,6 +419,7 @@ export type MintIdentityInput = Pick<
   | 'ownerKind'
   | 'channelEligible'
   | 'channelType'
+  | 'worker'
 >;
 
 /**
@@ -452,6 +462,7 @@ export function mintIdentity(input: MintIdentityInput, key: string | IdentityCon
     ...(input.ownerKind !== undefined ? { ownerKind: input.ownerKind } : {}),
     ...(input.channelEligible !== undefined ? { channelEligible: input.channelEligible } : {}),
     ...(input.channelType !== undefined ? { channelType: input.channelType } : {}),
+    ...(input.worker !== undefined ? { worker: input.worker } : {}),
     jti: randomUUID(),
     exp: now + lifetime,
   };
@@ -513,7 +524,9 @@ function isClaims(v: unknown): v is IdentityClaims {
     (c.ownerKind === undefined || c.ownerKind === 'user' || c.ownerKind === 'channel') &&
     (c.channelEligible === undefined || typeof c.channelEligible === 'boolean') &&
     // Signed conversation type is authorization-affecting: accept only Slack's closed event values.
-    (c.channelType === undefined || isSlackConversationType(c.channelType))
+    (c.channelType === undefined || isSlackConversationType(c.channelType)) &&
+    // #360 worker flag: reject a wrong-typed value rather than coercing it.
+    (c.worker === undefined || typeof c.worker === 'boolean')
   );
 }
 
