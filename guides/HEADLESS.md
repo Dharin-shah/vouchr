@@ -516,7 +516,9 @@ Channel governance mirrors the Bolt `/vouchr` commands: `POST /v1/admin/mode` se
 channel mode, `POST /v1/admin/tools` toggles a provider in the channel's tool allowlist, and
 `GET /v1/admin/config` reads both back. All three act on the SIGNED `channel` claim only — the
 channel is the trust boundary (#322), so any member the minter asserts in that channel may configure
-it; the request body carries no authority.
+it; the request body carries no authority. The writes (`tools`, and `mode` to `shared`) also need the
+signed `channelEligible: true` channel-class verdict (see DEPLOYMENT.md), so an externally shared
+channel cannot be governed from the broker any more than from Bolt.
 
 Direct `createBroker()` callers opt into the mutable gate by supplying the read-only `channelTools` store.
 The packaged `buildBrokerServer()` constructs it from its existing PostgreSQL handle unconditionally,

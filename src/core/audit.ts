@@ -128,7 +128,7 @@ export class Audit {
   }
 
   /** Every audit row tagged with this channel — channel-owned credential usage AND per-user activity
-   *  that happened in the channel (provider/action/actor/at). Admin-gated at the call site. Excludes `meta`. */
+   *  that happened in the channel (provider/action/actor/at). Member-gated at the call site. Excludes `meta`. */
   async listByChannel(teamId: string, channelId: string, limit: number): Promise<AuditRow[]> {
     return this.db.all(
       `SELECT provider, action, actor, channel, at FROM audit
@@ -139,7 +139,7 @@ export class Audit {
 
   /** Per-provider injection stats for a channel since `sinceEpoch` (ms epoch): total injections,
    *  distinct requesting humans, and last-used time. One GROUP BY, backend-agnostic (epoch comparison,
-   *  no date functions). Admin-gated at the call site; powers `/vouchr stats`.
+   *  no date functions). Member-gated at the call site; powers `/vouchr stats`.
    *
    *  "Distinct humans" = `COALESCE(actor, user_id)`: an inject row's `actor` is null and `user_id` IS
    *  the requester, so this counts requesters (the COALESCE also covers any future non-null actor).
@@ -166,7 +166,7 @@ export class Audit {
   }
 
   /** The last human who ran a 'config' action for (channel, provider) — the best-known "configuring
-   *  admin", used as the recipient for channel-credential health notices (#117). Null when nobody
+   *  member", used as the recipient for channel-credential health notices (#117). Null when nobody
    *  ever configured it (the caller should skip rather than guess). */
   async lastChannelConfigActor(teamId: string, channelId: string, provider: string): Promise<string | null> {
     const row = await this.db.get<{ user_id: string }>(

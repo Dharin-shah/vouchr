@@ -18,7 +18,7 @@ const vouchr = await createVouchr({
 });
 ```
 
-Then an admin, from inside the channel to configure, runs:
+Then a member of the channel, from inside it, runs:
 
 ```
 /vouchr connect-shared github

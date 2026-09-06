@@ -274,7 +274,7 @@ const vouchr = await createVouchr({
 });
 ```
 
-An admin then runs `/vouchr connect-shared github` and pastes an ARN into the private modal. Full setup,
+A member of the channel then runs `/vouchr connect-shared github` and pastes an ARN into the private modal. Full setup,
 auth (ambient IAM role, no static creds), and the least-privilege policy
 (`secretsmanager:GetSecretValue` scoped to the specific ARNs, `kms:Decrypt` if the secret uses a CMK)
 are in [`examples/aws-secrets-manager/README.md`](../examples/aws-secrets-manager/README.md).
@@ -564,7 +564,9 @@ POST /v1/admin/reference
 - Authority is the **signed `channel` claim**: any member of that channel may configure it (#322),
   and the minter asserts only the channel the verified Slack event came from.
 - Channel eligibility is enforced on the signed `channelEligible` claim (shared creds refused on
-  ineligible / externally-shared channels).
+  ineligible / externally-shared channels). `POST /v1/admin/mode` (to `shared`) and
+  `POST /v1/admin/tools` require the same `channelEligible: true` claim, as Bolt checks the channel
+  class on the same mutations; a token without it is refused 403 and audited `channel-ineligible`.
 - It stores only the validated non-secret reference (`vault.reference`) and flips the channel to
   `shared`. A headless host wanting static keys should point at a secret manager rather than send the
   value over this route. The route returns `{ ok: true }`.
@@ -847,7 +849,7 @@ enablement by the channel's members; neither can override a denial by the other.
 - **Per-user *referenced* credentials** (a user's own key for a non-OAuth provider): the user points
   their credential at an external secret-manager reference with `POST /v1/user/reference` (#58) —
   body `{ handle: { provider }, identityToken, secretRef, scopes? }`. It has the same supported-form,
-  derived-source, optional legacy-source match, and configured-resolver checks as the admin route.
+  derived-source, optional legacy-source match, and configured-resolver checks as the `/v1/admin/reference` route.
   Self-service authority comes from the signed identity token; **reference only** — no raw secret
   crosses the broker, and configured `resolvers` resolve JIT at egress. Raw-key ingest stays out of
   the broker by design.
@@ -1185,7 +1187,9 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
   `connect-shared`/`disconnect-shared`/`mode`/`enable`/`disable`/`stats`/`audit channel` commands,
   the config modal, and App Home governance read `conversations.members` (needs `channels:read`, and
   `groups:read` plus the app being in the channel for private channels) and fail closed. There is
-  no workspace-admin role, creator rule, or custom predicate.
+  no workspace-admin role, creator rule, or custom predicate. The roster scan is bounded
+  (`MAX_APPROVAL_AUDIENCE_MEMBERS`, 5000 members, within a 3 s deadline): a member beyond the scanned
+  prefix is refused with the same "make sure Vouchr is in the channel" copy as a non-member.
 
 Wire the four hooks (see the README example):
 

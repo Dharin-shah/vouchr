@@ -34,7 +34,7 @@ import { userOwner, channelOwner } from '../src/core/owner';
 import { sweepExpired } from '../src/core/sweep';
 import {
   APPROVAL_DELIVERY_SAFETY_MARGIN_MS,
-  APPROVAL_FANOUT_DEADLINE_MS,
+  APPROVAL_PROMPT_POST_DEADLINE_MS,
   ConnectContext,
   createVouchr,
   safeUserMessage,
@@ -157,6 +157,8 @@ async function harness(t: TestContext, o: {
   db?: Db;
   onSlackRead?: () => void | Promise<void>;
   masterKey?: Buffer;
+  /** Extra conversations.info fields (e.g. `is_ext_shared`); read at call time so a test can flip them. */
+  channelInfo?: Record<string, unknown>;
 } = {}) {
   process.env.VOUCHR_MASTER_KEY = (o.masterKey ?? randomBytes(32)).toString('base64');
   const provider = o.provider ?? approvalProvider();
@@ -178,7 +180,7 @@ async function harness(t: TestContext, o: {
     conversations: {
       info: async ({ channel }: any) => {
         await o.onSlackRead?.();
-        return { channel: { id: channel, is_channel: true, creator: 'U_CREATOR' } };
+        return { channel: { id: channel, is_channel: true, creator: 'U_CREATOR', ...o.channelInfo } };
       },
       members: async () => { await o.onSlackRead?.(); return { members }; },
     },
@@ -1523,6 +1525,51 @@ test('member approver (#322): one channel message; the requester and a non-membe
   });
 });
 
+test('member approver: no prompt is posted into an externally shared (Slack Connect) channel', async (t) => {
+  const { ctx, dms, ephemerals, approvalRows, auditRows } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_EXTERNAL_ORG'],
+    channelInfo: { is_ext_shared: true },
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    await assert.rejects(handle.fetch('https://api.acme.test/repos', { method: 'POST' }), /externally shared channels/);
+    assert.equal(dms.length, 0, 'a foreign org must never see the prompt');
+    assert.equal(ephemerals.length, 0);
+    assert.equal((await approvalRows()).length, 0, 'the undeliverable request is removed, not parked behind a lease');
+    assert.ok(!(await auditRows()).some((r) => r.action === 'approved' || r.action === 'approval_consumed'));
+    assert.equal(calls.length, 0, 'no egress');
+  });
+});
+
+test('member approver: a Slack Connect conversion after the prompt invalidates it; a foreign-org member cannot approve', async (t) => {
+  const channelInfo: Record<string, unknown> = {};
+  const { ctx, click, dms, approvalRows, auditRows } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'member' } }),
+    members: ['U1', 'U_EXTERNAL_ORG'],
+    channelInfo,
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(dms.length, 1, 'the prompt was posted while the channel was internal');
+    // The probe: conversations.info now reports Slack Connect and conversations.members lists a user
+    // from the other org, who is not the requester. Membership alone must not be enough.
+    channelInfo.is_ext_shared = true;
+    const responds: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U_EXTERNAL_ORG', e.approvalId, responds);
+    assert.match(String(responds[0]?.text), /no longer valid because provider or channel access changed/);
+    assert.equal((await approvalRows()).length, 0, 'the pending request is removed under the decision locks');
+    const audits = await auditRows();
+    assert.ok(!audits.some((r) => r.action === 'approved' || r.action === 'approval_consumed'), 'nothing was granted');
+    assert.equal(audits.filter((r) => r.action === 'approval_requested').length, 1, 'the request audit stands as the record');
+    // A retry cannot re-post into the now-external channel, and U1's credential never left.
+    await assert.rejects(handle.fetch('https://api.acme.test/repos', { method: 'POST' }), /externally shared channels/);
+    assert.equal(dms.length, 1, 'no second prompt reaches the shared channel');
+    assert.equal(calls.length, 0, 'no egress with the requester\'s credential');
+  });
+});
+
 test('member approver: a click whose signed channel differs from the request\'s channel decides nothing', async (t) => {
   const { ctx, click, approvalRows, auditRows } = await harness(t, {
     provider: approvalProvider({ approval: { approver: 'member' } }),
@@ -1600,14 +1647,14 @@ test('member approver in a DM degrades to self: the requester is prompted privat
   });
 });
 
-test('approval fan-out reserves a post, pool wait, query confirmation, and margin inside the lease', () => {
-  assert.ok(APPROVAL_FANOUT_DEADLINE_MS > 0, 'the posting window must remain usable');
+test('the approval prompt post reserves a post, pool wait, query confirmation, and margin inside the lease', () => {
+  assert.ok(APPROVAL_PROMPT_POST_DEADLINE_MS > 0, 'the posting window must remain usable');
   assert.ok(
     DB_RUNTIME_STATEMENT_TIMEOUT_MS <= DB_RUNTIME_QUERY_TIMEOUT_MS,
     'PostgreSQL must cancel no later than the client completion bound',
   );
   assert.equal(
-    APPROVAL_FANOUT_DEADLINE_MS
+    APPROVAL_PROMPT_POST_DEADLINE_MS
       + SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS
       + DB_CONNECTION_TIMEOUT_MS
       + DB_RUNTIME_QUERY_TIMEOUT_MS
@@ -1633,7 +1680,7 @@ test('an elapsed start budget sends nothing, releases its lease, and reports kno
       const realClaim = approvals.claimDelivery.bind(approvals);
       approvals.claimDelivery = async (...args: unknown[]) => {
         const claim = await realClaim(...args);
-        monotonicNow = BigInt((APPROVAL_FANOUT_DEADLINE_MS + 1) * 1_000_000);
+        monotonicNow = BigInt((APPROVAL_PROMPT_POST_DEADLINE_MS + 1) * 1_000_000);
         return claim;
       };
       await withFetch(async () => {

@@ -20,8 +20,8 @@ in your own repo, point `databaseUrl` at a fresh, dedicated PostgreSQL schema in
 
 ## What is real, what is synthetic
 
-- **Deny-by-default:** a channel enables nothing until an admin opts a provider in, so a test first
-  calls `vouchr.dryRun.enableTool(admin, channel, providerId)` — the programmatic form of an admin
+- **Deny-by-default:** a channel enables nothing until a channel member opts a provider in, so a test first
+  calls `vouchr.dryRun.enableTool(member, channel, providerId)` — the programmatic form of a member's
   running `/vouchr enable <provider>` (or the App Home toggle). Without it the first `connect()` in a
   channel is refused with `ToolDisabledError` before any consent. (DMs are personal/ungoverned and
   need no enable.)

@@ -1,7 +1,7 @@
 // AWS Secrets Manager resolver for Vouchr.
 //
 // Resolves a secret JIT: when the injector needs the credential it calls this
-// resolver with the ARN the admin configured, fetches the live SecretString from
+// resolver with the ARN a channel member configured, fetches the live SecretString from
 // AWS Secrets Manager, and hands it straight to the outbound request. The secret
 // is never stored by Vouchr (only the non-secret ARN is) and never cached here.
 // Rotation stays entirely in AWS SM, so a rotated secret is picked up on the next call.

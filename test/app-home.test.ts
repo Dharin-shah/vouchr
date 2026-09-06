@@ -336,7 +336,8 @@ test('Home/config Disconnect redelivery after reconnect cannot delete the replac
       rendered = h.published().view;
     } else {
       await h.runCommand('');
-      rendered = h.opened().view;
+      // PLAT-2: the trigger opens a loading view; the settings modal hydrates it through views.update.
+      rendered = h.updates().at(-1).view;
     }
     const button = rendered.blocks.find(
       (block: any) => block.accessory?.action_id === DISCONNECT_ACTION,

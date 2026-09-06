@@ -182,13 +182,13 @@ export const SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS = 3_000;
 /** Leave most of Slack's short-lived trigger window for modal construction/open after classifying
  * an ambiguous G… conversation. Timeout/error stays governed (fail closed). */
 export const SLACK_CONVERSATION_CLASSIFICATION_TIMEOUT_MS = 1_000;
-export const APPROVAL_FANOUT_CONCURRENCY = 16;
-/** One complete, current approval-recipient snapshot must resolve promptly before delivery is
- * claimed. This bounds pagination plus admin checks even for direct test/custom clients that do not
- * inherit WebClient's request timeout. */
-export const APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS = SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS;
-/** Fail closed instead of retaining unbounded member/admin work for an exceptionally large or
- * hostile paginated response. */
+export const SLACK_NOTIFICATION_CLIENT_CONCURRENCY = 16;
+/** One complete, current channel-membership proof must resolve promptly before a governance write,
+ * shared-credential use, or approval decision proceeds. This bounds roster pagination even for direct
+ * test/custom clients that do not inherit WebClient's request timeout. */
+export const CHANNEL_MEMBERSHIP_DEADLINE_MS = SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS;
+/** Fail closed instead of retaining unbounded roster work for an exceptionally large or hostile
+ * paginated response: a member beyond this scanned prefix is refused as a non-member. */
 export const MAX_APPROVAL_AUDIENCE_MEMBERS = 5_000;
 /** Bound empty/tiny pages with ever-changing cursors independently of the member-entry cap. */
 export const MAX_CHANNEL_MEMBER_PAGES = 100;
@@ -198,7 +198,7 @@ const SLACK_NOTIFICATION_CLIENT_OPTIONS = Object.freeze({
   rejectRateLimitedCalls: true,
   // The SDK's request timeout starts only AFTER its internal p-queue. A lower operator-supplied
   // concurrency could therefore serialize one 16-wide wave beyond the delivery lease.
-  maxRequestConcurrency: APPROVAL_FANOUT_CONCURRENCY,
+  maxRequestConcurrency: SLACK_NOTIFICATION_CLIENT_CONCURRENCY,
 });
 /** A custom installation store has no cancellation contract. Cap distinct unresolved workspace
  * lookups so a broken shared store cannot turn callback traffic into unbounded retained work. */
@@ -221,21 +221,21 @@ function monotonicElapsedMs(startNs: bigint): number {
   return Number(process.hrtime.bigint() - startNs) / 1e6;
 }
 
-class ApprovalAudienceResolutionError extends Error {}
+class MembershipResolutionError extends Error {}
 
-/** Await one audience-resolution stage only through the shared monotonic overall deadline. The
+/** Await one membership-resolution stage only through the shared monotonic overall deadline. The
  * underlying bounded WebClient call may finish later, but Promise.race owns its rejection and no
  * later result can mutate delivery state. */
-async function withinApprovalAudienceDeadline<T>(
+async function withinMembershipDeadline<T>(
   work: Promise<T>,
   startedAtNs: bigint,
 ): Promise<T> {
-  const remaining = APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS - monotonicElapsedMs(startedAtNs);
-  if (remaining <= 0) throw new ApprovalAudienceResolutionError('approval audience deadline elapsed');
+  const remaining = CHANNEL_MEMBERSHIP_DEADLINE_MS - monotonicElapsedMs(startedAtNs);
+  if (remaining <= 0) throw new MembershipResolutionError('channel membership deadline elapsed');
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
     timer = setTimeout(
-      () => reject(new ApprovalAudienceResolutionError('approval audience deadline elapsed')),
+      () => reject(new MembershipResolutionError('channel membership deadline elapsed')),
       remaining,
     );
     timer.unref?.();
@@ -247,8 +247,8 @@ async function withinApprovalAudienceDeadline<T>(
   }
 }
 
-/** Fail-closed channel-membership proof under the same finite cursor/member/deadline contract used
- * for approval audiences. This covers every shared-credential use and interaction revalidation,
+/** Fail-closed channel-membership proof under one finite cursor/member/deadline contract. This
+ * covers every governance write, shared-credential use, and interaction revalidation,
  * including custom clients whose pagination is malformed or whose request never settles. */
 async function boundedChannelMembership(
   client: WebClient,
@@ -258,14 +258,14 @@ async function boundedChannelMembership(
 ): Promise<boolean> {
   const startedAtNs = process.hrtime.bigint();
   const withinDeadline = (): boolean => (
-    monotonicElapsedMs(startedAtNs) < APPROVAL_AUDIENCE_RESOLUTION_DEADLINE_MS
+    monotonicElapsedMs(startedAtNs) < CHANNEL_MEMBERSHIP_DEADLINE_MS
   );
   try {
     const token = (client as { token?: unknown }).token;
     const memberClient = typeof token === 'string' && token.length > 0
       ? slackNotificationClient(token, clientOptions)
       : client;
-    return await withinApprovalAudienceDeadline(
+    return await withinMembershipDeadline(
       isChannelMember(memberClient, channel, userId, {
         maxMembers: MAX_APPROVAL_AUDIENCE_MEMBERS,
         maxPages: MAX_CHANNEL_MEMBER_PAGES,
@@ -282,7 +282,7 @@ async function boundedChannelMembership(
  * before the 30s lease. The timer begins BEFORE claimDelivery, conservatively including its round
  * trip, so even a late-wave first success starts confirmation with the supported database budget. */
 export const APPROVAL_DELIVERY_SAFETY_MARGIN_MS = 1_000;
-export const APPROVAL_FANOUT_DEADLINE_MS = PROMPT_DELIVERY_LEASE_US / 1_000
+export const APPROVAL_PROMPT_POST_DEADLINE_MS = PROMPT_DELIVERY_LEASE_US / 1_000
   - SLACK_NOTIFICATION_RESOLUTION_TIMEOUT_MS
   - DB_CONNECTION_TIMEOUT_MS
   - DB_RUNTIME_QUERY_TIMEOUT_MS
@@ -600,10 +600,10 @@ export interface VouchrOptions {
    * in production. Safety rails: startup hard-fails if the database already holds non-dry-run
    * credential rows, a request refuses (and the dry-run callback never overwrites) a real row
    * written later, and every audit row written in dry-run carries `meta.dry_run: true`. The
-   * returned `vouchr.dryRun` object exposes two test helpers: `enableTool(admin, channel,
+   * returned `vouchr.dryRun` object exposes two test helpers: `enableTool(member, channel,
    * providerId)` opts a provider into a channel's allowlist (channels are DENY-BY-DEFAULT, so you
    * MUST call this before `connect()` will resolve that provider in a channel — it reproduces an
-   * admin's `/vouchr enable`; DMs are ungoverned and need no enable), and `completeConsent(user,
+   * member's `/vouchr enable`; DMs are ungoverned and need no enable), and `completeConsent(user,
    * provider)` finishes a prompted consent programmatically. Default false: zero behavior change.
    */
   dryRun?: boolean;
@@ -1061,6 +1061,19 @@ export class ConnectContext {
         'Vouchr could not render a complete approval prompt for this action. Ask an admin to narrow the endpoint.',
       );
     }
+    // A 'member' prompt is a regular message the whole channel reads and its decision surface is
+    // channel membership, so an ineligible channel (Slack Connect / externally shared / DM-classed /
+    // unverifiable) must never receive it: conversations.members there includes foreign-org users.
+    // Checked before any delivery claim, so like a render failure this is a KNOWN no-post and the
+    // impossible request is removed instead of parked behind a lease.
+    if (spec.approver === 'member') {
+      try {
+        await assertChannelEligible(this.promptClient(), this.channel!);
+      } catch (error) {
+        await this.approvals?.discardPending(spec.approvalId).catch(() => undefined);
+        throw error;
+      }
+    }
     // The surface binds the persisted delivered marker: the requester for 'self', the owning channel
     // for 'member', so a self→member rule change produces a fresh usable surface. 'member' always
     // has a channel here: effectiveApprover degraded it to 'self' wherever no channel governs.
@@ -1261,7 +1274,7 @@ export class ConnectContext {
     const client = this.promptClient();
     const { blocks, fallback } = prompt;
     const threadArg = spec.thread ? { thread_ts: spec.thread } : {};
-    if (APPROVAL_FANOUT_DEADLINE_MS - monotonicElapsedMs(deliveryLeaseStartedAtNs) <= 0) {
+    if (APPROVAL_PROMPT_POST_DEADLINE_MS - monotonicElapsedMs(deliveryLeaseStartedAtNs) <= 0) {
       throw new ApprovalPromptNotStartedError('approval delivery budget elapsed before posting');
     }
     if (spec.approver === 'member') {
@@ -1557,7 +1570,7 @@ export class ConnectContext {
 
   /**
    * Store the acting user's OWN static key for `providerId` (key providers). Self-service,
-   * NOT admin-gated (it's the user's own credential), keyed to `userOwner`. Leak-safe: the
+   * NOT member-gated (it's the user's own credential), keyed to `userOwner`. Leak-safe: the
    * secret never enters audit meta, the return value, or any error string.
    */
   async setUserSecret(providerId: string, secret: string): Promise<void> {
@@ -2970,7 +2983,7 @@ export async function createVouchr(opts: VouchrOptions) {
     return new ConnectContext(deps);
   }
 
-  /** The manifest plus its raw allowlist snapshot for admin renderers. Keeping the raw predicate lets
+  /** The manifest plus its raw allowlist snapshot for governance renderers. Keeping the raw predicate lets
    *  them show policy-denied-but-allowlisted tools correctly without reading channel_tool twice. */
   const manifestSnapshotFor = (
     identity: SlackIdentity,
@@ -3026,7 +3039,7 @@ export async function createVouchr(opts: VouchrOptions) {
     // escaping prevents injection, not disclosure. Keep one static, actionable response for every
     // provider-taking command.
     const UNKNOWN_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr tools` to see the registered providers.';
-    // A trusted audit subject for non-admin attempts against an unregistered provider-shaped value.
+    // A trusted audit subject for non-member attempts against an unregistered provider-shaped value.
     // The submitted value is not yet recognized and therefore must never reach any audit column.
     const DISCONNECT_SHARED_DENIAL_SUBJECT = 'disconnect-shared';
     const UNKNOWN_DISCONNECT_PROVIDER_TEXT = 'Unknown provider. Run `/vouchr status` to see your connected accounts.';
@@ -3063,16 +3076,31 @@ export async function createVouchr(opts: VouchrOptions) {
       // No subcommand → open the interactive config modal (#109). `/vouchr status` (and any other
       // subcommand) keeps its text output below, so scripts and muscle memory are unaffected. A modal
       // needs a trigger_id; without one (shouldn't happen for a slash command) fall back to the text.
-      // Building the modal makes several DB/Slack round-trips within Slack's ~3s trigger window. A
-      // build/open failure gets fixed command guidance rather than silently substituting status for
-      // the settings surface the user requested; raw Slack/DB errors are never reflected.
+      // PLAT-2: the trigger is consumed by a cheap loading view FIRST; building the real modal reads
+      // the DB and pages the channel roster (up to the membership deadline), which can outlive Slack's
+      // ~3s trigger window, so the built modal hydrates that view through views.update (the pattern
+      // openConfigureModal uses). An open failure gets fixed command guidance rather than silently
+      // substituting status for the settings surface the user requested; a build/update failure
+      // replaces the loading view (or DMs) with the same guidance. Raw Slack/DB errors are never reflected.
       if (!sub && command.trigger_id) {
+        const recovery = 'Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.';
+        let viewId: unknown;
         try {
-          await client.views.open({ trigger_id: command.trigger_id, view: await buildConfigModal(identity, command.channel_id ?? null, client) });
-          return;
+          const opened: any = await client.views.open({
+            trigger_id: command.trigger_id,
+            view: privateStatusModal('Vouchr settings', 'Loading…'),
+          });
+          viewId = opened?.view?.id;
+          if (typeof viewId !== 'string' || !viewId) throw new Error('unconfirmed view');
         } catch {
-          return respond('Could not open Vouchr settings. Run `/vouchr help` to use the text commands instead.');
+          return respond(recovery);
         }
+        try {
+          await client.views.update({ view_id: viewId, view: await buildConfigModal(identity, command.channel_id ?? null, client) });
+        } catch {
+          await deliverModalOutcome(client, identity, { id: viewId }, 'Vouchr settings', recovery);
+        }
+        return;
       }
 
       // List the channel's tool manifest (which providers an agent may use here + their mode).
@@ -3630,7 +3658,7 @@ export async function createVouchr(opts: VouchrOptions) {
     }
 
     /**
-     * The per-provider ADMIN control rows for a channel — ONE ROW PER REGISTERED PROVIDER (#111),
+     * The per-provider governance control rows for a channel — ONE ROW PER REGISTERED PROVIDER (#111),
      * service tools included (their allowlist Enable/Disable is a valid channel control; renderers
      * use `identity` to omit the mode/credential controls core refuses for them). Shared by the App
      * Home governance section and (brokered-filtered) the config modal, so both consoles render the
@@ -4267,37 +4295,41 @@ export async function createVouchr(opts: VouchrOptions) {
       const ttlMs = approval.ttlMs ?? DEFAULT_APPROVAL_TTL_MS;
       let decided: ApprovalDecisionResult;
       try {
+        // Resolved for the request's own conversation (a DM degrades 'member' to 'self'), from the
+        // persisted governance scope — never from the payload.
+        const approverRule = effectiveApprover(approval.approver, pending.governableChannel);
         // Slack facts cannot be queried through PostgreSQL. Resolve them before taking lifecycle
         // locks, fail closed on any read error, then carry only the verdict into the row-locked
-        // validation. A channel-owned approval is invalid if the channel class is no longer safe or
-        // the original requester is no longer a member.
-        let sharedOwnerFactsValid = true;
-        if (pending.ownerKind === 'channel') {
-          if (!pending.channel) sharedOwnerFactsValid = false;
+        // validation. The channel is the trust boundary for a channel-owned approval AND for a
+        // 'member' decision surface: both are invalid once the channel class is no longer safe (a
+        // Slack Connect conversion puts foreign-org users in conversations.members), and a
+        // channel-owned approval also needs its original requester to still be a member.
+        const channelBound = pending.ownerKind === 'channel' || approverRule === 'member';
+        let channelFactsValid = true;
+        if (channelBound) {
+          if (!pending.channel) channelFactsValid = false;
           else {
             try {
               await assertChannelEligible(client, pending.channel);
             } catch {
-              sharedOwnerFactsValid = false;
+              channelFactsValid = false;
             }
             if (
-              sharedOwnerFactsValid &&
+              channelFactsValid &&
+              pending.ownerKind === 'channel' &&
               !(await boundedChannelMembership(
                 client,
                 pending.channel,
                 pending.userId,
                 opts.slackClientOptions,
               ))
-            ) sharedOwnerFactsValid = false;
+            ) channelFactsValid = false;
           }
         }
-        // Resolved for the request's own conversation (a DM degrades 'member' to 'self'), from the
-        // persisted governance scope — never from the payload.
-        const approverRule = effectiveApprover(approval.approver, pending.governableChannel);
         const approverEligible = approverRule === 'member'
-          ? identity.userId !== pending.userId
-            && !!pending.channel
-            && await boundedChannelMembership(client, pending.channel, identity.userId, opts.slackClientOptions)
+          ? channelFactsValid
+            && identity.userId !== pending.userId
+            && await boundedChannelMembership(client, pending.channel!, identity.userId, opts.slackClientOptions)
           : identity.userId === pending.userId;
         // Snapshot mode only to choose every possibly-relevant lock. The authoritative mode/owner/
         // policy/tool decision is reloaded after those canonical locks are held below.
@@ -4338,7 +4370,7 @@ export async function createVouchr(opts: VouchrOptions) {
                   return 'invalidated';
                 }
                 if (effectiveApprover(currentApproval.approver, row.governableChannel) !== approverRule) return 'invalidated';
-                if (row.ownerKind === 'channel' && !sharedOwnerFactsValid) return 'invalidated';
+                if ((row.ownerKind === 'channel' || approverRule === 'member') && !channelFactsValid) return 'invalidated';
                 if (!(await approvalOwnerStillCurrent({
                   row,
                   db: decisionTx,

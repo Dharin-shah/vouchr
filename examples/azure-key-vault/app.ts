@@ -4,7 +4,7 @@ import { azureKeyVault } from './resolver';
 // Wire the Azure Key Vault resolver into Vouchr. Its 'azure-kv' key matches the source Vouchr
 // derives from a supported Azure reference; configuration checks presence without resolving.
 //
-// An admin then runs, from inside the channel they want to configure:
+// A member of the channel then runs, from inside the channel to configure:
 //
 //   /vouchr connect-shared github
 //

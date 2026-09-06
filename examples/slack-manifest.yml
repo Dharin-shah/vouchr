@@ -35,8 +35,8 @@ oauth_config:
       - app_mentions:read   # receive @-mentions
       - chat:write          # post Connect prompts / confirmation DMs
       - commands            # the /vouchr slash command
-      - users:read          # admin gate for channel creds + offboarding (user_change)
-      - channels:read       # conversations.info: channel eligibility/creator checks (App Home + shared creds)
+      - users:read          # offboarding (user_change)
+      - channels:read       # conversations.info + conversations.members: channel class and membership (App Home, /vouchr, shared creds)
       - groups:read         # same, for private channels
       - mpim:read           # conversations.info: distinguish group DMs from governed private channels
 settings:

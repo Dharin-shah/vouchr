@@ -10,11 +10,11 @@ const WRITE_CHANNEL_MODE = Symbol('write-channel-mode');
  * Per-channel auth mode for a provider. The single source of truth for which credential model
  * `connect()` uses in this channel:
  *  - 'shared':   the channel owns one credential every member's agent injects (a static key or an
- *                 external ref, admin-set). connect() routes to the shared credential.
+ *                 external ref, set by a channel member). connect() routes to the shared credential.
  *  - 'per-user': each member uses their own credential; no shared cred may exist here (invariant 7).
  *  - 'session':  per-user, but usable only inside the Slack thread the user approved it in (a thread
  *                 session grant), with a TTL ceiling.
- * No row → unconfigured, treated as 'per-user' (each member uses their own; an admin may set a mode).
+ * No row → unconfigured, treated as 'per-user' (each member uses their own; any member may set a mode).
  */
 export const CHANNEL_MODES = ['shared', 'per-user', 'session'] as const;
 export type ChannelMode = (typeof CHANNEL_MODES)[number];

@@ -119,6 +119,16 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Changed
 
+- `/vouchr tools` ends with `Any member: \`/vouchr enable|disable <provider>\`.` where it printed
+  `Admins: …`, and the config modal's governance header reads `Channel settings` (was `Channel
+  settings (admin)`) (#322). Bare `/vouchr` now consumes the trigger with a `Loading…` view and
+  hydrates it with the settings modal through `views.update`, so a large channel roster no longer
+  expires the `trigger_id` (PLAT-2).
+- `POST /v1/admin/tools` requires the signed `channelEligible: true` channel-class claim, like
+  `/v1/admin/reference` and `/v1/admin/mode` to `shared` (skipped only with
+  `requireChannelEligibility: false`); a token without it is refused 403 and audited `denied` /
+  `channel-ineligible`. Bolt already refused `/vouchr enable|disable` in an externally shared
+  channel; the two doors now agree.
 - Channel configuration (`/vouchr enable|disable|mode|connect-shared|disconnect-shared|stats|audit
   channel`, the config modal, App Home governance) is available to any current member of the
   channel (#322). The Slack app now needs `channels:read` (and `groups:read` plus membership of the

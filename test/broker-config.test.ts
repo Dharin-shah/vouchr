@@ -456,6 +456,27 @@ test('admin/mode: `shared` on an ineligible channel is refused (eligibility pari
   }
 });
 
+// A member of an externally shared channel must not govern its tool allowlist from the broker any more
+// than from Bolt (whose `/vouchr enable|disable` runs assertChannelEligible): same signed verdict, same door.
+test('admin/tools: an ineligible channel is refused and audited (parity with Bolt and /v1/admin/mode)', async (t) => {
+  const { server, port, db, channelTools } = await makeConfigBroker(t);
+  try {
+    const r = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: admin({ channelEligible: false }) });
+    assert.equal(r.status, 403);
+    assert.deepEqual(r.json, { error: 'channel is ineligible for tool configuration' });
+    assert.equal(await channelTools.isConfigured('T1', 'C1'), false, 'refused: nothing materialized');
+    const denied = (await db.get(`SELECT user_id, channel, meta FROM audit WHERE action='denied'`)) as any;
+    assert.equal(denied.user_id, 'U1');
+    assert.equal(denied.channel, 'C1');
+    assert.deepEqual(JSON.parse(denied.meta), { reason: 'channel-ineligible', owner: 'channel', channel: 'C1' });
+    // Omitted (undefined) fails closed exactly like false.
+    const absent = await post(port, '/v1/admin/tools', { provider: 'acme', enabled: true, identityToken: signIdentity(claims({}), SECRET) });
+    assert.equal(absent.status, 403);
+  } finally {
+    server.close();
+  }
+});
+
 // P3(d): a mode write emits a `config` audit row (the non-repudiation claim).
 test('admin/mode: a mode write is audited as `config` with owner:channel (non-repudiation)', async (t) => {
   const { server, port, db } = await makeConfigBroker(t);

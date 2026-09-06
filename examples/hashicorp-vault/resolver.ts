@@ -1,7 +1,7 @@
 // HashiCorp Vault (KV v2) resolver for Vouchr.
 //
 // Resolves a secret JIT: when the injector needs the credential it calls this
-// resolver with the reference the admin configured, reads the live value from Vault's
+// resolver with the reference a channel member configured, reads the live value from Vault's
 // KV v2 engine, and hands it straight to the outbound request. Vouchr stores only the
 // non-secret reference and never caches the value here. Rotation stays entirely in
 // Vault, so a rotated secret is picked up on the next call.

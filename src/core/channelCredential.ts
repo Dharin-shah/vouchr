@@ -174,7 +174,7 @@ export async function setChannelCredentialMode(
  *  prior break-glass revoke deleted the row but left the mode) and still returned it to per-user;
  *  `not-shared` did nothing because the channel was not in `shared` mode (never downgrading a
  *  session/per-user channel); `stale` lost to a concurrent lifecycle change (a newer credential
- *  generation, or the acting admin being offboarded) and mutated nothing. `ok=false` on `removed`
+ *  generation, or the acting member being offboarded) and mutated nothing. `ok=false` on `removed`
  *  means upstream revocation debt may remain (the provider token could still be live). `audited=false`
  *  means the destructive work committed but its durable `revoke` audit row could not be written — the
  *  caller renders that separately and never discards the committed outcome (matches personal disconnect). */

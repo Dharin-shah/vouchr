@@ -14,7 +14,7 @@ product boundaries remain in [`vision.md`](../vision.md); the security model rem
 | Shape | Choose it when | Slack experience | Credential-use path |
 | --- | --- | --- | --- |
 | Embedded Bolt | The agent and Vouchr run in the same Node/Bolt process. | Built in | `context.vouchr.connect()` then `handle.fetch()` |
-| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Admin, connect, session, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
+| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Channel configuration, connect, session, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
 | Pure headless | There is no Slack control plane, or the host intentionally owns every UI. | Host-built | Private broker API |
 
 If the agent already runs in the same Bolt process, embedded Bolt is simpler. Hybrid is not a
@@ -25,7 +25,7 @@ handle.
 
 ```mermaid
 flowchart LR
-    U["Slack user or admin"] --> S["Slack"]
+    U["Slack user"] --> S["Slack"]
     S -->|"events, /vouchr, interactivity"| C["Public Bolt control service"]
     O["Provider OAuth"] -->|"/vouchr/oauth/callback"| C
     C -->|"connections, channel config, audit"| P[("PostgreSQL")]
@@ -57,7 +57,7 @@ no second credential database. The two planes form one Vouchr deployment through
 ## 1. Reuse or create the Slack app
 
 Install Vouchr in the agent's existing Slack app for the complete hybrid flow. A separate Vouchr app
-can own App Home and `/vouchr` administration, but it does not automatically receive the agent app's
+can own App Home and `/vouchr` configuration, but it does not automatically receive the agent app's
 verified event or request-bound `context.vouchr`; on-demand per-user/session preflight then needs a
 trusted cross-app handoff that remains host-owned under #194. Slack sends one command/event URL to one
 receiver, so when reusing an app, install Vouchr in that app's existing Bolt ingress process or route
@@ -485,7 +485,10 @@ server-side manifest/config, never accepted from the worker. For a channel-owned
 signed `ownerKind: 'channel'` and `channelEligible: true` must agree with the request handle. The
 broker rejects disagreement.
 
-`channelEligible` proves the **channel class** only; it is not a signed membership claim. When
+`channelEligible` proves the **channel class** only; it is not a signed membership claim. Every
+channel governance write (`/v1/admin/reference`, `/v1/admin/mode` to `shared`, and `/v1/admin/tools`)
+requires it to be `true` unless the broker runs with `requireChannelEligibility: false`, matching
+Bolt's channel-class check on the same mutations. When
 `requireChannelMembership: true`, the Bolt `connect()` preflight below must also run for shared mode,
 because that is where membership is rechecked. A custom minter that skips Bolt preflight must verify
 membership itself before minting channel ownership.
@@ -555,7 +558,7 @@ app.event('app_mention', async ({ context, event, client, say }) => {
   if (result.brokerDenial) {
     // The supported #194 bridge: relay the typed broker denial body from this verified context.
     // Vouchr re-resolves everything server-side and takes the correct private action — the
-    // connect/key prompt, the thread session prompt, admin configuration direction, or the
+    // connect/key prompt, the thread session prompt, shared-credential configuration direction, or the
     // Approve/Deny decision surface for the pending approvalId.
     const recovery = await context.vouchr.recoverBrokerDenial('internal-mcp', result.brokerDenial);
     if (recovery.status === 'resolved' || recovery.status === 'stale') {
@@ -636,8 +639,8 @@ There are two honest designs:
 
 1. **Vouchr-enforced channel boundary.** Physically split read and write into different endpoints and
    provider IDs. The read credential/endpoint must be incapable of mutation. Apply default-deny
-   static `Policy` to the write provider, keep the mutable channel enablement as a second admin
-   control, and use a least-privilege write credential. The packaged broker enforces both boundaries;
+   static `Policy` to the write provider, keep the mutable channel enablement as a second control
+   owned by the channel's members, and use a least-privilege write credential. The packaged broker enforces both boundaries;
    the request proceeds only when static policy and mutable channel enablement allow it.
 2. **Host/MCP-server boundary.** Keep one MCP endpoint and let the trusted host/server classify tool
    names, authorize them, perform transaction-specific confirmation, and supply idempotency or
@@ -698,8 +701,8 @@ The equivalent slash-command flow is:
 /vouchr stats
 ```
 
-Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-only manifest; admins
-can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
+Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-only manifest; members
+of the channel can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
 prevention belong to the trusted host; Vouchr does not retain provider responses or publish a
 preview-visibility policy. The modal does not contain the shared-credential input; use App Home's
 Connect shared account action or `/vouchr connect-shared <provider>`.

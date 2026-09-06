@@ -184,6 +184,11 @@ test("#113 loadProviders: invalid approval shapes are rejected at config load wi
   assert.throws(load({ approver: 'anyone' }), /approval\.approver.*unsupported/);
   // #322: the removed value fails closed with a message that names its replacement.
   assert.throws(load({ approver: 'admin' }), /approval\.approver.*'admin' was removed.*'member'/);
+  // The same guard on the createVouchr path: defineProvider is the one validator both loaders share.
+  assert.throws(
+    () => defineProvider({ ...APPROVAL_INTERNAL, approval: { approver: 'admin' } } as any),
+    /approval\.approver.*'admin' was removed.*'member'/,
+  );
   assert.throws(load({ approver: 'self', methods: [] }), /approval\.methods.*non-empty.*array/);
   assert.throws(load({ approver: 'self', methods: [42] }), /approval\.methods.*strings/);
   assert.throws(load({ approver: 'self', ttlMs: 0 }), /approval\.ttlMs.*positive safe integer/);

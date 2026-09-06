@@ -60,7 +60,7 @@ flowchart TB
     core <-->|encrypted blobs| db
     core <-->|wrap/unwrap DEK,\nresolve secretRef JIT| kms
     core -->|token injected at\nHTTP boundary, egress-checked| provapi
-    adapter <-->|admin check, channel class,\nconfirm DM| slackapi
+    adapter <-->|membership check, channel class,\nconfirm DM| slackapi
 ```
 
 Boundaries, and what crosses each:
@@ -487,7 +487,7 @@ agent keep acting as them.
   best-effort; approval decision and consumption also fence their trusted actor/request creation
   times, so cleanup failure cannot revive old authority. Grid/SCIM offboarding commits an
   enterprise/unscoped/global scope tombstone **before** artifact discovery, so even an empty
-  workspace is fenced. On the packaged broker route the admin assertion must sign the exact
+  workspace is fenced. On the packaged broker route the signed offboard assertion must name the exact
   `offboardTargetUserId`; a direct SCIM integration instead binds the target from its authenticated
   directory event. The tombstone itself is durable scope state, not a signed object. Purge success is
   not the security boundary; the durable tombstone is
@@ -506,8 +506,8 @@ agent keep acting as them.
 
 ### Stale shared-channel setup
 
-An admin begins shared-credential setup, but another credential, mode, or tool mutation commits
-while Slack opens the loading view or Vouchr checks channel/admin state. The older handler must not
+A channel member begins shared-credential setup, but another credential, mode, or tool mutation commits
+while Slack opens the loading view or Vouchr checks channel class and membership. The older handler must not
 later overwrite the newer state.
 
 - **Mitigated.** Every effective channel/provider credential or governance mutation advances a

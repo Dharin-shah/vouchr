@@ -251,7 +251,7 @@ export async function buildBrokerServer(
   // here only maps (team, channel, provider) → mode.
   const channelConfig = channelModes ? new ChannelConfig(db) : undefined;
   // #240 runtime channel governance is always available on the packaged path. Bolt and the broker
-  // share this PostgreSQL table, so one signed admin toggle is reflected in the channel manifest and
+  // share this PostgreSQL table, so one signed channel toggle is reflected in the channel manifest and
   // enforced by both credential-use doors without an additional process-local switch or cache.
   const channelTools = new ChannelTools(db);
 

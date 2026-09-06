@@ -1623,13 +1623,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       identity: acting, channel: claims.channel, providerId, reference, issuance: issuedAt,
       // Membership is what the signed channel claim asserts; there is no further gate (#322).
       authorize: async () => undefined,
-      assertEligible: async () => {
-        if (!(opts.requireChannelEligibility ?? true) || claims.channelEligible === true) return;
-        await opts.audit.record('denied', acting, providerId, {
-          reason: 'channel-ineligible', owner: 'channel', channel: claims.channel,
-        });
-        throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
-      },
+      assertEligible: () => assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential'),
       modeConflict: (mode) => {
         throw new HttpError(409, {
           error: `channel is ${mode} for this provider; shared references are not allowed`,
@@ -1638,6 +1632,24 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     });
     if (!stored) throw staleInteraction(409, 'channel credential setup no longer valid; resolve and retry');
     return { ok: true };
+  }
+
+  /** The broker's only channel-class fact is the SIGNED `channelEligible` verdict (it has no Slack
+   * client): refuse and audit an ineligible (Slack Connect / externally shared / DM / archived /
+   * unverified) channel at every governance write where Bolt runs assertChannelEligible, so the two
+   * doors agree and a foreign-org member of a shared channel cannot govern it. Fail closed: only an
+   * explicit true is eligible; requireChannelEligibility:false defers entirely to the minter. */
+  async function assertClaimedChannelEligible(
+    claims: IdentityClaims,
+    acting: SlackIdentity,
+    providerId: string,
+    error: string,
+  ): Promise<void> {
+    if (!(opts.requireChannelEligibility ?? true) || claims.channelEligible === true) return;
+    await opts.audit.record('denied', acting, providerId, {
+      reason: 'channel-ineligible', owner: 'channel', channel: claims.channel,
+    });
+    throw new HttpError(403, { error });
   }
 
   /** Verify identity before registry membership so an unauthenticated caller cannot enumerate
@@ -1681,11 +1693,10 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     if (!opts.channelConfig) throw new HttpError(403, { error: 'channel-owned credentials are not enabled' });
     // Marking a channel `shared` must be symmetric with /v1/admin/reference (and Bolt's
     // assertChannelEligible): refuse a shared cred on an ineligible (Slack-Connect / externally-shared)
-    // channel from the SIGNED verdict. Fail closed + audited. resolveOwner re-checks at use, so this is
-    // defense-in-depth, but the two config doors must agree.
-    if (mode === 'shared' && (opts.requireChannelEligibility ?? true) && claims.channelEligible !== true) {
-      await opts.audit.record('denied', acting, providerId, { reason: 'channel-ineligible', owner: 'channel', channel: claims.channel });
-      throw new HttpError(403, { error: 'channel is ineligible for a shared credential' });
+    // channel from the SIGNED verdict. resolveOwner re-checks at use, so this is defense-in-depth,
+    // but the two config doors must agree.
+    if (mode === 'shared') {
+      await assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for a shared credential');
     }
     // The shared core lifecycle mutation serializes this mode flip with Bolt/headless credential
     // setup across replicas. A user-owned mode and a live shared credential cannot both commit.
@@ -1729,10 +1740,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
       allProviders: providerIds,
       issuance,
       authorize: async () => true, // the signed channel claim is the membership fact (#322)
-      // The headless contract is scoped by the signed team/channel facts. Unlike Bolt,
-      // this transport has no Slack channel-class lookup at mutation time; channelEligible remains
-      // the separate credential-owner gate and is not silently broadened into a new API requirement.
-      assertEligible: async () => undefined,
+      // Same channel-class gate as Bolt's `/vouchr enable|disable` (assertChannelEligible), from the
+      // signed verdict: a member of an externally shared channel must not govern it from either door.
+      assertEligible: () => assertClaimedChannelEligible(claims, acting, providerId, 'channel is ineligible for tool configuration'),
     });
     if (configured === 'stale') throw staleInteraction(409, 'assertion no longer current; resolve and retry');
     return { ok: true };

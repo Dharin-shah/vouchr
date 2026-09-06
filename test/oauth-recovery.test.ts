@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import { ErrorCode as SlackErrorCode, WebClient } from '@slack/web-api';
 import {
-  APPROVAL_FANOUT_CONCURRENCY,
+  SLACK_NOTIFICATION_CLIENT_CONCURRENCY,
   ConnectContext,
   createVouchr,
   MAX_PENDING_NOTIFICATION_CLIENT_LOOKUPS,
@@ -1238,8 +1238,8 @@ test('a leased prompt post is bounded AND preserves the operator Slack transport
     assert.equal(posted[0].apiUrl, 'https://slack-proxy.internal/api/', 'the operator transport must survive the bound');
     assert.equal(
       posted[0].concurrency,
-      APPROVAL_FANOUT_CONCURRENCY,
-      'the SDK queue cannot serialize one bounded fan-out wave beyond its lease',
+      SLACK_NOTIFICATION_CLIENT_CONCURRENCY,
+      'the SDK queue cannot serialize bounded notification posts beyond their lease',
     );
   } finally {
     prototype.apiCall = realApiCall;

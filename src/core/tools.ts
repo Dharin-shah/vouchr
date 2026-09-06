@@ -36,7 +36,7 @@ export interface ToolManifestEntry {
  * Non-secret policy bits only: same kind of store as ChannelConfig, over the async `Db`.
  *
  * DENY-BY-DEFAULT (important): a channel with NO rows here enables NOTHING — an agent may use a
- * provider in a channel only after an admin explicitly turns it on (`/vouchr enable <provider>`
+ * provider in a channel only after a channel member explicitly turns it on (`/vouchr enable <provider>`
  * or the App Home toggle). The channel is always a strict allowlist: only a provider with an
  * `enabled` row is usable; an explicit-off or unlisted provider is off. The first write
  * MATERIALIZES the full manifest — every untouched provider is written as DISABLED — so the
@@ -133,8 +133,8 @@ export class ChannelTools {
    * The tool-allowlist verdict for EVERY provider in one channel-scoped read — the batched form of
    * {@link isEnabled}, same deny-by-default rule applied once, returning a predicate. A channel is a
    * strict allowlist: only a provider with an explicit `enabled` row is on. No rows → nothing enabled;
-   * an explicit-off or unlisted provider is off. An admin opts each provider in per channel (SEC-3).
-   * `buildToolManifest` and the App Home admin console fold through this so their query count is bounded
+   * an explicit-off or unlisted provider is off. A channel member opts each provider in per channel (SEC-3).
+   * `buildToolManifest` and the App Home governance console fold through this so their query count is bounded
    * by the channel, not the configured-provider count (#209).
    */
   async enabledSnapshot(teamId: string, channel: string): Promise<(provider: string) => boolean> {
@@ -207,7 +207,7 @@ export async function applyChannelToolsEnabled(
 
 /**
  * One channel-tool authorization, mutation, and audit sequence shared by Bolt and headless.
- * Transport adapters prove admin/channel eligibility through callbacks because only they can
+ * Transport adapters prove membership and channel eligibility through callbacks because only they can
  * validate Slack state or signed claims; after those checks, the first-write-safe allowlist update
  * and its canonical audit rows commit as one transaction and cannot drift between front doors.
  */

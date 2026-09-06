@@ -5,7 +5,7 @@ systems: *file this question on the PR*, *put it on my calendar*, *add it to the
 agent picks the provider from the request. Vouchr decides **whose** credential that becomes.
 
 Nothing here is provider-specific. The agent doesn't know it's talking to GitHub — it's given the
-list of providers an admin enabled **in this channel** and picks from it.
+list of providers a channel member enabled **in this channel** and picks from it.
 
 ## The three things this demonstrates
 
@@ -13,7 +13,7 @@ list of providers an admin enabled **in this channel** and picks from it.
 identity on the event*. There is no user-id argument to get wrong and nothing the model can say that
 changes whose account is used. Alice's comment is authored by Alice because Alice asked.
 
-**2. The provider list is the channel's, not the code's.** `toolManifest()` returns what an admin
+**2. The provider list is the channel's, not the code's.** `toolManifest()` returns what a channel member
 enabled here, and that list becomes the model's tool enum:
 
 ```ts
