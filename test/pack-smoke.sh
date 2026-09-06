@@ -368,7 +368,7 @@ if (!safeUserMessage(new ConsentRequiredError('github', 'reused')).includes('no 
 void promptStates;
 const documentedErrors = [
   new ConsentRequiredError('github', 'posted'),
-  new SessionApprovalRequiredError('github'),
+  new SessionApprovalRequiredError('github', 'posted'),
   new ApprovalRequiredError(
     'github', 'self', 'POST', 'api.github.com', 'hmac-sha256:' + 'a'.repeat(64),
     '00000000-0000-4000-8000-000000000001', 0, true,
