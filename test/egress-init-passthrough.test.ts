@@ -18,6 +18,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { Agent } from 'undici';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { ConnectionHandle } from '../src/core/injector';
@@ -51,9 +52,7 @@ test('init.dispatcher cannot redirect the injected credential to a non-allowlist
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end('{}');
   });
-  await new Promise<void>((r) => evil.listen(0, '127.0.0.1', () => r()));
-  const port = (evil.address() as { port: number }).port;
-  t.after(() => new Promise<void>((r) => evil.close(() => r())));
+  const port = await listen(t, evil);
 
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);

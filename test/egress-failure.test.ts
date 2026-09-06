@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -39,7 +40,7 @@ async function makeBroker(t: TestContext, events: VouchrEvent[]) {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), onEvent: (e) => events.push(e) });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, db, port: (server.address() as any).port };
 }
 

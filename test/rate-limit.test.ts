@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -252,7 +253,7 @@ test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, up
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [limited], vault, audit, db, identitySecret: identityConfig('broker-secret') });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;
   let upstream = 0;

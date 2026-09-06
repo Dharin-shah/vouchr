@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -395,7 +396,7 @@ test('broker: provider-level size/content-type breaches deny on the wire (413/50
     });
   }
   const server = createBroker({ providers: [capped, typed], vault, audit, db, identitySecret: identityConfig('broker-secret') });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;
   const OVERSIZED = '{"data":"THIS_BODY_MUST_NEVER_LEAK"}';
@@ -443,7 +444,7 @@ test('broker: a compliant response with set-cookie relays the body with the cook
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [p], vault, audit: new Audit(db), db, identitySecret: identityConfig('broker-secret') });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('{"ok":true}', {

@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import fs from 'node:fs';
@@ -88,7 +89,7 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     ...opts,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
 
