@@ -25,6 +25,10 @@ Import from the Bolt-free entry point so no `@slack/*` package is loaded:
 import { createBroker, loadIdentityConfig, mintIdentity } from '@vouchr/core/headless';
 ```
 
+`@slack/bolt` and `@slack/web-api` are peer dependencies of `@vouchr/core`. A headless host needs
+only `pg`: install with `npm install --omit=peer @vouchr/core` and no `@slack/*` package lands in
+`node_modules`.
+
 `@vouchr/core/headless` re-exports exactly the headless surface — `createBroker`, its `BrokerServer`
 type, `buildBrokerServer` (env → wired server), identity minting/verification, providers, the owner
 model, and the low-level building blocks (`openDb`/`migrate` and their `DbOptions`, `Vault`, `Audit`,

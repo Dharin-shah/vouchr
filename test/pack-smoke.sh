@@ -4,7 +4,10 @@
 # pilot integrator's first `npm install` will. Catches a broken `files` glob, an `exports`
 # typo, a bad bin shebang, or a type regression that `tsc` on src/ never sees.
 #
-# Runnable locally (`npm run pack-smoke`) and in CI. Needs network for the consumer install.
+# A second, Bolt-free consumer installs with --omit=peer and proves the headless entry and the
+# vouchr-broker bin need only pg (#342).
+#
+# Runnable locally (`npm run pack-smoke`) and in CI. Needs network for the consumer installs.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -439,4 +442,28 @@ JSON
 ( cd "$CONSUMER" && npm install -D typescript@5 >/dev/null && npx tsc -p tsconfig.json )
 echo "    typed consumer compiles"
 
-echo "==> PASS: package installs, resolves, and type-checks"
+# Second consumer (#342): Bolt is a peer dependency, so a headless host installs with --omit=peer and
+# must get pg's tree only. The headless entry and the vouchr-broker bin must load with no @slack/*
+# package present at all — a stray import would throw MODULE_NOT_FOUND here, not in production.
+echo "==> Bolt-free consumer: install with peers omitted, use only the headless entry"
+HEADLESS="$WORK/consumer-headless"
+mkdir -p "$HEADLESS"
+( cd "$HEADLESS" && npm init -y >/dev/null && npm install --omit=peer "$TGZ" >/dev/null )
+# npm ls exits non-zero because it reports the omitted peers as missing; the printed tree is still the
+# ground truth of what got installed, so keep the output and judge that.
+TREE="$( cd "$HEADLESS" && npm ls --omit=dev --all --parseable 2>/dev/null || true )"
+[ -n "$TREE" ] || { echo "FAIL: npm ls printed no production tree"; exit 1; }
+if echo "$TREE" | grep -E '/@slack/|/express$'; then
+  echo "FAIL: Bolt-free consumer's production tree still contains @slack or express"; exit 1
+fi
+echo "    production tree: $(echo "$TREE" | wc -l | tr -d ' ') entries, no @slack or express"
+( cd "$HEADLESS" && node -e "
+  const headless = require('@vouchr/core/headless');
+  if (typeof headless.createBroker !== 'function') throw new Error('headless entry missing createBroker');
+  console.log('    @vouchr/core/headless requires cleanly without Bolt');
+" )
+out="$( cd "$HEADLESS" && npx --no-install vouchr-broker --help 2>&1 )" \
+  || { echo "FAIL: vouchr-broker --help exited non-zero without Bolt"; echo "$out"; exit 1; }
+echo "    vouchr-broker --help ok without Bolt"
+
+echo "==> PASS: package installs, resolves, and type-checks; headless consumer needs only pg"
