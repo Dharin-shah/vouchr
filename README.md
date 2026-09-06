@@ -1,14 +1,14 @@
 <div align="center">
 <h1>Vouchr</h1>
 
-**Human in the loop for teams. Your agents act as your people, and your team approves what matters.**
+**A self-hosted identity broker for agents: per-user credentials injected at egress, human-in-the-loop approvals scoped to the team's channel, and an audit trail for every call.**
 
 [![npm](https://img.shields.io/npm/v/%40vouchr%2Fcore?style=for-the-badge&label=npm)](https://www.npmjs.com/package/@vouchr/core) [![CI](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml) [![Security](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/security.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Security)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge)](./LICENSE)
 
 </div>
 
-Vouchr is the identity and approval layer for agents that work on your behalf. It sits between
-your agent and your team's accounts and does three things:
+Vouchr sits between your agent and the accounts it uses, for Slack-native and headless agents
+alike. It does three things:
 
 1. The agent acts as the person who asked, with that person's own access.
 2. Sensitive steps wait for the team. The channel that owns the credential approves.
