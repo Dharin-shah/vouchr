@@ -42,12 +42,14 @@ export interface ChannelInfo {
  * (fails closed). Externally shared / Slack Connect is the security-critical case (cross-org leak).
  */
 export function channelIneligibleReason(info: ChannelInfo | null | undefined): string | null {
-  if (!info) return 'Could not verify the channel type; channel credentials are refused.';
+  // Every refusal names the alternative (#348): the person's own connection here, or another channel.
+  const alternative = 'Use your own connection here, or configure in an internal channel.';
+  if (!info) return 'Could not verify the channel type; channel credentials are refused. Add Vouchr to the channel, then retry.';
   if (info.is_ext_shared || info.is_shared || info.is_pending_ext_shared) {
-    return 'Channel credentials are not allowed in externally shared channels.';
+    return `Channel credentials are not allowed in externally shared channels. ${alternative}`;
   }
-  if (info.is_im || info.is_mpim) return 'Channel credentials are not allowed in DMs or group DMs.';
-  if (info.is_archived) return 'Channel credentials are not allowed in archived channels.';
+  if (info.is_im || info.is_mpim) return `Channel credentials are not allowed in DMs or group DMs. ${alternative}`;
+  if (info.is_archived) return 'Channel credentials are not allowed in archived channels. Configure in an active channel.';
   return null;
 }
 

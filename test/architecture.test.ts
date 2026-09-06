@@ -77,7 +77,14 @@ test('core is Slack-semantics-free (no conversations.members / is_admin / is_own
 // The channel-eligibility RULE is core so every adapter enforces it identically.
 test('channelIneligibleReason: classifies channel classes, fails closed on unknown', () => {
   assert.equal(channelIneligibleReason({}), null); // a normal channel is eligible
-  assert.equal(channelIneligibleReason(null), 'Could not verify the channel type; channel credentials are refused.');
+  assert.equal(
+    channelIneligibleReason(null),
+    'Could not verify the channel type; channel credentials are refused. Add Vouchr to the channel, then retry.',
+  );
+  // #348: every refusal names the alternative, never only the rule.
+  assert.match(channelIneligibleReason({ is_ext_shared: true })!, /Use your own connection here, or configure in an internal channel\.$/);
+  assert.match(channelIneligibleReason({ is_mpim: true })!, /Use your own connection here, or configure in an internal channel\.$/);
+  assert.match(channelIneligibleReason({ is_archived: true })!, /Configure in an active channel\.$/);
   assert.match(channelIneligibleReason({ is_ext_shared: true })!, /externally shared/);
   assert.match(channelIneligibleReason({ is_shared: true })!, /externally shared/);
   assert.match(channelIneligibleReason({ is_pending_ext_shared: true })!, /externally shared/);

@@ -134,9 +134,9 @@ export interface TtlPolicy {
  * #239 containment): credential SERVING (`get`), MINTING (`upsert`/`reference`) and refresh WRITES
  * fail closed, so a compromised deployment cannot serve or resurrect a credential while an incident
  * is being contained. Break-glass DELETION (`deleteForRevoke`) and metadata-only reads stay open so
- * `vouchr revoke` still works during lockdown. Carries no secret; `mapSafeError` deliberately has no
- * branch for it, so it collapses to the generic internal-error copy and never advertises the incident
- * state to a caller. Its authority is deployment configuration outside the credential database — a DB
+ * `vouchr revoke` still works during lockdown. Carries no secret; `mapSafeError` maps it to fixed
+ * `locked_down` copy that names the administrator as the next step and nothing about the cause (#348).
+ * Its authority is deployment configuration outside the credential database — a DB
  * flag would not be trustworthy once the database itself is the compromised boundary. */
 export class CredentialLockdownError extends Error {
   readonly code = 'credential_lockdown' as const;

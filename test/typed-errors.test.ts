@@ -4,6 +4,7 @@ import {
   ApprovalPathTooLongError,
   ApprovalRequiredError,
   ConsentRequiredError,
+  CredentialLockdownError,
   EgressBlockedError,
   InteractionStateChangedError,
   NoConnectionError,
@@ -91,13 +92,24 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
     0,
     true,
   );
+  // #348: the requester cannot decide a 'member' prompt, so the copy names who can.
+  const memberApproval = new ApprovalRequiredError(
+    'github', 'member', 'POST', 'api.github.com', `hmac-sha256:${'a'.repeat(64)}`,
+    '00000000-0000-4000-8000-000000000001', 0, true,
+  );
   const cases = [
     [new ConsentRequiredError('github', 'posted'), 'consent_required', 'connect', false, undefined,
       'Consent is required. Complete the private Connect prompt, then retry.'],
-    [new SessionApprovalRequiredError('github'), 'session_approval_required', 'request_approval', false, undefined,
+    [new SessionApprovalRequiredError('github', 'posted'), 'session_approval_required', 'request_approval', false, undefined,
       'Thread-scoped session approval is required. Approve the private prompt, then retry.'],
+    [new SessionApprovalRequiredError('github', 'reused'), 'session_approval_required', 'request_approval', false, undefined,
+      'Thread-scoped session approval is required. An approval prompt was already posted in the thread; if it is no longer visible, ask again in 30 seconds.'],
     [approval, 'approval_required', 'request_approval', false, undefined,
-      'Human approval is required. Request approval, then retry.'],
+      'Human approval is required. Approve the prompt Vouchr posted to you, then retry.'],
+    [memberApproval, 'approval_required', 'request_approval', false, undefined,
+      'Waiting for another channel member to approve the prompt; retry after they do.'],
+    [new CredentialLockdownError(), 'locked_down', 'contact_admin', false, undefined,
+      'Vouchr is locked down by an administrator. Ask them before retrying.'],
     [new ApprovalPathTooLongError(), 'approval_path_too_large', 'fix_configuration', false, undefined,
       'The approval action path is too large. Narrow the endpoint and retry.'],
     [new InteractionStateChangedError('connection', 'credential'), 'interaction_state_changed', 'resolve_again', false, undefined,
@@ -109,7 +121,7 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
     [new ToolDisabledError(), 'tool_disabled', 'contact_admin', false, undefined,
       'This provider is disabled in the channel. Any member can run `/vouchr enable` there.'],
     [new NoConnectionError('No connection for provider "github"', 'user'), 'not_connected', 'connect', false, undefined,
-      'No credential is connected. Connect the provider, then retry.'],
+      'No credential is connected. Ask the agent again; it will post a Connect prompt.'],
     [new NoConnectionError('No channel credential for provider "github"', 'channel'), 'not_connected', 'fix_configuration', false, undefined,
       'No shared channel credential is configured. Any member can run `/vouchr connect-shared` there.'],
     [new EgressBlockedError('Egress blocked: host not allowed'), 'egress_blocked', 'fix_configuration', false, undefined,
@@ -121,7 +133,7 @@ test('mapSafeError returns one exact stable code/recovery/retry contract for typ
     [new ResolverFailedError(), 'resolver_failed', 'retry_later', true, undefined,
       'The external credential resolver is temporarily unavailable. Retry later.'],
     [new UpstreamTimeoutError(), 'upstream_timeout', 'retry_later', false, undefined,
-      'The upstream request timed out. Its outcome may be unknown; do not retry automatically.'],
+      'The upstream request timed out and its outcome is unknown. Check the provider for the result, then ask the agent again.'],
     [new RateLimitedError('github', 60, 1_250), 'rate_limited', 'retry_later', true, 1_250,
       'The request rate limit was reached. Try again in 2s.'],
     [new OverloadedError('provider', 1_000), 'overloaded', 'retry_later', true, 1_000,
@@ -151,7 +163,7 @@ test('mapSafeError does not trust arbitrary messages merely because they use an 
   const secret = 'ghp_known_class_spoof_must_not_render';
   const errors = [
     new ConsentRequiredError(secret, 'posted'),
-    new SessionApprovalRequiredError(secret),
+    new SessionApprovalRequiredError(secret, 'posted'),
     new ApprovalRequiredError(
       secret, 'self', secret, secret, secret,
       '00000000-0000-4000-8000-000000000001', 0, true,
