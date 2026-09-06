@@ -209,7 +209,13 @@ read -r -t 10 status <&3 || fail "the in-flight request got no response after SI
 exec 3<&- 3>&-
 wait "$stop_pid"
 [ "$(exit_code "$NAME-1")" = 0 ] || fail "replica 1 did not exit 0 after draining the in-flight request"
-docker logs "$NAME-1" 2>&1 | grep -q "draining connections" || fail "replica 1 logged no drain line on SIGTERM"
+# Docker flushes the json-file log a moment after the container exits; read it with a short retry.
+drained_line=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  docker logs "$NAME-1" 2>&1 | grep -q "draining connections" && { drained_line=yes; break; }
+  sleep 0.5
+done
+[ "$drained_line" = yes ] || fail "replica 1 logged no drain line on SIGTERM"
 echo "    in-flight request answered '$(printf '%s' "$status" | tr -d '\r')' after SIGTERM; process exited 0"
 docker start "$NAME-1" >/dev/null
 wait_code "$PORT1" /readyz 200 30 "replica 1 back" || fail "replica 1 never became ready after the drain"
