@@ -29,6 +29,8 @@ import {
 
 // Block Kit is untyped here (unknown[]); cast to any for structural probing.
 const j = (b: unknown) => JSON.stringify(b);
+/** A well-formed opaque consent state for the Connect button value (#347: always required). */
+const STATE = 'S'.repeat(43);
 
 const mrkdwnTexts = (value: unknown): string[] => {
   const out: string[] = [];
@@ -114,7 +116,7 @@ test('connectedDmText: the post-OAuth confirmation DM escapes the account label 
 // finds a stale prompt knows why it stopped working.
 test('every prompt states its ten-minute lifetime', () => {
   const requestId = '123e4567-e89b-42d3-a456-426614174000';
-  assert.match(j(connectBlocks('github', 'https://auth')), /This link expires in 10 minutes\./);
+  assert.match(j(connectBlocks('github', 'https://auth', undefined, STATE)), /This link expires in 10 minutes\./);
   assert.match(j(keySetupBlocks('github', requestId)), /This prompt expires in 10 minutes\./);
   assert.match(j(sessionApprovalBlocks('github', requestId)), /This prompt expires in 10 minutes\./);
   assert.match(
@@ -127,19 +129,19 @@ test('every prompt states its ten-minute lifetime', () => {
 });
 
 test('connectBlocks: no scopes renders exactly the intro + button (no scope block)', () => {
-  const b = connectBlocks('github', 'https://auth') as any[];
+  const b = connectBlocks('github', 'https://auth', undefined, STATE) as any[];
   assert.equal(b.length, 2); // intro section + actions
   assert.doesNotMatch(j(b), /Connecting grants/);
 });
 
-test('connectBlocks: the OAuth button carries both the url and an action_id so Slack acks the click', () => {
+test('connectBlocks: the OAuth button carries the url, an action_id, and its state so the click can be acked and addressed', () => {
   // A url button still delivers a block_actions interaction; without an action_id the host cannot
   // register an ack and Slack shows "Operation timed out. Apps need to respond within 3 seconds."
-  const b = connectBlocks('github', 'https://auth') as any[];
+  const b = connectBlocks('github', 'https://auth', undefined, STATE) as any[];
   const button = b.find((x: any) => x.type === 'actions').elements[0];
   assert.equal(button.url, 'https://auth'); // one-click OAuth preserved
   assert.equal(button.action_id, OAUTH_CONNECT_ACTION); // so the host's no-op ack can match it
-  assert.equal('value' in button, false); // host-rendered prompt: no state, the click stays a bare ack
+  assert.equal(button.value, STATE); // every rendered button is addressable by its click (#347)
 });
 
 test('connectBlocks: the button value is exactly the given state, so the click can replace the prompt (#347)', () => {
@@ -173,7 +175,7 @@ test('connectBlocks: escapes the provider id in mrkdwn (SEC-5, #178)', () => {
   // escapes it, so a `<…|link>`-shaped id must render inert. Scope the assertion to the mrkdwn
   // sections: the button's `plain_text` is rendered literally by Slack (safe, and MUST stay raw —
   // escaping it would surface literal `&lt;` to the user).
-  const b = connectBlocks('<https://evil|gh>', 'https://auth') as any[];
+  const b = connectBlocks('<https://evil|gh>', 'https://auth', undefined, STATE) as any[];
   const mrkdwn = b.filter((x: any) => x.text?.type === 'mrkdwn').map((x: any) => x.text.text).join('\n');
   assert.ok(!mrkdwn.includes('<https://evil|gh>')); // no forged link in the mrkdwn body
   assert.match(mrkdwn, /&lt;https/); // present, but escaped
@@ -183,7 +185,7 @@ test('connectBlocks: renders human-language scope descriptions when passed', () 
   const b = connectBlocks('github', 'https://auth', {
     list: ['read:user', 'repo'],
     describe: { 'read:user': 'Read your profile', repo: 'Read and write your repositories' },
-  }) as any[];
+  }, STATE) as any[];
   assert.match(j(b), /Connecting grants the agent, acting as you/);
   assert.match(j(b), /Read your profile/);
   assert.match(j(b), /Read and write your repositories/);
@@ -193,7 +195,7 @@ test('connectBlocks: an unknown scope falls back to its raw string, never droppe
   const b = connectBlocks('acme', 'https://auth', {
     list: ['known', 'mystery:scope'],
     describe: { known: 'A known thing' },
-  }) as any[];
+  }, STATE) as any[];
   assert.match(j(b), /A known thing/);
   assert.match(j(b), /mystery:scope/); // raw fallback, not hidden
 });
@@ -202,7 +204,7 @@ test('connectBlocks: scope descriptions and fallback ids are inert mrkdwn, and b
   const b = connectBlocks('acme', 'https://auth', {
     list: ['known', '<!channel> <@U123>'],
     describe: { known: '   ' },
-  }) as any[];
+  }, STATE) as any[];
   const mrkdwn = b.filter((x: any) => x.text?.type === 'mrkdwn').map((x: any) => x.text.text).join('\n');
 
   assert.match(mrkdwn, /• known/); // blank description falls back to the real scope id
@@ -217,7 +219,7 @@ test('connectBlocks: large valid scope copy is split into Slack-compliant sectio
   const b = connectBlocks('acme', 'https://auth', {
     list: ['first', 'second'],
     describe: { first, second },
-  }) as any[];
+  }, STATE) as any[];
   const scopeSections = b.filter((x: any) => x.text?.type === 'mrkdwn' && /granted|Connecting grants/.test(x.text.text));
   assert.equal(scopeSections.length, 2);
   assert.ok(scopeSections.every((x: any) => x.text.text.length <= 3000));
@@ -228,7 +230,7 @@ test('connectBlocks: large valid scope copy is split into Slack-compliant sectio
 
 test('connectBlocks: a direct caller cannot construct an oversized Slack section', () => {
   assert.throws(
-    () => connectBlocks('acme', 'https://auth', { list: ['x'], describe: { x: '&'.repeat(600) } }),
+    () => connectBlocks('acme', 'https://auth', { list: ['x'], describe: { x: '&'.repeat(600) } }, STATE),
     /scope copy exceeds the Slack section limit/,
   );
 });

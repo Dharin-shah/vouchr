@@ -4229,12 +4229,11 @@ export async function createVouchr(opts: VouchrOptions) {
     // The OAuth "Connect <provider>" button carries a `url`, so Slack opens the sign-in page in the
     // browser on click AND delivers a block_actions interaction whose response_url addresses the
     // prompt itself (#347). The value is the prompt's own opaque state: it is read, never spent, and
-    // only the Slack-signed clicker matching the row's owner gets anything but the fixed stale copy.
-    // Prompts rendered before #347 carry no value; their click stays the bare ack it always was.
+    // only the Slack-signed clicker matching the row's owner gets anything but the fixed stale copy
+    // (a missing or tampered value included: every Vouchr-rendered button carries one).
     app.action(OAUTH_CONNECT_ACTION, async ({ ack, body, respond, client }: any) => {
       await ack();
       const state = body.actions?.[0]?.value;
-      if (state === undefined) return;
       const identity = resolveIdentity({ body });
       const reply = replyToActor(respond, client, identity);
       const found = identity ? await consent.inspect(state) : null;
@@ -4252,7 +4251,10 @@ export async function createVouchr(opts: VouchrOptions) {
       try {
         await respond({ replace_original: true, response_type: 'ephemeral', blocks, ...optionalBlockFallback(blocks) });
       } catch {
-        await reply(CONNECT_PROMPT_STALE_TEXT);
+        // Slack may have accepted the replacement before the failure surfaced. A second
+        // replace_original write through the same response_url could overwrite the installed
+        // "Send a new link" prompt with stale text, so the fallback is a DM, never the response_url.
+        await dmActor(client, identity, CONNECT_PROMPT_STALE_TEXT);
       }
     });
 
@@ -4277,6 +4279,10 @@ export async function createVouchr(opts: VouchrOptions) {
         || registry.get(providerId).credential === 'key') {
         return reply(CONNECT_PROMPT_STALE_TEXT);
       }
+      // Once the response_url has been written, a failure is ambiguous: a second write could
+      // overwrite a replacement Slack already installed. Report through a DM instead; before any
+      // write, the private ephemeral reply is still safe.
+      let wroteResponse = false;
       try {
         await deliverConnectPrompt({
           consent,
@@ -4286,12 +4292,14 @@ export async function createVouchr(opts: VouchrOptions) {
           channel: found.row.channel,
           issuedAt: await provisioningIssuedAtFromReceipt(vault, provisioningReceivedAt),
           post: async ({ blocks, fallback }) => {
+            wroteResponse = true;
             await respond({ replace_original: true, response_type: 'ephemeral', blocks, ...fallback });
           },
         });
       } catch (error) {
         if (error instanceof ConsentRequiredError) return; // the other replica's click replaced it
-        await reply(safeUserMessage(error), false);
+        if (wroteResponse) await dmActor(client, identity, safeUserMessage(error));
+        else await reply(safeUserMessage(error), false);
       }
     });
 

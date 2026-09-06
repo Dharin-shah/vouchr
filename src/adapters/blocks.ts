@@ -163,14 +163,15 @@ export function statsBlocks(enabled: string[], stats: StatsRow[], windowDays: nu
 
 /** Block Kit for the in-Slack "connect your account" prompt (ephemeral).
  *  `scopes` (optional) lists what the agent will be able to do as you; unknown scope ids
- *  render as their raw string so nothing granted is ever hidden. `state` (optional, #347) rides in
- *  the button value so the click handler can replace the prompt in place; it carries no authority
- *  (the handler re-reads the row and never spends it). Omitted for host-rendered prompts. */
+ *  render as their raw string so nothing granted is ever hidden. `state` (#347) rides in the
+ *  button value so the click handler can replace the prompt in place; it carries no authority
+ *  (the handler re-reads the row and never spends it). REQUIRED: every rendered button must be
+ *  addressable, so the browser's "the prompt in Slack now offers a new link" is always true. */
 export function connectBlocks(
   provider: string,
   authorizeUrl: string,
-  scopes?: { list: string[]; describe?: Record<string, string> },
-  state?: string,
+  scopes: { list: string[]; describe?: Record<string, string> } | undefined,
+  state: string,
 ): unknown[] {
   const MAX_SCOPE_SECTIONS = 48; // intro + scope sections + actions must stay within 50 message blocks
   // SEC-5 (#178): escape the provider id like every other mrkdwn renderer — no exception for a
@@ -215,7 +216,7 @@ export function connectBlocks(
           // Slack sends a block_actions payload for url buttons too; without an action_id + registered
           // ack the client shows "Operation timed out". The action carries no authority (SEC-3).
           action_id: OAUTH_CONNECT_ACTION,
-          ...(state === undefined ? {} : { value: state }),
+          value: state,
           style: 'primary',
         },
       ],

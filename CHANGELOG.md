@@ -16,8 +16,8 @@ All notable changes to this project are documented here. This project adheres to
   lease as an agent turn and swaps the fresh prompt in place. The browser stale page keeps its
   fixed copy and adds `The prompt in Slack now offers a new link.` The click never spends the
   state; a tampered or another user's value gets the fixed stale copy and writes nothing.
-  `connectBlocks` gains an optional fourth `state` argument (host-rendered prompts without it keep
-  the bare-ack behavior); `OAUTH_RENEW_ACTION` joins `OAUTH_CONNECT_ACTION` in the package
+  `connectBlocks` gains a required fourth `state` argument, so every rendered button is addressable
+  by its click; `OAUTH_RENEW_ACTION` joins `OAUTH_CONNECT_ACTION` in the package
   exports, and `connectExpiredBlocks`, `CONNECT_PROMPT_STALE_TEXT`, and
   `CONNECT_PROMPT_OPENING_TEXT` are exported from `src/adapters/blocks`.
 
@@ -37,6 +37,10 @@ All notable changes to this project are documented here. This project adheres to
   messages lose their buttons on the next sweep (best-effort `chat.update` from the posting process;
   no schema change). The README, `examples/bolt-github`, and `examples/demo` hosts post the fixed
   "already posted, ask again in 30 seconds" copy privately for a reused prompt instead of going silent.
+  Connect-click follow-ups: a failed `response_url` write falls back to a DM instead of a second
+  `replace_original` write that could overwrite the installed "Send a new link" prompt, and a
+  cancelled Slack sign-in says "Go back to Slack. If the connection prompt is still there, use it;
+  if not, ask the agent again." (true for channel ephemerals and durable DM prompts alike).
 
 ### Changed
 

@@ -76,7 +76,13 @@ async function harness(t: TestContext, db: Db) {
     return button.value as string;
   };
   /** Click a registered action with a Slack-signed-shaped payload; returns what `respond` received. */
-  const click = async (actionId: string, value: unknown, user = ID.userId) => {
+  const click = async (
+    actionId: string,
+    value: unknown,
+    user = ID.userId,
+    /** Replaces the default recording `respond` (a test can make the response_url write fail). */
+    respond?: (payload: any) => Promise<void>,
+  ) => {
     const responses: any[] = [];
     await actions[actionId]({
       ack: async () => {},
@@ -88,7 +94,7 @@ async function harness(t: TestContext, db: Db) {
         actions: [value === undefined ? {} : { value }],
       },
       client,
-      respond: async (payload: any) => { responses.push(payload); },
+      respond: respond ?? (async (payload: any) => { responses.push(payload); }),
     });
     return responses;
   };
@@ -113,9 +119,41 @@ test('a Connect click on a live in-channel prompt replaces the ephemeral and doe
   assert.deepEqual(await h.click(OAUTH_CONNECT_ACTION, dm.state, 'U2'), []);
   assert.ok(await new Consent(db).activeRow(dm.state));
 
-  // A prompt rendered before #347 carries no value: its click is acknowledged and nothing else.
-  assert.deepEqual(await h.click(OAUTH_CONNECT_ACTION, undefined), []);
+  // Every Vouchr-rendered button carries its state; a click without one is a tampered payload and
+  // gets the fixed stale copy, never a silent ack.
+  assert.deepEqual(await h.click(OAUTH_CONNECT_ACTION, undefined), [
+    { replace_original: true, response_type: 'ephemeral', text: CONNECT_PROMPT_STALE_TEXT },
+  ]);
   assert.equal(await count(db, 'FROM audit'), 0);
+});
+
+test('a failed response_url write is ambiguous: the fallback is a DM, never a second write that could overwrite the installed prompt', async (t) => {
+  const db = await openTestDb(t);
+  const h = await harness(t, db);
+  const state = await h.prompt();
+  await expire(db, state);
+  h.posts.length = 0;
+
+  // The replacement write throws after Slack may already have accepted it.
+  let writes = 0;
+  const responses = await h.click(OAUTH_CONNECT_ACTION, state, ID.userId, async () => {
+    writes++;
+    throw new Error('socket hang up');
+  });
+  assert.deepEqual(responses, [], 'nothing else rides the response_url');
+  assert.equal(writes, 1, 'exactly one response_url write; no replace_original retry');
+  assert.deepEqual(h.posts, [{ channel: ID.userId, text: CONNECT_PROMPT_STALE_TEXT }], 'the actor hears the outcome in a DM');
+
+  // The same rule for "Send a new link": once the fresh prompt has been written through the
+  // response_url, a failure reports through a DM instead of clobbering it.
+  const fresh = await h.prompt();
+  await expire(db, fresh);
+  h.posts.length = 0;
+  const renew = await h.click(OAUTH_RENEW_ACTION, fresh, ID.userId, async () => { throw new Error('socket hang up'); });
+  assert.deepEqual(renew, []);
+  assert.equal(h.posts.length, 1, 'one DM, no second response_url write');
+  assert.equal(h.posts[0].channel, ID.userId);
+  assert.doesNotMatch(String(h.posts[0].text), /socket hang up/, 'foreign error text never reaches Slack');
 });
 
 test('a Connect click on an expired, superseded, or spent prompt replaces it with the expiry copy and a Send a new link button', async (t) => {

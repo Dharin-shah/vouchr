@@ -342,6 +342,8 @@ test('#302 a Slack authorize error or missing code is a fixed 400 that does NOT 
     const { state } = await beginFlow(port);
     const cancel = await getRaw(port, `/oauth/slack?error=access_denied&state=${encodeURIComponent(state)}`);
     assert.equal(cancel.status, 400);
+    // One sentence that is true for a replaced channel ephemeral AND a durable DM prompt (#348).
+    assert.match(cancel.raw, /Slack sign-in did not complete\. Go back to Slack\. If the connection prompt is still there, use it; if not, ask the agent again\./);
     assert.equal(stub.log.slackTokenCalls, 0);
     // The legitimate user can still complete from the same prompt.
     const hop2 = await getRaw(port, `/oauth/slack?code=slack-code&state=${encodeURIComponent(state)}`);
