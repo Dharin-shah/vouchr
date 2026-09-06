@@ -55,7 +55,7 @@ const acmeApproval = defineProvider({
 });
 const authorizationBody = () => ({
   handle: { provider: 'acme', owner: 'user' }, identityToken: userToken(),
-  method: 'POST', path: '/data', bindingMessage: 'Create the demo record',
+  method: 'POST', path: '/data', reason: 'Create the demo record', link: 'https://tracker.example/T-42',
 });
 
 function claims(over: Partial<IdentityClaims> = {}): IdentityClaims {
@@ -197,9 +197,9 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
       const { server, port } = await makeBroker(t);
       try { return await request(port, 'GET', '/v1/manifest'); } finally { server.close(); }
   } },
-  { name: 'admin.mode.ok', run: async (t) => {
+  { name: 'admin.identity.ok', run: async (t) => {
       const { server, port } = await makeBroker(t);
-      try { return await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: adminToken() }); } finally { server.close(); }
+      try { return await request(port, 'POST', '/v1/admin/identity', { provider: 'acme', identity: 'channel', identityToken: adminToken() }); } finally { server.close(); }
   } },
   { name: 'admin.tools.ok', run: async (t) => {
       const { server, port } = await makeBroker(t);
@@ -208,15 +208,9 @@ const CASES: { name: string; run: (t: TestContext) => Promise<{ status: number; 
   { name: 'admin.config', run: async (t) => {
       const { server, port } = await makeBroker(t);
       try {
-        await request(port, 'POST', '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: adminToken() }); // configure so mode reads back non-null
+        await request(port, 'POST', '/v1/admin/identity', { provider: 'acme', identity: 'channel', identityToken: adminToken() }); // configure so mode reads back non-null
         return await request(port, 'GET', '/v1/admin/config', undefined, { 'x-vouchr-identity': adminToken() });
       } finally { server.close(); }
-  } },
-  { name: 'admin.config.unconfigured', run: async (t) => {
-      // The read side before any mode is set: `mode` is null (ChannelMode | null). Freezes that the
-      // null branch is part of the contract, alongside admin.config's configured (mode:string) shape.
-      const { server, port } = await makeBroker(t);
-      try { return await request(port, 'GET', '/v1/admin/config', undefined, { 'x-vouchr-identity': adminToken() }); } finally { server.close(); }
   } },
   { name: 'audit.self', run: async (t) => {
       const { server, db, port } = await makeBroker(t);

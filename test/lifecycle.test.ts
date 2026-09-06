@@ -18,7 +18,6 @@ import {
   UserProvisioningRequests,
 } from '../src/core/provisioning';
 import { defineProvider } from '../src/core/providers';
-import { SessionGrants } from '../src/core/session';
 import { Vault } from '../src/core/vault';
 import { identityConfig } from './support/identity';
 import { openTestDb } from './support/pg';
@@ -96,28 +95,12 @@ test('BrokerServer.sweepExpired owns every lifecycle family and preserves canoni
     host: 'api.acme.test',
     path: '/dangerous-action',
     queryHash: '',
+    grant: 'once',
     channel: null,
     thread: null,
     governableChannel: null,
   };
   await new Approvals(db).request(approvalKey);
-
-  const sessions = new SessionGrants(db);
-  await sessions.request(
-    identity('U_SESSION_REQUEST'),
-    'C_SESSION',
-    'TH_REQUEST',
-    'acme',
-    randomUUID(),
-  );
-  await sessions.grant(
-    identity('U_SESSION_GRANT'),
-    'C_SESSION',
-    'TH_GRANT',
-    'acme',
-    60_000,
-    randomUUID(),
-  );
 
   assert.ok(await new UserProvisioningRequests(db, vault).issue(
     identity('U_USER_SETUP'),
@@ -133,8 +116,6 @@ test('BrokerServer.sweepExpired owns every lifecycle family and preserves canoni
 
   await db.run(`UPDATE consent_request SET created_at=0`);
   await db.run(`UPDATE approval_request SET expires_at=0`);
-  await db.run(`UPDATE session_request SET expires_at=0`);
-  await db.run(`UPDATE session_grant SET expires_at=0`);
   await db.run(`UPDATE user_provisioning_request SET expires_at=0`);
   await db.run(`UPDATE channel_provisioning_request SET expires_at=0`);
 
@@ -142,8 +123,6 @@ test('BrokerServer.sweepExpired owns every lifecycle family and preserves canoni
     'connection',
     'consent_request',
     'approval_request',
-    'session_request',
-    'session_grant',
     'user_provisioning_request',
     'channel_provisioning_request',
   ]) {
@@ -157,8 +136,6 @@ test('BrokerServer.sweepExpired owns every lifecycle family and preserves canoni
     'connection',
     'consent_request',
     'approval_request',
-    'session_request',
-    'session_grant',
     'user_provisioning_request',
     'channel_provisioning_request',
   ]) {

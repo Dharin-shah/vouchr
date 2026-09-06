@@ -8,7 +8,7 @@ import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { Consent } from '../src/core/consent';
 import type { Db } from '../src/core/db';
 import { defineProvider, type Provider } from '../src/core/providers';
@@ -505,7 +505,7 @@ test('#194 mcp: a channel-owner assertion minted before actor offboard cannot us
   const owner = channelOwner('T1', 'C1');
   const { server, vault, db, port } = await makeMcpBroker(t, async (brokerDb) => {
     const channelConfig = new ChannelConfig(brokerDb);
-    await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'shared');
+    await writeChannelIdentity(channelConfig, 'T1', 'C1', 'acme', 'channel');
     await new Vault(brokerDb, KEY).upsert(owner, 'acme', {
       accessToken: SECRET_TOKEN,
       refreshToken: null,

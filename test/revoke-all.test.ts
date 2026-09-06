@@ -19,7 +19,6 @@ import {
   type RevokeAllDeps,
 } from '../src/core/offboard';
 import { Consent } from '../src/core/consent';
-import { SessionGrants } from '../src/core/session';
 
 const KEY = randomBytes(32);
 
@@ -355,12 +354,11 @@ test('a revoke loser reports no token disposition when the row is already gone',
   assert.ok(row);
   const audit = new Audit(db);
   const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
 
   await withFetch(async () => {
-    const winner = await revokeConnection(vault, audit, consent, sessions, REGISTRY, row, 'revok_ok');
+    const winner = await revokeConnection(vault, audit, consent, REGISTRY, row, 'revok_ok');
     assert.equal(winner.removed, true);
-    const loser = await revokeConnection(vault, audit, consent, sessions, REGISTRY, row, 'revok_ok');
+    const loser = await revokeConnection(vault, audit, consent, REGISTRY, row, 'revok_ok');
     assert.equal(loser.removed, false);
     assert.equal(loser.upstreamAttempted, false);
     assert.equal(loser.upstreamUnreadable, false);

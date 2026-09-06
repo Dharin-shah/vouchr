@@ -7,8 +7,6 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Policy } from '../src/core/policy';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
-import { SessionGrants } from '../src/core/session';
 import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { VouchrEvent } from '../src/core/injector';
@@ -69,70 +67,6 @@ function mockUpstream() {
   globalThis.fetch = (async (url: any) => { seen.push(String(url)); return new Response('{"ok":true}', { status: 200, headers: { 'content-type': 'application/json' } }); }) as any;
   return { seen, restore: () => { globalThis.fetch = real; } };
 }
-
-// ── (a) SECURITY: session-mode is fail-closed in the headless broker ──────────
-
-test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  const channelConfig = new ChannelConfig(db);
-  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
-  await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
-  const port = await listen(t, server);
-  const up = mockUpstream();
-  try {
-    // A signed user token WITH a thread but no grant → fail closed, no upstream call, token never served.
-    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token({ threadTs: '111.222' }), method: 'GET', path: '/x' });
-    assert.equal(r.status, 403);
-    assert.equal(up.seen.length, 0, 'the credential must NOT have been injected');
-    // No threadTs at all → cannot scope a session → also fail closed.
-    const r2 = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
-    assert.equal(r2.status, 403);
-    const row = (await db.get(`SELECT meta FROM audit WHERE action='denied' AND meta LIKE '%no-thread%' LIMIT 1`)) as any;
-    // meta carries the reason; a denied audit row exists for the no-thread case.
-    assert.ok(row, 'a denied audit row is written for the no-thread session refusal');
-  } finally { up.restore(); server.close(); }
-});
-
-test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  const channelConfig = new ChannelConfig(db);
-  const sessions = new SessionGrants(db);
-  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
-  await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const credentialId = await vault.liveId(userOwner(U1), 'acme');
-  assert.ok(credentialId);
-  await sessions.grant(U1, 'C1', '111.222', 'acme', 60_000, credentialId); // approve exactly this thread
-  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
-  const port = await listen(t, server);
-  const up = mockUpstream();
-  try {
-    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token({ threadTs: '111.222' }), method: 'GET', path: '/x' });
-    assert.equal(r.status, 200);
-    assert.equal(up.seen.length, 1, 'the credential was injected once the grant existed');
-    // A different thread has no grant → still refused (grant is thread-scoped, not user-wide).
-    const r2 = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token({ threadTs: '999.999' }), method: 'GET', path: '/x' });
-    assert.equal(r2.status, 403);
-  } finally { up.restore(); server.close(); }
-});
-
-test('session-mode is opt-in: with NO channelConfig the user credential serves as before', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // no channelConfig
-  const port = await listen(t, server);
-  const up = mockUpstream();
-  try {
-    const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
-    assert.equal(r.status, 200);
-  } finally { up.restore(); server.close(); }
-});
 
 // ── (b) /v1/status: single query, no per-provider decrypt ─────────────────────
 

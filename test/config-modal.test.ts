@@ -5,7 +5,7 @@ import { randomBytes } from 'node:crypto';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { createVouchr } from '../src/adapters/bolt';
 import { Policy } from '../src/core/policy';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { CONFIG_CALLBACK, DISCONNECT_ACTION } from '../src/adapters/blocks';
 import { userOwner } from '../src/core/owner';
@@ -449,11 +449,11 @@ test('enabling one provider materializes the full allowlist; the others stay dis
 test('untouched mode select does not revert a concurrent change or delete the shared credential', async (t) => {
   const h = await harness(t, { member: true });
   const cfg = new ChannelConfig(h.lan.db);
-  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'per-user');
+  await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'person');
   const view = await h.openModal(); // opens with mode 'per-user' as the select's initial
   const pm = view.private_metadata;
   // Between open and save, another member flips to shared and connects a shared credential.
-  await writeChannelMode(cfg, 'T1', 'C_FIN', 'mcp', 'shared');
+  await writeChannelIdentity(cfg, 'T1', 'C_FIN', 'mcp', 'channel');
   await h.lan.vault.upsert({ teamId: 'T1', kind: 'channel', id: 'C_FIN', enterpriseId: null }, 'mcp', { accessToken: 'SHARED', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // A saves the modal without touching the mode select (it re-submits its open value 'per-user').
   await h.submit({ 'mode:mcp': { mode: { selected_option: { value: 'per-user' } } } }, async () => {}, pm);

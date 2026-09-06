@@ -7,7 +7,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { channelOwner } from '../src/core/owner';
 import { defineProvider, type Provider } from '../src/core/providers';
@@ -356,7 +356,7 @@ test('admin mode and tools reject assertions issued before the acting admin was 
       assert.equal(response.json.recovery, 'resolve_again');
       assert.equal(response.json.retryable, false);
     }
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
     assert.equal(await channelTools.isEnabled('T1', 'C1', 'acme'), false); // unconfigured -> deny-by-default
     assert.equal(
       (await db.get<{ n: number }>(`SELECT COUNT(*)::int AS n FROM audit WHERE action='config'`))?.n,
@@ -380,8 +380,8 @@ test('admin/mode: channel comes from the signed claim, never the body (no spoofi
     assert.equal(r.status, 200);
 
     // The mode was written to the SIGNED channel (T1/C1), not the body-supplied CEVIL/TEVIL.
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), 'session');
-    assert.equal(await channelConfig.getMode('TEVIL', 'CEVIL', 'acme'), null);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), 'session');
+    assert.equal(await channelConfig.getIdentity('TEVIL', 'CEVIL', 'acme'), null);
 
     // And the read side, scoped to a token signed for CEVIL, sees no config there.
     const evil = await getConfig(port, admin({ channel: 'CEVIL', teamId: 'TEVIL' }));
@@ -449,7 +449,7 @@ test('admin/mode: `shared` on an ineligible channel is refused (eligibility pari
   try {
     const r = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: admin({ channelEligible: false }) });
     assert.equal(r.status, 403);
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null, 'refused: no mode written');
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null, 'refused: no mode written');
     // A user-owned mode has no eligibility requirement, so it still succeeds on the same channel.
     const ok = await post(port, '/v1/admin/mode', { provider: 'acme', mode: 'per-user', identityToken: admin({ channelEligible: false }) });
     assert.equal(ok.status, 200);
@@ -559,11 +559,11 @@ test('admin config routes reject an invalid/expired identity token (401)', async
 test('manifest: POST returns channel policy without a provider-output visibility field', async (t) => {
   const { server, port, channelConfig } = await makeConfigBroker(t);
   try {
-    await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
+    await writeChannelIdentity(channelConfig, 'T1', 'C1', 'acme', 'channel');
     const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 200);
     assert.deepEqual(r.json.tools.find((t: any) => t.provider === 'acme'), {
-      provider: 'acme', mode: 'session', enabled: false, identity: 'acting_human',
+      provider: 'acme', enabled: false, identity: 'channel',
     });
     assert.equal(Object.hasOwn(r.json.tools[0], 'visibility'), false);
     // Service tools still appear because identity tells the host who runs them.
@@ -579,7 +579,7 @@ test('manifest: POST requires a valid signed identity and reads only the claims 
     const bad = await post(port, '/v1/manifest', { identityToken: 'garbage' });
     assert.equal(bad.status, 401);
     // A mode on ANOTHER channel must not leak into this channel's manifest.
-    await writeChannelMode(channelConfig, 'T1', 'C_OTHER', 'acme', 'shared');
+    await writeChannelIdentity(channelConfig, 'T1', 'C_OTHER', 'acme', 'channel');
     const r = await post(port, '/v1/manifest', { identityToken: signIdentity(claims(), SECRET) }); // channel C1
     assert.equal(r.json.tools.find((t: any) => t.provider === 'acme').mode, null);
   } finally {

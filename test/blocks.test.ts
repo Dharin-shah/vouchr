@@ -21,7 +21,6 @@ import {
   disconnectConfirmBlocks,
   homeView,
   keySetupBlocks,
-  sessionApprovalBlocks,
   statsBlocks,
   userKeyModal,
   DISCONNECT_ACTION,
@@ -235,20 +234,18 @@ test('connectBlocks: a direct caller cannot construct an oversized Slack section
   );
 });
 
-test('credential and session renderers escape mrkdwn but preserve literal interaction data', () => {
+test('credential renderers escape mrkdwn but preserve literal interaction data', () => {
   const provider = '<!channel> & <https://evil.example|click>';
   const requestId = '123e4567-e89b-42d3-a456-426614174000';
   const escaped = '&lt;!channel&gt; &amp; &lt;https://evil.example|click&gt;';
   const configure = configureModal(provider, 'C1') as any;
   const userKey = userKeyModal(provider) as any;
   const keySetup = keySetupBlocks(provider, requestId) as any[];
-  const session = sessionApprovalBlocks(provider, requestId) as any[];
 
   for (const [name, rendered] of [
     ['configureModal', configure],
     ['userKeyModal', userKey],
     ['keySetupBlocks', keySetup],
-    ['sessionApprovalBlocks', session],
   ] as const) {
     const mrkdwn = mrkdwnTexts(rendered).join('\n');
     assert.ok(!mrkdwn.includes(provider), `${name} rendered live provider mrkdwn`);
@@ -263,10 +260,6 @@ test('credential and session renderers escape mrkdwn but preserve literal intera
   assert.equal(keyButton.text.text, `Set up ${provider}`);
   assert.equal(keyButton.value, requestId);
   assert.ok(!keyButton.value.includes(provider));
-  const sessionButton = session.find((block) => block.type === 'actions').elements[0];
-  assert.equal(sessionButton.text.text, `Allow ${provider} here`);
-  assert.equal(sessionButton.value, requestId);
-  assert.ok(!sessionButton.value.includes(provider));
 });
 
 test('configureModal: the disabled flag warns the credential is inert until enabled (#7)', () => {
@@ -365,18 +358,16 @@ test('statusBlocks: empty state explains on-demand connection without a phantom 
   assert.doesNotMatch(b[0].text.text, /\/vouchr connect/); // #194: no guidance for a command that doesn't exist
 });
 
-test('statusBlocks: lists each connection with channel + mode', () => {
+test('statusBlocks: lists each connection with its channel', () => {
   const b = statusBlocks([
-    { provider: 'github', channel: 'C1', mode: 'shared' },
-    { provider: 'stripe', channel: null, mode: 'per-user' },
+    { provider: 'github', channel: 'C1' },
+    { provider: 'stripe', channel: null },
   ]) as any[];
   assert.equal(b[0].type, 'header');
   const list = b[1].text.text as string;
   assert.match(list, /github/);
   assert.match(list, /<#C1>/);
-  assert.match(list, /shared/);
   assert.match(list, /your DMs/);
-  assert.match(list, /per-user/);
 });
 
 test('connectionLine preserves a maximum account label losslessly while escaping mrkdwn', () => {
@@ -451,27 +442,27 @@ test('configModal rejects an over-block view before Slack can truncate or reject
   assert.throws(() => configModal({
     channel: 'C1',
     connections: [],
-    tools: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
-    admin: providers.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
+    tools: providers.map((provider) => ({ provider, enabled: true, identity: 'person' as const })),
+    admin: providers.map((provider) => ({ provider, enabled: true, identity: 'person' as const })),
   }), /Slack modal block limit/);
 });
 
 test('configModal enforces Slack private_metadata independently of the block count', () => {
-  const providers = Array.from({ length: 30 }, (_, index) => {
+  const providers = Array.from({ length: 27 }, (_, index) => {
     const prefix = `p${String(index).padStart(2, '0')}`;
     return prefix + 'x'.repeat(63 - prefix.length);
   });
   const build = (ids: string[]) => configModal({
     channel: 'C1',
     connections: [],
-    tools: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
-    admin: ids.map((provider) => ({ provider, enabled: true, mode: 'per-user' })),
+    tools: ids.map((provider) => ({ provider, enabled: true, identity: 'person' as const })),
+    admin: ids.map((provider) => ({ provider, enabled: true, identity: 'person' as const })),
   }) as any;
 
-  const withinLimit = build(providers.slice(0, 30));
+  const withinLimit = build(providers.slice(0, 27));
   assert.ok(withinLimit.blocks.length <= 100);
   assert.ok(withinLimit.private_metadata.length <= 3_000);
-  assert.throws(() => build(Array.from({ length: 31 }, (_, index) => {
+  assert.throws(() => build(Array.from({ length: 33 }, (_, index) => {
     const prefix = `p${String(index).padStart(2, '0')}`;
     return prefix + 'x'.repeat(63 - prefix.length);
   })), /Slack modal private_metadata limit/);
@@ -530,7 +521,7 @@ test('disconnectConfirmBlocks: provider is inert in mrkdwn but literal in plain_
 
 test('homeView: returns a home view listing connections and available providers', () => {
   const v = homeView({
-    connections: [{ provider: 'github', channel: 'C1', mode: 'shared' }],
+    connections: [{ provider: 'github', channel: 'C1' }],
     providers: ['github', 'stripe'],
   }) as any;
   assert.equal(v.type, 'home');

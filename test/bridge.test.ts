@@ -14,13 +14,12 @@ import { identityConfig, signIdentity } from './support/identity';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
 import { Consent } from '../src/core/consent';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
-import { setChannelCredentialMode } from '../src/core/channelCredential';
+import { ChannelConfig, } from '../src/core/channelConfig';
+import { setChannelCredentialIdentity } from '../src/core/channelCredential';
 import { defineProvider, ProviderRegistry, type Provider } from '../src/core/providers';
 import { channelOwner, userOwner } from '../src/core/owner';
 import { Policy } from '../src/core/policy';
 import { PolicyDeniedError } from '../src/core/authz';
-import { SessionGrants } from '../src/core/session';
 import { createBroker } from '../src/adapters/http/broker';
 import {
   ConnectContext,
@@ -34,7 +33,6 @@ import { ToolDisabledError } from '../src/core/authz';
 import { mapSafeError, safeUserMessage, VOUCHR_ERROR_CODES, type VouchrErrorCode } from '../src/core/errors';
 import {
   APPROVAL_APPROVE_ACTION,
-  APPROVE_SESSION_ACTION,
   SETUP_KEY_ACTION,
 } from '../src/adapters/blocks';
 import type { Db } from '../src/core/db';
@@ -635,60 +633,18 @@ test('bridge: a stale not_connected relay resolves when the user is already conn
   assert.equal(h.ephemerals.length, 0, 'nothing to prompt');
 });
 
-// ── session_approval_required → the thread-scoped session prompt ──────────────────────────────────
-
-test('bridge: session denial posts ONE in-thread prompt; the click grants; a rerun resolves', async (t) => {
-  const h = await harness(t);
-  await writeChannelMode(new ChannelConfig(h.db), 'T1', 'C1', 'gh', 'session');
-  await h.vouchr.vault.upsert(userOwner(ID), 'gh', {
-    accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const denial = { code: 'session_approval_required', recovery: 'request_approval' };
-  const first = await (await h.context()).recoverBrokerDenial('gh', denial);
-  assert.deepEqual(first, { status: 'session_prompted', provider: 'gh' });
-  assert.equal(h.ephemerals.length, 1);
-  assert.equal(h.ephemerals[0].thread_ts, 'TH1', 'prompt is thread-scoped');
-  assert.ok(JSON.stringify(h.ephemerals[0].blocks).includes(APPROVE_SESSION_ACTION));
-  const rows = await h.db.all<any>('SELECT id FROM session_request', []);
-  assert.equal(rows.length, 1);
-
-  // Repeated relays converge on the one live request without re-posting.
-  const again = await (await h.context()).recoverBrokerDenial('gh', denial);
-  assert.deepEqual(again, { status: 'session_prompted', provider: 'gh' });
-  assert.equal(h.ephemerals.length, 1, 'no duplicate prompt');
-
-  // The click re-decides authority at the mutation (existing handler), then the bridge resolves.
-  await h.click(APPROVE_SESSION_ACTION, { value: rows[0].id });
-  const after = await (await h.context()).recoverBrokerDenial('gh', denial);
-  assert.deepEqual(after, { status: 'resolved', provider: 'gh' });
-});
-
-test('bridge: session denial without a thread yields the fixed off-thread guidance', async (t) => {
-  const h = await harness(t);
-  await writeChannelMode(new ChannelConfig(h.db), 'T1', 'C1', 'gh', 'session');
-  await h.vouchr.vault.upsert(userOwner(ID), 'gh', {
-    accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const ctx = await h.context({ thread: null });
-  await assert.rejects(
-    ctx.recoverBrokerDenial('gh', { code: 'session_approval_required' }),
-    /thread-scoped session/,
-  );
-  assert.equal(h.ephemerals.length, 0);
-});
-
 // ── not_connected, shared owner → direct the asking member to channel configuration ──────────────
 
 async function sharedModeVia(h: Awaited<ReturnType<typeof harness>>, adminId: string, providerId = 'gh') {
   // The audited member mutation (writes the 'config' row lastChannelConfigActor reads).
-  await setChannelCredentialMode({
+  await setChannelCredentialIdentity({
     vault: h.vouchr.vault,
     audit: h.vouchr.audit,
     channelConfig: new ChannelConfig(h.db),
     identity: { ...ID, userId: adminId },
     channel: 'C1',
     providerId,
-    mode: 'shared',
+    actAs: 'channel',
     issuance: await h.vouchr.vault.userProvisioningIssuedAt(),
   });
 }
@@ -848,33 +804,6 @@ test('bridge: an approval denial is bound to the verified thread before delivery
   assert.ok(
     await h.db.get('SELECT 1 AS x FROM approval_request WHERE id=?', [denial.approvalId]),
     'a wrong-context lookup does not destroy the legitimate thread request',
-  );
-});
-
-test('bridge: an expired session makes the pending action stale before approval delivery', async (t) => {
-  const provider = approvalProv('self');
-  const h = await harness(t, { providers: [provider] });
-  await h.vouchr.vault.upsert(userOwner(ID), 'acme', {
-    accessToken: TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const credentialId = await h.vouchr.vault.liveId(userOwner(ID), 'acme');
-  assert.ok(credentialId);
-  const channelConfig = new ChannelConfig(h.db);
-  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
-  await new SessionGrants(h.db).grant(ID, 'C1', 'TH1', 'acme', 60_000, credentialId);
-  const { denial } = await brokerApprovalDenial(t, h.db, h.key, provider, { channelConfig });
-
-  await h.db.run(
-    'DELETE FROM session_grant WHERE team_id=? AND channel=? AND thread=? AND user_id=? AND provider=?',
-    ['T1', 'C1', 'TH1', 'U1', 'acme'],
-  );
-  const r = await (await h.context()).recoverBrokerDenial('acme', denial);
-  assert.deepEqual(r, { status: 'stale', provider: 'acme' });
-  assert.equal(h.ephemerals.length, 0, 'no unusable action prompt is posted after session expiry');
-  assert.equal(
-    await h.db.get('SELECT 1 AS x FROM approval_request WHERE id=?', [denial.approvalId]),
-    undefined,
-    'the invalid pending action cannot revive if a session is granted later',
   );
 });
 

@@ -187,7 +187,7 @@ test('integration: a per-user provider in a DM works end to end with no channel 
     // The manifest reports the provider ENABLED in the DM (mode null), not deny-by-default disabled.
     const manifest = await ctx.vouchr.toolManifest();
     assert.deepEqual(manifest.find((m: any) => m.provider === 'mock'), {
-      provider: 'mock', mode: null, enabled: true, identity: 'acting_human',
+      provider: 'mock', enabled: true, identity: 'person',
     });
 
     // connect() reaches consent (a Connect prompt), not a tool-disabled refusal.

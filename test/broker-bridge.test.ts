@@ -18,11 +18,10 @@ import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { testDbUrl } from './support/pg';
 import { openDb } from '../src/core/db';
-import { ChannelConfig } from '../src/core/channelConfig';
 import { loadIdentityConfig, mintIdentity, type MintIdentityInput } from '../src/adapters/http/identity';
 import { ConnectContext, createVouchr } from '../src/adapters/bolt';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
-import { APPROVAL_APPROVE_ACTION, APPROVE_SESSION_ACTION, SETUP_KEY_ACTION } from '../src/adapters/blocks';
+import { APPROVAL_APPROVE_ACTION, SETUP_KEY_ACTION } from '../src/adapters/blocks';
 
 const IDENTITY_SECRET = 'bridge-e2e-identity-secret-at-least-32-bytes!!';
 const DEPLOYMENT_ID = 'bridge-e2e-deployment';
@@ -41,6 +40,10 @@ const PROVIDERS = [
   {
     id: 'writer', credential: 'key', egressAllow: ['api.bridge.test'],
     egressMethods: ['GET', 'POST'], approval: { approver: 'self' },
+  },
+  {
+    id: 'threaded', credential: 'key', egressAllow: ['api.bridge.test'],
+    egressMethods: ['GET', 'POST'], approval: { approver: 'self', grant: 'thread' },
   },
 ];
 
@@ -86,7 +89,6 @@ async function spawnBroker(t: TestContext, databaseUrl: string): Promise<{ port:
         VOUCHR_SLACK_CLIENT_ID: 'slack-app-cid',
         VOUCHR_SLACK_CLIENT_SECRET: 'slack-app-csec',
         VOUCHR_ALLOW_WRITES: '1',
-        VOUCHR_CHANNEL_MODES: '1',
         VOUCHR_PORT: '0',
         VOUCHR_SWEEP_INTERVAL_MS: '0',
         VOUCHR_PG_POOL_MAX: '2',
@@ -233,39 +235,35 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
   assert.equal((await fetchVia({ token: spent })).status, 200);
   assert.equal((await fetchVia({ token: spent })).status, 401, 'jti replay refused cluster-wide');
 
-  // ════ 2. Session recovery: session_approval_required → in-thread prompt → click → retry. ═══════
-  // A member sets the channel mode through the public Bolt surface (audited, shared PG row).
-  await (await context({ channel: 'C2' })).setChannelMode('ghlite', 'session');
-  const needsSession = await fetchVia({ channel: 'C2', thread: 'TH2' });
-  assert.equal(needsSession.status, 403);
-  assert.equal(needsSession.json.code, 'session_approval_required');
-  assert.equal(needsSession.json.recovery, 'request_approval');
+  // ════ 2. Thread grant recovery: approval_required → in-thread prompt → click → the thread proceeds. ═══
+  await (await context({ channel: 'C2' })).setUserSecret('threaded', USER_KEY);
+  const threadWrite = (path: string, thread = 'TH2') => fetchVia({ provider: 'threaded', method: 'POST', path, body: '{}', channel: 'C2', thread });
+  const needsThread = await threadWrite('/repos');
+  assert.equal(needsThread.status, 403);
+  assert.equal(needsThread.json.code, 'approval_required');
+  assert.equal(needsThread.json.recovery, 'request_approval');
 
-  const sessionDenial = needsSession.json;
-  const sessionRecovery = await (await context({ channel: 'C2', thread: 'TH2' })).recoverBrokerDenial('ghlite', sessionDenial);
-  assert.deepEqual(sessionRecovery, { status: 'session_prompted', provider: 'ghlite' });
-  const sessionPrompts = ephemerals.filter((p) => JSON.stringify(p.blocks ?? '').includes(APPROVE_SESSION_ACTION));
-  assert.equal(sessionPrompts.length, 1);
-  assert.equal(sessionPrompts[0].thread_ts, 'TH2', 'prompt is thread-scoped');
+  const threadDenial = needsThread.json;
+  const threadRecovery = await (await context({ channel: 'C2', thread: 'TH2' })).recoverBrokerDenial('threaded', threadDenial);
+  assert.deepEqual(threadRecovery, { status: 'approval_prompted', provider: 'threaded', approver: 'self' });
+  const threadPrompts = () => ephemerals.filter((p) => p.channel === 'C2' && JSON.stringify(p.blocks ?? '').includes(APPROVAL_APPROVE_ACTION));
+  assert.equal(threadPrompts().length, 1);
+  assert.equal(threadPrompts()[0].thread_ts, 'TH2', 'the prompt lands in the thread it covers');
+  assert.match(JSON.stringify(threadPrompts()[0].blocks), /every threaded call that needs approval in this thread/);
 
   // A repeated relay (broker denies again while the human decides) converges without a re-post.
-  const relayAgain = await (await context({ channel: 'C2', thread: 'TH2' })).recoverBrokerDenial('ghlite', sessionDenial);
-  assert.deepEqual(relayAgain, { status: 'session_prompted', provider: 'ghlite' });
-  assert.equal(
-    ephemerals.filter((p) => JSON.stringify(p.blocks ?? '').includes(APPROVE_SESSION_ACTION)).length,
-    1,
-    'no duplicate session prompt',
-  );
+  const relayAgain = await (await context({ channel: 'C2', thread: 'TH2' })).recoverBrokerDenial('threaded', threadDenial);
+  assert.deepEqual(relayAgain, { status: 'approval_prompted', provider: 'threaded', approver: 'self' });
+  assert.equal(threadPrompts().length, 1, 'no duplicate thread prompt');
 
-  const sessionRequest = await db.get<any>('SELECT id FROM session_request WHERE channel=?', ['C2']);
-  await click(APPROVE_SESSION_ACTION, sessionRequest.id, { channel: 'C2', thread: 'TH2' });
-  const afterGrant = await fetchVia({ channel: 'C2', thread: 'TH2' });
-  assert.equal(afterGrant.status, 200, 'the thread grant admits the retried call');
+  await click(APPROVAL_APPROVE_ACTION, threadDenial.approvalId, { channel: 'C2', thread: 'TH2' });
+  assert.equal((await threadWrite('/repos')).status, 200, 'the thread grant admits the retried call');
+  assert.equal((await threadWrite('/other')).status, 200, 'and every later matching call in the thread');
 
-  // The grant is thread-scoped: the same user in another thread is denied again.
-  const otherThread = await fetchVia({ channel: 'C2', thread: 'TH9' });
+  // The grant is thread-scoped: the same user in another thread is asked again.
+  const otherThread = await threadWrite('/repos', 'TH9');
   assert.equal(otherThread.status, 403);
-  assert.equal(otherThread.json.code, 'session_approval_required');
+  assert.equal(otherThread.json.code, 'approval_required');
 
   // ════ 3. Approval recovery: approval_required → decision surface → approve → single-use. ═══════
   await (await context()).setUserSecret('writer', USER_KEY);
@@ -296,6 +294,9 @@ test('two-process bridge: broker denials recover through Bolt for connect, sessi
   assert.ok(!everything.includes(USER_KEY));
   assert.ok(!everything.includes(IDENTITY_SECRET));
 
-  // The channel-mode fact both processes used is the same shared row (one PostgreSQL, no copies).
-  assert.equal(await new ChannelConfig(db).getMode('T1', 'C2', 'ghlite'), 'session');
+  // The thread grant both processes used is the same shared row (one PostgreSQL, no copies).
+  assert.equal(
+    (await db.get<any>(`SELECT grant_scope, status FROM approval_request WHERE id=?`, [threadDenial.approvalId]))?.grant_scope,
+    'thread',
+  );
 });

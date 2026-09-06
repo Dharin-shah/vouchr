@@ -27,7 +27,7 @@ import {
   UserProvisioningRequests,
 } from '../src/core/provisioning';
 import { DRY_RUN_CODE } from '../src/core/dryRun';
-import { configureChannelCredential, setChannelCredentialMode } from '../src/core/channelCredential';
+import { configureChannelCredential, setChannelCredentialIdentity } from '../src/core/channelCredential';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools, configureChannelTools } from '../src/core/tools';
 import { beginVerified } from './support/slackOidc';
@@ -1274,7 +1274,6 @@ test('direct channel credential writes invalidate every older setup form', async
             externalAccount: null,
           },
         },
-        modeConflict: (mode) => { throw new Error(`unexpected mode ${mode}`); },
       }),
       false,
       mutation.label,
@@ -1353,14 +1352,14 @@ test('effective channel governance changes fence setup receipts while no-op retr
   const modeProvider = 'mode-epoch';
   const modeChannel = 'C_MODE_EPOCH';
   const modeReceipt = await vault.userProvisioningIssuedAt();
-  await setChannelCredentialMode({
+  await setChannelCredentialIdentity({
     vault,
     audit,
     channelConfig: new ChannelConfig(db),
     identity: ID,
     channel: modeChannel,
     providerId: modeProvider,
-    mode: 'shared',
+    actAs: 'channel',
     issuance: modeReceipt,
   });
   assert.equal(await requests.issue(ID, modeChannel, modeProvider, modeReceipt), null);
@@ -1372,14 +1371,14 @@ test('effective channel governance changes fence setup receipts while no-op retr
     liveModeIssuance,
   );
   assert.ok(liveModeRequest);
-  await setChannelCredentialMode({
+  await setChannelCredentialIdentity({
     vault,
     audit,
     channelConfig: new ChannelConfig(db),
     identity: ID,
     channel: modeChannel,
     providerId: modeProvider,
-    mode: 'shared',
+    actAs: 'channel',
     issuance: liveModeIssuance,
   });
   assert.deepEqual(
@@ -1461,7 +1460,6 @@ test('two replicas: offboarding fences an already-open channel credential form',
         externalAccount: null,
       },
     },
-    modeConflict: (mode) => { throw new Error(`unexpected mode ${mode}`); },
   });
   await beforeLock;
   await offboardUser(new Vault(dbB, KEY), new Audit(dbB), new Consent(dbB), ID);
@@ -1526,7 +1524,6 @@ test('channel KMS preparation does not hold the acting admin offboard fence', as
         externalAccount: null,
       },
     },
-    modeConflict: (mode) => { throw new Error(`unexpected mode ${mode}`); },
   });
   await atWrap;
 

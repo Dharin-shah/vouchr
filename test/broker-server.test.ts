@@ -206,7 +206,7 @@ test('#113 loadProviders: canonicalizable approval methods are normalized (trim 
   // 'post ' would never match the upper-cased request method — the loader accepts it and
   // defineProvider normalizes it to 'POST' so it actually enforces (fail-closed, not fail-open).
   const [p] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: { approver: 'self', methods: ['post '] } }]) } as any);
-  assert.deepEqual(p.approval!.methods, ['POST']);
+  assert.deepEqual((p.approval as { methods?: string[] }).methods, ['POST']);
 });
 
 // #211 the remaining declarative knobs (scope descriptions, authorize params, public client, standard
@@ -814,7 +814,7 @@ test('#209 resource config is canonical, secret-safe, and rejected before Postgr
     'VOUCHR_PORT',
     'VOUCHR_ALLOW_WRITES',
     'VOUCHR_DRY_RUN',
-    'VOUCHR_CHANNEL_MODES',
+    'VOUCHR_CHANNEL_IDENTITIES',
   ]) {
     await assert.rejects(
       buildBrokerServer({ ...base, [name]: sentinel }),

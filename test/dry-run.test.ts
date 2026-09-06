@@ -15,7 +15,6 @@ import {
   ChannelProvisioningRequests,
   UserProvisioningRequests,
 } from '../src/core/provisioning';
-import { SessionGrants } from '../src/core/session';
 import { revokeConnection, selectRevocations } from '../src/core/offboard';
 import { EgressBlockedError } from '../src/core/injector';
 import { userOwner } from '../src/core/owner';
@@ -63,8 +62,6 @@ const LIFECYCLE_TABLES = [
   'audit',
   'consent_request',
   'approval_request',
-  'session_request',
-  'session_grant',
   'user_provisioning_request',
   'channel_provisioning_request',
 ] as const;
@@ -107,28 +104,12 @@ async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provide
     host: 'api.acme.example',
     path: '/write',
     queryHash: '',
+    grant: 'once',
     channel: null,
     thread: null,
     governableChannel: null,
   };
   await new Approvals(db).request(approvalKey);
-
-  const sessions = new SessionGrants(db);
-  await sessions.request(
-    lifecycleIdentity('U_SWEEP_SESSION_REQUEST'),
-    'C_SWEEP',
-    'TH_REQUEST',
-    provider.id,
-    randomUUID(),
-  );
-  await sessions.grant(
-    lifecycleIdentity('U_SWEEP_SESSION_GRANT'),
-    'C_SWEEP',
-    'TH_GRANT',
-    provider.id,
-    60_000,
-    randomUUID(),
-  );
 
   assert.ok(await new UserProvisioningRequests(db, vault).issue(
     lifecycleIdentity('U_SWEEP_USER_SETUP'),
@@ -151,8 +132,6 @@ async function seedContaminatedLifecycle(db: Db, vault: Vault, provider: Provide
   await db.run(`UPDATE connection SET created_at=0, last_used_at=0`);
   await db.run(`UPDATE consent_request SET created_at=0`);
   await db.run(`UPDATE approval_request SET expires_at=0`);
-  await db.run(`UPDATE session_request SET expires_at=0`);
-  await db.run(`UPDATE session_grant SET expires_at=0`);
   await db.run(`UPDATE user_provisioning_request SET expires_at=0`);
   await db.run(`UPDATE channel_provisioning_request SET expires_at=0`);
 }
@@ -664,11 +643,10 @@ test('P1-A: bulk revokeConnection skips a dry-run row upstream, but revokes a re
   const vault = new Vault(db, randomBytes(32));
   const audit = new Audit(db);
   const consent = new Consent(db);
-  const sessions = new SessionGrants(db);
   const registry = new ProviderRegistry([revProvider()]);
   const revoke = async () => {
     const [row] = await selectRevocations(db, { provider: 'rev', userId: 'U1' });
-    await revokeConnection(vault, audit, consent, sessions, registry, row, 'rev');
+    await revokeConnection(vault, audit, consent, registry, row, 'rev');
   };
   try {
     // A dry-run row (trusted column) → bulk revoke must SKIP the upstream call (synthetic token).

@@ -11,7 +11,7 @@ import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { ConnectionHandle, type VouchrEvent } from '../src/core/injector';
 import { userOwner, channelOwner } from '../src/core/owner';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { MAX_SECRET_REFERENCE_BYTES } from '../src/core/reference';
 import { createBroker, withEgressDefaults } from '../src/adapters/http/broker';
 import { openDb } from '../src/core/db';
@@ -995,51 +995,16 @@ test('fetch/resolve: owner:"channel" is rejected by default (no channelConfig; f
   }
 });
 
-test('#194 session-mode broker denial has stable request-approval recovery metadata', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  const channelConfig = new ChannelConfig(db);
-  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
-  await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
-    accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
-  });
-  const server = createBroker({ ...BROKER_REQUIRED,
-    providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
-  });
-  await listen(t, server);
-  const port = (server.address() as any).port;
-  const up = mockUpstream(() => new Response('{}', { status: 200 }));
-  try {
-    const r = await post(port, '/v1/fetch', {
-      handle: { provider: 'acme', owner: 'user' },
-      identityToken: signIdentity(claims({ threadTs: '1700000000.000001' }), SECRET),
-      method: 'GET', path: '/x',
-    });
-    assert.equal(r.status, 403);
-    assert.deepEqual(r.json, {
-      error: 'provider requires a thread-scoped session approval',
-      code: 'session_approval_required',
-      retryable: false,
-      recovery: 'request_approval',
-    });
-    assert.equal(up.seen.length, 0);
-  } finally {
-    up.restore();
-    server.close();
-  }
-});
-
 // ── #51 transport-agnostic channel gate (owner:"channel" via SIGNED claims) ──────
 
-/** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested mode. */
-async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user', seedShared = true) {
+/** A broker with the channel gate ENABLED (channelConfig set), seeded per the requested identity. */
+async function makeChannelBroker(t: TestContext, identity: 'channel' | 'person', seedShared = true) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', mode);
-  if (mode === 'shared' && seedShared) {
+  await writeChannelIdentity(channelConfig, 'T1', 'C1', 'acme', identity);
+  if (identity === 'channel' && seedShared) {
     // The channel owns one credential every member injects.
     await vault.upsert(channelOwner('T1', 'C1'), 'acme', {
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
@@ -1056,7 +1021,7 @@ function channelToken(over: Partial<IdentityClaims> = {}): string {
 }
 
 test('#194 shared owner missing a credential returns configuration recovery, never personal connect', async (t) => {
-  const { server, port } = await makeChannelBroker(t, 'shared', false);
+  const { server, port } = await makeChannelBroker(t, 'channel', false);
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -1074,7 +1039,7 @@ test('#194 shared owner missing a credential returns configuration recovery, nev
 });
 
 test('#51 shared: owner:"channel" resolves to the channel credential and injects it', async (t) => {
-  const { server, db, port } = await makeChannelBroker(t, 'shared');
+  const { server, db, port } = await makeChannelBroker(t, 'channel');
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const r = await post(port, '/v1/fetch', {
@@ -1093,7 +1058,7 @@ test('#51 shared: owner:"channel" resolves to the channel credential and injects
 });
 
 test('#194 shared use rejects a pre-offboard assertion while preserving the channel credential', async (t) => {
-  const { server, vault, db, port } = await makeChannelBroker(t, 'shared');
+  const { server, vault, db, port } = await makeChannelBroker(t, 'channel');
   const owner = channelOwner('T1', 'C1');
   const sharedId = await vault.liveId(owner, 'acme');
   assert.ok(sharedId);
@@ -1143,7 +1108,7 @@ test('#194 shared use rejects a pre-offboard assertion while preserving the chan
 });
 
 test('#51 ineligible signed claim -> refused (fail closed, cred never read)', async (t) => {
-  const { server, port } = await makeChannelBroker(t, 'shared');
+  const { server, port } = await makeChannelBroker(t, 'channel');
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     // channelEligible:false (the caller computed channelIneligibleReason() != null) -> 403.
@@ -1164,7 +1129,7 @@ test('#51 ineligible signed claim -> refused (fail closed, cred never read)', as
 });
 
 test('#51 a per-user channel is not reachable via owner:"channel"', async (t) => {
-  const { server, port } = await makeChannelBroker(t, 'per-user');
+  const { server, port } = await makeChannelBroker(t, 'person');
   try {
     const r = await post(port, '/v1/fetch', {
       handle: { provider: 'acme', owner: 'channel' }, identityToken: channelToken(), method: 'GET', path: '/x',
@@ -1176,7 +1141,7 @@ test('#51 a per-user channel is not reachable via owner:"channel"', async (t) =>
 });
 
 test('#51 forged signed ownerKind mismatch: body owner:"user" but claim says "channel" -> refused', async (t) => {
-  const { server, port } = await makeChannelBroker(t, 'shared');
+  const { server, port } = await makeChannelBroker(t, 'channel');
   try {
     // The handle must match the SIGNED ownerKind; a user handle with a channel claim is refused.
     const r = await post(port, '/v1/fetch', {
@@ -2060,7 +2025,7 @@ test('#53 admin reference stores a channel ref, flips to shared; a member fetch 
     assert.equal(r.status, 200);
     assert.equal(r.json.ok, true);
     assert.equal(resolverCalls, 0, 'configuration validates resolver presence without reading the secret');
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), 'shared');
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), 'channel');
     const stored = await vault.get(channelOwner('T1', 'C1'), 'acme');
     assert.equal(stored?.source, 'aws-sm');
     assert.equal(stored?.secretRef, AWS_ADMIN_REF);
@@ -2089,7 +2054,7 @@ test('#53 ineligible channel (signed eligibility false) -> refused', async (t) =
       handle: { provider: 'acme' }, identityToken: adminToken({ channelEligible: false }), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
     });
     assert.equal(r.status, 403);
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
   } finally {
     server.close();
   }
@@ -2132,7 +2097,7 @@ test('#53 both reference routes reject non-object JSON with a fixed 400 and no s
       }
     }
     assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
-    assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+    assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
     assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
   } finally {
     server.close();
@@ -2166,7 +2131,7 @@ test('#53 admin reference rejects invalid input before connection, mode, or audi
       assert.equal(r.json.code, entry.code);
       assert.ok(!r.raw.includes(sentinel), 'fixed validation response must not reflect caller input');
       assert.equal(await vault.get(channelOwner('T1', 'C1'), 'acme'), null);
-      assert.equal(await channelConfig.getMode('T1', 'C1', 'acme'), null);
+      assert.equal(await channelConfig.getIdentity('T1', 'C1', 'acme'), null);
       assert.equal((await db.get<any>('SELECT COUNT(*) n FROM audit')).n, 0);
     } finally {
       server.close();
@@ -2176,7 +2141,7 @@ test('#53 admin reference rejects invalid input before connection, mode, or audi
 
 test('#53 refuses a channel locked to a user-owned mode (invariant 7)', async (t) => {
   const { server, port, channelConfig } = await makeAdminBroker(t);
-  await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'per-user');
+  await writeChannelIdentity(channelConfig, 'T1', 'C1', 'acme', 'person');
   try {
     const r = await post(port, '/v1/admin/reference', {
       handle: { provider: 'acme' }, identityToken: adminToken(), source: 'aws-sm', secretRef: AWS_ADMIN_REF,
@@ -2239,7 +2204,7 @@ test('#194 stale assertions cannot read resolve, status, or the channel manifest
       body: (identityToken: string) => ({ identityToken }),
       assertFresh: (json: any) => {
         const byId = Object.fromEntries(json.tools.map((tool: any) => [tool.provider, tool]));
-        assert.deepEqual(byId.acme, { provider: 'acme', mode: null, enabled: true, identity: 'acting_human' });
+        assert.deepEqual(byId.acme, { provider: 'acme', enabled: true, identity: 'person' });
         assert.equal(byId.svc.identity, 'service');
       },
     },
@@ -2404,8 +2369,8 @@ test('#55 /v1/manifest lists providers with their acting_human/service identity'
     const r = await get(port, '/v1/manifest');
     assert.equal(r.status, 200);
     const byId = Object.fromEntries(r.json.providers.map((p: any) => [p.provider, p.identity]));
-    assert.equal(byId.acme, 'acting_human');
-    assert.equal(byId.other, 'acting_human');
+    assert.equal(byId.acme, 'person');
+    assert.equal(byId.other, 'person');
     assert.equal(byId.svc, 'service');
   } finally {
     server.close();

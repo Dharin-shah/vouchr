@@ -4,11 +4,11 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { defineProvider, type Provider } from '../src/core/providers';
 import { createVouchr } from '../src/adapters/bolt';
-import { ChannelConfig, writeChannelMode } from '../src/core/channelConfig';
+import { ChannelConfig, writeChannelIdentity } from '../src/core/channelConfig';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import {
   CONFIGURE_CALLBACK, DISCONNECT_ACTION, homeView,
-  HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
+  HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_IDENTITY_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
 } from '../src/adapters/blocks';
 import { userOwner, channelOwner } from '../src/core/owner';
 import type { Db } from '../src/core/db';
@@ -116,7 +116,7 @@ async function harness(t: TestContext, opts: {
     }),
     selectChannel: (channel: string) => act(HOME_CHANNEL_ACTION, { action_id: HOME_CHANNEL_ACTION, selected_conversation: channel }),
     setMode: (p: string, mode: string, metaChannel: string | null = 'C_FIN') =>
-      act(HOME_MODE_ACTION, { block_id: `home_mode:${p}`, selected_option: { value: mode } }, metaChannel),
+      act(HOME_IDENTITY_ACTION, { block_id: `home_identity:${p}`, selected_option: { value: mode } }, metaChannel),
     toggleTool: (value: string, metaChannel: string | null = 'C_FIN') => act(HOME_TOOL_ACTION, { value }, metaChannel),
     configure: (p: string, metaChannel: string | null = 'C_FIN') => act(HOME_CONFIGURE_ACTION, { value: p }, metaChannel),
     disconnect: async (p: string) => act(DISCONNECT_ACTION, {
@@ -146,7 +146,7 @@ test('app_home_opened: everyone sees connections and the governance channel pick
   assert.match(s, /octo/); // external account shown
   assert.ok(s.includes(DISCONNECT_ACTION)); // per-row Disconnect (same flow as the modal)
   assert.ok(s.includes(HOME_CHANNEL_ACTION)); // the picker: membership is decided per picked channel (#322)
-  assert.ok(!s.includes(HOME_MODE_ACTION)); // no control rows until a channel is picked
+  assert.ok(!s.includes(HOME_IDENTITY_ACTION)); // no control rows until a channel is picked
 });
 
 test('selected App Home keeps production-path reads fixed and performs zero KMS unwraps (#209)', async (t) => {
@@ -182,25 +182,25 @@ test('member gate: a member gets rows for the picked channel; a non-member gets 
   const mine = await harness(t, { member: true });
   await mine.openHome('C_FIN');
   let s = JSON.stringify(mine.published().view.blocks);
-  assert.ok(s.includes(HOME_MODE_ACTION)); // the same membership predicate as the slash commands admitted them
+  assert.ok(s.includes(HOME_IDENTITY_ACTION)); // the same membership predicate as the slash commands admitted them
 
   const foreign = await harness(t, { member: false });
   await foreign.openHome('C_FIN');
   s = JSON.stringify(foreign.published().view.blocks);
   assert.ok(s.includes(HOME_CHANNEL_ACTION)); // still offered the picker
-  assert.ok(!s.includes(HOME_MODE_ACTION)); // but no controls for a channel they are not in
+  assert.ok(!s.includes(HOME_IDENTITY_ACTION)); // but no controls for a channel they are not in
   assert.match(s, /Only a current member of this channel/);
 });
 
-test('selecting a channel re-renders rows reflecting the stored mode + enablement', async (t) => {
+test('selecting a channel re-renders rows reflecting the stored identity + enablement', async (t) => {
   const h = await harness(t, { member: true });
-  await writeChannelMode(new ChannelConfig(h.lan.db), 'T1', 'C_FIN', 'mcp', 'session');
+  await writeChannelIdentity(new ChannelConfig(h.lan.db), 'T1', 'C_FIN', 'mcp', 'channel');
   await setChannelToolEnabled(new ChannelTools(h.lan.db), 'T1', 'C_FIN', 'mcp', false);
   await h.selectChannel('C_FIN');
   const view = h.published().view;
   assert.equal(JSON.parse(view.private_metadata).channel, 'C_FIN'); // selection persists for the next render
-  const modeBlock = view.blocks.find((b: any) => b.block_id === 'home_mode:mcp');
-  assert.equal(modeBlock.accessory.initial_option.value, 'session'); // current mode as the select's initial
+  const modeBlock = view.blocks.find((b: any) => b.block_id === 'home_identity:mcp');
+  assert.equal(modeBlock.accessory.initial_option.value, 'channel'); // current identity as the select's initial
   const toolBlock = view.blocks.find((b: any) => b.block_id === 'home_tool:mcp');
   const toggle = toolBlock.elements.find((e: any) => e.action_id === HOME_TOOL_ACTION);
   assert.equal(toggle.value, 'enable:mcp'); // disabled now → the button offers Enable
@@ -229,7 +229,7 @@ test('forged home mode action from a non-member: no write, audited denied', asyn
 test('forged invalid mode value never reaches state: shared cred survives, nothing audited', async (t) => {
   const h = await harness(t, { member: true });
   const owner = channelOwner('T1', 'C_FIN');
-  await writeChannelMode(new ChannelConfig(h.lan.db), 'T1', 'C_FIN', 'mcp', 'shared');
+  await writeChannelIdentity(new ChannelConfig(h.lan.db), 'T1', 'C_FIN', 'mcp', 'channel');
   await h.lan.vault.upsert(owner, 'mcp', CRED);
   await h.setMode('mcp', 'evil-mode');
   assert.equal(await modeRow(h.lan.db), 'shared');
@@ -296,7 +296,7 @@ test('archived selected channel renders a fail-closed note instead of controls',
   const h = await harness(t, { member: true, channelInfo: { is_archived: true } });
   await h.openHome('C_FIN');
   const s = JSON.stringify(h.published().view.blocks);
-  assert.ok(!s.includes(HOME_MODE_ACTION));
+  assert.ok(!s.includes(HOME_IDENTITY_ACTION));
   assert.match(s, /archived/);
 });
 
@@ -307,7 +307,7 @@ test('deleted selected channel (conversations.info fails) still publishes, with 
   assert.ok(view); // rendered gracefully, not crashed
   const s = JSON.stringify(view.blocks);
   assert.ok(s.includes(HOME_CHANNEL_ACTION)); // picker still there to choose another channel
-  assert.ok(!s.includes(HOME_MODE_ACTION));
+  assert.ok(!s.includes(HOME_IDENTITY_ACTION));
 });
 
 test('home Disconnect removes the connection and re-publishes the view without the row', async (t) => {
@@ -518,13 +518,13 @@ test('service tools: not advertised as connectable; governed via Enable/Disable 
   assert.match(avail.text.text, /oauth1/); // the brokered provider is advertised
   assert.doesNotMatch(avail.text.text, /svc/); // the service tool is not connect-on-demand
   // #111: ONE ROW PER REGISTERED PROVIDER — the service tool IS governable, Enable/Disable only.
-  const svcRow = view.blocks.find((b: any) => b.block_id === 'home_mode:svc');
+  const svcRow = view.blocks.find((b: any) => b.block_id === 'home_identity:svc');
   assert.ok(svcRow); // present in governance
   assert.equal(svcRow.accessory, undefined); // but no mode select (core refuses modes for it)
   const svcTools = view.blocks.find((b: any) => b.block_id === 'home_tool:svc');
   assert.ok(svcTools.elements.some((e: any) => e.action_id === HOME_TOOL_ACTION)); // Enable/Disable present
   assert.ok(!svcTools.elements.some((e: any) => e.action_id === HOME_CONFIGURE_ACTION)); // no Configure
-  const oauthRow = view.blocks.find((b: any) => b.block_id === 'home_mode:oauth1');
+  const oauthRow = view.blocks.find((b: any) => b.block_id === 'home_identity:oauth1');
   assert.equal(oauthRow.accessory.type, 'static_select'); // brokered rows keep the full control set
 
   // Enable/Disable on the service tool works end-to-end, identical to the slash equivalent.

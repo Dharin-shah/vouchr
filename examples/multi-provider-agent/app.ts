@@ -76,10 +76,10 @@ app.event('app_mention', async ({ context, event, client, say }) => {
   const actor = event.user;
   if (!actor) return;
 
-  // The channel's tool manifest IS the model's tool surface. `acting_human` entries are the ones
+  // The channel's tool manifest IS the model's tool surface. Non-service entries are the ones
   // Vouchr brokers; a `service` tool is the host's own to wire up, so it is not offered here.
   const manifest = await vouchr.toolManifest();
-  const usable = manifest.filter((t) => t.enabled && t.identity === 'acting_human').map((t) => t.provider);
+  const usable = manifest.filter((t) => t.enabled && t.identity !== 'service').map((t) => t.provider);
   if (!usable.length) {
     await say({ thread_ts: thread, text: 'No providers are enabled in this channel yet. A member of this channel can run `/vouchr enable <provider>`.' });
     return;
