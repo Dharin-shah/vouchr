@@ -55,9 +55,15 @@ app.event('app_mention', async ({ context, event, client }) => {
       if (!res.ok) return reply(`GitHub said ${res.status}: ${body.message ?? 'no message'}.`);
       return reply(`Opened ${body.html_url} as *${body.user.login}*.`);
     }
-    const gh = await context.vouchr.connect('github');
-    const me: any = await (await gh.fetch('https://api.github.com/user')).json();
-    await reply(`You are *${me.login}* on GitHub, ${me.public_repos} public repos.`);
+    if (/who am i/i.test(text)) {
+      const gh = await context.vouchr.connect('github');
+      const me: any = await (await gh.fetch('https://api.github.com/user')).json();
+      return reply(`You are *${me.login}* on GitHub, ${me.public_repos} public repos.`);
+    }
+    // No model behind this demo: two fixed phrases. A real agent decides which provider to call.
+    return reply(
+      'I know two things: `who am I` (reads GitHub as you) and `open an issue titled <title> in repo <owner>/<repo>` (a write, so a teammate approves first). Add `team` before `issue` to use the channel credential.',
+    );
   } catch (e) {
     // Vouchr already posted the Connect prompt or the Approve/Deny prompt.
     if (e instanceof ConsentRequiredError || e instanceof ApprovalRequiredError) return;
