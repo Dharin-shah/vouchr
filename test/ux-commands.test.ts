@@ -332,7 +332,7 @@ test('SEC-4: disconnect of an unknown provider writes no audit revoke row', asyn
   assert.deepEqual(events, []);
 });
 
-// A non-admin denial must not make a syntactically-valid but unrecognized argument durable. The
+// A non-member denial must not make a syntactically-valid but unrecognized argument durable. The
 // submitted value can be a credential pasted into the provider slot; unlike `meta`, the audit
 // provider column has no redaction layer. A fixed trusted denial subject is safe, the input is not.
 test('SEC-4: disconnect-shared non-member denial never audits an unrecognized submitted marker', async (t) => {

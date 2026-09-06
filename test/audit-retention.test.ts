@@ -73,8 +73,7 @@ test('audit plans: the ACTUAL production queries (+ the prune DELETE) ride an in
   const real = await openDb({ databaseUrl: url });
   t.after(() => real.close());
   const now = Date.now();
-  // 50k rows are enough for the planner to prefer the indexes (the plans are deterministic from
-  // there); the 1M-row EXPLAIN ANALYZE / P95 / WAL reference is the opt-in `bench:audit` harness (#208).
+  // 50k rows are enough for the planner to prefer the indexes (the plans are deterministic from there).
   await seed(url, 50_000, now);
 
   // Capture the SQL each production method actually issues (not a copy), then EXPLAIN THAT.

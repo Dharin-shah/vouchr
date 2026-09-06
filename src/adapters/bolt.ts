@@ -107,7 +107,7 @@ import {
   configModal, CONFIG_CALLBACK, DISCONNECT_ACTION,
   homeView, connectionLine, HOME_CALLBACK, HOME_CHANNEL_ACTION, HOME_MODE_ACTION, HOME_TOOL_ACTION, HOME_CONFIGURE_ACTION,
   escapeMrkdwn, blocksFallbackText, connectedDmText, oauthRecoveryBlocks,
-  type Connection, type ConfigAdminRow,
+  type Connection, type ConfigMemberRow,
 } from './blocks';
 
 /** Default session-grant safety ceiling: 8h. The thread binding is the real scope; this just caps
@@ -118,12 +118,6 @@ const DEFAULT_SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const DEFAULT_AUTHORIZATION_DELIVERY_INTERVAL_MS = 15_000;
 /** #296: rows one delivery pass may post. Bounds Slack work per interval; the rest wait a pass. */
 const MAX_AUTHORIZATION_DELIVERIES_PER_PASS = 50;
-
-// One-release tombstones for preview controls issued by a drained v7 replica. These handlers retain
-// no provider response, perform no share, and are deliberately not exported as a supported surface.
-const RETIRED_PREVIEW_ACTIONS = ['vouchr_preview_share', 'vouchr_preview_dismiss'] as const;
-const RETIRED_PREVIEW_MESSAGE =
-  'This preview expired because private previews were removed. Ask the agent again.';
 
 /** Aggressive default per-user connection lifetime: idle 7d, hard cap 30d. */
 const DEFAULT_TTL: TtlPolicy = { idleMs: 7 * 24 * 60 * 60 * 1000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 };
@@ -156,10 +150,7 @@ function parseConfigMetadata(value: unknown): { channel: string; open: ConfigOpe
       !entry || typeof entry !== 'object' ||
       typeof entry.p !== 'string' || !isValidProviderId(entry.p) || seen.has(entry.p) ||
       !(entry.m === null || isChannelMode(entry.m)) ||
-      typeof entry.e !== 'boolean' ||
-      // A pre-removal modal carries `v`. Reject it as stale so rolling-version overlap cannot
-      // silently confirm mode/tool changes from a form that also contained a removed preview toggle.
-      Object.hasOwn(entry, 'v')
+      typeof entry.e !== 'boolean'
     ) return null;
     seen.add(entry.p);
   }
@@ -3652,7 +3643,7 @@ export async function createVouchr(opts: VouchrOptions) {
       // mode+enabled controls, meaningless for them). The App Home instead renders every
       // row and per-row picks which controls a service tool gets (Enable/Disable only).
       const admin = member && channelId
-        ? adminToolRows(manifest.tools, manifest.toolAllowed).filter((r) => isBrokeredProvider(r))
+        ? memberToolRows(manifest.tools, manifest.toolAllowed).filter((r) => isBrokeredProvider(r))
         : undefined;
       return configModal({ channel: channelId, connections, tools: manifest.tools, admin });
     }
@@ -3668,10 +3659,10 @@ export async function createVouchr(opts: VouchrOptions) {
      * disable (config-modal findings 3/1); the manifest keeps the intersected value for the
      * read-only displays.
      */
-    function adminToolRows(
+    function memberToolRows(
       tools: ToolManifestEntry[],
       toolAllowed: (provider: string) => boolean,
-    ): ConfigAdminRow[] {
+    ): ConfigMemberRow[] {
       // Raw tool-allowlist bit (NOT the manifest's policy-intersected `enabled`) reuses the manifest's
       // channel snapshot, so governance rendering adds no query and cannot drift to a second DB window.
       return tools.map((t) => ({
@@ -3862,10 +3853,10 @@ export async function createVouchr(opts: VouchrOptions) {
       const connections = await listBrokeredConnections(identity);
       // "Available providers" advertises connect-on-demand, so it lists only providers Vouchr
       // actually brokers a user credential for — a service tool must not be advertised as
-      // connectable. Governance rows are separate (adminToolRows, same brokered filter as the modal).
+      // connectable. Governance rows are separate (memberToolRows, same brokered filter as the modal).
       const connectable = providerIds.filter((p) => isBrokeredProvider(registry.get(p)));
 
-      let governance: { channel: string | null; note?: string; tools?: ConfigAdminRow[] } = { channel: selected };
+      let governance: { channel: string | null; note?: string; tools?: ConfigMemberRow[] } = { channel: selected };
       if (selected) {
         let info: ChannelInfo | null = null;
         try { info = ((await client.conversations.info({ channel: selected })) as any)?.channel ?? null; } catch { info = null; }
@@ -3876,7 +3867,7 @@ export async function createVouchr(opts: VouchrOptions) {
           governance = { channel: selected, note: memberOnly('configure this channel') };
         } else {
           const manifest = await manifestSnapshotFor(identity, selected, selected);
-          governance = { channel: selected, tools: adminToolRows(manifest.tools, manifest.toolAllowed) };
+          governance = { channel: selected, tools: memberToolRows(manifest.tools, manifest.toolAllowed) };
         }
       }
       // Ownership stamp: ONLY this internal publisher marks the view as Vouchr's and carries the
@@ -4426,16 +4417,6 @@ export async function createVouchr(opts: VouchrOptions) {
     };
     app.action(APPROVAL_APPROVE_ACTION, (a: any) => handleApprovalDecision(a, 'approve'));
     app.action(APPROVAL_DENY_ACTION, (a: any) => handleApprovalDecision(a, 'deny'));
-
-    // A pre-cutover ephemeral message can outlive the v7 process that created it. Ack its old
-    // controls before doing anything else, then replace the private message with fixed guidance.
-    // Never inspect/repost the old message body: v8 owns no preview data or share capability.
-    const expireRetiredPreview = async ({ ack, respond }: any) => {
-      await ack();
-      if (respond) await respond({ replace_original: true, text: RETIRED_PREVIEW_MESSAGE });
-    };
-    for (const action of RETIRED_PREVIEW_ACTIONS) app.action(action, expireRetiredPreview);
-
   }
 
   /** Remove all of a user's own connections + pending consent + thread sessions (offboarding).

@@ -457,14 +457,14 @@ test('sweep 3x in a row still sends ONE expiring-soon DM (persistent debounce th
   assert.match(dms[0].text, /Your acme connection expires in ~70h\. Reconnect to keep using it\./);
 });
 
-test('channel-owned credential: the expiring-soon DM goes to the configuring admin, or is skipped when unknown', async (t) => {
+test('channel-owned credential: the expiring-soon DM goes to the configuring member, or is skipped when unknown', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY, { maxAgeMs: 100 * H });
   const audit = new Audit(db);
   const consent = new Consent(db);
   const registry = new ProviderRegistry([acme()]);
   const now = Date.now();
-  // C9: configured by UADMIN (an audit 'config' row exists) → DM the admin, mentioning the channel.
+  // C9: configured by UADMIN (an audit 'config' row exists) → DM the member, mentioning the channel.
   await vault.upsert(channelOwner('T1', 'C9'), 'acme', { accessToken: 'a', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   await ageRow(db, 'C9', 'channel', 'acme', now - 30 * H, now - 30 * H);
   await audit.record('config', { enterpriseId: null, teamId: 'T1', userId: 'UADMIN' }, 'acme', { owner: 'channel', channel: 'C9', mode: 'shared' });

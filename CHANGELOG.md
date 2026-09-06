@@ -1,9 +1,17 @@
 # Changelog
 
 All notable changes to this project are documented here. This project adheres to
-[Semantic Versioning](https://semver.org/). Pre-1.0: minor versions may carry breaking changes.
+[Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [1.0.0] — 2026-09-06
+
+First production release. Approvals go to the team that owns the channel, background agents can
+ask for permission through the broker, the one supported deployment is proven on the image in CI,
+and a release is built once from protected main. Upgrade from `1.0.0-beta.1` with `vouchr migrate`
+(schema v15) after reading the Removed section: the workspace-admin role is gone.
+
 
 ### Security
 
@@ -27,15 +35,15 @@ All notable changes to this project are documented here. This project adheres to
   flip can neither leave a bypassable unenforced row behind a verify-hop URL nor a dead-end
   enforced row behind a direct URL. Schema v14 adds both columns (run `vouchr migrate`; **do not
   enable the flag while any v13 process is still live** — see DEPLOYMENT § v13 → v14 for the
-  required rollout order). Off by default in
-  the beta (no behaviour change unless enabled); slated ON-by-default for GA. Regression:
+  required rollout order). Off by default;
+  recommended for production deployments. Regression:
   `test/browser-identity.test.ts`. See guides/THREAT-MODEL.md § "Forwarded consent link" and
   guides/DEPLOYMENT.md § "Browser Slack-identity verification".
 
 ### Removed
 
 - **The workspace-admin role is gone (#322): the channel is the team and the trust boundary.**
-  Breaking for the beta. Every place that used to ask "is this user a Slack workspace admin/owner?"
+  Breaking change from `1.0.0-beta.1`. Every place that used to ask "is this user a Slack workspace admin/owner?"
   now asks "is this user a current member of this channel?", read from `conversations.members`
   and fail-closed. Removed, with no replacement knob:
   - `createVouchr({ isAdmin })` and `createVouchr({ allowChannelCreatorConfig })`, and the
@@ -58,8 +66,20 @@ All notable changes to this project are documented here. This project adheres to
   Rationale and the honest tradeoff (in a public channel every member can configure and approve, so
   govern agents from channels whose membership you control) are in guides/THREAT-MODEL.md.
 
+- `SecretReference` is no longer re-exported from `@vouchr/core` / `@vouchr/core/headless` (ADOPT-1):
+  it is the internal normalized shape of the reference path and no exported function, option, or
+  response carries it.
+- `SecretReferenceInput` is no longer re-exported from either entry point (ADOPT-1): the same
+  internal path's `unknown`-typed input; `ConnectContext.referenceUserSecret`/`referenceChannelSecret`
+  and the `/v1/{admin,user}/reference` routes declare their own request shapes. `SecretReferenceError`,
+  `SECRET_REFERENCE_ERROR_CODES`/`SecretReferenceErrorCode`, and
+  `SECRET_REFERENCE_SOURCES`/`SecretReferenceSource` stay exported.
+- `ConfigAdminRow` is no longer exported (ADOPT-1). It is renamed to `ConfigMemberRow` with the same
+  shape: the rows describe what a channel member can configure, and there is no admin role.
+
 ### Added
 
+- `ConfigMemberRow` type export: the former `ConfigAdminRow`, same shape (ADOPT-1).
 - **`approver: 'member'` (#322): any other member of the owning channel approves an agent's
   sensitive action.** The prompt is posted as one regular message in the channel (in the originating
   thread when there is one) through the existing cross-replica delivery lease, so two replicas post
@@ -173,17 +193,6 @@ All notable changes to this project are documented here. This project adheres to
   guides/DEPLOYMENT.md § Migrations. (Superseded as the current version by v14 above; the v13
   conversion still runs unchanged on the way through.)
 
-### Removed
-
-- `SecretReference` is no longer re-exported from `@vouchr/core` / `@vouchr/core/headless` (ADOPT-1):
-  it is the internal normalized shape of the reference path and no exported function, option, or
-  response carries it.
-- `SecretReferenceInput` is no longer re-exported from either entry point (ADOPT-1): the same
-  internal path's `unknown`-typed input; `ConnectContext.referenceUserSecret`/`referenceChannelSecret`
-  and the `/v1/{admin,user}/reference` routes declare their own request shapes. `SecretReferenceError`,
-  `SECRET_REFERENCE_ERROR_CODES`/`SecretReferenceErrorCode`, and
-  `SECRET_REFERENCE_SOURCES`/`SecretReferenceSource` stay exported.
-
 ### Docs
 
 - HEADLESS.md gained a route index (every broker route, where the identity rides, and its exported
@@ -191,7 +200,7 @@ All notable changes to this project are documented here. This project adheres to
   machine-readable contract (#278).
 - Pruned pre-beta upgrade paths from the guides (the bare-secret broker cutover and the headless
   TTL-default note, both older than `1.0.0-beta`), and aligned README, SECURITY's support table,
-  and `vision.md` on the shipped `1.0.0-beta.1` release: beta, not yet independently assessed.
+  and `vision.md` on the shipped release.
 
 ## [1.0.0-beta.1] — 2026-07-26
 

@@ -143,7 +143,7 @@ export class Audit {
    *
    *  "Distinct humans" = `COALESCE(actor, user_id)`: an inject row's `actor` is null and `user_id` IS
    *  the requester, so this counts requesters (the COALESCE also covers any future non-null actor).
-   *  Counts are numeric on both backends (SQLite native; Postgres via the global int8 parser in db.ts)
+   *  Counts arrive numeric through the global int8 parser in db.ts,
    *  and Postgres lowercases unquoted aliases, so we alias in snake_case and coerce with Number()
    *  defensively. */
   async statsByChannel(teamId: string, channelId: string, sinceEpoch: number): Promise<StatsRow[]> {

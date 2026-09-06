@@ -14,7 +14,7 @@ const KEY = randomBytes(32);
 const uid = (userId: string) => ({ enterpriseId: null, teamId: 'T1', userId });
 const tok = { accessToken: 'sk-secret', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null };
 
-// #107 /vouchr stats — admin per-channel usage analytics. Core query scoping + the command's admin
+// #107 /vouchr stats — per-channel usage analytics. Core query scoping + the command's membership
 // gate and enabled-but-idle flag.
 
 const mk = (id: string) => defineProvider({

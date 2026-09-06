@@ -79,8 +79,8 @@ export class DbInstallationStore implements InstallationStore {
   /**
    * Deterministic row key. Mirrors Bolt's keying: an enterprise (org-wide) install is
    * keyed by enterprise id alone (no team segment); every other install by
-   * enterprise+team. An explicit key column sidesteps the SQLite/Postgres difference in
-   * how NULLs behave inside a UNIQUE constraint.
+   * enterprise+team. An explicit key column avoids relying on how NULLs behave inside
+   * a UNIQUE constraint.
    */
   private static rowKey(
     enterpriseId: string | undefined,

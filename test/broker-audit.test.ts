@@ -14,7 +14,7 @@ import { identityConfig, signIdentity, type IdentityClaims } from './support/ide
 import type { SlackIdentity } from '../src/core/identity';
 
 // Headless /v1/audit parity (#150). Same invariants as the Slack /vouchr audit (#104): a caller only
-// ever reads their OWN rows, `audit channel` is admin-gated on the SIGNED claim, and `meta` is never
+// ever reads their OWN rows, `audit channel` is channel-gated on the SIGNED claim, and `meta` is never
 // returned. Scoping is enforced in core; these tests drive it through the real HTTP surface.
 
 const KEY = randomBytes(32);

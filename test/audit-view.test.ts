@@ -8,7 +8,7 @@ import { defineProvider } from '../src/core/providers';
 import type { SlackIdentity } from '../src/core/identity';
 
 // /vouchr audit — the self-service usage view (#104). Two security requirements under test:
-// a non-admin only ever sees rows attributed to their own user id, and meta is never rendered.
+// a caller only ever sees rows attributed to their own user id, and meta is never rendered.
 
 const provider = defineProvider({
   id: 'mcp', authorizeUrl: 'https://x/a', tokenUrl: 'https://x/t', scopesDefault: [],
@@ -87,7 +87,7 @@ test('audit: surfaces the non-caller actor (e.g. an approver) via the actor colu
 test('configure: an unknown (e.g. credential-shaped) provider is rejected before it is ever audited', async (t) => {
   const { audit, run } = await harness(t); // non-admin caller
   const res = await run('connect-shared ghp_looks_like_a_secret_0000', 'U_A');
-  assert.match(String(res), /Unknown provider/); // rejected before the admin gate / any record()
+  assert.match(String(res), /Unknown provider/); // rejected before the membership gate / any record()
   // The bogus value must NOT have been written to the audit provider column (no reflection surface).
   const rows = await audit.listByOwnerUser(id('U_A'), 20);
   assert.equal(rows.length, 0);

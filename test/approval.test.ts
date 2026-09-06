@@ -211,7 +211,7 @@ async function harness(t: TestContext, o: {
   };
   await vouchr.middleware(args);
   const ctx = args.context.vouchr;
-  // Deny-by-default: a channel enables no provider until an admin opts it in. Mirror that setup so
+  // Deny-by-default: a channel enables no provider until a member opts it in. Mirror that setup so
   // these tests exercise the approval/egress flow rather than tripping the tool gate first.
   if (channel) await setChannelToolEnabled(new ChannelTools(vouchr.db), 'T1', channel, provider.id, true);
   if (o.sharedChannel) {

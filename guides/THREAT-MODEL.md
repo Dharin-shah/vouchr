@@ -468,8 +468,7 @@ initiator's turns.
   and workspace AND links to that user's Slack profile (a `slack://user` deep link, so the completer
   can recognize *who* it is, not just an opaque id), and — when a provider account label is known
   (it can be null) — names that account. On Bolt, the initiator also receives the success DM. The
-  provider's own consent screen names the app. The flag is opt-in during the beta and slated
-  ON-by-default for GA (#302); it is not required for a supervised single-workspace pilot.
+  provider's own consent screen names the app. The flag is opt-in and recommended for production (#302); it is not required for a supervised single-workspace pilot.
 
 ### Deactivated user
 
@@ -596,6 +595,8 @@ non-goals live in [SECURITY.md -> "What Vouchr does not protect against"](../SEC
 - Disconnect/offboard deletes locally first; upstream revocation is best-effort.
 - Audit metadata is caller-supplied; don't put secrets in it.
 - The Postgres database is not wholly encrypted at rest.
+- A malicious self-hosted operator or full KMS/root-key compromise is outside Vouchr's protection:
+  root on the host, the KMS key, or the master key reads every stored credential.
 - Audit completeness is best-effort, not guaranteed (see below).
 
 ### Audit completeness is best-effort by design

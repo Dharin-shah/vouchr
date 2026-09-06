@@ -131,7 +131,7 @@ export {
   configModal,
   CONFIG_CALLBACK,
 } from './adapters/blocks';
-export type { Connection, ToolRow, ConfigAdminRow } from './adapters/blocks';
+export type { Connection, ToolRow, ConfigMemberRow } from './adapters/blocks';
 export type { TtlPolicy } from './core/vault';
 export type { EnvelopeProvider } from './core/crypto';
 // #115 master-key rotation for the direct (non-KMS) path: loadKeyring reads VOUCHR_MASTER_KEY

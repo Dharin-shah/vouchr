@@ -15,7 +15,7 @@ callback `${PUBLIC_URL}/vouchr/oauth/callback`, PostgreSQL, and the tunnel. Then
 in:
 
 ```bash
-npm run cli -- migrate   # once — the runtime is DML-only and never creates tables
+VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr npm run cli -- migrate   # once; the running app never creates tables, and the CLI does not read .env
 npm run example:github
 ```
 

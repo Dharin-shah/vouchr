@@ -37,7 +37,7 @@ const seedDry = (v: Vault, id: SlackIdentity, provider: string, extra: Partial<S
 /** A no-op envelope provider: its mere PRESENCE (not any call) must make dry-run refuse at startup. */
 const fakeEnvelope = { wrapDataKey: async (d: Buffer) => d, unwrapDataKey: async (w: Buffer) => w };
 
-/** Deny-by-default: opt providers into channel C1 (team T1), exactly as an admin's `/vouchr enable`
+/** Deny-by-default: opt providers into channel C1 (team T1), exactly as a member's `/vouchr enable`
  *  would, so a governed test reaches consent instead of ToolDisabledError. Raw fixture write (no audit). */
 const enableC1 = async (db: Db, ...providerIds: string[]) => {
   for (const id of providerIds) await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', id, true);

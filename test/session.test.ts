@@ -218,7 +218,7 @@ async function setup(t: TestContext, ghMode: 'session' | 'per-user' | 'shared' =
   const sessions = new SessionGrants(db);
   const channelConfig = new ChannelConfig(db);
   await writeChannelMode(channelConfig, 'T1', 'C1', 'gh', ghMode);
-  // Deny-by-default: opt gh into the channel these tests exercise (as an admin `/vouchr enable` would).
+  // Deny-by-default: opt gh into the channel these tests exercise (as a member `/vouchr enable` would).
   await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'gh', true);
   const posted: any[] = [];
   const client = { chat: { postEphemeral: async (p: any) => { posted.push(p); return {}; } } } as any;
@@ -270,7 +270,7 @@ async function sessionHarness(t: TestContext, o: {
       postMessage: async (payload: any) => { dms.push(payload); return {}; },
     },
   } as any;
-  // Deny-by-default: opt the registered providers into C1 (as an admin `/vouchr enable` would). Tests
+  // Deny-by-default: opt the registered providers into C1 (as a member `/vouchr enable` would). Tests
   // that assert a denial set their own session/shared state on top of this.
   for (const p of providers) {
     await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', p.id, true);

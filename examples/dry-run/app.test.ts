@@ -61,7 +61,7 @@ test('dry-run example: consent prompt, programmatic connect, real egress gates, 
   // 0. Deny-by-default: a channel member opts the provider into this channel first — in production that's
   //    `/vouchr enable github` (or the App Home toggle). Without it, the first connect() is refused
   //    with ToolDisabledError before any consent flow. (DMs are exempt and need no enable.)
-  await vouchr.dryRun!.enableTool({ enterpriseId: null, teamId: 'T1', userId: 'U_ADMIN' }, 'C1', 'github');
+  await vouchr.dryRun!.enableTool({ enterpriseId: null, teamId: 'T1', userId: 'U_MEMBER' }, 'C1', 'github');
 
   // 1. First mention: not connected yet → the handler stops; the REAL Connect prompt was posted.
   await handleMention(args);

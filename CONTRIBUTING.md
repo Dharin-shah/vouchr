@@ -29,9 +29,8 @@ needs the container from `npm run pg:up` and fails if it is unreachable.
 
 - One concern per PR; keep the diff focused and match surrounding style.
 - Non-trivial logic ships with a runnable test (`node:test`); flows get an integration test.
-  CI reports per-file `src/**` coverage (`npm run test:coverage`) on the Node 22 leg — new code
-  should keep it moving up, never down. (Visibility today; a failing floor lands once the baseline
-  is established, and only ever ratchets upward.)
+  CI enforces a coverage floor on the Node 22 leg (`npm run test:coverage`: lines 95, branches 87,
+  see `.github/workflows/ci.yml`). New code keeps it moving up, never down.
 - Never weaken the security invariants: tokens stay out of logs, messages, the audit
   table, and tool schemas; keep the egress allowlist and single-use OAuth `state`.
 - If the correct approach isn't feasible, raise it in the PR instead of faking it.
@@ -55,7 +54,7 @@ The package is published to npm as `@vouchr/core` by `.github/workflows/release.
 which runs only on a `v*` tag and requires the tag to match `package.json`'s version.
 To cut a release:
 
-1. Bump `version` in `package.json` (SemVer; pre-1.0 minors may carry breaking changes).
+1. Bump `version` in `package.json` (SemVer).
 2. Add a `## [x.y.z]` heading to `CHANGELOG.md` describing the changes.
 3. Confirm `npm run typecheck` and `npm test` are green, including the Postgres path
    (`npm run pg:up` then `npm test`).

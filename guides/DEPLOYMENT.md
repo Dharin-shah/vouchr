@@ -355,7 +355,7 @@ Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST
 `POST /v1/mcp`, `POST /v1/resolve`, `POST /v1/disconnect`, `POST /v1/admin/offboard`, `POST /v1/status`,
 `POST /v1/audit` (the caller's own credential-usage trail), `POST /v1/user/reference`,
 `GET /v1/manifest`, `POST /v1/manifest`, `POST /v1/admin/tools`, `GET /v1/admin/config`,
-`POST /v1/admin/audit` (that channel's usage, admin claim), `GET /healthz` (liveness, alias
+`POST /v1/admin/audit` (that channel's usage, signed channel claim), `GET /healthz` (liveness, alias
 `/health`), and `GET /readyz` (readiness). When channel modes are enabled it additionally makes
 `POST /v1/admin/mode` and `POST /v1/admin/reference` usable. The service listens on `VOUCHR_PORT`
 (default 3000) and runs the TTL sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it
@@ -427,7 +427,7 @@ Slack app configuration: add `"$VOUCHR_BASE_URL/oauth/slack"` (Bolt:
 needed (`openid` is a user-consented sign-in scope requested at the hop). Startup fails closed
 when the flag is set without both OIDC credentials or without `VOUCHR_BASE_URL`, and the flag is
 incompatible with `VOUCHR_DRY_RUN` (the synthetic authorize URL never passes the hop). The flag is
-opt-in during the beta and slated ON-by-default for GA (#302).
+opt-in and recommended for production (#302).
 
 ### Convenience: batch status + manifest (#55)
 
@@ -964,7 +964,7 @@ Vouchr ships two ways; pick by how your platform builds:
 
   **`:latest` is stale — do not use it.** The release workflow tags images with the exact version
   (`type=semver`), and `latest` only moves on a *stable* release, so it still points at the
-  pre-PostgreSQL `0.2.0` image. Use the explicit version tag (`1.0.0-beta.1`) or, better, the digest
+  pre-PostgreSQL `0.2.0` image. Use the explicit version tag (`1.0.0`) or, better, the digest
   you verified below.
 
 ### Running the image
@@ -973,7 +973,7 @@ Migrate first, then start the broker. Both use the same image; the migrate step 
 schema-owner URL and the runtime the DML-only one (see [Migrations](#migrations)):
 
 ```bash
-IMAGE=ghcr.io/dharin-shah/vouchr-broker:1.0.0-beta.1
+IMAGE=ghcr.io/dharin-shah/vouchr-broker:1.0.0
 docker run --rm -e VOUCHR_DATABASE_URL="postgres://vouchr_owner:...@host:5432/vouchr" \
   "$IMAGE" node dist/bin/vouchr.js migrate
 docker run -d --name vouchr-broker -p 3000:3000 \

@@ -539,7 +539,7 @@ test('#240 packaged broker shares and enforces channel governance across every d
     await built.db.exec(`ALTER TABLE audit DROP CONSTRAINT issue240_reject_config_audit`);
 
     // Once the audit sink recovers, the same route commits the full allowlist and audit together.
-    // Deny-by-default: an admin opts providers IN, so an ENABLE is the real change that writes + audits.
+    // Deny-by-default: a member opts providers IN, so an ENABLE is the real change that writes + audits.
     // Opting mcp-governed in materializes the explicit allowlist (fetcher stays off) in one transaction.
     const enabled = await requestJson(port, 'POST', '/v1/admin/tools', {
       provider: 'mcp-governed',

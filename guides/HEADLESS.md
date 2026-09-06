@@ -4,7 +4,7 @@ Use `createBroker()` when your Slack-facing service and agent worker are separat
 The Slack-facing service verifies the user, mints a short-lived identity token, and workers call
 Vouchr over HTTP. The token stays inside Vouchr.
 
-If Slack should remain the built-in human/admin experience, start with the
+If Slack should remain the built-in human experience, start with the
 [hybrid Slack control-plane guide](./HYBRID.md). This document is the lower-level HTTP/API contract.
 
 > [!NOTE]

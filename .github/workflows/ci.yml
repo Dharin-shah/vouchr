@@ -81,7 +81,7 @@ jobs:
           VOUCHR_TEST_SEED: ${{ github.event_name == 'schedule' && github.run_id || 20260905 }}
           VOUCHR_TEST_ITERS: ${{ github.event_name == 'schedule' && 25 || 1 }}
       # The advertised runnable dry-run example is a blocking regression: it exercises the real
-      # first-use flow (admin enable → consent → egress gates) end to end, so a change like
+      # first-use flow (member enable → consent → egress gates) end to end, so a change like
       # deny-by-default that breaks first use fails here instead of only in a user's repo.
       - run: npm run example:dry-run
 
