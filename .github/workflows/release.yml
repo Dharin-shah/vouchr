@@ -212,25 +212,18 @@ jobs:
       # release on the exact verification guides/DEPLOYMENT.md tells deployers to run: if a deployer's
       # `cosign verify` wouldn't succeed, the release fails here instead of shipping unverifiable.
       - name: cosign sign + attest SBOM, then verify (release gate)
+        # Each command writes to a file, not the step's pipes: on v1.0.0 and v1.1.0 the step sat 25 to
+        # 45 minutes after the last line of output because the runner keeps a step open while any
+        # process that inherited its stdout is alive, and cosign leaves one behind (#337). With the
+        # output in a file the step ends when the shell does.
         run: |
-          cosign sign --yes "$IMAGE_REF"
-          cosign attest --yes --type cyclonedx --predicate sbom-image.cdx.json "$IMAGE_REF"
+          run() { "$@" > cosign.out 2>&1 < /dev/null; rc=$?; cat cosign.out; return "$rc"; }
+          run cosign sign --yes "$IMAGE_REF"
+          run cosign attest --yes --type cyclonedx --predicate sbom-image.cdx.json "$IMAGE_REF"
           CERT_ID="^https://github\.com/${GITHUB_REPOSITORY}/\.github/workflows/release\.yml@refs/tags/v"
-          # cosign prints its verification block only after a successful verification, then has stayed
-          # alive for 24 to 44 minutes before exiting on both tag releases so far (#337). Bound the exit:
-          # a kill after the block is printed counts as verified; every other non-zero exit stays fatal.
-          verified() {
-            local out rc=0
-            out="$(timeout 300 cosign "$@" 2>&1)" || rc=$?
-            printf '%s\n' "$out"
-            if [ "$rc" -eq 124 ] && printf '%s' "$out" | grep -q 'The following checks were performed'; then
-              echo "::warning::cosign $1 verified but did not exit within 300s (#337)"; rc=0
-            fi
-            return "$rc"
-          }
-          verified verify --certificate-identity-regexp "$CERT_ID" \
+          run cosign verify --certificate-identity-regexp "$CERT_ID" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
-          verified verify-attestation --type cyclonedx --certificate-identity-regexp "$CERT_ID" \
+          run cosign verify-attestation --type cyclonedx --certificate-identity-regexp "$CERT_ID" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com "$IMAGE_REF"
 
   # After the artifacts publish, cut the GitHub Release from the CHANGELOG so the notes match exactly
