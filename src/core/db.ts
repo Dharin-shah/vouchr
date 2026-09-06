@@ -174,43 +174,27 @@ class PgClientDb implements Db {
 
 /**
  * Version of the schema this build writes, stamped into the `meta` table by the migration command.
- * The lineage stays MONOTONIC — never reset it, or an older marker would be wrongly refused as
- * "newer" by {@link guardSchemaVersion}. Versions 1-11 predate the published releases: v1-v6 are
- * the pre-#204 dual-backend era (v6 its last stamp), and v7-v11 only ever existed on unreleased
- * main between releases — no released version shipped them, so none are migratable here. Data on
- * a v6-v11 schema can first be carried to v12 by v1.0.0-beta.1's migrate; earlier schemas must be
- * recreated fresh.
- * Version 12 is the first published beta schema (v1.0.0-beta / v1.0.0-beta.1). Version 13 moves
- * every PostgreSQL-clock lifecycle-fence timestamp from millisecond to microsecond resolution
- * (#290) so unrelated operations no longer tie inside the clock's truncation window. Version 14
- * adds `consent_request.slack_verified_at` + `slack_verify_required` — the browser Slack-identity
- * verification stamp and the minted-time requirement the OAuth callback enforces (#302). Version 15
- * adds `approval_request.binding_message` — the plain transaction statement of a backchannel
- * (agent-initiated, CIBA-style) authorization request, and the marker that the Bolt control plane
- * delivers its decision surface on a timer instead of waiting for a relayed denial (#296).
- * `migrate()` accepts v12-v15 and applies every idempotent cleanup before stamping 15.
- * The `meta` marker fails a downgrade closed rather than letting rolling versions interpret stored
- * controls differently.
+ * Version 1 is the whole current schema in one DDL (#340): Vouchr is greenfield, so the 1.0.0
+ * migration ladder (v12-v15 and its data conversions) was deleted rather than carried, and a
+ * database stamped with any other version is recreated fresh. Future schema changes add steps from
+ * v1 and bump this number; the lineage stays MONOTONIC from here. The `meta` marker keeps a
+ * mismatched binary off the data: `openDb` requires exactly this version, so rolling versions can
+ * never interpret stored controls differently.
  */
-export const SCHEMA_VERSION = 15;
-export const MIGRATABLE_SCHEMA_VERSIONS = new Set([12, 13, 14, SCHEMA_VERSION]);
+export const SCHEMA_VERSION = 1;
 
 // The marker table. TEXT-only, so it needs no engine type parameterization.
 const META_DDL = `CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`;
 
 /**
- * Migration entry guard — runs BEFORE any DDL. `migrate()` creates a fresh baseline, carries a
- * v12-v14 database to v15, or idempotently verifies v15. The ONLY inputs it can correctly converge are:
+ * Migration entry guard — runs BEFORE any DDL. `migrate()` creates a fresh baseline or idempotently
+ * verifies one already at {@link SCHEMA_VERSION}. The ONLY inputs it can correctly converge are:
  *  - a genuinely FRESH schema (no version marker AND no vouchr tables) → baseline;
- *  - a v12 database → the ms→µs lifecycle-fence timestamp conversion (#290);
- *  - a v13 database → the browser Slack-identity verification columns on consent (#302);
- *  - a v14 database → the backchannel authorization binding-message column (#296);
- *  - a v15 database → idempotent no-op.
- * Everything else fails closed rather than getting stamped v15 over an unknown shape (a v1–v11
- * marker — none of which any published release shipped — a pre-marker legacy schema whose columns
- * this build never created, or a NEWER-than-v15 downgrade — which would let old code corrupt
- * encrypted rows). The fix for a rejected database is to recreate it fresh (or migrate through
- * v1.0.0-beta.1 first), not to add historical migrations.
+ *  - a database already at this version → idempotent no-op.
+ * Everything else fails closed rather than getting stamped over an unknown shape: a marker from the
+ * deleted 1.0.0 ladder (v12-v15), a pre-marker legacy schema whose columns this build never
+ * created, or a newer version this build does not know. The fix for a rejected database is to
+ * recreate it fresh, not to add historical migrations.
  */
 async function guardSchemaVersion(db: Db): Promise<number | null> {
   // Probe the marker WITHOUT creating `meta` first, so a genuinely empty schema is distinguishable
@@ -239,21 +223,13 @@ async function guardSchemaVersion(db: Db): Promise<number | null> {
     await db.exec(META_DDL); // fresh → ensure the marker table exists for the version stamp
     return null; // migrate() creates the baseline and stamps SCHEMA_VERSION
   }
-  const row = marker;
-  const found = Number(row.value);
-  if (!Number.isInteger(found)) throw new Error(`vouchr: unreadable schema_version "${row.value}".`);
-  if (found > SCHEMA_VERSION) {
-    throw new Error(
-      `vouchr: this database reports schema version ${found}, newer than this build (${SCHEMA_VERSION}). ` +
-        'Refusing to open it: old code against a newer schema could corrupt encrypted credential rows. ' +
-        'Upgrade the vouchr package.',
-    );
-  }
-  if (!MIGRATABLE_SCHEMA_VERSIONS.has(found)) {
+  const found = Number(marker.value);
+  if (!Number.isInteger(found)) throw new Error(`vouchr: unreadable schema_version "${marker.value}".`);
+  if (found !== SCHEMA_VERSION) {
     throw new Error(
       `vouchr: schema version ${found} is not supported for migration. Only a fresh database, or one at ` +
-        `version 12, 13, 14, or ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`. ` +
-        `To keep data on a v6-v11 development schema, run v1.0.0-beta.1's \`vouchr migrate\` first (it carries v6-v11 to v12), then upgrade.`,
+        `version ${SCHEMA_VERSION}, can be migrated — recreate the database fresh and run \`vouchr migrate\`. ` +
+        'There is no data migration from a 1.0.0 (schema 15) or earlier database.',
     );
   }
   return found;
@@ -268,9 +244,9 @@ async function stampSchemaVersion(db: Db): Promise<void> {
   );
 }
 
-/** The single baseline schema DDL (PostgreSQL). Defined once at its final shape (#204) — no
+/** The single schema DDL (PostgreSQL). Defined once at its current shape (#204, #340) — no
  *  incremental migration history, because greenfield means there are no deployed databases to
- *  migrate. Idempotent (CREATE TABLE IF NOT EXISTS) so the boot path can run it unconditionally. */
+ *  migrate. Idempotent (CREATE ... IF NOT EXISTS) so `migrate()` can run it unconditionally. */
 function schema(): string {
   const blob = 'BYTEA';
   const int = 'BIGINT';
@@ -311,9 +287,16 @@ function schema(): string {
       delivery_token TEXT,
       delivery_lease_expires_at ${int} NOT NULL DEFAULT 0,
       delivered_at ${int},
-      slack_verified_at ${int},
-      slack_verify_required ${int} NOT NULL DEFAULT 0
+      -- #302: when the browser completing this consent proved the bound Slack identity through the
+      -- Slack OIDC hop. NULL until then; the OAuth callback refuses an unstamped row.
+      slack_verified_at ${int}
     );
+    -- Runtime recovery sweeps use created_at as an exact range condition; the partial unique index
+    -- enforces the single-active-generation consent invariant.
+    CREATE INDEX IF NOT EXISTS idx_consent_request_created_at ON consent_request (created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_consent_request_active
+      ON consent_request (team_id, user_id, provider)
+      WHERE superseded_at IS NULL;
 
     CREATE TABLE IF NOT EXISTS user_provisioning_request (
       id TEXT PRIMARY KEY,
@@ -454,6 +437,8 @@ function schema(): string {
       -- delivers on its own timer (no relayed denial); NULL is an in-process/fetch-minted row.
       binding_message TEXT
     );
+    -- Exact-action approval deduplication depends on this uniqueness.
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_approval_request_action ON approval_request (action_key);
 
     CREATE TABLE IF NOT EXISTS notification_state (
       team_id TEXT NOT NULL,
@@ -573,8 +558,10 @@ function connectDb(
  * Verify the database has been migrated to EXACTLY this build's schema version. Does NO DDL, so the
  * runtime can connect with a DML-only role (no CREATE/ALTER grants). Fail closed:
  *  - meta table / marker absent → the database was never migrated (`vouchr migrate` first);
- *  - older version → an unmigrated/older database (`vouchr migrate` to converge);
- *  - newer version → the downgrade guard: old code against a newer schema can corrupt encrypted rows.
+ *  - any other version → a database this build cannot serve. With one schema version there is
+ *    nothing to converge: a 1.0.0 (v15) or older marker means recreate fresh, and a newer marker
+ *    means this binary is older than the data (old code against a newer schema can corrupt
+ *    encrypted rows) — either way the process must not touch it.
  */
 export async function assertSchemaCurrent(db: Db): Promise<void> {
   let row: { value: string } | undefined;
@@ -592,105 +579,30 @@ export async function assertSchemaCurrent(db: Db): Promise<void> {
   }
   const found = Number(row.value);
   if (!Number.isInteger(found)) throw new Error(`vouchr: unreadable schema_version "${row.value}".`);
-  if (found < SCHEMA_VERSION) {
+  if (found !== SCHEMA_VERSION) {
     throw new Error(
       `vouchr: this database is at schema version ${found}, but this build needs ${SCHEMA_VERSION}. ` +
-        'Run `vouchr migrate` to converge it.',
-    );
-  }
-  if (found > SCHEMA_VERSION) {
-    throw new Error(
-      `vouchr: this database reports schema version ${found}, newer than this build (${SCHEMA_VERSION}). ` +
-        'Refusing to open it: old code against a newer schema could corrupt encrypted credential rows. ' +
-        'Upgrade the vouchr package.',
+        'Refusing to open it. Recreate the database fresh and run `vouchr migrate` (there is no data ' +
+        'migration from a 1.0.0 or earlier schema), or run the vouchr build that matches it.',
     );
   }
 }
 
 /**
- * Create/converge the schema to this build's version. Run by the `vouchr migrate` command (and the
- * test harness) with a role that can CREATE — NOT the DML-only runtime role. Idempotent and safe to
- * run concurrently: an xact advisory lock keyed by the target schema serializes replicas so they
- * can't race `CREATE TABLE` (which is not atomic against the internal pg_type row → 23505). Opens a
- * short-lived connection and closes it before returning.
+ * Create the schema at this build's version, or verify it is already there. Run by the
+ * `vouchr migrate` command (and the test harness) with a role that can CREATE — NOT the DML-only
+ * runtime role. Idempotent and safe to run concurrently: an xact advisory lock keyed by the target
+ * schema serializes replicas so they can't race `CREATE TABLE` (which is not atomic against the
+ * internal pg_type row → 23505). Opens a short-lived connection and closes it before returning.
+ * A future schema change adds its step here, gated on the version the guard returns.
  */
 export async function migrate(opts: DbOptions = {}): Promise<{ version: number }> {
   const db = connectDb(opts, 300_000, 'vouchr-migrate'); // generous timeout: DDL + lock wait, not a request
   try {
     await db.transaction(async (tx) => {
       await tx.get('SELECT pg_advisory_xact_lock(hashtext(current_schema()))'); // released at COMMIT
-      const previousVersion = await guardSchemaVersion(tx); // fail closed before any DDL
-      await tx.exec(schema()); // idempotent baseline (CREATE TABLE IF NOT EXISTS)
-      // On a v12 database the baseline CREATE TABLE is a no-op, so `connection.generation_at` keeps
-      // its stored v12 MILLISECOND default — and every vault writer relies on that default. Reset it
-      // explicitly (idempotent) or every post-cutover write would stamp a ms-scale generation that
-      // no µs-scale issuance fence ever exceeds (fail-open).
-      await tx.exec(`ALTER TABLE connection ALTER COLUMN generation_at SET DEFAULT ${POSTGRES_NOW_US_SQL}`);
-      // v14 (#302): the browser Slack-identity verification columns. `slack_verify_required` is the
-      // MINTED-TIME requirement — enforcement authority travels with the state, never a replica's
-      // process-local flag, so a mixed-config fleet cannot complete an enforced consent unverified.
-      // Both are new and never carry pre-v13 ms values, so the v13 ×1000 conversion below rightly
-      // ignores them; a pre-v14 row gets required=0 (its prompt URL never offered the hop).
-      await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS slack_verified_at BIGINT`);
-      await tx.exec(`ALTER TABLE consent_request ADD COLUMN IF NOT EXISTS slack_verify_required BIGINT NOT NULL DEFAULT 0`);
-      // v15 (#296): the backchannel binding message. Nullable and additive; a pre-v15 pending row
-      // is an in-process/fetch-minted approval (NULL) and keeps its relayed-denial delivery path.
-      await tx.exec(`ALTER TABLE approval_request ADD COLUMN IF NOT EXISTS binding_message TEXT`);
-      // Consent lifecycle indexes live here, not in schema(): runtime recovery sweeps use the
-      // created_at index as an exact range condition, and the partial unique index enforces the
-      // single-active-generation consent invariant.
-      await tx.exec(`CREATE INDEX IF NOT EXISTS idx_consent_request_created_at ON consent_request (created_at)`);
-      await tx.exec(
-        `CREATE UNIQUE INDEX IF NOT EXISTS uq_consent_request_active
-           ON consent_request (team_id, user_id, provider)
-           WHERE superseded_at IS NULL`,
-      );
-      // v13 (#290): every PostgreSQL-clock lifecycle-fence timestamp moves from millisecond to
-      // microsecond resolution. A ×1000 DATA conversion — NOT idempotent, so it is gated on the
-      // recorded predecessor version. There are no dual-unit reads afterward: every reader/writer of
-      // these columns is microseconds-only, and openDb's exact-version assertion (assertSchemaCurrent)
-      // is what keeps a v12 (millisecond) binary off v13 data at the drained cutover.
-      // Application-clock columns (connection created_at/updated_at/last_used_at/expires_at,
-      // audit.at, installation.updated_at, notification_state, broker_jti.exp) never meet the
-      // PostgreSQL clock in a comparison and deliberately stay epoch-ms.
-      if (previousVersion !== null && previousVersion < 13) {
-        await tx.exec(`UPDATE connection SET generation_at=generation_at*1000`);
-        await tx.exec(`UPDATE channel_interaction_tombstone SET created_at=created_at*1000`);
-        await tx.exec(`UPDATE offboard_tombstone SET created_at=created_at*1000`);
-        await tx.exec(`UPDATE user_offboard_scope_tombstone SET created_at=created_at*1000`);
-        await tx.exec(`UPDATE provisioning_revocation_tombstone SET created_at=created_at*1000`);
-        await tx.exec(
-          `UPDATE consent_request
-             SET created_at=created_at*1000, consumed_at=consumed_at*1000,
-                 superseded_at=superseded_at*1000, delivered_at=delivered_at*1000,
-                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
-        );
-        await tx.exec(
-          `UPDATE user_provisioning_request
-             SET created_at=created_at*1000, expires_at=expires_at*1000,
-                 delivered_at=delivered_at*1000,
-                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
-        );
-        await tx.exec(
-          `UPDATE channel_provisioning_request SET created_at=created_at*1000, expires_at=expires_at*1000`,
-        );
-        await tx.exec(
-          `UPDATE session_request
-             SET created_at=created_at*1000, expires_at=expires_at*1000,
-                 delivered_at=delivered_at*1000,
-                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
-        );
-        await tx.exec(`UPDATE session_grant SET created_at=created_at*1000, expires_at=expires_at*1000`);
-        await tx.exec(
-          `UPDATE approval_request
-             SET created_at=created_at*1000, expires_at=expires_at*1000,
-                 delivered_at=delivered_at*1000,
-                 delivery_lease_expires_at=delivery_lease_expires_at*1000`,
-        );
-      }
-      // Lives here, not in schema(): exact-action approval deduplication depends on this uniqueness.
-      // Every migratable predecessor (v12+) already carries it with this exact definition.
-      await tx.exec(`CREATE UNIQUE INDEX IF NOT EXISTS uq_approval_request_action ON approval_request (action_key)`);
+      await guardSchemaVersion(tx); // fail closed before any DDL
+      await tx.exec(schema()); // idempotent (CREATE ... IF NOT EXISTS)
       await stampSchemaVersion(tx);
     });
     return { version: SCHEMA_VERSION };
