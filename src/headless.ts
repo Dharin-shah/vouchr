@@ -117,7 +117,7 @@ export { userOwner, channelOwner } from './core/owner';
 export type { Owner } from './core/owner';
 
 // ── opt-in channel gate ──
-export { ChannelConfig, channelIneligibleReason } from './core/channelConfig';
+export { CHANNEL_IDENTITIES, ChannelConfig, channelIneligibleReason, isChannelIdentity } from './core/channelConfig';
 export type { ChannelIdentity } from './core/channelConfig';
 
 // ── operator authorization surface: Policy scopes the broker to a channel (canary rollout), the tool

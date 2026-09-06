@@ -223,10 +223,6 @@ export async function buildBrokerServer(
   const url = env.VOUCHR_DATABASE_URL; // explicit only — no generic DATABASE_URL fallback (#204)
   const backend = 'postgres' as const; // PostgreSQL-only (#204); openDb fails closed if url unset/non-PG
 
-  // #51 opt-in channel gate. Parse this pure switch with the rest of boot configuration so a typo
-  // fails before KMS loading or Postgres acquisition; the store itself is created after openDb.
-  const channelModes = booleanEnv(env.VOUCHR_CHANNEL_MODES, 'VOUCHR_CHANNEL_MODES');
-
   // Optional KMS envelope — only when configured.
   let envelope: EnvelopeProvider | undefined;
   if (env.VOUCHR_KMS_KEY_ID) {
@@ -245,10 +241,11 @@ export async function buildBrokerServer(
   // createBroker always uses DbReplayStore (shared jti table), so a scaled fleet gets cluster-wide
   // single-use with no alternate replay path to wire here. #100/#212.
 
-  // #51 opt-in channel gate: enables owner:'channel' handles resolved from SIGNED claims. Off by
-  // default (user-only broker). The caller supplies eligibility facts as signed claims; the store
-  // here only maps (team, channel, provider) → mode.
-  const channelConfig = channelModes ? new ChannelConfig(db) : undefined;
+  // #51/#350 channel gate: owner:'channel' handles resolve from SIGNED claims against the same
+  // channel_config table Bolt writes, so one channel identity has one meaning on both doors. The
+  // caller supplies eligibility facts as signed claims; the store only maps (team, channel,
+  // provider) -> identity.
+  const channelConfig = new ChannelConfig(db);
   // #240 runtime channel governance is always available on the packaged path. Bolt and the broker
   // share this PostgreSQL table, so one signed channel toggle is reflected in the channel manifest and
   // enforced by both credential-use doors without an additional process-local switch or cache.
