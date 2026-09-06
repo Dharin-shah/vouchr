@@ -369,18 +369,22 @@ into many actions, or to skip the approval entirely.
   encoded-separator rule (a `%2f`/`%5c` in the path REQUIRES approval, so `/pay%2Fx`
   can't slip past a `/pay` lock unconfirmed). The grant is also bound to the **credential
   owner** it was minted against (user vs channel, and which user), so a later resolution
-  switch — a per-user→shared mode change — no longer matches and
+  switch — a person→channel identity change — no longer matches and
   re-prompts: the write can never run against a different credential than the human
   approved. And a grant is purged the moment its credential is deleted or replaced
   (disconnect, offboard, bulk-revoke, reconnect, TTL-expiry — all route through the one
   vault mutation surface), so it can't survive a revocation or be spent after a
   reconnect. Approve/Deny clicks are re-authorized server-side (provider re-validated
-  against the registry; current owner, live credential, mode/session, policy, tool bit,
+  against the registry; current owner, live credential, identity, policy, tool bit,
   signed conversation, and approver eligibility re-checked before the mutation; ineligible
-  clicks are rejected and audited) — nothing in the interaction payload is trusted. Decision and
+  clicks are rejected and audited) — nothing in the interaction payload is trusted. The agent's
+  `reason` and `link` on a prompt are bounded, rendered as plain text with a line saying they are
+  the agent's own claim, and never enter the decision or the action key. A `thread` grant is
+  matched on its full scope (team, channel, thread, requester, provider, owner) and its TTL, never
+  on the approval id. Decision and
   consume mutations share a PostgreSQL transaction with their audit companion, so an audit failure
-  grants or spends nothing. Mode/tool writers use the same canonical channel/provider lock and
-  atomically purge every dependent pending request and grant; a session→per-user→session or
+  grants or spends nothing. Identity/tool writers use the same canonical channel/provider lock and
+  atomically purge every dependent pending request and grant; a channel→person→channel or
   enabled→disabled→enabled ABA cannot revive old authority. Exact-action dedup uses a bounded
   length-framed SHA-256 lookup key because PostgreSQL cannot btree-index a multi-KiB raw path, but
   every request/consume still compares all full action fields — the digest is never authority.
@@ -556,7 +560,7 @@ These mirror what the code (and the test suite) enforce:
    enterprise/unscoped/global tombstones are checked under the credential/offboard locks before
    OAuth, static-key, dry-run, or reference writes. Retained handles and assertions are checked
    before secret access and provider send, and requester-bound approvals compare their creation
-   times at decision and consumption. Consent/setup/session/approval cleanup is bounded-state
+   times at decision and consumption. Consent/setup/approval cleanup is bounded-state
    hygiene, not the resurrection barrier (`offboard.ts`, `consent.ts`, `provisioning.ts`, `vault.ts`,
    `approval.ts`, `injector.ts`).
 7. **Refresh cannot bypass the max-age TTL.** Silent refresh uses `updateTokens`,

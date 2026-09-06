@@ -45,8 +45,8 @@ const payments = defineProvider({
 
 export const providers = [github(), jira, payments];
 
-// What `context.vouchr.toolManifest()` returns for a channel where Jira is set to
-// 'session' (per-user, thread-scoped) — the shape an agent reads before planning. The
+// What `context.vouchr.toolManifest()` returns for a channel where the agent acts as the channel
+// for Jira — the shape an agent reads before planning. The
 // host filters on `identity` to decide who runs the tool:
 //
 //   entry.identity !== 'service'  → await context.vouchr.connect(entry.provider)

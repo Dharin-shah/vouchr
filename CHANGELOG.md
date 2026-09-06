@@ -3,7 +3,75 @@
 All notable changes to this project are documented here. This project adheres to
 [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.2.0] — 2026-09-06
+
+One setting says who the agent acts as, writes wait for a human unless a provider opts out, and every
+prompt carries the agent's reason. This is a breaking configuration and schema change from `1.1.0`
+(#350): the schema is version 2 and needs a fresh database (`vouchr migrate` on an empty schema), the
+`session` mode is gone, and `VOUCHR_CHANNEL_MODES` is no longer read.
+
+**Upgrading.** Recreate the database and run `vouchr migrate`. Replace `/vouchr mode <provider> shared`
+with `/vouchr connect-shared <provider>` (or `/vouchr identity <provider> channel`) and `per-user` with
+`person`. A provider that used `session` mode declares `approval: { grant: 'thread' }` instead. Every
+non-GET/HEAD call now asks the channel unless the provider sets `approval: false`; a provider that
+declared `approval: { approver: 'member' }` keeps its behavior with the knob removed. Rename
+`bindingMessage` to `reason` on `POST /v1/authorization`; it is optional now. Drop
+`VOUCHR_CHANNEL_MODES` from the broker environment.
+
+### Removed
+
+- **The `mode` setting (`shared` / `per-user` / `session`), `/vouchr mode`, `POST /v1/admin/mode`, and
+  `VOUCHR_CHANNEL_MODES` (#350).** `session` was a second approval system: `src/core/session.ts`, the
+  `session_grant` and `session_request` tables, `SessionApprovalRequiredError`, the
+  `session_approval_required` broker code, the `session_prompted` recovery status, the thread-session
+  prompt, and their tests are gone. The packaged broker always wires channel-owned credentials behind
+  the signed channel-fact claims; the environment switch that gated them is not read.
+- **`bindingMessage`, `MAX_BINDING_MESSAGE_BYTES`, and `assertBindingMessage`.** Replaced by the
+  first-class `reason` below.
+- **`ChannelMode`, `CHANNEL_MODES`, `isChannelMode`, `writeChannelMode`, and the `mode` field on
+  `ToolRow`, `ConfigMemberRow`, `ToolManifestEntry`, and `GET /v1/admin/config`.** Replaced by the
+  `identity` names below.
+
+### Changed
+
+- **Who the agent acts as is one setting per channel per provider: `person` (default) or `channel`
+  (#350).** `channel_config.identity` replaces `mode`. `/vouchr identity <provider> <person|channel>`
+  and `POST /v1/admin/identity` (body `{ provider, identity }`) set it; `/vouchr connect-shared` sets
+  `channel` for you and switching back to `person` deletes the channel credential. The settings modal
+  and App Home show a two-answer picker. `ChannelIdentity`, `CHANNEL_IDENTITIES`, and
+  `isChannelIdentity` are exported from the root and headless entries; `ToolManifestEntry` is
+  `{ provider, enabled, identity: 'person' | 'channel' | 'service' }`; `vouchr channels` prints an
+  `identity` column.
+- **Approval is on by default (#350).** Every call other than GET/HEAD needs a live grant unless the
+  provider declares `approval: false`. The knob's fields are all optional: `approver` (`member`
+  default, `self`), `methods`, `paths`, `grant` (`once` default, `thread`), `ttlMs` (5 minutes
+  default). `null`, unknown keys, and invalid shapes fail at config load. The README example and
+  `examples/demo` configure nothing for `github()`.
+- **Thread-scoped approval is `grant: 'thread'` on the approval table (#350).** One approval covers
+  every matching call in the approving thread until `ttlMs`; the row is matched on its scope and is
+  not deleted on consume. `approval_request.grant_scope` holds `once` or `thread`; the approval prompt
+  and the approved message say which (`This covers one call, once, within 5 minutes.` or `This covers
+  every <provider> call that needs approval in this thread for 30 minutes.`).
+- **Re-asking while a prompt is pending posts nothing (#350).** The requester gets one private line,
+  `Still waiting for another member of this channel to approve the <provider> action.`, instead of a
+  second prompt. Offboarding deletes the person's pending approval rows, so a leftover Approve click
+  gets the fixed stale copy and grants nothing.
+- **`SCHEMA_VERSION` is 2.** `vouchr migrate` installs the new baseline on an empty schema and refuses
+  a version-1 schema, as the greenfield contract requires.
+
+### Added
+
+- **A first-class `reason` and optional `link` on every approval (#350).** In-process,
+  `handle.fetch(url, { method, body, reason, link })`; over the wire, the same two fields on
+  `POST /v1/fetch`, `POST /v1/mcp`, and `POST /v1/authorization` (where `reason` replaces the required
+  `bindingMessage`; both are optional). `reason` is at most 500 bytes of plain text (`MAX_REASON_BYTES`,
+  `assertReason`); `link` is an `https://` URL of at most 2,048 bytes with no credentials
+  (`MAX_LINK_BYTES`, `assertLink`). Every prompt renders the method, host, and plain path, then
+  `Reason:` and `Link:` lines when given, and says they are the agent's own claim. The reason is stored
+  on the `approval_requested` audit row under `meta.reason`; the link is not audited.
+- **`guides/DEMO.md` scenarios (a) to (m) run as `test/demo.test.ts` on the production path**, asserting
+  the exact Slack copy the guide quotes, including the thread grant, the stale-click fence after
+  offboarding, and the Slack Connect refusals.
 
 ### Added
 
@@ -23,19 +91,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
-- **`/vouchr disconnect-shared` and `/vouchr mode` check the channel before the provider (#352).**
-  Run from a DM with a mistyped provider, both now say to run from inside the channel, the same order
-  `enable`, `disable`, and `connect-shared` already used. The other three findings in #352 were
+- **`/vouchr disconnect-shared` and `/vouchr identity` (then `mode`) check the channel before the
+  provider (#352).** Run from a DM with a mistyped provider, both now say to run from inside the
+  channel, the same order `enable`, `disable`, and `connect-shared` already used. The other three findings in #352 were
   verified already correct and are pinned by regression tests: the lazily created refresh pool stays
   non-enumerable on the database handle, a no-op disable on an unconfigured channel writes no rows and
   no audit row, and a lost revoke claim reports `upstreamMissing: false`.
 - **Every terminal state names the next action, and no stale prompt survives (#348).** Found by a
-  code-walk audit after a live demo. Slack: session mode outside a thread, a non-member using a
-  shared credential, and a channel without a shared credential now raise `UserFacingError` with the
-  next step instead of collapsing to "check the Vouchr logs"; an ineligible Approve/Deny click says
-  who can decide; every prompt states its ten-minute lifetime; a re-asked session prompt inside the
-  redelivery window reports `promptState: 'reused'` like consent does; `CredentialLockdownError` maps
-  to fixed `locked_down` copy. Browser: a consumed or replayed callback link, a failed exchange, and
+  code-walk audit after a live demo. Slack: a non-member using a channel credential and a channel
+  without one now raise `UserFacingError` with the next step instead of collapsing to "check the
+  Vouchr logs"; an ineligible Approve/Deny click says who can decide; every prompt states its
+  ten-minute lifetime; `CredentialLockdownError` maps to fixed `locked_down` copy. Browser: a consumed or replayed callback link, a failed exchange, and
   the post-connect landing page all say to go back to Slack and ask the agent again; the broker's
   hop and callback paths render that page under lockdown instead of raw JSON. Core copy:
   `not_connected` (user), `upstream_timeout`, `approval_required` for a `member` approver, and the
@@ -55,8 +121,6 @@ All notable changes to this project are documented here. This project adheres to
   `identity_replayed` distinct from `invalid_identity`. Additive for JSON readers; the wire goldens
   and `guides/HEADLESS.md` list the new codes (`unauthorized`, `invalid_identity`,
   `identity_replayed`, `request_too_large`, `not_found`, `locked_down`).
-- **`SessionApprovalRequiredError` requires `promptState`.** Constructing it directly now takes the
-  same second argument as `ConsentRequiredError`.
 
 ## [1.1.0] — 2026-09-06
 

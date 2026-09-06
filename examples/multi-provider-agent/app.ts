@@ -105,8 +105,8 @@ app.event('app_mention', async ({ context, event, client, say }) => {
       additionalProperties: false,
     },
     run: async ({ provider, method, url, body }) => {
-      // connect() resolves the credential for the ACTING human and re-checks mode, policy, channel
-      // tools and session state. It throws ConsentRequiredError if this person has not connected —
+      // connect() resolves the credential for the ACTING human and re-checks identity, policy, channel
+      // tools, and approvals. It throws ConsentRequiredError if this person has not connected —
       // which is per-person: one participant connecting does nothing for the others.
       const handle = await vouchr.connect(provider);
       const res = await handle.fetch(url, {

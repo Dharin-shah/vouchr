@@ -4,10 +4,11 @@ A script for one recorded session: the maintainer, two or three friends, one Sla
 product scenario. Each scenario says who does what, the exact copy Slack shows (quoted from the
 code, with the file it comes from), what the audit shows afterwards, and what to capture.
 
-The app is [`examples/demo/app.ts`](../examples/demo/app.ts): the quickstart app plus one write
-that waits for a teammate and one shared credential. Slack copy is rendered by
-`src/adapters/blocks.ts` and `src/adapters/bolt.ts`; refusal copy is in `src/core/errors.ts` and
-`src/core/channelConfig.ts`. `<#C…>` is Slack's channel link, `<@U…>` a user mention.
+The app is [`examples/demo/app.ts`](../examples/demo/app.ts): the quickstart app plus one shared
+credential. Slack copy is rendered by `src/adapters/blocks.ts` and `src/adapters/bolt.ts`; refusal
+copy is in `src/core/errors.ts` and `src/core/channelConfig.ts`. `<#C…>` is Slack's channel link,
+`<@U…>` a user mention. Every scenario below also runs in `test/demo.test.ts` on the production
+path, asserting this copy.
 
 ## 1. Cast and props
 
@@ -22,7 +23,7 @@ that waits for a teammate and one shared credential. Slack copy is rendered by
 - A private channel `#demo-team` with you, Alex, Sam, and the bot. Jo is not in it.
 - A public channel `#demo-public` with the bot. Jo can join it.
 - A GitHub OAuth app (quickstart step 5), a throwaway repo Alex can write to (`alex/vouchr-demo`
-  below), and a personal access token that can open issues in it: the shared credential in (h).
+  below), and a personal access token that can open issues in it: the shared credential in (g).
 - Local PostgreSQL and a tunnel to port 3000.
 
 ### Pre-flight checklist
@@ -56,7 +57,7 @@ Follow [QUICKSTART.md](../QUICKSTART.md) steps 2 to 8 once, with these differenc
 
    ```bash
    VOUCHR_DATABASE_URL=postgres://vouchr:vouchr@localhost:5432/vouchr npm run cli -- migrate
-   # prints: OK schema migrated to version 1
+   # prints: OK schema migrated to version 2
    npm run example:demo
    # prints: ⚡ Vouchr demo on :3000. Callback at https://<tunnel host>/vouchr/oauth/callback
    ```
@@ -83,15 +84,21 @@ Record one take per scenario with the app's terminal beside Slack. Screenshots a
 None of the shipped examples has both a read and a governed write, so
 [`examples/demo/app.ts`](../examples/demo/app.ts) adds them on top of `examples/bolt-github`:
 
-- `github` with `approval: { approver: 'member', methods: ['POST', 'PUT', 'PATCH', 'DELETE'], paths: ['/repos/'] }`.
+- `github()` with no approval configuration at all. The default asks another member of the channel
+  once per write (every method except GET and HEAD); reads go through.
 - `github-team`, a key provider in the style of `examples/internal-api-key`, for the channel's
-  shared token. Same approval rule. The default injection is `Authorization: Bearer <key>`.
+  shared token, with `approval: { grant: 'thread', ttlMs: 30 * 60 * 1000 }`: one approval covers
+  every write in the approving thread for thirty minutes. The default injection is
+  `Authorization: Bearer <key>`.
 - `@vouchr who am I` runs `GET /user`. Any other text does the same.
 - `@vouchr open an issue titled <title> in repo <owner>/<name>` runs `POST /repos/<owner>/<name>/issues`
-  as the person who asked.
+  as the person who asked, with a `reason` and `link` on the call.
 - `@vouchr open a team issue titled <title> in repo <owner>/<name>` does the same write with the
   channel's `github-team` credential.
 - Replies come in a thread under the mention. `examples/demo/worker.ts` is the headless job for (j).
+
+Nobody picks a mode. Who the agent acts as is one setting per channel per provider, `person` (the
+default) or `channel`, and `connect-shared` sets it for you.
 
 ## 3. Scenarios
 
@@ -116,8 +123,8 @@ Sam, in `#demo-team`: `/vouchr enable github`.
 
 Expected (`src/adapters/bolt.ts`): `Enabled *github* in <#demo-team>.`
 
-On the laptop `VOUCHR_DATABASE_URL=... npm run cli -- channels` shows the row with enabled `yes`.
-Audit: a `config` row. Shots: the reply and the `channels` output.
+On the laptop `VOUCHR_DATABASE_URL=... npm run cli -- channels` shows the row with identity `person`
+and enabled `yes`. Audit: a `config` row. Shots: the reply and the `channels` output.
 
 ### (c) Alex connects
 
@@ -133,23 +140,16 @@ Expected, private to Alex (`src/adapters/blocks.ts`, `connectBlocks`):
 
 with a **Connect github** button. Alex clicks it. The browser goes to Slack's sign-in page first
 (Slack's own screen), then to GitHub's authorize screen, then lands on Vouchr's page
-(`src/adapters/landing.ts`):
-
-> ✅ github connected as alex
-> This connection is now linked to this Slack user (`U…` in workspace `T…`). The agent will act as that Slack user with: `<granted scopes>`.
-> Now go back to Slack and ask the agent again. You can close this tab.
-
-Back in Slack, Alex gets a DM and a private note in the channel, both
-`✅ github connected as alex. Ask the agent again.` (`src/adapters/blocks.ts`, `connectedDmText`). The prompt itself was
+(`src/adapters/landing.ts`). Back in Slack, Alex gets a DM and a private note in the channel, both
+`✅ github connected as alex.` (`src/adapters/blocks.ts`, `connectedDmText`). The prompt itself was
 replaced on click with `Opening the sign-in page. If it says the request is no longer current, mention me again.`
 
-If a prompt is left for more than ten minutes, clicking it opens a plain
-`This connection request is no longer current. Ask the agent for a new connection prompt. The prompt in Slack now offers a new link.`
-page, and in Slack the prompt is replaced by `This connection prompt is no longer current. Get a new link to continue.`
-with a **Send a new link** button (`connectExpiredBlocks`). Clicking that swaps in a fresh Connect
-prompt in place; no new mention is needed.
+If a prompt is left for more than ten minutes, clicking it replaces it with
+`This connection prompt is no longer current. Get a new link to continue.` and a **Send a new link**
+button (`connectExpiredBlocks`). Clicking that swaps in a fresh Connect prompt in place.
 
-`/vouchr status` from Alex lists the github connection with the account name. Audit: a `connect` row. `vouchr inventory` shows one row, `owner_kind` user.
+`/vouchr status` from Alex prints `Your connected accounts:` then `• *github* (alex) in your DMs`.
+Audit: a `connect` row. `vouchr inventory` shows one row, `owner_kind` user.
 
 Shots: the Connect prompt, the Slack sign-in page, the GitHub consent screen, the landing page, the DM.
 
@@ -167,15 +167,20 @@ Shots: the reply and the terminal side by side.
 
 Alex: `@vouchr open an issue titled Demo issue in repo alex/vouchr-demo`.
 
-Nothing is sent. The channel gets one message (`src/adapters/blocks.ts`, `approvalBlocks`):
+Nothing is sent. The channel gets one message, in the thread (`src/adapters/blocks.ts`, `approvalBlocks`):
 
 > :lock: *Approve this github action?*
 > The agent wants to run an action on github for <@alex>. Another member of this channel must approve it.
-> POST api.github.com
-> Action fingerprint: <hash>
-> The fingerprint binds the exact owner, method, endpoint, and query string — once — and expires in 10 minutes if unused. The raw path and request body are not displayed or inspected.
+> POST api.github.com/repos/alex/vouchr-demo/issues
+> Reason: Open an issue titled "Demo issue" in alex/vouchr-demo, asked for in Slack
+> Link: https://github.com/alex/vouchr-demo
+> This covers one call, once, within 5 minutes. This prompt expires in 10 minutes if unused. The request body is not shown or inspected. The reason and link are the agent's own claim, not verified by Vouchr.
 
-with **Approve** and **Deny** buttons.
+with **Approve** and **Deny** buttons. The reason and link are what the demo app passes on the
+call; an agent that gives none gets the same prompt without those two lines.
+
+Alex repeats the same mention while the prompt is up. Nothing new is posted; Alex gets one private
+line: `Still waiting for another member of this channel to approve the github action.`
 
 Alex clicks **Approve**. Private reply, the prompt stays (`src/adapters/bolt.ts`):
 
@@ -183,18 +188,18 @@ Alex clicks **Approve**. Private reply, the prompt stays (`src/adapters/bolt.ts`
 
 Sam clicks **Approve**. The prompt is replaced by:
 
-> ✅ Approved the *github* action. The approval is single-use and expires in 300s — have the agent retry now.
+> ✅ Approved the *github* action. This covers one call, once, within 5 minutes. Have the agent retry now.
 
-Alex gets a private note: `✅ <@sam> approved your *github* action — ask the agent to retry.`
+Alex gets a private note: `✅ <@sam> approved your *github* action. Ask the agent to retry.`
 
 Alex repeats the exact same mention. Reply: `Opened https://github.com/alex/vouchr-demo/issues/1 as *alex*.`
 
 Alex repeats it once more. A new approval prompt appears. Approvals are single use
-(`test/approval.test.ts`, "state machine: prompt → approve → consume exactly once → re-prompt").
+(`test/demo.test.ts`, "(e) a write waits for the team").
 
-Audit, in order: `approval_requested`, `denied` with `reason: 'not-approver'` for Alex's click,
-`approved` with Sam as `actor`, `approval_consumed` with Sam as `actor`, `inject`.
-`/vouchr audit channel` shows the same rows with `by <@sam>` on the approval rows.
+Audit, in order: `approval_requested` (with the reason under `meta.reason`), `denied` with
+`reason: 'not-approver'` for Alex's click, `approved` with Sam as `actor`, `approval_consumed` with Sam
+as `actor`, `inject`. `/vouchr audit channel` shows the same rows with `by <@sam>` on the approval rows.
 
 Shots: the prompt, Alex's refusal, the approved message, the issue on GitHub, the second prompt.
 
@@ -207,68 +212,61 @@ Sam clicks **Deny** on the prompt left over from (e). The prompt is replaced by:
 Alex gets `🚫 <@sam> denied your *github* action. Nothing was sent.`
 
 The denial is kept in the table with `status = 'denied'` for ten minutes so a headless poller can
-read it. It does not block: if Alex asks again, a new prompt appears
-(`test/approval.test.ts`, "member approver: deny is retained (#296), ...").
+read it. It does not block: if Alex asks again, a new prompt appears.
 
 Audit: `denied` with `reason: 'approval-denied'`. Shots: the denied message, Alex's note.
 
-### (g) Session mode in a thread
+### (g) A shared credential the channel owns
 
-Sam: `/vouchr mode github session`. Reply: `Set *github* to *session* in <#demo-team>.`
-
-Alex, at the top level of the channel: `@vouchr who am I`. Private reply (`src/adapters/bolt.ts`):
-
-> "github" needs a thread-scoped session; ask me inside a thread.
-
-Alex replies in any thread: `@vouchr who am I`. Private prompt in the thread
-(`src/adapters/blocks.ts`, `sessionApprovalBlocks`):
-
-> :lock: *Allow github in this thread?*
-> The agent will be able to act as you on github only inside this thread, until the session expires. This approval does not apply to any other thread or channel. This prompt expires in 10 minutes.
-
-with an **Allow github here** button. Alex clicks it: `Approved *github* for this thread. Ask the agent again.`
-
-Alex mentions again in the thread: the read runs. Alex mentions in a different thread: the prompt
-appears again (`test/session.test.ts`, "after granting the thread, the same thread proceeds but other threads do not").
-
-The time limit is eight hours by default, set with `sessionTtlMs` on `createVouchr`. It is not shown
-in Slack. To show expiry on camera, add `sessionTtlMs: 2 * 60 * 1000` to `createVouchr` in
-`examples/demo/app.ts`, restart, and mention again after two minutes: the prompt is back.
-
-Reset: Sam runs `/vouchr mode github per-user`.
-
-Audit: `session` rows with `event: 'request'` and `event: 'grant'` in `meta`.
-Shots: the top-level refusal, the thread prompt, the approved reply.
-
-### (h) A shared credential
-
-Sam: `/vouchr mode github-team shared`. Reply: `Set *github-team* to *shared* in <#demo-team>.`
-
-Sam: `/vouchr connect-shared github-team`. A modal titled **Channel credential** opens
-(`src/adapters/blocks.ts`, `configureModal`):
+Sam: `/vouchr enable github-team`, then `/vouchr connect-shared github-team`. A modal titled
+**Channel credential** opens (`src/adapters/blocks.ts`, `configureModal`):
 
 > Set the *github-team* credential for this channel. Only you can see what you type here. It is never posted to the channel.
 
 Sam pastes the team token into **Paste a key directly** and saves. A modal titled **Credential saved**
-says `Saved the *github-team* credential for <#demo-team>.`
+says `Saved the *github-team* credential for <#demo-team>.` From now on the agent acts as the channel
+for `github-team` there; `/vouchr tools` shows `• *github-team*: enabled (acts as channel)`.
 
-Alex: `@vouchr open a team issue titled Team issue in repo alex/vouchr-demo`. The approval prompt
-appears as in (e), for `github-team`. Sam approves. Alex repeats the mention:
-`Opened https://github.com/alex/vouchr-demo/issues/2 as *<token owner>*.`
+If Sam had set the identity first (`/vouchr identity github-team channel`, reply
+`In <#demo-team> the agent now acts as the channel for *github-team*. Connect its account with
+\`/vouchr connect-shared github-team\`.`) and Alex asked before the token was connected, Alex would
+see one line: `No shared channel credential is configured. Any member can run \`/vouchr connect-shared\` there.`
 
-Audit: `config` for the credential, then the approval rows. `/vouchr audit channel` lists them.
+Alex: `@vouchr open a team issue titled Team issue in repo alex/vouchr-demo`. The prompt appears as
+in (e), for `github-team`, with one different sentence:
+
+> This covers every github-team call that needs approval in this thread for 30 minutes. This prompt expires in 10 minutes if unused. The request body is not shown or inspected.
+
+Sam approves: `✅ Approved the *github-team* action. This covers every github-team call that needs approval in this thread for 30 minutes. Have the agent retry now.`
+Alex repeats the mention: `Opened https://github.com/alex/vouchr-demo/issues/2 as *<token owner>*.`
+
+Audit: `config` for the credential, then the approval rows with `grant: 'thread'` in `meta`.
 `vouchr inventory` now has a second row with `owner_kind` channel and `owner_id` the channel id.
 
 Shots: the modal (blur the field), the saved message, the prompt, the issue opened by the token owner.
+
+### (h) One approval covers the thread
+
+Alex, in the same thread: `@vouchr open a team issue titled Second team issue in repo alex/vouchr-demo`.
+No prompt. Reply: `Opened https://github.com/alex/vouchr-demo/issues/3 as *<token owner>*.`
+
+Alex, in a different thread: the same mention. The prompt is back; the grant is bound to the thread
+it was approved in. After thirty minutes the first thread asks again too
+(`test/demo.test.ts`, "(h) one approval covers the thread until the TTL").
+
+Reset for the rest of the session: nothing to do. To show the switch back, Sam runs
+`/vouchr disconnect-shared github-team`: `Removed the shared *github-team* account in <#demo-team>. The agent now acts as each person there.`
+
+Shots: the second issue with no prompt, the prompt in the other thread.
 
 ### (i) Jo, the outsider
 
 Jo is not in `#demo-team`. Slack itself keeps the channel and every prompt in it out of Jo's sight,
 so there is nothing for Jo to click. Screenshot Jo's sidebar without the channel.
 
-The server-side gate is the same in every channel: only a current member may enable, set a mode,
-connect a shared credential, or approve, and the requester may never approve their own request
-(`test/channel-member.test.ts`, `test/approval.test.ts`). The refusal copy for a non-member on the
+The server-side gate is the same in every channel: only a current member may enable, set who the
+agent acts as, connect a shared credential, or approve, and the requester may never approve their
+own request (`test/demo.test.ts`, "(i) an outsider"). The refusal copy for a non-member on the
 configure commands is (`src/adapters/bolt.ts`):
 
 > Only a current member of this channel can change channel tools. If you are one, make sure Vouchr is in the channel and try again.
@@ -286,7 +284,7 @@ Shots: Jo's sidebar, the enable reply in the public channel.
 ### (j) An autonomous worker
 
 A job with no human requester asks the channel for approval over the broker and runs the write with
-the `github-team` credential from (h). The broker is a second process on the same database. In a
+the `github-team` credential from (g). The broker is a second process on the same database. In a
 second terminal:
 
 ```bash
@@ -297,7 +295,7 @@ export VOUCHR_IDENTITY_SECRET=$(openssl rand -base64 32)
 export VOUCHR_DEPLOYMENT_ID=demo
 export VOUCHR_BASE_URL=http://localhost:3001     # the broker's connect routes are not used here
 export VOUCHR_PORT=3001 VOUCHR_ALLOW_WRITES=1
-export VOUCHR_PROVIDERS='[{"id":"github-team","credential":"key","egressAllow":["api.github.com"],"approval":{"approver":"member","methods":["POST","PUT","PATCH","DELETE"],"paths":["/repos/"]}}]'
+export VOUCHR_PROVIDERS='[{"id":"github-team","credential":"key","egressAllow":["api.github.com"],"approval":{"grant":"thread","ttlMs":1800000}}]'
 npm run broker
 ```
 
@@ -308,20 +306,22 @@ DEMO_TEAM=T... DEMO_BOT_USER=U... DEMO_CHANNEL=C... DEMO_REPO=alex/vouchr-demo \
   node --import tsx examples/demo/worker.ts
 ```
 
-The worker mints an identity for the bot user bound to `#demo-team`, calls `POST /v1/authorization`,
-prints `authorization 200 { authorizationId: '…', status: 'pending', expiresAt: … }`, then
-`poll pending` every five seconds. Within fifteen seconds the Slack app delivers the prompt to `#demo-team`:
+The worker mints an identity for the bot user bound to `#demo-team`, calls `POST /v1/authorization`
+with a `reason` and a `link`, prints `authorization 200 { authorizationId: '…', status: 'pending', expiresAt: … }`,
+then `poll pending` every five seconds. Within fifteen seconds the Slack app delivers the prompt to `#demo-team`:
 
 > :lock: *Approve this github-team action?*
 > The agent wants to run an action on github-team for <@vouchr>. Another member of this channel must approve it.
-> POST api.github.com
-> Action fingerprint: <hash>
-> Agent's statement: TICKET-42: open the release checklist issue
+> POST api.github.com/repos/alex/vouchr-demo/issues
+> Reason: TICKET-42: open the release checklist issue
+> Link: https://tracker.example/TICKET-42
+> This covers every github-team call that needs approval in this thread for 30 minutes. ...
 
 Sam approves. The worker prints `poll approved`, sends `POST /v1/fetch` with the same claims, and
-prints `fetch 200 { status: 201, url: 'https://github.com/alex/vouchr-demo/issues/3' }`.
+prints `fetch 200 { status: 201, url: 'https://github.com/alex/vouchr-demo/issues/4' }`.
 
-Audit: `approval_requested` and `approval_consumed` carry the bot's user id as `user_id`;
+Same channel, two providers: humans use `github` as themselves, the worker uses `github-team` as the
+channel. Audit: `approval_requested` and `approval_consumed` carry the bot's user id as `user_id`;
 `approval_consumed` carries Sam in `actor` (`test/authorization.test.ts`, "autonomous worker").
 
 Shots: the worker terminal, the prompt naming the bot, the fetch line, the issue.
@@ -337,11 +337,11 @@ stays: it belongs to the channel. `psql -d vouchr -c "select action, provider, m
 shows a `revoke` row with `"reason":"offboarded"`.
 
 The fence: if Alex asked for a write just before being deactivated, the prompt is still in the
-channel. Sam clicks **Approve**. Reply (`src/adapters/bolt.ts`):
+channel, but the request went with the credential. Sam clicks **Approve**. Reply (`src/adapters/bolt.ts`):
 
-> This approval is no longer valid because provider or channel access changed. Ask the agent again.
+> This approval expired or was already decided. Ask the agent again.
 
-Nothing is granted (`test/approval.test.ts`, the offboard fence tests around "no longer valid").
+Nothing is granted (`test/demo.test.ts`, "(k) offboarding fences a pending prompt").
 
 The SCIM example (`examples/scim`) does the same from a directory event but ships no runnable
 endpoint, so it is not recorded. Reactivate Alex afterwards.
@@ -350,16 +350,15 @@ Shots: the inventory before and after, Sam's refusal.
 
 ### (l) Slack Connect
 
-Vouchr refuses channel credentials in externally shared channels
+Vouchr refuses channel credentials in externally shared channels, with one message everywhere
 (`src/core/channelConfig.ts`, `channelIneligibleReason`):
 
-> Channel credentials are not allowed in externally shared channels. Use your own connection here, or configure in an internal channel.
+> Channel credentials are not allowed in externally shared channels.
 
 Showing it needs a second workspace and a Slack Connect channel. If you have one, run
-`/vouchr connect-shared github-team` there and screenshot the refusal. Otherwise say so on camera
-and point at `test/approval.test.ts`: "member approver: no prompt is posted into an externally
-shared (Slack Connect) channel" and "member approver: a Slack Connect conversion after the prompt
-invalidates it; a foreign-org member cannot approve".
+`/vouchr connect-shared github-team` there and screenshot the refusal in the modal; `/vouchr identity`
+and `/vouchr enable` answer the same line, and a write that needs a teammate's approval is refused
+with it instead of posting a prompt (`test/demo.test.ts`, "(l) Slack Connect"). Otherwise say so on camera.
 
 ### (m) The operator CLI
 
@@ -367,39 +366,41 @@ On the laptop, with `VOUCHR_DATABASE_URL` and `VOUCHR_MASTER_KEY` exported. See 
 
 ```bash
 npm run cli -- inventory                                  # every live credential, no secrets
-npm run cli -- channels --team T...                       # provider, mode, enabled per channel
+npm run cli -- channels --team T...                       # provider, identity, enabled per channel
 npm run cli -- revoke --provider github-team --channel C... # dry run
 npm run cli -- revoke --provider github-team --channel C... --yes
 npm run cli -- doctor
 ```
 
+`channels` prints `team  channel  provider  identity  enabled` with `person` or `channel` per row.
 The dry run ends with `No changes made. Re-run with --yes to revoke.` The real run prints
 `Revoked 1 locally; 0 matching connection(s) remain.` and an `Upstream revoke:` line with attempted,
 failed, unresolved, and skipped counts. `doctor` prints `PASS`/`FAIL`/`INFO` lines. Shots: each output.
 
 ## 4. Talk track
 
-Vouchr is a self-hosted identity broker for agents: per-user credentials injected at egress,
+Vouchr is a self-hosted identity broker for agents: per-person credentials injected at egress,
 human-in-the-loop approvals scoped to the team's channel, and an audit trail for every call. The
-agent acts as the person who asked, with that person's own access. Sensitive steps wait for the
-team: the channel that owns the credential approves. Every action is on record: who, what, where,
-and who approved.
+agent acts as the person who asked, with that person's own access. Writes wait for the team by
+default: the channel that owns the credential approves. Every prompt says who asked, what, and why.
+Every action is on record: who, what, where, and who approved.
 
 Here is the order. A channel starts closed: the agent is refused. Sam opens it. Alex connects once,
 through Slack sign-in and GitHub consent. A read runs as Alex. A write stops: the team sees who
-asked, what provider, what method, what host. Alex cannot approve Alex. Sam approves, the write runs
-once, and the next one asks again. Sam denies one. Then session mode: a thread, a time limit. Then
-a shared team token that any member can approve. Jo is outside and sees nothing; a public channel
-is the tradeoff. A worker with no human asks the same channel the same way. Alex leaves and the
-credential goes with them. The CLI shows every live credential and can revoke any of them.
+asked, the provider, the method, the path, and the agent's reason. Alex cannot approve Alex. Sam
+approves, the write runs once, and the next one asks again. Sam denies one. Then a shared team token
+the channel owns, with one approval covering a whole thread. Jo is outside and sees nothing; a
+public channel is the tradeoff. A worker with no human asks the same channel the same way. Alex
+leaves and the credential goes with them. The CLI shows every live credential and can revoke any of
+them.
 
 ## 5. Reset in five minutes
 
 1. Stop the app, the broker, and the worker.
 2. `dropdb vouchr && createdb -O vouchr vouchr`, then the `migrate` command from the checklist.
-   This clears connections, channel modes, approvals, sessions, and the audit table.
+   This clears connections, channel identities, approvals, and the audit table.
 3. GitHub: Alex opens Settings, Applications, Authorized OAuth Apps, and revokes `Vouchr demo`, so
    the consent screen appears again on camera.
 4. Slack: nothing to clear. The bot token in `.env` stays valid and the app stores no installation
-   of its own in this setup. Reactivate Alex if (k) ran. Remove `sessionTtlMs` if you added it.
+   of its own in this setup. Reactivate Alex if (k) ran.
 5. `npm run example:demo`, then the two-minute smoke test.

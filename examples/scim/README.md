@@ -16,7 +16,7 @@ deprovisioned org-wide, the cross-team counterpart to the Slack app's per-team
 
 `offboardUserEverywhere` closes that gap: given `{ enterpriseId?, userId }` it first records a
 durable enterprise/global scope tombstone, then finds every team where the user has a connection or
-pending consent/session/setup/approval artifact and replays the normal per-team offboard (local delete →
+pending consent/setup/approval artifact and replays the normal per-team offboard (local delete →
 best-effort upstream revoke → audit → bounded-state cleanup), using the full owner key per team so it
 never touches another user's rows. Shared channel credentials remain for other current actors, while
 the departed user's older handles, assertions, and requested approvals remain tombstone-fenced. The

@@ -9,11 +9,11 @@ import {
 } from '../../src';
 
 // The demo app behind guides/DEMO.md: examples/bolt-github plus one write and one shared credential.
-// Reads go through. Writes under /repos/ wait for another member of the channel.
-const approval = { approver: 'member' as const, methods: ['POST', 'PUT', 'PATCH', 'DELETE'], paths: ['/repos/'] };
+// `github()` needs no approval config: reads go through, every write waits for another member.
 
 // The channel's shared credential: a GitHub token pasted once with `/vouchr connect-shared github-team`.
 // No OAuth. The default injection is `Authorization: Bearer <key>`, which GitHub accepts for a token.
+// One approval covers every write in the approving thread for 30 minutes.
 const githubTeam = defineProvider({
   id: 'github-team',
   credential: 'key',
@@ -23,7 +23,7 @@ const githubTeam = defineProvider({
   egressAllow: ['api.github.com'],
   refresh: 'none',
   pkce: false,
-  approval,
+  approval: { grant: 'thread', ttlMs: 30 * 60 * 1000 },
 });
 
 const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_SECRET! });
@@ -47,6 +47,9 @@ app.event('app_mention', async ({ context, event, client }) => {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ title }),
+        // Shown on the Approve/Deny prompt and kept in the audit row, as the agent's own claim.
+        reason: `Open an issue titled "${title}" in ${repo}, asked for in Slack`,
+        link: `https://github.com/${repo}`,
       });
       const body: any = await res.json();
       if (!res.ok) return reply(`GitHub said ${res.status}: ${body.message ?? 'no message'}.`);
@@ -65,7 +68,7 @@ app.event('app_mention', async ({ context, event, client }) => {
 
 (async () => {
   // Same wiring as examples/bolt-github. `install` also delivers the headless worker's prompts (guides/DEMO.md, scenario j).
-  const vouchr = await createVouchr({ providers: [github({ approval }), githubTeam], baseUrl: process.env.PUBLIC_URL! });
+  const vouchr = await createVouchr({ providers: [github(), githubTeam], baseUrl: process.env.PUBLIC_URL! });
   vouchr.install(app, receiver);
   const port = process.env.PORT ? Number(process.env.PORT) : 3000;
   await app.start(port);

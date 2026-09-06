@@ -14,7 +14,7 @@ product boundaries remain in [`vision.md`](../vision.md); the security model rem
 | Shape | Choose it when | Slack experience | Credential-use path |
 | --- | --- | --- | --- |
 | Embedded Bolt | The agent and Vouchr run in the same Node/Bolt process. | Built in | `context.vouchr.connect()` then `handle.fetch()` |
-| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Channel configuration, connect, session, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
+| **Hybrid** | Slack and the agent/MCP worker are separate services or languages. | Channel configuration, connect, approvals, and the broker-denial recovery bridge (`recoverBrokerDenial`) are built in | Private `/v1/fetch` or `/v1/mcp` broker call |
 | Pure headless | There is no Slack control plane, or the host intentionally owns every UI. | Host-built | Private broker API |
 
 If the agent already runs in the same Bolt process, embedded Bolt is simpler. Hybrid is not a
@@ -58,7 +58,7 @@ no second credential database. The two planes form one Vouchr deployment through
 
 Install Vouchr in the agent's existing Slack app for the complete hybrid flow. A separate Vouchr app
 can own App Home and `/vouchr` configuration, but it does not automatically receive the agent app's
-verified event or request-bound `context.vouchr`; on-demand per-user/session preflight then needs a
+verified event or request-bound `context.vouchr`; on-demand preflight then needs a
 trusted cross-app handoff that remains host-owned under #194. Slack sends one command/event URL to one
 receiver, so when reusing an app, install Vouchr in that app's existing Bolt ingress process or route
 the same ingress endpoint to the combined receiver.
@@ -275,7 +275,6 @@ VOUCHR_MASTER_KEY=<same key material as the control service>
 VOUCHR_IDENTITY_SECRET=<random identity-only signing key>
 VOUCHR_DEPLOYMENT_ID=vouchr-production-eu1
 VOUCHR_IDENTITY_ISSUER=vouchr-slack-control
-VOUCHR_CHANNEL_MODES=1
 VOUCHR_ALLOW_WRITES=1
 VOUCHR_SWEEP_INTERVAL_MS=0
 VOUCHR_PROVIDERS_FILE=/run/config/providers.json
@@ -350,7 +349,6 @@ containing it.
 > [!NOTE]
 > The packaged broker enforces both the static operator `Policy` above and PostgreSQL-backed
 > `ChannelTools` state shared with Bolt; neither gate can override a denial by the other.
-> `VOUCHR_CHANNEL_MODES=1` is separate and only permits channel-owned credential modes.
 
 Both `/v1/admin/reference` and `/v1/user/reference` enforce the reference-only boundary before any
 credential, mode, or audit write: the broker validates a bounded supported reference form, derives its
@@ -433,10 +431,10 @@ type SlackChannelReader = {
 
 async function mintForBrokerCall(
   facts: VerifiedSlackFacts,
-  serverMode: 'shared' | 'per-user' | 'session' | null,
+  serverIdentity: 'person' | 'channel' | 'service',
   client: SlackChannelReader,
 ) {
-  // `facts` came from one verified Bolt request; `serverMode` came from Vouchr's
+  // `facts` came from one verified Bolt request; `serverIdentity` came from Vouchr's
   // server-side manifest after preflight. Neither came from the worker/model.
   if ([facts.teamId, facts.userId, facts.channel, facts.threadTs].some((v) => !v.trim())) {
     throw new Error('Verified Slack identity is incomplete.');
@@ -453,7 +451,7 @@ async function mintForBrokerCall(
     ...(facts.enterpriseId ? { enterpriseId: facts.enterpriseId } : {}),
   };
 
-  if (serverMode === 'shared') {
+  if (serverIdentity === 'channel') {
     let info: Parameters<typeof channelIneligibleReason>[0] = null;
     try {
       // Fetch by the exact channel being signed so eligibility cannot be borrowed
@@ -482,16 +480,16 @@ missing. Accept only Slack's closed vocabulary (`channel`, `group`, `im`, `mpim`
 exported `isSlackConversationType` guard and carry that trusted value in `channelType`; never infer
 it from a worker-supplied channel id. This is load-bearing for group DMs: an MPIM has a `G…` id that
 otherwise resembles a governed private channel, so the signed `mpim` fact keeps personal DM use
-outside mutable channel governance. `serverMode` above must be read from Vouchr's current
+outside mutable channel governance. `serverIdentity` above must be read from Vouchr's current
 server-side manifest/config, never accepted from the worker. For a channel-owned assertion, the
 signed `ownerKind: 'channel'` and `channelEligible: true` must agree with the request handle. The
 broker rejects disagreement.
 
 `channelEligible` proves the **channel class** only; it is not a signed membership claim. Every
-channel governance write (`/v1/admin/reference`, `/v1/admin/mode` to `shared`, and `/v1/admin/tools`)
+channel governance write (`/v1/admin/reference`, `/v1/admin/identity` to `channel`, and `/v1/admin/tools`)
 requires it to be `true` unless the broker runs with `requireChannelEligibility: false`, matching
 Bolt's channel-class check on the same mutations. When
-`requireChannelMembership: true`, the Bolt `connect()` preflight below must also run for shared mode,
+`requireChannelMembership: true`, the Bolt `connect()` preflight below must also run for the channel identity,
 because that is where membership is rechecked. A custom minter that skips Bolt preflight must verify
 membership itself before minting channel ownership.
 
@@ -520,23 +518,19 @@ owner/provider generation is finalized transactionally, fixed browser outcomes r
 waiting for Slack, and attributable failures make at most one immediate, best-effort private
 recovery-DM attempt. A process failure can drop that message.
 
-For **every brokered mode**, preflight with the in-process Bolt context before dispatching the remote
-worker. In shared mode this rechecks current mode, policy/tool state, credential presence, channel
-class, and optional membership; in per-user/session mode it also renders the recovery prompt:
+Whatever the identity, preflight with the in-process Bolt context before dispatching the remote
+worker. For the `channel` identity this rechecks the current identity, policy/tool state, credential
+presence, channel class, and optional membership; for `person` it also renders the connect prompt:
 
 ![Private connect prompt](../assets/slack-connect-prompt.svg)
-
-Session mode uses the same preflight but binds the grant to the verified Slack thread:
-
-![Thread-scoped session prompt](../assets/slack-session-thread.svg)
 
 ```ts
 app.event('app_mention', async ({ context, event, client, say }) => {
   try {
-    // Resolve mode and show the built-in OAuth/key/session prompt when needed.
+    // Resolve who the agent acts as and show the built-in OAuth/key prompt when needed.
     await context.vouchr.connect('internal-mcp');
   } catch (error) {
-    // ConsentRequiredError / SessionApprovalRequiredError are control flow: the
+    // ConsentRequiredError is control flow: the
     // private prompt is already posted, so stop this turn without calling the worker.
     if (isVouchrPrompt(error)) return;
     throw error;
@@ -544,10 +538,10 @@ app.event('app_mention', async ({ context, event, client, say }) => {
 
   const tool = (await context.vouchr.toolManifest())
     .find((entry) => entry.provider === 'internal-mcp');
-  if (!tool?.enabled || tool.identity !== 'acting_human') {
+  if (!tool?.enabled || tool.identity === 'service') {
     throw new Error('Internal MCP is not available in this channel.');
   }
-  const ownerKind = tool.mode === 'shared' ? 'channel' : 'user';
+  const ownerKind = tool.identity === 'channel' ? 'channel' : 'user';
 
   const result = await dispatchTrustedGateway({
     teamId: context.teamId,
@@ -560,7 +554,7 @@ app.event('app_mention', async ({ context, event, client, say }) => {
   if (result.brokerDenial) {
     // The supported #194 bridge: relay the typed broker denial body from this verified context.
     // Vouchr re-resolves everything server-side and takes the correct private action — the
-    // connect/key prompt, the thread session prompt, shared-credential configuration direction, or the
+    // connect/key prompt, channel-credential configuration direction, or the
     // Approve/Deny decision surface for the pending approvalId.
     const recovery = await context.vouchr.recoverBrokerDenial('internal-mcp', result.brokerDenial);
     if (recovery.status === 'resolved' || recovery.status === 'stale') {
@@ -696,7 +690,7 @@ The equivalent slash-command flow is:
 
 ```text
 /vouchr tools
-/vouchr mode internal-mcp shared
+/vouchr identity internal-mcp channel
 /vouchr enable internal-mcp
 /vouchr connect-shared internal-mcp
 /vouchr audit channel
@@ -704,19 +698,20 @@ The equivalent slash-command flow is:
 ```
 
 Bare `/vouchr` opens the settings modal. Everyone sees connections and a read-only manifest; members
-of the channel can edit mode and enabled state and press **Save**. Provider-output rendering and data-loss
+of the channel can edit who the agent acts as and enabled state and press **Save**. Provider-output rendering and data-loss
 prevention belong to the trusted host; Vouchr does not retain provider responses or publish a
 preview-visibility policy. The modal does not contain the shared-credential input; use App Home's
 Connect shared account action or `/vouchr connect-shared <provider>`.
 
 ### Channel-member experience
 
-- `shared`: the person asks the agent; no personal connection is required. Preflight checks the
+- `channel`: the person asks the agent; no personal connection is required. Preflight checks the
   channel credential and optional membership, and the eventual use is audited as the acting human.
-- `per-user`: first use posts a private OAuth/key prompt. The person connects, then retries the
+- `person`: first use posts a private OAuth/key prompt. The person connects, then retries the
   original request.
-- `session`: the person acts in a Slack thread, approves the thread-scoped grant there, then retries
-  before the grant expires.
+- Either way a write posts one Approve/Deny prompt in the channel unless the provider sets
+  `approval: false`. With `grant: 'thread'` one approval covers the thread for `ttlMs`; the person
+  retries before it expires.
 
 ### Channel credential modal
 
@@ -729,8 +724,8 @@ The private modal is titled **Channel credential** and accepts exactly one value
 It is the exported `configureModal(provider, channel, referenceSources?, requestId?, disabled?)`
 builder (callback id `CONFIGURE_CALLBACK`); its self-service twin is `userKeyModal(provider,
 referenceSources?, requestId?)` (`USER_KEY_CALLBACK`), opened from the `SETUP_KEY_ACTION` button.
-`configModal` and `homeView` take `ToolRow` (`{ provider, enabled, mode? }`) and `ConfigMemberRow`
-(adds `mode`, `identity`) rows, and their Disconnect buttons carry `DISCONNECT_ACTION`. A host that
+`configModal` and `homeView` take `ToolRow` (`{ provider, enabled, identity? }`) and `ConfigMemberRow`
+(`{ provider, identity, enabled }`) rows, and their Disconnect buttons carry `DISCONNECT_ACTION`. A host that
 renders these with its own client owns the handlers for those ids: Bolt runs every matching listener.
 
 ```text
@@ -752,9 +747,8 @@ If the broker owns resolution, configure references through `/v1/admin/reference
 resolver in Bolt merely to make the field appear when the broker lacks the same capability.
 
 Slack has no password/masked text input. Vouchr does not echo, post, or audit the submitted value,
-but a reference is safer than a raw key. If the channel is unconfigured, successfully saving a
-credential sets its mode to `shared`. If it is already `per-user` or `session`, the save is refused;
-switch to `shared` first. Switching away from `shared` deletes the channel credential. Successful
+but a reference is safer than a raw key. Successfully saving a credential sets the channel's identity
+for the provider to `channel`. Switching it back to `person` deletes the channel credential. Successful
 configuration is confirmed privately by DM.
 
 Shared credentials are refused for Slack Connect/externally shared or pending-shared channels, DMs,
@@ -810,7 +804,6 @@ state; recovery metadata is routing guidance, not authority.
 | `409`, code `not_connected` | No usable owner credential | Relay to `recoverBrokerDenial`: user ownership gets the private connect/key flow; shared ownership directs the asking member to channel configuration. Do not loop broker retries |
 | `403`, code `tool_disabled` | The provider was never enabled in this channel (channels are deny-by-default) | Relay to `recoverBrokerDenial`: it privately tells the asking user a channel member must enable it, in the same words the embedded path uses. Returns `notified`; the host adds nothing |
 | `403`, code `policy_denied` | Provider policy denies this channel | Relay to `recoverBrokerDenial`: same private-notice path, returns `notified` |
-| `403`, code `session_approval_required` | No live thread grant | Relay to `recoverBrokerDenial` from the verified thread context: it creates/reuses the one thread-scoped approval prompt, and the click re-validates everything at the mutation. Retry only after the grant, with a fresh assertion |
 | `403`, code `approval_required` | A write needs a human grant | Relay to `recoverBrokerDenial`: the opaque `approvalId` is a lookup handle, never authority — the bridge re-reads the pending row, re-derives the self/member rule from the registry, and delivers the decision surface. Retry only after one live grant, with a fresh assertion |
 | `policy_denied` or `tool_disabled` | Provider is not authorized here | Non-retryable `contact_admin`; never silently widen scope or loop retries. If you run the Slack control plane, relay to `recoverBrokerDenial` instead of rendering your own copy — it posts the notice and returns `notified` (see the denial table above). |
 | `429` code `rate_limited` or `503` code `overloaded` | Bounded back-pressure | Only `retry_later` outcomes are retryable; honor `Retry-After`, mint a fresh assertion, and retry only when the operation is safe |
@@ -909,8 +902,8 @@ Run this proof against at least two broker replicas and one shared PostgreSQL da
 1. Migrate with the exact release image, then prove both runtime roles lack DDL privileges.
 2. Connect a per-user provider in Slack; retry and prove the remote worker uses only that user's
    credential without receiving it.
-3. Set a provider to `session`; prove the verified thread prompts, grants, expires, and cannot be
-   reused from another thread.
+3. Give a provider `approval: { grant: 'thread' }`; prove one approval in a verified thread covers
+   later writes there, expires, and does not cover another thread.
 4. Configure an AWS ARN as a channel credential; prove another eligible member can use it in that
    channel, a non-member is refused when membership is required, and a different channel cannot use
    it.
@@ -951,7 +944,7 @@ vision and the open blocker set above.
   and every broker runs the current release. There is no channel-allowlist cache to wait out.
 - **ARN saves but egress fails:** verify the resolver is wired on the broker, region/IAM/KMS rights,
   and the secret value is the exact credential shape the provider expects.
-- **Broker returns session/approval denial with no Slack prompt:** shared storage alone does not
+- **Broker returns an approval denial with no Slack prompt:** shared storage alone does not
   bridge UI; relay the typed denial body to `recoverBrokerDenial` from the verified event context
   (or run Bolt preflight before dispatch). Never mutate interaction tables directly — the bridge and
   the click handlers own those mutations.

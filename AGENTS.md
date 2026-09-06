@@ -200,7 +200,7 @@ fixture is unavailable. `npm run example:github` runs the live demo by hand.
 
 ```
 src/core/      crypto · db · vault · injector · tokens · consent · oauthCallback · providers ·
-               policy · identity · owner · channelConfig · tools · audit · offboard · session ·
+               policy · identity · owner · channelConfig · tools · audit · offboard · approval ·
                sweep · authz — provider- and transport-agnostic
 src/adapters/  bolt.ts (Bolt middleware + /vouchr command + modals) · blocks.ts ·
                http/ (broker) · slack-identity · installationStore · kms

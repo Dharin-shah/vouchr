@@ -276,8 +276,9 @@ Entrypoint: `dist/bin/broker-server.js` (dev: `npm run broker`). It serves `POST
 `POST /v1/audit` (the caller's own credential-usage trail), `POST /v1/user/reference`,
 `GET /v1/manifest`, `POST /v1/manifest`, `POST /v1/admin/tools`, `GET /v1/admin/config`,
 `POST /v1/admin/audit` (that channel's usage, signed channel claim), `GET /healthz` (liveness, alias
-`/health`), and `GET /readyz` (readiness). When channel modes are enabled it additionally makes
-`POST /v1/admin/mode` and `POST /v1/admin/reference` usable. The service listens on `VOUCHR_PORT`
+`/health`), `GET /readyz` (readiness), `POST /v1/admin/identity` and `POST /v1/admin/reference`
+(channel governance, signed channel claim), and `POST /v1/authorization` plus
+`GET /v1/authorization/{id}` (backchannel approvals). The service listens on `VOUCHR_PORT`
 (default 3000) and runs the TTL sweep on a timer (see *Lifecycle*). With `VOUCHR_BASE_URL` set it
 additionally serves `POST /v1/connect` and the OAuth callback (below).
 
@@ -420,16 +421,12 @@ as one transaction. A disabled brokered provider is refused before credential re
 I/O. Service tools carry the same stored and rendered Enable/Disable bit, but Vouchr never
 executes their service-authenticated egress; the trusted host must enforce a disabled service row.
 
-`VOUCHR_CHANNEL_MODES` is independent: it controls channel-owned credential mode/reference/use, not
-whether the channel tool allowlist is available.
-
 ### Channel-owned credentials headless (`owner: "channel"`)
 
-By default the broker is **user-only**: a `handle.owner` of `"channel"` is refused. Set
-`VOUCHR_CHANNEL_MODES=1` to enable the transport-agnostic channel gate (#51), which lets a headless
-caller reach the `shared` channel mode the Bolt adapter offers — **without** a Slack
-client in the broker. The broker has no way to read Slack, so **the caller supplies the Slack-derived
-facts as signed claims** and the broker trusts them at the same level as `teamId`/`userId`:
+A `handle.owner` of `"channel"` reaches the channel's one credential when the channel's identity for
+that provider is `channel`, the same credential the Bolt adapter's `connect-shared` sets up, **without**
+a Slack client in the broker (#51). The broker has no way to read Slack, so **the caller supplies the
+Slack-derived facts as signed claims** and the broker trusts them at the same level as `teamId`/`userId`:
 
 - `ownerKind: "channel"` — the request targets a channel-owned credential. It must match `handle.owner`
   or the request is refused, so a forged body alone can never reach a channel credential.
@@ -448,14 +445,14 @@ const token = mintIdentity(
 );
 ```
 
-`shared` resolves to the channel's credential (audited as the acting human). `per-user` / `session`
-channels are **not** reachable this way — those are user-owned modes, so the caller uses
-`owner: "user"`.
+`owner: "channel"` resolves to the channel's credential (audited as the acting human) and is refused
+with `403 { "error": "channel is not configured for a channel-owned credential" }` when the channel's
+identity for the provider is `person`. A person's own credential is reached with `owner: "user"`.
 
 #### Channel-credential config (`POST /v1/admin/reference`, #53)
 
-The headless contract lets a channel member point a channel's **shared** credential at an external secret
-manager when channel modes are enabled (`VOUCHR_CHANNEL_MODES=1`). The route shape is:
+The headless contract lets a channel member point a channel's credential at an external secret
+manager. The route shape is:
 
 ```
 POST /v1/admin/reference
@@ -472,16 +469,16 @@ POST /v1/admin/reference
   unique, single-space-separated OAuth tokens, each of which must appear in the provider's
   `scopesDefault`. Omit `scopes` for providers that declare none.
 - Raw values, malformed/unknown references, mismatched sources, invalid scopes, and missing resolvers
-  are rejected before any credential, channel mode, or audit row is written. Errors use fixed copy
+  are rejected before any credential, channel identity, or audit row is written. Errors use fixed copy
   and never echo the rejected value.
 - Authority is the **signed `channel` claim**: any member of that channel may configure it (#322),
   and the minter asserts only the channel the verified Slack event came from.
 - Channel eligibility is enforced on the signed `channelEligible` claim (shared creds refused on
-  ineligible / externally-shared channels). `POST /v1/admin/mode` (to `shared`) and
+  ineligible / externally-shared channels). `POST /v1/admin/identity` (to `channel`) and
   `POST /v1/admin/tools` require the same `channelEligible: true` claim, as Bolt checks the channel
   class on the same mutations; a token without it is refused 403 and audited `channel-ineligible`.
-- It stores only the validated non-secret reference (`vault.reference`) and flips the channel to
-  `shared`. A headless host wanting static keys should point at a secret manager rather than send the
+- It stores only the validated non-secret reference (`vault.reference`) and sets the channel's
+  identity for the provider to `channel`. A headless host wanting static keys should point at a secret manager rather than send the
   value over this route. The route returns `{ ok: true }`.
 
 ### Environment contract
@@ -508,7 +505,6 @@ POST /v1/admin/reference
 | `VOUCHR_SLACK_CLIENT_ID` / `VOUCHR_SLACK_CLIENT_SECRET` | yes | the Slack app's OIDC client credentials for the browser identity check on every Connect link (#302). The secret must be distinct from every other configured secret (purpose separation). See [Browser Slack-identity verification](#browser-slack-identity-verification-302). |
 | `VOUCHR_ALLOW_WRITES` | no | `1`/`true` opts into the write path (still per-provider `egressMethods`); `0`/`false` disables it. Any other value refuses boot. |
 | `VOUCHR_DRY_RUN` | no | `1`/`true` enables dry-run (#116); `0`/`false` disables it, and any other value refuses boot. Dry-run runs real gates with no real network on any edge — consent yields a synthetic credential (marked by a system-only `dry_run` column) and `/v1/fetch` returns a `{ dryRun, method, url, wouldInjectAs }` echo. Boot hard-fails if the database holds any non-dry-run credential row; a real row written later is refused per-request. Requires a **local master key** — an external KMS envelope (`VOUCHR_KMS_KEY_ID`) is refused at startup. Never set on production state. |
-| `VOUCHR_CHANNEL_MODES` | no | `1`/`true` enables `owner:"channel"` handles (shared) via signed channel-fact claims (#51); `0`/`false` disables them. Any other value refuses boot. Independent of the always-wired channel tool allowlist. |
 | `VOUCHR_LOCKDOWN` | no | `1`/`true` puts this replica into #239 containment: readiness → 503 and credential serving, refresh, OAuth-callback writes, resolver access, credential/reference setup, and built-in Slack installation reads/writes are denied before any secret is read. `0`/`false` disables; any other value refuses boot. Break-glass deletion still works during lockdown. Authority is this env, **outside** the credential database. See [Incident break-glass](#incident-break-glass-239). |
 | `VOUCHR_PORT` | no | listen port (default 3000). |
 | `AWS_REGION` | with KMS | region for the KMS client (else SDK default chain). |
@@ -536,7 +532,7 @@ Two credential-store incidents demand different responses:
      compromised database would not be trustworthy — the authority is the deployment env.
   2. **Invalidate locally.** `vouchr revoke --all` (dry-run) to preview counts, then
      `vouchr revoke --all --confirm ALL-CREDENTIALS`. It deletes every credential, external reference,
-     pending consent, session grant/request, action approval, notification-state row, and Slack
+     pending consent, action approval (thread grants included), notification-state row, and Slack
      installation — no key/KMS/provider config required — and attempts bounded best-effort upstream
      revocation per provider. Dry-run uses `would_attempt`; execution reports attempted rows plus
      `revoked`/`failed`/`unsupported`/`undecryptable`/`unresolved`/`external_reference`/`synthetic`.
@@ -622,9 +618,10 @@ With no `egressMethods`, the broker default-denies non-GET/HEAD — a read-only 
 writes with `VOUCHR_ALLOW_WRITES=1` **and** an explicit `egressMethods` on the provider.
 
 **Write/approval boundary (plain language).** Enabling writes lets the agent use the connected
-credential at the endpoints and methods you allowlisted — nothing more. A generic session approval is
-permission to *use the credential at that endpoint/method*, not transaction-level sign-off on an
-arbitrary request body: Vouchr does not inspect or fingerprint payloads. A provider that needs a human
+credential at the endpoints and methods you allowlisted — nothing more. An approval is permission to
+*use the credential at that endpoint/method*, not transaction-level sign-off on an arbitrary request
+body: Vouchr does not inspect or fingerprint payloads, and the `reason` and `link` an agent passes are
+shown to the approver as the agent's own claim, not verified. A provider that needs a human
 to confirm the specific action (an amount, a recipient) must either keep generic writes off, or the
 host must implement that confirmation with a tool-specific step — see the `approval` knob below for
 per-endpoint human-in-the-loop approval, which binds a grant to the exact method + origin (scheme,
@@ -647,11 +644,13 @@ on top of the write gating above, and locks the reachable endpoint + response me
 ]
 ```
 
-To require **human-in-the-loop approval** for a provider's writes (#113), declare the `approval`
-knob — `approver` is required: `"self"` (the acting user confirms) or `"member"` (any other current
-member of the owning channel confirms; in a DM it behaves like `"self"`). `"admin"` was removed in
-#322 and fails validation. `methods` defaults to every non-GET/HEAD
-method, `paths` to all (same matcher as `egressPaths`), `ttlMs` to 5 minutes. Invalid shapes are
+**Human-in-the-loop approval is on by default** (#113, #350): every non-GET/HEAD call needs a live
+grant. The optional `approval` knob adjusts it. `false` turns it off for the provider. Otherwise an
+object with any of: `approver` (`"member"`, the default: any other current member of the owning
+channel confirms, in a DM it behaves like `"self"`; or `"self"`: the acting user confirms), `methods`
+(default every non-GET/HEAD method), `paths` (default all, same matcher as `egressPaths`), `grant`
+(`"once"`, the default: one exact call; or `"thread"`: every matching call in the approving thread
+until the TTL), and `ttlMs` (default 5 minutes). Unknown keys, `null`, and invalid shapes are
 rejected fail-closed at config load. A matching request with no live grant gets
 `403 { "error": "approval_required", "approvalId": "…", "code": "approval_required",
 "retryable": false, "recovery": "request_approval" }` from the broker — the Approve/Deny surface is
@@ -664,10 +663,15 @@ the Slack app (see the [headless guide](./HEADLESS.md)'s approvals section):
     "credential": "key",
     "egressAllow": ["api.internal.example"],
     "egressMethods": ["GET", "POST"],
-    "approval": { "approver": "member", "methods": ["POST"], "ttlMs": 300000 }
-  }
+    "approval": { "grant": "thread", "ttlMs": 1800000 }
+  },
+  { "id": "read-only-feed", "credential": "key", "egressAllow": ["feed.example"], "approval": false }
 ]
 ```
+
+A request may carry `reason` (up to 500 bytes, plain text) and `link` (an `https://` URL, up to
+2,048 bytes) beside `method` and `path` on `/v1/fetch`, `/v1/mcp`, and `/v1/authorization`. Both are
+rendered on the prompt; the reason is also written to the `approval_requested` audit row.
 
 ### Provider response constraints (`egressResponse`)
 
@@ -814,7 +818,7 @@ The headless broker can **revoke** credentials, not just inject them — the two
 
 For in-process control, `offboardUser`, the lower-level core `sweepExpired`, and `disconnectProvider`
 are exported from the package root. A direct broker must use its own `server.sweepExpired()` method so
-approval/session cleanup cannot be omitted. `disconnectProvider` returns
+approval cleanup cannot be omitted. `disconnectProvider` returns
 `{ recognized, removed, ok, audited }`; delete failures still reject, while an audit failure preserves
 the already-committed local/upstream outcome as `audited: false`. For source compatibility,
 `offboardUser` still returns only the locally removed provider ids; that array is not a claim that
@@ -1093,10 +1097,10 @@ Create the app from [`examples/slack-manifest.yml`](../examples/slack-manifest.y
 - **Slash command:** bare `/vouchr` opens the settings modal (with a truthful status fallback if
   Slack cannot open it); `/vouchr help` is the canonical current command list. It includes personal
   `status`, `disconnect <provider>`, and `audit`; channel `tools`; and the channel-member commands
-  `connect-shared`/`disconnect-shared <provider>`, `mode <provider> <shared|per-user|session>`,
+  `connect-shared`/`disconnect-shared <provider>`, `identity <provider> <person|channel>`,
   `enable`/`disable <provider>`, `stats`, and `audit channel`.
 - **Who may configure:** any **current member of the channel** (#322). The
-  `connect-shared`/`disconnect-shared`/`mode`/`enable`/`disable`/`stats`/`audit channel` commands,
+  `connect-shared`/`disconnect-shared`/`identity`/`enable`/`disable`/`stats`/`audit channel` commands,
   the config modal, and App Home governance read `conversations.members` (needs `channels:read`, and
   `groups:read` plus the app being in the channel for private channels) and fail closed. There is
   no workspace-admin role, creator rule, or custom predicate. The roster scan is bounded
