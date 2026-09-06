@@ -18,6 +18,7 @@ import { Audit } from '../src/core/audit';
 import { defineProvider } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const SECRET = 'python-client-secret';
@@ -55,7 +56,7 @@ test('#278 python example: stdlib client round-trips a real broker (fetch, one r
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'bridge', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [bridge], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET), allowWrites: true });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [bridge], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET), allowWrites: true });
   await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;

@@ -165,19 +165,12 @@ export async function buildBrokerServer(
   // VOUCHR_ALLOW_WRITES; explicit 1/true enables and 0/false disables, while typos fail boot.
   const dryRun = booleanEnv(env.VOUCHR_DRY_RUN, 'VOUCHR_DRY_RUN');
   const brokerToken = env.VOUCHR_BROKER_TOKEN || undefined;
-  // #52 setting VOUCHR_BASE_URL mounts the OAuth connect flow (/v1/connect + the callback). Unset →
-  // the historical use-only broker (no consent kickoff).
-  const baseUrl = env.VOUCHR_BASE_URL || undefined;
+  // #52/#302 VOUCHR_BASE_URL mounts the OAuth connect flow (/v1/connect, the Slack verify hop, and
+  // the callback); the Slack OIDC pair drives the hop. All three are required — createBroker fails
+  // closed naming the missing one, before the listener opens.
+  const baseUrl = env.VOUCHR_BASE_URL ?? '';
   const callbackPath = env.VOUCHR_CALLBACK_PATH || undefined;
-  // #302 browser Slack-identity hop: pure flag parse here (typos fail boot before KMS/Postgres);
-  // createBroker owns the cross-checks (requires baseUrl + both OIDC credentials, refuses dryRun).
-  const requireBrowserSlackIdentity = booleanEnv(
-    env.VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY,
-    'VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY',
-  );
-  const slackOidc = env.VOUCHR_SLACK_CLIENT_ID || env.VOUCHR_SLACK_CLIENT_SECRET
-    ? { clientId: env.VOUCHR_SLACK_CLIENT_ID ?? '', clientSecret: env.VOUCHR_SLACK_CLIENT_SECRET ?? '' }
-    : undefined;
+  const slackOidc = { clientId: env.VOUCHR_SLACK_CLIENT_ID ?? '', clientSecret: env.VOUCHR_SLACK_CLIENT_SECRET ?? '' };
 
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');
@@ -269,7 +262,6 @@ export async function buildBrokerServer(
     baseUrl,
     callbackPath,
     dryRun,
-    requireBrowserSlackIdentity,
     slackOidc,
     ...resourceBounds,
     authorize: overrides.authorize,
@@ -312,12 +304,14 @@ Usage: vouchr-broker            start the broker, config from env
 
 Required env: VOUCHR_IDENTITY_SECRET (>= 32 random bytes; distinct from every other secret),
               VOUCHR_DEPLOYMENT_ID (binds every identity assertion to this deployment),
-              VOUCHR_MASTER_KEY (base64 of 32 bytes), VOUCHR_DATABASE_URL (PostgreSQL).
+              VOUCHR_MASTER_KEY (base64 of 32 bytes), VOUCHR_DATABASE_URL (PostgreSQL),
+              VOUCHR_BASE_URL (public HTTPS origin; the connect, Slack verify, and callback routes
+              mount under it), VOUCHR_SLACK_CLIENT_ID + VOUCHR_SLACK_CLIENT_SECRET (the Slack app
+              OIDC credentials for the browser identity check on every Connect link, #302).
 Optional env: VOUCHR_IDENTITY_SECRET_PREVIOUS (rolling key rotation), VOUCHR_IDENTITY_ISSUER (default
-              'vouchr'), VOUCHR_PORT (3000), VOUCHR_KMS_KEY_ID, VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN,
-              VOUCHR_SWEEP_INTERVAL_MS, VOUCHR_POLICY (inline JSON), VOUCHR_POLICY_FILE (JSON path;
-              mutually exclusive with VOUCHR_POLICY), VOUCHR_REQUIRE_BROWSER_SLACK_IDENTITY (#302;
-              needs VOUCHR_BASE_URL + VOUCHR_SLACK_CLIENT_ID + VOUCHR_SLACK_CLIENT_SECRET).
+              'vouchr'), VOUCHR_PORT (3000), VOUCHR_CALLBACK_PATH, VOUCHR_KMS_KEY_ID,
+              VOUCHR_ALLOW_WRITES, VOUCHR_DRY_RUN, VOUCHR_SWEEP_INTERVAL_MS, VOUCHR_POLICY (inline
+              JSON), VOUCHR_POLICY_FILE (JSON path; mutually exclusive with VOUCHR_POLICY).
 Resource bounds (#209): VOUCHR_FETCH_DEADLINE_MS (30000), VOUCHR_MAX_INFLIGHT (200),
               VOUCHR_MAX_INFLIGHT_PER_PROVIDER (40), VOUCHR_HEADERS_TIMEOUT_MS (15000),
               VOUCHR_REQUEST_TIMEOUT_MS (30000), VOUCHR_KEEPALIVE_TIMEOUT_MS (10000),

@@ -19,6 +19,10 @@ import { createVouchr, github, ConsentRequiredError } from '../../src';
 
 // Vouchr's at-rest encryption key — any random 32 bytes will do in a test.
 process.env.VOUCHR_MASTER_KEY ??= randomBytes(32).toString('base64');
+// The Slack app credentials every createVouchr requires (#302). Dry-run never contacts Slack: its
+// synthetic authorize URL stands in for the Slack sign-in hop as it does for the provider.
+process.env.VOUCHR_SLACK_CLIENT_ID ??= 'dry-run';
+process.env.VOUCHR_SLACK_CLIENT_SECRET ??= 'dry-run';
 
 // This example is a first-run sanity check, so an absent database must SAY what to run. Opting into
 // the suite's require-Postgres mode makes pgReachable() below throw its actionable "run npm run

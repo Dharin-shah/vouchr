@@ -22,6 +22,7 @@ import { createBroker } from '../src/adapters/http/broker';
 import { createVouchr } from '../src/adapters/bolt';
 import { APPROVAL_APPROVE_ACTION, APPROVAL_DENY_ACTION } from '../src/adapters/blocks';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const SECRET = 'authorization-signing-secret';
 const TOKEN = 'tok_live_secret_value_never_rendered';
@@ -138,7 +139,7 @@ async function harness(t: TestContext, o: {
   });
   // Deny-by-default on the Bolt side: the control plane only delivers for an enabled provider.
   await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'acme', true);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [provider], vault, audit, db, identitySecret: identityConfig(SECRET),
     allowWrites: o.allowWrites ?? true,
     ...(owner === 'channel' ? { channelConfig } : {}),

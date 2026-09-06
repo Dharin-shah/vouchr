@@ -11,6 +11,7 @@ import { defineProvider } from '../src/core/providers';
 import { userOwner, channelOwner, type Owner } from '../src/core/owner';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, mintIdentity } from './support/identity';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // #51 owner-binding invariant — the cross-tenant guard in resolveOwner. This EXHAUSTIVELY enumerates
 // the small tuple space (deterministic — better than random here) and asserts fail-closed behavior:
@@ -64,7 +65,7 @@ async function makeBroker(t: TestContext, channelConfigSet: boolean) {
     await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'shared'); // the channel owns one shared credential
   }
 
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   await listen(t, server);
   const port = (server.address() as any).port;
   return { server, port, reads, reset: () => { reads.length = 0; } };

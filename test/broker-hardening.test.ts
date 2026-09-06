@@ -15,6 +15,7 @@ import type { VouchrEvent } from '../src/core/injector';
 import { createBroker } from '../src/adapters/http/broker';
 import { createVouchr } from '../src/adapters/bolt';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -78,7 +79,7 @@ test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', 
   const channelConfig = new ChannelConfig(db);
   await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   const port = await listen(t, server);
   const up = mockUpstream();
   try {
@@ -106,7 +107,7 @@ test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', asy
   const credentialId = await vault.liveId(userOwner(U1), 'acme');
   assert.ok(credentialId);
   await sessions.grant(U1, 'C1', '111.222', 'acme', 60_000, credentialId); // approve exactly this thread
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   const port = await listen(t, server);
   const up = mockUpstream();
   try {
@@ -124,7 +125,7 @@ test('session-mode is opt-in: with NO channelConfig the user credential serves a
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // no channelConfig
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // no channelConfig
   const port = await listen(t, server);
   const up = mockUpstream();
   try {
@@ -144,7 +145,7 @@ test('/v1/status: one listForUser call, no per-provider vault.get decrypts', asy
   let getCalls = 0;
   const realGet = vault.get.bind(vault);
   (vault as any).get = (...a: any[]) => { getCalls++; return (realGet as any)(...a); };
-  const server = createBroker({ providers: [acme, beta, svc], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme, beta, svc], vault, audit, db, identitySecret: identityConfig(SECRET) });
   const port = await listen(t, server);
   try {
     const r = await post(port, '/v1/status', { identityToken: token() });
@@ -164,7 +165,7 @@ test('/v1/status: a past-idle-TTL connection reports needs_consent, not connecte
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // Age the row past the idle window (mirrors what vault.get would treat as expired → null).
   await db.run(`UPDATE connection SET last_used_at=?, created_at=? WHERE provider='acme'`, [Date.now() - 5000, Date.now() - 5000]);
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
   const port = await listen(t, server);
   try {
     const r = await post(port, '/v1/status', { identityToken: token() });
@@ -184,7 +185,7 @@ test('policy_denied event fires on a policy-denied fetch (parity with the Bolt p
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const events: VouchrEvent[] = [];
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
     policy: new Policy({}, { defaultDeny: true }), // no rule for acme + defaultDeny → denied
     onEvent: (e) => events.push(e),
@@ -204,7 +205,7 @@ test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
     policy: new Policy({}, { defaultDeny: true }), // acme denied → emits policy_denied
     onEvent: () => { throw new Error('sink boom'); }, // a broken sink must never affect the request
@@ -225,7 +226,7 @@ test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async (
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // allowWrites unset
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // allowWrites unset
   const port = await listen(t, server);
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'POST', path: '/x', body: '{}' });
@@ -268,7 +269,7 @@ test('lockdown broker: liveness stays 200, readiness is 503, and functional rout
   const vault = new Vault(db, KEY, {}, undefined, true);
   // The route gate derives from the same immutable Vault flag; direct callers cannot wire two
   // contradictory lockdown states.
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
   const port = await listen(t, server);
   const up = mockUpstream();
   try {

@@ -44,6 +44,7 @@ import {
   POSTGRES_NOW_US_SQL,
   PROMPT_REDELIVERY_DEBOUNCE_US,
 } from '../src/core/interaction';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const ID = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
 const TOKEN = 'sk-secret-token';
@@ -231,7 +232,7 @@ async function brokerApprovalDenial(
 }> {
   const SECRET = 'bridge-test-secret';
   const owner = options.owner ?? 'user';
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [provider],
     vault: new Vault(db, key),
     audit: new Audit(db),

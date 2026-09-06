@@ -20,6 +20,7 @@ import {
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import { waitFor } from './support/clock';
 import { MAX_TIMER_MS } from '../src/core/options';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // #209 resource bounds at the HTTP boundary: finite upstream deadlines + client-cancel propagation,
 // inbound Content-Length/streamed caps, per-process global + per-provider in-flight ceilings (503 +
@@ -125,7 +126,7 @@ async function buildBroker(t: TestContext, over: Partial<BrokerOptions> = {}) {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const server = createBroker({ providers: [acme], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET), ...over });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET), ...over });
   const port = await listen(t, server);
   return { db, vault, server, port };
 }
@@ -606,7 +607,7 @@ test('/readyz: concurrent probes share both DB checks until both settle (#209)',
       return typeof value === 'function' ? value.bind(target) : value;
     },
   });
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme], vault, audit: new Audit(db), db: readinessDb,
     identitySecret: identityConfig(SECRET),
   });

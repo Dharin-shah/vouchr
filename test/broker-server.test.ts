@@ -327,9 +327,25 @@ async function baseEnv(t: TestContext, extra: Record<string, string> = {}): Prom
     VOUCHR_MASTER_KEY: KEY_B64,
     VOUCHR_DATABASE_URL: await testDbUrl(t), // PostgreSQL-only; a fresh isolated schema per broker
     VOUCHR_PROVIDERS: JSON.stringify([{ id: 'internal', credential: 'key', egressAllow: ['api.internal.example'] }]),
+    // #340: the OAuth connect flow and its Slack verify hop are always mounted, so all three are required.
+    VOUCHR_BASE_URL: 'https://broker.example',
+    VOUCHR_SLACK_CLIENT_ID: 'slack-app-cid',
+    VOUCHR_SLACK_CLIENT_SECRET: 'slack-app-csec',
     ...extra,
   };
 }
+
+test('#340 buildBrokerServer fails closed without VOUCHR_BASE_URL or the Slack OIDC pair, naming the variable', async (t) => {
+  const without = async (name: string) => {
+    const env = await baseEnv(t);
+    delete env[name];
+    return env;
+  };
+  await assert.rejects(buildBrokerServer(await without('VOUCHR_BASE_URL')), /baseUrl is required \(VOUCHR_BASE_URL\)/);
+  await assert.rejects(buildBrokerServer(await without('VOUCHR_SLACK_CLIENT_ID')), /VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/);
+  await assert.rejects(buildBrokerServer(await without('VOUCHR_SLACK_CLIENT_SECRET')), /VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/);
+  await assert.rejects(buildBrokerServer(await baseEnv(t, { VOUCHR_SLACK_CLIENT_SECRET: '' })), /slackOidc\.clientSecret/);
+});
 
 test('buildBrokerServer: boots on PostgreSQL and serves /healthz + /health + /readyz', async (t) => {
   const built = await buildBrokerServer(await baseEnv(t, { VOUCHR_PORT: '0' }));

@@ -442,8 +442,10 @@ test('property: authorize URL always carries the required params; code_challenge
     }
 
     const ident: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: `U${rint(1000)}` };
-    const { authorizeUrl, state } = await consent.begin(ident, provider, redirectUri, null);
-    const sp = new URL(authorizeUrl).searchParams;
+    const { authorizeUrl: prompt, state } = await consent.begin(ident, provider, redirectUri, null);
+    assert.equal(prompt, `https://app.example/oauth/verify?state=${state}`, 'the prompt is the Slack verify hop');
+    const row = (await consent.activeRow(state))!;
+    const sp = new URL(consent.providerAuthorizeUrl(provider, redirectUri, state, row.pkceVerifier)).searchParams;
 
     assert.equal(sp.get('client_id'), provider.clientId, 'client_id');
     assert.equal(sp.get('redirect_uri'), redirectUri, 'redirect_uri');

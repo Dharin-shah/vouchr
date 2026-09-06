@@ -10,6 +10,7 @@ import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { github, defineProvider, ProviderRegistry } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
+import { beginVerified } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -97,7 +98,7 @@ test('audit-sink: consent_granted fires on a successful OAuth callback; no token
   const audit = new Audit(db);
   const consent = new Consent(db);
   const registry = new ProviderRegistry([ACME]);
-  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const { state } = await beginVerified(consent, ID, ACME, 'https://app.example/cb', null);
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: TOKEN, refresh_token: REFRESH }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
   try {
@@ -123,7 +124,7 @@ test('audit-sink: consent_denied fires on a REAL user denial (?error=access_deni
   const audit = new Audit(db);
   const consent = new Consent(db);
   const registry = new ProviderRegistry([ACME]);
-  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const { state } = await beginVerified(consent, ID, ACME, 'https://app.example/cb', null);
   // No code, an error param, and a valid state: the user clicked "Deny" at the provider.
   const res = await handleOAuthCallback(
     { registry, vault, audit, consent, redirectUri: 'https://app.example/cb', auditSink: (e) => events.push(e) },
@@ -144,7 +145,7 @@ test('audit-sink: a real denial carries status 500 when its canonical audit writ
   const db = await openTestDb(t);
   const consent = new Consent(db);
   const registry = new ProviderRegistry([ACME]);
-  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const { state } = await beginVerified(consent, ID, ACME, 'https://app.example/cb', null);
   const res = await handleOAuthCallback(
     {
       registry,
@@ -171,7 +172,7 @@ test('audit-sink: a token-exchange failure emits consent_failed, not consent_den
   const audit = new Audit(db);
   const consent = new Consent(db);
   const registry = new ProviderRegistry([ACME]);
-  const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+  const { state } = await beginVerified(consent, ID, ACME, 'https://app.example/cb', null);
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('nope', { status: 400 })) as any; // exchange fails
   try {
@@ -193,18 +194,18 @@ test('audit-sink: a provider redirect error emits consent_failed, but access_den
   const mk = () => ({ vault: new Vault(db, KEY), audit: new Audit(db), consent: new Consent(db), registry, redirectUri: 'https://app.example/cb' });
 
   const denied: VouchrAuditEvent[] = [];
-  const s1 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
+  const s1 = (await beginVerified(mk().consent, ID, ACME, 'https://app.example/cb', null)).state;
   await handleOAuthCallback({ ...mk(), auditSink: (e) => denied.push(e) }, undefined, s1, 'access_denied');
   assert.equal(denied[0].action, 'consent_denied', 'a real user denial is consent_denied');
 
   const failed: VouchrAuditEvent[] = [];
-  const s2 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
+  const s2 = (await beginVerified(mk().consent, ID, ACME, 'https://app.example/cb', null)).state;
   await handleOAuthCallback({ ...mk(), auditSink: (e) => failed.push(e) }, undefined, s2, 'temporarily_unavailable');
   assert.equal(failed[0].action, 'consent_failed', 'a provider-side error is consent_failed');
   assert.equal(failed[0].status, 502, 'a transient provider redirect carries status 502');
 
   const incomplete: VouchrAuditEvent[] = [];
-  const s3 = (await mk().consent.begin(ID, ACME, 'https://app.example/cb', null)).state;
+  const s3 = (await beginVerified(mk().consent, ID, ACME, 'https://app.example/cb', null)).state;
   await handleOAuthCallback({ ...mk(), auditSink: (e) => incomplete.push(e) }, undefined, s3);
   assert.equal(incomplete[0].action, 'consent_failed', 'an incomplete callback is consent_failed');
   assert.equal(incomplete[0].status, 400, 'an audited incomplete callback carries status 400');
@@ -221,7 +222,7 @@ test('audit-sink: an offboard/revoke race during exchange emits consent_failed, 
     // consent_failed spans distinct lifecycle statuses: 403 offboarded, 409 revoked (contract doc).
     for (const [outcome, status] of [['offboarded', 403], ['revoked', 409]] as const) {
       const consent = new Consent(db);
-      const { state } = await consent.begin(ID, ACME, 'https://app.example/cb', null);
+      const { state } = await beginVerified(consent, ID, ACME, 'https://app.example/cb', null);
       const events: VouchrAuditEvent[] = [];
       // The lifecycle invalidation wins the fence during token exchange (upsert returns the outcome).
       const vault = { upsertUser: async () => outcome } as any;

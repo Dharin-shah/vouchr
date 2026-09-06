@@ -10,6 +10,7 @@ import { handleOAuthCallback } from '../src/core/oauthCallback';
 import { defineProvider, ProviderRegistry } from '../src/core/providers';
 import { userOwner } from '../src/core/owner';
 import type { SlackIdentity } from '../src/core/identity';
+import { beginVerified } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -98,7 +99,7 @@ test('consent deny: user denial + exchange failure each audit denied attributed 
   const db1 = await openTestDb(t);
   const consent1 = new Consent(db1);
   const registry = new ProviderRegistry([ACME]);
-  const { state: s1 } = await consent1.begin(ID, ACME, 'https://app.example/cb', null);
+  const { state: s1 } = await beginVerified(consent1, ID, ACME, 'https://app.example/cb', null);
   const denyRes = await handleOAuthCallback(
     { registry, vault: new Vault(db1, KEY), audit: new Audit(db1), consent: consent1, redirectUri: 'https://app.example/cb' },
     undefined, s1, 'access_denied',
@@ -113,7 +114,7 @@ test('consent deny: user denial + exchange failure each audit denied attributed 
   // Post-consent failure: valid code+state, but the token exchange 400s.
   const db2 = await openTestDb(t);
   const consent2 = new Consent(db2);
-  const { state: s2 } = await consent2.begin(ID, ACME, 'https://app.example/cb', null);
+  const { state: s2 } = await beginVerified(consent2, ID, ACME, 'https://app.example/cb', null);
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response('nope', { status: 400 })) as any;
   try {

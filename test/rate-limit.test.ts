@@ -16,6 +16,7 @@ import type { SlackIdentity } from '../src/core/identity';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import { ConnectContext, safeUserMessage } from '../src/adapters/bolt';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // Per-(owner, provider) rate limiting at the injection boundary (#114). Time-sensitive cases run on
 // node:test mock timers (Date only — real I/O timers keep working), so refill math is exact.
@@ -252,7 +253,7 @@ test('broker: a rate-limited /v1/fetch returns 429 with a Retry-After header, up
   await vault.upsert(userOwner(U1), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [limited], vault, audit, db, identitySecret: identityConfig('broker-secret') });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [limited], vault, audit, db, identitySecret: identityConfig('broker-secret') });
   await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;

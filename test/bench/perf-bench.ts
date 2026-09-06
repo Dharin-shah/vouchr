@@ -24,6 +24,7 @@ import { defineProvider } from '../../src/core/providers';
 import { decrypt, encrypt, type EnvelopeProvider } from '../../src/core/crypto';
 import { MAX_TIMER_MS, nonNegativeIntegerEnv, optionalPositiveEnv } from '../../src/core/options';
 import { identityConfig, signIdentity } from '../support/identity';
+import { BROKER_REQUIRED } from '../support/slackOidc';
 
 const PG = process.env.VOUCHR_TEST_PG_URL ?? 'postgres://vouchr:vouchr@localhost:5432/vouchr';
 const SECRET = 'bench-identity';
@@ -228,7 +229,7 @@ async function main(): Promise<void> {
     });
 
     for (let i = 0; i < cfg.replicas; i++) {
-      const server = createBroker({
+      const server = createBroker({ ...BROKER_REQUIRED,
         providers: [acme], vault: vaults[i], audit: new Audit(databases[i]), db: databases[i],
         identitySecret: identityConfig(SECRET), maxInflight: cfg.maxInflight,
         maxInflightPerProvider: cfg.maxInflightPerProvider,

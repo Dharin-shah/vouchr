@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import type { TestContext } from 'node:test';
 import { Client } from 'pg';
 import { migrate, openDb, type Db } from '../../src/core/db';
+import './slackOidc';
 
 // Many test files run in parallel, each opening isolated-schema pools; keep each pool tiny so their
 // combined connections stay well under a single Postgres's ceiling. Set before any openDb runs.

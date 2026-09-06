@@ -11,6 +11,7 @@ import { userOwner } from '../src/core/owner';
 import { type VouchrEvent } from '../src/core/injector';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -39,7 +40,7 @@ async function makeBroker(t: TestContext, events: VouchrEvent[]) {
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), onEvent: (e) => events.push(e) });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), onEvent: (e) => events.push(e) });
   await listen(t, server);
   return { server, db, port: (server.address() as any).port };
 }

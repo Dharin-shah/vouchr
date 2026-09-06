@@ -29,6 +29,7 @@ import {
   IDENTITY_SKEW_MS,
   type IdentityClaims,
 } from './support/identity';
+import { BROKER_REQUIRED, verifyConsent } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -68,7 +69,7 @@ async function makeBroker(t: TestContext, extra: Partial<Parameters<typeof creat
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
   await listen(t, server);
   const port = (server.address() as any).port;
   return { server, vault, db, port };
@@ -155,7 +156,7 @@ test('#212 createBroker rejects a legacy bare identity secret at the production 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   assert.throws(
-    () => createBroker({ providers: [acme], vault, audit, db, identitySecret: SECRET as any }),
+    () => createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: SECRET as any }),
     /identity config must be a plain object/,
   );
 });
@@ -183,7 +184,7 @@ test('#212 createBroker rejects identity-key reuse with direct broker/provider s
     { providers: [provider] },
   ]) {
     assert.throws(
-      () => createBroker({ ...options, vault, audit, db, identitySecret: identity }),
+      () => createBroker({ ...BROKER_REQUIRED, ...options, vault, audit, db, identitySecret: identity }),
       (error: Error) => /distinct/.test(error.message) && !error.message.includes(reused),
     );
   }
@@ -195,7 +196,7 @@ test('#212 createBroker rejects identity-key reuse with direct broker/provider s
     keys: [{ kid: identityKid(masterSecret), secret: masterSecret }],
   });
   assert.throws(
-    () => createBroker({
+    () => createBroker({ ...BROKER_REQUIRED,
       providers: [acme], vault: new Vault(db, Buffer.from(masterSecret)), audit, db,
       identitySecret: masterIdentity,
     }),
@@ -596,8 +597,8 @@ test('#212 PostgreSQL replay protection rejects one jti across broker instances'
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const a = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
-  const b = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const a = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const b = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
   await listen(t, a);
   await listen(t, b);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
@@ -803,7 +804,7 @@ test('#212 readyz: 503 when the replay expiry column is missing', async (t) => {
 test('#212 createBroker rejects the removed custom replayStore at runtime', async (t) => {
   const db = await openTestDb(t);
   assert.throws(
-    () => createBroker({
+    () => createBroker({ ...BROKER_REQUIRED,
       providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db,
       identitySecret: identityConfig(SECRET),
       replayStore: { use: () => true, ready: async () => {} },
@@ -838,7 +839,7 @@ async function makeBrokerOn(t: TestContext, build: (db: any, vault: Vault, audit
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...build(db, vault, audit) });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...build(db, vault, audit) });
   await listen(t, server);
   return { server, db, audit, port: (server.address() as any).port };
 }
@@ -1003,7 +1004,7 @@ test('#194 session-mode broker denial has stable request-approval recovery metad
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
   });
   await listen(t, server);
@@ -1044,7 +1045,7 @@ async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user', se
       accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
     });
   }
-  const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
   await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
@@ -1264,7 +1265,7 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
   // Expired token so both concurrent requests trigger a refresh; a slow /token keeps both in the
   // refresh window at once, so a per-request inflight map would fire TWO /token calls.
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: Date.now() - 1000, externalAccount: null });
-  const server = createBroker({ providers: [refreshing], vault, audit, db, identitySecret: identityConfig(SECRET) });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [refreshing], vault, audit, db, identitySecret: identityConfig(SECRET) });
   await listen(t, server);
   const port = (server.address() as any).port;
   const real = globalThis.fetch;
@@ -1509,7 +1510,7 @@ test('#194 a delayed pre-offboard disconnect cannot revoke a fresh post-offboard
     accessToken: 'OLD_TOKEN', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const staleAssertion = signIdentity(claims(), SECRET);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [provider], vault: vaultA, audit: new Audit(dbA), db: dbA,
     identitySecret: identityConfig(SECRET),
   });
@@ -1599,7 +1600,7 @@ test('#194 a delayed assertion cannot retarget disconnect onto a later reconnect
   const generationB = await vaultB.liveId(owner, 'acme');
   assert.ok(generationB);
 
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [provider], vault: vaultA, audit: new Audit(dbA), db: dbA,
     identitySecret: identityConfig(SECRET),
   });
@@ -1896,7 +1897,7 @@ async function makeOauthBroker(t: TestContext, extra: Partial<Parameters<typeof 
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback', ...extra,
   });
@@ -1920,8 +1921,8 @@ test('#52 /v1/connect mints an authorizeUrl + single-use state bound to the veri
   try {
     const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
     assert.equal(r.status, 200);
-    assert.match(r.json.authorizeUrl, /^https:\/\/acme\.example\/auth\?/);
-    assert.match(r.json.authorizeUrl, /redirect_uri=https%3A%2F%2Fbroker\.example%2Foauth%2Fcallback/);
+    // #302: the prompt URL is the Vouchr verify hop, never the provider's authorize URL.
+    assert.match(r.json.authorizeUrl, /^https:\/\/broker\.example\/oauth\/verify\?state=/);
     assert.ok(r.json.state, 'no state returned');
     // State is persisted bound to the VERIFIED identity (U1), never the body.
     const row = (await db.get(`SELECT user_id, provider FROM consent_request WHERE state=?`, [r.json.state])) as any;
@@ -1952,18 +1953,8 @@ test('#52 /v1/connect refuses a service tool (no human credential / OAuth handsh
   }
 });
 
-test('#52 /v1/connect is 404 when baseUrl is unset (use-only broker unchanged)', async (t) => {
-  const { server, port } = await makeBroker(t); // no baseUrl
-  try {
-    const r = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
-    assert.equal(r.status, 404);
-  } finally {
-    server.close();
-  }
-});
-
 test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds', async (t) => {
-  const { server, port } = await makeOauthBroker(t);
+  const { server, port, db } = await makeOauthBroker(t);
   const NEW = 'NEW_ACCESS_TOKEN_from_oauth';
   const real = globalThis.fetch;
   let upstreamAuth: string | null = null; // what the provider API received on the wire
@@ -1979,6 +1970,7 @@ test('#52 full flow: connect -> callback vaults the token -> /v1/fetch succeeds'
   }) as any;
   try {
     const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    await verifyConsent(db, c.json.state); // the Slack hop passed (browser-identity.test.ts drives it for real)
     const cb = await getRaw(port, `/oauth/callback?code=abc123&state=${encodeURIComponent(c.json.state)}`);
     assert.equal(cb.status, 200);
     assert.match(cb.contentType ?? '', /text\/html/);
@@ -2005,6 +1997,7 @@ test('#52 callback with provider denial (?error) audits consent_denied and store
   const { server, port, db } = await makeOauthBroker(t, { auditSink: (e) => events.push(e) });
   try {
     const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    await verifyConsent(db, c.json.state);
     const cb = await getRaw(port, `/oauth/callback?error=access_denied&state=${encodeURIComponent(c.json.state)}`);
     assert.equal(cb.status, 400);
     assert.ok(events.some((e) => e.action === 'consent_denied'), 'consent_denied not emitted on the audit stream');
@@ -2016,7 +2009,7 @@ test('#52 callback with provider denial (?error) audits consent_denied and store
 });
 
 test('#52 callback state is single-use: replaying it fails (no second connection)', async (t) => {
-  const { server, port } = await makeOauthBroker(t);
+  const { server, port, db } = await makeOauthBroker(t);
   const real = globalThis.fetch;
   globalThis.fetch = (async (u: any) =>
     String(u).startsWith('https://acme.example/token')
@@ -2024,6 +2017,7 @@ test('#52 callback state is single-use: replaying it fails (no second connection
       : new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } })) as any;
   try {
     const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: signIdentity(claims(), SECRET) });
+    await verifyConsent(db, c.json.state);
     const first = await getRaw(port, `/oauth/callback?code=abc&state=${encodeURIComponent(c.json.state)}`);
     assert.equal(first.status, 200);
     const replay = await getRaw(port, `/oauth/callback?code=abc&state=${encodeURIComponent(c.json.state)}`);
@@ -2041,7 +2035,7 @@ async function makeAdminBroker(t: TestContext, extra: Partial<Parameters<typeof 
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     ...extra,
@@ -2208,7 +2202,7 @@ async function makeMultiBroker(t: TestContext, extra: Partial<Parameters<typeof 
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', {
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
-  const server = createBroker({ providers: [acme, other, svc], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
+  const server = createBroker({ ...BROKER_REQUIRED, providers: [acme, other, svc], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
   await listen(t, server);
   return { server, db, port: (server.address() as any).port };
 }
@@ -2430,7 +2424,7 @@ async function makeRefBroker(t: TestContext, extra: Partial<Parameters<typeof cr
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     ...extra,
@@ -2474,7 +2468,7 @@ test('#194 a pre-offboard identity token cannot recreate a user reference on ano
   const [dbA, dbB] = await Promise.all([openDb({ databaseUrl: url }), openDb({ databaseUrl: url })]);
   t.after(() => Promise.all([dbA.close(), dbB.close()]));
   const vaultA = new Vault(dbA, KEY);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme],
     vault: vaultA,
     audit: new Audit(dbA),
@@ -2524,7 +2518,7 @@ test('#194 enterprise offboard fences old headless setup on an artifact-free tea
   const [dbA, dbB] = await Promise.all([openDb({ databaseUrl: url }), openDb({ databaseUrl: url })]);
   t.after(() => Promise.all([dbA.close(), dbB.close()]));
   const vaultA = new Vault(dbA, KEY);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme],
     vault: vaultA,
     audit: new Audit(dbA),

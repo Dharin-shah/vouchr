@@ -16,6 +16,7 @@ import { createVouchr } from '../src/adapters/bolt';
 import { identityConfig, signIdentity, IDENTITY_SKEW_MS, type IdentityClaims } from './support/identity';
 import type { Db } from '../src/core/db';
 import { countingDb } from './support/counting-db';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const SECRET = 'broker-signing-secret';
@@ -75,7 +76,7 @@ async function makeConfigBroker(t: TestContext, opts: { providers?: Provider[]; 
   const audit = new Audit(db);
   const channelConfig = new ChannelConfig(db);
   const channelTools = new ChannelTools(db);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: opts.providers ?? [acme, svc],
     vault,
     audit,
@@ -144,14 +145,14 @@ test('#211 createBroker: only a canonical callback pathname is accepted and the 
   const opts = { providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
   for (const callbackPath of INVALID_CALLBACK_PATHS) {
     assert.throws(
-      () => createBroker({ ...opts, callbackPath }),
+      () => createBroker({ ...BROKER_REQUIRED, ...opts, callbackPath }),
       /callbackPath must be one canonical absolute path/,
       callbackPath || '(empty)',
     );
   }
-  assert.throws(() => createBroker({ ...opts, baseUrl: 'http://broker.example' }), /must use https/);
+  assert.throws(() => createBroker({ ...BROKER_REQUIRED, ...opts, baseUrl: 'http://broker.example' }), /must use https/);
 
-  const server = createBroker({ ...opts, callbackPath: '/custom/oauth/callback' });
+  const server = createBroker({ ...BROKER_REQUIRED, ...opts, callbackPath: '/custom/oauth/callback' });
   await listen(t, server);
   const port = (server.address() as any).port;
   try {
@@ -404,7 +405,7 @@ test('admin config routes validate input and require the stores to be enabled', 
 
   // A broker with neither store wired refuses the writes (fail closed), but still reads config (all defaults).
   const db = await openTestDb(t);
-  const bare = createBroker({ providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET) });
+  const bare = createBroker({ ...BROKER_REQUIRED, providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET) });
   await listen(t, bare);
   const p2 = (bare.address() as any).port;
   try {

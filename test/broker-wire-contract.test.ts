@@ -15,6 +15,7 @@ import { defineProvider } from '../src/core/providers';
 import { createBroker } from '../src/adapters/http/broker';
 import { identityConfig, signIdentity, type IdentityClaims } from './support/identity';
 import { userOwner } from '../src/core/owner';
+import { BROKER_REQUIRED } from './support/slackOidc';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Broker WIRE-CONTRACT snapshot tests (#129).
@@ -82,7 +83,7 @@ async function makeBroker(t: TestContext, opts: Partial<Parameters<typeof create
   // mirroring a member having run `/vouchr enable`. Denial cases below drive their own state.
   const channelTools = new ChannelTools(db);
   for (const p of [acme, svc]) await setChannelToolEnabled(channelTools, 'T1', 'C1', p.id, true);
-  const server = createBroker({
+  const server = createBroker({ ...BROKER_REQUIRED,
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     channelConfig: new ChannelConfig(db), channelTools: new ChannelTools(db),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback',

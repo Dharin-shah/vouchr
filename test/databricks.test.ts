@@ -97,7 +97,10 @@ test('databricks: authorize URL carries client_id, PKCE challenge, and the U2M s
   const db = await openTestDb(t);
   const consent = new Consent(db);
   const p = databricks({ host: HOST, clientId: 'cid' });
-  const { authorizeUrl } = await consent.begin(ID, p, 'https://app/cb', null);
+  const { authorizeUrl: prompt, state } = await consent.begin(ID, p, 'https://app/cb', null);
+  assert.ok(prompt.startsWith('https://app/verify?state='), 'the prompt carries the Slack verify hop (#302)');
+  const row = (await consent.activeRow(state))!;
+  const authorizeUrl = consent.providerAuthorizeUrl(p, 'https://app/cb', state, row.pkceVerifier);
   assert.ok(authorizeUrl.startsWith(`${HOST}/oidc/v1/authorize?`));
   const sp = new URL(authorizeUrl).searchParams;
   assert.equal(sp.get('client_id'), 'cid');

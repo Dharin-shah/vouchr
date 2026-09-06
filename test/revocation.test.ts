@@ -30,6 +30,7 @@ import { DRY_RUN_CODE } from '../src/core/dryRun';
 import { configureChannelCredential, setChannelCredentialMode } from '../src/core/channelCredential';
 import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools, configureChannelTools } from '../src/core/tools';
+import { beginVerified } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const ID: SlackIdentity = { enterpriseId: null, teamId: 'T1', userId: 'U1' };
@@ -1558,7 +1559,7 @@ test('OAuth credential and connect audit commit or roll back together', async (t
   const consent = new Consent(db);
   const audit = new Audit(db);
   const registry = new ProviderRegistry([revocable]);
-  const pending = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  const pending = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null);
   (audit as any).record = async () => { throw new Error('audit unavailable'); };
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => new Response(
@@ -1590,7 +1591,7 @@ test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot 
   const registry = new ProviderRegistry([revocable]);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   // A pending "Connect" exists when the user is offboarded…
-  const { state } = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  const { state } = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null);
   // …and the offboarding row-purge FAILS (transient DB error) while everything else works.
   const realPurge = consent.deleteForUser.bind(consent);
   (consent as any).deleteForUser = async () => { throw new Error('consent table down'); };
@@ -1611,7 +1612,7 @@ test('offboarding gates the OAuth callback: a saved pre-offboard consent cannot 
   // A NEW consent begun after offboarding (legitimate re-onboarding) works immediately. Both the
   // tombstone and consent use PostgreSQL clock time, so exact ordering replaces the retired pod-skew
   // margin and no application-clock manipulation can affect authority.
-  const again = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  const again = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null);
   globalThis.fetch = (async () => new Response(JSON.stringify({ access_token: 'NEW_TOK' }), { status: 200, headers: { 'content-type': 'application/json' } })) as any;
   try {
     const res = await handleOAuthCallback({ registry, vault, audit, consent, redirectUri: 'https://cb.example/x' }, 'CODE', again.state);
@@ -1633,7 +1634,7 @@ test('offboarding during token exchange cannot resurrect the credential (atomic 
   const consent = new Consent(db);
   const registry = new ProviderRegistry([revocable]);
   await vault.upsert(O1, 'revocable', { accessToken: 'SECRET_TOK', refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
-  const { state } = await consent.begin(ID, revocable, 'https://cb.example/x', null); // consumed at callback start, BEFORE any tombstone
+  const { state } = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null); // consumed at callback start, BEFORE any tombstone
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () => {
     await offboardUser(vault, audit, consent, ID); // offboard fully completes mid-exchange: tombstone written + credential deleted
@@ -1659,7 +1660,7 @@ test('break-glass revoke during token exchange invalidates the old OAuth write b
   const audit = new Audit(dbA);
   const consent = new Consent(dbA);
   const registry = new ProviderRegistry([revocable]);
-  const { state } = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  const { state } = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null);
   const realFetch = globalThis.fetch;
   let revokeDuringExchange = true;
   globalThis.fetch = (async () => {
@@ -1700,7 +1701,7 @@ test('break-glass revoke during token exchange invalidates the old OAuth write b
     assert.deepEqual(JSON.parse(denied?.meta ?? '{}'), { reason: 'revoked' });
 
     await new Promise((resolve) => setTimeout(resolve, 5));
-    const fresh = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+    const fresh = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null);
     const freshResult = await handleOAuthCallback(
       { registry, vault, audit, consent, redirectUri: 'https://cb.example/x' },
       'NEW_CODE',
@@ -1721,7 +1722,7 @@ test('dry-run OAuth uses the same offboard fence after state consumption', async
   const consent = new Consent(dbA, true);
   const audit = new Audit(dbA);
   const registry = new ProviderRegistry([revocable]);
-  const pending = await consent.begin(ID, revocable, 'https://cb.example/x', null);
+  const pending = await beginVerified(consent, ID, revocable, 'https://cb.example/x', null);
 
   const realWrite = vaultA.upsertDryRunUser.bind(vaultA);
   vaultA.upsertDryRunUser = (async (...args: Parameters<Vault['upsertDryRunUser']>) => {

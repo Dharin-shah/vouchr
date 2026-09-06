@@ -1,6 +1,7 @@
-// #302 requireBrowserSlackIdentity: the Slack OIDC hop that binds the browser completing provider
-// OAuth to the Slack identity bound in the consent state. Offline: Slack's OIDC token endpoint and
-// the provider token endpoint are fetch-stubbed (TEST-3); the broker/bolt routes run for real.
+// #302/#340: the Slack OIDC hop that binds the browser completing provider OAuth to the Slack
+// identity bound in the consent state — the only consent path on both surfaces. Offline: Slack's
+// OIDC token endpoint and the provider token endpoint are fetch-stubbed (TEST-3); the broker/bolt
+// routes run for real.
 import { test, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
@@ -16,15 +17,13 @@ import { createVouchr } from '../src/adapters/bolt';
 import { ChannelTools, setChannelToolEnabled } from '../src/core/tools';
 import { SLACK_OIDC_AUTHORIZE_URL, SLACK_OIDC_TOKEN_URL } from '../src/adapters/slackVerify';
 import { signIdentity, identityConfig, type IdentityClaims } from './support/identity';
+import { TEST_SLACK_OIDC } from './support/slackOidc';
 
 const KEY = randomBytes(32);
 const SECRET = 'browser-identity-signing-secret';
 // Endpoints are deliberately NOT configurable (a configurable token endpoint would be a seam that
 // receives the client secret + code and can fabricate any identity); tests stub fetch instead.
-const OIDC = {
-  clientId: 'slack-app-cid',
-  clientSecret: 'slack-app-csec',
-};
+const OIDC = TEST_SLACK_OIDC;
 
 const acme = defineProvider({
   id: 'acme',
@@ -86,7 +85,7 @@ async function makeVerifiedBroker(t: TestContext, extra: Partial<Parameters<type
   const audit = new Audit(db);
   const server = createBroker({
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
-    baseUrl: 'https://broker.example', requireBrowserSlackIdentity: true, slackOidc: OIDC, ...extra,
+    baseUrl: 'https://broker.example', slackOidc: OIDC, ...extra,
   });
   await listen(t, server);
   return { server, vault, audit, db, port: (server.address() as any).port };
@@ -271,121 +270,36 @@ test('#302 guardrail: a direct callback on an unverified consent can never write
   }
 });
 
-test('#302 guardrail: the requirement is the ROW\'s, not the replica\'s — a flag-off instance sharing the database still enforces it', async (t) => {
+test('#302 two replicas sharing the database: the stamp travels with the row, so either callback enforces it', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const audit = new Audit(db);
-  const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
-  // Instance A mints with enforcement ON; instance B (rollout / config drift) has the flag OFF.
-  const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
-  const serverOff = createBroker({ ...base });
-  await listen(t, serverOn);
-  await listen(t, serverOff);
-  const portOn = (serverOn.address() as any).port;
-  const portOff = (serverOff.address() as any).port;
+  const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example', slackOidc: OIDC };
+  const serverA = createBroker({ ...base });
+  const serverB = createBroker({ ...base });
+  await listen(t, serverA);
+  await listen(t, serverB);
+  const portA = (serverA.address() as any).port;
+  const portB = (serverB.address() as any).port;
   const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
   try {
-    const { state } = await beginFlow(portOn);
-    // Completing through the flag-off replica's callback must fail closed: the requirement was
-    // persisted at mint, so B's process-local configuration cannot bypass it.
-    const cb = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(state)}`);
+    // Minted on A, never verified: B's callback refuses it — the state is spent, nothing written.
+    const { state } = await beginFlow(portA);
+    const cb = await getRaw(portB, `/oauth/callback?code=abc123&state=${encodeURIComponent(state)}`);
     assert.equal(cb.status, 403, cb.raw);
     assert.equal(stub.log.providerTokenCalls, 0, 'the provider code must never be exchanged');
     assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
 
-    // Positive control: a verified consent completes through the flag-off replica — the stamp
-    // travels with the shared row, so a mixed fleet works when the hop actually ran.
-    const second = await beginFlow(portOn);
-    const hop2 = await getRaw(portOn, `/oauth/slack?code=slack-code&state=${encodeURIComponent(second.state)}`);
+    // Minted on A, verified on A, completed on B: the stamp is in the shared row.
+    const second = await beginFlow(portA);
+    const hop2 = await getRaw(portA, `/oauth/slack?code=slack-code&state=${encodeURIComponent(second.state)}`);
     assert.equal(hop2.status, 302, hop2.raw);
-    const done = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(second.state)}`);
+    const done = await getRaw(portB, `/oauth/callback?code=abc123&state=${encodeURIComponent(second.state)}`);
     assert.equal(done.status, 200, done.raw);
   } finally {
     stub.restore();
-    serverOn.close();
-    serverOff.close();
-  }
-});
-
-test('#302 mode flip off→on: the unenforced prompt is superseded, the replacement row requires verification', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
-  const serverOff = createBroker({ ...base });
-  const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
-  await listen(t, serverOff);
-  await listen(t, serverOn);
-  const portOff = (serverOff.address() as any).port;
-  const portOn = (serverOn.address() as any).port;
-  const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
-  try {
-    // Minted unenforced: the prompt carries the DIRECT provider URL.
-    const first = await beginFlow(portOff);
-    assert.equal(`${first.authorize.origin}${first.authorize.pathname}`, 'https://acme.example/auth');
-
-    // The same user/provider/channel connects again through an ENFORCING replica: the persisted
-    // mode differs, so the old generation is superseded and a fresh enforced one is minted.
-    const second = await beginFlow(portOn);
-    assert.notEqual(second.state, first.state);
-    assert.equal(second.authorize.pathname, '/oauth/verify');
-    const newRow = (await db.get(
-      `SELECT slack_verify_required FROM consent_request WHERE state=?`, [second.state],
-    )) as any;
-    assert.equal(Number(newRow.slack_verify_required), 1);
-
-    // The old direct provider URL can no longer complete — the unenforced state went stale…
-    const stale = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(first.state)}`);
-    assert.equal(stale.status, 409, stale.raw);
-    // …and the replacement enforces the hop: a direct callback fails closed and writes nothing.
-    const bypass = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(second.state)}`);
-    assert.equal(bypass.status, 403, bypass.raw);
-    assert.equal(stub.log.providerTokenCalls, 0);
-    assert.equal(await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme'), null);
-  } finally {
-    stub.restore();
-    serverOff.close();
-    serverOn.close();
-  }
-});
-
-test('#302 mode flip on→off: the enforced prompt is superseded instead of becoming a dead end', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const audit = new Audit(db);
-  const base = { providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example' };
-  const serverOn = createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC });
-  const serverOff = createBroker({ ...base });
-  await listen(t, serverOn);
-  await listen(t, serverOff);
-  const portOn = (serverOn.address() as any).port;
-  const portOff = (serverOff.address() as any).port;
-  const stub = stubFetch(() => ({ status: 200, body: { ok: true, id_token: idToken() } }));
-  try {
-    const first = await beginFlow(portOn);
-    assert.equal(first.authorize.pathname, '/oauth/verify');
-
-    // A connect under the off mode must NOT reuse the enforced row (its direct URL could never
-    // complete): it supersedes and mints an unenforced generation with a direct provider URL.
-    const second = await beginFlow(portOff);
-    assert.notEqual(second.state, first.state);
-    assert.equal(`${second.authorize.origin}${second.authorize.pathname}`, 'https://acme.example/auth');
-    const newRow = (await db.get(
-      `SELECT slack_verify_required FROM consent_request WHERE state=?`, [second.state],
-    )) as any;
-    assert.equal(Number(newRow.slack_verify_required), 0);
-
-    // The old enforced state is stale, and the new unenforced one completes directly.
-    const stale = await getRaw(portOn, `/oauth/callback?code=abc123&state=${encodeURIComponent(first.state)}`);
-    assert.equal(stale.status, 409, stale.raw);
-    const done = await getRaw(portOff, `/oauth/callback?code=abc123&state=${encodeURIComponent(second.state)}`);
-    assert.equal(done.status, 200, done.raw);
-    const cred = await vault.get(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme');
-    assert.equal(cred?.accessToken, 'PROVIDER_TOKEN');
-  } finally {
-    stub.restore();
-    serverOn.close();
-    serverOff.close();
+    serverA.close();
+    serverB.close();
   }
 });
 
@@ -396,7 +310,7 @@ test('#302 mismatch with a failing audit store: state stays spent, but the respo
   audit.record = async () => { throw new Error('audit store down'); };
   const server = createBroker({
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET),
-    baseUrl: 'https://broker.example', requireBrowserSlackIdentity: true, slackOidc: OIDC,
+    baseUrl: 'https://broker.example', slackOidc: OIDC,
   });
   await listen(t, server);
   const port = (server.address() as any).port;
@@ -468,65 +382,52 @@ test('#302 a failing/invalid Slack token exchange is a fixed 502 that does NOT s
   }
 });
 
-// ── flag off: unchanged behavior ─────────────────────────────────────────────
+// ── construction-time validation (fail closed, both surfaces) ────────────────
 
-test('#302 flag off: /v1/connect returns the provider authorize URL directly and the hop routes are absent', async (t) => {
-  const db = await openTestDb(t);
-  const vault = new Vault(db, KEY);
-  const server = createBroker({
-    providers: [acme], vault, audit: new Audit(db), db,
-    identitySecret: identityConfig(SECRET), baseUrl: 'https://broker.example',
-  });
-  await listen(t, server);
-  const port = (server.address() as any).port;
-  try {
-    const { authorize } = await beginFlow(port);
-    assert.equal(`${authorize.origin}${authorize.pathname}`, 'https://acme.example/auth');
-    const hop = await getRaw(port, '/oauth/verify?state=x');
-    assert.equal(hop.status, 404);
-  } finally {
-    server.close();
-  }
-});
-
-// ── construction-time validation (fail closed) ───────────────────────────────
-
-test('#302 createBroker fails closed on flag misconfiguration', async (t) => {
+test('#340 createBroker fails closed without the Slack OIDC credentials or baseUrl, naming the variable', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, KEY);
   const base = { providers: [acme], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET) };
   assert.throws(
-    () => createBroker({ ...base, baseUrl: 'https://b.example', requireBrowserSlackIdentity: true }),
-    /slackOidc/,
+    () => createBroker({ ...base, baseUrl: 'https://b.example', slackOidc: undefined as any }),
+    /VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/,
+  );
+  for (const partial of [{ clientId: '', clientSecret: 'x' }, { clientId: 'x', clientSecret: '' }, { clientId: 'x' } as any]) {
+    assert.throws(() => createBroker({ ...base, baseUrl: 'https://b.example', slackOidc: partial }), /slackOidc\.clientSecret/);
+  }
+  assert.throws(
+    () => createBroker({ ...base, slackOidc: OIDC, baseUrl: undefined as any }),
+    /baseUrl is required \(VOUCHR_BASE_URL\)/,
   );
   assert.throws(
-    () => createBroker({ ...base, requireBrowserSlackIdentity: true, slackOidc: OIDC }),
-    /baseUrl/,
-  );
-  assert.throws(
-    () => createBroker({ ...base, baseUrl: 'https://b.example', requireBrowserSlackIdentity: true, slackOidc: OIDC, dryRun: true }),
-    /dryRun/,
-  );
-  assert.throws(
-    () => createBroker({ ...base, baseUrl: 'https://b.example', requireBrowserSlackIdentity: 'yes' as any, slackOidc: OIDC }),
-    /boolean/,
-  );
-  assert.throws(
-    () => createBroker({ ...base, baseUrl: 'https://b.example', callbackPath: '/oauth/verify', requireBrowserSlackIdentity: true, slackOidc: OIDC }),
+    () => createBroker({ ...base, baseUrl: 'https://b.example', callbackPath: '/oauth/verify', slackOidc: OIDC }),
     /must not end in/,
   );
+  // dryRun (#116) coexists with the required credentials: its synthetic authorize URL stands in
+  // for the Slack hop as it does for the provider, so a dry-run broker constructs.
+  const dry = createBroker({ ...base, baseUrl: 'https://b.example', slackOidc: OIDC, dryRun: true });
+  dry.close();
 });
 
-test('#302 createVouchr fails closed on flag misconfiguration', async (t) => {
+test('#340 createVouchr fails closed without the Slack OIDC credentials (option or env), naming the variable', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
-  t.after(() => { delete process.env.VOUCHR_MASTER_KEY; });
+  const saved = { id: process.env.VOUCHR_SLACK_CLIENT_ID, secret: process.env.VOUCHR_SLACK_CLIENT_SECRET };
+  t.after(() => {
+    delete process.env.VOUCHR_MASTER_KEY;
+    process.env.VOUCHR_SLACK_CLIENT_ID = saved.id;
+    process.env.VOUCHR_SLACK_CLIENT_SECRET = saved.secret;
+  });
+  delete process.env.VOUCHR_SLACK_CLIENT_ID;
+  delete process.env.VOUCHR_SLACK_CLIENT_SECRET;
   await assert.rejects(
-    createVouchr({ providers: [acme], baseUrl: 'https://x.example', requireBrowserSlackIdentity: true }),
-    /slackOidc/,
+    createVouchr({ providers: [acme], baseUrl: 'https://x.example' }),
+    /createVouchr: slackOidc\.clientId and slackOidc\.clientSecret are required \(VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/,
   );
+  process.env.VOUCHR_SLACK_CLIENT_ID = 'only-the-id';
+  await assert.rejects(createVouchr({ providers: [acme], baseUrl: 'https://x.example' }), /VOUCHR_SLACK_CLIENT_SECRET/);
   await assert.rejects(
-    createVouchr({ providers: [acme], baseUrl: 'https://x.example', requireBrowserSlackIdentity: true, slackOidc: OIDC, dryRun: true }),
-    /dryRun/,
+    createVouchr({ providers: [acme], baseUrl: 'https://x.example', callbackPath: '/vouchr/oauth/slack', slackOidc: OIDC }),
+    /must not end in/,
   );
 });
 
@@ -536,10 +437,7 @@ test('#302 Bolt: prompt URL is the verify hop; hop → callback completes and wr
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   t.after(() => { delete process.env.VOUCHR_MASTER_KEY; });
   const db = await openTestDb(t);
-  const lan = await createVouchr({
-    providers: [acme], baseUrl: 'https://bolt.example', db,
-    requireBrowserSlackIdentity: true, slackOidc: OIDC,
-  });
+  const lan = await createVouchr({ providers: [acme], baseUrl: 'https://bolt.example', db, slackOidc: OIDC });
   await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'acme', true);
 
   const routes: Record<string, (req: any, res: any) => Promise<any>> = {};
@@ -595,14 +493,11 @@ test('#302 Bolt: prompt URL is the verify hop; hop → callback completes and wr
   }
 });
 
-test('#302 Bolt guardrail: with the flag on, a direct callback is refused and writes nothing', async (t) => {
+test('#302 Bolt guardrail: a direct callback is refused and writes nothing', async (t) => {
   process.env.VOUCHR_MASTER_KEY = KEY.toString('base64');
   t.after(() => { delete process.env.VOUCHR_MASTER_KEY; });
   const db = await openTestDb(t);
-  const lan = await createVouchr({
-    providers: [acme], baseUrl: 'https://bolt.example', db,
-    requireBrowserSlackIdentity: true, slackOidc: OIDC,
-  });
+  const lan = await createVouchr({ providers: [acme], baseUrl: 'https://bolt.example', db, slackOidc: OIDC });
   await setChannelToolEnabled(new ChannelTools(db), 'T1', 'C1', 'acme', true);
   const routes: Record<string, (req: any, res: any) => Promise<any>> = {};
   lan.mountRoutes({ get: (p: string, h: any) => { routes[p] = h; } });
