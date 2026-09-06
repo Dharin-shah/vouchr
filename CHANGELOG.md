@@ -5,7 +5,34 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- A worker's request is authorized by a channel member as themselves (#360). An identity token
+  minted with `worker: true` (the app's bot user, `owner: 'user'` handle) in a channel where the agent
+  acts as each person posts one channel message with the worker, provider, method, path, reason, and
+  link and a single "Authorize with your account" button. Any current member other than the worker
+  may click; a member with no connected credential for the provider is sent the private Connect
+  prompt in the same thread and the request stays pending. The grant binds to the clicking member's
+  credential (owner, provider, credential generation), the worker's `/v1/fetch` or `/v1/mcp` spends
+  it with that member's token, and the audit row carries the worker as requester, the member as
+  actor and `owner`, the thread, and the reason. The thread (the channel when the token names none)
+  becomes that member's session for the worker and provider: every later approval-needing action there
+  asks the same member privately, each time, and a request in another thread starts a new any-member
+  authorization. A session ends after 30 minutes without a request or spend, or when the member
+  disconnects the provider or is offboarded; that fences its pending grants and the next request goes
+  back to any member. A DM token, a channel the signed eligibility verdict does not clear (Slack
+  Connect, externally shared), and a channel whose identity is the shared credential are refused.
+  `approvalDecider` and `delegationOf` are exported beside `effectiveApprover`.
+
 ### Changed
+
+- Schema version 3: `approval_request.delegated` and the `worker_session` table. Vouchr is greenfield
+  for database compatibility; recreate the database and run `vouchr migrate` (#360).
+- A person's private prompts (Connect, approval, notices) are placed where they asked: in the thread
+  when the mention sits inside an existing thread, at channel level for a top-level message, since an
+  ephemeral under an unreplied root shows no reply indicator and is never seen. The grant still binds
+  to the root message either way (#360).
+- `vouchr revoke --all` reports and clears worker sessions beside the other authorization rows.
 
 - An unset `approval.approver` now follows who the agent acts as: `self` when the identity is
   `person`, `member` when it is `channel` (#359). The requester of a write with their own credential
