@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -68,11 +69,6 @@ function mockUpstream() {
   return { seen, restore: () => { globalThis.fetch = real; } };
 }
 
-async function listen(server: http.Server): Promise<number> {
-  await new Promise<void>((r) => server.listen(0, r));
-  return (server.address() as any).port;
-}
-
 // ── (a) SECURITY: session-mode is fail-closed in the headless broker ──────────
 
 test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', async (t) => {
@@ -83,7 +79,7 @@ test('session-mode: owner:"user" fetch is REFUSED without a live thread grant', 
   await writeChannelMode(channelConfig, 'T1', 'C1', 'acme', 'session');
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
-  const port = await listen(server);
+  const port = await listen(t, server);
   const up = mockUpstream();
   try {
     // A signed user token WITH a thread but no grant → fail closed, no upstream call, token never served.
@@ -111,7 +107,7 @@ test('session-mode: owner:"user" fetch is ALLOWED with a live thread grant', asy
   assert.ok(credentialId);
   await sessions.grant(U1, 'C1', '111.222', 'acme', 60_000, credentialId); // approve exactly this thread
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
-  const port = await listen(server);
+  const port = await listen(t, server);
   const up = mockUpstream();
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token({ threadTs: '111.222' }), method: 'GET', path: '/x' });
@@ -129,7 +125,7 @@ test('session-mode is opt-in: with NO channelConfig the user credential serves a
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // no channelConfig
-  const port = await listen(server);
+  const port = await listen(t, server);
   const up = mockUpstream();
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
@@ -149,7 +145,7 @@ test('/v1/status: one listForUser call, no per-provider vault.get decrypts', asy
   const realGet = vault.get.bind(vault);
   (vault as any).get = (...a: any[]) => { getCalls++; return (realGet as any)(...a); };
   const server = createBroker({ providers: [acme, beta, svc], vault, audit, db, identitySecret: identityConfig(SECRET) });
-  const port = await listen(server);
+  const port = await listen(t, server);
   try {
     const r = await post(port, '/v1/status', { identityToken: token() });
     assert.equal(r.status, 200);
@@ -169,7 +165,7 @@ test('/v1/status: a past-idle-TTL connection reports needs_consent, not connecte
   // Age the row past the idle window (mirrors what vault.get would treat as expired → null).
   await db.run(`UPDATE connection SET last_used_at=?, created_at=? WHERE provider='acme'`, [Date.now() - 5000, Date.now() - 5000]);
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
-  const port = await listen(server);
+  const port = await listen(t, server);
   try {
     const r = await post(port, '/v1/status', { identityToken: token() });
     assert.equal(r.status, 200);
@@ -193,7 +189,7 @@ test('policy_denied event fires on a policy-denied fetch (parity with the Bolt p
     policy: new Policy({}, { defaultDeny: true }), // no rule for acme + defaultDeny → denied
     onEvent: (e) => events.push(e),
   });
-  const port = await listen(server);
+  const port = await listen(t, server);
   const up = mockUpstream();
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
@@ -213,7 +209,7 @@ test('a throwing onEvent sink does not turn a denied fetch into a 500 (stays 403
     policy: new Policy({}, { defaultDeny: true }), // acme denied → emits policy_denied
     onEvent: () => { throw new Error('sink boom'); }, // a broken sink must never affect the request
   });
-  const port = await listen(server);
+  const port = await listen(t, server);
   const up = mockUpstream();
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'GET', path: '/x' });
@@ -230,7 +226,7 @@ test('write-gating unchanged: non-GET is 405 when allowWrites is unset', async (
   const audit = new Audit(db);
   await vault.upsert(userOwner(U1), 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) }); // allowWrites unset
-  const port = await listen(server);
+  const port = await listen(t, server);
   try {
     const r = await post(port, '/v1/fetch', { handle: { provider: 'acme', owner: 'user' }, identityToken: token(), method: 'POST', path: '/x', body: '{}' });
     assert.equal(r.status, 405);
@@ -273,7 +269,7 @@ test('lockdown broker: liveness stays 200, readiness is 503, and functional rout
   // The route gate derives from the same immutable Vault flag; direct callers cannot wire two
   // contradictory lockdown states.
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
-  const port = await listen(server);
+  const port = await listen(t, server);
   const up = mockUpstream();
   try {
     assert.equal(await getStatus(port, '/healthz'), 200, 'liveness must stay up');

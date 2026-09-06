@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import { openTestDb } from './support/pg';
+import { closeServer } from './support/http';
 import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { createServer, type Server } from 'node:http';
@@ -57,7 +58,7 @@ function startMockProvider(): Promise<{
       resolve({
         base: `http://127.0.0.1:${port}`,
         reqs,
-        close: () => new Promise((r) => server.close(() => r(undefined))),
+        close: () => closeServer(server, 'test/integration.test.ts mock provider'),
       });
     });
   });

@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import { identityConfig, mintIdentity } from './support/identity';
 import { Vault } from '../src/core/vault';
 import { Audit } from '../src/core/audit';
@@ -55,8 +56,7 @@ test('#278 python example: stdlib client round-trips a real broker (fetch, one r
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [bridge], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET), allowWrites: true });
-  await new Promise<void>((r) => server.listen(0, r));
-  t.after(() => server.close());
+  await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;
   await import(STUB); // answers api.bridge.test only; any other egress from the broker throws

@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb, testDbUrl } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -68,7 +69,7 @@ async function makeBroker(t: TestContext, extra: Partial<Parameters<typeof creat
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   return { server, vault, db, port };
 }
@@ -597,8 +598,8 @@ test('#212 PostgreSQL replay protection rejects one jti across broker instances'
   });
   const a = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
   const b = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET) });
-  await new Promise<void>((r) => a.listen(0, r));
-  await new Promise<void>((r) => b.listen(0, r));
+  await listen(t, a);
+  await listen(t, b);
   const up = mockUpstream(() => new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }));
   try {
     const tok = signIdentity(claims(), SECRET);
@@ -838,7 +839,7 @@ async function makeBrokerOn(t: TestContext, build: (db: any, vault: Vault, audit
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), ...build(db, vault, audit) });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, db, audit, port: (server.address() as any).port };
 }
 
@@ -1005,7 +1006,7 @@ test('#194 session-mode broker denial has stable request-approval recovery metad
   const server = createBroker({
     providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig,
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const up = mockUpstream(() => new Response('{}', { status: 200 }));
   try {
@@ -1044,7 +1045,7 @@ async function makeChannelBroker(t: TestContext, mode: 'shared' | 'per-user', se
     });
   }
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
 
@@ -1264,7 +1265,7 @@ test('refresh single-flight: concurrent broker requests collapse to ONE /token c
   // refresh window at once, so a per-request inflight map would fire TWO /token calls.
   await vault.upsert(userOwner({ enterpriseId: null, teamId: 'T1', userId: 'U1' }), 'acme', { accessToken: 'old', refreshToken: 'r1', scopes: 'x', expiresAt: Date.now() - 1000, externalAccount: null });
   const server = createBroker({ providers: [refreshing], vault, audit, db, identitySecret: identityConfig(SECRET) });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const real = globalThis.fetch;
   let tokenCalls = 0;
@@ -1512,7 +1513,7 @@ test('#194 a delayed pre-offboard disconnect cannot revoke a fresh post-offboard
     providers: [provider], vault: vaultA, audit: new Audit(dbA), db: dbA,
     identitySecret: identityConfig(SECRET),
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
+  await listen(t, server);
   const port = (server.address() as any).port;
 
   await offboardUser(vaultB, new Audit(dbB), new Consent(dbB), {
@@ -1602,7 +1603,7 @@ test('#194 a delayed assertion cannot retarget disconnect onto a later reconnect
     providers: [provider], vault: vaultA, audit: new Audit(dbA), db: dbA,
     identitySecret: identityConfig(SECRET),
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
+  await listen(t, server);
   const port = (server.address() as any).port;
   const realFetch = globalThis.fetch;
   let upstreamCalls = 0;
@@ -1899,7 +1900,7 @@ async function makeOauthBroker(t: TestContext, extra: Partial<Parameters<typeof 
     providers: [acme, svc], vault, audit, db, identitySecret: identityConfig(SECRET),
     baseUrl: 'https://broker.example', callbackPath: '/oauth/callback', ...extra,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
 
@@ -2045,7 +2046,7 @@ async function makeAdminBroker(t: TestContext, extra: Partial<Parameters<typeof 
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     ...extra,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, db, channelConfig, port: (server.address() as any).port };
 }
 
@@ -2208,7 +2209,7 @@ async function makeMultiBroker(t: TestContext, extra: Partial<Parameters<typeof 
     accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null,
   });
   const server = createBroker({ providers: [acme, other, svc], vault, audit, db, identitySecret: identityConfig(SECRET), ...extra });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, db, port: (server.address() as any).port };
 }
 
@@ -2434,7 +2435,7 @@ async function makeRefBroker(t: TestContext, extra: Partial<Parameters<typeof cr
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     ...extra,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, vault, db, port: (server.address() as any).port };
 }
 
@@ -2482,8 +2483,7 @@ test('#194 a pre-offboard identity token cannot recreate a user reference on ano
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     baseUrl: 'https://broker.example',
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
-  t.after(() => server.close());
+  await listen(t, server);
   const port = (server.address() as any).port;
   const oldReferenceToken = signIdentity(claims(), SECRET);
   const oldConnectToken = signIdentity(claims(), SECRET);
@@ -2533,8 +2533,7 @@ test('#194 enterprise offboard fences old headless setup on an artifact-free tea
     resolvers: { 'aws-sm': async () => SECRET_TOKEN },
     baseUrl: 'https://broker.example',
   });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
-  t.after(() => server.close());
+  await listen(t, server);
   const port = (server.address() as any).port;
   const identity = { enterpriseId: 'E1', teamId: 'T_EMPTY', userId: 'U_EMPTY' };
   const oldReferenceToken = signIdentity(claims(identity), SECRET);

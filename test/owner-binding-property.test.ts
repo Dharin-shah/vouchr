@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes } from 'node:crypto';
@@ -64,7 +65,7 @@ async function makeBroker(t: TestContext, channelConfigSet: boolean) {
   }
 
   const server = createBroker({ providers: [acme], vault, audit, db, identitySecret: identityConfig(SECRET), channelConfig });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   const port = (server.address() as any).port;
   return { server, port, reads, reset: () => { reads.length = 0; } };
 }

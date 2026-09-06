@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
@@ -82,11 +83,6 @@ function chunkedPost(
   });
 }
 
-async function listen(server: http.Server): Promise<number> {
-  await new Promise<void>((r) => server.listen(0, r));
-  return (server.address() as any).port;
-}
-
 /** Send an intentionally incomplete HTTP/1.1 request and resolve only when the server closes it. */
 function rawUntilClose(port: number, request: string, timeoutMs = 2_000): Promise<{ text: string; ms: number }> {
   return new Promise((resolve, reject) => {
@@ -130,8 +126,7 @@ async function buildBroker(t: TestContext, over: Partial<BrokerOptions> = {}) {
   const vault = new Vault(db, KEY);
   await vault.upsert(O1, 'acme', { accessToken: SECRET_TOKEN, refreshToken: null, scopes: '', expiresAt: null, externalAccount: null });
   const server = createBroker({ providers: [acme], vault, audit: new Audit(db), db, identitySecret: identityConfig(SECRET), ...over });
-  const port = await listen(server);
-  t.after(() => server.close());
+  const port = await listen(t, server);
   return { db, vault, server, port };
 }
 
@@ -615,8 +610,7 @@ test('/readyz: concurrent probes share both DB checks until both settle (#209)',
     providers: [acme], vault, audit: new Audit(db), db: readinessDb,
     identitySecret: identityConfig(SECRET),
   });
-  const port = await listen(server);
-  t.after(() => server.close());
+  const port = await listen(t, server);
 
   const first = get(port, '/readyz');
   await waitFor(() => queryCalls === 2);

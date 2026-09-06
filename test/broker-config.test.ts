@@ -1,5 +1,6 @@
 import { test, type TestContext } from 'node:test';
 import { openTestDb } from './support/pg';
+import { listen } from './support/http';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
@@ -83,7 +84,7 @@ async function makeConfigBroker(t: TestContext, opts: { providers?: Provider[]; 
     channelConfig,
     channelTools,
   });
-  await new Promise<void>((r) => server.listen(0, r));
+  await listen(t, server);
   return { server, db, vault, channelConfig, channelTools, port: (server.address() as any).port };
 }
 
@@ -151,7 +152,7 @@ test('#211 createBroker: only a canonical callback pathname is accepted and the 
   assert.throws(() => createBroker({ ...opts, baseUrl: 'http://broker.example' }), /must use https/);
 
   const server = createBroker({ ...opts, callbackPath: '/custom/oauth/callback' });
-  await new Promise<void>((resolve) => server.listen(0, resolve));
+  await listen(t, server);
   const port = (server.address() as any).port;
   try {
     assert.equal(await getStatus(port, '/custom/oauth/callback'), 400, 'the exact configured callback route is mounted');
@@ -404,7 +405,7 @@ test('admin config routes validate input and require the stores to be enabled', 
   // A broker with neither store wired refuses the writes (fail closed), but still reads config (all defaults).
   const db = await openTestDb(t);
   const bare = createBroker({ providers: [acme], vault: new Vault(db, KEY), audit: new Audit(db), db, identitySecret: identityConfig(SECRET) });
-  await new Promise<void>((r) => bare.listen(0, r));
+  await listen(t, bare);
   const p2 = (bare.address() as any).port;
   try {
     const mode = await post(p2, '/v1/admin/mode', { provider: 'acme', mode: 'shared', identityToken: admin() });
