@@ -240,6 +240,8 @@ const vouchr = await createVouchr({
   db,
   envelope,
   installationStore: store,
+  // The sign-in check on every Connect link uses the same Slack app as the installer above.
+  slackOidc: { clientId: process.env.SLACK_CLIENT_ID!, clientSecret: process.env.SLACK_CLIENT_SECRET! },
 });
 ```
 

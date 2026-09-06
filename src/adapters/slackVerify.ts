@@ -35,8 +35,8 @@ export interface SlackOidcOptions {
 /** Validate the required OIDC config at startup (fail closed, before any listener/pool opens). The
  *  message names the env pair both surfaces read so a bare boot log says what to set. */
 export function assertSlackOidcOptions(oidc: SlackOidcOptions | undefined, label: string): SlackOidcOptions {
-  if (!oidc || typeof oidc.clientId !== 'string' || oidc.clientId.length === 0
-    || typeof oidc.clientSecret !== 'string' || oidc.clientSecret.length === 0) {
+  if (!oidc || typeof oidc.clientId !== 'string' || oidc.clientId.trim() === ''
+    || typeof oidc.clientSecret !== 'string' || oidc.clientSecret.trim() === '') {
     throw new Error(
       `${label}: slackOidc.clientId and slackOidc.clientSecret are required ` +
         '(VOUCHR_SLACK_CLIENT_ID / VOUCHR_SLACK_CLIENT_SECRET, the Slack app OIDC credentials for the ' +

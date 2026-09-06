@@ -322,8 +322,8 @@ export interface BrokerOptions {
    * #116 dry-run: identical semantics to `VouchrOptions.dryRun` — every gate runs for real, and NO
    * real network call leaves the process (outbound fetch, token exchange, refresh, and upstream
    * revoke are all stubbed or skipped). `/v1/connect` mints an authorize URL that points at THIS
-   * broker's own callback, standing in for the Slack verify hop too, so a test client completes consent by simply
-   * GETting it — the callback consumes the single-use state and writes a synthetic credential
+   * broker's own callback, standing in for the Slack verify hop too (its two routes are not mounted,
+   * 404), so a test client completes consent by simply GETting it — the callback consumes the single-use state and writes a synthetic credential
    * marked `external_account: 'dry-run'`. `/v1/fetch` then runs policy, tool, owner, and egress
    * gates, reads the (synthetic) credential from the vault, and returns a
    * `200 { dryRun, method, url, wouldInjectAs }` echo instead of calling the provider; request-side
@@ -738,7 +738,7 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
     ...(rawOpts.slackOidc?.clientSecret ? [rawOpts.slackOidc.clientSecret] : []),
   ], (secret) => rawOpts.vault.usesMasterKeyMaterial(secret));
   // #302: the browser Slack-identity hop is the only consent path; its config fails closed here.
-  if (!rawOpts.baseUrl) {
+  if (typeof rawOpts.baseUrl !== 'string' || rawOpts.baseUrl.trim() === '') {
     throw new Error('createBroker: baseUrl is required (VOUCHR_BASE_URL) — the connect, Slack verify, and callback routes mount under it');
   }
   const slackOidc = assertSlackOidcOptions(rawOpts.slackOidc, 'createBroker');
@@ -2086,7 +2086,9 @@ export function createBroker(rawOpts: BrokerOptions): BrokerServer {
           return res.end(r.html);
         }
         // #302 browser Slack-identity hop — browser routes like the callback: no perimeter gate.
-        if (req.method === 'GET') {
+        // #116 dry-run: not mounted (404). Hop 2 is the one place the client secret would leave the
+        // process for slack.com; the dry-run prompt points at the callback, never at these routes.
+        if (req.method === 'GET' && !dryRun) {
           const hopUrl = new URL(url, 'http://localhost');
           if (hopUrl.pathname === browserVerifyPath) {
             const r = await browserVerifier.begin(hopUrl.searchParams.get('state') ?? undefined);

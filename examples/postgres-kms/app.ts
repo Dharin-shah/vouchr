@@ -52,6 +52,8 @@ import { loadKeyring } from '../../src/core/crypto';
     db,                                           // share one pool (Postgres → stateless, multi-instance)
     envelope,                                     // at-rest secrets wrapped by KMS
     installationStore,                            // multi-workspace token source
+    // The sign-in check on every Connect link uses the same Slack app as the installer above.
+    slackOidc: { clientId: process.env.SLACK_CLIENT_ID!, clientSecret: process.env.SLACK_CLIENT_SECRET! },
   });
   app.use(vouchr.middleware);
   app.event('app_mention', async ({ context, event, client }) => {

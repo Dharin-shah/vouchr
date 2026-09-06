@@ -163,6 +163,8 @@ const vouchr = await createVouchr({
   db,                       // inject the SAME handle the store uses → one shared pool, not two
   envelope,                 // the SAME KMS boundary protects Vault connection tokens
   installationStore: store, // confirmation DM uses the connecting user's workspace token
+  // The sign-in check on every Connect link uses the same Slack app as the installer above.
+  slackOidc: { clientId: process.env.SLACK_CLIENT_ID!, clientSecret: process.env.SLACK_CLIENT_SECRET! },
 });
 ```
 
@@ -337,7 +339,8 @@ Slack app configuration: add `"$VOUCHR_BASE_URL/oauth/slack"` (Bolt:
 `"$baseUrl/vouchr/oauth/slack"`) to the app's **OAuth redirect URLs**; no extra bot scope is
 needed (`openid` is a user-consented sign-in scope requested at the hop). Dry-run
 (`VOUCHR_DRY_RUN`) keeps its synthetic local authorize URL: it stands in for the Slack hop as it
-does for the provider, and can only mint a synthetic credential row.
+does for the provider, and can only mint a synthetic credential row; the verify and Slack routes are
+not mounted under dry-run (404), so no request can reach Slack's token endpoint.
 
 ### Convenience: batch status + manifest (#55)
 

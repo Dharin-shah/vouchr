@@ -883,6 +883,44 @@ test('dry-run broker: callback refuses a foreign code and never clobbers a real 
   }
 });
 
+test('dry-run: the Slack verify hop routes are not mounted on either adapter, so hop 2 never fetches (404)', async (t) => {
+  // Hop 2 is the one route that would send the client secret to slack.com: with a LIVE state and a
+  // code it must not exist at all under dry-run (the dryRun.ts invariant), not merely fail.
+  let fetches = 0;
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetches++;
+    throw new Error('network egress attempted in a dry-run test');
+  }) as any;
+  const db = await openTestDb(t);
+  const server = createBroker({ ...BROKER_REQUIRED,
+    providers: [acme()], vault: new Vault(db, randomBytes(32)), audit: new Audit(db), db,
+    identitySecret: identityConfig('shh'), baseUrl: 'https://broker.test', dryRun: true,
+  });
+  const port = await listen(t, server);
+  try {
+    const c = await post(port, '/v1/connect', { handle: { provider: 'acme' }, identityToken: tok('shh') });
+    const state = new URL(c.json.authorizeUrl).searchParams.get('state')!;
+    const hop2 = await get(port, `/oauth/slack?code=x&state=${state}`);
+    assert.equal(hop2.status, 404);
+    assert.deepEqual(JSON.parse(hop2.body), { error: 'not found' }); // the same 404 as any unmounted path
+    assert.equal((await get(port, `/oauth/verify?state=${state}`)).status, 404);
+    assert.equal(fetches, 0);
+    assert.ok(await new Consent(db, true).activeRow(state)); // the state was not spent by a dead hop
+
+    // Bolt: mountRoutes registers the callback only.
+    const vouchr = await createVouchr({ providers: [acme()], baseUrl: 'https://app.test', db, dryRun: true });
+    const mounted: string[] = [];
+    vouchr.mountRoutes({ get: (path: string) => mounted.push(path) });
+    assert.deepEqual(mounted, ['/vouchr/oauth/callback']);
+    assert.equal(fetches, 0);
+  } finally {
+    server.close();
+    await db.close();
+    globalThis.fetch = realFetch;
+  }
+});
+
 test('dry-run broker: fails every request closed against a vault with real credentials', async (t) => {
   const db = await openTestDb(t);
   const vault = new Vault(db, randomBytes(32));

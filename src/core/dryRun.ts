@@ -13,6 +13,8 @@ import type { Audit } from './audit';
  *  - token refresh           → skipped; the stored synthetic token is returned (injector.doRefresh)
  *  - upstream token revoke   → skipped for rows the trusted `dry_run` column marks synthetic
  *    (offboard.ts — data-driven off the row, so flagless callers like the CLI are covered too)
+ *  - Slack OIDC hop (#302)   → its two routes are not mounted (404) on either adapter; hop 2 would
+ *    otherwise send the client secret to slack.com. The dry-run prompt never points at them.
  * consent.begin additionally substitutes the authorize URL (no network activity — it just points
  * the Connect button at the real local callback). Everything else runs the production code paths,
  * so dry-run behavior cannot drift from production anywhere else.

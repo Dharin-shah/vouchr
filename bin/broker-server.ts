@@ -22,6 +22,7 @@ import { ChannelConfig } from '../src/core/channelConfig';
 import { ChannelTools } from '../src/core/tools';
 import { loadKeyring, type EnvelopeProvider, type Keyring } from '../src/core/crypto';
 import { assertDryRunVault, dryRunAudit } from '../src/core/dryRun';
+import { assertSlackOidcOptions } from '../src/adapters/slackVerify';
 import { loadProviders } from './providerConfig';
 import { loadPolicy } from './policyConfig';
 import { booleanEnv, MAX_TIMER_MS, nonNegativeIntegerEnv, optionalPositiveEnv } from '../src/core/options';
@@ -166,11 +167,16 @@ export async function buildBrokerServer(
   const dryRun = booleanEnv(env.VOUCHR_DRY_RUN, 'VOUCHR_DRY_RUN');
   const brokerToken = env.VOUCHR_BROKER_TOKEN || undefined;
   // #52/#302 VOUCHR_BASE_URL mounts the OAuth connect flow (/v1/connect, the Slack verify hop, and
-  // the callback); the Slack OIDC pair drives the hop. All three are required — createBroker fails
-  // closed naming the missing one, before the listener opens.
+  // the callback); the Slack OIDC pair drives the hop. All three are required — pure config errors
+  // precede infrastructure, so a missing one fails here, before Postgres or KMS is touched
+  // (createBroker re-checks the same at its public boundary).
   const baseUrl = env.VOUCHR_BASE_URL ?? '';
   const callbackPath = env.VOUCHR_CALLBACK_PATH || undefined;
   const slackOidc = { clientId: env.VOUCHR_SLACK_CLIENT_ID ?? '', clientSecret: env.VOUCHR_SLACK_CLIENT_SECRET ?? '' };
+  if (baseUrl.trim() === '') {
+    fail('vouchr-broker: baseUrl is required (VOUCHR_BASE_URL) — the connect, Slack verify, and callback routes mount under it');
+  }
+  assertSlackOidcOptions(slackOidc, 'vouchr-broker');
 
   const providers = loadProviders(env);
   if (!providers.length) fail('no providers configured (set VOUCHR_PROVIDERS or VOUCHR_PROVIDERS_FILE)');

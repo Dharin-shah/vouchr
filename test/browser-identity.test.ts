@@ -392,13 +392,13 @@ test('#340 createBroker fails closed without the Slack OIDC credentials or baseU
     () => createBroker({ ...base, baseUrl: 'https://b.example', slackOidc: undefined as any }),
     /VOUCHR_SLACK_CLIENT_ID \/ VOUCHR_SLACK_CLIENT_SECRET/,
   );
-  for (const partial of [{ clientId: '', clientSecret: 'x' }, { clientId: 'x', clientSecret: '' }, { clientId: 'x' } as any]) {
+  for (const partial of [{ clientId: '', clientSecret: 'x' }, { clientId: 'x', clientSecret: '' }, { clientId: 'x' } as any,
+    { clientId: ' ', clientSecret: 'x' }, { clientId: 'x', clientSecret: '\t' }]) { // IMP-3: whitespace is empty
     assert.throws(() => createBroker({ ...base, baseUrl: 'https://b.example', slackOidc: partial }), /slackOidc\.clientSecret/);
   }
-  assert.throws(
-    () => createBroker({ ...base, slackOidc: OIDC, baseUrl: undefined as any }),
-    /baseUrl is required \(VOUCHR_BASE_URL\)/,
-  );
+  for (const baseUrl of [undefined as any, '', ' ']) {
+    assert.throws(() => createBroker({ ...base, slackOidc: OIDC, baseUrl }), /baseUrl is required \(VOUCHR_BASE_URL\)/);
+  }
   assert.throws(
     () => createBroker({ ...base, baseUrl: 'https://b.example', callbackPath: '/oauth/verify', slackOidc: OIDC }),
     /must not end in/,

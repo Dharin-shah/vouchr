@@ -2861,30 +2861,34 @@ export async function createVouchr(opts: VouchrOptions) {
 
   /** Mount the Slack verify hop (#302) and the OAuth callback on the receiver's router. */
   function mountRoutes(router: any): void {
-    // #302 hop 1: the Connect prompt's URL. Redirects the browser to Slack's OIDC authorize.
-    router.get(browserVerifyPath, async (req: any, res: any) => {
-      try {
-        const r = await browserVerifier.begin(req.query?.state);
-        if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
-        return sendPlain(res, r.status, r.error);
-      } catch {
-        sendPlain(res, 500, 'Connection failed. Please try again.');
-      }
-    });
-    // #302 hop 2: Slack's redirect back. A verified match continues to the provider authorize URL.
-    router.get(slackRedirectPath, async (req: any, res: any) => {
-      try {
-        const r = await browserVerifier.complete({
-          code: req.query?.code,
-          state: req.query?.state,
-          error: req.query?.error,
-        });
-        if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
-        return sendPlain(res, r.status, r.error);
-      } catch {
-        sendPlain(res, 500, 'Connection failed. Please try again.');
-      }
-    });
+    // #116 dry-run: the hop routes are not mounted (404). Hop 2 is the one place the client secret
+    // would leave the process for slack.com; the dry-run prompt points at the callback, never here.
+    if (!dryRun) {
+      // #302 hop 1: the Connect prompt's URL. Redirects the browser to Slack's OIDC authorize.
+      router.get(browserVerifyPath, async (req: any, res: any) => {
+        try {
+          const r = await browserVerifier.begin(req.query?.state);
+          if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
+          return sendPlain(res, r.status, r.error);
+        } catch {
+          sendPlain(res, 500, 'Connection failed. Please try again.');
+        }
+      });
+      // #302 hop 2: Slack's redirect back. A verified match continues to the provider authorize URL.
+      router.get(slackRedirectPath, async (req: any, res: any) => {
+        try {
+          const r = await browserVerifier.complete({
+            code: req.query?.code,
+            state: req.query?.state,
+            error: req.query?.error,
+          });
+          if (r.ok) return res.status(302).set({ location: r.redirectUrl }).send();
+          return sendPlain(res, r.status, r.error);
+        } catch {
+          sendPlain(res, 500, 'Connection failed. Please try again.');
+        }
+      });
+    }
     router.get(callbackPath, async (req: any, res: any) => {
       try {
         const { code, state, error } = req.query;

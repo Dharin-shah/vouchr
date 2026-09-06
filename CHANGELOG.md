@@ -37,7 +37,8 @@ variables and a fresh database. No code path or option keeps the old behavior.
   bound identity. The mismatch denial (`denied` / `browser_identity_mismatch` against the bound
   user), the fixed non-reflecting error, the single-use state spend, and the bounded server-side
   code exchange are unchanged. Dry-run keeps its synthetic local authorize URL: it stands in for the
-  Slack hop as it does for the provider, and can only mint a synthetic credential row.
+  Slack hop as it does for the provider, and can only mint a synthetic credential row; the verify and
+  Slack routes are not mounted under dry-run (404), so no request can reach Slack's token endpoint.
 - **Schema version is 1.** One DDL creates the whole current schema, including the consent and
   approval indexes that `migrate()` used to add separately. `vouchr migrate` on an empty database
   creates it; on a version-1 database it is a no-op; on any other recorded version it refuses with
