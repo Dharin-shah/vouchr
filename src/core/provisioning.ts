@@ -430,7 +430,7 @@ export async function confirmUserProvisioningDelivery(
 
 /** Release a definitely-undelivered key-setup prompt lease. The reusable setup row stays live so a
  * later verified turn can retry the same safe opaque control; ambiguous delivery deliberately keeps
- * its lease, matching consent/session/approval crash-safe semantics. */
+ * its lease, matching consent/approval crash-safe semantics. */
 export async function abandonUserProvisioningDelivery(
   vault: Vault,
   identity: SlackIdentity,

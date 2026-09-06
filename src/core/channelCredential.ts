@@ -1,5 +1,5 @@
 import type { Audit } from './audit';
-import { writeChannelMode, type ChannelConfig, type ChannelMode } from './channelConfig';
+import { writeChannelIdentity, type ChannelConfig, type ChannelIdentity } from './channelConfig';
 import {
   latestProvisioningRevocationTombstone,
   latestUserOffboardTombstone,
@@ -41,14 +41,14 @@ interface ChannelCredentialMutation {
 }
 
 /**
- * Store one shared credential, its mode, and its audit row behind the owner/provider lifecycle
- * lock. The lock makes setup mutually exclusive with mode changes across replicas; the transaction
- * makes the row, mode, satellite cleanup, and audit one committed outcome.
+ * Store one channel credential, set the channel identity to `channel`, and write the audit row behind
+ * the owner/provider lifecycle lock. The lock makes setup mutually exclusive with identity changes
+ * across replicas; the transaction makes the row, identity, satellite cleanup, and audit one
+ * committed outcome.
  */
 export async function configureChannelCredential(
   input: ChannelCredentialMutation & {
     credential: ChannelCredential;
-    modeConflict: (mode: Exclude<ChannelMode, 'shared'>) => never;
     /** Server-trusted intent time, resolved at most once inside the final write transaction. */
     issuance: ChannelProvisioningIssuance;
   },
@@ -84,25 +84,17 @@ export async function configureChannelCredential(
         tombstoneBlocks(offboardedAt, issuedAt) ||
         tombstoneBlocks(changedAt, issuedAt)
       ) return false;
-      const mode = await input.channelConfig.getMode(
-        owner.teamId,
-        input.channel,
-        input.providerId,
-        fencedTx,
-      );
-      if (mode != null && mode !== 'shared') input.modeConflict(mode);
-
       if (input.credential.kind === 'secret') {
         await preparedSecret!(fencedTx, owner, input.providerId);
       } else {
         await locked.reference(owner, input.providerId, input.credential.reference);
       }
-      await writeChannelMode(
+      await writeChannelIdentity(
         input.channelConfig,
         owner.teamId,
         input.channel,
         input.providerId,
-        'shared',
+        'channel',
         fencedTx,
       );
       await purgeChannelInteractionState(
@@ -114,7 +106,7 @@ export async function configureChannelCredential(
       await input.audit.record('config', input.identity, input.providerId, {
         owner: 'channel',
         channel: input.channel,
-        mode: 'shared',
+        identity: 'channel',
         kind: input.credential.kind,
         ...(input.credential.kind === 'ref' ? { source: input.credential.reference.source } : {}),
       }, undefined, fencedTx);
@@ -123,12 +115,12 @@ export async function configureChannelCredential(
 }
 
 /**
- * Change one channel credential mode behind the same lifecycle lock used by setup. Moving to a
- * user-owned mode deletes any shared credential in the locked transaction, preventing a dormant
- * credential from surviving or being reactivated by a later shared flip.
+ * Change who the agent acts as for one provider in a channel, behind the same lifecycle lock used by
+ * setup. Moving to `person` deletes any channel credential in the locked transaction, preventing a
+ * dormant credential from surviving or being reactivated by a later flip back.
  */
-export async function setChannelCredentialMode(
-  input: ChannelCredentialMutation & { mode: ChannelMode; issuance: number },
+export async function setChannelCredentialIdentity(
+  input: ChannelCredentialMutation & { actAs: ChannelIdentity; issuance: number },
 ): Promise<boolean> {
   const owner = channelOwner(input.identity.teamId, input.channel);
   return input.vault.withCredentialLock(owner, input.providerId, async (locked, tx) => {
@@ -137,22 +129,22 @@ export async function setChannelCredentialMode(
       input.identity,
       input.issuance,
       async (fencedTx) => {
-        const previous = await input.channelConfig.getMode(
+        const previous = await input.channelConfig.getIdentity(
           owner.teamId,
           input.channel,
           input.providerId,
           fencedTx,
         );
-        if (input.mode !== 'shared') await locked.delete(owner, input.providerId);
-        await writeChannelMode(
+        if (input.actAs === 'person') await locked.delete(owner, input.providerId);
+        await writeChannelIdentity(
           input.channelConfig,
           owner.teamId,
           input.channel,
           input.providerId,
-          input.mode,
+          input.actAs,
           fencedTx,
         );
-        if (previous !== input.mode) {
+        if (previous !== input.actAs) {
           await purgeChannelInteractionState(
             fencedTx,
             owner.teamId,
@@ -161,7 +153,7 @@ export async function setChannelCredentialMode(
           );
         }
         await input.audit.record('config', input.identity, input.providerId, {
-          owner: 'channel', channel: input.channel, mode: input.mode,
+          owner: 'channel', channel: input.channel, identity: input.actAs,
         }, undefined, fencedTx);
       },
     );
@@ -169,11 +161,11 @@ export async function setChannelCredentialMode(
   });
 }
 
-/** The truthful outcome of {@link disconnectChannelShared}. `removed` deleted a shared credential and
- *  returned the channel to per-user; `missing` found `shared` mode but no stored credential (e.g. a
- *  prior break-glass revoke deleted the row but left the mode) and still returned it to per-user;
- *  `not-shared` did nothing because the channel was not in `shared` mode (never downgrading a
- *  session/per-user channel); `stale` lost to a concurrent lifecycle change (a newer credential
+/** The truthful outcome of {@link disconnectChannelShared}. `removed` deleted a channel credential and
+ *  returned the channel to `person`; `missing` found identity `channel` but no stored credential (e.g.
+ *  a prior break-glass revoke deleted the row but left the identity) and still returned it to
+ *  `person`; `not-shared` did nothing because the channel's identity was already `person`; `stale`
+ *  lost to a concurrent lifecycle change (a newer credential
  *  generation, or the acting member being offboarded) and mutated nothing. `ok=false` on `removed`
  *  means upstream revocation debt may remain (the provider token could still be live). `audited=false`
  *  means the destructive work committed but its durable `revoke` audit row could not be written — the
@@ -186,22 +178,22 @@ export type DisconnectSharedOutcome = {
 };
 
 /**
- * Remove a channel's SHARED credential: the dedicated counterpart to configureChannelCredential.
- * Unlike a generic mode reset it:
- *  - only acts when the channel is actually in `shared` mode, so a `per-user`/`session` channel is
- *    never mutated (a session channel keeps its thread-approval requirement — no access widening);
+ * Remove a channel's credential: the dedicated counterpart to configureChannelCredential. Unlike a
+ * generic identity reset it:
+ *  - only acts when the channel's identity is actually `channel`, so a `person` channel is never
+ *    mutated;
  *  - deletes the shared credential through the SAME claim→decode→revoke primitive the personal
  *    disconnect uses, so revocable provider authority is actually revoked upstream, not just dropped
  *    locally; and
  *  - reports a truthful outcome (`not-shared`/`missing`/`stale`/`removed` with `ok`/`attempted`).
  *
- * Every decision and mutation — the actor/receipt fence, the shared-mode check, the current-generation
- * validation, the exact-row claim-delete, the mode flip, the satellite purge, and the local audit —
+ * Every decision and mutation (the actor/receipt fence, the identity check, the current-generation
+ * validation, the exact-row claim-delete, the identity flip, the satellite purge, and the local audit)
  * happens in ONE locked, fenced transaction, mirroring configureChannelCredential's lock stack
- * (credential → provisioning-revocation → actor-offboard). Only the best-effort upstream revoke (a
+ * (credential -> provisioning-revocation -> actor-offboard). Only the best-effort upstream revoke (a
  * network call that must not run inside the DB transaction) happens after commit, against the token
  * material claimed by the delete. Doing the claim-delete inside the same locked transaction as the
- * mode read is what prevents a concurrent shared→session change from being clobbered, a newer shared
+ * identity read is what prevents a concurrent identity change from being clobbered, a newer channel
  * credential from being deleted by a delayed command, and an offboarded actor from deleting before
  * its stale issuance is rejected.
  */
@@ -232,11 +224,11 @@ export async function disconnectChannelShared(input: {
         const offboardedAt = await latestUserOffboardTombstone(fencedTx, input.identity);
         if (tombstoneBlocks(offboardedAt, input.issuance)) return { status: 'stale' };
 
-        // Shared-mode check INSIDE the lock: a session/per-user channel is never touched, and a
-        // concurrent shared→session change is either already visible here (⇒ not-shared) or blocked
-        // on the credential lock until we commit (⇒ it applies on top, never silently clobbered).
-        const mode = await input.channelConfig.getMode(owner.teamId, input.channel, input.providerId, fencedTx);
-        if (mode !== 'shared') return { status: 'not-shared' };
+        // Identity check INSIDE the lock: a `person` channel is never touched, and a concurrent
+        // identity change is either already visible here (not-shared) or blocked on the credential
+        // lock until we commit (it applies on top, never silently clobbered).
+        const identity = await input.channelConfig.getIdentity(owner.teamId, input.channel, input.providerId, fencedTx);
+        if (identity !== 'channel') return { status: 'not-shared' };
 
         // Current-generation validation: only a credential generation strictly OLDER than this
         // request's issuance is deletable. Timestamp equality FAILS CLOSED (`>=`): both are integer
@@ -251,19 +243,20 @@ export async function disconnectChannelShared(input: {
         );
         if (existing && existing.generation_at >= input.issuance) return { status: 'stale' };
 
-        // Return the channel to per-user + purge satellites + audit the mode change — always, once we
-        // are committed to acting on a shared channel. The purge advances the channel-interaction
-        // tombstone, which fences any stalled setup request from recreating the credential.
+        // Return the channel to `person` + purge satellites + audit the identity change, always, once
+        // we are committed to acting on a channel-identity channel. The purge advances the
+        // channel-interaction tombstone, which fences any stalled setup request from recreating the
+        // credential.
         const flipAndAudit = async () => {
-          await writeChannelMode(input.channelConfig, owner.teamId, input.channel, input.providerId, 'per-user', fencedTx);
+          await writeChannelIdentity(input.channelConfig, owner.teamId, input.channel, input.providerId, 'person', fencedTx);
           await purgeChannelInteractionState(fencedTx, owner.teamId, input.channel, input.providerId);
           await input.audit.record('config', input.identity, input.providerId, {
-            owner: 'channel', channel: input.channel, mode: 'per-user',
+            owner: 'channel', channel: input.channel, identity: 'person',
           }, undefined, fencedTx);
         };
 
-        // `missing`: shared mode with no stored credential (a prior break-glass revoke left the mode).
-        // Still recover the channel to per-user, but there is nothing to delete or revoke.
+        // `missing`: identity `channel` with no stored credential (a prior break-glass revoke left the
+        // identity). Still recover the channel to `person`, but there is nothing to delete or revoke.
         if (!existing) {
           await flipAndAudit();
           return { status: 'missing' };
@@ -277,7 +270,7 @@ export async function disconnectChannelShared(input: {
       })));
 
   if (decided.status !== 'removed') {
-    // Nothing was deleted, so no `revoke` audit is due; any mode-flip audit already committed inside
+    // Nothing was deleted, so no `revoke` audit is due; any identity-flip audit already committed inside
     // the transaction above (it cannot fail post-commit), so these are audited by construction.
     if (decided.status === 'not-shared') return { status: 'not-shared', ok: true, attempted: false, audited: true };
     if (decided.status === 'stale') return { status: 'stale', ok: false, attempted: false, audited: true };

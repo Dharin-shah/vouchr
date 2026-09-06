@@ -3,7 +3,7 @@ import type { Vault } from './vault';
 import type { UserProvisioningIssuance, UserProvisioningResult } from './vault';
 import type { Audit } from './audit';
 import type { SlackIdentity } from './identity';
-import type { ChannelConfig, ChannelMode } from './channelConfig';
+import type { ChannelConfig } from './channelConfig';
 import {
   configureChannelCredential,
   type ChannelProvisioningIssuance,
@@ -181,8 +181,8 @@ export async function referenceUserCredential(input: {
 }
 
 /**
- * One channel-reference authorization/mode/mutation/audit sequence, shared by Bolt and headless.
- * Transport callbacks prove their own trusted facts and map a mode conflict to their surface.
+ * One channel-reference authorization/mutation/audit sequence, shared by Bolt and headless.
+ * Transport callbacks prove their own trusted facts.
  */
 export async function referenceChannelCredential(input: {
   vault: Vault;
@@ -195,7 +195,6 @@ export async function referenceChannelCredential(input: {
   issuance: ChannelProvisioningIssuance;
   authorize: () => Promise<void>;
   assertEligible: () => Promise<void>;
-  modeConflict: (mode: Exclude<ChannelMode, 'shared'>) => never;
 }): Promise<boolean> {
   await input.authorize();
   await input.assertEligible();
@@ -208,6 +207,5 @@ export async function referenceChannelCredential(input: {
     providerId: input.providerId,
     issuance: input.issuance,
     credential: { kind: 'ref', reference: input.reference },
-    modeConflict: input.modeConflict,
   });
 }

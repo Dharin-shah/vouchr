@@ -7,7 +7,6 @@
  * exported contract; enforcing them on the handlers is a fine follow-up. Keep them in sync with broker.ts.
  */
 
-import type { ChannelMode } from './core/channelConfig';
 import type { AuditRow } from './core/audit';
 import type { AuthorizationStatus } from './core/approval';
 import type { ToolManifestEntry } from './core/tools';
@@ -78,16 +77,17 @@ export interface BrokerChannelManifestResponse {
   tools: ToolManifestEntry[];
 }
 
-/** `POST /v1/admin/mode` · `POST /v1/admin/tools` — admin config write acknowledgement. No secret. */
+/** `POST /v1/admin/identity` · `POST /v1/admin/tools` — admin config write acknowledgement. No secret. */
 export interface BrokerAdminOkResponse {
   ok: true;
 }
 
-/** `GET /v1/admin/config` — the caller's channel's per-provider mode + tool-enabled state (read side
- *  of the `/v1/admin/*` config write routes). Policy bits only, NO secret. `mode` is null when unconfigured
- *  and always null for a service tool, which has no Vouchr-owned credential. */
+/** `GET /v1/admin/config` — the caller's channel's per-provider identity + tool-enabled state (read
+ *  side of the `/v1/admin/*` config write routes). Policy bits only, NO secret. `identity` is who the
+ *  agent acts as there (`person` unless a channel credential was connected; `service` for a tool
+ *  Vouchr does not broker); `enabled` is the raw allowlist bit. */
 export interface BrokerAdminConfigResponse {
-  providers: { provider: string; mode: ChannelMode | null; enabled: boolean }[];
+  providers: { provider: string; identity: ToolManifestEntry['identity']; enabled: boolean }[];
 }
 
 /** `POST /v1/authorization` · `GET /v1/authorization/{id}` — one backchannel (CIBA-style)
