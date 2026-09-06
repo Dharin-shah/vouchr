@@ -29,8 +29,10 @@ export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
  *  - `methods`: which HTTP methods ask. Unset = every method except GET and HEAD (the one place that
  *    default lives is `approvalNeeded` in the injector).
  *  - `paths`: narrow to these paths (same matcher semantics as `egressPaths`). Unset = every path.
- *  - `approver`: `member` (any OTHER current member of the owning channel; in a DM, where no channel
- *    governs the action, it degrades to `self` via `effectiveApprover`) or `self`.
+ *  - `approver`: `self` (the requester confirms) or `member` (any OTHER current member of the owning
+ *    channel). Unset follows the identity of the request (#359): `self` when the agent acts as the
+ *    person, `member` when it acts as the channel. In a DM, where no channel governs the action,
+ *    `member` degrades to `self`. One resolver, `effectiveApprover`, applies all of that.
  *  - `grant`: `once` (single use, exact action) or `thread` (one approval covers every matching call
  *    in the approving thread until `ttlMs`; outside a thread it behaves as `once`).
  *  - `ttlMs`: how long a grant stays usable. Default 5 minutes.
@@ -38,7 +40,7 @@ export const DEFAULT_APPROVAL_TTL_MS = 5 * 60 * 1000;
 export interface ApprovalRule {
   methods?: string[];
   paths?: string[];
-  approver: Approver;
+  approver?: Approver;
   grant: ApprovalGrant;
   ttlMs: number;
 }
@@ -778,7 +780,7 @@ export function defineProvider(spec: ProviderSpec): Provider {
   }
 
   // #350: approval is on unless the provider opts out. An omitted or partial rule takes the defaults
-  // (member approver, once, five minutes); `false` is the only way to switch the gate off.
+  // (approver by identity (#359), once, five minutes); `false` is the only way to switch the gate off.
   let approval: Provider['approval'] = false;
   if (spec.approval !== false) {
     const rule: unknown = spec.approval === undefined ? {} : spec.approval;
@@ -786,7 +788,10 @@ export function defineProvider(spec: ProviderSpec): Provider {
     assertKnownKeys(rule, ['methods', 'paths', 'approver', 'grant', 'ttlMs'], 'approval');
     // Declarative config is raw JSON, so the removed value is compared as unknown (#322).
     if ((rule.approver as unknown) === 'admin') providerError('approval.approver', "'admin' was removed: workspace admins are not a Vouchr role. Use 'member' (any other member of the owning channel) or 'self'");
-    const approver = optionalEnum(rule.approver, 'approval.approver', APPROVERS, 'member') as Approver;
+    // Unset stays unset: the approver is resolved per request from its identity (effectiveApprover).
+    const approver = rule.approver === undefined
+      ? undefined
+      : optionalEnum(rule.approver, 'approval.approver', APPROVERS, 'member') as Approver;
     const grant = optionalEnum(rule.grant, 'approval.grant', APPROVAL_GRANTS, 'once') as ApprovalGrant;
     const methods = canonicalMethods(rule.methods, 'approval.methods');
     const paths = canonicalPaths(rule.paths, 'approval.paths');
@@ -794,7 +799,7 @@ export function defineProvider(spec: ProviderSpec): Provider {
     if (!Number.isSafeInteger(ttlMs) || (ttlMs as number) <= 0 || (ttlMs as number) > MAX_TIMER_MS) {
       providerError('approval.ttlMs', `must be a positive safe integer no greater than ${MAX_TIMER_MS}`);
     }
-    approval = { approver, grant, ttlMs: ttlMs as number, ...(methods ? { methods } : {}), ...(paths ? { paths } : {}) };
+    approval = { ...(approver ? { approver } : {}), grant, ttlMs: ttlMs as number, ...(methods ? { methods } : {}), ...(paths ? { paths } : {}) };
   }
 
   for (const field of ['egressValidate', 'inject', 'revoke', 'accountProbe'] as const) {

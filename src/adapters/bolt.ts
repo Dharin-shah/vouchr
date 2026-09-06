@@ -1929,9 +1929,10 @@ export class ConnectContext {
           return { status: 'stale', provider: providerId };
         }
       }
+      const approver = effectiveApprover(approval.approver, row.ownerKind, row.governableChannel);
       await this.deliverApprovalPrompt({
         provider: providerId,
-        approver: effectiveApprover(approval.approver, row.governableChannel),
+        approver,
         method: row.method,
         host: row.host,
         path: row.path,
@@ -1942,7 +1943,7 @@ export class ConnectContext {
         reason: row.reason,
         link: row.link,
       });
-      return { status: 'approval_prompted', provider: providerId, approver: approval.approver };
+      return { status: 'approval_prompted', provider: providerId, approver };
     }
 
     // Denials that need a HUMAN, not a consent surface. On the Bolt path these already reach the
@@ -4225,9 +4226,9 @@ export async function createVouchr(opts: VouchrOptions) {
         }
       };
       const ttlMs = approval.ttlMs;
-      // Resolved for the request's own conversation (a DM degrades 'member' to 'self'), from the
-      // persisted governance scope — never from the payload.
-      const approverRule = effectiveApprover(approval.approver, pending.governableChannel);
+      // Resolved for the request's own identity and conversation (unset follows the persisted owner
+      // kind, a DM degrades 'member' to 'self'), from the persisted row — never from the payload.
+      const approverRule = effectiveApprover(approval.approver, pending.ownerKind, pending.governableChannel);
       let decided: ApprovalDecisionResult;
       try {
         // Slack facts cannot be queried through PostgreSQL. Resolve them before taking lifecycle
@@ -4301,7 +4302,7 @@ export async function createVouchr(opts: VouchrOptions) {
                 if (!currentApproval || !approvalNeeded(currentApproval, row.method, row.path)) {
                   return 'invalidated';
                 }
-                if (effectiveApprover(currentApproval.approver, row.governableChannel) !== approverRule) return 'invalidated';
+                if (effectiveApprover(currentApproval.approver, row.ownerKind, row.governableChannel) !== approverRule) return 'invalidated';
                 if ((row.ownerKind === 'channel' || approverRule === 'member') && !channelFactsValid) return 'invalidated';
                 if (!(await approvalOwnerStillCurrent({
                   row,

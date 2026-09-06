@@ -175,10 +175,11 @@ test('#113 loadProviders: the approval knob loads and reaches the provider with 
   const full = { methods: ['POST'], paths: ['/repos'], approver: 'self', grant: 'thread', ttlMs: 60_000 };
   const [q] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...APPROVAL_INTERNAL, approval: full }]) } as any);
   assert.deepEqual(q.approval, full);
-  // #350: an omitted rule is the default (writes ask another member once); false switches it off.
+  // #350/#359: an omitted rule is the default (writes ask once; who decides follows the request's
+  // identity, so the approver stays unset here); false switches it off.
   const { approval: _omit, ...bare } = APPROVAL_INTERNAL;
   const [d] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([bare]) } as any);
-  assert.deepEqual(d.approval, { approver: 'member', grant: 'once', ttlMs: 300_000 });
+  assert.deepEqual(d.approval, { grant: 'once', ttlMs: 300_000 });
   const [off] = loadProviders({ VOUCHR_PROVIDERS: JSON.stringify([{ ...bare, approval: false }]) } as any);
   assert.equal(off.approval, false);
 });

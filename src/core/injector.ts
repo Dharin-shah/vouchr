@@ -805,7 +805,7 @@ export class ConnectionHandle {
         // names and values are caller-controlled, SEC-1) and is bound by the digest in the key.
         throw new ApprovalRequiredError(
           this.provider.id,
-          effectiveApprover(approval.approver, key.governableChannel),
+          effectiveApprover(approval.approver, key.ownerKind, key.governableChannel),
           method,
           url.hostname,
           url.pathname,

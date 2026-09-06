@@ -146,7 +146,7 @@ automatic replay of an uncertain or non-idempotent write.
 | Exported error | Stable code | Recovery | Meaning |
 | --- | --- | --- | --- |
 | `ConsentRequiredError` | `consent_required` | `connect` | A private connection prompt was posted; stop the turn. |
-| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. For a `member` approver the copy tells the requester to wait for another channel member. |
+| `ApprovalRequiredError` | `approval_required` | `request_approval` | The exact write needs a human decision; stop the turn. `error.approver` is the resolved rule: `self` (the requester confirms; the default when acting as the person) or `member` (the copy tells the requester to wait for another channel member; the default when acting as the channel). |
 | `ApprovalPathTooLongError` | `approval_path_too_large` | `fix_configuration` | The approval endpoint exceeds the bounded exact-action path; narrow it before retrying. |
 | `InteractionStateChangedError` | `interaction_state_changed` | `resolve_again` | The credential generation or current authorization changed; discard the stale handle and resolve current access before retrying. |
 | `PolicyDeniedError` | `policy_denied` | `contact_admin` | Provider/channel policy denied the request; retrying cannot change governance. |
@@ -314,8 +314,9 @@ verification, replay guard, policy, channel-tool, host/path/method, and HTTPS ch
 
 ## Human-in-the-loop approvals (#113)
 
-A provider declaring the `approval` knob (`{ methods?, paths?, approver: 'self' | 'member',
-ttlMs? }`; default = every non-GET/HEAD method) requires a live, single-use human approval per
+A provider declaring the `approval` knob (`{ methods?, paths?, approver?: 'self' | 'member',
+grant?, ttlMs? }`; default = every non-GET/HEAD method, approver by identity: `self` for a person-owned
+credential, `member` for a channel-owned one) requires a live, single-use human approval per
 matching action — enforced in the shared injector, so this door inherits it identically: strictly
 AFTER every egress gate (never a bypass) and BEFORE the credential is read. The broker **cannot
 render Approve/Deny buttons**, so the split is deliberate:
@@ -461,8 +462,9 @@ user) as the requester, and let the channel's members approve.
   with `ownerKind: 'channel'`, `channelEligible: true`, `channel`, and `channelType`, exactly as the
   [hybrid guide's minter](./HYBRID.md#4-mint-identity-only-from-verified-slack-facts) does. Send
   `handle: { provider, owner: 'channel' }`.
-- **Approver.** Leave the provider's `approval` at its default (`approver: 'member'`). The bot is the
-  requester, so any human member of the channel can approve. Put the ticket reference in `reason`
+- **Approver.** Leave the provider's `approval` at its default. The credential is the channel's, so
+  the default approver is `member`: the bot is the requester and can never approve its own request,
+  and any human member of the channel can. Put the ticket reference in `reason`
   and its URL in `link`; `grant: 'thread'` lets one approval cover a job's later writes in the same
   thread.
 - **Flow.** `POST /v1/authorization`, poll `GET /v1/authorization/{id}`, then `/v1/fetch` with the

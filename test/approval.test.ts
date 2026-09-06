@@ -300,12 +300,15 @@ test('defineProvider: garbage approval knobs are rejected at definition time (SE
   assert.throws(spec({ approver: 'self', ttlMs: MAX_TIMER_MS + 1 }), new RegExp(`approval\\.ttlMs.*no greater than ${MAX_TIMER_MS}`));
   assert.equal((approvalProvider({ approval: { ttlMs: MAX_TIMER_MS } }).approval as ApprovalRule).ttlMs, MAX_TIMER_MS);
   // #350: the defaults. An omitted or empty rule asks another member once for five minutes; false is off.
-  assert.deepEqual(approvalProvider({ approval: undefined }).approval, { approver: 'member', grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
-  assert.deepEqual(approvalProvider({ approval: {} }).approval, { approver: 'member', grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
+  // #359: an unset approver stays unset on the definition; effectiveApprover resolves it per request.
+  assert.deepEqual(approvalProvider({ approval: undefined }).approval, { grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
+  assert.deepEqual(approvalProvider({ approval: {} }).approval, { grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
+  assert.deepEqual(approvalProvider({ approval: { approver: 'member' } }).approval, { approver: 'member', grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
+  assert.deepEqual(approvalProvider({ approval: { approver: 'self' } }).approval, { approver: 'self', grant: 'once' as const, ttlMs: DEFAULT_APPROVAL_TTL_MS });
   assert.equal(approvalProvider({ approval: false }).approval, false);
   assert.deepEqual(
     approvalProvider({ approval: { grant: 'thread', ttlMs: 1000, paths: ['/repos/'] } }).approval,
-    { approver: 'member', grant: 'thread', ttlMs: 1000, paths: ['/repos/'] },
+    { grant: 'thread', ttlMs: 1000, paths: ['/repos/'] },
   );
 });
 
@@ -1643,6 +1646,120 @@ test('member approver: two members clicking at once on two Bolt instances yield 
     const res = await handle.fetch('https://api.acme.test/repos', { method: 'POST' });
     assert.equal(res.status, 200);
     assert.equal(calls.length, 1);
+  });
+});
+
+// ── #359: an unset approver follows the identity ─────────────────────────────────────────────────
+
+test('#359 person identity, no approver set: the requester is prompted privately, a teammate is refused, the requester approves and the call runs once', async (t) => {
+  const { ctx, ephemerals, dms, click, auditRows } = await harness(t, {
+    provider: approvalProvider({ approval: {} }),
+    members: ['U1', 'U_MEMBER'],
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST', body: BODY_SENTINEL }));
+    assert.equal(e.approver, 'self', 'acting as the person, the requester is the human in the loop');
+    assert.equal(mapSafeError(e).message, 'Human approval is required. Approve the prompt Vouchr posted to you, then retry.');
+    assert.equal(dms.length, 0, 'no channel message');
+    assert.equal(ephemerals.length, 1);
+    assert.equal(ephemerals[0].user, 'U1');
+    assert.match(JSON.stringify(ephemerals[0]), /as you on/);
+    const other: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', e.approvalId, other);
+    assert.match(String(other[0]?.text), /only the requester can/);
+    assert.equal(calls.length, 0);
+    const own: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId, own);
+    assert.match(String(own[0]?.text), /Approved/);
+    assert.equal((await handle.fetch('https://api.acme.test/repos', { method: 'POST' })).status, 200);
+    assert.equal(calls.length, 1);
+    await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(calls.length, 1, 'single-use');
+    const consumed = (await auditRows()).find((r) => r.action === 'approval_consumed');
+    assert.equal(consumed.actor, 'U1');
+    assert.equal(consumed.user_id, 'U1');
+  });
+});
+
+test('#359 channel identity, no approver set: one channel message, the requester is refused, another member approves', async (t) => {
+  const { ctx, ephemerals, dms, click, auditRows } = await harness(t, {
+    provider: approvalProvider({ approval: {} }),
+    sharedChannel: true,
+    members: ['U1', 'U_MEMBER'],
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(e.approver, 'member', 'the credential belongs to the channel, so a teammate decides');
+    assert.equal(mapSafeError(e).message, 'Waiting for another channel member to approve the prompt; retry after they do.');
+    assert.equal(ephemerals.length, 0);
+    assert.equal(dms.length, 1);
+    assert.equal(dms[0].channel, 'C1');
+    assert.match(JSON.stringify(dms[0]), /Another member of this channel must approve it/);
+    const own: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId, own);
+    assert.match(String(own[0]?.text), /another channel member must/);
+    assert.equal(calls.length, 0);
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', e.approvalId);
+    assert.equal((await handle.fetch('https://api.acme.test/repos', { method: 'POST' })).status, 200);
+    assert.equal(calls.length, 1);
+    const consumed = (await auditRows()).find((r) => r.action === 'approval_consumed');
+    assert.equal(consumed.actor, 'U_MEMBER');
+    assert.equal(consumed.user_id, 'U1');
+  });
+});
+
+test('#359 explicit self on a channel-identity provider: the operator\'s choice holds, the requester approves the team credential\'s use', async (t) => {
+  const { ctx, ephemerals, dms, click } = await harness(t, {
+    provider: approvalProvider({ approval: { approver: 'self' } }),
+    sharedChannel: true,
+    members: ['U1', 'U_MEMBER'],
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(e.approver, 'self');
+    assert.equal(dms.length, 0);
+    assert.equal(ephemerals[0].user, 'U1');
+    const other: any[] = [];
+    await click(APPROVAL_APPROVE_ACTION, 'U_MEMBER', e.approvalId, other);
+    assert.match(String(other[0]?.text), /only the requester can/);
+    await click(APPROVAL_APPROVE_ACTION, 'U1', e.approvalId);
+    assert.equal((await handle.fetch('https://api.acme.test/repos', { method: 'POST' })).status, 200);
+    assert.equal(calls.length, 1);
+    assert.equal(new Headers(calls[0].init?.headers).get('authorization'), `Bearer ${TOKEN}`);
+  });
+});
+
+test('#359 a request made as the person is not decidable after the identity flips to the channel', async (t) => {
+  const { vouchr, ctx, click, approvalRows } = await harness(t, {
+    provider: approvalProvider({ approval: {} }),
+    members: ['U1', 'U_MEMBER'],
+  });
+  await withFetch(async (calls) => {
+    const handle = await ctx.connect('acme');
+    const e = await expectApprovalRequired(handle.fetch('https://api.acme.test/repos', { method: 'POST' }));
+    assert.equal(e.approver, 'self');
+    await setChannelCredentialIdentity({
+      vault: vouchr.vault,
+      audit: vouchr.audit,
+      channelConfig: new ChannelConfig(vouchr.db),
+      identity: ID,
+      channel: 'C1',
+      providerId: 'acme',
+      actAs: 'channel',
+      issuance: await vouchr.vault.userProvisioningIssuedAt(),
+    });
+    // The rule for the row would now read 'member', but the row was minted under 'self' for the
+    // requester's own credential: the identity change purged it, so neither click decides anything.
+    for (const clicker of ['U1', 'U_MEMBER']) {
+      const r: any[] = [];
+      await click(APPROVAL_APPROVE_ACTION, clicker, e.approvalId, r);
+      assert.match(String(r[0]?.text), /expired or was already decided/, clicker);
+    }
+    assert.equal((await approvalRows()).length, 0);
+    assert.equal(calls.length, 0);
   });
 });
 

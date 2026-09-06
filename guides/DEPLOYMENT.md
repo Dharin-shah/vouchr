@@ -652,8 +652,9 @@ narrow `"approval": { "paths": [...] }` to the provider's non-MCP endpoints.
 
 **Human-in-the-loop approval is on by default** (#113, #350): every non-GET/HEAD call needs a live
 grant. The optional `approval` knob adjusts it. `false` turns it off for the provider. Otherwise an
-object with any of: `approver` (`"member"`, the default: any other current member of the owning
-channel confirms, in a DM it behaves like `"self"`; or `"self"`: the acting user confirms), `methods`
+object with any of: `approver` (unset, the default, follows the identity: `"self"` when the agent acts
+as the person, `"member"` when it acts as the channel; `"member"`: any other current member of the
+owning channel confirms, in a DM it behaves like `"self"`; `"self"`: the requester confirms), `methods`
 (default every non-GET/HEAD method), `paths` (default all, same matcher as `egressPaths`), `grant`
 (`"once"`, the default: one exact call; or `"thread"`: every matching call in the approving thread
 until the TTL), and `ttlMs` (default 5 minutes). Unknown keys, `null`, and invalid shapes are

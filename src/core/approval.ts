@@ -119,12 +119,22 @@ export function approvalDeliveryAudienceKey(
   return hash.digest('hex');
 }
 
-/** The approver rule that actually applies to ONE request (#322): `member` means "another member of
- * the channel that governs this action", so where no channel governs it (a DM or group DM, whose
- * governance scope is null) it degrades to `self`. One helper for the injector, both Bolt delivery
- * paths, and the click, so no site can disagree about who may decide. */
-export function effectiveApprover(approver: Approver, governableChannel: string | null): Approver {
-  return approver === 'member' && governableChannel === null ? 'self' : approver;
+/** The approver rule that actually applies to ONE request. An explicit provider `approver` wins;
+ * unset follows the identity the request runs under (#359): a `user`-owned credential (identity
+ * `person`) defaults to `self`, since the requester is already the human in the loop, and a
+ * `channel`-owned credential (identity `channel`) defaults to `member`, since the credential belongs
+ * to the team. `member` means "another member of the channel that governs this action", so where no
+ * channel governs it (a DM or group DM, whose governance scope is null) it degrades to `self` (#322).
+ * The owner kind and scope come from the persisted row (or the key about to be persisted), never from
+ * a payload. One helper for the injector, both Bolt delivery paths, and the click, so no site can
+ * disagree about who may decide. */
+export function effectiveApprover(
+  approver: Approver | undefined,
+  ownerKind: Owner['kind'],
+  governableChannel: string | null,
+): Approver {
+  const rule = approver ?? (ownerKind === 'channel' ? 'member' : 'self');
+  return rule === 'member' && governableChannel === null ? 'self' : rule;
 }
 
 /** Finite bound for the agent's `reason` (#350). It is rendered verbatim (escaped) on the decision

@@ -5,6 +5,17 @@ All notable changes to this project are documented here. This project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- An unset `approval.approver` now follows who the agent acts as: `self` when the identity is
+  `person`, `member` when it is `channel` (#359). The requester of a write with their own credential
+  is already the human in the loop, so asking a teammate added a step without adding a check, and
+  one person alone could not complete a write as themselves. An explicit `approver` still wins, a DM
+  still degrades `member` to `self`, and an autonomous worker on a channel credential still needs a
+  human member. `effectiveApprover(approver, ownerKind, governableChannel)` gains the owner-kind
+  argument and accepts an unset approver; a normalized `ApprovalRule` no longer carries `approver`
+  unless the provider set it.
+
 ### Fixed
 
 - The settings modal (`/vouchr` with no arguments) shows who the agent acts as for each enabled
