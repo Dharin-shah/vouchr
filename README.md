@@ -1,22 +1,26 @@
 <div align="center">
 <h1>Vouchr</h1>
 
-**Let your agent read freely. Make it ask before it writes. Keep a record of everything.**
+**Human in the loop for teams. Your agents act as your people, and your team approves what matters.**
 
 [![npm](https://img.shields.io/npm/v/%40vouchr%2Fcore?style=for-the-badge&label=npm)](https://www.npmjs.com/package/@vouchr/core) [![CI](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml) [![Security](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/security.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Security)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge)](./LICENSE)
 
 </div>
 
-Reading GitHub, Google, or Jira with one shared token is usually fine. Writing is not. An agent
-that creates issues, merges code, sends mail, or changes records needs three things:
+Vouchr is the identity and approval layer for agents that work on your behalf. It sits between
+your agent and your team's accounts and does three things:
 
-1. It acts as the person who asked, with that person's own access.
-2. Sensitive writes wait for a human. The team that owns the channel approves.
-3. Every call is on record: who, what, where, and who approved.
+1. The agent acts as the person who asked, with that person's own access.
+2. Sensitive steps wait for the team. The channel that owns the credential approves.
+3. Every action is on record: who, what, where, and who approved.
 
-Vouchr does these three things for Slack agents. It is self-hosted and runs on PostgreSQL. Your
-code gets a handle, never a token. Vouchr adds the credential when the request leaves for the
-provider, so the model, the transcript, and your logs never see it.
+Reading GitHub, Google, or Jira with one shared token is usually fine. Writing is not, and that is
+where Vouchr earns its place: an agent that creates issues, merges code, sends mail, or changes
+records does it as a person, with the team's approval, and with a record.
+
+It is self-hosted and runs on PostgreSQL. Your code gets a handle, never a token. Vouchr adds the
+credential when the request leaves for the provider, so the model, the transcript, and your logs
+never see it.
 
 ## Example
 
