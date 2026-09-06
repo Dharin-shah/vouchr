@@ -78,6 +78,7 @@
     "pg:down": "docker rm -f vouchr-pg",
     "bench:perf": "node --import tsx test/bench/perf-bench.ts",
     "example:github": "node --env-file=.env --import tsx examples/bolt-github/app.ts",
+    "example:demo": "node --env-file=.env --import tsx examples/demo/app.ts",
     "example:dry-run": "node --import tsx --test examples/dry-run/app.test.ts"
   },
   "dependencies": {
