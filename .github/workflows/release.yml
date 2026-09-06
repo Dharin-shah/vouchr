@@ -21,6 +21,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read # the test suite runs without the workflow's id-token/packages write
     # Vouchr is PostgreSQL-only, so `npm test` (the real-PG suite) needs a live Postgres — mirror the
@@ -66,8 +67,10 @@ jobs:
             || { echo "::error::tag v$VERSION does not match package.json version $PKG_VERSION — bump package.json before tagging"; exit 1; }
           # A re-run of a finished release, or a force-moved tag, must not rebuild and re-push the image
           # under a new digest while `npm publish` fails on the duplicate version.
-          npm view "@vouchr/core@$VERSION" version >/dev/null 2>&1 \
-            && { echo "::error::@vouchr/core@$VERSION is already published — a release runs once per version"; exit 1; }
+          PUBLISHED_HEAD="$(npm view "@vouchr/core@$VERSION" gitHead 2>/dev/null || true)"
+          if [ -n "$PUBLISHED_HEAD" ] && [ "$PUBLISHED_HEAD" != "$(git rev-parse HEAD)" ]; then
+            echo "::error::@vouchr/core@$VERSION is already published from $PUBLISHED_HEAD, not this commit — a version releases once"; exit 1
+          fi
           awk -v ver="$VERSION" 'index($0,"## ["ver"]")==1{g=1;next} g&&/^## /{g=0} g{print}' CHANGELOG.md | grep -q . \
             || { echo "::error::no CHANGELOG section for $VERSION — add a '## [$VERSION]' entry before tagging"; exit 1; }
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -83,6 +86,7 @@ jobs:
   npm-publish:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
@@ -103,8 +107,15 @@ jobs:
             *-rc*|*-alpha*) TAG=rc ;;
             *)              TAG=latest ;;
           esac
-          echo "publishing ${GITHUB_REF_NAME} under dist-tag ${TAG}"
-          npm publish --provenance --tag "${TAG}"
+          VERSION="${GITHUB_REF_NAME#v}"
+          # A rerun of the same tag (for example after a later job hung) must not fail on the duplicate
+          # version: the verify job already proved the published copy is this exact commit.
+          if [ "$(npm view "@vouchr/core@${VERSION}" gitHead 2>/dev/null || true)" = "$(git rev-parse HEAD)" ]; then
+            echo "@vouchr/core@${VERSION} is already published from this commit; skipping publish"
+          else
+            echo "publishing ${GITHUB_REF_NAME} under dist-tag ${TAG}"
+            npm publish --provenance --tag "${TAG}"
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       # #217 verify after publication: the registry's copy must name THIS commit (npm records the
@@ -128,6 +139,7 @@ jobs:
   docker-ghcr:
     needs: verify
     runs-on: ubuntu-latest
+    timeout-minutes: 90 # cosign sign/attest/verify took 44 min on v1.0.0-beta.1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
@@ -213,6 +225,7 @@ jobs:
   github-release:
     needs: [npm-publish, docker-ghcr]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write # create the release
     steps:
