@@ -1,23 +1,22 @@
 <div align="center">
 <h1>Vouchr</h1>
 
-**Your Slack agent acts as the person asking, and never holds their tokens.**
+**Let your agent read freely. Make it ask before it writes. Keep a record of everything.**
 
 [![npm](https://img.shields.io/npm/v/%40vouchr%2Fcore?style=for-the-badge&label=npm)](https://www.npmjs.com/package/@vouchr/core) [![CI](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/ci.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=CI)](https://github.com/Dharin-shah/vouchr/actions/workflows/ci.yml) [![Security](https://img.shields.io/github/actions/workflow/status/Dharin-shah/vouchr/security.yml?style=for-the-badge&logo=githubactions&logoColor=white&label=Security)](https://github.com/Dharin-shah/vouchr/actions/workflows/security.yml) [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue?style=for-the-badge)](./LICENSE)
 
 </div>
 
-Vouchr is a self-hosted credential broker for Slack agents.
+Reading GitHub, Google, or Jira with one shared token is usually fine. Writing is not. An agent
+that creates issues, merges code, sends mail, or changes records needs three things:
 
-When a Slack agent calls GitHub, Google, or Jira, it usually holds one bot token with everyone's
-power, or it carries user tokens through prompts and logs. Vouchr removes both. Each person
-connects their own account once, in Slack. Your code gets a handle, never a token, and Vouchr adds
-the credential only when the request leaves for the provider. Vouchr does not read or filter provider
-responses, so what the model does with data it is allowed to see stays your responsibility.
+1. It acts as the person who asked, with that person's own access.
+2. Sensitive writes wait for a human. The team that owns the channel approves.
+3. Every call is on record: who, what, where, and who approved.
 
-Token vaults and integration platforms hand the token to your code or to a hosted service. Vouchr
-keeps it out of your code, your model, and your logs, and asks the owning team before sensitive
-actions. It is self-hosted and PostgreSQL-only.
+Vouchr does these three things for Slack agents. It is self-hosted and runs on PostgreSQL. Your
+code gets a handle, never a token. Vouchr adds the credential when the request leaves for the
+provider, so the model, the transcript, and your logs never see it.
 
 ## Example
 
@@ -33,7 +32,13 @@ const receiver = new ExpressReceiver({ signingSecret: process.env.SLACK_SIGNING_
 const app = new App({ token: process.env.SLACK_BOT_TOKEN, receiver });
 
 // Needs VOUCHR_DATABASE_URL and VOUCHR_MASTER_KEY in the environment, and a one-time `npx vouchr migrate`.
-const vouchr = await createVouchr({ providers: [github()], baseUrl: process.env.PUBLIC_URL! });
+const vouchr = await createVouchr({
+  providers: [
+    // Reads go through. Writes under /repos/ wait for a teammate's approval.
+    github({ approval: { approver: 'member', methods: ['POST', 'PUT', 'PATCH', 'DELETE'], paths: ['/repos/'] } }),
+  ],
+  baseUrl: process.env.PUBLIC_URL!,
+});
 vouchr.install(app, receiver);
 
 app.event('app_mention', async ({ context, event, client, say }) => {
@@ -43,29 +48,49 @@ app.event('app_mention', async ({ context, event, client, say }) => {
     await say(`You're *${me.login}* on GitHub.`);
   } catch (error) {
     if (error instanceof ConsentRequiredError) return; // Vouchr already posted a private Connect prompt.
-    // Any other refusal: show the user Vouchr's fixed, secret-free message, then let Bolt log it.
     await client.chat.postEphemeral({ channel: event.channel, user: event.user!, text: safeUserMessage(error) });
     throw error;
   }
 });
 ```
 
-Channels are deny-by-default. Before first use in a channel, a member of that channel runs
-`/vouchr enable github`. Direct messages need no enable. `connect()` then prompts the user
-privately. After one browser OAuth, the agent works.
+Channels are deny-by-default. A member of the channel runs `/vouchr enable github` once. The
+first time someone uses the agent there, Vouchr asks them privately to connect their account.
+After one browser sign-in, the agent works as them.
 
 ![Vouchr Slack connect prompt](./assets/slack-connect-prompt.svg)
 
-## Quickstart
+## Writes and sensitive paths
 
-[QUICKSTART.md](./QUICKSTART.md) goes from nothing to a bot acting as you on GitHub. Plan on about
-ten minutes of Slack and GitHub app setup, then a few minutes to run. It needs Node 22 or newer and
-PostgreSQL.
+The `approval` setting on a provider says which calls need a human.
+
+- `methods`: which HTTP methods wait. Leave it out and every method except GET and HEAD waits.
+- `paths`: which paths wait. A prefix ending in `/` matches everything under it. Leave it out and
+  every path waits.
+- `approver`: `member` asks the channel that owns the credential. Any member other than the
+  requester can approve. `self` asks the person driving the agent.
+
+When the agent reaches one of these calls, Vouchr posts a prompt in the channel with who asked,
+the provider, the method, and the host. One click approves exactly that call, once. Then the agent
+continues to the next step and asks again when it has to. A credential only ever goes to the
+provider's own hosts.
+
+This is how an agent does most of a task alone and still stops at the steps that matter. It drafts
+and reviews on its own, pauses to merge or to publish, and a teammate approves in Slack.
+
+## Audit
+
+Every connect, call, approval, denial, and disconnect is written to an audit table: time, person,
+channel, provider, method, host, and outcome, and for approvals who approved. Secrets are never in it.
+
+- `/vouchr audit` in Slack shows where your own credentials have been used.
+- `/vouchr audit channel` shows a channel's shared-credential usage.
+- `vouchr inventory` on the command line lists every live credential.
+- The table is plain PostgreSQL. The [Prometheus example](./examples/prometheus) exports it.
 
 ## Credential modes
 
-Each channel picks how a provider is authorized. Your handler code does not change;
-`connect(provider)` follows the channel's mode.
+Each channel picks how a provider is authorized. Your handler code does not change.
 
 | Mode | What it means | Typical use |
 | --- | --- | --- |
@@ -73,43 +98,29 @@ Each channel picks how a provider is authorized. Your handler code does not chan
 | `session` | Usable only inside the approving thread, for a limited time. | Sensitive writes |
 | `shared` | The channel uses one credential a channel member configures. | Team tools, internal APIs |
 
-## Human approval from any agent
-
-An agent can do most of a task on its own and stop at each sensitive step. The team decides
-those steps. Mark a provider's sensitive actions with the `approval` knob, for example
-`github({ approval: { approver: 'member', methods: ['POST', 'PUT'] } })`. When the agent reaches
-one, Vouchr posts a prompt in the channel that owns the credential. It shows who asked, the
-provider, the method, and the host. Any other member of that channel clicks Approve or Deny. On
-approval the agent runs exactly that action, once. Then it asks again for the next sensitive step.
-
-For example, an agent drafts a release and reviews the changes on its own. It pauses to publish the
-release and to merge the pull request. The team approves each in Slack. The agent finishes.
-
-`approver: 'self'` asks the person driving the agent instead. In a direct message there is no
-team, so `member` behaves like `self`. This also works for agents outside Slack. They call the
-broker, and the same prompt lands in the same channel. See the
-[headless guide](./guides/HEADLESS.md#backchannel-authorization-for-background-agents-296).
-
 ## Providers
 
 Built in: `github()`, `google()`, `gitlab()`, `notion()`, `databricks()`. Any other OAuth2 API takes
-about ten lines with `defineProvider`. API keys and secret-manager references (AWS, GCP, Azure,
-Vault) work too. Request only the scopes you use: `github({ scopes: ['read:user'] })` asks for
-"Read your profile", not the default `repo`. See
-[provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
+about ten lines with `defineProvider`. API keys and secret-manager references work too. Ask only
+for the scopes you use. See [provider configuration](./guides/DEPLOYMENT.md#provider-config-declarative).
 
-## Headless
+## Agents outside Slack
 
-Agent workers in another process or language call a private HTTP broker instead of Bolt. The token
-still never leaves Vouchr. A background agent with no Slack turn (cron, CI, a durable workflow)
-initiates the human decision itself with `POST /v1/authorization` and polls for the outcome. See
-the [headless guide](./guides/HEADLESS.md) and the [hybrid guide](./guides/HYBRID.md).
+Workers in another process or language call a private HTTP broker. The token still never leaves
+Vouchr. A background agent with no Slack turn asks for approval with `POST /v1/authorization` and
+polls for the answer. The prompt lands in the same channel. See the
+[headless guide](./guides/HEADLESS.md).
+
+## Quickstart
+
+[QUICKSTART.md](./QUICKSTART.md) goes from nothing to a bot acting as you on GitHub. Plan on about
+ten minutes of Slack and GitHub app setup, then a few minutes to run. It needs Node 22 or newer and
+PostgreSQL.
 
 ## Learn more
 
 | | |
 | --- | --- |
-| [Quickstart](./QUICKSTART.md) | Zero to a working demo |
 | [Examples](./examples/README.md) | Google, Databricks, API keys, secret managers, broker client, MCP, Prometheus, SCIM, dry-run |
 | [Architecture](./guides/ARCHITECTURE.md) | How consent, injection, and audit fit together |
 | [Threat model](./guides/THREAT-MODEL.md) | What Vouchr defends against, and its limits |
