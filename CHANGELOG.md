@@ -23,6 +23,12 @@ All notable changes to this project are documented here. This project adheres to
 
 ### Fixed
 
+- **`/vouchr disconnect-shared` and `/vouchr mode` check the channel before the provider (#352).**
+  Run from a DM with a mistyped provider, both now say to run from inside the channel, the same order
+  `enable`, `disable`, and `connect-shared` already used. The other three findings in #352 were
+  verified already correct and are pinned by regression tests: the lazily created refresh pool stays
+  non-enumerable on the database handle, a no-op disable on an unconfigured channel writes no rows and
+  no audit row, and a lost revoke claim reports `upstreamMissing: false`.
 - **Every terminal state names the next action, and no stale prompt survives (#348).** Found by a
   code-walk audit after a live demo. Slack: session mode outside a thread, a non-member using a
   shared credential, and a channel without a shared credential now raise `UserFacingError` with the

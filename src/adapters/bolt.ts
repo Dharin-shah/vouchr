@@ -3266,8 +3266,8 @@ export async function createVouchr(opts: VouchrOptions) {
         if (words.length !== 3 || !arg || !isChannelMode(arg2)) {
           return respond('Usage: `/vouchr mode <provider> <shared|per-user|session>`');
         }
-        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         if (!command.channel_id) return respond('Run `/vouchr mode` from inside the channel you want to configure.');
+        if (!registry.has(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
         try {
           await contextFor(
             identity,
@@ -3313,10 +3313,10 @@ export async function createVouchr(opts: VouchrOptions) {
       // the shared credential AND attempts upstream revocation, and reports its real outcome.
       if (sub === 'disconnect-shared') {
         if (words.length !== 2) return respond('Usage: `/vouchr disconnect-shared <provider>`');
+        if (!command.channel_id) return respond('Run `/vouchr disconnect-shared` from inside the channel you want to configure.');
         // Validate id syntax before any lookup or audit (SEC-4). Registry membership is safe to use
         // in the denial audit; an unregistered submitted value is replaced by a fixed trusted subject.
         if (!isValidProviderId(arg)) return respond(UNKNOWN_PROVIDER_TEXT);
-        if (!command.channel_id) return respond('Run `/vouchr disconnect-shared` from inside the channel you want to configure.');
         const chan = command.channel_id;
         let outcome: Awaited<ReturnType<typeof disconnectChannelShared>>;
         try {

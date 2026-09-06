@@ -36,10 +36,10 @@ async function harness(t: TestContext, providers = [mcp]) {
   const vouchr = await createVouchr({ providers, baseUrl: 'https://app.test', db, onEvent: (e) => events.push(e) });
   let handler: any;
   vouchr.registerCommands({ command: (_n: string, h: any) => (handler = h), view: () => undefined, action: () => undefined });
-  const run = async (text: string, client: unknown = MEMBER_CLIENT): Promise<string> => {
+  const run = async (text: string, client: unknown = MEMBER_CLIENT, channelId: string | null = 'C_FIN'): Promise<string> => {
     const out: string[] = [];
     await handler({
-      command: { team_id: 'T1', user_id: 'U1', channel_id: 'C_FIN', text },
+      command: { team_id: 'T1', user_id: 'U1', channel_id: channelId, text },
       ack: async () => {}, respond: async (m: any) => out.push(typeof m === 'string' ? m : JSON.stringify(m)), client,
     });
     return out[0] ?? '';
@@ -708,4 +708,16 @@ test('disconnect-shared truthfully warns Slack when upstream revocation fails af
     owner: 'channel', channel: 'C_FIN', ok: false,
   });
   assert.ok(!JSON.stringify(await db.all(`SELECT * FROM audit`)).includes(secret));
+});
+
+// #352: every channel-scoped subcommand checks the channel BEFORE the provider argument, so a DM gets
+// the "run from inside the channel" step (UX-5) instead of "Unknown provider" for a typo.
+test('channel-scoped subcommands in a DM say to run from inside the channel, even with an unknown provider', async (t) => {
+  const { run, db } = await harness(t);
+  for (const text of ['enable bogus', 'disable bogus', 'mode bogus shared', 'connect-shared bogus', 'disconnect-shared bogus']) {
+    const msg = await run(text, MEMBER_CLIENT, null); // null: a DM has no governable channel
+    assert.match(msg, /from inside the channel you want to configure/, text);
+    assert.doesNotMatch(msg, /Unknown provider/, text);
+  }
+  assert.equal((await db.all('SELECT id FROM audit')).length, 0, 'a DM rejection writes nothing');
 });
